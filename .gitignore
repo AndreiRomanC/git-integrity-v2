@@ -1,0 +1,8 @@
+src-tauri/target/
+.build-windows/
+dist/
+.DS_Store
+*.log
+
+*.zip
+*.bak*

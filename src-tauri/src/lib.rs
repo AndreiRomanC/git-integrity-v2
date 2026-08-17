@@ -1,0 +1,52 @@
+mod repository;
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    tauri::Builder::default()
+        .invoke_handler(tauri::generate_handler![
+            repository::choose_folder,
+            repository::init_repository,
+            repository::clone_repository,
+            repository::open_external_url,
+            repository::open_repository_item,
+            repository::load_repository,
+            repository::stage_files,
+            repository::unstage_files,
+            repository::create_commit,
+            repository::create_branch,
+            repository::switch_branch,
+            repository::load_directory,
+            repository::entry_details,
+            repository::submodule_versions,
+            repository::add_submodule,
+            repository::switch_submodule_version,
+            repository::change_submodule_url,
+            repository::remove_git_path,
+            repository::delete_local_path,
+            repository::commit_path,
+            repository::commit_files,
+            repository::restore_file,
+            repository::restore_remote_file,
+            repository::path_history,
+            repository::compare_remote_directory,
+            repository::compare_file_contents,
+            repository::read_text_file,
+            repository::write_text_file,
+            repository::list_remotes,
+            repository::fetch_remote,
+            repository::sync_repository,
+            repository::publish_status,
+            repository::publish_branch,
+            repository::submodule_repository,
+            repository::stash_changes,
+            repository::pop_stash,
+            repository::rename_branch,
+            repository::delete_branch,
+            repository::commit_submodule,
+            repository::push_submodule,
+            repository::fetch_submodule,
+            repository::file_blame,
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running Git Integrity");
+}

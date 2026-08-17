@@ -1,0 +1,6 @@
+[build]
+# Keep build cache out of the project folder — it's disposable, and can grow to
+# several GB when compiling all dependencies from source (git2/libgit2/openssl
+# vendored, the full Tauri/webview stack). Building here means the project on
+# disk stays small; delete this directory anytime to reclaim space.
+target-dir = "/tmp/git-integrity-cargo-target"

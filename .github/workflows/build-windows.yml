@@ -1,0 +1,33 @@
+name: Build Windows
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  windows-portable:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build portable executable
+        shell: pwsh
+        run: ./build-windows.ps1
+
+      - name: Verify executable size
+        shell: pwsh
+        run: |
+          $exe = Get-Item "dist/windows/git-integrity.exe"
+          if ($exe.Length -gt 30MB) { throw "Executable exceeds 30 MB" }
+          Write-Host "Windows executable: $([math]::Round($exe.Length / 1MB, 2)) MB"
+
+      - name: Upload Windows application
+        uses: actions/upload-artifact@v4
+        with:
+          name: git-integrity-windows
+          path: dist/windows/git-integrity.exe
+          if-no-files-found: error

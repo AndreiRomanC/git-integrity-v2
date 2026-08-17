@@ -1,0 +1,254 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Git Integrity</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand"><span class="brand-mark">G</span><span>Git Integrity</span></div>
+      <button class="repo-picker" id="openRepo">
+        <span class="folder-icon">▰</span>
+        <span class="repo-picker-copy"><strong id="repoName">Open a repository</strong><small id="repoPath">Choose an existing Git folder</small></span>
+        <span class="chevron">⌄</span>
+      </button>
+      <div class="top-actions">
+        <button id="refresh" title="Refresh repository">↻</button>
+        <button id="fetchCurrent" title="Fetch current remote">↓</button>
+        <button id="pullCurrent" title="Pull current branch">⇣</button>
+        <button id="pushCurrent" title="Push current branch">↑</button>
+      </div>
+    </header>
+
+    <main class="main-layout">
+      <aside class="sidebar">
+        <button class="nav-item active" id="navExplorer"><span class="nav-icon">▰</span><span>Project Explorer</span></button>
+        <button class="nav-item" id="navCommander"><span class="nav-icon">⇄</span><span>Local ↔ Remote</span></button>
+        <button class="nav-item" id="navGraph"><span class="nav-icon">⑂</span><span>Branch Map</span></button>
+        <button class="nav-item" id="navRemotes"><span class="nav-icon">◎</span><span>Remotes</span></button>
+
+        <div class="side-heading"><span>BRANCHES</span><button id="newBranch" title="Create branch">＋</button></div>
+        <div id="branches" class="branch-list"></div>
+
+        <div class="side-heading workspace-heading"><span>WORKSPACE</span></div>
+        <button class="workspace-status" id="showChanges">
+          <span class="workspace-dot"></span>
+          <span><strong id="workspaceTitle">Working tree</strong><small id="workspaceSubtitle">No repository loaded</small></span>
+          <b id="changeBadge">0</b>
+        </button>
+        <button class="workspace-status publish-status" id="showPublish"><span class="publish-dot">↑</span><span><strong>Unpublished commits</strong><small id="publishSubtitle">Choose what goes to server</small></span><b id="publishBadge">?</b></button>
+        <button class="workspace-status" id="stashWork" data-tooltip="Save work in progress (stash)" title="Save work in progress"><span class="workspace-dot" style="background:#b294ff;"></span><span><strong>Stash work</strong><small>Save changes temporarily</small></span></button>
+        <button class="workspace-status" id="popStash" data-tooltip="Restore stashed work (pop)" title="Restore stashed work" style="display:none;"><span class="workspace-dot" style="background:#48cc7e;"></span><span><strong>Pop stash</strong><small>Restore saved changes</small></span></button>
+      </aside>
+
+      <section class="content">
+        <div id="recentReposBar" class="recent-repos-bar" hidden>
+        <button id="closeRecentRepos" style="width:28px;height:28px;padding:0;border:0;background:transparent;color:#8fa0b0;font-size:18px;cursor:pointer;">×</button>
+        <span>Recent:</span>
+        <div id="recentReposList" class="recent-repos-list"></div>
+      </div>
+      <div class="location-strip" id="locationStrip"><span>REPOSITORY</span><strong id="locationRepository">—</strong><i>›</i><span>BRANCH</span><strong id="locationBranch">—</strong><i>›</i><span>PATH</span><strong id="locationPath">/</strong></div>
+        <div class="content-head" id="contentHead">
+          <div>
+            <h1 id="viewTitle">Project Explorer</h1>
+            <p id="graphSubtitle">Navigate folders and inspect every item in your repository.</p>
+          </div>
+          <div class="view-tools">
+            <label class="search"><span>⌕</span><input id="search" placeholder="Filter this folder"></label>
+            <button class="scope-action" id="showPathHistory">History</button>
+            <button class="scope-action folder-changes-action" id="showFolderChanges">Changes in folder</button>
+            <button class="scope-action" id="addSubmodule">＋ Add submodule</button>
+            <button class="scope-action primary" id="commitScope">Commit folder</button>
+            <button class="icon-action" id="goUp" title="Parent folder">↑</button>
+            <button class="icon-action" id="reloadFolder" title="Reload folder">↻</button>
+          </div>
+        </div>
+
+        <div id="emptyState" class="empty-state">
+          <div class="empty-graph-symbol">
+            <i></i><i></i><i></i><span></span>
+          </div>
+          <h2>Explore your project visually</h2>
+          <p>Open an existing Git repository to browse folders, files, submodules and Git details.</p>
+          <div class="empty-actions">
+            <button class="primary-action" id="emptyOpen">Open repository</button>
+            <button class="primary-action" id="cloneRepo">Clone from server</button>
+            <button class="secondary-action" id="initRepo">Create repository</button>
+          </div>
+          <small id="browserNotice" hidden>Browser preview cannot execute Git. Run the desktop application to open local repositories.</small>
+        </div>
+
+        <div id="explorerView" class="explorer-view" hidden>
+          <nav id="breadcrumbs" class="breadcrumbs" aria-label="Repository path"></nav>
+          <div class="file-header file-grid"><span>NAME</span><span>GIT</span><span>SIZE</span><span>MODIFIED</span></div>
+          <div id="fileList" class="file-list"></div>
+        </div>
+
+        <div id="commanderView" class="commander-view" hidden>
+          <div class="commander-toolbar">
+            <nav id="commanderBreadcrumbs" class="commander-breadcrumbs"></nav>
+            <label><span>REMOTE SNAPSHOT</span><select id="remoteRef"></select></label>
+          </div>
+          <div class="commander-head commander-grid"><span>LOCAL WORKSPACE</span><span>STATE</span><span>REMOTE BRANCH</span></div>
+          <div id="commanderRows" class="commander-rows"></div>
+          <div class="commander-legend"><span><i class="same"></i>Same</span><span><i class="modified"></i>Modified</span><span><i class="local-only"></i>Only local</span><span><i class="remote-only"></i>Only remote</span></div>
+        </div>
+
+        <div id="graphView" class="graph-view" hidden>
+          <button id="leaveSubmoduleGraph" class="back-context" hidden>← Back to parent repository</button>
+          <div id="laneLegend" class="lane-legend"></div>
+          <div id="graph" class="graph"></div>
+        </div>
+        <div id="remotesView" class="remotes-view" hidden><div id="remoteCards" class="remote-cards"></div></div>
+      </section>
+
+      <aside id="detailsPanel" class="details-panel">
+        <div class="details-empty">
+          <div class="details-node"></div>
+          <strong>Select an item</strong>
+          <span>Select a file or folder to inspect its Git details.</span>
+        </div>
+      </aside>
+    </main>
+
+    <section id="changesDrawer" class="changes-drawer" aria-label="Working tree changes">
+      <div class="drawer-handle"></div>
+      <div class="drawer-head">
+        <div><strong id="drawerScopeTitle">Working directory</strong><span id="changesSummary">No changes</span></div>
+        <button id="closeChanges">×</button>
+      </div>
+      <div class="drawer-body">
+        <div id="changes" class="change-list"></div>
+        <div class="commit-area">
+          <textarea id="commitMessage" placeholder="Describe your changes…"></textarea>
+          <div><span id="selectionText">0 files staged</span><button id="commitButton" disabled>Commit changes</button></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="submoduleMenu" class="submodule-menu" hidden aria-label="Submodule versions">
+      <header>
+        <div><span>SUBMODULE VERSION</span><strong id="submoduleMenuName">Submodule</strong></div>
+        <button id="closeSubmoduleMenu">×</button>
+      </header>
+      <div class="version-current"><span>Current</span><code id="currentSubmoduleVersion">—</code></div>
+      <div class="version-tabs"><button class="active" data-version-filter="branch">Branches</button><button data-version-filter="commit">Recent commits</button></div>
+      <div id="submoduleVersions" class="version-list"></div>
+      <footer class="version-help">Select a version to update the submodule reference.</footer>
+    </section>
+
+    <footer>
+      <span id="statusDot" class="status-dot"></span><span id="statusText">Ready</span>
+      <span class="footer-spacer"></span><span class="branch-footer">⑂ <b id="currentBranch">No branch</b></span>
+    </footer>
+    <div id="operationToast" class="operation-toast" hidden role="status"></div>
+  </div>
+
+  <dialog id="commandPalette" class="command-palette">
+    <form method="dialog">
+      <input id="commandInput" type="text" placeholder="Type command or search… (Esc to close)" autocomplete="off" spellcheck="false">
+      <div id="commandList" class="command-list"></div>
+      <div class="command-help">Ctrl+K or Cmd+K</div>
+    </form>
+  </dialog>
+
+  <dialog id="appConfirmDialog" class="app-confirm-dialog">
+    <div class="dialog-symbol" id="appConfirmIcon">?</div>
+    <h2 id="appConfirmTitle">Confirm</h2>
+    <p id="appConfirmMessage" style="white-space: pre-line;"></p>
+    <div class="commit-dialog-actions" style="justify-content:center;">
+      <button type="button" id="appConfirmCancel">Cancel</button>
+      <button type="button" id="appConfirmOk" class="confirm">Confirm</button>
+    </div>
+  </dialog>
+  <dialog id="appPromptDialog" class="app-confirm-dialog">
+    <div class="dialog-symbol">✎</div>
+    <h2 id="appPromptTitle">Enter value</h2>
+    <p id="appPromptMessage"></p>
+    <input type="text" id="appPromptInput" style="width:100%;height:38px;margin-top:6px;border:1px solid #405263;border-radius:6px;padding:0 10px;background:#0d151c;color:#d4e0ea;font:13px ui-monospace, monospace;">
+    <div class="commit-dialog-actions" style="justify-content:center;margin-top:16px;">
+      <button type="button" id="appPromptCancel">Cancel</button>
+      <button type="button" id="appPromptOk" class="confirm">OK</button>
+    </div>
+  </dialog>
+
+  <dialog id="browserDialog">
+    <form method="dialog">
+      <div class="dialog-symbol">↗</div>
+      <h2>Desktop access required</h2>
+      <p>A browser page cannot safely run Git commands on your computer. Open this project as the Tauri desktop application to select a real repository.</p>
+      <button value="close">Got it</button>
+    </form>
+  </dialog>
+  <dialog id="commitScopeDialog" class="commit-dialog">
+    <form method="dialog">
+      <div class="commit-dialog-icon">✓</div>
+      <h2>Commit selected changes</h2>
+      <p>Only changes inside <strong id="commitScopeName">the current folder</strong> will be committed. Other staged changes remain untouched.</p>
+      <label><span>Commit message</span><textarea id="scopeCommitMessage" placeholder="Describe this change…"></textarea></label>
+      <div class="commit-dialog-actions"><button value="cancel">Cancel</button><button value="default" id="confirmScopeCommit" class="confirm" disabled>Commit selection</button></div>
+    </form>
+  </dialog>
+  <dialog id="compareDialog" class="compare-dialog">
+    <form method="dialog">
+      <header><div><h2 id="compareTitle">Compare file</h2><p id="compareSubtitle"></p></div><button value="close">×</button></header>
+      <div class="compare-actionbar">
+        <div class="compare-action-group">
+          <span class="compare-group-label">STAGING</span>
+          <button type="button" id="compareStage" data-tooltip="git add — stage this file's current content">＋ Stage</button>
+          <button type="button" id="compareUnstage" data-tooltip="Soft/Mixed reset — unstages only, keeps your edits on disk unchanged">− Soft/Mixed reset (unstage)</button>
+        </div>
+        <div class="compare-action-group">
+          <span class="compare-group-label">RESET FILE</span>
+          <button type="button" id="compareRestoreHead" class="compare-action-warn" data-tooltip="Hard reset — permanently discards all edits, file becomes identical to the last commit">↶ Hard reset (discard)</button>
+          <button type="button" id="compareRestoreRemote" class="compare-action-primary" data-tooltip="Fetch + hard reset from remote — overwrites the file with the remote version">↓ Restore from remote</button>
+        </div>
+      </div>
+      <div id="recoveryHelp" class="recovery-help">Choose an action to see exactly what it changes. No repository-wide reset is performed here.</div>
+      <strong id="compareActionStatus" role="status" class="compare-status-line">Ready — choose one action for this file.</strong>
+      <div class="compare-head"><span>LOCAL</span><span>REMOTE</span></div>
+      <div class="compare-content"><pre id="localCompare"></pre><pre id="remoteCompare"></pre></div>
+    </form>
+  </dialog>
+  <dialog id="editorDialog" class="editor-dialog">
+    <div class="editor-shell"><header><div><h2 id="editorTitle">Edit file</h2><p id="editorPath"></p></div><button type="button" id="closeEditor">×</button></header>
+      <div class="editor-hint">Git actions (stage, discard, restore, compare) are available from the details panel on the right, not here — this editor is for content only.</div>
+      <textarea id="editorContent" spellcheck="false"></textarea>
+      <footer><span id="editorSaveState">Local file · UTF-8 · maximum 2 MB</span><button type="button" id="cancelEditor">Cancel</button><button type="button" id="saveFile">Save file</button></footer>
+    </div>
+  </dialog>
+  <dialog id="publishDialog" class="publish-dialog">
+    <form method="dialog"><header><div><h2>Publish to server</h2><p>A push publishes commits, not uncommitted files.</p></div><button value="cancel">×</button></header>
+      <div class="publish-controls"><label><span>LOCAL BRANCH</span><select id="publishBranch"></select></label><span class="publish-arrow">→</span><label><span>REMOTE</span><select id="publishRemote"></select></label></div>
+      <div class="publish-explain"><b id="publishDestination">—</b><span>All commits listed below will be published in order. Select files before Commit; select the destination here before Push.</span></div>
+      <div id="publishCommits" class="publish-commits"></div>
+      <details class="submodule-auth"><summary>Private server credentials</summary><div><label><span>USERNAME</span><input id="publishUsername" autocomplete="username" placeholder="Git username"></label><label><span>PERSONAL ACCESS TOKEN</span><input id="publishToken" type="password" autocomplete="off" placeholder="Token (not account password)"></label></div><small>Used only for this push and never saved by Git Integrity.</small></details>
+      <p id="publishOperationStatus" class="submodule-operation-status" role="status"></p>
+      <footer><span id="publishSummary">Checking…</span><button value="cancel">Cancel</button><button value="default" id="confirmPublish">Publish branch</button></footer>
+    </form>
+  </dialog>
+  <dialog id="cloneDialog" class="clone-dialog">
+    <form method="dialog"><div class="dialog-symbol">↓</div><h2>Clone repository from server</h2><p>Creates one local working copy and opens it automatically.</p>
+      <label><span>REPOSITORY URL</span><input id="cloneUrl" placeholder="https://server/team/project.git"></label>
+      <div class="clone-location"><label><span>PARENT FOLDER</span><input id="cloneParent" readonly placeholder="Choose a local folder"></label><button type="button" id="chooseCloneParent">Choose…</button></div>
+      <label><span>LOCAL FOLDER NAME</span><input id="cloneName" placeholder="project" autocomplete="off" autocapitalize="off" spellcheck="false"></label>
+      <div class="commit-dialog-actions"><button value="cancel">Cancel</button><button value="default" id="confirmClone" class="confirm" disabled>Clone repository</button></div>
+    </form>
+  </dialog>
+  <dialog id="submoduleDialog" class="clone-dialog submodule-dialog">
+    <form method="dialog"><div class="dialog-symbol">◇</div><h2>Add Git submodule</h2><p>The repository will be cloned inside the folder currently open in Project Navigator. Git links and staging are handled automatically.</p>
+      <label><span>REPOSITORY URL</span><input id="submoduleUrl" placeholder="https://server/team/module.git" autocomplete="off" autocapitalize="off" spellcheck="false"></label>
+      <label><span>ADD INSIDE CURRENT FOLDER</span><input id="submoduleParent" readonly></label>
+      <label><span>SUBMODULE FOLDER NAME</span><input id="submoduleName" placeholder="module" autocomplete="off" autocapitalize="off" spellcheck="false"></label>
+      <details class="submodule-auth"><summary>Private repository credentials</summary><label><span>USERNAME (OPTIONAL)</span><input id="submoduleUsername" autocomplete="username" placeholder="Git server username"></label><label><span>PERSONAL ACCESS TOKEN</span><input id="submoduleToken" type="password" autocomplete="off" placeholder="Used once; never saved"></label></details>
+      <div class="submodule-add-result">Creates the folder, updates <code>.gitmodules</code>, adds the Git link to the index and prepares both changes for one commit.</div>
+      <div id="submoduleAddStatus" class="submodule-operation-status" role="status">Ready — destination will be shown here before anything changes.</div>
+      <div class="commit-dialog-actions"><button value="cancel">Cancel</button><button type="button" id="confirmAddSubmodule" class="confirm" disabled>Add submodule</button></div>
+    </form>
+  </dialog>
+  <script src="app.js"></script>
+</body>
+</html>
