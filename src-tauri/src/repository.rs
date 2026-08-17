@@ -322,10 +322,22 @@ pub fn clone_repository(url: String, parent_path: String, folder_name: String) -
     Ok(destination.to_string_lossy().into_owned())
 }
 
+// Matches only URLs this app itself generates from a "P:PROJECT-NUMBER" pattern in
+// a commit message (see commitSubjectHtml in the frontend), e.g.
+// "https://polarion.vitesco.io/polarion/#/project/OMBMS/workitem?id=OMBMS-21610".
+// Kept as a strict allowlist (not just "starts with the host") since this reaches
+// a shell command (`open`/`cmd start`/`xdg-open`) with the URL as an argument.
+fn is_generated_polarion_url(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("https://polarion.vitesco.io/polarion/#/project/") else { return false };
+    let Some((project, tail)) = rest.split_once("/workitem?id=") else { return false };
+    if project.is_empty() || !project.chars().all(|value| value.is_ascii_alphanumeric() || value == '_') { return false; }
+    let Some((id_project, id_number)) = tail.split_once('-') else { return false };
+    id_project == project && !id_number.is_empty() && id_number.chars().all(|value| value.is_ascii_digit())
+}
+
 #[tauri::command]
 pub fn open_external_url(url: String) -> Result<(), String> {
-    let allowed = url.starts_with("https://www.polarion.com/ID-") && url["https://www.polarion.com/ID-".len()..].chars().all(|value| value.is_ascii_digit());
-    if !allowed { return Err("Only generated Polarion links can be opened".into()); }
+    if !is_generated_polarion_url(&url) { return Err("Only generated Polarion links can be opened".into()); }
     #[cfg(target_os = "macos")]
     let status = Command::new("open").arg(&url).status();
     #[cfg(target_os = "windows")]
@@ -370,6 +382,16 @@ pub fn open_repository_item(repository_path: String, relative_path: String, kind
         format!("{base}/{segment}/{branch}/{path}")
     };
     launch_browser(&url)
+}
+
+#[tauri::command]
+pub fn open_commit_on_server(repository_path: String, commit_id: String) -> Result<(), String> {
+    validate_path(&repository_path)?;
+    let repo = internal_repository(&repository_path)?;
+    let remote = repo.find_remote("origin").or_else(|_| { let names = repo.remotes()?; let first = names.iter().flatten().next().ok_or_else(|| git2::Error::from_str("No remote is configured"))?; repo.find_remote(first) }).map_err(|error| error.message().to_string())?;
+    let remote = remote.url().ok_or("The remote has no URL")?.to_string();
+    let base = browser_repository_url(remote.trim()).ok_or("This remote URL cannot be opened in a browser")?;
+    launch_browser(&format!("{base}/commit/{}", commit_id.trim()))
 }
 
 #[tauri::command]
@@ -1796,5 +1818,28 @@ mod tests {
         assert!(!parent_changes.iter().any(|change| change.path == "vendor/dep"), "the parent should be auto-updated after a force push too");
 
         fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn polarion_url_validation_accepts_generated_links_and_rejects_everything_else() {
+        assert!(is_generated_polarion_url("https://polarion.vitesco.io/polarion/#/project/OMBMS/workitem?id=OMBMS-21610"));
+        assert!(is_generated_polarion_url("https://polarion.vitesco.io/polarion/#/project/A_B1/workitem?id=A_B1-1"));
+
+        // Wrong host, wrong shape, mismatched project, or an attempt to smuggle a
+        // different destination must all be rejected — this reaches a shell command.
+        assert!(!is_generated_polarion_url("https://evil.example/polarion/#/project/OMBMS/workitem?id=OMBMS-21610"));
+        assert!(!is_generated_polarion_url("https://polarion.vitesco.io/polarion/#/project/OMBMS/workitem?id=OTHER-21610"));
+        assert!(!is_generated_polarion_url("https://polarion.vitesco.io/polarion/#/project/OMBMS/workitem?id=OMBMS-"));
+        assert!(!is_generated_polarion_url("https://polarion.vitesco.io/polarion/#/project/OMBMS/workitem?id=OMBMS-12x"));
+        assert!(!is_generated_polarion_url("https://polarion.vitesco.io/polarion/#/project//workitem?id=-21610"));
+        assert!(!is_generated_polarion_url("javascript:alert(1)"));
+        assert!(!is_generated_polarion_url("https://polarion.vitesco.io/polarion/#/project/OMBMS/workitem?id=OMBMS-21610\" & calc.exe"));
+    }
+
+    #[test]
+    fn browser_repository_url_builds_a_commit_link_for_enterprise_github_too() {
+        let base = browser_repository_url("git@github.vitesco.io:eng/sw-prj-OMBMS_000U0.git").expect("should parse an SSH enterprise GitHub URL");
+        assert_eq!(base, "https://github.vitesco.io/eng/sw-prj-OMBMS_000U0");
+        assert_eq!(format!("{base}/commit/49032750e188cfb56b0c72834feef071a4d9cc13"), "https://github.vitesco.io/eng/sw-prj-OMBMS_000U0/commit/49032750e188cfb56b0c72834feef071a4d9cc13");
     }
 }

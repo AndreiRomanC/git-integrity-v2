@@ -9,6 +9,7 @@ pub fn run() {
             repository::clone_repository,
             repository::open_external_url,
             repository::open_repository_item,
+            repository::open_commit_on_server,
             repository::load_repository,
             repository::stage_files,
             repository::unstage_files,

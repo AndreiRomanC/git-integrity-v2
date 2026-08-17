@@ -62,7 +62,21 @@ const refs = {
 };
 
 function esc(value = '') { return String(value).replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c])); }
-function commitSubjectHtml(subject = '') { let cursor = 0; const parts = []; for (const match of subject.matchAll(/P:(\d+)/g)) { parts.push(esc(subject.slice(cursor, match.index))); const id = match[1]; parts.push(`<a class="polarion-link" href="https://www.polarion.com/ID-${id}" target="_blank" rel="noreferrer" title="Open Polarion ID-${id}">${esc(match[0])}</a>`); cursor = match.index + match[0].length; } parts.push(esc(subject.slice(cursor))); return parts.join(''); }
+function commitSubjectHtml(subject = '') {
+  // Commit messages carry Polarion work item IDs like "P:OMBMS-21610" (project
+  // code, dash, number) — e.g. "P:OMBMS-21610 - 0ADOBD - DEM/FIM ...". The
+  // Polarion URL needs the project code on its own (for the /project/ segment)
+  // plus the full ID again for the workitem id.
+  let cursor = 0; const parts = [];
+  for (const match of subject.matchAll(/P:([A-Za-z][A-Za-z0-9_]*-\d+)/g)) {
+    parts.push(esc(subject.slice(cursor, match.index)));
+    const workitemId = match[1]; const project = workitemId.split('-')[0];
+    const url = `https://polarion.vitesco.io/polarion/#/project/${project}/workitem?id=${workitemId}`;
+    parts.push(`<a class="polarion-link" href="${esc(url)}" target="_blank" rel="noreferrer" title="Open Polarion ${workitemId}">${esc(match[0])}</a>`);
+    cursor = match.index + match[0].length;
+  }
+  parts.push(esc(subject.slice(cursor))); return parts.join('');
+}
 function status(message, kind = '') { refs.statusText.textContent = message; refs.statusDot.className = `status-dot ${kind}`; }
 let toastTimer; function showOperationToast(message, kind = '') { clearTimeout(toastTimer); refs.operationToast.textContent = message; refs.operationToast.className = `operation-toast ${kind}`; refs.operationToast.hidden = false; toastTimer = setTimeout(() => { refs.operationToast.hidden = true; }, 7000); }
 
@@ -512,7 +526,7 @@ function renderEntryDetails(entry) {
     <div class="detail-section"><h3>GENERAL</h3><div class="detail-grid"><span>Type</span><strong>${kindLabel}</strong><span>Git</span><strong>${entry.tracked ? (entry.status || 'Tracked, clean') : 'Untracked'}</strong>
     ${entry.item_count != null ? `<span>Items</span><strong>${entry.item_count}</strong>` : `<span>Size</span><strong>${formatSize(entry.size)}</strong>`}<span>Modified</span><strong>${formatModified(entry.modified)}</strong></div></div>
     ${entry.kind === 'submodule' ? `<div class="detail-section"><h3>SUBMODULE</h3><div class="detail-grid"><span>Remote</span><strong>${esc(entry.submodule_url || 'Not configured')}</strong><span>Branch</span><strong>${esc(entry.submodule_branch || 'Default')}</strong><span>Status</span><strong>${entry.status ? (entry.status === 'M' ? 'Has local changes' : 'Modified') : 'Clean'}</strong></div>${entry.submodule_push_status ? `<div class="submodule-push-banner"><i></i><span>${esc(entry.submodule_push_status)}</span></div>` : ''}</div>` : ''}
-    <div class="detail-section"><h3>LAST COMMIT</h3><div class="detail-grid"><span>Commit</span><strong>${esc(entry.last_commit_id?.slice(0, 8) || 'No commit')}</strong><span>Message</span><strong>${commitSubjectHtml(entry.last_commit_subject || '—')}</strong><span>Author</span><strong>${esc(entry.last_commit_author || '—')}</strong><span>Date</span><strong>${esc(entry.last_commit_date || '—')}</strong></div></div></div>`;
+    <div class="detail-section"><h3>LAST COMMIT</h3><div class="detail-grid"><span>Commit</span><strong>${entry.last_commit_id ? `<a href="#" class="commit-server-link" data-commit-id="${esc(entry.last_commit_id)}" title="Open this commit on the server">${esc(entry.last_commit_id.slice(0, 8))} ↗</a>` : 'No commit'}</strong><span>Message</span><strong>${commitSubjectHtml(entry.last_commit_subject || '—')}</strong><span>Author</span><strong>${esc(entry.last_commit_author || '—')}</strong><span>Date</span><strong>${esc(entry.last_commit_date || '—')}</strong></div></div></div>`;
   refs.details.querySelectorAll('[data-detail-action]').forEach(button => button.addEventListener('click', () => { Promise.resolve(handleDetailAction(button.dataset.detailAction, entry, button)).catch(error => handleError(error)); }));
 }
 
@@ -854,7 +868,7 @@ function selectCommit(id) {
   state.selectedCommit = state.commits.find(commit => commit.id === id);
   refs.graph.querySelectorAll('.commit-row').forEach(row => row.classList.toggle('selected', row.dataset.id === id));
   const c = state.selectedCommit;
-  refs.details.innerHTML = `<div class="commit-details"><div class="large-node"></div><h2>${commitSubjectHtml(c.subject)}</h2><div class="hash">${esc(c.id)}</div>
+  refs.details.innerHTML = `<div class="commit-details"><div class="large-node"></div><h2>${commitSubjectHtml(c.subject)}</h2><div class="hash"><a href="#" class="commit-server-link" data-commit-id="${esc(c.id)}" title="Open this commit on the server">${esc(c.id)} ↗</a></div>
     <div class="detail-grid"><span>Author</span><strong>${esc(c.author)}</strong><span>Date</span><strong>${esc(c.date)}</strong>
     <span>Parents</span><strong>${esc(c.parents?.join(', ') || 'First commit')}</strong><span>Refs</span><strong>${esc(c.refs?.join(', ') || '—')}</strong></div></div>`;
 }
@@ -948,6 +962,12 @@ $('#pullCurrent').addEventListener('click', () => syncCurrent('pull')); $('#push
 refs.publishBranch.addEventListener('change', refreshPublish); refs.publishRemote.addEventListener('change', refreshPublish); $('#confirmPublish').addEventListener('click', confirmPublish);
 [['#compareRestoreRemote','remote'],['#compareRestoreHead','head'],['#compareStage','stage'],['#compareUnstage','unstage']].forEach(([selector, action]) => $(selector)?.addEventListener('click', event => { event.preventDefault(); updateRecoveryHelp(action); applyFileRecovery(action).catch(error => handleError(error)); }));
 document.addEventListener('click', event => { const link = event.target.closest('.polarion-link'); if (!link) return; event.preventDefault(); if (invoke) invoke('open_external_url', { url: link.href }).catch(error => status(String(error), 'error')); else window.open(link.href, '_blank', 'noopener'); });
+document.addEventListener('click', event => {
+  const link = event.target.closest('.commit-server-link'); if (!link || !state.repository) return; event.preventDefault();
+  const commitId = link.dataset.commitId;
+  if (!invoke) return status(`Preview: open commit ${commitId.slice(0, 8)} on server`);
+  invoke('open_commit_on_server', { repositoryPath: state.repository.path, commitId }).catch(error => handleError(error));
+});
 refs.goUp.addEventListener('click', () => { const commander = state.view === 'commander'; const parts = (commander ? state.commanderPath : state.currentPath).split('/').filter(Boolean); parts.pop(); commander ? openCommanderDirectory(parts.join('/')) : openDirectory(parts.join('/')); });
 refs.reloadFolder.addEventListener('click', () => state.view === 'commander' ? openCommanderDirectory(state.commanderPath) : openDirectory(state.currentPath, { force: true }));
 document.addEventListener('keydown', event => { if (event.key !== 'Escape' || state.view !== 'commander' || document.querySelector('dialog[open]')) return; event.preventDefault(); returnToProjectNavigator(); });
