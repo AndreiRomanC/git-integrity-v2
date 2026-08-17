@@ -30,8 +30,8 @@
         <button class="nav-item" id="navGraph"><span class="nav-icon">⑂</span><span>Branch Map</span></button>
         <button class="nav-item" id="navRemotes"><span class="nav-icon">◎</span><span>Remotes</span></button>
 
-        <div class="side-heading"><span>BRANCHES</span><button id="newBranch" title="Create branch">＋</button></div>
-        <div id="branches" class="branch-list"></div>
+        <div class="side-heading branch-list-heading" id="toggleBranchList"><span class="branch-heading-arrow">▸</span><span>BRANCHES</span><button id="newBranch" title="Create branch">＋</button></div>
+        <div id="branches" class="branch-list collapsed"></div>
 
         <div class="side-heading workspace-heading"><span>WORKSPACE</span></div>
         <button class="workspace-status" id="showChanges">
@@ -68,9 +68,7 @@
         </div>
 
         <div id="emptyState" class="empty-state">
-          <div class="empty-graph-symbol">
-            <i></i><i></i><i></i><span></span>
-          </div>
+          <div class="empty-graph-symbol">⑂</div>
           <h2>Explore your project visually</h2>
           <p>Open an existing Git repository to browse folders, files, submodules and Git details.</p>
           <div class="empty-actions">

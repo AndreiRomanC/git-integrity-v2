@@ -54,7 +54,10 @@ pub struct Commit { id: String, parents: Vec<String>, subject: String, author: S
 pub struct Change { status: String, path: String, staged: bool }
 
 #[derive(Serialize)]
-pub struct RepositoryData { repository: RepositoryInfo, branches: Vec<Branch>, commits: Vec<Commit>, changes: Vec<Change> }
+pub struct StashEntry { index: usize, message: String, base_commit: String }
+
+#[derive(Serialize)]
+pub struct RepositoryData { repository: RepositoryInfo, branches: Vec<Branch>, commits: Vec<Commit>, changes: Vec<Change>, stashes: Vec<StashEntry> }
 
 #[derive(Serialize)]
 pub struct DirectoryEntry {
@@ -168,7 +171,18 @@ fn internal_statuses(repository: &Repository, scope: Option<&str>) -> Result<Vec
     // inside them individually (a major cost on large repos with big non-gitignored
     // directories, e.g. build output) — libgit2 still reports one entry for the
     // directory itself, which is all `status_for` needs to flag it as changed.
-    options.include_untracked(true).recurse_untracked_dirs(false).include_ignored(false).renames_head_to_index(true).renames_index_to_workdir(true);
+    // `update_index(true)` opportunistically refreshes the on-disk index's cached
+    // file stat info during the scan (the same trick plain `git status` uses) so
+    // later scans can trust the cache instead of re-stat'ing unchanged files —
+    // pure perf, doesn't change what's reported.
+    options.include_untracked(true).recurse_untracked_dirs(false).include_ignored(false).update_index(true);
+    // Rename detection (comparing added/deleted file contents to spot moves) is
+    // the single most expensive part of a status scan on a huge repository with
+    // many pending changes, and it's only cosmetic — a renamed file still shows
+    // up correctly as separate add/delete entries without it. Worth paying for on
+    // a small, scoped folder view; not worth it on the full unscoped repository-wide
+    // scan that `load_repository` runs after almost every action.
+    if scope.is_some() { options.renames_head_to_index(true).renames_index_to_workdir(true); }
     // Scanning the whole working tree on every folder click is what made navigation
     // painfully slow on large repositories (worse still on Windows, where the same
     // filesystem calls are typically slower than on macOS/Linux) — a pathspec limits
@@ -444,7 +458,7 @@ pub fn open_commit_on_server(repository_path: String, commit_id: String) -> Resu
 #[tauri::command]
 pub fn load_repository(path: String) -> Result<RepositoryData, String> {
     validate_path(&path)?;
-    let repo = internal_repository(&path)?;
+    let mut repo = internal_repository(&path)?;
     let name = Path::new(&path).file_name().and_then(|n| n.to_str()).unwrap_or("repository").to_string();
     let current_branch = repo.head().ok().and_then(|head| head.shorthand().map(String::from)).unwrap_or_default();
     let mut branches = Vec::new();
@@ -453,13 +467,30 @@ pub fn load_repository(path: String) -> Result<RepositoryData, String> {
         branches.push(Branch { current: branch_type == BranchType::Local && branch_name == current_branch, name: branch_name, remote: branch_type == BranchType::Remote });
     } } }
 
+    // `refs/stash` is a real Git ref but its target is a synthetic WIP commit
+    // (with an index/untracked-files "merge" parent structure) that has nothing
+    // to do with real branch history — excluded here and surfaced separately as
+    // `stashes` instead, so the graph only ever shows real ancestry.
     let mut refs_by_oid: HashMap<String, Vec<String>> = HashMap::new();
-    if let Ok(references) = repo.references() { for reference in references.flatten() { if let (Some(oid), Some(name)) = (reference.target(), reference.shorthand()) { refs_by_oid.entry(oid.to_string()).or_default().push(name.to_string()); } } }
+    if let Ok(references) = repo.references() { for reference in references.flatten() {
+        if reference.name() == Some("refs/stash") { continue; }
+        if let (Some(oid), Some(name)) = (reference.target(), reference.shorthand()) { refs_by_oid.entry(oid.to_string()).or_default().push(name.to_string()); }
+    } }
     let mut commits = Vec::new(); let mut walk = repo.revwalk().map_err(|error| error.message().to_string())?; walk.set_sorting(Sort::TOPOLOGICAL | Sort::TIME).map_err(|error| error.message().to_string())?;
-    if let Ok(references) = repo.references() { for reference in references.flatten() { if let Ok(object) = reference.peel(ObjectType::Commit) { let _ = walk.push(object.id()); } } }
+    if let Ok(references) = repo.references() { for reference in references.flatten() {
+        if reference.name() == Some("refs/stash") { continue; }
+        if let Ok(object) = reference.peel(ObjectType::Commit) { let _ = walk.push(object.id()); }
+    } }
     for oid in walk.flatten().take(500) { if let Ok(commit) = repo.find_commit(oid) {
         commits.push(Commit { id: oid.to_string(), parents: commit.parent_ids().map(|id| id.to_string()).collect(), subject: commit.summary().unwrap_or("No message").to_string(), author: commit.author().name().unwrap_or("Unknown").to_string(), date: short_date(commit.time().seconds()), refs: refs_by_oid.remove(&oid.to_string()).unwrap_or_default(), lane: 0 });
     } }
+
+    let mut raw_stashes: Vec<(usize, String, git2::Oid)> = Vec::new();
+    let _ = repo.stash_foreach(|index, message, oid| { raw_stashes.push((index, message.to_string(), *oid)); true });
+    let stashes = raw_stashes.into_iter().map(|(index, message, oid)| {
+        let base_commit = repo.find_commit(oid).ok().and_then(|commit| commit.parent_id(0).ok()).map(|id| id.to_string()).unwrap_or_default();
+        StashEntry { index, message, base_commit }
+    }).collect();
 
     let internal = internal_statuses(&repo, None)?;
     let statuses = internal.iter().map(|(path, status, _)| (path.clone(), status.clone())).collect::<Vec<_>>();
@@ -467,7 +498,7 @@ pub fn load_repository(path: String) -> Result<RepositoryData, String> {
 
     replace_git_metadata(&path, statuses);
 
-    Ok(RepositoryData { repository: RepositoryInfo { path, name, current_branch }, branches, commits, changes })
+    Ok(RepositoryData { repository: RepositoryInfo { path, name, current_branch }, branches, commits, changes, stashes })
 }
 
 #[tauri::command]
@@ -884,14 +915,43 @@ pub fn commit_files(repository_path: String, files: Vec<String>, message: String
 
 fn commit_selected_internal(repository_path: &str, files: &[String], message: &str) -> Result<String, String> {
     let repo = internal_repository(repository_path)?;
-    for file in files { if let Ok(mut submodule) = repo.find_submodule(file) { submodule.add_to_index(true).map_err(|error| format!("Cannot prepare submodule {file} for commit: {}", error.message()))?; } }
+    // A submodule folder can be deleted straight from disk (Finder/terminal, or a
+    // failed clone) without going through this app's own removal flow, leaving it
+    // still registered as a gitlink. In that case `add_to_index` would need to
+    // open the submodule's own .git to read its current HEAD, which no longer
+    // exists — only ask it to prepare the submodule when its working directory is
+    // actually still there; otherwise this is really a deletion, handled below.
+    for file in files { let absolute = Path::new(repository_path).join(file); if !absolute.exists() { continue; } if let Ok(mut submodule) = repo.find_submodule(file) { submodule.add_to_index(true).map_err(|error| format!("Cannot prepare submodule {file} for commit: {}", error.message()))?; } }
     let parent = repo.head().ok().and_then(|head| head.peel_to_commit().ok()); let parent_tree = parent.as_ref().and_then(|commit| commit.tree().ok()); let mut index = repo.index().map_err(|error| error.message().to_string())?;
     let gitlinks: HashMap<String, git2::IndexEntry> = index.iter().filter(|entry| entry.mode == 0o160000).map(|entry| (String::from_utf8_lossy(&entry.path).into_owned(), entry)).collect();
     if let Some(tree) = parent_tree.as_ref() { index.read_tree(tree).map_err(|error| error.message().to_string())?; } else { index.clear().map_err(|error| error.message().to_string())?; }
     let mut includes_submodule = false;
-    for file in files { let path = Path::new(file); if let Some(entry) = gitlinks.get(file) { index.add(entry).map_err(|error| error.message().to_string())?; includes_submodule = true; continue; } let absolute = Path::new(repository_path).join(path); if absolute.exists() { index.add_all([path], git2::IndexAddOption::DEFAULT, None).map_err(|error| error.message().to_string())?; } else { let _ = index.remove_all([path], None); } }
+    for file in files {
+        let path = Path::new(file); let absolute = Path::new(repository_path).join(path);
+        // Only reuse the existing gitlink entry unchanged when the submodule is
+        // still present on disk — if it was deleted, fall through to the normal
+        // add/remove handling below so the deletion actually gets committed.
+        if let Some(entry) = gitlinks.get(file) { if absolute.exists() { index.add(entry).map_err(|error| error.message().to_string())?; includes_submodule = true; continue; } }
+        if absolute.exists() { index.add_all([path], git2::IndexAddOption::DEFAULT, None).map_err(|error| error.message().to_string())?; } else { let _ = index.remove_all([path], None); }
+    }
     if includes_submodule && Path::new(repository_path).join(".gitmodules").exists() { index.add_path(Path::new(".gitmodules")).map_err(|error| error.message().to_string())?; }
-    let tree_id = index.write_tree_to(&repo).map_err(|error| error.message().to_string())?; if parent_tree.as_ref().map(|tree| tree.id()) == Some(tree_id) { return Err("There are no changes to commit in the selected files".into()); } let tree = repo.find_tree(tree_id).map_err(|error| error.message().to_string())?; let signature = repo.signature().map_err(|_| "Configure user.name and user.email for this repository".to_string())?; let parents: Vec<&git2::Commit<'_>> = parent.iter().collect(); let oid = repo.commit(Some("HEAD"), &signature, &signature, message, &tree, &parents).map_err(|error| error.message().to_string())?; invalidate_git_metadata(repository_path); Ok(oid.to_string())
+    let tree_id = index.write_tree_to(&repo).map_err(|error| error.message().to_string())?; if parent_tree.as_ref().map(|tree| tree.id()) == Some(tree_id) { return Err("There are no changes to commit in the selected files".into()); } let tree = repo.find_tree(tree_id).map_err(|error| error.message().to_string())?; let signature = repo.signature().map_err(|_| "Configure user.name and user.email for this repository".to_string())?; let parents: Vec<&git2::Commit<'_>> = parent.iter().collect(); let oid = repo.commit(Some("HEAD"), &signature, &signature, message, &tree, &parents).map_err(|error| error.message().to_string())?;
+    // `index` above was repurposed as an in-memory scratch copy (parent tree plus
+    // only the selected files) to build the commit tree, and `repo.index()` returns
+    // that same cached instance rather than a fresh read — so it must not be
+    // written back to .git/index as-is, or every other pending file not part of
+    // this (possibly scoped/partial) commit would silently lose its staged status.
+    // Force-reload the real on-disk index first, then sync just the committed
+    // files into it so they stop showing as staged, leaving every other entry
+    // (which was never touched on disk) untouched.
+    index.read(true).map_err(|error| error.message().to_string())?;
+    for file in files {
+        let relative = Path::new(file); let absolute = Path::new(repository_path).join(relative);
+        if gitlinks.contains_key(file) && absolute.exists() { if let Ok(mut submodule) = repo.find_submodule(file) { let _ = submodule.add_to_index(true); } continue; }
+        if absolute.exists() { index.add_path(relative).map_err(|error| error.message().to_string())?; } else { let _ = index.remove_path(relative); }
+    }
+    index.write().map_err(|error| error.message().to_string())?;
+    invalidate_git_metadata(repository_path); Ok(oid.to_string())
 }
 
 #[tauri::command]
@@ -1473,6 +1533,80 @@ mod tests {
         assert_eq!(browser_repository_url("https://gitlab.example/team/project.git").as_deref(), Some("https://gitlab.example/team/project"));
 
         fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn committing_a_manually_deleted_submodule_folder_stages_the_removal() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-deleted-submodule-{suffix}"));
+        let parent = base.join("parent"); let dependency = base.join("dependency");
+        create_libgit2_repository(&parent, "README.md"); create_libgit2_repository(&dependency, "module.txt");
+        let parent_string = parent.to_string_lossy().into_owned();
+        add_submodule(parent_string.clone(), "".into(), dependency.to_string_lossy().into_owned(), "test".into(), String::new(), String::new()).unwrap();
+        create_commit(parent_string.clone(), "Add test submodule".into()).unwrap();
+
+        // Simulate the user deleting the submodule folder outside the app (Finder/
+        // terminal) instead of using the app's own removal flow — the working
+        // directory (and its .git) is gone, but the gitlink is still registered.
+        fs::remove_dir_all(parent.join("test")).unwrap();
+        assert!(!parent.join("test").exists());
+
+        let result = commit_files(parent_string.clone(), vec!["test".into()], "Remove deleted submodule".into());
+        assert!(result.is_ok(), "expected the deletion to commit cleanly, got: {:?}", result);
+        let repo = Repository::open(&parent).unwrap();
+        assert!(repo.index().unwrap().get_path(Path::new("test"), 0).is_none(), "the gitlink entry should be gone from the index after committing the deletion");
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn stash_does_not_pollute_the_commit_graph() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let repository = std::env::temp_dir().join(format!("git-integrity-stash-graph-{suffix}"));
+        fs::create_dir_all(&repository).unwrap();
+        fs::write(repository.join("a.txt"), "one").unwrap();
+        run_git(&repository, &["init"]);
+        run_git(&repository, &["config", "user.email", "test@example.com"]);
+        run_git(&repository, &["config", "user.name", "Test User"]);
+        run_git(&repository, &["add", "."]);
+        run_git(&repository, &["commit", "-m", "Initial commit"]);
+        let base = git(repository.to_str().unwrap(), &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+
+        fs::write(repository.join("a.txt"), "two").unwrap();
+        fs::write(repository.join("untracked.txt"), "new").unwrap();
+        let path = repository.to_string_lossy().into_owned();
+        stash_changes(path.clone()).unwrap();
+
+        let data = load_repository(path.clone()).unwrap();
+        assert!(!data.commits.iter().any(|commit| commit.parents.len() > 1), "the WIP stash commit (with its index/untracked parents) must never appear as a graph commit");
+        assert!(!data.commits.iter().any(|commit| commit.refs.iter().any(|r| r == "stash")), "refs/stash must not be attached as a label on any commit");
+        assert_eq!(data.stashes.len(), 1);
+        assert_eq!(data.stashes[0].base_commit, base);
+
+        fs::remove_dir_all(repository).unwrap();
+    }
+
+    #[test]
+    fn committing_all_staged_files_stops_them_showing_as_staged() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let repository = std::env::temp_dir().join(format!("git-integrity-commit-clears-staged-{suffix}"));
+        fs::create_dir_all(&repository).unwrap();
+        fs::write(repository.join("intro.css"), "body{}").unwrap();
+        run_git(&repository, &["init"]);
+        run_git(&repository, &["config", "user.email", "test@example.com"]);
+        run_git(&repository, &["config", "user.name", "Test User"]);
+        run_git(&repository, &["add", "."]);
+        run_git(&repository, &["commit", "-m", "Initial commit"]);
+
+        fs::write(repository.join("intro.css"), "body{color:red}").unwrap();
+        let path = repository.to_string_lossy().into_owned();
+        stage_files(path.clone(), vec!["intro.css".into()]).unwrap();
+        assert!(load_repository(path.clone()).unwrap().changes.iter().any(|change| change.path == "intro.css" && change.staged));
+
+        commit_files(path.clone(), vec!["intro.css".into()], "Update intro.css".into()).unwrap();
+        assert!(!load_repository(path.clone()).unwrap().changes.iter().any(|change| change.path == "intro.css"), "intro.css should no longer appear as a pending change right after commit");
+
+        fs::remove_dir_all(repository).unwrap();
     }
 
     #[test]

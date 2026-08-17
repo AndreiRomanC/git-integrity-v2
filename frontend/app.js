@@ -15,7 +15,7 @@ function addRecentRepo(path, name) {
   renderRecentRepos();
 }
 
-const state = { repository: null, branches: [], commits: [], allCommits: [], changes: [], selectedCommit: null, view: 'explorer', currentPath: '', entries: [], selectedEntry: null, historyScope: '', commanderPath: '', commanderRows: [], remoteRef: '', remotes: [], graphContext: null, editingPath: '', editorOriginal: '', publish: null, changesScope: 'global', commanderFocus: '', comparingRow: null, hasStash: false };
+const state = { repository: null, branches: [], commits: [], allCommits: [], changes: [], selectedCommit: null, view: 'explorer', currentPath: '', entries: [], selectedEntry: null, historyScope: '', commanderPath: '', commanderRows: [], remoteRef: '', remotes: [], graphContext: null, editingPath: '', editorOriginal: '', publish: null, changesScope: 'global', commanderFocus: '', comparingRow: null, hasStash: false, stashes: [] };
 const previewData = {
   repository: { name: 'vehicle-control', path: '/projects/vehicle-control', current_branch: 'feature/diagnostics' },
   branches: [
@@ -82,6 +82,7 @@ let toastTimer; function showOperationToast(message, kind = '') { clearTimeout(t
 
 function handleError(error) {
   const msg = String(error).toLowerCase();
+  if (msg.includes('no changes to commit')) { const friendly = 'Nothing to commit — this selection has no uncommitted local changes.'; status(friendly, 'error'); return friendly; }
   const adviceMap = {
     'no upstream': 'Go to Branch Map (Ctrl+Shift+G) → Right-click branch → Set upstream',
     'not a git': 'Open a valid Git repository with File > Open Repository',
@@ -417,6 +418,7 @@ function renderExplorer() {
   refs.fileList.querySelectorAll('[data-entry]').forEach(row => {
     row.addEventListener('click', () => selectEntry(row.dataset.entry));
     row.addEventListener('dblclick', () => { const entry = state.entries.find(item => item.relative_path === row.dataset.entry); if (entry && ['folder','submodule'].includes(entry.kind)) openDirectory(entry.relative_path); });
+    row.querySelector('.folder-arrow')?.addEventListener('click', event => { event.stopPropagation(); const entry = state.entries.find(item => item.relative_path === row.dataset.entry); if (entry && ['folder','submodule'].includes(entry.kind)) openDirectory(entry.relative_path); });
     row.addEventListener('contextmenu', event => {
       const entry = state.entries.find(item => item.relative_path === row.dataset.entry);
       if (entry?.kind !== 'submodule') return;
@@ -492,13 +494,20 @@ function selectedScope() {
   return { path: state.selectedEntry?.relative_path || state.currentPath || '', name: state.selectedEntry?.name || (state.currentPath ? state.currentPath.split('/').pop() : state.repository?.name || 'repository') };
 }
 
+function scopeHasChanges(scope) {
+  return state.changes.some(change => !scope.path || change.path === scope.path || change.path.startsWith(`${scope.path}/`));
+}
+
 function openScopeCommit() {
-  const scope = selectedScope(); refs.commitScopeName.textContent = scope.name; refs.scopeCommitMessage.value = ''; refs.confirmScopeCommit.disabled = true; refs.commitScopeDialog.showModal(); refs.scopeCommitMessage.focus();
+  const scope = selectedScope();
+  if (!scopeHasChanges(scope)) { const msg = `Nothing to commit — "${scope.name}" has no uncommitted local changes.`; status(msg); showOperationToast(msg, 'error'); return; }
+  refs.commitScopeName.textContent = scope.name; refs.scopeCommitMessage.value = ''; refs.confirmScopeCommit.disabled = true; refs.commitScopeDialog.showModal(); refs.scopeCommitMessage.focus();
 }
 
 async function commitSelectedScope(event) {
   event.preventDefault(); const scope = selectedScope(); const message = refs.scopeCommitMessage.value.trim(); if (!message) return;
   if (!invoke) { refs.commitScopeDialog.close(); status(`Preview: committed ${scope.name}`); return; }
+  if (!scopeHasChanges(scope)) { const msg = `Nothing to commit — "${scope.name}" has no uncommitted local changes.`; refs.commitScopeDialog.close(); status(msg); showOperationToast(msg, 'error'); return; }
   refs.confirmScopeCommit.disabled = true; refs.confirmScopeCommit.textContent = 'Committing…';
   try {
     await invoke('commit_path', { repositoryPath: state.repository.path, relativePath: scope.path, message });
@@ -737,7 +746,7 @@ function updateEditorSaveState() { const dirty = refs.editorContent.value !== st
 async function openSubmoduleGraph(entry) {
   clearDetails('Select a submodule commit');
   if (!invoke) { state.graphContext = { name: entry.name }; state.view = 'graph'; render(); return; }
-  try { const data = await invoke('submodule_repository', { repositoryPath: state.repository.path, relativePath: entry.relative_path }); state.graphContext = { name: entry.name, parent: { repository: state.repository, branches: state.branches, commits: state.allCommits, changes: state.changes } }; state.repository = data.repository; state.branches = data.branches; state.commits = data.commits; state.allCommits = data.commits; state.changes = data.changes; state.view = 'graph'; render(); }
+  try { const data = await invoke('submodule_repository', { repositoryPath: state.repository.path, relativePath: entry.relative_path }); state.graphContext = { name: entry.name, parent: { repository: state.repository, branches: state.branches, commits: state.allCommits, changes: state.changes } }; state.repository = data.repository; state.branches = data.branches; state.commits = data.commits; state.allCommits = data.commits; state.changes = data.changes; state.stashes = data.stashes || []; state.view = 'graph'; render(); }
   catch (error) { handleError(error); }
 }
 
@@ -814,54 +823,128 @@ async function popStash() {
 
 function updateStashUI() { $('#stashWork').hidden = state.hasStash; $('#popStash').hidden = !state.hasStash; }
 
-function graphLayouts(commits) {
-  const active = []; return commits.map(commit => {
-    let lane = active.indexOf(commit.id); if (lane < 0) { lane = active.findIndex(item => !item); if (lane < 0) lane = active.length; active[lane] = commit.id; }
-    const before = [...active]; active.splice(lane, 1, ...(commit.parents || []).filter((id, index, all) => id && all.indexOf(id) === index && !active.includes(id)));
-    const after = [...active]; return { lane, before, after, parentLanes: (commit.parents || []).map(id => after.indexOf(id)).filter(value => value >= 0) };
+// ---- Git DAG / topology model -------------------------------------------
+// Assigns each commit a stable vertical lane. Lanes are never renumbered or
+// shifted for unrelated commits — a lane slot is only ever (a) kept as-is,
+// (b) reused in place by the first still-unseen parent of the commit that
+// currently occupies it, or (c) freed and later reused (first-fit) by a
+// later, unrelated fork. This is what keeps a linear branch pinned to one
+// lane for its entire visible history instead of drifting row to row.
+function buildGraphModel(commits) {
+  const lanes = []; // lanes[i] = commitId currently occupying that lane, or null
+  const dedupe = list => (list || []).filter((id, index, all) => id && all.indexOf(id) === index);
+
+  return commits.map((commit, row) => {
+    let lane = lanes.indexOf(commit.id);
+    if (lane < 0) { lane = lanes.indexOf(null); if (lane < 0) lane = lanes.length; }
+    const before = lanes.slice();
+    lanes[lane] = null;
+
+    const parentIds = dedupe(commit.parents);
+    const newParents = parentIds.filter(id => !lanes.includes(id));
+    if (newParents.length) { lanes[lane] = newParents[0]; }
+    for (let index = 1; index < newParents.length; index++) {
+      let slot = lanes.indexOf(null); if (slot < 0) slot = lanes.length;
+      lanes[slot] = newParents[index];
+    }
+    while (lanes.length && lanes[lanes.length - 1] == null) lanes.pop();
+    const after = lanes.slice();
+
+    return {
+      commitId: commit.id, row, lane, before, after,
+      parents: parentIds.map(id => ({ commitId: id, targetRow: row + 1, targetLane: after.indexOf(id) })).filter(p => p.targetLane >= 0),
+      refs: commit.refs || [],
+      type: 'commit',
+    };
   });
 }
 
-function graphSvg(commit, layout, maxLanes) {
-  const laneWidth = 34; const height = 64;
-  const viewWidth = Math.max(maxLanes, 1) * laneWidth;
-  const lane = layout.lane; const x = laneWidth / 2 + lane * laneWidth; const color = palette[lane % palette.length];
-  const laneX = index => laneWidth / 2 + index * laneWidth;
+const laneX = (lane, laneWidth) => laneWidth / 2 + lane * laneWidth;
 
-  // Every other lane that simply passes through this row (not this commit's own lane).
-  const continuations = layout.after.map((id, targetLane) => {
+// ---- Edge routing / rendering --------------------------------------------
+function renderGraphRowSvg(node, maxLanes) {
+  const laneWidth = 30; const height = 60;
+  const viewWidth = Math.max(maxLanes, 1) * laneWidth;
+  const lane = node.lane; const x = laneX(lane, laneWidth); const color = palette[lane % palette.length];
+  const x_ = i => laneX(i, laneWidth);
+
+  // Lanes that simply pass straight through this row untouched (not this commit's own lane).
+  const continuations = node.after.map((id, targetLane) => {
     if (targetLane === lane) return '';
-    const sourceLane = layout.before.indexOf(id); if (sourceLane < 0) return '';
-    const sx = laneX(sourceLane), tx = laneX(targetLane);
+    const sourceLane = node.before.indexOf(id); if (sourceLane < 0) return '';
+    const sx = x_(sourceLane), tx = x_(targetLane);
     const lineColor = palette[sourceLane % palette.length];
     return sourceLane === targetLane
       ? `<line x1="${sx}" y1="0" x2="${tx}" y2="${height}" stroke="${lineColor}" stroke-width="3" stroke-linecap="round"/>`
       : `<path d="M${sx} 0 C${sx} ${height * 0.4} ${tx} ${height * 0.6} ${tx} ${height}" stroke="${lineColor}" stroke-width="3" fill="none" stroke-linecap="round"/>`;
   }).join('');
 
-  // This commit's own edges: up to where it was referenced from, and down to each parent.
-  const hasIncoming = layout.before[lane];
+  // This commit's own edges: up from where a child referenced it, down to each parent.
+  const hasIncoming = node.before[lane];
   const incoming = hasIncoming ? `<line x1="${x}" y1="0" x2="${x}" y2="${height / 2}" stroke="${color}" stroke-width="3" stroke-linecap="round"/>` : '';
-  const outgoing = layout.parentLanes.map(parentLane => { const px = laneX(parentLane); return parentLane === lane
+  const outgoing = node.parents.map(p => { const px = x_(p.targetLane); return p.targetLane === lane
     ? `<line x1="${x}" y1="${height / 2}" x2="${x}" y2="${height}" stroke="${color}" stroke-width="3" stroke-linecap="round"/>`
     : `<path d="M${x} ${height / 2} C${x} ${height * 0.75} ${px} ${height * 0.75} ${px} ${height}" stroke="${color}" stroke-width="3" fill="none" stroke-linecap="round"/>`; }).join('');
 
-  const tags = (commit.refs || []).filter(ref => ref !== 'HEAD').map(ref => `<span class="branch-tip" style="--lane-color:${color}">${esc(ref)}</span>`).join('');
-  return `<svg viewBox="0 0 ${viewWidth} ${height}" preserveAspectRatio="xMinYMid meet">${continuations}${incoming}${outgoing}<circle cx="${x}" cy="${height / 2}" r="6" fill="${color}" stroke="#0d1117" stroke-width="2.5"/></svg><div class="branch-tips">${tags}</div>`;
+  const isHead = node.refs.includes('HEAD') || node.isHead;
+  const dot = isHead
+    ? `<circle cx="${x}" cy="${height / 2}" r="8.5" fill="${color}" stroke="#0d1117" stroke-width="2.5"/><circle cx="${x}" cy="${height / 2}" r="8.5" fill="none" stroke="#e8eef5" stroke-width="1.6"/>`
+    : `<circle cx="${x}" cy="${height / 2}" r="6" fill="${color}" stroke="#0d1117" stroke-width="2.5"/>`;
+  return `<svg viewBox="0 0 ${viewWidth} ${height}" preserveAspectRatio="xMinYMid meet">${continuations}${incoming}${outgoing}${dot}</svg>`;
+}
+
+function refsBadges(refList, color) {
+  const grouped = refList.filter(ref => ref !== 'HEAD');
+  if (!grouped.length) return '';
+  return `<span class="ref-pills">${grouped.map(ref => `<b class="ref-pill" style="--lane-color:${color}">${esc(ref)}</b>`).join('')}</span>`;
 }
 
 function renderGraph() {
   const query = refs.search.value.trim().toLowerCase();
   const commits = state.commits.filter(c => !query || `${c.subject} ${c.author} ${c.id} ${(c.refs || []).join(' ')}`.toLowerCase().includes(query));
-  const layouts = graphLayouts(commits);
-  const maxLanes = Math.max(1, ...layouts.map(l => Math.max(l.before.length, l.after.length)));
-  refs.laneLegend.innerHTML = '<span class="time-direction"><b>NEWEST</b><i>↓ time</i><b>OLDEST</b></span><span class="graph-help"><b>Git ancestry:</b> every line continues to a parent below. A new lane is a fork; joined lanes are a merge.</span>';
-  refs.graph.innerHTML = commits.map((commit, index) => `<article class="commit-row" data-id="${esc(commit.id)}">
-    <div class="graph-cell" style="width:${34 * maxLanes}px">${graphSvg(commit, layouts[index], maxLanes)}</div>
-    <div class="commit-card"><div class="commit-main"><span class="commit-title">${commitSubjectHtml(commit.subject)}</span><span class="commit-id">${esc(commit.id.slice(0, 8))}</span></div>
-    <span class="topology-badges">${commit.parents?.length > 1 ? `<b class="merge-badge">MERGE · ${commit.parents.length} parents</b>` : ''}</span><span class="commit-author">${esc(commit.author)}</span><span class="commit-date">${esc(commit.date)}</span></div>
-  </article>`).join('') || '<div class="empty-change">No commits match this filter</div>';
-  refs.graph.querySelectorAll('.commit-row').forEach(row => row.addEventListener('click', () => selectCommit(row.dataset.id)));
+  const model = buildGraphModel(commits);
+  const byId = new Map(commits.map((commit, index) => [commit.id, { commit, node: model[index] }]));
+  const currentBranch = state.repository?.current_branch;
+  const headEntry = currentBranch ? commits.find(commit => (commit.refs || []).includes(currentBranch)) : null;
+  if (headEntry) { byId.get(headEntry.id).node.isHead = true; }
+  const maxLanes = Math.max(1, ...model.map(n => Math.max(n.before.length, n.after.length)));
+
+  refs.laneLegend.innerHTML = `<span class="time-direction"><b>NEWEST</b><i>↓</i><b>OLDEST</b></span>
+    ${currentBranch ? `<span class="head-banner">HEAD <i>→</i> <b>${esc(currentBranch)}</b></span>` : ''}
+    <span class="lane-header"><span>GRAPH</span><span>REFS</span><span>COMMIT</span></span>`;
+
+  // Stash entries are informational pointers, not real DAG commits — rendered
+  // as their own dashed-connector rows anchored to the commit they were taken
+  // from, never mixed into the lane/parent topology above.
+  const stashesByBase = new Map();
+  (state.stashes || []).forEach(stash => { if (!stashesByBase.has(stash.base_commit)) stashesByBase.set(stash.base_commit, []); stashesByBase.get(stash.base_commit).push(stash); });
+
+  const rows = commits.map((commit, index) => {
+    const node = model[index]; const color = palette[node.lane % palette.length];
+    const stashRows = (stashesByBase.get(commit.id) || []).map(stash => `<article class="commit-row stash-row" data-stash="${stash.index}">
+      <div class="graph-cell" style="width:${30 * maxLanes}px"><svg viewBox="0 0 ${30 * maxLanes} 44" preserveAspectRatio="xMinYMid meet">
+        <line x1="${laneX(node.lane, 30)}" y1="44" x2="${laneX(node.lane, 30)}" y2="8" stroke="${color}" stroke-width="2" stroke-dasharray="3 4" stroke-linecap="round"/>
+        <rect x="${laneX(node.lane, 30) - 5}" y="4" width="10" height="10" rx="2.5" fill="none" stroke="${color}" stroke-width="2"/>
+      </svg></div>
+      <div class="ref-cell"></div>
+      <div class="commit-card stash-card" data-toggle-stash="${stash.index}">
+        <div class="commit-main"><span class="commit-title">stash@{${stash.index}} — ${esc(stash.message.replace(/^WIP on [^:]+:\s*[0-9a-f]+\s*/, 'WIP on ') || 'Saved work')}</span></div>
+        <span class="topology-badges"><b class="stash-badge">STASH</b></span>
+        <span class="commit-author stash-internals" hidden>Bundles: working-tree changes, staged index${stash.message.includes('untracked') ? ', untracked files' : ''} — base ${esc(stash.base_commit.slice(0, 8))}</span>
+      </div>
+    </article>`).join('');
+
+    return stashRows + `<article class="commit-row ${node.isHead ? 'is-head' : ''}" data-id="${esc(commit.id)}">
+      <div class="graph-cell" style="width:${30 * maxLanes}px">${renderGraphRowSvg(node, maxLanes)}</div>
+      <div class="ref-cell">${refsBadges(node.refs, color)}${node.isHead ? '<b class="here-badge">YOU ARE HERE</b>' : ''}</div>
+      <div class="commit-card"><div class="commit-main"><span class="commit-title">${commitSubjectHtml(commit.subject)}</span><span class="commit-id">${esc(commit.id.slice(0, 8))}</span></div>
+      <span class="topology-badges">${commit.parents?.length > 1 ? `<b class="merge-badge">MERGE · ${commit.parents.length} parents</b>` : ''}</span><span class="commit-author">${esc(commit.author)}</span><span class="commit-date">${esc(commit.date)}</span></div>
+    </article>`;
+  }).join('') || '<div class="empty-change">No commits match this filter</div>';
+
+  refs.graph.innerHTML = rows;
+  refs.graph.querySelectorAll('.commit-row[data-id]').forEach(row => row.addEventListener('click', () => selectCommit(row.dataset.id)));
+  refs.graph.querySelectorAll('[data-toggle-stash]').forEach(card => card.addEventListener('click', () => card.querySelector('.stash-internals')?.toggleAttribute('hidden')));
 }
 
 function selectCommit(id) {
@@ -952,6 +1035,17 @@ refs.leaveSubmoduleGraph.addEventListener('click', leaveSubmoduleGraph);
     localStorage.setItem('detailsPanelCollapsed', isCollapsed ? '1' : '0');
     toggle.title = isCollapsed ? 'Expand panel' : 'Collapse panel';
     toggle.setAttribute('data-tooltip', isCollapsed ? 'Expand details panel' : 'Collapse details panel');
+  });
+})();
+(() => {
+  const heading = $('#toggleBranchList'); const arrow = heading.querySelector('.branch-heading-arrow');
+  const expanded = localStorage.getItem('branchListExpanded') === '1';
+  if (expanded) { refs.branches.classList.remove('collapsed'); arrow.textContent = '▾'; }
+  heading.addEventListener('click', event => {
+    if (event.target.closest('#newBranch')) return;
+    const isExpanded = refs.branches.classList.toggle('collapsed') === false;
+    localStorage.setItem('branchListExpanded', isExpanded ? '1' : '0');
+    arrow.textContent = isExpanded ? '▾' : '▸';
   });
 })();
 $('#saveFile').addEventListener('click', saveEditor); $('#closeEditor').addEventListener('click', () => refs.editorDialog.close()); $('#cancelEditor').addEventListener('click', () => refs.editorDialog.close());
