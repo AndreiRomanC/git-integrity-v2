@@ -31,9 +31,11 @@ cargo tauri dev
 
 ## Windows
 
-The Windows application is a portable `git-integrity.exe`. End users do not need Git, Node.js, Rust or an installer; the Git engine is included in the executable.
+The Windows application is a portable `git-integrity.exe`. End users need neither Node.js, Rust, nor an installer.
 
-Build it on a Windows build machine with:
+Most Git operations (browsing, staging, committing, branching, history, submodule version switching) run entirely through the embedded libgit2 engine and need nothing else installed. **Network operations — push, fetch, pull, and "restore from remote"** — shell out to the system `git` command so they transparently reuse whatever credentials (SSH agent, credential helper, OS keychain) already work in a terminal on that machine, instead of libgit2's much narrower built-in credential search. This means **Git for Windows must be installed and on `PATH`** for those specific actions; everything else works without it.
+
+Build the executable on a Windows build machine with:
 
 ```powershell
 .\build-windows.ps1
