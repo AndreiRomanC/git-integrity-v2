@@ -65,19 +65,19 @@ button { cursor: default; }
 .publish-status { margin-top: 2px; border-top: 1px solid var(--border-soft); border-radius: 0 0 7px 7px; }.publish-dot { width: 18px; height: 18px; display: grid !important; place-items: center; border-radius: 50%; background: #215f91; color: #d9efff; font-size: 12px; }
 
 .content { min-width: 0; min-height: 0; display: flex; flex-direction: column; background: var(--bg); }
-.content-head { min-height: 82px; display: flex; align-items: center; gap: 20px; padding: 14px 22px; border-bottom: 1px solid var(--border); }
+.content-head { min-height: 82px; display: flex; flex-wrap: wrap; align-items: center; gap: 12px 20px; padding: 14px 22px; border-bottom: 1px solid var(--border); }
 .content-head h1 { margin: 0 0 4px; font-size: 22px; }
 .content-head > div:first-child { min-width: 155px; }
 .content-head h1 { white-space: nowrap; }
 .content-head p { margin: 0; color: var(--muted); font-size: 12px; }
-.view-tools { display: flex; align-items: center; margin-left: auto; }
+.view-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-left: auto; max-width: 100%; }
 .search { width: 170px; height: 34px; display: flex; align-items: center; gap: 7px; margin-right: 5px; padding: 0 10px; border: 1px solid var(--border); border-radius: 7px; background: #10161c; }
 .search span { color: #8294a6; font-size: 18px; }
 .search input { width: 100%; border: 0; outline: 0; background: transparent; }
-.icon-action { width: 34px; height: 34px; margin-left: 6px; border: 1px solid var(--border); border-radius: 7px; background: #161e27; color: #aebdcc; font-size: 17px; }
+.icon-action { width: 34px; height: 34px; margin-left: 0; border: 1px solid var(--border); border-radius: 7px; background: #161e27; color: #aebdcc; font-size: 17px; flex-shrink: 0; }
 .icon-action:hover:not(:disabled) { border-color: #526779; background: var(--surface-soft); color: white; }
 .icon-action:disabled { opacity: .35; }
-.scope-action { height: 34px; margin-left: 6px; padding: 0 12px; border: 1px solid var(--border); border-radius: 7px; background: #161e27; color: #aebdcc; white-space: nowrap; }
+.scope-action { height: 34px; margin-left: 0; padding: 0 12px; border: 1px solid var(--border); border-radius: 7px; background: #161e27; color: #aebdcc; white-space: nowrap; flex-shrink: 0; }
 .scope-action:hover { border-color: #526779; background: var(--surface-soft); color: white; }
 .scope-action.primary { border-color: #4f8fc8; background: #28679f; color: white; }
 .scope-action.primary:hover { background: #3479b5; }
@@ -189,12 +189,12 @@ button { cursor: default; }
 .lane-pill { display: inline-flex; align-items: center; gap: 7px; height: 26px; padding: 0 5px; border: 0; background: transparent; color: #9eafbe; font-size: 11px; }
 .lane-pill i { width: 9px; height: 9px; border-radius: 50%; background: var(--lane-color); }
 .graph { padding: 20px 20px 30px; }
-.commit-row { min-height: 120px; display: grid; grid-template-columns: 200px minmax(400px, 1fr); align-items: stretch; border-radius: 9px; cursor: default; gap: 16px; }
+.commit-row { min-height: 64px; display: grid; grid-template-columns: auto minmax(300px, 1fr); align-items: stretch; border-radius: 9px; cursor: default; gap: 16px; }
 .commit-row:hover { background: #121c26; }
 .commit-row.selected { background: #17283a; box-shadow: inset 0 0 0 1px #315b82; }
-.graph-cell { position: relative; min-height: 120px; padding: 8px 0; }
-.graph-cell svg { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; }.branch-tips { position: absolute; z-index: 2; left: 100%; top: 30px; margin-left: 12px; display: flex; flex-direction: column; gap: 4px; max-width: 150px; }.branch-tip { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 3px 8px; border-left: 3px solid var(--lane-color); background: #1b2a36; color: #d6e5f0; font-size: 10px; font-weight: 700; }
-.commit-card { align-self: center; min-width: 0; display: grid; grid-template-columns: 1fr auto auto auto; align-items: center; gap: 14px; min-height: 70px; padding: 12px 16px; border: 1px solid var(--border-soft); border-radius: 8px; background: #141c24; box-shadow: 0 3px 10px #0002; }
+.graph-cell { position: relative; min-height: 64px; flex-shrink: 0; }
+.graph-cell svg { display: block; width: 100%; height: 100%; overflow: visible; }.branch-tips { position: absolute; z-index: 2; left: 100%; top: 50%; transform: translateY(-50%); margin-left: 10px; display: flex; flex-direction: column; gap: 4px; max-width: 150px; }.branch-tip { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 3px 8px; border-left: 3px solid var(--lane-color); background: #1b2a36; color: #d6e5f0; font-size: 10px; font-weight: 700; }
+.commit-card { align-self: center; min-width: 0; display: grid; grid-template-columns: 1fr auto auto auto; align-items: center; gap: 14px; min-height: 52px; padding: 9px 14px; border: 1px solid var(--border-soft); border-radius: 8px; background: #141c24; box-shadow: 0 3px 10px #0002; }
 .commit-row:hover .commit-card, .commit-row.selected .commit-card { border-color: #3d5368; background: #18232e; }
 .commit-main { min-width: 0; display: flex; flex-direction: column; gap: 6px; }
 .commit-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; font-size: 14px; }
@@ -204,7 +204,13 @@ button { cursor: default; }
 .topology-badges { min-width: 0; display: flex; flex-direction: column; align-items: flex-start; gap: 3px; }.topology-badges b { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 3px 6px; border-radius: 4px; font-size: 8px; letter-spacing: .45px; }.fork-badge { border: 1px solid #a47b2e; background: #3c2d15; color: #ffd783; }.merge-badge { border: 1px solid #6f5aad; background: #2c2443; color: #d8c7ff; }
 .ref-label { position: absolute; z-index: 2; left: 81px; top: 31px; max-width: 120px; height: 22px; padding: 3px 5px 3px 8px; border: 0; border-left: 3px solid var(--lane-color); border-radius: 0; background: transparent; color: #c7d7e6; font-size: 11px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-.details-panel { min-width: 0; background: #111820; border-left: 1px solid var(--border); }
+.details-panel-wrap { min-width: 0; display: flex; }
+.details-panel { min-width: 0; flex: 1; background: #111820; border-left: 1px solid var(--border); overflow-y: auto; }
+.details-toggle { flex-shrink: 0; align-self: stretch; width: 18px; margin: 0; border: 0; border-left: 1px solid var(--border); border-radius: 0; background: #141c24; color: #8395a6; font-size: 11px; line-height: 1; display: grid; place-items: center; }
+.details-toggle:hover { background: var(--surface-soft); color: white; }
+.main-layout.details-collapsed { grid-template-columns: 244px minmax(540px, 1fr) 18px !important; }
+.main-layout.details-collapsed .details-panel { display: none; }
+.main-layout.details-collapsed .details-toggle { transform: rotate(180deg); }
 .details-empty { height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; padding: 28px; color: var(--muted); text-align: center; }
 .details-empty strong { color: #c8d3de; }
 .details-node { width: 35px; height: 35px; margin-bottom: 5px; border: 6px solid #48647f; border-radius: 50%; }
@@ -227,6 +233,7 @@ button { cursor: default; }
 .context-actions .danger-action { border-color: #7c3c44; color: #ff9da8; background: #25171b; }.context-actions .danger-action:hover { background: #3a1d23; border-color: #d45c69; }
 .context-actions .danger-action-soft { border-color: #a9722e; color: #ffcd8f; background: #241a0d; }.context-actions .danger-action-soft:hover { background: #392710; border-color: #c98c3f; }
 .local-change-banner { display: flex; align-items: center; gap: 9px; margin-top: 15px; padding: 10px; border: 1px solid #765b27; border-radius: 6px; background: #332814; }.local-change-banner > i { width: 10px; height: 10px; flex: none; border-radius: 50%; background: var(--amber); box-shadow: 0 0 9px #f0b65a77; }.local-change-banner div { display: flex; flex-direction: column; gap: 2px; }.local-change-banner strong { color: #ffe2a8; font-size: 11px; }.local-change-banner span { color: #a8916a; font-size: 9px; }
+.submodule-push-banner { display: flex; align-items: center; gap: 9px; margin-top: 10px; padding: 9px 10px; border: 1px solid #765b27; border-radius: 6px; background: #332814; }.submodule-push-banner > i { width: 9px; height: 9px; flex: none; border-radius: 50%; background: var(--amber); box-shadow: 0 0 9px #f0b65a77; }.submodule-push-banner span { color: #ffe2a8; font-size: 11px; line-height: 1.4; }
 
 .remotes-view { flex: 1; overflow: auto; padding: 22px; }.remote-cards { display: grid; gap: 12px; max-width: 900px; }.remote-card { display: grid; grid-template-columns: 48px 1fr auto; gap: 15px; align-items: center; padding: 18px; border: 1px solid #30404e; border-radius: 9px; background: #141d25; }.remote-symbol { display: grid; place-items: center; width: 42px; height: 42px; border: 3px solid var(--blue); border-radius: 50%; color: var(--blue); font-size: 20px; }.remote-card h2 { margin: 0 0 10px; font-size: 16px; }.remote-card span { display: block; margin-top: 6px; color: #738697; font-size: 9px; letter-spacing: .7px; }.remote-card code { color: #b8c9d8; font-size: 11px; overflow-wrap: anywhere; }.remote-card button { height: 35px; padding: 0 13px; border: 1px solid #5193cd; border-radius: 6px; background: #24689f; color: white; }.remote-empty { padding: 45px; text-align: center; color: var(--muted); }
 
@@ -314,6 +321,6 @@ dialog form { padding: 28px; text-align: center; }dialog h2 { margin: 0 0 10px; 
 .recent-repo-btn { padding: 6px 10px; border: 1px solid #465563; border-radius: 5px; background: #1a2530; color: #d8e5f0; font-size: 11px; white-space: nowrap; cursor: pointer; }
 .recent-repo-btn:hover { border-color: #58a6ff; background: #1f3847; }
 
-@media (max-width: 1180px) { .main-layout { grid-template-columns: 220px 1fr; }.details-panel { display: none; }.changes-drawer { left: 220px; }.commit-card { grid-template-columns: minmax(180px, 1fr) 135px 100px; }.commit-date { display: none; } }
+@media (max-width: 1180px) { .main-layout { grid-template-columns: 220px 1fr; }.details-panel-wrap { display: none; }.changes-drawer { left: 220px; }.commit-card { grid-template-columns: minmax(180px, 1fr) 135px 100px; }.commit-date { display: none; } }
 .commander-mode .main-layout { grid-template-columns: 244px minmax(600px, 1fr); }
-.commander-mode .details-panel { display: none; }
+.commander-mode .details-panel-wrap { display: none; }

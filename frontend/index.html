@@ -105,13 +105,16 @@
         <div id="remotesView" class="remotes-view" hidden><div id="remoteCards" class="remote-cards"></div></div>
       </section>
 
-      <aside id="detailsPanel" class="details-panel">
-        <div class="details-empty">
-          <div class="details-node"></div>
-          <strong>Select an item</strong>
-          <span>Select a file or folder to inspect its Git details.</span>
-        </div>
-      </aside>
+      <div class="details-panel-wrap" id="detailsPanelWrap">
+        <button id="toggleDetailsPanel" class="details-toggle" title="Collapse panel" data-tooltip="Collapse details panel">›</button>
+        <aside id="detailsPanel" class="details-panel">
+          <div class="details-empty">
+            <div class="details-node"></div>
+            <strong>Select an item</strong>
+            <span>Select a file or folder to inspect its Git details.</span>
+          </div>
+        </aside>
+      </div>
     </main>
 
     <section id="changesDrawer" class="changes-drawer" aria-label="Working tree changes">

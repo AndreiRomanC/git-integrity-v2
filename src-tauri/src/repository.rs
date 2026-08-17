@@ -1,6 +1,6 @@
 use serde::Serialize;
 use git2::{BranchType, ObjectType, Repository, Sort, Status, StatusOptions};
-use std::{collections::{HashMap, HashSet}, fs, path::{Component, Path, PathBuf}, process::Command, sync::{Mutex, OnceLock}, time::UNIX_EPOCH};
+use std::{collections::{HashMap, HashSet}, fs, path::{Component, Path, PathBuf}, process::Command, sync::{Mutex, OnceLock}, time::{Instant, Duration, UNIX_EPOCH}};
 
 #[derive(Clone, Default)]
 struct GitMetadata {
@@ -9,9 +9,17 @@ struct GitMetadata {
     statuses: Vec<(String, String)>,
 }
 
-static GIT_METADATA_CACHE: OnceLock<Mutex<HashMap<String, GitMetadata>>> = OnceLock::new();
+// A full status scan (`build_git_metadata`) walks the entire working tree — on a
+// large repository (tens of thousands of files) this can take a noticeable amount
+// of time. Doing it on *every* folder click / entry selection made navigation on
+// large repos painfully slow. A short time-to-live cache keeps navigation snappy
+// while still picking up changes made outside the app (another editor, a build
+// tool) within a few seconds, instead of requiring a full app restart to see them.
+const GIT_METADATA_TTL: Duration = Duration::from_secs(4);
 
-fn metadata_cache() -> &'static Mutex<HashMap<String, GitMetadata>> {
+static GIT_METADATA_CACHE: OnceLock<Mutex<HashMap<String, (Instant, GitMetadata)>>> = OnceLock::new();
+
+fn metadata_cache() -> &'static Mutex<HashMap<String, (Instant, GitMetadata)>> {
     GIT_METADATA_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -53,6 +61,7 @@ pub struct EntryDetails {
     item_count: Option<usize>,
     submodule_url: Option<String>,
     submodule_branch: Option<String>,
+    submodule_push_status: Option<String>,
     last_commit_id: Option<String>,
     last_commit_subject: Option<String>,
     last_commit_author: Option<String>,
@@ -137,7 +146,11 @@ fn internal_repository(path: &str) -> Result<Repository, String> {
 
 fn internal_statuses(repository: &Repository) -> Result<Vec<(String, String, bool)>, String> {
     let mut options = StatusOptions::new();
-    options.include_untracked(true).recurse_untracked_dirs(true).include_ignored(false).renames_head_to_index(true).renames_index_to_workdir(true);
+    // Not recursing into wholly-untracked directories avoids enumerating every file
+    // inside them individually (a major cost on large repos with big non-gitignored
+    // directories, e.g. build output) — libgit2 still reports one entry for the
+    // directory itself, which is all `status_for` needs to flag it as changed.
+    options.include_untracked(true).recurse_untracked_dirs(false).include_ignored(false).renames_head_to_index(true).renames_index_to_workdir(true);
     let statuses = repository.statuses(Some(&mut options)).map_err(|error| error.message().to_string())?;
     Ok(statuses.iter().filter_map(|entry| {
         let path = entry.path()?.to_string(); let value = entry.status();
@@ -225,17 +238,17 @@ fn build_git_metadata(repository: &str, statuses: Option<Vec<(String, String)>>)
 }
 
 fn cached_git_metadata(repository: &str) -> GitMetadata {
-    // Always rescan: files can change outside this app (another editor, a background
-    // tool), and a stale in-memory cache would hide those changes from the file list,
-    // the details panel, and the reset/compare actions that depend on `status`.
+    if let Some((cached_at, metadata)) = metadata_cache().lock().unwrap().get(repository) {
+        if cached_at.elapsed() < GIT_METADATA_TTL { return metadata.clone(); }
+    }
     let metadata = build_git_metadata(repository, None);
-    metadata_cache().lock().unwrap().insert(repository.to_string(), metadata.clone());
+    metadata_cache().lock().unwrap().insert(repository.to_string(), (Instant::now(), metadata.clone()));
     metadata
 }
 
 fn replace_git_metadata(repository: &str, statuses: Vec<(String, String)>) {
     let metadata = build_git_metadata(repository, Some(statuses));
-    metadata_cache().lock().unwrap().insert(repository.to_string(), metadata);
+    metadata_cache().lock().unwrap().insert(repository.to_string(), (Instant::now(), metadata));
 }
 
 fn invalidate_git_metadata(repository: &str) {
@@ -574,13 +587,31 @@ pub fn entry_details(repository_path: String, relative_path: String) -> Result<E
         .map(|commit| (commit.id, commit.subject, commit.author, commit.date));
     let submodule_url = (kind == "submodule").then(|| submodule_value(&repository_path, &relative_string, "url")).flatten();
     let submodule_branch = (kind == "submodule").then(|| submodule_value(&repository_path, &relative_string, "branch")).flatten();
+    let submodule_push_status = (kind == "submodule").then(|| submodule_push_status(&absolute.to_string_lossy())).flatten();
 
     Ok(EntryDetails {
         name: absolute.file_name().and_then(|name| name.to_str()).unwrap_or(&relative_string).to_string(), relative_path: relative_string,
-        kind, status, tracked, size: if metadata.is_file() { metadata.len() } else { 0 }, modified, item_count, submodule_url, submodule_branch,
+        kind, status, tracked, size: if metadata.is_file() { metadata.len() } else { 0 }, modified, item_count, submodule_url, submodule_branch, submodule_push_status,
         last_commit_id: last.as_ref().map(|value| value.0.clone()),
         last_commit_subject: last.as_ref().map(|value| value.1.clone()), last_commit_author: last.as_ref().map(|value| value.2.clone()), last_commit_date: last.as_ref().map(|value| value.3.clone()),
     })
+}
+
+// Uses only already-known local refs (no fetch) so it's cheap enough to call every
+// time a submodule is selected. Tells the user, at a glance, whether the commit
+// they're looking at has actually reached the submodule's own remote yet.
+fn submodule_push_status(sub_path: &str) -> Option<String> {
+    let repo = internal_repository(sub_path).ok()?;
+    let head = repo.head().ok()?;
+    let local_target = head.target()?;
+    if repo.head_detached().unwrap_or(true) { return Some("Detached — not on a branch, so it cannot be pushed as-is. Use \"Change version\" to switch to a branch first.".into()); }
+    let branch = head.shorthand()?.to_string();
+    drop(head);
+    let remote_target = repo.find_reference(&format!("refs/remotes/origin/{branch}")).ok()?.target()?;
+    if remote_target == local_target { return None; }
+    let mut walk = repo.revwalk().ok()?; walk.push(local_target).ok()?; let _ = walk.hide(remote_target);
+    let ahead = walk.take(50).count();
+    Some(if ahead > 0 { format!("{ahead} commit{} not yet pushed to origin/{branch} — needs push", if ahead == 1 { "" } else { "s" }) } else { format!("Diverged from origin/{branch}") })
 }
 
 fn validate_submodule(repository_path: &str, relative_path: &str) -> Result<PathBuf, String> {
@@ -1018,8 +1049,11 @@ pub fn commit_submodule(repository_path: String, relative_path: String, message:
     Ok(oid.to_string())
 }
 
+#[derive(Serialize, Debug)]
+pub struct PushSubmoduleResult { revision: String, branch: String }
+
 #[tauri::command]
-pub fn push_submodule(repository_path: String, relative_path: String) -> Result<(), String> {
+pub fn push_submodule(repository_path: String, relative_path: String) -> Result<PushSubmoduleResult, String> {
     validate_path(&repository_path)?;
     let absolute = validate_submodule(&repository_path, &relative_path)?;
     let sub_path = absolute.to_string_lossy().into_owned();
@@ -1065,8 +1099,64 @@ pub fn push_submodule(repository_path: String, relative_path: String) -> Result<
     if remote_target.is_some() && remote_target == local_target {
         return Err(format!("Nothing to push — this submodule has no commits ahead of origin/{branch}. Commit your changes in the submodule first."));
     }
-    git(&sub_path, &["push", "origin", &format!("HEAD:refs/heads/{branch}")])?;
+    git(&sub_path, &["push", "origin", &format!("HEAD:refs/heads/{branch}")]).map_err(|detail| {
+        if detail.contains("non-fast-forward") || detail.contains("[rejected]") || detail.contains("fetch first") {
+            format!("Push rejected — origin/{branch} has commits you don't have locally (someone else pushed there, or it moved since the last fetch). Fetch the submodule, review/merge the new commits, then push again — or, if you're the only one using this remote, use \"Force push submodule\" to overwrite it.\n\nGit's message: {detail}")
+        } else { format!("Push failed: {detail}") }
+    })?;
+
+    record_pushed_submodule_in_parent(&repository_path, &relative_path, local_target)?;
+    Ok(PushSubmoduleResult { revision: local_target.map(|oid| oid.to_string()).unwrap_or_default(), branch })
+}
+
+// Once a commit is safely on the submodule's own server, it is no longer "only
+// local" — automatically record that new commit in the parent project too, so the
+// submodule stops showing as modified. This mirrors clicking "Commit this item" on
+// the submodule, done here for you right after a successful push.
+fn record_pushed_submodule_in_parent(repository_path: &str, relative_path: &str, local_target: Option<git2::Oid>) -> Result<(), String> {
+    let parent = internal_repository(repository_path)?;
+    let mut submodule = parent.find_submodule(relative_path).map_err(|error| format!("Pushed, but could not update the parent's reference: {}", error.message()))?;
+    submodule.add_to_index(true).map_err(|error| format!("Pushed, but could not stage the updated submodule reference in the parent: {}", error.message()))?;
+    let short_sha = local_target.map(|oid| oid.to_string()[..8.min(oid.to_string().len())].to_string()).unwrap_or_default();
+    match commit_selected_internal(repository_path, &[normalized(Path::new(relative_path))], &format!("Update submodule {relative_path} to {short_sha}")) {
+        Ok(_) => {}
+        // "nothing to commit" happens if the parent's index already matched (e.g. it
+        // was committed by hand right before pushing) — not an error worth surfacing.
+        Err(message) if message.contains("no changes to commit") => {}
+        Err(message) => return Err(format!("Pushed successfully, but could not update the parent project: {message}")),
+    }
+    invalidate_git_metadata(repository_path);
     Ok(())
+}
+
+#[tauri::command]
+pub fn force_push_submodule(repository_path: String, relative_path: String) -> Result<PushSubmoduleResult, String> {
+    validate_path(&repository_path)?;
+    let absolute = validate_submodule(&repository_path, &relative_path)?;
+    let sub_path = absolute.to_string_lossy().into_owned();
+    let repo = internal_repository(&sub_path)?;
+    let local_target = repo.head().ok().and_then(|head| head.target());
+
+    let dirty = internal_statuses(&repo)?;
+    if !dirty.is_empty() {
+        let files: Vec<String> = dirty.iter().take(5).map(|(path, status, _)| format!("{status} {path}")).collect();
+        let more = if dirty.len() > 5 { format!(" (+{} more)", dirty.len() - 5) } else { String::new() };
+        return Err(format!("This submodule has uncommitted changes that will NOT be pushed:\n{}{more}\n\nCommit them first, then push.", files.join("\n")));
+    }
+    if repo.head_detached().unwrap_or(true) {
+        return Err("This submodule is in detached HEAD (not on a branch). Use \"Change version\" to switch to a branch first, then push.".into());
+    }
+    let branch = repo.head().ok().and_then(|head| head.shorthand().map(String::from)).ok_or("Could not determine the current branch")?;
+
+    repo.find_remote("origin").map_err(|_| "No 'origin' remote configured for this submodule".to_string())?;
+    // --force: intentionally overwrites whatever commit origin/<branch> currently
+    // points at, discarding any commits there aren't in this local history. Only
+    // safe when nobody else's work lives on that remote branch — the frontend
+    // requires an explicit, separate confirmation before calling this.
+    git(&sub_path, &["push", "--force", "origin", &format!("HEAD:refs/heads/{branch}")]).map_err(|detail| format!("Force push failed: {detail}"))?;
+
+    record_pushed_submodule_in_parent(&repository_path, &relative_path, local_target)?;
+    Ok(PushSubmoduleResult { revision: local_target.map(|oid| oid.to_string()).unwrap_or_default(), branch })
 }
 
 #[tauri::command]
@@ -1077,6 +1167,46 @@ pub fn fetch_submodule(repository_path: String, relative_path: String) -> Result
     let repo = internal_repository(&sub_path)?;
     repo.find_remote("origin").map_err(|_| "No 'origin' remote configured for this submodule".to_string())?;
     git(&sub_path, &["fetch", "origin"])?;
+    invalidate_git_metadata(&sub_path);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn pull_submodule(repository_path: String, relative_path: String) -> Result<(), String> {
+    validate_path(&repository_path)?;
+    let absolute = validate_submodule(&repository_path, &relative_path)?;
+    let sub_path = absolute.to_string_lossy().into_owned();
+    let repo = internal_repository(&sub_path)?;
+
+    let dirty = internal_statuses(&repo)?;
+    if !dirty.is_empty() {
+        return Err("This submodule has uncommitted changes. Commit or discard them before pulling, so a fast-forward can't overwrite anything.".into());
+    }
+    if repo.head_detached().unwrap_or(true) {
+        return Err("This submodule is in detached HEAD (not on a branch), so there is nothing to pull into. Use \"Change version\" to switch to a branch first.".into());
+    }
+    let branch = repo.head().ok().and_then(|head| head.shorthand().map(String::from)).ok_or("Could not determine the current branch")?;
+
+    repo.find_remote("origin").map_err(|_| "No 'origin' remote configured for this submodule".to_string())?;
+    git(&sub_path, &["fetch", "origin"])?;
+
+    let remote_ref = repo.find_reference(&format!("refs/remotes/origin/{branch}")).map_err(|error| format!("origin/{branch} not found after fetch: {}", error.message()))?;
+    let target = remote_ref.target().ok_or("origin's branch has no commits")?;
+    let annotated = repo.find_annotated_commit(target).map_err(|error| error.message().to_string())?;
+    let (analysis, _) = repo.merge_analysis(&[&annotated]).map_err(|error| error.message().to_string())?;
+    if analysis.is_up_to_date() { return Err(format!("Already up to date with origin/{branch}.")); }
+    if !analysis.is_fast_forward() {
+        return Err(format!("Cannot fast-forward — your local commit(s) and origin/{branch} have diverged (both have commits the other doesn't). This needs a manual merge or rebase in a terminal inside the submodule folder; it can't be done safely from here."));
+    }
+    let mut local = repo.find_reference(&format!("refs/heads/{branch}")).map_err(|error| error.message().to_string())?;
+    local.set_target(target, "fast-forward pull").map_err(|error| error.message().to_string())?;
+    repo.set_head(&format!("refs/heads/{branch}")).map_err(|error| error.message().to_string())?;
+    // `.safe()` alone can silently skip files it mistakenly believes are locally
+    // modified (a stat/mtime-cache false positive in libgit2, not a real conflict) —
+    // we already verified the working tree is clean above, so force() is safe here
+    // and guarantees the checkout actually lands instead of silently no-op'ing.
+    let mut checkout = git2::build::CheckoutBuilder::new(); checkout.force();
+    repo.checkout_head(Some(&mut checkout)).map_err(|error| error.message().to_string())?;
     invalidate_git_metadata(&sub_path);
     Ok(())
 }
@@ -1252,6 +1382,32 @@ mod tests {
     }
 
     #[test]
+    fn a_wholly_new_untracked_folder_is_still_flagged_without_full_recursion() {
+        // internal_statuses no longer recurses into brand-new untracked directories
+        // (a performance fix for large repos) — this verifies that a new folder full
+        // of files still shows up as untracked at the folder level, which is all the
+        // Explorer UI needs.
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-untracked-folder-{suffix}"));
+        create_libgit2_repository(&base, "README.md");
+        fs::create_dir_all(base.join("brand-new-folder/nested")).unwrap();
+        fs::write(base.join("brand-new-folder/one.txt"), "a").unwrap();
+        fs::write(base.join("brand-new-folder/nested/two.txt"), "b").unwrap();
+
+        let path = base.to_string_lossy().into_owned();
+        let entries = load_directory(path.clone(), "".into()).unwrap();
+        let folder_entry = entries.iter().find(|entry| entry.relative_path == "brand-new-folder").expect("the new folder should be listed");
+        assert!(!folder_entry.tracked, "a wholly new folder should not be marked as tracked");
+        assert!(!folder_entry.status.is_empty(), "load_directory should flag the new folder with a status (e.g. untracked/changed), got empty status");
+
+        let details = entry_details(path, "brand-new-folder".into()).unwrap();
+        assert!(!details.tracked, "entry_details should also report the new folder as untracked");
+        assert!(!details.status.is_empty(), "entry_details should flag the new folder with a status too, got empty status");
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
     fn submodule_commit_and_push_are_scoped_to_the_submodule() {
         let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let base = std::env::temp_dir().join(format!("git-integrity-subpush-{suffix}"));
@@ -1309,8 +1465,15 @@ mod tests {
         let parent_changes = load_repository(repo_path.clone()).unwrap().changes;
         assert!(parent_changes.iter().any(|change| change.path == "vendor/dep"), "parent status should flag the submodule as differing");
 
-        // Now push should succeed.
+        // Now push should succeed, and — since the commit is now safely on the
+        // submodule's own server — the parent should be updated automatically so the
+        // submodule stops showing as merely "modified locally".
         push_submodule(repo_path.clone(), "vendor/dep".into()).expect("push_submodule should succeed after a commit");
+        let parent_index_oid_after_push = { let repo = Repository::open(&repository).unwrap(); repo.index().unwrap().get_path(Path::new("vendor/dep"), 0).unwrap().id };
+        let submodule_head_oid_after_push = { let repo = Repository::open(&sub_path).unwrap(); let oid = repo.head().unwrap().target().unwrap(); oid };
+        assert_eq!(parent_index_oid_after_push, submodule_head_oid_after_push, "after a successful push, the parent should automatically record the new submodule commit");
+        let parent_changes_after_push = load_repository(repo_path.clone()).unwrap().changes;
+        assert!(!parent_changes_after_push.iter().any(|change| change.path == "vendor/dep"), "the submodule should no longer show as modified in the parent after push auto-commits the new pointer");
 
         fs::remove_dir_all(base).unwrap();
     }
@@ -1458,6 +1621,179 @@ mod tests {
         let file_comparison = compare_file_contents(repo_path, "vendor/dep/module.txt".into(), "origin/main".into()).unwrap();
         assert_eq!(file_comparison.local_content, file_comparison.remote_content, "local and remote content should match after push");
         assert_eq!(file_comparison.local_content, "v2");
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn submodule_status_is_clean_everywhere_after_push_including_explorer_and_details() {
+        // Checks every status source the UI actually reads (load_repository's change
+        // list, load_directory's per-row status, and entry_details), not just one of
+        // them, to catch any inconsistency between them after a push auto-commits the
+        // parent's pointer.
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-status-after-push-{suffix}"));
+        let repository = base.join("main");
+        let dep_remote = base.join("dep-remote.git");
+        let dep_seed = base.join("dep-seed");
+        fs::create_dir_all(&repository).unwrap();
+        fs::create_dir_all(&dep_seed).unwrap();
+        fs::create_dir_all(&dep_remote).unwrap();
+        fs::write(repository.join("README.md"), "root").unwrap();
+        fs::write(dep_seed.join("module.txt"), "v1").unwrap();
+
+        run_git(&dep_remote, &["init", "--bare"]);
+        for path in [&repository, &dep_seed] {
+            run_git(path, &["init"]);
+            run_git(path, &["config", "user.email", "test@example.com"]);
+            run_git(path, &["config", "user.name", "Test User"]);
+            run_git(path, &["add", "."]);
+            run_git(path, &["commit", "-m", "Initial"]);
+        }
+        run_git(&dep_seed, &["remote", "add", "origin", dep_remote.to_str().unwrap()]);
+        run_git(&dep_seed, &["-c", "protocol.file.allow=always", "push", "origin", "HEAD:main"]);
+        run_git(&repository, &["-c", "protocol.file.allow=always", "submodule", "add", dep_remote.to_str().unwrap(), "vendor/dep"]);
+        run_git(&repository, &["commit", "-am", "Add dep submodule"]);
+
+        let repo_path = repository.to_string_lossy().into_owned();
+        let sub_path = repository.join("vendor/dep");
+        run_git(&sub_path, &["config", "user.email", "test@example.com"]);
+        run_git(&sub_path, &["config", "user.name", "Test User"]);
+
+        fs::write(sub_path.join("module.txt"), "v2").unwrap();
+        commit_submodule(repo_path.clone(), "vendor/dep".into(), "Update module".into()).unwrap();
+        push_submodule(repo_path.clone(), "vendor/dep".into()).unwrap();
+
+        let changes = load_repository(repo_path.clone()).unwrap().changes;
+        assert!(!changes.iter().any(|change| change.path == "vendor/dep"), "load_repository still lists the submodule as changed: {:?}", changes.iter().map(|c| (&c.path, &c.status)).collect::<Vec<_>>());
+
+        let entries = load_directory(repo_path.clone(), "vendor".into()).unwrap();
+        let dep_entry = entries.iter().find(|entry| entry.relative_path == "vendor/dep").expect("submodule entry should be listed");
+        assert_eq!(dep_entry.status, "", "load_directory still reports a status for the submodule: {:?}", dep_entry.status);
+
+        let details = entry_details(repo_path, "vendor/dep".into()).unwrap();
+        assert_eq!(details.status, "", "entry_details still reports a status for the submodule: {:?}", details.status);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn submodule_push_status_reports_unpushed_commits_and_clears_after_push() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-push-status-{suffix}"));
+        let repository = base.join("main");
+        let dep_remote = base.join("dep-remote.git");
+        let dep_seed = base.join("dep-seed");
+        fs::create_dir_all(&repository).unwrap();
+        fs::create_dir_all(&dep_seed).unwrap();
+        fs::create_dir_all(&dep_remote).unwrap();
+        fs::write(repository.join("README.md"), "root").unwrap();
+        fs::write(dep_seed.join("module.txt"), "v1").unwrap();
+
+        run_git(&dep_remote, &["init", "--bare"]);
+        for path in [&repository, &dep_seed] {
+            run_git(path, &["init"]);
+            run_git(path, &["config", "user.email", "test@example.com"]);
+            run_git(path, &["config", "user.name", "Test User"]);
+            run_git(path, &["add", "."]);
+            run_git(path, &["commit", "-m", "Initial"]);
+        }
+        run_git(&dep_seed, &["remote", "add", "origin", dep_remote.to_str().unwrap()]);
+        run_git(&dep_seed, &["-c", "protocol.file.allow=always", "push", "origin", "HEAD:main"]);
+        run_git(&repository, &["-c", "protocol.file.allow=always", "submodule", "add", dep_remote.to_str().unwrap(), "vendor/dep"]);
+        run_git(&repository, &["commit", "-am", "Add dep submodule"]);
+
+        let repo_path = repository.to_string_lossy().into_owned();
+        let sub_path = repository.join("vendor/dep");
+        run_git(&sub_path, &["config", "user.email", "test@example.com"]);
+        run_git(&sub_path, &["config", "user.name", "Test User"]);
+
+        // Freshly cloned and in sync: nothing to report.
+        assert_eq!(submodule_push_status(&sub_path.to_string_lossy()), None, "a freshly synced submodule should report no pending push");
+
+        // Commit locally without pushing: should report exactly 1 unpushed commit.
+        fs::write(sub_path.join("module.txt"), "v2").unwrap();
+        commit_submodule(repo_path.clone(), "vendor/dep".into(), "Local only".into()).unwrap();
+        let status = submodule_push_status(&sub_path.to_string_lossy());
+        assert!(status.as_deref().is_some_and(|message| message.contains("1 commit") && message.contains("needs push")), "expected an unpushed-commit message, got: {status:?}");
+
+        // After a successful push, the warning must clear.
+        push_submodule(repo_path, "vendor/dep".into()).unwrap();
+        assert_eq!(submodule_push_status(&sub_path.to_string_lossy()), None, "after push, the submodule should no longer report anything unpushed");
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn pull_submodule_fast_forwards_but_refuses_a_real_divergence() {
+        // Reproduces the exact reported scenario: someone else pushed a new commit to
+        // the submodule's remote that the local checkout doesn't have. `pull_submodule`
+        // should fast-forward cleanly in that case, but must refuse (not guess) when
+        // local and remote have both moved in incompatible directions.
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-pull-submodule-{suffix}"));
+        let repository = base.join("main");
+        let dep_remote = base.join("dep-remote.git");
+        let dep_seed = base.join("dep-seed");
+        fs::create_dir_all(&repository).unwrap();
+        fs::create_dir_all(&dep_seed).unwrap();
+        fs::create_dir_all(&dep_remote).unwrap();
+        fs::write(repository.join("README.md"), "root").unwrap();
+        fs::write(dep_seed.join("module.txt"), "v1").unwrap();
+
+        run_git(&dep_remote, &["init", "--bare"]);
+        for path in [&repository, &dep_seed] {
+            run_git(path, &["init"]);
+            run_git(path, &["config", "user.email", "test@example.com"]);
+            run_git(path, &["config", "user.name", "Test User"]);
+            run_git(path, &["add", "."]);
+            run_git(path, &["commit", "-m", "Initial"]);
+        }
+        run_git(&dep_seed, &["remote", "add", "origin", dep_remote.to_str().unwrap()]);
+        run_git(&dep_seed, &["-c", "protocol.file.allow=always", "push", "origin", "HEAD:main"]);
+        run_git(&repository, &["-c", "protocol.file.allow=always", "submodule", "add", dep_remote.to_str().unwrap(), "vendor/dep"]);
+        run_git(&repository, &["commit", "-am", "Add dep submodule"]);
+
+        let repo_path = repository.to_string_lossy().into_owned();
+        let sub_path = repository.join("vendor/dep");
+        run_git(&sub_path, &["config", "user.email", "test@example.com"]);
+        run_git(&sub_path, &["config", "user.name", "Test User"]);
+
+        // Simulate "someone else pushed": a second clone commits and pushes ahead.
+        let other_clone = base.join("other-clone");
+        run_git(&base, &["-c", "protocol.file.allow=always", "clone", dep_remote.to_str().unwrap(), "other-clone"]);
+        run_git(&other_clone, &["config", "user.email", "test@example.com"]);
+        run_git(&other_clone, &["config", "user.name", "Someone Else"]);
+        fs::write(other_clone.join("module.txt"), "from someone else").unwrap();
+        run_git(&other_clone, &["commit", "-am", "Someone else's commit"]);
+        run_git(&other_clone, &["-c", "protocol.file.allow=always", "push", "origin", "HEAD:main"]);
+
+        // Our local submodule is still on the old commit and has nothing of its own —
+        // this must fast-forward cleanly.
+        pull_submodule(repo_path.clone(), "vendor/dep".into()).expect("a clean fast-forward pull should succeed");
+        assert_eq!(fs::read_to_string(sub_path.join("module.txt")).unwrap(), "from someone else", "pull should have brought in the other clone's content");
+
+        // Now create a REAL divergence: local commits something new, and the remote
+        // (via the other clone) also moves again — neither is an ancestor of the other.
+        fs::write(sub_path.join("module.txt"), "local edit").unwrap();
+        commit_submodule(repo_path.clone(), "vendor/dep".into(), "Local divergent commit".into()).unwrap();
+        fs::write(other_clone.join("module.txt"), "remote diverges too").unwrap();
+        run_git(&other_clone, &["commit", "-am", "Remote diverges too"]);
+        run_git(&other_clone, &["-c", "protocol.file.allow=always", "push", "origin", "HEAD:main"]);
+
+        let diverged = pull_submodule(repo_path.clone(), "vendor/dep".into());
+        assert!(diverged.is_err(), "a real divergence must not be silently resolved, got Ok");
+        let message = diverged.unwrap_err();
+        assert!(message.to_lowercase().contains("diverged") || message.to_lowercase().contains("manual"), "expected a message explaining manual resolution is needed, got: {message}");
+
+        // force_push_submodule must resolve exactly this stuck situation by
+        // overwriting the remote with the local history.
+        let forced = force_push_submodule(repo_path.clone(), "vendor/dep".into());
+        assert!(forced.is_ok(), "force_push_submodule should succeed even when diverged, got: {:?}", forced);
+        let remote_content = git(&dep_remote.to_string_lossy(), &["show", "main:module.txt"]).unwrap();
+        assert_eq!(remote_content.trim(), "local edit", "the remote should now match the local (forced) content");
+        let parent_changes = load_repository(repo_path).unwrap().changes;
+        assert!(!parent_changes.iter().any(|change| change.path == "vendor/dep"), "the parent should be auto-updated after a force push too");
 
         fs::remove_dir_all(base).unwrap();
     }

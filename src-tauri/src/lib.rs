@@ -45,6 +45,8 @@ pub fn run() {
             repository::commit_submodule,
             repository::push_submodule,
             repository::fetch_submodule,
+            repository::pull_submodule,
+            repository::force_push_submodule,
             repository::file_blame,
         ])
         .run(tauri::generate_context!())

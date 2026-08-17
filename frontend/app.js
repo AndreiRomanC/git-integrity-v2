@@ -72,7 +72,8 @@ function handleError(error) {
     'no upstream': 'Go to Branch Map (Ctrl+Shift+G) → Right-click branch → Set upstream',
     'not a git': 'Open a valid Git repository with File > Open Repository',
     'merge conflict': 'Resolve conflicts manually in the files, then stage them',
-    'diverged': 'Pull the latest changes first (Ctrl+Shift+↓)',
+    'diverged': 'This needs manual resolution: open a terminal in that folder, run `git fetch` then `git merge origin/<branch>` (or `git rebase origin/<branch>`), resolve any conflicts, commit, then Push again from here.',
+    'non-fast-forward': 'Use "Pull submodule" first. If it also refuses (diverged), resolve manually in a terminal: `git fetch`, `git merge origin/<branch>`, fix conflicts, commit, then push.',
     'authentication': 'Check your Git credentials and SSH keys',
     'permission denied': 'Check file permissions and access rights',
     'branch not found': 'Refresh (Ctrl+R) and verify the branch name',
@@ -239,6 +240,9 @@ function render() {
   const activeScope = state.selectedEntry?.relative_path || state.currentPath;
   const activeName = state.selectedEntry?.name || (state.currentPath ? state.currentPath.split('/').pop() : state.repository?.name);
   refs.commitScope.textContent = state.selectedEntry ? `Commit ${activeName}` : state.currentPath ? 'Commit folder' : 'Commit repository';
+  const scopeChangeCount = loaded ? state.changes.filter(change => !activeScope || change.path === activeScope || change.path.startsWith(`${activeScope}/`)).length : 0;
+  refs.commitScope.disabled = !scopeChangeCount;
+  refs.commitScope.title = scopeChangeCount ? '' : 'Nothing to commit here — no uncommitted local changes in this scope';
   $('#navExplorer').classList.toggle('active', state.view === 'explorer'); $('#navGraph').classList.toggle('active', state.view === 'graph');
   $('#navCommander').classList.toggle('active', state.view === 'commander');
   $('#navRemotes').classList.toggle('active', state.view === 'remotes');
@@ -485,8 +489,10 @@ async function commitSelectedScope(event) {
   try {
     await invoke('commit_path', { repositoryPath: state.repository.path, relativePath: scope.path, message });
     const folder = state.currentPath; refs.commitScopeDialog.close(); const data = await invoke('load_repository', { path: state.repository.path });
-    Object.assign(state, data); state.allCommits = data.commits; state.selectedEntry = null; directoryCache.clear(); await openDirectory(folder, { force: true }); status(`Committed ${scope.name}`);
-  } catch (error) { handleError(error); }
+    Object.assign(state, data); state.allCommits = data.commits; state.selectedEntry = null; directoryCache.clear(); await openDirectory(folder, { force: true });
+    const successMsg = `Committed "${scope.name}". Push when you're ready to send it to the server.`;
+    status(successMsg); showOperationToast(successMsg, 'success');
+  } catch (error) { const message = handleError(error); showOperationToast(message, 'error'); }
   finally { refs.confirmScopeCommit.textContent = 'Commit selection'; refs.confirmScopeCommit.disabled = !refs.scopeCommitMessage.value.trim(); }
 }
 
@@ -502,10 +508,10 @@ function renderEntryDetails(entry) {
   refs.details.innerHTML = `<div class="entry-details"><div class="entry-preview ${esc(entry.kind)}">${entry.kind === 'submodule' ? '◇' : entry.kind === 'folder' ? '▰' : '▤'}</div>
     <h2>${esc(entry.name)}</h2><div class="entry-path">${esc(entry.relative_path)}</div>${entry.kind === 'submodule' ? '<span class="submodule-badge">◇ Git submodule</span>' : ''}
     ${entry.status || !entry.tracked ? `<div class="local-change-banner"><i></i><div><strong>${entry.tracked ? 'Modified locally' : 'New local file'}</strong><span>This item differs from the committed repository state.</span></div></div>` : ''}
-    <div class="context-actions">${entry.kind === 'file' ? '<button data-detail-action="edit">Edit local file</button>' : '<button data-detail-action="open">Open folder</button>'}<button data-detail-action="server">Open on server ↗</button><button data-detail-action="history">View history</button>${entry.tracked || entry.status ? '<button data-detail-action="commit">Commit this item</button>' : ''}${entry.kind === 'file' && (entry.status || !entry.tracked) ? `<button data-detail-action="stage" data-tooltip="git add — add this file's current content to staging">＋ Stage this file</button><button data-detail-action="unstage" data-tooltip="Soft/Mixed reset — git restore --staged. Unstages only; your edits on disk are kept exactly as they are.">− Soft/Mixed reset (unstage)</button><button data-detail-action="head" class="danger-action-soft" data-tooltip="Hard reset — git checkout HEAD -- file. Permanently discards ALL edits; the file on disk becomes identical to the last commit. Cannot be undone.">↶ Hard reset (discard all edits)</button><button data-detail-action="compare" data-tooltip="Open side-by-side compare with reset options">⇄ Compare with remote</button>` : ''}${entry.kind === 'submodule' ? '<button data-detail-action="subserver">Open submodule repository ↗</button><button data-detail-action="subgraph">Submodule branch map</button><button data-detail-action="versions">Change version</button><button data-detail-action="subcommit">Commit submodule</button><button data-detail-action="subpush">Push submodule</button><button data-detail-action="subfetch">Fetch submodule</button><button data-detail-action="location">Replace repository URL</button>' : ''}<button class="danger-action" data-detail-action="delete">Delete…</button></div>
+    <div class="context-actions">${entry.kind === 'file' ? '<button data-detail-action="edit">Edit local file</button>' : '<button data-detail-action="open">Open folder</button>'}<button data-detail-action="server">Open on server ↗</button><button data-detail-action="history">View history</button>${entry.status ? '<button data-detail-action="commit">Commit this item</button>' : ''}${entry.kind === 'file' && (entry.status || !entry.tracked) ? `<button data-detail-action="stage" data-tooltip="git add — add this file's current content to staging">＋ Stage this file</button><button data-detail-action="unstage" data-tooltip="Soft/Mixed reset — git restore --staged. Unstages only; your edits on disk are kept exactly as they are.">− Soft/Mixed reset (unstage)</button><button data-detail-action="head" class="danger-action-soft" data-tooltip="Hard reset — git checkout HEAD -- file. Permanently discards ALL edits; the file on disk becomes identical to the last commit. Cannot be undone.">↶ Hard reset (discard all edits)</button><button data-detail-action="compare" data-tooltip="Open side-by-side compare with reset options">⇄ Compare with remote</button>` : ''}${entry.kind === 'submodule' ? `<button data-detail-action="subserver">Open submodule repository ↗</button><button data-detail-action="subgraph">Submodule branch map</button><button data-detail-action="versions">Change version</button><button data-detail-action="subcommit" ${entry.status ? '' : 'disabled'} data-tooltip="${entry.status ? 'Commit uncommitted changes inside the submodule' : 'Nothing to commit — no uncommitted changes inside this submodule'}">Commit submodule</button><button data-detail-action="subpull" data-tooltip="Fast-forward pull — brings in new commits from the submodule's remote. Refuses if it would require a manual merge.">Pull submodule</button><button data-detail-action="subpush">Push submodule</button><button data-detail-action="subforcepush" class="danger-action-soft" data-tooltip="⚠️ Overwrites the remote branch with your local history, discarding any commits there aren't in yours. Only safe if nobody else uses that remote.">Force push submodule…</button><button data-detail-action="subfetch">Fetch submodule</button><button data-detail-action="location">Replace repository URL</button>` : ''}<button class="danger-action" data-detail-action="delete">Delete…</button></div>
     <div class="detail-section"><h3>GENERAL</h3><div class="detail-grid"><span>Type</span><strong>${kindLabel}</strong><span>Git</span><strong>${entry.tracked ? (entry.status || 'Tracked, clean') : 'Untracked'}</strong>
     ${entry.item_count != null ? `<span>Items</span><strong>${entry.item_count}</strong>` : `<span>Size</span><strong>${formatSize(entry.size)}</strong>`}<span>Modified</span><strong>${formatModified(entry.modified)}</strong></div></div>
-    ${entry.kind === 'submodule' ? `<div class="detail-section"><h3>SUBMODULE</h3><div class="detail-grid"><span>Remote</span><strong>${esc(entry.submodule_url || 'Not configured')}</strong><span>Branch</span><strong>${esc(entry.submodule_branch || 'Default')}</strong><span>Status</span><strong>${entry.status ? (entry.status === 'M' ? 'Has local changes' : 'Modified') : 'Clean'}</strong></div></div>` : ''}
+    ${entry.kind === 'submodule' ? `<div class="detail-section"><h3>SUBMODULE</h3><div class="detail-grid"><span>Remote</span><strong>${esc(entry.submodule_url || 'Not configured')}</strong><span>Branch</span><strong>${esc(entry.submodule_branch || 'Default')}</strong><span>Status</span><strong>${entry.status ? (entry.status === 'M' ? 'Has local changes' : 'Modified') : 'Clean'}</strong></div>${entry.submodule_push_status ? `<div class="submodule-push-banner"><i></i><span>${esc(entry.submodule_push_status)}</span></div>` : ''}</div>` : ''}
     <div class="detail-section"><h3>LAST COMMIT</h3><div class="detail-grid"><span>Commit</span><strong>${esc(entry.last_commit_id?.slice(0, 8) || 'No commit')}</strong><span>Message</span><strong>${commitSubjectHtml(entry.last_commit_subject || '—')}</strong><span>Author</span><strong>${esc(entry.last_commit_author || '—')}</strong><span>Date</span><strong>${esc(entry.last_commit_date || '—')}</strong></div></div></div>`;
   refs.details.querySelectorAll('[data-detail-action]').forEach(button => button.addEventListener('click', () => { Promise.resolve(handleDetailAction(button.dataset.detailAction, entry, button)).catch(error => handleError(error)); }));
 }
@@ -523,7 +529,9 @@ async function handleDetailAction(action, entry, button) {
   if (action === 'delete') return deleteEntry(entry, button);
   if (action === 'compare') return compareEntryWithRemote(entry);
   if (action === 'subcommit') return commitSubmoduleChanges(entry);
+  if (action === 'subpull') return pullSubmodule(entry);
   if (action === 'subpush') return pushSubmodule(entry);
+  if (action === 'subforcepush') return forcePushSubmodule(entry);
   if (action === 'subfetch') return fetchSubmodule(entry);
   if (['head','stage','unstage'].includes(action)) return runEntryFileAction(entry, action);
 }
@@ -562,14 +570,54 @@ async function commitSubmoduleChanges(entry) {
   catch (error) { const message2 = handleError(error); showOperationToast(`Commit failed: ${message2}`, 'error'); }
 }
 
+async function pullSubmodule(entry) {
+  if (entry.kind !== 'submodule') return;
+  if (!invoke) return status(`Preview: pulled ${entry.name}`);
+  try {
+    status(`Pulling ${entry.name} from its remote…`, 'busy');
+    await invoke('pull_submodule', { repositoryPath: state.repository.path, relativePath: entry.relative_path });
+    directoryCache.clear(); await loadRepository(state.repository.path); await openDirectory(state.currentPath, { force: true });
+    if (state.selectedEntry?.relative_path === entry.relative_path) await selectEntry(entry.relative_path);
+    const successMsg = `${entry.name}: pulled the latest commits from its remote (fast-forward).`;
+    status(successMsg); showOperationToast(successMsg, 'success');
+  }
+  catch (error) { const message = handleError(error); showOperationToast(message, 'error'); }
+}
+
+async function forcePushSubmodule(entry) {
+  if (entry.kind !== 'submodule') return;
+  const firstConfirm = await customConfirm(
+    `⚠️ FORCE PUSH will OVERWRITE the remote branch for "${entry.name}" with your local history. Any commits on the remote that aren't in your local history will be PERMANENTLY LOST from the server.\n\nOnly do this if you're certain nobody else is using that remote. Continue?`,
+    { title: 'Force push — destructive', danger: true, okLabel: 'I understand, continue' }
+  );
+  if (!firstConfirm) { status('Force push cancelled'); return; }
+  const secondConfirm = await customConfirm(
+    `Last check: force push submodule "${entry.name}" now? This cannot be undone from here.`,
+    { title: 'Force push — final confirmation', danger: true, okLabel: 'Force push' }
+  );
+  if (!secondConfirm) { status('Force push cancelled'); return; }
+  if (!invoke) return status(`Preview: force pushed ${entry.name}`);
+  try {
+    status(`Force pushing ${entry.name}…`, 'busy');
+    const result = await invoke('force_push_submodule', { repositoryPath: state.repository.path, relativePath: entry.relative_path });
+    directoryCache.clear(); await loadRepository(state.repository.path); await openDirectory(state.currentPath, { force: true });
+    const shortSha = (result?.revision || '').slice(0, 8);
+    const successMsg = `${entry.name}: force pushed to branch "${result?.branch}". The remote now matches your local history exactly (commit ${shortSha}). The project was updated too.`;
+    status(successMsg); showOperationToast(successMsg, 'success');
+  }
+  catch (error) { const message = handleError(error); showOperationToast(message, 'error'); }
+}
+
 async function pushSubmodule(entry) {
   if (entry.kind !== 'submodule') return;
   if (!await customConfirm(`Push commits in submodule ${entry.name} to its own remote repository?`, { title: 'Push submodule', okLabel: 'Push' })) { status('Push cancelled'); return; }
   if (!invoke) return status(`Preview: pushed ${entry.name}`);
   try {
     status(`Pushing ${entry.name} to its remote…`, 'busy');
-    await invoke('push_submodule', { repositoryPath: state.repository.path, relativePath: entry.relative_path });
-    const successMsg = `${entry.name}: pushed to its own remote repository.`;
+    const result = await invoke('push_submodule', { repositoryPath: state.repository.path, relativePath: entry.relative_path });
+    directoryCache.clear(); await loadRepository(state.repository.path); await openDirectory(state.currentPath, { force: true });
+    const shortSha = (result?.revision || '').slice(0, 8);
+    const successMsg = `${entry.name}: pushed to branch "${result?.branch}" on its remote. The project was updated to commit ${shortSha}.`;
     status(successMsg); showOperationToast(successMsg, 'success');
   }
   catch (error) { const message = handleError(error); showOperationToast(message, 'error'); }
@@ -760,30 +808,44 @@ function graphLayouts(commits) {
   });
 }
 
-function graphSvg(commit, index, layout) {
-  const beforeCount = layout.before.filter(Boolean).length, afterCount = layout.after.filter(Boolean).length;
-  const laneWidth = 50; const height = 120;
-  if (beforeCount <= 1 && afterCount <= 1 && (commit.parents || []).length <= 1) {
-    const color = palette[0]; const cx = laneWidth / 2; const top = index === 0 ? height / 2 : 0; const bottom = (commit.parents || []).length ? height : height / 2;
-    return `<svg viewBox="0 0 ${laneWidth} ${height}" preserveAspectRatio="none"><g stroke="${color}" stroke-width="5" fill="none" stroke-linecap="round"><line x1="${cx}" y1="${top}" x2="${cx}" y2="${bottom}"/></g><circle cx="${cx}" cy="${height / 2}" r="10" fill="${color}" stroke="#0d1117" stroke-width="3"/></svg><div class="branch-tips">${(commit.refs || []).filter(ref => ref !== 'HEAD').map(ref => `<span class="branch-tip" style="--lane-color:${color}">${esc(ref)}</span>`).join('')}</div>`;
-  }
-  const lane = layout.lane; const x = laneWidth / 2 + lane * laneWidth; const maxLanes = Math.max(beforeCount, afterCount, 2); const viewWidth = maxLanes * laneWidth; const color = palette[lane % palette.length];
-  const continuations = layout.after.map((id, targetLane) => { const sourceLane = layout.before.indexOf(id); if (sourceLane < 0 || sourceLane === lane) return ''; const sx = laneWidth / 2 + sourceLane * laneWidth, tx = laneWidth / 2 + targetLane * laneWidth; return `<path d="M${sx} 0 C${sx} 55 ${tx} 65 ${tx} ${height}"/>`; }).join('');
-  const parents = layout.parentLanes.map(parentLane => { const px = laneWidth / 2 + parentLane * laneWidth; return `<path class="parent-line" d="M${x} ${height / 2} C${x} 80 ${px} 80 ${px} ${height}"/>`; }).join('');
+function graphSvg(commit, layout, maxLanes) {
+  const laneWidth = 34; const height = 64;
+  const viewWidth = Math.max(maxLanes, 1) * laneWidth;
+  const lane = layout.lane; const x = laneWidth / 2 + lane * laneWidth; const color = palette[lane % palette.length];
+  const laneX = index => laneWidth / 2 + index * laneWidth;
+
+  // Every other lane that simply passes through this row (not this commit's own lane).
+  const continuations = layout.after.map((id, targetLane) => {
+    if (targetLane === lane) return '';
+    const sourceLane = layout.before.indexOf(id); if (sourceLane < 0) return '';
+    const sx = laneX(sourceLane), tx = laneX(targetLane);
+    const lineColor = palette[sourceLane % palette.length];
+    return sourceLane === targetLane
+      ? `<line x1="${sx}" y1="0" x2="${tx}" y2="${height}" stroke="${lineColor}" stroke-width="3" stroke-linecap="round"/>`
+      : `<path d="M${sx} 0 C${sx} ${height * 0.4} ${tx} ${height * 0.6} ${tx} ${height}" stroke="${lineColor}" stroke-width="3" fill="none" stroke-linecap="round"/>`;
+  }).join('');
+
+  // This commit's own edges: up to where it was referenced from, and down to each parent.
+  const hasIncoming = layout.before[lane];
+  const incoming = hasIncoming ? `<line x1="${x}" y1="0" x2="${x}" y2="${height / 2}" stroke="${color}" stroke-width="3" stroke-linecap="round"/>` : '';
+  const outgoing = layout.parentLanes.map(parentLane => { const px = laneX(parentLane); return parentLane === lane
+    ? `<line x1="${x}" y1="${height / 2}" x2="${x}" y2="${height}" stroke="${color}" stroke-width="3" stroke-linecap="round"/>`
+    : `<path d="M${x} ${height / 2} C${x} ${height * 0.75} ${px} ${height * 0.75} ${px} ${height}" stroke="${color}" stroke-width="3" fill="none" stroke-linecap="round"/>`; }).join('');
+
   const tags = (commit.refs || []).filter(ref => ref !== 'HEAD').map(ref => `<span class="branch-tip" style="--lane-color:${color}">${esc(ref)}</span>`).join('');
-  return `<svg viewBox="0 0 ${viewWidth} ${height}" preserveAspectRatio="none"><g stroke="${color}" stroke-width="5" fill="none" stroke-linecap="round">${continuations}${parents}<line x1="${x}" y1="0" x2="${x}" y2="${height * 0.4}"/></g><circle cx="${x}" cy="${height / 2}" r="10" fill="${color}" stroke="#0d1117" stroke-width="3"/></svg><div class="branch-tips">${tags}</div>`;
+  return `<svg viewBox="0 0 ${viewWidth} ${height}" preserveAspectRatio="xMinYMid meet">${continuations}${incoming}${outgoing}<circle cx="${x}" cy="${height / 2}" r="6" fill="${color}" stroke="#0d1117" stroke-width="2.5"/></svg><div class="branch-tips">${tags}</div>`;
 }
 
 function renderGraph() {
   const query = refs.search.value.trim().toLowerCase();
   const commits = state.commits.filter(c => !query || `${c.subject} ${c.author} ${c.id} ${(c.refs || []).join(' ')}`.toLowerCase().includes(query));
   const layouts = graphLayouts(commits);
-  refs.laneLegend.innerHTML = '<span class="time-direction"><b>NEWEST</b><i>↓ time</i><b>OLDEST</b></span><span class="graph-help"><b>Git ancestry:</b> every thin line continues to a parent below. A new side lane is a fork; joined lanes are a merge. Labels mark the exact branch tip.</span>';
-  const childCounts = new Map(); commits.forEach(commit => (commit.parents || []).forEach(parent => childCounts.set(parent, (childCounts.get(parent) || 0) + 1)));
+  const maxLanes = Math.max(1, ...layouts.map(l => Math.max(l.before.length, l.after.length)));
+  refs.laneLegend.innerHTML = '<span class="time-direction"><b>NEWEST</b><i>↓ time</i><b>OLDEST</b></span><span class="graph-help"><b>Git ancestry:</b> every line continues to a parent below. A new lane is a fork; joined lanes are a merge.</span>';
   refs.graph.innerHTML = commits.map((commit, index) => `<article class="commit-row" data-id="${esc(commit.id)}">
-    <div class="graph-cell">${graphSvg(commit, index, layouts[index])}</div>
+    <div class="graph-cell" style="width:${34 * maxLanes}px">${graphSvg(commit, layouts[index], maxLanes)}</div>
     <div class="commit-card"><div class="commit-main"><span class="commit-title">${commitSubjectHtml(commit.subject)}</span><span class="commit-id">${esc(commit.id.slice(0, 8))}</span></div>
-    <span class="topology-badges">${childCounts.get(commit.id) > 1 ? `<b class="fork-badge">FORK POINT · ${childCounts.get(commit.id)} paths</b>` : ''}${commit.parents?.length > 1 ? `<b class="merge-badge">MERGE · ${commit.parents.length} parents</b>` : ''}</span><span class="commit-author">${esc(commit.author)}</span><span class="commit-date">${esc(commit.date)}</span></div>
+    <span class="topology-badges">${commit.parents?.length > 1 ? `<b class="merge-badge">MERGE · ${commit.parents.length} parents</b>` : ''}</span><span class="commit-author">${esc(commit.author)}</span><span class="commit-date">${esc(commit.date)}</span></div>
   </article>`).join('') || '<div class="empty-change">No commits match this filter</div>';
   refs.graph.querySelectorAll('.commit-row').forEach(row => row.addEventListener('click', () => selectCommit(row.dataset.id)));
 }
@@ -867,6 +929,17 @@ $('#navCommander').addEventListener('click', () => { const selected = state.sele
 $('#navGraph').addEventListener('click', () => { state.commits = state.allCommits.length ? state.allCommits : state.commits; state.historyScope = ''; state.selectedEntry = null; state.selectedCommit = null; state.view = 'graph'; refs.search.value = ''; clearDetails('Select a commit'); render(); });
 $('#navRemotes').addEventListener('click', loadRemotes);
 refs.leaveSubmoduleGraph.addEventListener('click', leaveSubmoduleGraph);
+(() => {
+  const mainLayout = document.querySelector('.main-layout'); const toggle = $('#toggleDetailsPanel');
+  const collapsed = localStorage.getItem('detailsPanelCollapsed') === '1';
+  if (collapsed) { mainLayout.classList.add('details-collapsed'); toggle.title = 'Expand panel'; }
+  toggle.addEventListener('click', () => {
+    const isCollapsed = mainLayout.classList.toggle('details-collapsed');
+    localStorage.setItem('detailsPanelCollapsed', isCollapsed ? '1' : '0');
+    toggle.title = isCollapsed ? 'Expand panel' : 'Collapse panel';
+    toggle.setAttribute('data-tooltip', isCollapsed ? 'Expand details panel' : 'Collapse details panel');
+  });
+})();
 $('#saveFile').addEventListener('click', saveEditor); $('#closeEditor').addEventListener('click', () => refs.editorDialog.close()); $('#cancelEditor').addEventListener('click', () => refs.editorDialog.close());
 refs.editorContent.addEventListener('input', updateEditorSaveState);
 $('#fetchCurrent').addEventListener('click', () => { const first = state.remotes[0]?.name || state.branches.find(branch => branch.remote)?.name.split('/')[0]; if (first) fetchRemote(first); else status('No remote is configured', 'error'); });
