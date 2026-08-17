@@ -416,9 +416,11 @@ function renderExplorer() {
   </button>`).join('') || (state.currentPath ? '' : '<div class="empty-change">This folder is empty</div>');
   refs.fileList.querySelector('[data-go-up]')?.addEventListener('click', () => { const parent = state.currentPath.split('/').slice(0, -1).join('/'); openDirectory(parent); });
   refs.fileList.querySelectorAll('[data-entry]').forEach(row => {
-    row.addEventListener('click', () => selectEntry(row.dataset.entry));
-    row.addEventListener('dblclick', () => { const entry = state.entries.find(item => item.relative_path === row.dataset.entry); if (entry && ['folder','submodule'].includes(entry.kind)) openDirectory(entry.relative_path); });
-    row.querySelector('.folder-arrow')?.addEventListener('click', event => { event.stopPropagation(); const entry = state.entries.find(item => item.relative_path === row.dataset.entry); if (entry && ['folder','submodule'].includes(entry.kind)) openDirectory(entry.relative_path); });
+    row.addEventListener('click', () => {
+      const entry = state.entries.find(item => item.relative_path === row.dataset.entry);
+      if (entry && ['folder','submodule'].includes(entry.kind)) { openDirectory(entry.relative_path); return; }
+      selectEntry(row.dataset.entry);
+    });
     row.addEventListener('contextmenu', event => {
       const entry = state.entries.find(item => item.relative_path === row.dataset.entry);
       if (entry?.kind !== 'submodule') return;
