@@ -1,6 +1,9 @@
 src-tauri/target/
 .build-windows/
-dist/
+dist/*
+!dist/windows/
+dist/windows/*
+!dist/windows/git-integrity.exe
 .DS_Store
 *.log
 
