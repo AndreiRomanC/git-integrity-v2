@@ -652,8 +652,7 @@ pub fn entry_details(repository_path: String, relative_path: String) -> Result<E
     let modified = metadata.modified().ok().and_then(|time| time.duration_since(UNIX_EPOCH).ok()).map(|value| value.as_secs()).unwrap_or(0);
     let item_count = metadata.is_dir().then(|| fs::read_dir(&absolute).map(|items| items.count()).unwrap_or(0));
 
-    let last = path_history(repository_path.clone(), relative_string.clone()).ok().and_then(|history| history.into_iter().next())
-        .map(|commit| (commit.id, commit.subject, commit.author, commit.date));
+    let last = last_commit_touching_path(&repository_path, &relative);
     let submodule_url = (kind == "submodule").then(|| submodule_value(&repository_path, &relative_string, "url")).flatten();
     let submodule_branch = (kind == "submodule").then(|| submodule_value(&repository_path, &relative_string, "branch")).flatten();
     let submodule_push_status = (kind == "submodule").then(|| submodule_push_status(&absolute.to_string_lossy())).flatten();
@@ -927,6 +926,32 @@ pub fn restore_remote_file(repository_path: String, relative_path: String, remot
     let repo = internal_repository(&repository_path)?; repo.find_remote(remote).map_err(|_| "The selected remote is not configured".to_string())?;
     git(&repository_path, &["fetch", remote]).map_err(|detail| format!("Fetch failed: {detail}"))?;
     restore_file(repository_path, relative_path, remote_ref.to_string())
+}
+
+// entry_details only needs the single most recent commit that touched a path (for
+// its "Last Commit" section) — it used to get this via `path_history(...).next()`,
+// which computed the *entire* matching history (walking up to 500 commits, diffing
+// each one) just to throw away everything after the first result. This walks the
+// same way but stops the instant a match is found, which is the overwhelmingly
+// common case (most viewed files were touched somewhat recently) and was, on a
+// large/long-lived repository, one of the biggest remaining sources of the
+// "selecting anything is slow, and it gets worse the deeper you navigate" feeling
+// — every single click paid for a full history walk regardless of depth.
+fn last_commit_touching_path(repository_path: &str, relative: &Path) -> Option<(String, String, String, String)> {
+    let repo = internal_repository(repository_path).ok()?;
+    let mut walk = repo.revwalk().ok()?; walk.push_head().ok()?; let _ = walk.set_sorting(Sort::TOPOLOGICAL | Sort::TIME);
+    for oid in walk.flatten().take(2000) {
+        let Ok(commit) = repo.find_commit(oid) else { continue };
+        let matches = if relative.as_os_str().is_empty() { true } else {
+            let parent_tree = commit.parent(0).ok().and_then(|parent| parent.tree().ok());
+            let mut options = git2::DiffOptions::new(); options.pathspec(relative);
+            commit.tree().ok().and_then(|tree| repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), Some(&mut options)).ok()).map(|diff| diff.deltas().next().is_some()).unwrap_or(false)
+        };
+        if matches {
+            return Some((oid.to_string(), commit.summary().unwrap_or("No message").to_string(), commit.author().name().unwrap_or("Unknown").to_string(), short_date(commit.time().seconds())));
+        }
+    }
+    None
 }
 
 #[tauri::command]
