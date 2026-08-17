@@ -23,6 +23,24 @@ fn metadata_cache() -> &'static Mutex<HashMap<String, (Instant, GitMetadata)>> {
     GIT_METADATA_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+// tracked/submodules (from the index) don't depend on which folder is being
+// browsed, so callers that only need those — not the working-tree status scan —
+// can use this instead of paying for a (possibly scoped) status scan they don't need.
+static INDEX_METADATA_CACHE: OnceLock<Mutex<HashMap<String, (Instant, (HashSet<String>, HashSet<String>))>>> = OnceLock::new();
+
+fn index_metadata_cache() -> &'static Mutex<HashMap<String, (Instant, (HashSet<String>, HashSet<String>))>> {
+    INDEX_METADATA_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cached_index_metadata(repository: &str) -> (HashSet<String>, HashSet<String>) {
+    if let Some((cached_at, data)) = index_metadata_cache().lock().unwrap().get(repository) {
+        if cached_at.elapsed() < GIT_METADATA_TTL { return data.clone(); }
+    }
+    let data = index_metadata(repository);
+    index_metadata_cache().lock().unwrap().insert(repository.to_string(), (Instant::now(), data.clone()));
+    data
+}
+
 #[derive(Serialize)]
 pub struct RepositoryInfo { path: String, name: String, current_branch: String }
 
@@ -144,13 +162,19 @@ fn internal_repository(path: &str) -> Result<Repository, String> {
     Repository::discover(path).map_err(|error| format!("Cannot open Git repository: {error}"))
 }
 
-fn internal_statuses(repository: &Repository) -> Result<Vec<(String, String, bool)>, String> {
+fn internal_statuses(repository: &Repository, scope: Option<&str>) -> Result<Vec<(String, String, bool)>, String> {
     let mut options = StatusOptions::new();
     // Not recursing into wholly-untracked directories avoids enumerating every file
     // inside them individually (a major cost on large repos with big non-gitignored
     // directories, e.g. build output) — libgit2 still reports one entry for the
     // directory itself, which is all `status_for` needs to flag it as changed.
     options.include_untracked(true).recurse_untracked_dirs(false).include_ignored(false).renames_head_to_index(true).renames_index_to_workdir(true);
+    // Scanning the whole working tree on every folder click is what made navigation
+    // painfully slow on large repositories (worse still on Windows, where the same
+    // filesystem calls are typically slower than on macOS/Linux) — a pathspec limits
+    // the scan to just the folder being viewed, so cost scales with that folder's
+    // size instead of the entire repository's.
+    if let Some(scope) = scope { if !scope.is_empty() { options.pathspec(scope); } }
     let statuses = repository.statuses(Some(&mut options)).map_err(|error| error.message().to_string())?;
     Ok(statuses.iter().filter_map(|entry| {
         let path = entry.path()?.to_string(); let value = entry.status();
@@ -222,37 +246,60 @@ fn submodule_value(repository: &str, path: &str, field: &str) -> Option<String> 
     match field { "url" => submodule.url().map(String::from), "branch" => submodule.branch().map(String::from), _ => None }
 }
 
-fn worktree_status(repository: &str) -> Vec<(String, String)> {
-    internal_repository(repository).ok().and_then(|repo| internal_statuses(&repo).ok()).unwrap_or_default().into_iter().map(|(path, status, _)| (path, status)).collect()
+fn worktree_status(repository: &str, scope: Option<&str>) -> Vec<(String, String)> {
+    internal_repository(repository).ok().and_then(|repo| internal_statuses(&repo, scope).ok()).unwrap_or_default().into_iter().map(|(path, status, _)| (path, status)).collect()
 }
 
-fn build_git_metadata(repository: &str, statuses: Option<Vec<(String, String)>>) -> GitMetadata {
-    let mut metadata = GitMetadata { statuses: statuses.unwrap_or_else(|| worktree_status(repository)), ..GitMetadata::default() };
+// tracked/submodules come from the index (a compact binary read, no per-file stat
+// calls) so scanning it fully is cheap regardless of repository size — only the
+// working-tree status scan needs to be scoped to stay fast on large repositories.
+fn index_metadata(repository: &str) -> (HashSet<String>, HashSet<String>) {
+    let mut tracked = HashSet::new(); let mut submodules = HashSet::new();
     if let Ok(repo) = internal_repository(repository) {
         if let Ok(index) = repo.index() { for entry in index.iter() {
-            let path = String::from_utf8_lossy(&entry.path).into_owned(); metadata.tracked.insert(path.clone());
-            if entry.mode == 0o160000 { metadata.submodules.insert(path); }
+            let path = String::from_utf8_lossy(&entry.path).into_owned(); tracked.insert(path.clone());
+            if entry.mode == 0o160000 { submodules.insert(path); }
         } }
     }
-    metadata
+    (tracked, submodules)
 }
 
-fn cached_git_metadata(repository: &str) -> GitMetadata {
-    if let Some((cached_at, metadata)) = metadata_cache().lock().unwrap().get(repository) {
+fn build_git_metadata(repository: &str, scope: Option<&str>, statuses: Option<Vec<(String, String)>>) -> GitMetadata {
+    let (tracked, submodules) = cached_index_metadata(repository);
+    GitMetadata { statuses: statuses.unwrap_or_else(|| worktree_status(repository, scope)), tracked, submodules }
+}
+
+// Cache key includes the scope so different folders (and the unscoped "whole
+// repository" view) are cached independently — browsing into a small folder inside
+// a huge repository should be fast even if the repository-wide view was scanned
+// moments ago, and vice versa.
+fn metadata_cache_key(repository: &str, scope: &str) -> String { format!("{repository}\u{0}{scope}") }
+
+fn cached_git_metadata(repository: &str, scope: &str) -> GitMetadata {
+    let key = metadata_cache_key(repository, scope);
+    if let Some((cached_at, metadata)) = metadata_cache().lock().unwrap().get(&key) {
         if cached_at.elapsed() < GIT_METADATA_TTL { return metadata.clone(); }
     }
-    let metadata = build_git_metadata(repository, None);
-    metadata_cache().lock().unwrap().insert(repository.to_string(), (Instant::now(), metadata.clone()));
+    let metadata = build_git_metadata(repository, Some(scope), None);
+    metadata_cache().lock().unwrap().insert(key, (Instant::now(), metadata.clone()));
     metadata
 }
 
 fn replace_git_metadata(repository: &str, statuses: Vec<(String, String)>) {
-    let metadata = build_git_metadata(repository, Some(statuses));
-    metadata_cache().lock().unwrap().insert(repository.to_string(), (Instant::now(), metadata));
+    // `statuses` here is always a full, unscoped scan (from load_repository, which
+    // needs every change for the Changes drawer regardless of folder) — seed the
+    // repository-wide cache entry with it instead of discarding that work.
+    let metadata = build_git_metadata(repository, None, Some(statuses));
+    metadata_cache().lock().unwrap().insert(metadata_cache_key(repository, ""), (Instant::now(), metadata));
 }
 
 fn invalidate_git_metadata(repository: &str) {
-    metadata_cache().lock().unwrap().remove(repository);
+    // Cache keys are "{repository}\0{scope}" (one entry per folder that's been
+    // browsed) — a mutation can affect any of them, so drop every scope cached for
+    // this repository, not just the unscoped entry.
+    let prefix = format!("{repository}\u{0}");
+    metadata_cache().lock().unwrap().retain(|key, _| !key.starts_with(&prefix));
+    index_metadata_cache().lock().unwrap().remove(repository);
 }
 
 fn remove_submodule_section(path: &Path, name: &str) -> Result<(), String> {
@@ -414,7 +461,7 @@ pub fn load_repository(path: String) -> Result<RepositoryData, String> {
         commits.push(Commit { id: oid.to_string(), parents: commit.parent_ids().map(|id| id.to_string()).collect(), subject: commit.summary().unwrap_or("No message").to_string(), author: commit.author().name().unwrap_or("Unknown").to_string(), date: short_date(commit.time().seconds()), refs: refs_by_oid.remove(&oid.to_string()).unwrap_or_default(), lane: 0 });
     } }
 
-    let internal = internal_statuses(&repo)?;
+    let internal = internal_statuses(&repo, None)?;
     let statuses = internal.iter().map(|(path, status, _)| (path.clone(), status.clone())).collect::<Vec<_>>();
     let changes = internal.into_iter().map(|(path, status, staged)| Change { status, path, staged }).collect();
 
@@ -560,7 +607,7 @@ pub fn load_directory(repository_path: String, relative_path: String) -> Result<
     let absolute = Path::new(&repository_path).join(&relative);
     if !absolute.is_dir() { return Err("The selected path is not a folder".into()); }
 
-    let git_metadata = cached_git_metadata(&repository_path);
+    let git_metadata = cached_git_metadata(&repository_path, &relative_path);
     let mut entries = Vec::new();
 
     for item in fs::read_dir(&absolute).map_err(|error| error.to_string())? {
@@ -595,7 +642,7 @@ pub fn entry_details(repository_path: String, relative_path: String) -> Result<E
     let absolute = Path::new(&repository_path).join(&relative);
     let metadata = fs::symlink_metadata(&absolute).map_err(|error| error.to_string())?;
     let relative_string = normalized(&relative);
-    let git_metadata = cached_git_metadata(&repository_path);
+    let git_metadata = cached_git_metadata(&repository_path, &relative_string);
     let kind = if git_metadata.submodules.contains(&relative_string) { "submodule" }
         else if metadata.file_type().is_symlink() { "symlink" }
         else if metadata.is_dir() { "folder" } else { "file" }.to_string();
@@ -639,7 +686,7 @@ fn submodule_push_status(sub_path: &str) -> Option<String> {
 fn validate_submodule(repository_path: &str, relative_path: &str) -> Result<PathBuf, String> {
     let relative = safe_relative_path(relative_path)?;
     let normalized_path = normalized(&relative);
-    if !cached_git_metadata(repository_path).submodules.contains(&normalized_path) { return Err("The selected folder is not a Git submodule".into()); }
+    if !cached_index_metadata(repository_path).1.contains(&normalized_path) { return Err("The selected folder is not a Git submodule".into()); }
     let absolute = Path::new(repository_path).join(relative);
     if !absolute.is_dir() { return Err("The submodule is not initialized".into()); }
     internal_repository(absolute.to_str().unwrap_or_default())?;
@@ -677,7 +724,7 @@ pub fn add_submodule(repository_path: String, parent_path: String, url: String, 
 
     let repo = internal_repository(&repository_path)?;
     let destination = Path::new(&repository_path).join(&relative);
-    let indexed = build_git_metadata(&repository_path, None).tracked.contains(&relative_string);
+    let indexed = cached_index_metadata(&repository_path).0.contains(&relative_string);
     let stale_name = repo.submodules().ok().and_then(|items| items.into_iter()
         .find(|item| normalized(item.path()) == relative_string)
         .map(|item| item.name().unwrap_or(&relative_string).to_string()));
@@ -762,9 +809,9 @@ pub fn remove_git_path(repository_path: String, relative_path: String) -> Result
     validate_path(&repository_path)?;
     let relative = normalized(&safe_relative_path(&relative_path)?);
     if relative.is_empty() { return Err("The repository root cannot be removed".into()); }
-    let metadata = build_git_metadata(&repository_path, None);
+    let (tracked, _) = cached_index_metadata(&repository_path);
     let prefix = format!("{relative}/");
-    if !metadata.tracked.contains(&relative) && !metadata.tracked.iter().any(|path| path.starts_with(&prefix)) {
+    if !tracked.contains(&relative) && !tracked.iter().any(|path| path.starts_with(&prefix)) {
         return Err("This item is not tracked by Git. Remove it with the operating system if intended".into());
     }
     let repo = internal_repository(&repository_path)?;
@@ -796,9 +843,9 @@ pub fn delete_local_path(repository_path: String, relative_path: String) -> Resu
     let relative_string = normalized(&relative);
     if relative_string.is_empty() { return Err("The repository root cannot be deleted".into()); }
     // Destructive checks must reflect the current index, not an older Explorer snapshot.
-    let metadata = build_git_metadata(&repository_path, None);
+    let (tracked, _) = cached_index_metadata(&repository_path);
     let prefix = format!("{relative_string}/");
-    if metadata.tracked.contains(&relative_string) || metadata.tracked.iter().any(|path| path.starts_with(&prefix)) {
+    if tracked.contains(&relative_string) || tracked.iter().any(|path| path.starts_with(&prefix)) {
         return Err("This item is tracked. Use Remove from Git so the deletion can be committed".into());
     }
     let repo = internal_repository(&repository_path)?;
@@ -926,8 +973,8 @@ fn default_remote_ref(repository: &str) -> Option<String> {
 // repository and its own remote, or every file in it would incorrectly and
 // permanently show as "local-only" regardless of whether it was ever pushed.
 fn resolve_submodule_boundary(repository_path: &str, relative_path: &str) -> Option<(String, String)> {
-    let metadata = cached_git_metadata(repository_path);
-    let submodule_path = metadata.submodules.iter().find(|sub| relative_path == sub.as_str() || relative_path.starts_with(&format!("{sub}/")))?.clone();
+    let (_, submodules) = cached_index_metadata(repository_path);
+    let submodule_path = submodules.iter().find(|sub| relative_path == sub.as_str() || relative_path.starts_with(&format!("{sub}/")))?.clone();
     let absolute_sub = Path::new(repository_path).join(&submodule_path);
     let sub_path_string = absolute_sub.to_string_lossy().into_owned();
     let inner_relative = if relative_path == submodule_path { String::new() } else { relative_path[submodule_path.len() + 1..].to_string() };
@@ -947,7 +994,7 @@ pub fn compare_remote_directory(repository_path: String, relative_path: String, 
     let commit = resolve_commit(&repository_path, &remote_ref)?;
     let mut remote = remote_directory_entries(&repository_path, &commit, &relative_path)?;
     let changed = changed_paths_against(&repository_path, &commit, &relative_path);
-    let git_metadata = cached_git_metadata(&repository_path);
+    let git_metadata = cached_git_metadata(&repository_path, &relative_path);
     let mut rows = Vec::new();
 
     let local_items = if absolute.is_dir() {
@@ -1085,7 +1132,7 @@ pub fn push_submodule(repository_path: String, relative_path: String) -> Result<
     // Warn explicitly about uncommitted edits before pushing — otherwise a push can
     // silently "succeed" while leaving the user's freshest work off the server, with
     // no indication anything was left behind.
-    let dirty = internal_statuses(&repo)?;
+    let dirty = internal_statuses(&repo, None)?;
     if !dirty.is_empty() {
         let files: Vec<String> = dirty.iter().take(5).map(|(path, status, _)| format!("{status} {path}")).collect();
         let more = if dirty.len() > 5 { format!(" (+{} more)", dirty.len() - 5) } else { String::new() };
@@ -1159,7 +1206,7 @@ pub fn force_push_submodule(repository_path: String, relative_path: String) -> R
     let repo = internal_repository(&sub_path)?;
     let local_target = repo.head().ok().and_then(|head| head.target());
 
-    let dirty = internal_statuses(&repo)?;
+    let dirty = internal_statuses(&repo, None)?;
     if !dirty.is_empty() {
         let files: Vec<String> = dirty.iter().take(5).map(|(path, status, _)| format!("{status} {path}")).collect();
         let more = if dirty.len() > 5 { format!(" (+{} more)", dirty.len() - 5) } else { String::new() };
@@ -1200,7 +1247,7 @@ pub fn pull_submodule(repository_path: String, relative_path: String) -> Result<
     let sub_path = absolute.to_string_lossy().into_owned();
     let repo = internal_repository(&sub_path)?;
 
-    let dirty = internal_statuses(&repo)?;
+    let dirty = internal_statuses(&repo, None)?;
     if !dirty.is_empty() {
         return Err("This submodule has uncommitted changes. Commit or discard them before pulling, so a fast-forward can't overwrite anything.".into());
     }
@@ -1361,7 +1408,7 @@ mod tests {
         let release = versions.versions.iter().find(|version| version.name.ends_with("release/2.4")).unwrap();
         let switched = switch_submodule_version(repository.to_string_lossy().into_owned(), "vendor/dependency".into(), release.revision.clone(), release.kind.clone(), release.name.clone()).unwrap();
         assert_eq!(switched, release.revision);
-        assert!(worktree_status(repository.to_str().unwrap()).iter().any(|(path, _)| path == "vendor/dependency"));
+        assert!(worktree_status(repository.to_str().unwrap(), None).iter().any(|(path, _)| path == "vendor/dependency"));
 
         fs::write(repository.join("src/main.c"), "int main(void) { return 1; }").unwrap();
         fs::write(repository.join("unrelated.txt"), "keep staged").unwrap();
