@@ -161,10 +161,24 @@ pub struct PublishCommit { id: String, subject: String, author: String, date: St
 #[derive(Serialize)]
 pub struct PublishStatus { branch: String, remote: String, remote_branch: String, commits: Vec<PublishCommit> }
 
+// `GIT_TERMINAL_PROMPT=0` + a null stdin are the real fix for the app
+// "freezing" on some machines (reported worse on Windows): without them, if a
+// remote needs credentials that aren't already cached (no saved token, an
+// expired credential-manager entry, a corporate proxy asking for a login…),
+// `git` tries to prompt for a username/password on a terminal that doesn't
+// exist in a GUI app — and just hangs forever waiting for input nobody can
+// ever provide, instead of failing with a clear error. With this, the same
+// situation now fails fast with Git's own "could not read... terminal
+// prompts disabled" message, which `handleError` on the frontend already
+// recognizes and gives credential-setup guidance for.
+fn configure_git_command(command: &mut Command) -> &mut Command {
+    command.env("GIT_TERMINAL_PROMPT", "0").stdin(std::process::Stdio::null())
+}
+
 fn git(path: &str, args: &[&str]) -> Result<String, String> {
-    let output = Command::new("git")
-        .arg("-C").arg(path).arg("-c").arg("color.ui=false")
-        .args(args).output().map_err(|e| format!("Cannot start Git: {e}"))?;
+    let mut command = Command::new("git");
+    command.arg("-C").arg(path).arg("-c").arg("color.ui=false").args(args);
+    let output = configure_git_command(&mut command).output().map_err(|e| format!("Cannot start Git: {e}"))?;
     if output.status.success() { Ok(String::from_utf8_lossy(&output.stdout).into_owned()) }
     else { Err(String::from_utf8_lossy(&output.stderr).trim().to_string()) }
 }
@@ -188,10 +202,9 @@ pub fn run_git_command(repository_path: String, args: String) -> Result<RawGitRe
     let parts: Vec<&str> = args.split_whitespace().collect();
     if parts.is_empty() { return Err("Type a git subcommand, e.g. \"status\" or \"log --oneline -10\"".into()); }
     if parts[0] == "git" { return Err("Don't include \"git\" itself — just the subcommand, e.g. \"status\" not \"git status\"".into()); }
-    let output = Command::new("git")
-        .arg("-C").arg(&repository_path).arg("-c").arg("color.ui=false")
-        .args(&parts)
-        .output().map_err(|e| format!("Cannot start Git: {e}"))?;
+    let mut command = Command::new("git");
+    command.arg("-C").arg(&repository_path).arg("-c").arg("color.ui=false").args(&parts);
+    let output = configure_git_command(&mut command).output().map_err(|e| format!("Cannot start Git: {e}"))?;
     invalidate_git_metadata(&repository_path);
     Ok(RawGitResult {
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
