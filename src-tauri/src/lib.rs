@@ -49,6 +49,14 @@ pub fn run() {
             repository::pull_submodule,
             repository::force_push_submodule,
             repository::file_blame,
+            repository::merge_branch,
+            repository::list_conflicts,
+            repository::conflict_sides,
+            repository::resolve_conflict,
+            repository::complete_merge,
+            repository::abort_merge,
+            repository::create_submodule_branch,
+            repository::run_git_command,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Git Integrity");

@@ -20,6 +20,8 @@
         <button id="fetchCurrent" title="Fetch current remote">↓</button>
         <button id="pullCurrent" title="Pull current branch">⇣</button>
         <button id="pushCurrent" title="Push current branch">↑</button>
+        <button id="mergeCurrent" title="Merge a branch into the current one">⑂</button>
+        <button id="openConsole" title="Command console — type what you want to do (Ctrl/Cmd+K)">⌘</button>
       </div>
     </header>
 
@@ -40,6 +42,7 @@
           <b id="changeBadge">0</b>
         </button>
         <button class="workspace-status publish-status" id="showPublish"><span class="publish-dot">↑</span><span><strong>Unpublished commits</strong><small id="publishSubtitle">Choose what goes to server</small></span><b id="publishBadge">?</b></button>
+        <button class="workspace-status" id="mergeConflictsBanner" data-tooltip="A merge is waiting for you to resolve conflicts" title="Resolve merge conflicts" hidden><span class="workspace-dot" style="background:#f06d75;"></span><span><strong>Merge conflicts</strong><small id="mergeConflictsSubtitle">0 files to resolve</small></span></button>
         <button class="workspace-status" id="stashWork" data-tooltip="Save work in progress (stash)" title="Save work in progress"><span class="workspace-dot" style="background:#b294ff;"></span><span><strong>Stash work</strong><small>Save changes temporarily</small></span></button>
         <button class="workspace-status" id="popStash" data-tooltip="Restore stashed work (pop)" title="Restore stashed work" style="display:none;"><span class="workspace-dot" style="background:#48cc7e;"></span><span><strong>Pop stash</strong><small>Restore saved changes</small></span></button>
       </aside>
@@ -150,9 +153,10 @@
 
   <dialog id="commandPalette" class="command-palette">
     <form method="dialog">
-      <input id="commandInput" type="text" placeholder="Type command or search… (Esc to close)" autocomplete="off" spellcheck="false">
+      <div id="commandContext" class="command-context"></div>
+      <input id="commandInput" type="text" placeholder="Type a command, or &quot;$ &lt;git args&gt;&quot; to run raw git…" autocomplete="off" spellcheck="false">
       <div id="commandList" class="command-list"></div>
-      <div class="command-help">Ctrl+K or Cmd+K</div>
+      <div class="command-help">↑↓ to navigate · Enter to run · "$ log --oneline" for raw git · Esc to close</div>
     </form>
   </dialog>
 
@@ -200,15 +204,15 @@
         <div class="compare-action-group">
           <span class="compare-group-label">STAGING</span>
           <button type="button" id="compareStage" data-tooltip="git add — stage this file's current content">＋ Stage</button>
-          <button type="button" id="compareUnstage" data-tooltip="Soft/Mixed reset — unstages only, keeps your edits on disk unchanged">− Soft/Mixed reset (unstage)</button>
+          <button type="button" id="compareUnstage" data-tooltip="Unstage — keeps your edits on disk unchanged, only removes the staging entry">− Unstage</button>
         </div>
         <div class="compare-action-group">
-          <span class="compare-group-label">RESET FILE</span>
-          <button type="button" id="compareRestoreHead" class="compare-action-warn" data-tooltip="Hard reset — permanently discards all edits, file becomes identical to the last commit">↶ Hard reset (discard)</button>
-          <button type="button" id="compareRestoreRemote" class="compare-action-primary" data-tooltip="Fetch + hard reset from remote — overwrites the file with the remote version">↓ Restore from remote</button>
+          <span class="compare-group-label">RESTORE FILE — pick the source</span>
+          <button type="button" id="compareRestoreHead" class="compare-action-warn" data-tooltip="Restore from your last local commit (HEAD) — permanently discards uncommitted edits, file becomes identical to what you last committed">↶ Restore from last commit (HEAD)</button>
+          <button type="button" id="compareRestoreRemote" class="compare-action-primary" data-tooltip="Fetch the latest version from the server, then overwrite this file with it — may differ from your last commit if the server has newer changes">↓ Restore from server (fetch first)</button>
         </div>
       </div>
-      <div id="recoveryHelp" class="recovery-help">Choose an action to see exactly what it changes. No repository-wide reset is performed here.</div>
+      <div id="recoveryHelp" class="recovery-help">Choose an action to see exactly what it changes. This only affects this one file — no repository-wide reset is performed here.</div>
       <strong id="compareActionStatus" role="status" class="compare-status-line">Ready — choose one action for this file.</strong>
       <div class="compare-head"><span>LOCAL</span><span>REMOTE</span></div>
       <div class="compare-content"><pre id="localCompare"></pre><pre id="remoteCompare"></pre></div>
@@ -248,6 +252,24 @@
       <div class="submodule-add-result">Creates the folder, updates <code>.gitmodules</code>, adds the Git link to the index and prepares both changes for one commit.</div>
       <div id="submoduleAddStatus" class="submodule-operation-status" role="status">Ready — destination will be shown here before anything changes.</div>
       <div class="commit-dialog-actions"><button value="cancel">Cancel</button><button type="button" id="confirmAddSubmodule" class="confirm" disabled>Add submodule</button></div>
+    </form>
+  </dialog>
+  <dialog id="mergeBranchDialog" class="clone-dialog">
+    <form method="dialog"><div class="dialog-symbol">⑂</div><h2>Merge branch</h2><p id="mergeBranchSubtitle">Bring another branch's commits into the current one.</p>
+      <label><span>MERGE INTO</span><input id="mergeBranchCurrent" readonly></label>
+      <label><span>SOURCE BRANCH</span><select id="mergeBranchSource"></select></label>
+      <div class="local-change-banner"><i></i><div><strong>This stays entirely local</strong><span>Only creates a commit on your machine. Nothing is pushed or sent to the server — push and go through your normal PR process afterward.</span></div></div>
+      <p id="mergeBranchStatus" class="submodule-operation-status" role="status"></p>
+      <div class="commit-dialog-actions"><button value="cancel">Cancel</button><button type="button" id="confirmMergeBranch" class="confirm">Merge</button></div>
+    </form>
+  </dialog>
+  <dialog id="conflictsDialog" class="publish-dialog">
+    <form method="dialog"><header><div><h2>Merge conflicts</h2><p id="conflictsSubtitle">Resolve each file, then complete the merge.</p></div><button value="cancel">×</button></header>
+      <div id="conflictsList" class="conflicts-list"></div>
+      <label class="commit-scope-label"><span>MERGE COMMIT MESSAGE</span><input id="conflictsCommitMessage" placeholder="Merge branch …"></label>
+      <p class="conflicts-local-note">This only affects your local repository. Push and continue through your normal PR process once complete.</p>
+      <p id="conflictsStatus" class="submodule-operation-status" role="status"></p>
+      <footer><button type="button" id="abortMerge" class="danger-action-soft">Abort merge</button><span style="flex:1"></span><button value="cancel">Close</button><button type="button" value="default" id="confirmCompleteMerge" class="confirm">Complete merge</button></footer>
     </form>
   </dialog>
   <script src="app.js"></script>

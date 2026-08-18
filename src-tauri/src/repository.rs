@@ -87,6 +87,14 @@ pub struct EntryDetails {
     last_commit_subject: Option<String>,
     last_commit_author: Option<String>,
     last_commit_date: Option<String>,
+    // For a submodule, `last_commit_*` above is the *parent's* commit that last
+    // touched the gitlink — usually just "Update submodule to <sha>", not
+    // informative on its own. These are the submodule's own HEAD commit, i.e.
+    // the one that actually carries the real change description.
+    submodule_commit_id: Option<String>,
+    submodule_commit_subject: Option<String>,
+    submodule_commit_author: Option<String>,
+    submodule_commit_date: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -161,6 +169,37 @@ fn git(path: &str, args: &[&str]) -> Result<String, String> {
     else { Err(String::from_utf8_lossy(&output.stderr).trim().to_string()) }
 }
 
+#[derive(Serialize)]
+pub struct RawGitResult { stdout: String, stderr: String, success: bool }
+
+// The command console's "run any git command" escape hatch — scoped to whatever
+// folder the caller passes (the folder currently being browsed, or a selected
+// submodule), using `git -C <path>` exactly like the rest of this file's shell
+// calls. `Command::args` passes each token as a literal argument straight to the
+// `git` binary — never through a shell — so there is no shell-injection surface
+// here regardless of what the user types (no `;`, `&&`, backticks etc. have any
+// special meaning). It genuinely can run destructive commands if asked to
+// (that's the point), so the frontend must confirm before anything recognizably
+// destructive; this only enforces that the first token isn't literally "git"
+// again (a common typo: pasting "git status" here instead of just "status").
+#[tauri::command]
+pub fn run_git_command(repository_path: String, args: String) -> Result<RawGitResult, String> {
+    validate_path(&repository_path)?;
+    let parts: Vec<&str> = args.split_whitespace().collect();
+    if parts.is_empty() { return Err("Type a git subcommand, e.g. \"status\" or \"log --oneline -10\"".into()); }
+    if parts[0] == "git" { return Err("Don't include \"git\" itself — just the subcommand, e.g. \"status\" not \"git status\"".into()); }
+    let output = Command::new("git")
+        .arg("-C").arg(&repository_path).arg("-c").arg("color.ui=false")
+        .args(&parts)
+        .output().map_err(|e| format!("Cannot start Git: {e}"))?;
+    invalidate_git_metadata(&repository_path);
+    Ok(RawGitResult {
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        success: output.status.success(),
+    })
+}
+
 fn internal_repository(path: &str) -> Result<Repository, String> {
     Repository::discover(path).map_err(|error| format!("Cannot open Git repository: {error}"))
 }
@@ -193,7 +232,7 @@ fn internal_statuses(repository: &Repository, scope: Option<&str>) -> Result<Vec
     Ok(statuses.iter().filter_map(|entry| {
         let path = entry.path()?.to_string(); let value = entry.status();
         let staged = value.intersects(Status::INDEX_NEW | Status::INDEX_MODIFIED | Status::INDEX_DELETED | Status::INDEX_RENAMED | Status::INDEX_TYPECHANGE);
-        let code = if value.contains(Status::WT_NEW) { "??" } else if value.intersects(Status::WT_DELETED | Status::INDEX_DELETED) { "D" } else if value.intersects(Status::INDEX_NEW) { "A" } else if value.intersects(Status::WT_RENAMED | Status::INDEX_RENAMED) { "R" } else { "M" };
+        let code = if value.contains(Status::CONFLICTED) { "U" } else if value.contains(Status::WT_NEW) { "??" } else if value.intersects(Status::WT_DELETED | Status::INDEX_DELETED) { "D" } else if value.intersects(Status::INDEX_NEW) { "A" } else if value.intersects(Status::WT_RENAMED | Status::INDEX_RENAMED) { "R" } else { "M" };
         Some((path, code.to_string(), staged))
     }).collect())
 }
@@ -534,6 +573,24 @@ pub fn create_branch(path: String, branch: String) -> Result<(), String> {
     let repo = internal_repository(&path)?; let head = repo.head().and_then(|head| head.peel_to_commit()).map_err(|error| error.message().to_string())?; repo.branch(branch.trim(), &head, false).map_err(|error| error.message().to_string())?; drop(head); switch_branch(path, branch)
 }
 
+// Creates and switches to a new branch inside a submodule's own repository —
+// same as `create_branch`, just resolved to the submodule's path first, and
+// with the parent's index refreshed afterward so it stays consistent with
+// what every other submodule-state-changing action in this app already does
+// (the commit itself doesn't change, but this keeps "modified" status honest).
+#[tauri::command]
+pub fn create_submodule_branch(repository_path: String, relative_path: String, branch: String) -> Result<(), String> {
+    if branch.trim().is_empty() { return Err("Branch name cannot be empty".into()); }
+    validate_path(&repository_path)?;
+    let absolute = validate_submodule(&repository_path, &relative_path)?;
+    create_branch(absolute.to_string_lossy().into_owned(), branch)?;
+    let parent = internal_repository(&repository_path)?;
+    let mut submodule = parent.find_submodule(&relative_path).map_err(|error| error.message().to_string())?;
+    submodule.add_to_index(true).map_err(|error| format!("Branch created, but the parent index could not be updated: {}", error.message()))?;
+    invalidate_git_metadata(&repository_path);
+    Ok(())
+}
+
 #[tauri::command]
 pub fn switch_branch(path: String, branch: String) -> Result<(), String> {
     let repo = internal_repository(&path)?; let reference = format!("refs/heads/{}", branch.trim()); repo.find_reference(&reference).map_err(|error| error.message().to_string())?; repo.set_head(&reference).map_err(|error| error.message().to_string())?; let mut checkout = git2::build::CheckoutBuilder::new(); checkout.safe(); repo.checkout_head(Some(&mut checkout)).map_err(|error| error.message().to_string())?; invalidate_git_metadata(&path); Ok(())
@@ -588,6 +645,214 @@ pub fn sync_repository(repository_path: String, action: String) -> Result<(), St
         "pull" => { fetch_remote(repository_path.clone(), remote_name.into())?; let remote_ref = repo.find_reference(&format!("refs/remotes/{remote_name}/{remote_branch}")).map_err(|error| error.message().to_string())?; let target = remote_ref.target().ok_or("Remote branch has no target")?; let annotated = repo.find_annotated_commit(target).map_err(|error| error.message().to_string())?; let (analysis, _) = repo.merge_analysis(&[&annotated]).map_err(|error| error.message().to_string())?; if !analysis.is_fast_forward() && !analysis.is_up_to_date() { return Err("Pull requires a merge; only fast-forward pull is allowed".into()); } if analysis.is_fast_forward() { let mut local = repo.find_reference(&format!("refs/heads/{branch}")).map_err(|error| error.message().to_string())?; local.set_target(target, "fast-forward pull").map_err(|error| error.message().to_string())?; repo.set_head(&format!("refs/heads/{branch}")).map_err(|error| error.message().to_string())?; let mut checkout = git2::build::CheckoutBuilder::new(); checkout.safe(); repo.checkout_head(Some(&mut checkout)).map_err(|error| error.message().to_string())?; } }
         "push" => { repo.find_remote(remote_name).map_err(|error| error.message().to_string())?; git(&repository_path, &["push", remote_name, &format!("{branch}:refs/heads/{remote_branch}")]).map_err(|detail| format!("Push failed: {detail}"))?; }
         _ => return Err("Unsupported synchronization action".into()), }
+    invalidate_git_metadata(&repository_path);
+    Ok(())
+}
+
+#[derive(Serialize, Clone)]
+pub struct ConflictedFile { path: String, has_ours: bool, has_theirs: bool }
+
+#[derive(Serialize)]
+pub struct MergeOutcome { status: String, message: String, conflicts: Vec<ConflictedFile> }
+
+#[derive(Serialize)]
+pub struct ConflictSides { ancestor: Option<String>, ours: Option<String>, theirs: Option<String> }
+
+fn blob_text(repo: &Repository, id: Option<git2::Oid>) -> Option<String> {
+    let id = id?;
+    let blob = repo.find_blob(id).ok()?;
+    Some(String::from_utf8_lossy(blob.content()).into_owned())
+}
+
+fn gather_conflicts(repo: &Repository) -> Result<Vec<ConflictedFile>, String> {
+    let index = repo.index().map_err(|error| error.message().to_string())?;
+    let conflicts = index.conflicts().map_err(|error| error.message().to_string())?;
+    let mut files = Vec::new();
+    for conflict in conflicts.flatten() {
+        let path = conflict.our.as_ref().or(conflict.their.as_ref()).or(conflict.ancestor.as_ref())
+            .map(|entry| String::from_utf8_lossy(&entry.path).into_owned());
+        if let Some(path) = path {
+            files.push(ConflictedFile { path, has_ours: conflict.our.is_some(), has_theirs: conflict.their.is_some() });
+        }
+    }
+    Ok(files)
+}
+
+// Generic merge — works identically on the main repository or a submodule's own
+// repository (a submodule is just another repository at a different path), used
+// both as the explicit "Merge branch…" action and as the fallback offered when a
+// fast-forward-only pull refuses because of a real divergence.
+//
+// All merge/conflict commands below take (repository_path, target_path, ...) —
+// same convention as the submodule action commands — so the same code works
+// identically on the main repository (target_path == "") or on a submodule
+// (target_path == the submodule's path within the parent), which is just
+// another repository at a different location on disk.
+fn resolve_target_repository(repository_path: &str, target_path: &str) -> Result<String, String> {
+    if target_path.trim().is_empty() { return Ok(repository_path.to_string()); }
+    Ok(validate_submodule(repository_path, target_path)?.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+pub fn merge_branch(repository_path: String, target_path: String, source_ref: String) -> Result<MergeOutcome, String> {
+    let repository_path = resolve_target_repository(&repository_path, &target_path)?;
+    validate_path(&repository_path)?;
+    let mut repo = internal_repository(&repository_path)?;
+    if repo.state() != git2::RepositoryState::Clean {
+        return Err("A merge (or other operation) is already in progress here. Resolve or abort it first.".into());
+    }
+    let dirty = internal_statuses(&repo, None)?;
+    if !dirty.is_empty() {
+        return Err("There are uncommitted changes here. Commit or stash them first, so a merge can't mix them up with incoming changes.".into());
+    }
+    if repo.head_detached().unwrap_or(true) {
+        return Err("This is a detached HEAD (not on a branch), so there is nothing to merge into.".into());
+    }
+    let current_branch = repo.head().ok().and_then(|head| head.shorthand().map(String::from)).ok_or("Could not determine the current branch")?;
+    let reference = repo.resolve_reference_from_short_name(source_ref.trim()).map_err(|_| format!("Could not find branch \"{source_ref}\" — fetch first if it's a remote branch."))?;
+    let annotated = repo.reference_to_annotated_commit(&reference).map_err(|error| error.message().to_string())?;
+    let (analysis, _) = repo.merge_analysis(&[&annotated]).map_err(|error| error.message().to_string())?;
+
+    if analysis.is_up_to_date() {
+        return Ok(MergeOutcome { status: "up_to_date".into(), message: format!("{current_branch} is already up to date with {source_ref}."), conflicts: vec![] });
+    }
+    if analysis.is_fast_forward() {
+        let target = annotated.id();
+        let mut local = repo.find_reference(&format!("refs/heads/{current_branch}")).map_err(|error| error.message().to_string())?;
+        local.set_target(target, "fast-forward merge").map_err(|error| error.message().to_string())?;
+        repo.set_head(&format!("refs/heads/{current_branch}")).map_err(|error| error.message().to_string())?;
+        let mut checkout = git2::build::CheckoutBuilder::new(); checkout.force();
+        repo.checkout_head(Some(&mut checkout)).map_err(|error| error.message().to_string())?;
+        invalidate_git_metadata(&repository_path);
+        return Ok(MergeOutcome { status: "fast_forwarded".into(), message: format!("Fast-forwarded {current_branch} to {source_ref}."), conflicts: vec![] });
+    }
+
+    let mut checkout = git2::build::CheckoutBuilder::new();
+    // Conflicts are expected here — write the standard `<<<<<<<`/`=======`/`>>>>>>>`
+    // marker files to disk instead of aborting, so they can be resolved below.
+    checkout.allow_conflicts(true).conflict_style_merge(true).force();
+    repo.merge(&[&annotated], None, Some(&mut checkout)).map_err(|error| error.message().to_string())?;
+    invalidate_git_metadata(&repository_path);
+    drop(annotated); drop(reference);
+
+    let index = repo.index().map_err(|error| error.message().to_string())?;
+    if index.has_conflicts() {
+        let conflicts = gather_conflicts(&repo)?;
+        let count = conflicts.len();
+        return Ok(MergeOutcome { status: "conflicts".into(), message: format!("Merging {source_ref} produced {count} conflict{}. Resolve them, then complete the merge.", if count == 1 { "" } else { "s" }), conflicts });
+    }
+
+    // No conflicts — the merge resolved automatically; finish it with a commit
+    // right away instead of leaving the repository in a pending-merge state.
+    drop(index);
+    let oid = complete_merge_internal(&mut repo, &repository_path, &format!("Merge {source_ref} into {current_branch}"))?;
+    Ok(MergeOutcome { status: "merged".into(), message: format!("Merged {source_ref} into {current_branch} ({}).", &oid[..8.min(oid.len())]), conflicts: vec![] })
+}
+
+#[tauri::command]
+pub fn list_conflicts(repository_path: String, target_path: String) -> Result<Vec<ConflictedFile>, String> {
+    let repository_path = resolve_target_repository(&repository_path, &target_path)?;
+    validate_path(&repository_path)?;
+    let repo = internal_repository(&repository_path)?;
+    gather_conflicts(&repo)
+}
+
+#[tauri::command]
+pub fn conflict_sides(repository_path: String, target_path: String, relative_path: String) -> Result<ConflictSides, String> {
+    let repository_path = resolve_target_repository(&repository_path, &target_path)?;
+    validate_path(&repository_path)?;
+    let relative = safe_relative_path(&relative_path)?; let relative = normalized(&relative);
+    let repo = internal_repository(&repository_path)?;
+    let index = repo.index().map_err(|error| error.message().to_string())?;
+    let conflicts = index.conflicts().map_err(|error| error.message().to_string())?;
+    for conflict in conflicts.flatten() {
+        let path = conflict.our.as_ref().or(conflict.their.as_ref()).or(conflict.ancestor.as_ref()).map(|entry| String::from_utf8_lossy(&entry.path).into_owned());
+        if path.as_deref() != Some(relative.as_str()) { continue; }
+        return Ok(ConflictSides {
+            ancestor: blob_text(&repo, conflict.ancestor.as_ref().map(|entry| entry.id)),
+            ours: blob_text(&repo, conflict.our.as_ref().map(|entry| entry.id)),
+            theirs: blob_text(&repo, conflict.their.as_ref().map(|entry| entry.id)),
+        });
+    }
+    Err(format!("{relative_path} is not a conflicted file"))
+}
+
+#[tauri::command]
+pub fn resolve_conflict(repository_path: String, target_path: String, relative_path: String, resolution: String) -> Result<(), String> {
+    let repository_path = resolve_target_repository(&repository_path, &target_path)?;
+    validate_path(&repository_path)?;
+    let relative = safe_relative_path(&relative_path)?;
+    let repo = internal_repository(&repository_path)?;
+    let absolute = Path::new(&repository_path).join(&relative);
+    match resolution.as_str() {
+        "ours" | "theirs" => {
+            let index = repo.index().map_err(|error| error.message().to_string())?;
+            let conflicts = index.conflicts().map_err(|error| error.message().to_string())?;
+            let target = normalized(&relative);
+            let mut content = None;
+            for conflict in conflicts.flatten() {
+                let entry = if resolution == "ours" { conflict.our } else { conflict.their };
+                let Some(entry) = entry else { continue };
+                if String::from_utf8_lossy(&entry.path) != target { continue; }
+                content = blob_text(&repo, Some(entry.id));
+                break;
+            }
+            let content = content.ok_or_else(|| format!("No {resolution} version exists for {relative_path} (it may have been added only on one side — deleting or keeping the existing file may be more appropriate)."))?;
+            fs::write(&absolute, content).map_err(|error| format!("Cannot write {}: {error}", absolute.display()))?;
+        }
+        "manual" => { if !absolute.exists() { return Err(format!("{relative_path} does not exist on disk — nothing to mark resolved.")); } }
+        other => return Err(format!("Unknown resolution kind \"{other}\"")),
+    }
+    let mut index = repo.index().map_err(|error| error.message().to_string())?;
+    index.add_path(&relative).map_err(|error| error.message().to_string())?;
+    index.write().map_err(|error| error.message().to_string())?;
+    invalidate_git_metadata(&repository_path);
+    Ok(())
+}
+
+fn complete_merge_internal(repo: &mut Repository, repository_path: &str, message: &str) -> Result<String, String> {
+    let mut index = repo.index().map_err(|error| error.message().to_string())?;
+    if index.has_conflicts() { return Err("There are still unresolved conflicts.".into()); }
+    let mut merge_heads = Vec::new();
+    repo.mergehead_foreach(|oid| { merge_heads.push(*oid); true }).map_err(|error| error.message().to_string())?;
+    let head_commit = repo.head().ok().and_then(|head| head.peel_to_commit().ok());
+    let mut parents = Vec::new();
+    if let Some(commit) = head_commit.as_ref() { parents.push(commit.clone()); }
+    for oid in &merge_heads { if let Ok(commit) = repo.find_commit(*oid) { parents.push(commit); } }
+    let tree_id = index.write_tree_to(repo).map_err(|error| error.message().to_string())?;
+    let tree = repo.find_tree(tree_id).map_err(|error| error.message().to_string())?;
+    let signature = repo.signature().map_err(|_| "Configure user.name and user.email for this repository".to_string())?;
+    let parent_refs: Vec<&git2::Commit<'_>> = parents.iter().collect();
+    let oid = repo.commit(Some("HEAD"), &signature, &signature, message, &tree, &parent_refs).map_err(|error| error.message().to_string())?;
+    repo.cleanup_state().map_err(|error| error.message().to_string())?;
+    invalidate_git_metadata(repository_path);
+    Ok(oid.to_string())
+}
+
+#[tauri::command]
+pub fn complete_merge(repository_path: String, target_path: String, message: String) -> Result<String, String> {
+    let repository_path = resolve_target_repository(&repository_path, &target_path)?;
+    validate_path(&repository_path)?;
+    if message.trim().is_empty() { return Err("Merge commit message cannot be empty".into()); }
+    let mut repo = internal_repository(&repository_path)?;
+    if repo.state() != git2::RepositoryState::Merge {
+        return Err("There is no merge in progress here.".into());
+    }
+    complete_merge_internal(&mut repo, &repository_path, message.trim())
+}
+
+#[tauri::command]
+pub fn abort_merge(repository_path: String, target_path: String) -> Result<(), String> {
+    let repository_path = resolve_target_repository(&repository_path, &target_path)?;
+    validate_path(&repository_path)?;
+    let repo = internal_repository(&repository_path)?;
+    if repo.state() != git2::RepositoryState::Merge {
+        return Err("There is no merge in progress here.".into());
+    }
+    let head_commit = repo.head().map_err(|error| error.message().to_string())?.peel_to_commit().map_err(|error| error.message().to_string())?;
+    let mut checkout = git2::build::CheckoutBuilder::new(); checkout.force();
+    repo.reset(head_commit.as_object(), git2::ResetType::Hard, Some(&mut checkout)).map_err(|error| error.message().to_string())?;
+    repo.cleanup_state().map_err(|error| error.message().to_string())?;
     invalidate_git_metadata(&repository_path);
     Ok(())
 }
@@ -687,12 +952,20 @@ pub fn entry_details(repository_path: String, relative_path: String) -> Result<E
     let submodule_url = (kind == "submodule").then(|| submodule_value(&repository_path, &relative_string, "url")).flatten();
     let submodule_branch = (kind == "submodule").then(|| submodule_value(&repository_path, &relative_string, "branch")).flatten();
     let submodule_push_status = (kind == "submodule").then(|| submodule_push_status(&absolute.to_string_lossy())).flatten();
+    let submodule_commit = (kind == "submodule").then(|| {
+        let repo = internal_repository(absolute.to_str().unwrap_or_default()).ok()?;
+        let commit = repo.head().ok()?.peel_to_commit().ok()?;
+        let author_name = commit.author().name().unwrap_or("Unknown").to_string();
+        Some((commit.id().to_string(), commit.summary().unwrap_or("No message").to_string(), author_name, short_date(commit.time().seconds())))
+    }).flatten();
 
     Ok(EntryDetails {
         name: absolute.file_name().and_then(|name| name.to_str()).unwrap_or(&relative_string).to_string(), relative_path: relative_string,
         kind, status, tracked, size: if metadata.is_file() { metadata.len() } else { 0 }, modified, item_count, submodule_url, submodule_branch, submodule_push_status,
         last_commit_id: last.as_ref().map(|value| value.0.clone()),
         last_commit_subject: last.as_ref().map(|value| value.1.clone()), last_commit_author: last.as_ref().map(|value| value.2.clone()), last_commit_date: last.as_ref().map(|value| value.3.clone()),
+        submodule_commit_id: submodule_commit.as_ref().map(|value| value.0.clone()),
+        submodule_commit_subject: submodule_commit.as_ref().map(|value| value.1.clone()), submodule_commit_author: submodule_commit.as_ref().map(|value| value.2.clone()), submodule_commit_date: submodule_commit.as_ref().map(|value| value.3.clone()),
     })
 }
 
@@ -808,6 +1081,30 @@ pub fn switch_submodule_version(repository_path: String, relative_path: String, 
         // produced "reference 'refs/heads/<sha>' not found" for every local branch.
         let branch_name = if name.is_empty() { revision.clone() } else { name.clone() };
         let reference = format!("refs/heads/{branch_name}"); repo.find_reference(&reference).map_err(|error| format!("Branch '{branch_name}' not found: {}", error.message()))?; repo.set_head(&reference).map_err(|error| error.message().to_string())?;
+    } else if version_kind == "remote" {
+        // Picking a remote branch (e.g. "origin/main") from the list feels like
+        // picking "main" — landing on a detached HEAD there is technically correct
+        // Git behavior (you can't literally be "on" a remote-tracking ref) but
+        // surprises users who expect to end up on a normal, attached branch. Mirror
+        // what `git checkout <remote-branch>` actually does: if a same-named local
+        // branch doesn't exist yet, create one tracking this commit and check that
+        // out instead of detaching; if one already exists and already points at
+        // this exact commit, just attach to it. Only fall back to a detached
+        // checkout when a local branch of that name exists but points somewhere
+        // else — moving it here could silently strand the user's own commits.
+        let object = repo.revparse_single(&revision).map_err(|error| error.message().to_string())?;
+        let commit = object.peel_to_commit().map_err(|error| error.message().to_string())?;
+        let local_name = name.split_once('/').map(|(_, rest)| rest).unwrap_or(&name);
+        match repo.find_branch(local_name, BranchType::Local) {
+            Ok(existing) if existing.get().target() == Some(commit.id()) => {
+                repo.set_head(&format!("refs/heads/{local_name}")).map_err(|error| error.message().to_string())?;
+            }
+            Ok(_) => { repo.set_head_detached(commit.id()).map_err(|error| error.message().to_string())?; }
+            Err(_) => {
+                repo.branch(local_name, &commit, false).map_err(|error| error.message().to_string())?;
+                repo.set_head(&format!("refs/heads/{local_name}")).map_err(|error| error.message().to_string())?;
+            }
+        }
     } else {
         let object = repo.revparse_single(&revision).map_err(|error| error.message().to_string())?; repo.set_head_detached(object.id()).map_err(|error| error.message().to_string())?;
     }
@@ -900,7 +1197,10 @@ pub fn commit_path(repository_path: String, relative_path: String, message: Stri
     validate_path(&repository_path)?;
     if message.trim().is_empty() { return Err("Commit message cannot be empty".into()); }
     let relative = safe_relative_path(&relative_path)?;
-    let pathspec = if relative.as_os_str().is_empty() { ".".to_string() } else { normalized(&relative) };
+    // An empty string is the sentinel `commit_selected_internal` recognizes as
+    // "whole repository" — git2 rejects "." as a literal pathspec outright (see
+    // the handling below), so that can't be used here.
+    let pathspec = if relative.as_os_str().is_empty() { String::new() } else { normalized(&relative) };
     commit_selected_internal(&repository_path, &[pathspec], message.trim())
 }
 
@@ -927,6 +1227,19 @@ fn commit_selected_internal(repository_path: &str, files: &[String], message: &s
     if let Some(tree) = parent_tree.as_ref() { index.read_tree(tree).map_err(|error| error.message().to_string())?; } else { index.clear().map_err(|error| error.message().to_string())?; }
     let mut includes_submodule = false;
     for file in files {
+        if file.is_empty() {
+            // Whole-repository scope ("Commit repository" with nothing selected).
+            // git2 rejects "." as a literal pathspec ("repo path `.` should not
+            // start with `.`"), and `add_all` alone never removes index entries
+            // for files deleted from disk — pairing it with `update_all` (which
+            // does drop them) makes this behave like `git add -A` for the whole
+            // working tree, submodules included (add_all stages a submodule's
+            // current HEAD as its gitlink automatically).
+            index.add_all(Vec::<String>::new(), git2::IndexAddOption::DEFAULT, None).map_err(|error| error.message().to_string())?;
+            index.update_all(Vec::<String>::new(), None).map_err(|error| error.message().to_string())?;
+            includes_submodule = true;
+            continue;
+        }
         let path = Path::new(file); let absolute = Path::new(repository_path).join(path);
         // Only reuse the existing gitlink entry unchanged when the submodule is
         // still present on disk — if it was deleted, fall through to the normal
@@ -946,6 +1259,11 @@ fn commit_selected_internal(repository_path: &str, files: &[String], message: &s
     // (which was never touched on disk) untouched.
     index.read(true).map_err(|error| error.message().to_string())?;
     for file in files {
+        if file.is_empty() {
+            index.add_all(Vec::<String>::new(), git2::IndexAddOption::DEFAULT, None).map_err(|error| error.message().to_string())?;
+            index.update_all(Vec::<String>::new(), None).map_err(|error| error.message().to_string())?;
+            continue;
+        }
         let relative = Path::new(file); let absolute = Path::new(repository_path).join(relative);
         if gitlinks.contains_key(file) && absolute.exists() { if let Ok(mut submodule) = repo.find_submodule(file) { let _ = submodule.add_to_index(true); } continue; }
         if absolute.exists() { index.add_path(relative).map_err(|error| error.message().to_string())?; } else { let _ = index.remove_path(relative); }
@@ -1018,9 +1336,39 @@ fn last_commit_touching_path(repository_path: &str, relative: &Path) -> Option<(
 pub fn path_history(repository_path: String, relative_path: String) -> Result<Vec<Commit>, String> {
     validate_path(&repository_path)?;
     let relative = safe_relative_path(&relative_path)?;
-    let repo = internal_repository(&repository_path)?; let mut walk = repo.revwalk().map_err(|error| error.message().to_string())?; walk.push_head().map_err(|error| error.message().to_string())?; let _ = walk.set_sorting(Sort::TOPOLOGICAL | Sort::TIME); let mut commits = Vec::new();
-    for oid in walk.flatten().take(500) { if let Ok(commit) = repo.find_commit(oid) { let include = if relative.as_os_str().is_empty() { true } else { let parent_tree = commit.parent(0).ok().and_then(|parent| parent.tree().ok()); let mut options = git2::DiffOptions::new(); options.pathspec(&relative); if let Ok(tree) = commit.tree() { repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), Some(&mut options)).map(|diff| diff.deltas().next().is_some()).unwrap_or(false) } else { false } }; if include { commits.push(Commit { id: oid.to_string(), parents: commit.parent_ids().map(|id| id.to_string()).collect(), subject: commit.summary().unwrap_or("No message").into(), author: commit.author().name().unwrap_or("Unknown").into(), date: short_date(commit.time().seconds()), refs: Vec::new(), lane: 0 }); } } }
-    Ok(commits)
+    let repo = internal_repository(&repository_path)?; let mut walk = repo.revwalk().map_err(|error| error.message().to_string())?; walk.push_head().map_err(|error| error.message().to_string())?; let _ = walk.set_sorting(Sort::TOPOLOGICAL | Sort::TIME);
+
+    struct Walked { oid: git2::Oid, parent_ids: Vec<git2::Oid>, included: bool, subject: String, author: String, date: String }
+    let mut walked = Vec::new();
+    for oid in walk.flatten().take(500) { if let Ok(commit) = repo.find_commit(oid) {
+        let included = if relative.as_os_str().is_empty() { true } else { let parent_tree = commit.parent(0).ok().and_then(|parent| parent.tree().ok()); let mut options = git2::DiffOptions::new(); options.pathspec(&relative); if let Ok(tree) = commit.tree() { repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), Some(&mut options)).map(|diff| diff.deltas().next().is_some()).unwrap_or(false) } else { false } };
+        walked.push(Walked { oid, parent_ids: commit.parent_ids().collect(), included, subject: commit.summary().unwrap_or("No message").into(), author: commit.author().name().unwrap_or("Unknown").into(), date: short_date(commit.time().seconds()) });
+    } }
+
+    // A commit's real Git parent may not itself have touched this path, so it
+    // was never walked into the filtered list above — naively keeping the raw
+    // parent id then produces a dangling reference to a commit that doesn't
+    // exist in the response, which the graph renderer has no choice but to
+    // drop, making that lane look like it starts or ends with no explanation.
+    // Re-link every included commit to its nearest *included* ancestor(s),
+    // skipping over excluded commits transitively — the same history
+    // simplification plain `git log -- <path>` does — so the visible commits
+    // keep their real, correct ancestry.
+    let included_ids: HashSet<git2::Oid> = walked.iter().filter(|entry| entry.included).map(|entry| entry.oid).collect();
+    let mut resolved: HashMap<git2::Oid, Vec<git2::Oid>> = HashMap::new();
+    for entry in walked.iter().rev() {
+        let mut ancestors = Vec::new();
+        for parent in &entry.parent_ids {
+            if included_ids.contains(parent) { if !ancestors.contains(parent) { ancestors.push(*parent); } }
+            else if let Some(grand) = resolved.get(parent) { for grand_id in grand { if !ancestors.contains(grand_id) { ancestors.push(*grand_id); } } }
+        }
+        resolved.insert(entry.oid, ancestors);
+    }
+
+    Ok(walked.into_iter().filter(|entry| entry.included).map(|entry| {
+        let parents = resolved.remove(&entry.oid).unwrap_or_default();
+        Commit { id: entry.oid.to_string(), parents: parents.into_iter().map(|oid| oid.to_string()).collect(), subject: entry.subject, author: entry.author, date: entry.date, refs: Vec::new(), lane: 0 }
+    }).collect())
 }
 
 fn resolve_commit(repository: &str, reference: &str) -> Result<String, String> {
@@ -1259,6 +1607,12 @@ pub fn push_submodule(repository_path: String, relative_path: String) -> Result<
         } else { format!("Push failed: {detail}") }
     })?;
 
+    // `dirty`/status checks above ran against the submodule's own cached status
+    // entries (keyed by `sub_path`), separate from the parent's cache that
+    // `record_pushed_submodule_in_parent` invalidates below — without this, opening
+    // the submodule as its own repository view right after a push could still show
+    // its pre-push status for up to the cache's TTL.
+    invalidate_git_metadata(&sub_path);
     record_pushed_submodule_in_parent(&repository_path, &relative_path, local_target)?;
     Ok(PushSubmoduleResult { revision: local_target.map(|oid| oid.to_string()).unwrap_or_default(), branch })
 }
@@ -1309,6 +1663,7 @@ pub fn force_push_submodule(repository_path: String, relative_path: String) -> R
     // requires an explicit, separate confirmation before calling this.
     git(&sub_path, &["push", "--force", "origin", &format!("HEAD:refs/heads/{branch}")]).map_err(|detail| format!("Force push failed: {detail}"))?;
 
+    invalidate_git_metadata(&sub_path);
     record_pushed_submodule_in_parent(&repository_path, &relative_path, local_target)?;
     Ok(PushSubmoduleResult { revision: local_target.map(|oid| oid.to_string()).unwrap_or_default(), branch })
 }
@@ -1440,7 +1795,10 @@ mod tests {
         drop(repo);
         create_commit(parent_string.clone(), "P:89312 add engine".into()).unwrap();
         assert_eq!(entry_details(parent_string.clone(), "README.md".into()).unwrap().last_commit_subject.as_deref(), Some("Initial commit"));
-        assert_eq!(entry_details(parent_string.clone(), "components/engine".into()).unwrap().last_commit_subject.as_deref(), Some("P:89312 add engine"));
+        let engine_details = entry_details(parent_string.clone(), "components/engine".into()).unwrap();
+        assert_eq!(engine_details.last_commit_subject.as_deref(), Some("P:89312 add engine"), "last_commit_* must stay the parent's gitlink-bump commit");
+        assert_eq!(engine_details.submodule_commit_subject.as_deref(), Some("Initial commit"), "submodule_commit_* must be the submodule's own HEAD commit, not the parent's");
+        assert!(engine_details.submodule_commit_id.is_some());
         let versions = submodule_versions(parent_string.clone(), added.clone()).unwrap();
         switch_submodule_version(parent_string.clone(), added.clone(), versions.current_revision, "commit".into(), String::new()).unwrap();
         remove_git_path(parent_string, added).unwrap();
@@ -1531,6 +1889,211 @@ mod tests {
         assert!(git(&cloned, &["diff", "--cached", "--name-only"]).unwrap().lines().any(|path| path == "README.md"));
         assert_eq!(browser_repository_url("git@github.com:team/project.git").as_deref(), Some("https://github.com/team/project"));
         assert_eq!(browser_repository_url("https://gitlab.example/team/project.git").as_deref(), Some("https://gitlab.example/team/project"));
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    fn setup_diverged_repo(suffix: u128) -> (PathBuf, String) {
+        let repository = std::env::temp_dir().join(format!("git-integrity-merge-{suffix}"));
+        fs::create_dir_all(&repository).unwrap();
+        fs::write(repository.join("a.txt"), "base\n").unwrap();
+        run_git(&repository, &["init", "-b", "main"]);
+        run_git(&repository, &["config", "user.email", "test@example.com"]);
+        run_git(&repository, &["config", "user.name", "Test User"]);
+        run_git(&repository, &["add", "."]);
+        run_git(&repository, &["commit", "-m", "Base"]);
+        run_git(&repository, &["switch", "-c", "feature"]);
+        (repository, "main".into())
+    }
+
+    #[test]
+    fn merge_branch_fast_forwards_when_possible() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let (repository, _) = setup_diverged_repo(suffix);
+        // feature has no new commits yet — main advances, feature should fast-forward to it.
+        run_git(&repository, &["switch", "main"]);
+        fs::write(repository.join("a.txt"), "advanced\n").unwrap();
+        run_git(&repository, &["commit", "-am", "Advance main"]);
+        run_git(&repository, &["switch", "feature"]);
+        let path = repository.to_string_lossy().into_owned();
+        let outcome = merge_branch(path.clone(), "".into(), "main".into()).unwrap();
+        assert_eq!(outcome.status, "fast_forwarded");
+        assert_eq!(fs::read_to_string(repository.join("a.txt")).unwrap(), "advanced\n");
+        fs::remove_dir_all(repository).unwrap();
+    }
+
+    #[test]
+    fn merge_branch_auto_merges_non_conflicting_changes() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let (repository, _) = setup_diverged_repo(suffix);
+        fs::write(repository.join("b.txt"), "from feature\n").unwrap();
+        run_git(&repository, &["add", "."]); run_git(&repository, &["commit", "-m", "Feature adds b.txt"]);
+        run_git(&repository, &["switch", "main"]);
+        fs::write(repository.join("c.txt"), "from main\n").unwrap();
+        run_git(&repository, &["add", "."]); run_git(&repository, &["commit", "-m", "Main adds c.txt"]);
+        run_git(&repository, &["switch", "feature"]);
+        let path = repository.to_string_lossy().into_owned();
+        let outcome = merge_branch(path.clone(), "".into(), "main".into()).unwrap();
+        assert_eq!(outcome.status, "merged");
+        assert!(repository.join("b.txt").exists()); assert!(repository.join("c.txt").exists());
+        let repo = Repository::open(&repository).unwrap();
+        assert_eq!(repo.head().unwrap().peel_to_commit().unwrap().parent_count(), 2);
+        assert_eq!(repo.state(), git2::RepositoryState::Clean, "a clean auto-merge must not leave the repo in a pending-merge state");
+        fs::remove_dir_all(repository).unwrap();
+    }
+
+    #[test]
+    fn merge_branch_reports_conflicts_and_resolve_and_complete_work() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let (repository, _) = setup_diverged_repo(suffix);
+        fs::write(repository.join("a.txt"), "feature version\n").unwrap();
+        run_git(&repository, &["commit", "-am", "Feature changes a.txt"]);
+        run_git(&repository, &["switch", "main"]);
+        fs::write(repository.join("a.txt"), "main version\n").unwrap();
+        run_git(&repository, &["commit", "-am", "Main changes a.txt"]);
+        run_git(&repository, &["switch", "feature"]);
+        let path = repository.to_string_lossy().into_owned();
+
+        let outcome = merge_branch(path.clone(), "".into(), "main".into()).unwrap();
+        assert_eq!(outcome.status, "conflicts");
+        assert_eq!(outcome.conflicts.len(), 1);
+        assert_eq!(outcome.conflicts[0].path, "a.txt");
+        let repo = Repository::open(&repository).unwrap();
+        assert_eq!(repo.state(), git2::RepositoryState::Merge);
+        let on_disk = fs::read_to_string(repository.join("a.txt")).unwrap();
+        assert!(on_disk.contains("<<<<<<<"), "conflict markers should be written to disk");
+
+        let sides = conflict_sides(path.clone(), "".into(), "a.txt".into()).unwrap();
+        assert_eq!(sides.ours.as_deref(), Some("feature version\n"));
+        assert_eq!(sides.theirs.as_deref(), Some("main version\n"));
+
+        // Completing before resolving must fail — no silent commit with conflict markers baked in.
+        assert!(complete_merge(path.clone(), "".into(), "Merge main".into()).is_err());
+
+        resolve_conflict(path.clone(), "".into(), "a.txt".into(), "theirs".into()).unwrap();
+        assert!(list_conflicts(path.clone(), "".into()).unwrap().is_empty());
+        assert_eq!(fs::read_to_string(repository.join("a.txt")).unwrap(), "main version\n");
+
+        let oid = complete_merge(path.clone(), "".into(), "Merge main into feature".into()).unwrap();
+        assert!(!oid.is_empty());
+        let repo = Repository::open(&repository).unwrap();
+        assert_eq!(repo.state(), git2::RepositoryState::Clean);
+        assert_eq!(repo.head().unwrap().peel_to_commit().unwrap().parent_count(), 2);
+        assert!(load_repository(path).unwrap().changes.is_empty());
+
+        fs::remove_dir_all(repository).unwrap();
+    }
+
+    #[test]
+    fn abort_merge_restores_the_pre_merge_state() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let (repository, _) = setup_diverged_repo(suffix);
+        fs::write(repository.join("a.txt"), "feature version\n").unwrap();
+        run_git(&repository, &["commit", "-am", "Feature changes a.txt"]);
+        run_git(&repository, &["switch", "main"]);
+        fs::write(repository.join("a.txt"), "main version\n").unwrap();
+        run_git(&repository, &["commit", "-am", "Main changes a.txt"]);
+        run_git(&repository, &["switch", "feature"]);
+        let path = repository.to_string_lossy().into_owned();
+
+        merge_branch(path.clone(), "".into(), "main".into()).unwrap();
+        assert_eq!(Repository::open(&repository).unwrap().state(), git2::RepositoryState::Merge);
+
+        abort_merge(path.clone(), "".into()).unwrap();
+        let repo = Repository::open(&repository).unwrap();
+        assert_eq!(repo.state(), git2::RepositoryState::Clean);
+        assert_eq!(fs::read_to_string(repository.join("a.txt")).unwrap(), "feature version\n", "aborting must restore the pre-merge working tree");
+        assert!(load_repository(path).unwrap().changes.is_empty());
+
+        fs::remove_dir_all(repository).unwrap();
+    }
+
+    #[test]
+    fn merge_and_conflict_commands_can_target_a_submodule_by_relative_path() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-merge-submodule-{suffix}"));
+        let parent = base.join("parent"); let dependency = base.join("dependency");
+        create_libgit2_repository(&parent, "README.md"); create_libgit2_repository(&dependency, "module.txt");
+        let parent_string = parent.to_string_lossy().into_owned();
+        let added = add_submodule(parent_string.clone(), "".into(), dependency.to_string_lossy().into_owned(), "dep".into(), String::new(), String::new()).unwrap();
+        create_commit(parent_string.clone(), "Add dep submodule".into()).unwrap();
+
+        let sub_path = parent.join(&added);
+        run_git(&sub_path, &["switch", "-c", "feature"]);
+        fs::write(sub_path.join("module.txt"), "feature version\n").unwrap();
+        run_git(&sub_path, &["commit", "-am", "Feature change"]);
+        run_git(&sub_path, &["switch", "master"]);
+        fs::write(sub_path.join("module.txt"), "master version\n").unwrap();
+        run_git(&sub_path, &["commit", "-am", "Master change"]);
+        run_git(&sub_path, &["switch", "feature"]);
+
+        // Everything below is called with (parent_path, target_path=<submodule path>),
+        // never a raw absolute path — this is exactly how the frontend addresses a
+        // submodule for every other action in this app.
+        let outcome = merge_branch(parent_string.clone(), added.clone(), "master".into()).unwrap();
+        assert_eq!(outcome.status, "conflicts");
+        assert_eq!(list_conflicts(parent_string.clone(), added.clone()).unwrap().len(), 1);
+
+        resolve_conflict(parent_string.clone(), added.clone(), "module.txt".into(), "theirs".into()).unwrap();
+        assert!(list_conflicts(parent_string.clone(), added.clone()).unwrap().is_empty());
+        let oid = complete_merge(parent_string.clone(), added.clone(), "Merge master into feature".into()).unwrap();
+        assert!(!oid.is_empty());
+        assert_eq!(fs::read_to_string(sub_path.join("module.txt")).unwrap(), "master version\n");
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn committing_the_whole_repository_with_nothing_selected_works() {
+        // "Commit repository" (nothing selected, browsing at the root) sends an
+        // empty relative_path — commit_path used to turn that into pathspec "."
+        // which git2 rejects outright, so this always failed, for any change.
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let repository = std::env::temp_dir().join(format!("git-integrity-root-commit-{suffix}"));
+        fs::create_dir_all(&repository).unwrap();
+        fs::write(repository.join("a.txt"), "one").unwrap();
+        run_git(&repository, &["init"]);
+        run_git(&repository, &["config", "user.email", "test@example.com"]);
+        run_git(&repository, &["config", "user.name", "Test User"]);
+        run_git(&repository, &["add", "."]);
+        run_git(&repository, &["commit", "-m", "Initial commit"]);
+
+        fs::write(repository.join("a.txt"), "two").unwrap();
+        fs::write(repository.join("new.txt"), "brand new").unwrap();
+        let path = repository.to_string_lossy().into_owned();
+        let committed = commit_path(path.clone(), "".into(), "Commit everything".into()).unwrap();
+        assert!(!committed.is_empty());
+        let head_files = git(&path, &["show", "--pretty=format:", "--name-only", "HEAD"]).unwrap();
+        assert!(head_files.lines().any(|p| p == "a.txt"));
+        assert!(head_files.lines().any(|p| p == "new.txt"));
+        assert!(load_repository(path).unwrap().changes.is_empty(), "nothing should be left pending after committing the whole repository");
+
+        fs::remove_dir_all(repository).unwrap();
+    }
+
+    #[test]
+    fn committing_the_whole_repository_picks_up_a_submodule_advanced_outside_the_app() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-root-commit-submodule-{suffix}"));
+        let parent = base.join("parent"); let dependency = base.join("dependency");
+        create_libgit2_repository(&parent, "README.md"); create_libgit2_repository(&dependency, "module.txt");
+        let parent_string = parent.to_string_lossy().into_owned();
+        let added = add_submodule(parent_string.clone(), "".into(), dependency.to_string_lossy().into_owned(), "dep".into(), String::new(), String::new()).unwrap();
+        create_commit(parent_string.clone(), "Add dep submodule".into()).unwrap();
+
+        // Advance the submodule's HEAD the way a user would from a plain terminal
+        // (or another tool) — entirely outside this app, so nothing here ever calls
+        // `add_to_index` on it.
+        run_git(&parent.join(&added), &["commit", "--allow-empty", "-m", "External commit inside submodule"]);
+        let sub_repo = Repository::open(parent.join(&added)).unwrap();
+        let expected_oid = sub_repo.head().unwrap().target().unwrap();
+
+        // "Commit repository" with nothing selected uses relative_path == "" → pathspec "."
+        commit_path(parent_string.clone(), "".into(), "Bump submodule".into()).unwrap();
+
+        let repo = Repository::open(&parent).unwrap();
+        let recorded_oid = repo.index().unwrap().get_path(Path::new(&added), 0).unwrap().id;
+        assert_eq!(recorded_oid, expected_oid, "committing the whole repository should pick up the submodule's current HEAD even if it advanced outside the app");
 
         fs::remove_dir_all(base).unwrap();
     }
@@ -1801,6 +2364,145 @@ mod tests {
     }
 
     #[test]
+    fn switching_to_a_remote_branch_lands_attached_not_detached() {
+        // Picking a remote-tracking entry like "origin/main" from "Change version"
+        // used to always leave the submodule in detached HEAD, even when a local
+        // branch of the same name existed (or could trivially be created) — this
+        // reproduces the report and checks both cases end up attached.
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-switch-remote-{suffix}"));
+        let repository = base.join("main");
+        let dependency = base.join("dependency");
+        fs::create_dir_all(&repository).unwrap();
+        fs::create_dir_all(&dependency).unwrap();
+        fs::write(repository.join("README.md"), "root").unwrap();
+        fs::write(dependency.join("module.txt"), "v1").unwrap();
+        for path in [&repository, &dependency] {
+            run_git(path, &["init", "-b", "main"]);
+            run_git(path, &["config", "user.email", "test@example.com"]);
+            run_git(path, &["config", "user.name", "Test User"]);
+            run_git(path, &["add", "."]);
+            run_git(path, &["commit", "-m", "Initial"]);
+        }
+        run_git(&repository, &["-c", "protocol.file.allow=always", "submodule", "add", dependency.to_str().unwrap(), "vendor/dep"]);
+        run_git(&repository, &["commit", "-am", "Add dep submodule"]);
+
+        let repo_path = repository.to_string_lossy().into_owned();
+        let sub_path = repository.join("vendor/dep");
+        run_git(&sub_path, &["-c", "protocol.file.allow=always", "fetch", "origin"]);
+
+        // Case 1: no local branch named "main" exists in the submodule's own
+        // checkout yet (typical right after `submodule add`, which leaves it
+        // detached) — selecting "origin/main" should create and attach to one.
+        run_git(&sub_path, &["checkout", "--detach", "HEAD"]);
+        assert!(Repository::open(&sub_path).unwrap().head_detached().unwrap());
+        let versions = submodule_versions(repo_path.clone(), "vendor/dep".into()).unwrap();
+        let origin_main = versions.versions.iter().find(|v| v.kind == "remote" && v.name == "origin/main").expect("origin/main should be listed").clone();
+        switch_submodule_version(repo_path.clone(), "vendor/dep".into(), origin_main.revision.clone(), origin_main.kind.clone(), origin_main.name.clone()).unwrap();
+        let sub_repo = Repository::open(&sub_path).unwrap();
+        assert!(!sub_repo.head_detached().unwrap(), "selecting origin/main with no local main should attach, not detach");
+        assert_eq!(sub_repo.head().unwrap().shorthand(), Some("main"));
+        drop(sub_repo);
+
+        // Case 2: a local branch of the same name already exists and already
+        // points at that exact commit — selecting the remote entry should just
+        // attach to the existing local branch, not error or duplicate it.
+        run_git(&sub_path, &["checkout", "--detach", "HEAD"]);
+        switch_submodule_version(repo_path.clone(), "vendor/dep".into(), origin_main.revision.clone(), origin_main.kind.clone(), origin_main.name.clone()).unwrap();
+        let sub_repo = Repository::open(&sub_path).unwrap();
+        assert!(!sub_repo.head_detached().unwrap());
+        assert_eq!(sub_repo.head().unwrap().shorthand(), Some("main"));
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn path_history_relinks_parents_across_commits_that_did_not_touch_the_path() {
+        // Reproduces the graph-review report: filtering history to one path used to
+        // keep the *raw* Git parent id even when that parent never touched the path
+        // (so it isn't in the filtered list at all) — the frontend graph had no
+        // choice but to silently drop that edge, making the lane look like it just
+        // ends with no explanation. It must instead re-link to the nearest ancestor
+        // that IS in the filtered list, skipping the excluded ones in between.
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let repository = std::env::temp_dir().join(format!("git-integrity-path-history-relink-{suffix}"));
+        fs::create_dir_all(&repository).unwrap();
+        fs::write(repository.join("a.txt"), "1").unwrap();
+        fs::write(repository.join("b.txt"), "1").unwrap();
+        run_git(&repository, &["init", "-b", "main"]);
+        run_git(&repository, &["config", "user.email", "test@example.com"]);
+        run_git(&repository, &["config", "user.name", "Test User"]);
+        run_git(&repository, &["add", "."]);
+        run_git(&repository, &["commit", "-m", "root touches a.txt"]); // included
+
+        fs::write(repository.join("b.txt"), "2").unwrap();
+        run_git(&repository, &["commit", "-am", "only b.txt changes"]); // excluded
+        fs::write(repository.join("b.txt"), "3").unwrap();
+        run_git(&repository, &["commit", "-am", "only b.txt changes again"]); // excluded
+
+        fs::write(repository.join("a.txt"), "2").unwrap();
+        run_git(&repository, &["commit", "-am", "a.txt changes again"]); // included
+
+        let path = repository.to_string_lossy().into_owned();
+        let history = path_history(path, "a.txt".into()).unwrap();
+        assert_eq!(history.len(), 2, "only the two commits that touched a.txt should be listed: {:?}", history.iter().map(|c| &c.subject).collect::<Vec<_>>());
+        assert_eq!(history[0].subject, "a.txt changes again");
+        assert_eq!(history[1].subject, "root touches a.txt");
+        assert_eq!(history[0].parents, vec![history[1].id.clone()], "the newer visible commit must be re-linked directly to the older visible one, skipping the two excluded commits in between");
+        assert!(history[1].parents.is_empty(), "the root commit has no parent at all");
+
+        fs::remove_dir_all(repository).unwrap();
+    }
+
+    #[test]
+    fn create_submodule_branch_switches_and_keeps_the_parent_index_consistent() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-sub-new-branch-{suffix}"));
+        let parent = base.join("parent"); let dependency = base.join("dependency");
+        create_libgit2_repository(&parent, "README.md"); create_libgit2_repository(&dependency, "module.txt");
+        let parent_string = parent.to_string_lossy().into_owned();
+        let added = add_submodule(parent_string.clone(), "".into(), dependency.to_string_lossy().into_owned(), "dep".into(), String::new(), String::new()).unwrap();
+        create_commit(parent_string.clone(), "Add dep submodule".into()).unwrap();
+
+        create_submodule_branch(parent_string.clone(), added.clone(), "feature-x".into()).unwrap();
+
+        let sub_repo = Repository::open(parent.join(&added)).unwrap();
+        assert!(!sub_repo.head_detached().unwrap());
+        assert_eq!(sub_repo.head().unwrap().shorthand(), Some("feature-x"));
+        drop(sub_repo);
+
+        // Same commit, so nothing should look "modified" in the parent afterward.
+        assert!(!load_repository(parent_string.clone()).unwrap().changes.iter().any(|change| change.path == added));
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn run_git_command_executes_scoped_to_the_given_folder_and_reports_stdout_stderr() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let repository = std::env::temp_dir().join(format!("git-integrity-run-git-command-{suffix}"));
+        fs::create_dir_all(&repository).unwrap();
+        fs::write(repository.join("a.txt"), "one").unwrap();
+        run_git(&repository, &["init", "-b", "main"]);
+        run_git(&repository, &["config", "user.email", "test@example.com"]);
+        run_git(&repository, &["config", "user.name", "Test User"]);
+        run_git(&repository, &["add", "."]);
+        run_git(&repository, &["commit", "-m", "Initial"]);
+        let path = repository.to_string_lossy().into_owned();
+
+        let ok = run_git_command(path.clone(), "log --oneline -1".into()).unwrap();
+        assert!(ok.success); assert!(ok.stdout.contains("Initial"));
+
+        let failed = run_git_command(path.clone(), "show refs/heads/does-not-exist".into()).unwrap();
+        assert!(!failed.success); assert!(!failed.stderr.is_empty());
+
+        let rejected = run_git_command(path, "git status".into());
+        assert!(rejected.is_err(), "including the literal \"git\" prefix should be rejected with a clear message, not passed through");
+
+        fs::remove_dir_all(repository).unwrap();
+    }
+
+    #[test]
     fn commander_view_compares_files_inside_a_submodule_against_its_own_remote() {
         // Reproduces the reported issue: after committing and pushing a change
         // *inside* a submodule (to the submodule's own remote), browsing into that
@@ -1901,6 +2603,67 @@ mod tests {
 
         let details = entry_details(repo_path, "vendor/dep".into()).unwrap();
         assert_eq!(details.status, "", "entry_details still reports a status for the submodule: {:?}", details.status);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn parent_shows_the_submodule_bump_as_a_ready_to_push_commit_immediately_after_push() {
+        // The exact flow the user asked about: modify a submodule, commit it, push
+        // it — the parent should already show the new revision (auto-committed),
+        // and the workspace should make it obvious there is now a new commit in
+        // the parent ready to push, without any delay.
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-parent-ready-to-push-{suffix}"));
+        let repository = base.join("main");
+        let parent_remote = base.join("main-remote.git");
+        let dep_remote = base.join("dep-remote.git");
+        let dep_seed = base.join("dep-seed");
+        fs::create_dir_all(&repository).unwrap();
+        fs::create_dir_all(&dep_seed).unwrap();
+        fs::create_dir_all(&dep_remote).unwrap();
+        fs::create_dir_all(&parent_remote).unwrap();
+        fs::write(repository.join("README.md"), "root").unwrap();
+        fs::write(dep_seed.join("module.txt"), "v1").unwrap();
+
+        run_git(&dep_remote, &["init", "--bare"]);
+        run_git(&parent_remote, &["init", "--bare"]);
+        for path in [&repository, &dep_seed] {
+            run_git(path, &["init"]);
+            run_git(path, &["config", "user.email", "test@example.com"]);
+            run_git(path, &["config", "user.name", "Test User"]);
+            run_git(path, &["add", "."]);
+            run_git(path, &["commit", "-m", "Initial"]);
+        }
+        run_git(&dep_seed, &["remote", "add", "origin", dep_remote.to_str().unwrap()]);
+        run_git(&dep_seed, &["-c", "protocol.file.allow=always", "push", "origin", "HEAD:main"]);
+        run_git(&repository, &["-c", "protocol.file.allow=always", "submodule", "add", dep_remote.to_str().unwrap(), "vendor/dep"]);
+        run_git(&repository, &["commit", "-am", "Add dep submodule"]);
+        run_git(&repository, &["remote", "add", "origin", parent_remote.to_str().unwrap()]);
+        run_git(&repository, &["-c", "protocol.file.allow=always", "push", "origin", "HEAD:main"]);
+        run_git(&repository, &["branch", "--set-upstream-to=origin/main", "main"]);
+
+        let repo_path = repository.to_string_lossy().into_owned();
+        let sub_path = repository.join("vendor/dep");
+        run_git(&sub_path, &["config", "user.email", "test@example.com"]);
+        run_git(&sub_path, &["config", "user.name", "Test User"]);
+
+        // Before pushing the submodule, the parent has nothing new to push.
+        let before = publish_status(repo_path.clone(), "main".into(), "origin".into()).unwrap();
+        assert_eq!(before.commits.len(), 0, "parent should have nothing to push before the submodule is touched");
+
+        fs::write(sub_path.join("module.txt"), "v2").unwrap();
+        commit_submodule(repo_path.clone(), "vendor/dep".into(), "Update module".into()).unwrap();
+        push_submodule(repo_path.clone(), "vendor/dep".into()).unwrap();
+
+        // The parent's working copy of the submodule must already be at the new revision.
+        assert_eq!(fs::read_to_string(sub_path.join("module.txt")).unwrap(), "v2");
+
+        // And the parent itself must already show a locally-ready, unpushed commit
+        // for that bump — immediately, no polling/delay needed.
+        let after = publish_status(repo_path.clone(), "main".into(), "origin".into()).unwrap();
+        assert_eq!(after.commits.len(), 1, "parent should show exactly one new commit ready to push (the submodule bump): {:?}", after.commits.iter().map(|c| &c.subject).collect::<Vec<_>>());
+        assert!(after.commits[0].subject.contains("vendor/dep"), "the ready-to-push commit should be the submodule bump: {:?}", after.commits[0].subject);
 
         fs::remove_dir_all(base).unwrap();
     }

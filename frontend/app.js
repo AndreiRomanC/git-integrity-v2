@@ -1,6 +1,9 @@
 const invoke = window.__TAURI__?.core?.invoke;
 const $ = selector => document.querySelector(selector);
-const palette = ['#58a6ff', '#f0b65a', '#b294ff', '#48cc7e'];
+// Lane colors only — never branch identity, never commit state. Deliberately no
+// red: that's reserved elsewhere in the app for danger/conflict/delete states,
+// so a lane must never look like an error.
+const palette = ['#58a6ff', '#39c5cf', '#48cc7e', '#f0b65a', '#b294ff', '#e17fd5'];
 const directoryCache = new Map();
 let submoduleMenuData = null;
 let versionFilter = 'branch';
@@ -15,7 +18,7 @@ function addRecentRepo(path, name) {
   renderRecentRepos();
 }
 
-const state = { repository: null, branches: [], commits: [], allCommits: [], changes: [], selectedCommit: null, view: 'explorer', currentPath: '', entries: [], selectedEntry: null, historyScope: '', commanderPath: '', commanderRows: [], remoteRef: '', remotes: [], graphContext: null, editingPath: '', editorOriginal: '', publish: null, changesScope: 'global', commanderFocus: '', comparingRow: null, hasStash: false, stashes: [] };
+const state = { repository: null, branches: [], commits: [], allCommits: [], changes: [], selectedCommit: null, view: 'explorer', currentPath: '', entries: [], selectedEntry: null, historyScope: '', commanderPath: '', commanderRows: [], remoteRef: '', remotes: [], graphContext: null, editingPath: '', editorOriginal: '', publish: null, changesScope: 'global', commanderFocus: '', comparingRow: null, hasStash: false, stashes: [], editingConflict: null, mergeTarget: null };
 const previewData = {
   repository: { name: 'vehicle-control', path: '/projects/vehicle-control', current_branch: 'feature/diagnostics' },
   branches: [
@@ -58,7 +61,10 @@ const refs = {
   submoduleMenu: $('#submoduleMenu'), submoduleVersions: $('#submoduleVersions'), submoduleMenuName: $('#submoduleMenuName'), currentSubmoduleVersion: $('#currentSubmoduleVersion'),
   commitScope: $('#commitScope'), showPathHistory: $('#showPathHistory'), commitScopeDialog: $('#commitScopeDialog'), commitScopeName: $('#commitScopeName'), scopeCommitMessage: $('#scopeCommitMessage'), confirmScopeCommit: $('#confirmScopeCommit'),
   commanderView: $('#commanderView'), commanderRows: $('#commanderRows'), commanderBreadcrumbs: $('#commanderBreadcrumbs'), remoteRef: $('#remoteRef'), compareDialog: $('#compareDialog'), compareTitle: $('#compareTitle'), compareSubtitle: $('#compareSubtitle'), localCompare: $('#localCompare'), remoteCompare: $('#remoteCompare'),
-  remotesView: $('#remotesView'), remoteCards: $('#remoteCards'), editorDialog: $('#editorDialog'), editorTitle: $('#editorTitle'), editorPath: $('#editorPath'), editorContent: $('#editorContent'), locationRepository: $('#locationRepository'), locationBranch: $('#locationBranch'), locationPath: $('#locationPath'), leaveSubmoduleGraph: $('#leaveSubmoduleGraph'), publishDialog: $('#publishDialog'), publishBranch: $('#publishBranch'), publishRemote: $('#publishRemote'), publishCommits: $('#publishCommits'), publishSummary: $('#publishSummary'), publishDestination: $('#publishDestination'), publishBadge: $('#publishBadge'), publishSubtitle: $('#publishSubtitle'), cloneDialog: $('#cloneDialog'), cloneUrl: $('#cloneUrl'), cloneParent: $('#cloneParent'), cloneName: $('#cloneName'), confirmClone: $('#confirmClone'), submoduleDialog: $('#submoduleDialog'), submoduleUrl: $('#submoduleUrl'), submoduleParent: $('#submoduleParent'), submoduleName: $('#submoduleName'), submoduleUsername: $('#submoduleUsername'), submoduleToken: $('#submoduleToken'), submoduleAddStatus: $('#submoduleAddStatus'), confirmAddSubmodule: $('#confirmAddSubmodule'), operationToast: $('#operationToast'), drawerScopeTitle: $('#drawerScopeTitle')
+  remotesView: $('#remotesView'), remoteCards: $('#remoteCards'), editorDialog: $('#editorDialog'), editorTitle: $('#editorTitle'), editorPath: $('#editorPath'), editorContent: $('#editorContent'), locationRepository: $('#locationRepository'), locationBranch: $('#locationBranch'), locationPath: $('#locationPath'), leaveSubmoduleGraph: $('#leaveSubmoduleGraph'), publishDialog: $('#publishDialog'), publishBranch: $('#publishBranch'), publishRemote: $('#publishRemote'), publishCommits: $('#publishCommits'), publishSummary: $('#publishSummary'), publishDestination: $('#publishDestination'), publishBadge: $('#publishBadge'), publishSubtitle: $('#publishSubtitle'), cloneDialog: $('#cloneDialog'), cloneUrl: $('#cloneUrl'), cloneParent: $('#cloneParent'), cloneName: $('#cloneName'), confirmClone: $('#confirmClone'), submoduleDialog: $('#submoduleDialog'), submoduleUrl: $('#submoduleUrl'), submoduleParent: $('#submoduleParent'), submoduleName: $('#submoduleName'), submoduleUsername: $('#submoduleUsername'), submoduleToken: $('#submoduleToken'), submoduleAddStatus: $('#submoduleAddStatus'), confirmAddSubmodule: $('#confirmAddSubmodule'), operationToast: $('#operationToast'), drawerScopeTitle: $('#drawerScopeTitle'),
+  mergeBranchDialog: $('#mergeBranchDialog'), mergeBranchSubtitle: $('#mergeBranchSubtitle'), mergeBranchCurrent: $('#mergeBranchCurrent'), mergeBranchSource: $('#mergeBranchSource'), mergeBranchStatus: $('#mergeBranchStatus'), confirmMergeBranch: $('#confirmMergeBranch'),
+  conflictsDialog: $('#conflictsDialog'), conflictsSubtitle: $('#conflictsSubtitle'), conflictsList: $('#conflictsList'), conflictsCommitMessage: $('#conflictsCommitMessage'), conflictsStatus: $('#conflictsStatus'), confirmCompleteMerge: $('#confirmCompleteMerge'), abortMergeButton: $('#abortMerge'),
+  mergeConflictsBanner: $('#mergeConflictsBanner'), mergeConflictsSubtitle: $('#mergeConflictsSubtitle')
 };
 
 function esc(value = '') { return String(value).replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c])); }
@@ -183,14 +189,16 @@ async function confirmAddSubmodule() {
   finally { refs.confirmAddSubmodule.textContent = 'Add submodule'; }
 }
 
-async function loadRepository(path) {
+async function loadRepository(path, options = {}) {
   status('Reading repository…', 'busy');
+  const keepPath = options.keepPath ? state.currentPath : '';
   try {
     const data = await invoke('load_repository', { path });
     directoryCache.clear(); Object.assign(state, data); state.allCommits = data.commits; state.historyScope = ''; state.view = 'explorer'; state.commanderPath = ''; state.commanderRows = [];
-    state.remoteRef = data.branches.find(branch => branch.remote)?.name || ''; await openDirectory(''); status(`${data.commits.length} commits loaded`);
+    state.remoteRef = data.branches.find(branch => branch.remote)?.name || ''; await openDirectory(keepPath, { force: true }); status(`${data.commits.length} commits loaded`);
     addRecentRepo(path, data.repository.name);
     updatePublishIndicator();
+    await checkForMergeConflicts();
   } catch (error) { handleError(error); }
 }
 
@@ -338,8 +346,8 @@ async function applyFileRecovery(forcedAction = '') {
   const action = forcedAction, row = state.comparingRow;
   if (!row) { setCompareActionStatus('No file is selected for comparison.', 'error'); return; }
   if (!action) { setCompareActionStatus('No action was received. Close Compare and open the file again.', 'error'); return; }
-  const descriptions = { remote: `replace the working file with the snapshot from ${state.remoteRef}; staging is not changed`, head: 'discard working-file edits and restore the last local commit (HEAD)', stage: 'add the current working-file content to the staging area', unstage: 'reset only the staging-area entry to HEAD while keeping working-file edits' };
-  if (['remote','head'].includes(action) && !await customConfirm(`This will ${descriptions[action]} for ${row.relative_path}. Continue?`, { title: action === 'head' ? 'Hard reset' : 'Restore from remote', danger: true, okLabel: 'Continue' })) return;
+  const descriptions = { remote: `fetch ${state.remoteRef} and replace the working file with that server snapshot — may differ from your last local commit; staging is not changed`, head: 'discard working-file edits and restore your last local commit (HEAD) — does not fetch anything from the server', stage: 'add the current working-file content to the staging area', unstage: 'remove only the staging-area entry while keeping working-file edits' };
+  if (['remote','head'].includes(action) && !await customConfirm(`This will ${descriptions[action]} for ${row.relative_path}. Continue?`, { title: action === 'head' ? 'Restore from last commit (HEAD)' : 'Restore from server', danger: true, okLabel: 'Continue' })) return;
   if (!invoke) { setCompareActionStatus(`Preview complete: ${descriptions[action]}`, 'success'); return; }
   try {
     setCompareActionsDisabled(true); setCompareActionStatus(action === 'remote' ? `Contacting server and fetching ${state.remoteRef}…` : `Applying ${action} to ${row.name}…`, 'busy');
@@ -358,7 +366,7 @@ async function applyFileRecovery(forcedAction = '') {
   catch (error) { const message = String(error); setCompareActionStatus(`Failed: ${message}`, 'error'); status(message, 'error'); showOperationToast(`Failed: ${message}`, 'error'); }
   finally { setCompareActionsDisabled(false); }
 }
-function updateRecoveryHelp(action = '') { const help = { stage: '`git add` – Stage the current file content', unstage: 'SOFT/MIXED RESET (`git restore --staged`) – unstages only, your edits on disk stay exactly as they are', head: 'HARD RESET (`git checkout HEAD -- file`) – permanently discards all edits, file becomes identical to the last commit', remote: `Fetch from ${state.remoteRef || 'remote'} then HARD RESET from it – overwrites the file on disk with the remote version` }; if (action) { $('#recoveryHelp').textContent = help[action]; } else { const allOptions = `Stage: ${help.stage} • Soft/Mixed reset: ${help.unstage} • Hard reset: ${help.head} • Remote: ${help.remote}`; $('#recoveryHelp').textContent = allOptions; } }
+function updateRecoveryHelp(action = '') { const help = { stage: '`git add` – Stage the current file content', unstage: 'UNSTAGE (`git restore --staged`) – unstages only, your edits on disk stay exactly as they are', head: 'RESTORE FROM LAST COMMIT (`git checkout HEAD -- file`) – no network access; discards edits using what you already have locally', remote: `RESTORE FROM SERVER – fetches ${state.remoteRef || 'remote'} first, then overwrites the file with that server version (can differ from your last local commit if the server has newer changes)` }; if (action) { $('#recoveryHelp').textContent = help[action]; } else { const allOptions = `Stage: ${help.stage} • Unstage: ${help.unstage} • Restore from last commit: ${help.head} • Restore from server: ${help.remote}`; $('#recoveryHelp').textContent = allOptions; } }
 
 function renderComparisonContents(localText, remoteText) {
   const localLines = localText.split('\n'); const remoteLines = remoteText.split('\n'); const count = Math.max(localLines.length, remoteLines.length);
@@ -414,13 +422,10 @@ function renderExplorer() {
     <span class="file-main">${iconFor(entry)}<span class="entry-copy"><span class="entry-name">${esc(entry.name)}${entry.kind === 'submodule' ? '<b class="inline-submodule-badge">SUBMODULE</b>' : ''}</span><span class="entry-hint">${entry.kind === 'submodule' ? 'Independent Git repository' : entry.kind}</span></span>${['folder','submodule'].includes(entry.kind) ? '<span class="folder-arrow">›</span>' : ''}</span>
     ${gitState(entry)}<span class="file-size">${entry.kind === 'file' ? formatSize(entry.size) : '—'}</span><span class="file-modified">${formatModified(entry.modified)}</span>
   </button>`).join('') || (state.currentPath ? '' : '<div class="empty-change">This folder is empty</div>');
-  refs.fileList.querySelector('[data-go-up]')?.addEventListener('click', () => { const parent = state.currentPath.split('/').slice(0, -1).join('/'); openDirectory(parent); });
+  refs.fileList.querySelector('[data-go-up]')?.addEventListener('dblclick', () => { const parent = state.currentPath.split('/').slice(0, -1).join('/'); openDirectory(parent); });
   refs.fileList.querySelectorAll('[data-entry]').forEach(row => {
-    row.addEventListener('click', () => {
-      const entry = state.entries.find(item => item.relative_path === row.dataset.entry);
-      if (entry && ['folder','submodule'].includes(entry.kind)) { openDirectory(entry.relative_path); return; }
-      selectEntry(row.dataset.entry);
-    });
+    row.addEventListener('click', () => selectEntry(row.dataset.entry));
+    row.addEventListener('dblclick', () => { const entry = state.entries.find(item => item.relative_path === row.dataset.entry); if (entry && ['folder','submodule'].includes(entry.kind)) openDirectory(entry.relative_path); });
     row.addEventListener('contextmenu', event => {
       const entry = state.entries.find(item => item.relative_path === row.dataset.entry);
       if (entry?.kind !== 'submodule') return;
@@ -533,11 +538,12 @@ function renderEntryDetails(entry) {
   refs.details.innerHTML = `<div class="entry-details"><div class="entry-preview ${esc(entry.kind)}">${entry.kind === 'submodule' ? '◇' : entry.kind === 'folder' ? '▰' : '▤'}</div>
     <h2>${esc(entry.name)}</h2><div class="entry-path">${esc(entry.relative_path)}</div>${entry.kind === 'submodule' ? '<span class="submodule-badge">◇ Git submodule</span>' : ''}
     ${entry.status || !entry.tracked ? `<div class="local-change-banner"><i></i><div><strong>${entry.tracked ? 'Modified locally' : 'New local file'}</strong><span>This item differs from the committed repository state.</span></div></div>` : ''}
-    <div class="context-actions">${entry.kind === 'file' ? '<button data-detail-action="edit">Edit local file</button>' : '<button data-detail-action="open">Open folder</button>'}<button data-detail-action="server">Open on server ↗</button><button data-detail-action="history">View history</button>${entry.status ? '<button data-detail-action="commit">Commit this item</button>' : ''}${entry.kind === 'file' && (entry.status || !entry.tracked) ? `<button data-detail-action="stage" data-tooltip="git add — add this file's current content to staging">＋ Stage this file</button><button data-detail-action="unstage" data-tooltip="Soft/Mixed reset — git restore --staged. Unstages only; your edits on disk are kept exactly as they are.">− Soft/Mixed reset (unstage)</button><button data-detail-action="head" class="danger-action-soft" data-tooltip="Hard reset — git checkout HEAD -- file. Permanently discards ALL edits; the file on disk becomes identical to the last commit. Cannot be undone.">↶ Hard reset (discard all edits)</button><button data-detail-action="compare" data-tooltip="Open side-by-side compare with reset options">⇄ Compare with remote</button>` : ''}${entry.kind === 'submodule' ? `<button data-detail-action="subserver">Open submodule repository ↗</button><button data-detail-action="subgraph">Submodule branch map</button><button data-detail-action="versions">Change version</button><button data-detail-action="subcommit" ${entry.status ? '' : 'disabled'} data-tooltip="${entry.status ? 'Commit uncommitted changes inside the submodule' : 'Nothing to commit — no uncommitted changes inside this submodule'}">Commit submodule</button><button data-detail-action="subpull" data-tooltip="Fast-forward pull — brings in new commits from the submodule's remote. Refuses if it would require a manual merge.">Pull submodule</button><button data-detail-action="subpush">Push submodule</button><button data-detail-action="subforcepush" class="danger-action-soft" data-tooltip="⚠️ Overwrites the remote branch with your local history, discarding any commits there aren't in yours. Only safe if nobody else uses that remote.">Force push submodule…</button><button data-detail-action="subfetch">Fetch submodule</button><button data-detail-action="location">Replace repository URL</button>` : ''}<button class="danger-action" data-detail-action="delete">Delete…</button></div>
+    <div class="context-actions">${entry.kind === 'file' ? '<button data-detail-action="edit">Edit local file</button>' : '<button data-detail-action="open">Open folder</button>'}<button data-detail-action="server">Open on server ↗</button><button data-detail-action="history">View history</button>${entry.status ? '<button data-detail-action="commit">Commit this item</button>' : ''}${entry.kind === 'file' && (entry.status || !entry.tracked) ? `<button data-detail-action="stage" data-tooltip="git add — add this file's current content to staging">＋ Stage this file</button><button data-detail-action="unstage" data-tooltip="Unstage — git restore --staged. Removes only the staging entry; your edits on disk are kept exactly as they are.">− Unstage</button><button data-detail-action="head" class="danger-action-soft" data-tooltip="Restore from your last local commit (HEAD) — git checkout HEAD -- file. Permanently discards ALL edits; the file on disk becomes identical to what you last committed. Cannot be undone.">↶ Restore from last commit (HEAD)</button><button data-detail-action="compare" data-tooltip="Open side-by-side compare with restore options">⇄ Compare with remote</button>` : ''}${entry.kind === 'submodule' ? `<button data-detail-action="subserver">Open submodule repository ↗</button><button data-detail-action="subgraph">Submodule branch map</button><button data-detail-action="subnewbranch" data-tooltip="Create a new local branch in this submodule, starting from its current commit, and switch to it">＋ New branch…</button><button data-detail-action="versions">Change version</button><button data-detail-action="subcommit" ${entry.status ? '' : 'disabled'} data-tooltip="${entry.status ? 'Commit uncommitted changes inside the submodule' : 'Nothing to commit — no uncommitted changes inside this submodule'}">Commit submodule</button><button data-detail-action="subpull" data-tooltip="Fast-forward pull — brings in new commits from the submodule's remote. Refuses if it would require a manual merge.">Pull submodule</button><button data-detail-action="submerge" data-tooltip="Merge a branch into this submodule's current branch, with conflict resolution if needed">Merge branch…</button><button data-detail-action="subpush">Push submodule</button><button data-detail-action="subforcepush" class="danger-action-soft" data-tooltip="⚠️ Overwrites the remote branch with your local history, discarding any commits there aren't in yours. Only safe if nobody else uses that remote.">Force push submodule…</button><button data-detail-action="subfetch">Fetch submodule</button><button data-detail-action="location">Replace repository URL</button>` : ''}<button class="danger-action" data-detail-action="delete">Delete…</button></div>
     <div class="detail-section"><h3>GENERAL</h3><div class="detail-grid"><span>Type</span><strong>${kindLabel}</strong><span>Git</span><strong>${entry.tracked ? (entry.status || 'Tracked, clean') : 'Untracked'}</strong>
     ${entry.item_count != null ? `<span>Items</span><strong>${entry.item_count}</strong>` : `<span>Size</span><strong>${formatSize(entry.size)}</strong>`}<span>Modified</span><strong>${formatModified(entry.modified)}</strong></div></div>
     ${entry.kind === 'submodule' ? `<div class="detail-section"><h3>SUBMODULE</h3><div class="detail-grid"><span>Remote</span><strong>${esc(entry.submodule_url || 'Not configured')}</strong><span>Branch</span><strong>${esc(entry.submodule_branch || 'Default')}</strong><span>Status</span><strong>${entry.status ? (entry.status === 'M' ? 'Has local changes' : 'Modified') : 'Clean'}</strong></div>${entry.submodule_push_status ? `<div class="submodule-push-banner"><i></i><span>${esc(entry.submodule_push_status)}</span></div>` : ''}</div>` : ''}
-    <div class="detail-section"><h3>LAST COMMIT</h3><div class="detail-grid"><span>Commit</span><strong>${entry.last_commit_id ? `<a href="#" class="commit-server-link" data-commit-id="${esc(entry.last_commit_id)}" title="Open this commit on the server">${esc(entry.last_commit_id.slice(0, 8))} ↗</a>` : 'No commit'}</strong><span>Message</span><strong>${commitSubjectHtml(entry.last_commit_subject || '—')}</strong><span>Author</span><strong>${esc(entry.last_commit_author || '—')}</strong><span>Date</span><strong>${esc(entry.last_commit_date || '—')}</strong></div></div></div>`;
+    ${entry.kind === 'submodule' ? `<div class="detail-section"><h3>SUBMODULE COMMIT (actual change)</h3><div class="detail-grid"><span>Commit</span><strong>${entry.submodule_commit_id ? `<a href="#" class="commit-server-link" data-commit-id="${esc(entry.submodule_commit_id)}" data-submodule-path="${esc(entry.relative_path)}" title="Open this commit on the submodule's own server">${esc(entry.submodule_commit_id.slice(0, 8))} ↗</a>` : 'No commit'}</strong><span>Message</span><strong>${commitSubjectHtml(entry.submodule_commit_subject || '—')}</strong><span>Author</span><strong>${esc(entry.submodule_commit_author || '—')}</strong><span>Date</span><strong>${esc(entry.submodule_commit_date || '—')}</strong></div></div>` : ''}
+    <div class="detail-section"><h3>${entry.kind === 'submodule' ? 'PROJECT COMMIT (gitlink update)' : 'LAST COMMIT'}</h3><div class="detail-grid"><span>Commit</span><strong>${entry.last_commit_id ? `<a href="#" class="commit-server-link" data-commit-id="${esc(entry.last_commit_id)}" title="Open this commit on the server">${esc(entry.last_commit_id.slice(0, 8))} ↗</a>` : 'No commit'}</strong><span>Message</span><strong>${commitSubjectHtml(entry.last_commit_subject || '—')}</strong><span>Author</span><strong>${esc(entry.last_commit_author || '—')}</strong><span>Date</span><strong>${esc(entry.last_commit_date || '—')}</strong></div></div></div>`;
   refs.details.querySelectorAll('[data-detail-action]').forEach(button => button.addEventListener('click', () => { Promise.resolve(handleDetailAction(button.dataset.detailAction, entry, button)).catch(error => handleError(error)); }));
 }
 
@@ -555,10 +561,27 @@ async function handleDetailAction(action, entry, button) {
   if (action === 'compare') return compareEntryWithRemote(entry);
   if (action === 'subcommit') return commitSubmoduleChanges(entry);
   if (action === 'subpull') return pullSubmodule(entry);
+  if (action === 'submerge') return openMergeBranchDialog(mergeTargetForSubmodule(entry));
   if (action === 'subpush') return pushSubmodule(entry);
   if (action === 'subforcepush') return forcePushSubmodule(entry);
   if (action === 'subfetch') return fetchSubmodule(entry);
+  if (action === 'subnewbranch') return createSubmoduleBranch(entry);
   if (['head','stage','unstage'].includes(action)) return runEntryFileAction(entry, action);
+}
+
+async function createSubmoduleBranch(entry) {
+  if (entry.kind !== 'submodule') return;
+  const name = await customPrompt(`New branch name for submodule ${entry.name} (created from its current commit):`, '', { title: 'New submodule branch' });
+  if (!name) return;
+  if (!invoke) return status(`Preview: created branch "${name}" in ${entry.name}`);
+  try {
+    status(`Creating branch "${name}" in ${entry.name}…`, 'busy');
+    await invoke('create_submodule_branch', { repositoryPath: state.repository.path, relativePath: entry.relative_path, branch: name });
+    directoryCache.clear(); await loadRepository(state.repository.path); await openDirectory(state.currentPath, { force: true });
+    if (state.selectedEntry?.relative_path === entry.relative_path) await selectEntry(entry.relative_path);
+    const msg = `${entry.name}: branch "${name}" created and checked out.`;
+    status(msg); showOperationToast(msg, 'success');
+  } catch (error) { const message = handleError(error); showOperationToast(message, 'error'); }
 }
 
 async function openEntryOnServer(entry, submodule) {
@@ -606,8 +629,160 @@ async function pullSubmodule(entry) {
     const successMsg = `${entry.name}: pulled the latest commits from its remote (fast-forward).`;
     status(successMsg); showOperationToast(successMsg, 'success');
   }
-  catch (error) { const message = handleError(error); showOperationToast(message, 'error'); }
+  catch (error) {
+    const message = handleError(error);
+    if (String(error).toLowerCase().includes('diverged')) {
+      showOperationToast(`${message}\nTry "Merge branch…" instead — it can resolve the conflicts here.`, 'error');
+    } else { showOperationToast(message, 'error'); }
+  }
 }
+
+// ---- Merge & conflict resolution -----------------------------------------
+// Works identically for the main repository and for a submodule — a submodule
+// is just another repository at a different path, addressed the same way the
+// rest of the app already does: (parent repositoryPath, submodule targetPath).
+function mergeTargetForMain() { return { targetPath: '', label: state.repository.current_branch || 'current branch', isSubmodule: false }; }
+function mergeTargetForSubmodule(entry) { return { targetPath: entry.relative_path, label: entry.name, isSubmodule: true }; }
+
+async function openMergeBranchDialog(target) {
+  state.mergeTarget = target;
+  refs.mergeBranchCurrent.value = target.label;
+  refs.mergeBranchSubtitle.textContent = target.isSubmodule ? `Merge a branch into "${target.label}" (submodule).` : "Bring another branch's commits into your current branch.";
+  refs.mergeBranchStatus.textContent = '';
+  refs.confirmMergeBranch.disabled = false; refs.confirmMergeBranch.textContent = 'Merge';
+  if (!invoke) { refs.mergeBranchSource.innerHTML = '<option value="main">main</option>'; refs.mergeBranchDialog.showModal(); return; }
+  try {
+    const branches = target.isSubmodule
+      ? (await invoke('submodule_repository', { repositoryPath: state.repository.path, relativePath: target.targetPath })).branches
+      : state.branches;
+    const options = branches.filter(branch => !branch.current);
+    refs.mergeBranchSource.innerHTML = options.map(branch => `<option value="${esc(branch.name)}">${esc(branch.name)}${branch.remote ? ' (remote)' : ''}</option>`).join('') || '<option value="" disabled>No other branches</option>';
+    refs.mergeBranchDialog.showModal();
+  } catch (error) { handleError(error); }
+}
+
+async function refreshAfterMerge() {
+  directoryCache.clear();
+  await loadRepository(state.repository.path, { keepPath: true });
+  await checkForMergeConflicts();
+}
+
+refs.confirmMergeBranch.addEventListener('click', async () => {
+  const sourceRef = refs.mergeBranchSource.value; if (!sourceRef) return;
+  const target = state.mergeTarget;
+  if (!invoke) { refs.mergeBranchDialog.close(); status(`Preview: merged ${sourceRef}`); return; }
+  refs.confirmMergeBranch.disabled = true; refs.confirmMergeBranch.textContent = 'Merging…';
+  try {
+    const outcome = await invoke('merge_branch', { repositoryPath: state.repository.path, targetPath: target.targetPath, sourceRef });
+    if (outcome.status === 'conflicts') {
+      refs.mergeBranchDialog.close();
+      await refreshAfterMerge();
+      openConflictsDialog(target, outcome.conflicts, outcome.message);
+    } else {
+      refs.mergeBranchDialog.close();
+      status(outcome.message); showOperationToast(outcome.message, 'success');
+      await refreshAfterMerge();
+    }
+  } catch (error) { refs.mergeBranchStatus.textContent = String(error); handleError(error); }
+  finally { refs.confirmMergeBranch.disabled = false; refs.confirmMergeBranch.textContent = 'Merge'; }
+});
+
+function renderConflictsList(target, conflicts) {
+  refs.conflictsList.innerHTML = conflicts.map(conflict => `<div class="conflict-row" data-path="${esc(conflict.path)}">
+    <div class="conflict-head"><span class="conflict-path">${esc(conflict.path)}</span><span class="conflict-state pending">PENDING</span></div>
+    <div class="conflict-actions">
+      <button data-resolve="ours" ${conflict.has_ours ? '' : 'disabled'} data-tooltip="Keep your version of this file">↤ Keep mine</button>
+      <button data-resolve="theirs" ${conflict.has_theirs ? '' : 'disabled'} data-tooltip="Keep the incoming branch's version of this file">↦ Keep theirs</button>
+      <button data-resolve="manual" data-tooltip="Open the file (with conflict markers) and edit it yourself">✎ Edit manually</button>
+    </div>
+  </div>`).join('') || '<div class="empty-change">No conflicts remaining</div>';
+  refs.conflictsList.querySelectorAll('[data-resolve]').forEach(button => button.addEventListener('click', () => {
+    const path = button.closest('.conflict-row').dataset.path; const kind = button.dataset.resolve;
+    if (kind === 'manual') editConflictFile(target, path); else resolveConflictAction(target, path, kind);
+  }));
+}
+
+function openConflictsDialog(target, conflicts, introMessage) {
+  state.mergeTarget = target;
+  refs.conflictsSubtitle.textContent = introMessage || `${conflicts.length} file${conflicts.length === 1 ? '' : 's'} need resolution before the merge can be completed.`;
+  refs.conflictsCommitMessage.value = target.isSubmodule ? `Merge into ${target.label}` : `Merge into ${state.repository.current_branch}`;
+  refs.conflictsStatus.textContent = '';
+  renderConflictsList(target, conflicts);
+  refs.conflictsDialog.showModal();
+}
+
+async function refreshConflictsDialog(target) {
+  try {
+    const conflicts = await invoke('list_conflicts', { repositoryPath: state.repository.path, targetPath: target.targetPath });
+    renderConflictsList(target, conflicts);
+    refs.conflictsSubtitle.textContent = conflicts.length ? `${conflicts.length} file${conflicts.length === 1 ? '' : 's'} still need resolution.` : 'All conflicts resolved — ready to complete the merge.';
+    await checkForMergeConflicts();
+  } catch (error) { handleError(error); }
+}
+
+async function resolveConflictAction(target, path, kind) {
+  try {
+    status(`Resolving ${path}…`, 'busy');
+    await invoke('resolve_conflict', { repositoryPath: state.repository.path, targetPath: target.targetPath, relativePath: path, resolution: kind });
+    const msg = `${path}: kept ${kind === 'ours' ? 'your' : 'the incoming'} version.`;
+    status(msg); showOperationToast(msg, 'success');
+    await refreshConflictsDialog(target);
+  } catch (error) { handleError(error); }
+}
+
+function editConflictFile(target, path) {
+  const joined = target.targetPath ? `${target.targetPath}/${path}` : path;
+  state.editingConflict = { target, path };
+  refs.editorTitle.textContent = `Resolve ${path}`;
+  refs.editorPath.textContent = path;
+  refs.editorContent.value = 'Loading…';
+  refs.editorDialog.showModal();
+  if (!invoke) { refs.editorContent.value = '<<<<<<< HEAD\n(your version)\n=======\n(their version)\n>>>>>>> branch\n'; return; }
+  invoke('read_text_file', { repositoryPath: state.repository.path, relativePath: joined })
+    .then(file => { refs.editorContent.value = file.content; refs.editorContent.focus(); })
+    .catch(error => { refs.editorDialog.close(); handleError(error); });
+}
+
+refs.confirmCompleteMerge.addEventListener('click', async () => {
+  const target = state.mergeTarget; const message = refs.conflictsCommitMessage.value.trim();
+  if (!message) { refs.conflictsStatus.textContent = 'A merge commit message is required.'; return; }
+  refs.confirmCompleteMerge.disabled = true; refs.confirmCompleteMerge.textContent = 'Completing…';
+  try {
+    await invoke('complete_merge', { repositoryPath: state.repository.path, targetPath: target.targetPath, message });
+    refs.conflictsDialog.close();
+    const msg = `Merge completed${target.isSubmodule ? ` in ${target.label}` : ''}.`;
+    status(msg); showOperationToast(msg, 'success');
+    await refreshAfterMerge();
+  } catch (error) { refs.conflictsStatus.textContent = String(error); }
+  finally { refs.confirmCompleteMerge.disabled = false; refs.confirmCompleteMerge.textContent = 'Complete merge'; }
+});
+
+refs.abortMergeButton.addEventListener('click', async () => {
+  const target = state.mergeTarget;
+  if (!await customConfirm('Abort this merge? All conflict resolutions made so far will be discarded and the repository will return to its pre-merge state.', { title: 'Abort merge', danger: true, okLabel: 'Abort merge' })) return;
+  try {
+    await invoke('abort_merge', { repositoryPath: state.repository.path, targetPath: target.targetPath });
+    refs.conflictsDialog.close();
+    const msg = `Merge aborted${target.isSubmodule ? ` in ${target.label}` : ''}.`;
+    status(msg); showOperationToast(msg, 'success');
+    await refreshAfterMerge();
+  } catch (error) { handleError(error); }
+});
+
+// Detects a merge left mid-resolution (e.g. the app was closed before finishing)
+// and surfaces it via the sidebar banner so it's never silently stuck.
+async function checkForMergeConflicts() {
+  if (!invoke || !state.repository) { refs.mergeConflictsBanner.hidden = true; return; }
+  try {
+    const conflicts = await invoke('list_conflicts', { repositoryPath: state.repository.path, targetPath: '' });
+    refs.mergeConflictsBanner.hidden = conflicts.length === 0;
+    refs.mergeConflictsSubtitle.textContent = `${conflicts.length} file${conflicts.length === 1 ? '' : 's'} to resolve`;
+    state.pendingMainConflicts = conflicts;
+  } catch { refs.mergeConflictsBanner.hidden = true; }
+}
+
+refs.mergeConflictsBanner.addEventListener('click', () => openConflictsDialog(mergeTargetForMain(), state.pendingMainConflicts || []));
+$('#mergeCurrent').addEventListener('click', () => state.repository && openMergeBranchDialog(mergeTargetForMain()));
 
 async function forcePushSubmodule(entry) {
   if (entry.kind !== 'submodule') return;
@@ -627,7 +802,7 @@ async function forcePushSubmodule(entry) {
     const result = await invoke('force_push_submodule', { repositoryPath: state.repository.path, relativePath: entry.relative_path });
     directoryCache.clear(); await loadRepository(state.repository.path); await openDirectory(state.currentPath, { force: true });
     const shortSha = (result?.revision || '').slice(0, 8);
-    const successMsg = `${entry.name}: force pushed to branch "${result?.branch}". The remote now matches your local history exactly (commit ${shortSha}). The project was updated too.`;
+    const successMsg = `${entry.name}: force pushed to branch "${result?.branch}" (now at ${shortSha}). This project now has a new local commit recording that — see "Unpublished commits" in the sidebar to push it too.`;
     status(successMsg); showOperationToast(successMsg, 'success');
   }
   catch (error) { const message = handleError(error); showOperationToast(message, 'error'); }
@@ -642,7 +817,7 @@ async function pushSubmodule(entry) {
     const result = await invoke('push_submodule', { repositoryPath: state.repository.path, relativePath: entry.relative_path });
     directoryCache.clear(); await loadRepository(state.repository.path); await openDirectory(state.currentPath, { force: true });
     const shortSha = (result?.revision || '').slice(0, 8);
-    const successMsg = `${entry.name}: pushed to branch "${result?.branch}" on its remote. The project was updated to commit ${shortSha}.`;
+    const successMsg = `${entry.name}: pushed to branch "${result?.branch}" on its remote (now at ${shortSha}). This project now has a new local commit recording that — see "Unpublished commits" in the sidebar to push it too.`;
     status(successMsg); showOperationToast(successMsg, 'success');
   }
   catch (error) { const message = handleError(error); showOperationToast(message, 'error'); }
@@ -686,9 +861,9 @@ async function deleteEntry(entry, button) {
 
 async function compareEntryWithRemote(entry) { state.commanderFocus = entry.relative_path; state.commanderPath = entry.relative_path.split('/').slice(0, -1).join('/'); state.view = 'commander'; state.commanderRows = []; render(); await openCommanderDirectory(state.commanderPath); const row = state.commanderRows.find(item => item.relative_path === entry.relative_path); if (row?.local?.kind === 'file' && row.remote?.kind === 'file') openFileCompare(row); else status('This file is not available on both local and selected remote', 'error'); }
 async function runEntryFileAction(entry, action) {
-  const explanations = { head: 'HARD RESET: this permanently discards ALL uncommitted edits in this file. The file on disk will become identical to the last commit (HEAD). This cannot be undone. Continue?', stage: 'Add this file to the staging area?', unstage: 'SOFT/MIXED RESET: remove this file from staging. Your edits on disk are kept exactly as they are — only the staging entry is reset. Continue?' };
-  const successMessages = { head: `${entry.name}: HARD RESET complete — working copy reverted to the last commit (HEAD). The project on disk was updated.`, stage: `${entry.name}: staged. It will be included in the next commit.`, unstage: `${entry.name}: SOFT/MIXED RESET complete — removed from staging. Your edits on disk were kept unchanged.` };
-  const titles = { head: 'Hard reset', stage: 'Stage file', unstage: 'Soft/Mixed reset' };
+  const explanations = { head: 'RESTORE: this permanently discards ALL uncommitted edits in this file. The file on disk will become identical to the last commit (HEAD). This cannot be undone. Continue?', stage: 'Add this file to the staging area?', unstage: 'UNSTAGE: remove this file from staging. Your edits on disk are kept exactly as they are — only the staging entry is removed. Continue?' };
+  const successMessages = { head: `${entry.name}: restored from the last commit (HEAD) — edits on disk were discarded.`, stage: `${entry.name}: staged. It will be included in the next commit.`, unstage: `${entry.name}: unstaged — removed from staging, edits on disk were kept unchanged.` };
+  const titles = { head: 'Restore file', stage: 'Stage file', unstage: 'Unstage file' };
   if (!await customConfirm(explanations[action], { title: titles[action], danger: action === 'head', okLabel: action === 'head' ? 'Discard everything' : 'Continue' })) return;
   if (!invoke) { status(`Preview: ${action} ${entry.name}`); showOperationToast(`Preview: ${action} ${entry.name}`); return; }
   try {
@@ -707,6 +882,7 @@ async function openEditor(entry) {
 }
 
 function addEditorBlameHints() {
+  if (state.editingConflict) return;
   setTimeout(() => {
     const content = refs.editorContent;
     const lines = content.value.split('\n');
@@ -738,6 +914,19 @@ function addEditorBlameHints() {
 
 async function saveEditor(event) {
   event?.preventDefault();
+  if (state.editingConflict) {
+    const { target, path } = state.editingConflict;
+    const joined = target.targetPath ? `${target.targetPath}/${path}` : path;
+    try {
+      status(`Saving ${path}…`, 'busy');
+      await invoke('write_text_file', { repositoryPath: state.repository.path, relativePath: joined, content: refs.editorContent.value });
+      await invoke('resolve_conflict', { repositoryPath: state.repository.path, targetPath: target.targetPath, relativePath: path, resolution: 'manual' });
+      refs.editorDialog.close(); state.editingConflict = null;
+      status(`${path}: marked resolved.`); showOperationToast(`${path}: marked resolved.`, 'success');
+      await refreshConflictsDialog(target);
+    } catch (error) { handleError(error); }
+    return;
+  }
   try { status(`Saving ${state.editingPath}…`, 'busy'); await saveEditorContent(); refs.editorDialog.close(); directoryCache.clear(); await loadRepository(state.repository.path); status(`Saved ${state.editingPath}`); }
   catch (error) { handleError(error); }
 }
@@ -861,59 +1050,40 @@ function buildGraphModel(commits) {
   });
 }
 
-const laneX = (lane, laneWidth) => laneWidth / 2 + lane * laneWidth;
+const LANE_WIDTH = 30;
+const laneX = lane => LANE_WIDTH / 2 + lane * LANE_WIDTH;
 
-// ---- Edge routing / rendering --------------------------------------------
-function renderGraphRowSvg(node, maxLanes) {
-  const laneWidth = 30; const height = 60;
-  const viewWidth = Math.max(maxLanes, 1) * laneWidth;
-  const lane = node.lane; const x = laneX(lane, laneWidth); const color = palette[lane % palette.length];
-  const x_ = i => laneX(i, laneWidth);
-
-  // Lanes that simply pass straight through this row untouched (not this commit's own lane).
-  const continuations = node.after.map((id, targetLane) => {
-    if (targetLane === lane) return '';
-    const sourceLane = node.before.indexOf(id); if (sourceLane < 0) return '';
-    const sx = x_(sourceLane), tx = x_(targetLane);
-    const lineColor = palette[sourceLane % palette.length];
-    return sourceLane === targetLane
-      ? `<line x1="${sx}" y1="0" x2="${tx}" y2="${height}" stroke="${lineColor}" stroke-width="3" stroke-linecap="round"/>`
-      : `<path d="M${sx} 0 C${sx} ${height * 0.4} ${tx} ${height * 0.6} ${tx} ${height}" stroke="${lineColor}" stroke-width="3" fill="none" stroke-linecap="round"/>`;
-  }).join('');
-
-  // This commit's own edges: up from where a child referenced it, down to each parent.
-  const hasIncoming = node.before[lane];
-  const incoming = hasIncoming ? `<line x1="${x}" y1="0" x2="${x}" y2="${height / 2}" stroke="${color}" stroke-width="3" stroke-linecap="round"/>` : '';
-  const outgoing = node.parents.map(p => { const px = x_(p.targetLane); return p.targetLane === lane
-    ? `<line x1="${x}" y1="${height / 2}" x2="${x}" y2="${height}" stroke="${color}" stroke-width="3" stroke-linecap="round"/>`
-    : `<path d="M${x} ${height / 2} C${x} ${height * 0.75} ${px} ${height * 0.75} ${px} ${height}" stroke="${color}" stroke-width="3" fill="none" stroke-linecap="round"/>`; }).join('');
-
-  const isHead = node.refs.includes('HEAD') || node.isHead;
-  const dot = isHead
-    ? `<circle cx="${x}" cy="${height / 2}" r="8.5" fill="${color}" stroke="#0d1117" stroke-width="2.5"/><circle cx="${x}" cy="${height / 2}" r="8.5" fill="none" stroke="#e8eef5" stroke-width="1.6"/>`
-    : `<circle cx="${x}" cy="${height / 2}" r="6" fill="${color}" stroke="#0d1117" stroke-width="2.5"/>`;
-  return `<svg viewBox="0 0 ${viewWidth} ${height}" preserveAspectRatio="xMinYMid meet">${continuations}${incoming}${outgoing}${dot}</svg>`;
-}
-
-function refsBadges(refList, color) {
+function refsBadges(refList, color, isHead) {
   const grouped = refList.filter(ref => ref !== 'HEAD');
-  if (!grouped.length) return '';
-  return `<span class="ref-pills">${grouped.map(ref => `<b class="ref-pill" style="--lane-color:${color}">${esc(ref)}</b>`).join('')}</span>`;
+  const headPill = isHead ? '<b class="head-pill">HEAD</b>' : '';
+  if (!grouped.length && !headPill) return '';
+  return `<span class="ref-pills">${headPill}${grouped.map(ref => `<b class="ref-pill" style="--lane-color:${color}">${esc(ref)}</b>`).join('')}</span>`;
 }
 
+// ---- Rendering -------------------------------------------------------------
+// Every node/edge is drawn on a single continuous SVG overlaid across the whole
+// list, using each row's *actual* rendered position (measured from the DOM
+// after layout) rather than an assumed fixed row height — this is what
+// guarantees a commit's dot always lines up exactly with its own row, and that
+// a parent/child edge is one real line straight from one dot to the other,
+// however many rows apart they end up being (instead of independent per-row
+// segments that only look connected when every row happens to be the same
+// height).
 function renderGraph() {
   const query = refs.search.value.trim().toLowerCase();
   const commits = state.commits.filter(c => !query || `${c.subject} ${c.author} ${c.id} ${(c.refs || []).join(' ')}`.toLowerCase().includes(query));
   const model = buildGraphModel(commits);
-  const byId = new Map(commits.map((commit, index) => [commit.id, { commit, node: model[index] }]));
+  const nodeById = new Map(commits.map((commit, index) => [commit.id, model[index]]));
   const currentBranch = state.repository?.current_branch;
   const headEntry = currentBranch ? commits.find(commit => (commit.refs || []).includes(currentBranch)) : null;
-  if (headEntry) { byId.get(headEntry.id).node.isHead = true; }
+  if (headEntry) { nodeById.get(headEntry.id).isHead = true; }
   const maxLanes = Math.max(1, ...model.map(n => Math.max(n.before.length, n.after.length)));
+  const lanesWidth = maxLanes * LANE_WIDTH;
 
+  refs.laneLegend.style.setProperty('--lanes-width', `${lanesWidth}px`);
   refs.laneLegend.innerHTML = `<span class="time-direction"><b>NEWEST</b><i>↓</i><b>OLDEST</b></span>
     ${currentBranch ? `<span class="head-banner">HEAD <i>→</i> <b>${esc(currentBranch)}</b></span>` : ''}
-    <span class="lane-header"><span>GRAPH</span><span>REFS</span><span>COMMIT</span></span>`;
+    <span class="lane-header"><span>GRAPH</span><span>COMMIT</span></span>`;
 
   // Stash entries are informational pointers, not real DAG commits — rendered
   // as their own dashed-connector rows anchored to the commit they were taken
@@ -923,12 +1093,8 @@ function renderGraph() {
 
   const rows = commits.map((commit, index) => {
     const node = model[index]; const color = palette[node.lane % palette.length];
-    const stashRows = (stashesByBase.get(commit.id) || []).map(stash => `<article class="commit-row stash-row" data-stash="${stash.index}">
-      <div class="graph-cell" style="width:${30 * maxLanes}px"><svg viewBox="0 0 ${30 * maxLanes} 44" preserveAspectRatio="xMinYMid meet">
-        <line x1="${laneX(node.lane, 30)}" y1="44" x2="${laneX(node.lane, 30)}" y2="8" stroke="${color}" stroke-width="2" stroke-dasharray="3 4" stroke-linecap="round"/>
-        <rect x="${laneX(node.lane, 30) - 5}" y="4" width="10" height="10" rx="2.5" fill="none" stroke="${color}" stroke-width="2"/>
-      </svg></div>
-      <div class="ref-cell"></div>
+    const stashRows = (stashesByBase.get(commit.id) || []).map(stash => `<article class="commit-row stash-row" data-stash="${stash.index}" data-stash-lane="${node.lane}">
+      <div class="graph-cell" style="width:${lanesWidth}px"></div>
       <div class="commit-card stash-card" data-toggle-stash="${stash.index}">
         <div class="commit-main"><span class="commit-title">stash@{${stash.index}} — ${esc(stash.message.replace(/^WIP on [^:]+:\s*[0-9a-f]+\s*/, 'WIP on ') || 'Saved work')}</span></div>
         <span class="topology-badges"><b class="stash-badge">STASH</b></span>
@@ -936,17 +1102,58 @@ function renderGraph() {
       </div>
     </article>`).join('');
 
-    return stashRows + `<article class="commit-row ${node.isHead ? 'is-head' : ''}" data-id="${esc(commit.id)}">
-      <div class="graph-cell" style="width:${30 * maxLanes}px">${renderGraphRowSvg(node, maxLanes)}</div>
-      <div class="ref-cell">${refsBadges(node.refs, color)}${node.isHead ? '<b class="here-badge">YOU ARE HERE</b>' : ''}</div>
-      <div class="commit-card"><div class="commit-main"><span class="commit-title">${commitSubjectHtml(commit.subject)}</span><span class="commit-id">${esc(commit.id.slice(0, 8))}</span></div>
+    return stashRows + `<article class="commit-row ${node.isHead ? 'is-head' : ''}" data-id="${esc(commit.id)}" data-lane="${node.lane}">
+      <div class="graph-cell" style="width:${lanesWidth}px"></div>
+      <div class="commit-card"><div class="commit-main"><span class="commit-title">${commitSubjectHtml(commit.subject)}</span>${refsBadges(node.refs, color, node.isHead)}</div><span class="commit-id">${esc(commit.id.slice(0, 8))}</span>
       <span class="topology-badges">${commit.parents?.length > 1 ? `<b class="merge-badge">MERGE · ${commit.parents.length} parents</b>` : ''}</span><span class="commit-author">${esc(commit.author)}</span><span class="commit-date">${esc(commit.date)}</span></div>
     </article>`;
   }).join('') || '<div class="empty-change">No commits match this filter</div>';
 
-  refs.graph.innerHTML = rows;
+  refs.graph.innerHTML = `<svg class="graph-overlay"></svg>` + rows;
   refs.graph.querySelectorAll('.commit-row[data-id]').forEach(row => row.addEventListener('click', () => selectCommit(row.dataset.id)));
   refs.graph.querySelectorAll('[data-toggle-stash]').forEach(card => card.addEventListener('click', () => card.querySelector('.stash-internals')?.toggleAttribute('hidden')));
+  if (commits.length) drawGraphOverlay(model, lanesWidth);
+}
+
+function drawGraphOverlay(model, lanesWidth) {
+  const container = refs.graph;
+  const positions = new Map(); // commitId -> {x, y}
+  container.querySelectorAll('.commit-row[data-id]').forEach((row, index) => {
+    const node = model[index];
+    positions.set(node.commitId, { x: laneX(node.lane), y: row.offsetTop + row.offsetHeight / 2 });
+  });
+
+  const parts = [];
+  model.forEach(node => {
+    const from = positions.get(node.commitId); if (!from) return;
+    node.parents.forEach(parent => {
+      const to = positions.get(parent.commitId); if (!to) return;
+      const color = palette[node.lane % palette.length];
+      parts.push(from.x === to.x
+        ? `<line x1="${from.x}" y1="${from.y}" x2="${to.x}" y2="${to.y}" stroke="${color}" stroke-width="3" stroke-linecap="round"/>`
+        : `<path d="M${from.x} ${from.y} C${from.x} ${(from.y + to.y) / 2} ${to.x} ${(from.y + to.y) / 2} ${to.x} ${to.y}" stroke="${color}" stroke-width="3" fill="none" stroke-linecap="round"/>`);
+    });
+  });
+  container.querySelectorAll('.stash-row').forEach(row => {
+    const lane = Number(row.dataset.stashLane); const color = palette[lane % palette.length];
+    const x = laneX(lane); const y = row.offsetTop + row.offsetHeight / 2;
+    const belowY = row.nextElementSibling ? row.nextElementSibling.offsetTop + row.nextElementSibling.offsetHeight / 2 : y;
+    parts.push(`<line x1="${x}" y1="${y}" x2="${x}" y2="${belowY}" stroke="${color}" stroke-width="2" stroke-dasharray="3 4" stroke-linecap="round"/>`);
+    parts.push(`<rect x="${x - 5}" y="${y - 5}" width="10" height="10" rx="2.5" fill="#0d1117" stroke="${color}" stroke-width="2"/>`);
+  });
+  model.forEach(node => {
+    const pos = positions.get(node.commitId); if (!pos) return;
+    const color = palette[node.lane % palette.length];
+    parts.push(node.isHead
+      ? `<circle cx="${pos.x}" cy="${pos.y}" r="8" fill="${color}" stroke="#0d1117" stroke-width="2.5"/><circle cx="${pos.x}" cy="${pos.y}" r="8" fill="none" stroke="#e8eef5" stroke-width="1.6"/>`
+      : `<circle cx="${pos.x}" cy="${pos.y}" r="6" fill="${color}" stroke="#0d1117" stroke-width="2.5"/>`);
+  });
+
+  const svg = container.querySelector('.graph-overlay');
+  const height = container.scrollHeight;
+  svg.setAttribute('width', lanesWidth); svg.setAttribute('height', height);
+  svg.setAttribute('viewBox', `0 0 ${lanesWidth} ${height}`);
+  svg.innerHTML = parts.join('');
 }
 
 function selectCommit(id) {
@@ -1014,7 +1221,7 @@ refs.cloneUrl.addEventListener('input', () => { if (!refs.cloneName.dataset.edit
 $('#addSubmodule').addEventListener('click', openAddSubmoduleDialog); refs.confirmAddSubmodule.addEventListener('click', confirmAddSubmodule);
 refs.submoduleUrl.addEventListener('input', () => { if (!refs.submoduleName.dataset.edited) refs.submoduleName.value = suggestedRepositoryName(refs.submoduleUrl.value); validateSubmoduleForm(); });
 refs.submoduleName.addEventListener('input', () => { refs.submoduleName.dataset.edited = refs.submoduleName.value ? '1' : ''; validateSubmoduleForm(); });
-$('#refresh').addEventListener('click', () => state.repository && loadRepository(state.repository.path));
+$('#refresh').addEventListener('click', () => state.repository && loadRepository(state.repository.path, { keepPath: true }));
 $('#showChanges').addEventListener('click', () => { state.changesScope = 'global'; renderChanges(); refs.changesDrawer.classList.add('open'); });
 $('#showFolderChanges').addEventListener('click', () => { state.changesScope = 'folder'; renderChanges(); refs.changesDrawer.classList.add('open'); });
 $('#showPublish').addEventListener('click', () => openPublish().catch(error => status(String(error), 'error')));
@@ -1053,7 +1260,16 @@ refs.leaveSubmoduleGraph.addEventListener('click', leaveSubmoduleGraph);
 $('#saveFile').addEventListener('click', saveEditor); $('#closeEditor').addEventListener('click', () => refs.editorDialog.close()); $('#cancelEditor').addEventListener('click', () => refs.editorDialog.close());
 refs.editorContent.addEventListener('input', updateEditorSaveState);
 $('#fetchCurrent').addEventListener('click', () => { const first = state.remotes[0]?.name || state.branches.find(branch => branch.remote)?.name.split('/')[0]; if (first) fetchRemote(first); else status('No remote is configured', 'error'); });
-async function syncCurrent(action) { if (!invoke || !state.repository) return; try { status(`${action === 'pull' ? 'Pulling' : 'Pushing'} ${state.repository.current_branch}…`, 'busy'); await invoke('sync_repository', { repositoryPath: state.repository.path, action }); await loadRepository(state.repository.path); status(`${action === 'pull' ? 'Pull' : 'Push'} complete`); } catch (error) { handleError(error); } }
+async function syncCurrent(action) {
+  if (!invoke || !state.repository) return;
+  try { status(`${action === 'pull' ? 'Pulling' : 'Pushing'} ${state.repository.current_branch}…`, 'busy'); await invoke('sync_repository', { repositoryPath: state.repository.path, action }); await loadRepository(state.repository.path); status(`${action === 'pull' ? 'Pull' : 'Push'} complete`); }
+  catch (error) {
+    const message = handleError(error);
+    if (action === 'pull' && String(error).toLowerCase().includes('requires a merge')) {
+      showOperationToast(`${message}\nUse "Merge branch…" (⑂) instead — it can resolve conflicts here.`, 'error');
+    } else { showOperationToast(message, 'error'); }
+  }
+}
 $('#pullCurrent').addEventListener('click', () => syncCurrent('pull')); $('#pushCurrent').addEventListener('click', () => syncCurrent('push'));
 refs.publishBranch.addEventListener('change', refreshPublish); refs.publishRemote.addEventListener('change', refreshPublish); $('#confirmPublish').addEventListener('click', confirmPublish);
 [['#compareRestoreRemote','remote'],['#compareRestoreHead','head'],['#compareStage','stage'],['#compareUnstage','unstage']].forEach(([selector, action]) => $(selector)?.addEventListener('click', event => { event.preventDefault(); updateRecoveryHelp(action); applyFileRecovery(action).catch(error => handleError(error)); }));
@@ -1061,8 +1277,10 @@ document.addEventListener('click', event => { const link = event.target.closest(
 document.addEventListener('click', event => {
   const link = event.target.closest('.commit-server-link'); if (!link || !state.repository) return; event.preventDefault();
   const commitId = link.dataset.commitId;
+  const subPath = link.dataset.submodulePath;
+  const repositoryPath = subPath ? `${state.repository.path}/${subPath}` : state.repository.path;
   if (!invoke) return status(`Preview: open commit ${commitId.slice(0, 8)} on server`);
-  invoke('open_commit_on_server', { repositoryPath: state.repository.path, commitId }).catch(error => handleError(error));
+  invoke('open_commit_on_server', { repositoryPath, commitId }).catch(error => handleError(error));
 });
 refs.goUp.addEventListener('click', () => { const commander = state.view === 'commander'; const parts = (commander ? state.commanderPath : state.currentPath).split('/').filter(Boolean); parts.pop(); commander ? openCommanderDirectory(parts.join('/')) : openDirectory(parts.join('/')); });
 refs.reloadFolder.addEventListener('click', () => state.view === 'commander' ? openCommanderDirectory(state.commanderPath) : openDirectory(state.currentPath, { force: true }));
@@ -1090,64 +1308,181 @@ refs.commitButton.addEventListener('click', async () => {
   catch (error) { handleError(error); }
 });
 
-// Command Palette
-const commands = [
-  { id: 'open-repo', name: 'Open Repository', keys: 'Ctrl+O', fn: openRepository },
-  { id: 'new-branch', name: 'New Branch', keys: 'Ctrl+Shift+B', fn: () => $('#newBranch').click() },
-  { id: 'commit', name: 'Commit Changes', keys: 'Ctrl+Shift+C', fn: () => { state.changesScope = 'global'; refs.changesDrawer.classList.add('open'); refs.commitMessage.focus(); } },
-  { id: 'push', name: 'Push Current Branch', keys: 'Ctrl+Shift+P', fn: () => $('#pushCurrent').click() },
-  { id: 'pull', name: 'Pull Current Branch', keys: '', fn: () => $('#pullCurrent').click() },
-  { id: 'fetch', name: 'Fetch Remote', keys: 'Ctrl+Shift+F', fn: () => $('#fetchCurrent').click() },
-  { id: 'stash', name: 'Stash Work in Progress', keys: 'Ctrl+Shift+S', fn: stashWork },
-  { id: 'pop', name: 'Restore Stashed Work', keys: '', fn: popStash },
-  { id: 'search', name: 'Search Repository', keys: 'Ctrl+F', fn: () => refs.search.focus() },
-  { id: 'explorer', name: 'Go to Explorer', keys: '', fn: () => $('#navExplorer').click() },
-  { id: 'commander', name: 'Go to Local ↔ Remote', keys: 'Ctrl+Shift+L', fn: () => $('#navCommander').click() },
-  { id: 'graph', name: 'Go to Branch Map', keys: 'Ctrl+Shift+G', fn: () => $('#navGraph').click() },
-  { id: 'remotes', name: 'Go to Remotes', keys: '', fn: () => $('#navRemotes').click() },
-];
+// Command Console — a context-aware command palette. It never runs anything
+// outside the app's own already-tested actions (no raw shell access); the
+// "smart" part is: what's suggested first depends on where you are (a
+// submodule selected, a folder open, a repo not yet loaded…), a short
+// explanation is always shown, and typing a plain word ("push", "merge",
+// "stash") is enough — you don't need to know the exact button label.
+function currentConsoleContext() {
+  const entry = state.selectedEntry;
+  if (!state.repository) return { label: 'No repository open', tags: ['no-repo'] };
+  if (entry?.kind === 'submodule') return { label: `Submodule: ${entry.relative_path}`, tags: ['submodule', 'has-selection'] };
+  if (entry) return { label: `Selected: ${entry.relative_path}`, tags: ['file', 'has-selection'] };
+  if (state.view === 'graph') return { label: `Branch Map · ${state.repository.current_branch || 'detached'}`, tags: ['graph'] };
+  if (state.view === 'commander') return { label: 'Local ↔ Remote', tags: ['commander'] };
+  return { label: `${state.currentPath || state.repository.name} · branch ${state.repository.current_branch || 'detached'}`, tags: ['explorer'] };
+}
+
+function buildCommands() {
+  const entry = state.selectedEntry;
+  const list = [
+    { id: 'open-repo', name: 'Open Repository', description: 'Choose a local Git folder to open', keys: 'Ctrl+O', tags: ['no-repo'], fn: openRepository },
+    { id: 'new-branch', name: 'New Branch', description: 'Create a new local branch from the current one', keys: 'Ctrl+Shift+B', tags: ['explorer', 'graph'], fn: () => $('#newBranch').click() },
+    { id: 'commit', name: 'Commit Changes', description: 'Open the Working tree drawer and write a commit message for staged files', keys: 'Ctrl+Shift+C', keywords: 'save record', tags: ['explorer'], fn: () => { state.changesScope = 'global'; refs.changesDrawer.classList.add('open'); refs.commitMessage.focus(); } },
+    { id: 'push', name: 'Push Current Branch', description: 'Send your local commits on this branch to the server', keys: 'Ctrl+Shift+P', tags: ['explorer', 'graph'], fn: () => $('#pushCurrent').click() },
+    { id: 'pull', name: 'Pull Current Branch', description: 'Fetch and fast-forward the current branch from the server', keys: '', tags: ['explorer', 'graph'], fn: () => $('#pullCurrent').click() },
+    { id: 'merge', name: 'Merge Branch…', description: 'Bring another branch\'s commits into your current one — stays local, resolves conflicts here if any', keys: '', keywords: 'combine join', tags: ['explorer', 'graph'], fn: () => state.repository && openMergeBranchDialog(mergeTargetForMain()) },
+    { id: 'fetch', name: 'Fetch Remote', description: 'Download new commits/refs from the server without changing your branch', keys: 'Ctrl+Shift+F', tags: ['explorer', 'graph'], fn: () => $('#fetchCurrent').click() },
+    { id: 'stash', name: 'Stash Work in Progress', description: 'Temporarily set aside uncommitted changes, restore them later', keys: 'Ctrl+Shift+S', tags: ['explorer'], fn: stashWork },
+    { id: 'pop', name: 'Restore Stashed Work', description: 'Bring back the changes you last stashed', keys: '', tags: ['explorer'], fn: popStash },
+    { id: 'conflicts', name: 'Resolve Merge Conflicts', description: 'Open the conflict resolution dialog for a merge in progress', keys: '', keywords: 'merge conflict resolve', tags: state.pendingMainConflicts?.length ? ['explorer', 'graph', 'relevant'] : [], fn: () => openConflictsDialog(mergeTargetForMain(), state.pendingMainConflicts || []) },
+    { id: 'search', name: 'Search Repository', description: 'Filter the current view by name, author or commit id', keys: 'Ctrl+F', tags: ['explorer', 'graph', 'commander'], fn: () => refs.search.focus() },
+    { id: 'explorer', name: 'Go to Project Explorer', description: 'Browse files, folders and submodules', keys: '', keywords: 'files browse', tags: [], fn: () => $('#navExplorer').click() },
+    { id: 'commander', name: 'Go to Local ↔ Remote', description: 'Compare your working copy against a remote snapshot, file by file', keys: 'Ctrl+Shift+L', keywords: 'diff compare', tags: [], fn: () => $('#navCommander').click() },
+    { id: 'graph', name: 'Go to Branch Map', description: 'See commit history and branches as a graph', keys: 'Ctrl+Shift+G', keywords: 'log history commits', tags: [], fn: () => $('#navGraph').click() },
+    { id: 'remotes', name: 'Go to Remotes', description: 'View and fetch configured server locations', keys: '', tags: [], fn: () => $('#navRemotes').click() },
+    { id: 'refresh', name: 'Refresh Repository', description: 'Re-read branches, commits and status from disk (e.g. after external Git commands)', keys: '', keywords: 'reload', tags: [], fn: () => $('#refresh').click() },
+  ];
+  if (entry?.kind === 'submodule') {
+    list.push(
+      { id: 'sub-pull', name: `Pull Submodule (${entry.name})`, description: 'Fast-forward this submodule from its own remote', tags: ['submodule', 'relevant'], keywords: 'submodule update', fn: () => pullSubmodule(entry) },
+      { id: 'sub-push', name: `Push Submodule (${entry.name})`, description: 'Send this submodule\'s local commits to its own remote', tags: ['submodule', 'relevant'], fn: () => pushSubmodule(entry) },
+      { id: 'sub-merge', name: `Merge Branch into Submodule (${entry.name})`, description: 'Bring another branch into this submodule\'s current branch', tags: ['submodule', 'relevant'], keywords: 'merge combine', fn: () => openMergeBranchDialog(mergeTargetForSubmodule(entry)) },
+      { id: 'sub-commit', name: `Commit Submodule (${entry.name})`, description: 'Commit uncommitted changes inside this submodule', tags: ['submodule', 'relevant'], fn: () => commitSubmoduleChanges(entry) },
+      { id: 'sub-version', name: `Change Submodule Version (${entry.name})`, description: 'Switch this submodule to a different branch, tag or commit', tags: ['submodule', 'relevant'], keywords: 'checkout switch branch', fn: () => openSubmoduleMenu(entry, innerWidth - 480, 110) },
+      { id: 'sub-fetch', name: `Fetch Submodule (${entry.name})`, description: 'Download new commits for this submodule without changing its checkout', tags: ['submodule'], fn: () => fetchSubmodule(entry) },
+      { id: 'sub-new-branch', name: `New Branch in Submodule (${entry.name})`, description: 'Create and switch to a new branch in this submodule, from its current commit', tags: ['submodule', 'relevant'], keywords: 'checkout create', fn: () => createSubmoduleBranch(entry) },
+    );
+  } else if (entry?.kind === 'file') {
+    list.push(
+      { id: 'file-edit', name: `Edit ${entry.name}`, description: 'Open this file in the built-in editor', tags: ['file', 'relevant'], fn: () => openEditor(entry) },
+      { id: 'file-compare', name: `Compare ${entry.name} with Remote`, description: 'Side-by-side diff against the server version, with restore options', tags: ['file', 'relevant'], keywords: 'diff', fn: () => compareEntryWithRemote(entry) },
+    );
+  }
+  return list;
+}
+
 let commandPaletteOpen = false;
+let activeCommands = [];
+
+function scoreCommand(cmd, query, tags) {
+  const relevant = cmd.tags?.some(tag => tags.includes(tag)) ? 1 : 0;
+  if (!query) return relevant;
+  const haystack = `${cmd.name} ${cmd.description || ''} ${cmd.keywords || ''}`.toLowerCase();
+  if (!haystack.includes(query)) return -1;
+  const nameMatch = cmd.name.toLowerCase().startsWith(query) ? 2 : cmd.name.toLowerCase().includes(query) ? 1 : 0;
+  return relevant * 10 + nameMatch;
+}
+
+function renderCommandList(query) {
+  const ctx = currentConsoleContext();
+  const q = query.trim().toLowerCase();
+  const scored = activeCommands.map(cmd => ({ cmd, score: scoreCommand(cmd, q, ctx.tags) })).filter(entry => entry.score >= 0);
+  scored.sort((a, b) => b.score - a.score);
+  const list = $('#commandList');
+  list.innerHTML = scored.map(({ cmd, score }, i) => `<div class="command-item ${i === 0 ? 'selected' : ''} ${score >= 10 ? 'relevant' : ''}" data-cmd-id="${esc(cmd.id)}">
+    <div class="command-item-head"><span class="command-name">${esc(cmd.name)}</span>${cmd.keys ? `<span class="command-keys">${esc(cmd.keys)}</span>` : ''}</div>
+    <span class="command-desc">${esc(cmd.description || '')}</span>
+  </div>`).join('') || '<div class="command-item" style="text-align:center;color:#6b7f96;">No matching commands</div>';
+}
+
+// ---- Raw git escape hatch --------------------------------------------------
+// Typing "$ <git args>" runs that literal git subcommand — scoped to wherever
+// you currently are (the selected submodule, or the folder being browsed) —
+// and shows git's actual stdout/stderr. This is real freedom to run any git
+// command, deliberately kept separate from the app's own tested actions above
+// (which never touch a shell) so the two are never confused with each other.
+const RAW_GIT_PREFIX = '$';
+function isRawGitQuery(query) { return query.trimStart().startsWith(RAW_GIT_PREFIX); }
+function rawGitArgs(query) { return query.trimStart().slice(1).trim(); }
+const DESTRUCTIVE_GIT_PATTERN = /(^|\s)(reset\s+--hard|clean\s+-[a-z]*f|push\s+.*(--force|-f\b)|branch\s+-D|checkout\s+.*-f\b|rebase|filter-branch|gc\s+--prune|update-ref\s+-d)/i;
+
+function consoleGitTarget() {
+  const entry = state.selectedEntry;
+  if (entry?.kind === 'submodule') return { path: `${state.repository.path}/${entry.relative_path}`, label: entry.relative_path };
+  const folder = state.currentPath ? `${state.repository.path}/${state.currentPath}` : state.repository.path;
+  return { path: folder, label: state.currentPath || '.' };
+}
+
+function renderRawGitPrompt(args) {
+  const target = consoleGitTarget();
+  $('#commandList').innerHTML = `<div class="command-item selected raw-git-item" data-raw-git="1">
+    <div class="command-item-head"><span class="command-name">▸ Run: git ${esc(args || '…')}</span><span class="command-keys">Enter</span></div>
+    <span class="command-desc">Runs in ${esc(target.label)} — shows git's real output below</span>
+  </div>`;
+}
+
+function renderRawGitOutput(args, result) {
+  const target = consoleGitTarget();
+  $('#commandList').innerHTML = `<div class="raw-git-output">
+    <div class="raw-git-cmd">$ git ${esc(args)} <span class="raw-git-cwd">(in ${esc(target.label)})</span> <b class="raw-git-status ${result.success ? 'ok' : 'fail'}">${result.success ? 'OK' : 'FAILED'}</b></div>
+    ${result.stdout ? `<pre class="raw-git-stdout">${esc(result.stdout)}</pre>` : ''}
+    ${result.stderr ? `<pre class="raw-git-stderr">${esc(result.stderr)}</pre>` : ''}
+    ${!result.stdout && !result.stderr ? '<div class="raw-git-empty">(no output)</div>' : ''}
+  </div>`;
+}
+
+async function runRawGitFromConsole(args) {
+  if (!args) return;
+  if (!state.repository) { renderRawGitOutput(args, { success: false, stdout: '', stderr: 'Open a repository first.' }); return; }
+  if (DESTRUCTIVE_GIT_PATTERN.test(args)) {
+    const target = consoleGitTarget();
+    const ok = await customConfirm(`This looks like a destructive command: "git ${args}" in ${target.label}. It can permanently discard commits, branches or uncommitted work. Continue?`, { title: 'Destructive git command', danger: true, okLabel: 'Run it anyway' });
+    if (!ok) return;
+  }
+  if (!invoke) { renderRawGitOutput(args, { success: true, stdout: '(preview mode — not actually run)', stderr: '' }); return; }
+  const target = consoleGitTarget();
+  try {
+    const result = await invoke('run_git_command', { repositoryPath: target.path, args });
+    renderRawGitOutput(args, result);
+    directoryCache.clear(); await loadRepository(state.repository.path, { keepPath: true });
+  } catch (error) { renderRawGitOutput(args, { success: false, stdout: '', stderr: String(error) }); }
+}
+
 function openCommandPalette() {
   const input = $('#commandInput');
-  const list = $('#commandList');
   commandPaletteOpen = true;
+  activeCommands = buildCommands();
   input.value = '';
-  list.innerHTML = commands.map((cmd, i) => `<div class="command-item ${i === 0 ? 'selected' : ''}" data-cmd-id="${esc(cmd.id)}">
-    <span class="command-name">${esc(cmd.name)}</span>${cmd.keys ? `<span class="command-keys">${esc(cmd.keys)}</span>` : ''}</div>`).join('');
+  const ctx = currentConsoleContext();
+  $('#commandContext').textContent = `CONTEXT: ${ctx.label} — tip: type "$ <git args>" to run any git command here`;
+  renderCommandList('');
   $('#commandPalette').showModal();
   input.focus();
 }
-function filterCommands(query) {
-  const list = $('#commandList');
-  const filtered = commands.filter(c => !query || c.name.toLowerCase().includes(query.toLowerCase()));
-  list.innerHTML = filtered.map((cmd, i) => `<div class="command-item ${i === 0 ? 'selected' : ''}" data-cmd-id="${esc(cmd.id)}">
-    <span class="command-name">${esc(cmd.name)}</span>${cmd.keys ? `<span class="command-keys">${esc(cmd.keys)}</span>` : ''}</div>`).join('') || '<div class="command-item" style="text-align:center;color:#6b7f96;">No commands found</div>';
-}
+function filterCommands(query) { isRawGitQuery(query) ? renderRawGitPrompt(rawGitArgs(query)) : renderCommandList(query); }
 $('#commandInput').addEventListener('input', (e) => filterCommands(e.target.value));
 $('#commandInput').addEventListener('keydown', (e) => {
+  if (isRawGitQuery($('#commandInput').value)) {
+    if (e.key === 'Enter') { e.preventDefault(); runRawGitFromConsole(rawGitArgs($('#commandInput').value)); }
+    return;
+  }
   const items = Array.from($('#commandList').querySelectorAll('.command-item'));
   const selected = items.find(i => i.classList.contains('selected'));
-  if (e.key === 'ArrowDown') { e.preventDefault(); const next = selected?.nextElementSibling || items[0]; items.forEach(i => i.classList.remove('selected')); next?.classList.add('selected'); }
-  else if (e.key === 'ArrowUp') { e.preventDefault(); const prev = selected?.previousElementSibling || items[items.length - 1]; items.forEach(i => i.classList.remove('selected')); prev?.classList.add('selected'); }
-  else if (e.key === 'Enter') { e.preventDefault(); const cmd = commands.find(c => c.id === selected?.dataset.cmdId); if (cmd) { $('#commandPalette').close(); cmd.fn(); commandPaletteOpen = false; } }
+  if (e.key === 'ArrowDown') { e.preventDefault(); const next = selected?.nextElementSibling || items[0]; items.forEach(i => i.classList.remove('selected')); next?.classList.add('selected'); next?.scrollIntoView({ block: 'nearest' }); }
+  else if (e.key === 'ArrowUp') { e.preventDefault(); const prev = selected?.previousElementSibling || items[items.length - 1]; items.forEach(i => i.classList.remove('selected')); prev?.classList.add('selected'); prev?.scrollIntoView({ block: 'nearest' }); }
+  else if (e.key === 'Enter') { e.preventDefault(); const cmd = activeCommands.find(c => c.id === selected?.dataset.cmdId); if (cmd) { $('#commandPalette').close(); cmd.fn(); commandPaletteOpen = false; } }
 });
 $('#commandList').addEventListener('click', (e) => {
+  if (e.target.closest('[data-raw-git]')) { runRawGitFromConsole(rawGitArgs($('#commandInput').value)); return; }
   const item = e.target.closest('.command-item');
   if (item && item.dataset.cmdId) {
-    const cmd = commands.find(c => c.id === item.dataset.cmdId);
+    const cmd = activeCommands.find(c => c.id === item.dataset.cmdId);
     if (cmd) { $('#commandPalette').close(); cmd.fn(); commandPaletteOpen = false; }
   }
 });
 $('#commandPalette').addEventListener('close', () => { commandPaletteOpen = false; });
+$('#openConsole').addEventListener('click', () => openCommandPalette());
 document.addEventListener('keydown', (e) => {
   if ((e.ctrlKey || e.metaKey) && e.key === 'k') { e.preventDefault(); commandPaletteOpen ? $('#commandPalette').close() : openCommandPalette(); }
   else if ((e.ctrlKey || e.metaKey) && e.key === 'o') { e.preventDefault(); openRepository(); }
-  else if ((e.ctrlKey || e.metaKey) && (e.shiftKey && e.key === 'C')) { e.preventDefault(); commands.find(c => c.id === 'commit')?.fn(); }
-  else if ((e.ctrlKey || e.metaKey) && (e.shiftKey && e.key === 'P')) { e.preventDefault(); commands.find(c => c.id === 'push')?.fn(); }
-  else if ((e.ctrlKey || e.metaKey) && (e.shiftKey && e.key === 'F')) { e.preventDefault(); commands.find(c => c.id === 'fetch')?.fn(); }
+  else if ((e.ctrlKey || e.metaKey) && (e.shiftKey && e.key === 'C')) { e.preventDefault(); $('#navExplorer') && (state.changesScope = 'global', refs.changesDrawer.classList.add('open'), refs.commitMessage.focus()); }
+  else if ((e.ctrlKey || e.metaKey) && (e.shiftKey && e.key === 'P')) { e.preventDefault(); $('#pushCurrent').click(); }
+  else if ((e.ctrlKey || e.metaKey) && (e.shiftKey && e.key === 'F')) { e.preventDefault(); $('#fetchCurrent').click(); }
   else if ((e.ctrlKey || e.metaKey) && (e.shiftKey && e.key === 'S')) { e.preventDefault(); state.hasStash ? popStash() : stashWork(); }
-  else if ((e.ctrlKey || e.metaKey) && (e.shiftKey && e.key === 'L')) { e.preventDefault(); commands.find(c => c.id === 'commander')?.fn(); }
-  else if ((e.ctrlKey || e.metaKey) && (e.shiftKey && e.key === 'G')) { e.preventDefault(); commands.find(c => c.id === 'graph')?.fn(); }
+  else if ((e.ctrlKey || e.metaKey) && (e.shiftKey && e.key === 'L')) { e.preventDefault(); $('#navCommander').click(); }
+  else if ((e.ctrlKey || e.metaKey) && (e.shiftKey && e.key === 'G')) { e.preventDefault(); $('#navGraph').click(); }
   else if ((e.ctrlKey || e.metaKey) && e.key === 'f' && !['input','textarea'].includes(document.activeElement.tagName.toLowerCase())) { e.preventDefault(); refs.search.focus(); }
 });
 
