@@ -18,7 +18,8 @@ function addRecentRepo(path, name) {
   renderRecentRepos();
 }
 
-const state = { repository: null, branches: [], commits: [], allCommits: [], changes: [], selectedCommit: null, view: 'explorer', currentPath: '', entries: [], selectedEntry: null, historyScope: '', commanderPath: '', commanderRows: [], remoteRef: '', remotes: [], graphContext: null, editingPath: '', editorOriginal: '', publish: null, changesScope: 'global', commanderFocus: '', comparingRow: null, hasStash: false, stashes: [], editingConflict: null, mergeTarget: null };
+const state = { repository: null, branches: [], commits: [], allCommits: [], changes: [], selectedCommit: null, view: 'explorer', currentPath: '', entries: [], selectedEntry: null, historyScope: '', commanderPath: '', commanderRows: [], remoteRef: '', remotes: [], graphContext: null, editingPath: '', editorOriginal: '', publish: null, changesScope: 'global', commanderFocus: '', comparingRow: null, hasStash: false, stashes: [], editingConflict: null, mergeTarget: null,
+  consoleMode: 'commands', consoleTranscript: [], consoleCmdHistory: [], consoleScopeOverride: null, graphPrimaryBranch: null };
 const previewData = {
   repository: { name: 'vehicle-control', path: '/projects/vehicle-control', current_branch: 'feature/diagnostics' },
   branches: [
@@ -192,9 +193,19 @@ async function confirmAddSubmodule() {
 async function loadRepository(path, options = {}) {
   status('Reading repository…', 'busy');
   const keepPath = options.keepPath ? state.currentPath : '';
+  // A plain refresh must not silently kick you out of whatever view you were
+  // looking at (e.g. Branch Map) back to Project Explorer — that made a
+  // just-refreshed history look unchanged when really you just weren't
+  // looking at it anymore. Only reset the view for a genuine fresh open.
+  const keepView = options.keepPath ? state.view : 'explorer';
   try {
     const data = await invoke('load_repository', { path });
-    directoryCache.clear(); Object.assign(state, data); state.allCommits = data.commits; state.historyScope = ''; state.view = 'explorer'; state.commanderPath = ''; state.commanderRows = [];
+    // `data.commits` (assigned onto state.commits below) is always the full,
+    // unscoped history — a scoped "History · <path>" view can't stay correctly
+    // scoped through a refresh without re-querying that same scope, so it
+    // falls back to the full Branch Map instead of showing stale-looking
+    // scoped chrome over full data.
+    directoryCache.clear(); Object.assign(state, data); state.allCommits = data.commits; state.historyScope = ''; state.view = keepView; state.commanderPath = options.keepPath ? state.commanderPath : ''; state.commanderRows = options.keepPath ? state.commanderRows : [];
     state.remoteRef = data.branches.find(branch => branch.remote)?.name || ''; await openDirectory(keepPath, { force: true }); status(`${data.commits.length} commits loaded`);
     addRecentRepo(path, data.repository.name);
     updatePublishIndicator();
@@ -502,7 +513,15 @@ function selectedScope() {
 }
 
 function scopeHasChanges(scope) {
-  return state.changes.some(change => !scope.path || change.path === scope.path || change.path.startsWith(`${scope.path}/`));
+  if (state.changes.some(change => !scope.path || change.path === scope.path || change.path.startsWith(`${scope.path}/`))) return true;
+  // A file inside a submodule never shows up in state.changes — the parent's
+  // own status scan can't see inside a submodule's own index at all, only the
+  // submodule as one opaque entry. The currently selected entry's own status
+  // (sourced correctly from the submodule's own repo when it's inside one) is
+  // already accurate, so fall back to trusting that directly.
+  const entry = state.selectedEntry;
+  if (entry && entry.relative_path === scope.path) return Boolean(entry.status) || !entry.tracked;
+  return false;
 }
 
 function openScopeCommit() {
@@ -1021,28 +1040,60 @@ function updateStashUI() { $('#stashWork').hidden = state.hasStash; $('#popStash
 // currently occupies it, or (c) freed and later reused (first-fit) by a
 // later, unrelated fork. This is what keeps a linear branch pinned to one
 // lane for its entire visible history instead of drifting row to row.
-function buildGraphModel(commits) {
+// Every commit reachable from `primaryTipId` (the selected branch's tip) —
+// walking ALL parents, not just first-parent, so a merge into the selected
+// branch still counts its merged-in history as "belongs to this branch".
+function reachableFrom(tipId, commits) {
+  const set = new Set(); if (!tipId) return set;
+  const byId = new Map(commits.map(c => [c.id, c]));
+  const stack = [tipId];
+  while (stack.length) {
+    const id = stack.pop(); if (set.has(id)) continue; set.add(id);
+    const commit = byId.get(id); if (commit) (commit.parents || []).forEach(p => stack.push(p));
+  }
+  return set;
+}
+
+// Lane 0 is reserved for the selected branch's own ancestry. A commit that
+// isn't reachable from it — e.g. another branch's commit made after the two
+// diverged — is never placed there, even if it's chronologically newer and
+// would otherwise be first in line; it gets its own lane instead, and that
+// lane only exists for as long as it actually needs to (freed again right
+// after its edge reconnects to the primary chain).
+function buildGraphModel(commits, primaryTipId) {
+  const primarySet = reachableFrom(primaryTipId, commits);
   const lanes = []; // lanes[i] = commitId currently occupying that lane, or null
+  if (primarySet.size && commits.some(c => c.id === primaryTipId)) lanes[0] = primaryTipId;
   const dedupe = list => (list || []).filter((id, index, all) => id && all.indexOf(id) === index);
 
   return commits.map((commit, row) => {
+    const isPrimary = primarySet.has(commit.id);
     let lane = lanes.indexOf(commit.id);
-    if (lane < 0) { lane = lanes.indexOf(null); if (lane < 0) lane = lanes.length; }
+    if (lane < 0) {
+      if (isPrimary) { lane = lanes[0] == null ? 0 : lanes.indexOf(null); if (lane < 0) lane = lanes.length; }
+      else { lane = lanes.length > 1 ? lanes.indexOf(null, 1) : -1; if (lane < 0) lane = Math.max(lanes.length, 1); }
+    }
     const before = lanes.slice();
     lanes[lane] = null;
 
     const parentIds = dedupe(commit.parents);
     const newParents = parentIds.filter(id => !lanes.includes(id));
-    if (newParents.length) { lanes[lane] = newParents[0]; }
-    for (let index = 1; index < newParents.length; index++) {
-      let slot = lanes.indexOf(null); if (slot < 0) slot = lanes.length;
-      lanes[slot] = newParents[index];
+    const primaryParent = newParents.find(id => primarySet.has(id));
+    const secondaryNewParents = newParents.filter(id => id !== primaryParent);
+    if (primaryParent && lanes[0] == null) { lanes[0] = primaryParent; }
+    if (secondaryNewParents.length) {
+      let index = 0;
+      if (lane !== 0) { lanes[lane] = secondaryNewParents[0]; index = 1; }
+      for (; index < secondaryNewParents.length; index++) {
+        let slot = lanes.length > 1 ? lanes.indexOf(null, 1) : -1; if (slot < 0) slot = Math.max(lanes.length, 1);
+        lanes[slot] = secondaryNewParents[index];
+      }
     }
     while (lanes.length && lanes[lanes.length - 1] == null) lanes.pop();
     const after = lanes.slice();
 
     return {
-      commitId: commit.id, row, lane, before, after,
+      commitId: commit.id, row, lane, before, after, isPrimary,
       parents: parentIds.map(id => ({ commitId: id, targetRow: row + 1, targetLane: after.indexOf(id) })).filter(p => p.targetLane >= 0),
       refs: commit.refs || [],
       type: 'commit',
@@ -1053,11 +1104,18 @@ function buildGraphModel(commits) {
 const LANE_WIDTH = 30;
 const laneX = lane => LANE_WIDTH / 2 + lane * LANE_WIDTH;
 
+// Show at most a couple of ref labels inline — the graph's shape is the main
+// signal, refs are a secondary lookup. Anything beyond that collapses into a
+// single "+N" pill instead of filling the row with badges.
+const MAX_INLINE_REFS = 2;
 function refsBadges(refList, color, isHead) {
   const grouped = refList.filter(ref => ref !== 'HEAD');
   const headPill = isHead ? '<b class="head-pill">HEAD</b>' : '';
   if (!grouped.length && !headPill) return '';
-  return `<span class="ref-pills">${headPill}${grouped.map(ref => `<b class="ref-pill" style="--lane-color:${color}">${esc(ref)}</b>`).join('')}</span>`;
+  const shown = grouped.slice(0, MAX_INLINE_REFS);
+  const rest = grouped.slice(MAX_INLINE_REFS);
+  const restPill = rest.length ? `<b class="ref-pill ref-pill-more" data-tooltip="${esc(rest.join(', '))}">+${rest.length}</b>` : '';
+  return `<span class="ref-pills">${headPill}${shown.map(ref => `<b class="ref-pill" style="--lane-color:${color}">${esc(ref)}</b>`).join('')}${restPill}</span>`;
 }
 
 // ---- Rendering -------------------------------------------------------------
@@ -1072,9 +1130,16 @@ function refsBadges(refList, color, isHead) {
 function renderGraph() {
   const query = refs.search.value.trim().toLowerCase();
   const commits = state.commits.filter(c => !query || `${c.subject} ${c.author} ${c.id} ${(c.refs || []).join(' ')}`.toLowerCase().includes(query));
-  const model = buildGraphModel(commits);
-  const nodeById = new Map(commits.map((commit, index) => [commit.id, model[index]]));
   const currentBranch = state.repository?.current_branch;
+  // "Selected branch" drives which lane is primary — defaults to whatever is
+  // currently checked out. Any branch whose tip isn't reachable from it (a
+  // sibling that's diverged, even if newer) gets pushed to its own lane
+  // instead of ever sharing the primary one.
+  const localBranchNames = (state.branches || []).filter(b => !b.remote).map(b => b.name);
+  const primaryBranchName = state.graphPrimaryBranch && localBranchNames.includes(state.graphPrimaryBranch) ? state.graphPrimaryBranch : currentBranch;
+  const primaryTip = primaryBranchName ? commits.find(c => (c.refs || []).includes(primaryBranchName)) : null;
+  const model = buildGraphModel(commits, primaryTip?.id);
+  const nodeById = new Map(commits.map((commit, index) => [commit.id, model[index]]));
   const headEntry = currentBranch ? commits.find(commit => (commit.refs || []).includes(currentBranch)) : null;
   if (headEntry) { nodeById.get(headEntry.id).isHead = true; }
   const maxLanes = Math.max(1, ...model.map(n => Math.max(n.before.length, n.after.length)));
@@ -1083,44 +1148,81 @@ function renderGraph() {
   refs.laneLegend.style.setProperty('--lanes-width', `${lanesWidth}px`);
   refs.laneLegend.innerHTML = `<span class="time-direction"><b>NEWEST</b><i>↓</i><b>OLDEST</b></span>
     ${currentBranch ? `<span class="head-banner">HEAD <i>→</i> <b>${esc(currentBranch)}</b></span>` : ''}
+    ${localBranchNames.length > 1 ? `<label class="primary-branch-picker"><span>Primary</span><select id="graphPrimaryBranch">${localBranchNames.map(name => `<option value="${esc(name)}" ${name === primaryBranchName ? 'selected' : ''}>${esc(name)}</option>`).join('')}</select></label>` : ''}
     <span class="lane-header"><span>GRAPH</span><span>COMMIT</span></span>`;
+  $('#graphPrimaryBranch')?.addEventListener('change', event => { state.graphPrimaryBranch = event.target.value; renderGraph(); });
 
-  // Stash entries are informational pointers, not real DAG commits — rendered
-  // as their own dashed-connector rows anchored to the commit they were taken
-  // from, never mixed into the lane/parent topology above.
+  // Stash entries are informational pointers, not real DAG commits. Rendering
+  // them as their own row used to insert a break in the middle of the vertical
+  // chain, making a branch that's just one commit ahead look like it "floats"
+  // disconnected from where it actually came from. They're attached instead as
+  // a small lateral pill on their base commit's own row — secondary
+  // information, never interrupting the parent/child line.
   const stashesByBase = new Map();
   (state.stashes || []).forEach(stash => { if (!stashesByBase.has(stash.base_commit)) stashesByBase.set(stash.base_commit, []); stashesByBase.get(stash.base_commit).push(stash); });
 
+  // When a straight (single-lane) run of commits has a ref-labeled commit at
+  // the top and another, differently-labeled one further down with nothing
+  // labeled in between, that gap between them is a branch point: the lower
+  // commit is the common ancestor both refs share, the upper one(s) exist
+  // only on the newer ref. Marked on both ends, kept to one short line each —
+  // the tip gets "N commit(s) ahead", the base gets a distinct marker instead
+  // of trying to bend a single real lane into a decorative fork.
+  const aheadAnnotations = new Map(); // row index -> short text
+  const branchPointRows = new Set(); // row indices that are a shared-ancestor base
+  for (let i = 0; i < model.length; i++) {
+    const from = model[i]; const fromRefs = (from.refs || []).filter(r => r !== 'HEAD');
+    if (!fromRefs.length) continue;
+    let j = i + 1;
+    while (j < model.length && model[j].lane === from.lane && !(model[j].refs || []).filter(r => r !== 'HEAD').length) j++;
+    if (j >= model.length || model[j].lane !== from.lane) continue;
+    const toRefs = (model[j].refs || []).filter(r => r !== 'HEAD');
+    if (!toRefs.length || toRefs.join(',') === fromRefs.join(',')) continue;
+    const distance = j - i;
+    aheadAnnotations.set(i, `↳ ${distance} commit${distance === 1 ? '' : 's'} ahead of ${toRefs.join('/')}`);
+    branchPointRows.add(j);
+  }
+  // More generally: wherever an edge actually crosses lanes (a real diagonal
+  // fork/merge line, not just a straight same-lane continuation), the commit
+  // it lands on is a genuine branch/merge point — mark it the same way.
+  const commitIdToRow = new Map(commits.map((c, i) => [c.id, i]));
+  model.forEach(node => node.parents.forEach(parent => {
+    if (parent.targetLane === node.lane) return;
+    const targetRow = commitIdToRow.get(parent.commitId);
+    if (targetRow != null) branchPointRows.add(targetRow);
+  }));
+
   const rows = commits.map((commit, index) => {
     const node = model[index]; const color = palette[node.lane % palette.length];
-    const stashRows = (stashesByBase.get(commit.id) || []).map(stash => `<article class="commit-row stash-row" data-stash="${stash.index}" data-stash-lane="${node.lane}">
-      <div class="graph-cell" style="width:${lanesWidth}px"></div>
-      <div class="commit-card stash-card" data-toggle-stash="${stash.index}">
-        <div class="commit-main"><span class="commit-title">stash@{${stash.index}} — ${esc(stash.message.replace(/^WIP on [^:]+:\s*[0-9a-f]+\s*/, 'WIP on ') || 'Saved work')}</span></div>
-        <span class="topology-badges"><b class="stash-badge">STASH</b></span>
-        <span class="commit-author stash-internals" hidden>Bundles: working-tree changes, staged index${stash.message.includes('untracked') ? ', untracked files' : ''} — base ${esc(stash.base_commit.slice(0, 8))}</span>
-      </div>
-    </article>`).join('');
+    const stashPills = (stashesByBase.get(commit.id) || []).map(stash => `<b class="stash-pill" data-toggle-stash="${stash.index}" data-tooltip="stash@{${stash.index}} — click for details">⇕ stash</b>`).join('');
+    const stashDetails = (stashesByBase.get(commit.id) || []).map(stash => `<div class="stash-internals" data-stash-detail="${stash.index}" hidden>stash@{${stash.index}}: ${esc(stash.message.replace(/^WIP on [^:]+:\s*[0-9a-f]+\s*/, 'WIP on ') || 'Saved work')} — bundles working-tree changes, staged index${stash.message.includes('untracked') ? ', untracked files' : ''}</div>`).join('');
+    const ahead = aheadAnnotations.get(index);
+    const isBranchPoint = branchPointRows.has(index);
 
-    return stashRows + `<article class="commit-row ${node.isHead ? 'is-head' : ''}" data-id="${esc(commit.id)}" data-lane="${node.lane}">
+    return `<article class="commit-row ${node.isHead ? 'is-head' : ''} ${isBranchPoint ? 'is-branch-point' : ''}" data-id="${esc(commit.id)}" data-lane="${node.lane}">
       <div class="graph-cell" style="width:${lanesWidth}px"></div>
-      <div class="commit-card"><div class="commit-main"><span class="commit-title">${commitSubjectHtml(commit.subject)}</span>${refsBadges(node.refs, color, node.isHead)}</div><span class="commit-id">${esc(commit.id.slice(0, 8))}</span>
-      <span class="topology-badges">${commit.parents?.length > 1 ? `<b class="merge-badge">MERGE · ${commit.parents.length} parents</b>` : ''}</span><span class="commit-author">${esc(commit.author)}</span><span class="commit-date">${esc(commit.date)}</span></div>
+      <div class="commit-body">
+        <div class="commit-card"><div class="commit-main">${isBranchPoint ? '<b class="branch-point-pill" data-tooltip="Common ancestor — where the newer branch above split off">⑂</b>' : ''}<span class="commit-title">${commitSubjectHtml(commit.subject)}</span>${refsBadges(node.refs, color, node.isHead)}${stashPills}</div><span class="commit-id">${esc(commit.id.slice(0, 8))}</span>
+        <span class="topology-badges">${commit.parents?.length > 1 ? `<b class="merge-badge">MERGE</b>` : ''}</span><span class="commit-author">${esc(commit.author)}</span></div>
+        ${ahead ? `<div class="ahead-annotation">${esc(ahead)}</div>` : ''}${stashDetails}
+      </div>
     </article>`;
   }).join('') || '<div class="empty-change">No commits match this filter</div>';
 
   refs.graph.innerHTML = `<svg class="graph-overlay"></svg>` + rows;
   refs.graph.querySelectorAll('.commit-row[data-id]').forEach(row => row.addEventListener('click', () => selectCommit(row.dataset.id)));
-  refs.graph.querySelectorAll('[data-toggle-stash]').forEach(card => card.addEventListener('click', () => card.querySelector('.stash-internals')?.toggleAttribute('hidden')));
+  refs.graph.querySelectorAll('[data-toggle-stash]').forEach(pill => pill.addEventListener('click', event => { event.stopPropagation(); pill.closest('.commit-card').parentElement.querySelector(`[data-stash-detail="${pill.dataset.toggleStash}"]`)?.toggleAttribute('hidden'); }));
   if (commits.length) drawGraphOverlay(model, lanesWidth);
 }
 
 function drawGraphOverlay(model, lanesWidth) {
   const container = refs.graph;
   const positions = new Map(); // commitId -> {x, y}
+  const branchPointIds = new Set();
   container.querySelectorAll('.commit-row[data-id]').forEach((row, index) => {
     const node = model[index];
     positions.set(node.commitId, { x: laneX(node.lane), y: row.offsetTop + row.offsetHeight / 2 });
+    if (row.classList.contains('is-branch-point')) branchPointIds.add(node.commitId);
   });
 
   const parts = [];
@@ -1134,19 +1236,19 @@ function drawGraphOverlay(model, lanesWidth) {
         : `<path d="M${from.x} ${from.y} C${from.x} ${(from.y + to.y) / 2} ${to.x} ${(from.y + to.y) / 2} ${to.x} ${to.y}" stroke="${color}" stroke-width="3" fill="none" stroke-linecap="round"/>`);
     });
   });
-  container.querySelectorAll('.stash-row').forEach(row => {
-    const lane = Number(row.dataset.stashLane); const color = palette[lane % palette.length];
-    const x = laneX(lane); const y = row.offsetTop + row.offsetHeight / 2;
-    const belowY = row.nextElementSibling ? row.nextElementSibling.offsetTop + row.nextElementSibling.offsetHeight / 2 : y;
-    parts.push(`<line x1="${x}" y1="${y}" x2="${x}" y2="${belowY}" stroke="${color}" stroke-width="2" stroke-dasharray="3 4" stroke-linecap="round"/>`);
-    parts.push(`<rect x="${x - 5}" y="${y - 5}" width="10" height="10" rx="2.5" fill="#0d1117" stroke="${color}" stroke-width="2"/>`);
-  });
   model.forEach(node => {
     const pos = positions.get(node.commitId); if (!pos) return;
     const color = palette[node.lane % palette.length];
-    parts.push(node.isHead
-      ? `<circle cx="${pos.x}" cy="${pos.y}" r="8" fill="${color}" stroke="#0d1117" stroke-width="2.5"/><circle cx="${pos.x}" cy="${pos.y}" r="8" fill="none" stroke="#e8eef5" stroke-width="1.6"/>`
-      : `<circle cx="${pos.x}" cy="${pos.y}" r="6" fill="${color}" stroke="#0d1117" stroke-width="2.5"/>`);
+    if (node.isHead) {
+      parts.push(`<circle cx="${pos.x}" cy="${pos.y}" r="8" fill="${color}" stroke="#0d1117" stroke-width="2.5"/><circle cx="${pos.x}" cy="${pos.y}" r="8" fill="none" stroke="#e8eef5" stroke-width="1.6"/>`);
+    } else if (branchPointIds.has(node.commitId)) {
+      // The common ancestor two differently-labeled refs share — a distinct
+      // ring marks it as the split point, without bending the (real, single)
+      // lane into a decorative fork it doesn't topologically have yet.
+      parts.push(`<circle cx="${pos.x}" cy="${pos.y}" r="6" fill="${color}" stroke="#0d1117" stroke-width="2.5"/><circle cx="${pos.x}" cy="${pos.y}" r="10" fill="none" stroke="${color}" stroke-width="1.4" stroke-dasharray="2 2"/>`);
+    } else {
+      parts.push(`<circle cx="${pos.x}" cy="${pos.y}" r="6" fill="${color}" stroke="#0d1117" stroke-width="2.5"/>`);
+    }
   });
 
   const svg = container.querySelector('.graph-overlay');
@@ -1181,6 +1283,16 @@ function renderChanges() {
 
 async function openPublish() {
   if (!state.repository) return;
+  // "Unpublished commits" only ever means the MAIN project — it has no
+  // concept of a selected submodule, so clicking it while a submodule is
+  // selected silently shows the main project's own history instead, which
+  // reads as if the submodule's branch dumped its whole history "to push".
+  // Make the scope explicit instead of guessing.
+  if (state.selectedEntry?.kind === 'submodule') {
+    const entry = state.selectedEntry;
+    const showMain = await customConfirm(`"${entry.name}" (a submodule) is currently selected, but "Unpublished commits" always shows the MAIN project — not the submodule. To push the submodule's own commits, cancel this and use "Push submodule" in ${entry.name}'s own details panel instead.`, { title: 'Unpublished commits — main project only', okLabel: 'Show main project anyway' });
+    if (!showMain) return pushSubmodule(entry);
+  }
   if (!state.remotes.length && invoke) state.remotes = await invoke('list_remotes', { repositoryPath: state.repository.path });
   if (!invoke && !state.remotes.length) state.remotes = [{ name: 'origin', fetch_url: 'git@example.com:vehicle-control.git', push_url: 'git@example.com:vehicle-control.git' }];
   const locals = state.branches.filter(branch => !branch.remote); refs.publishBranch.innerHTML = locals.map(branch => `<option value="${esc(branch.name)}" ${branch.current ? 'selected' : ''}>${esc(branch.name)}${branch.current ? ' (current)' : ''}</option>`).join('');
@@ -1222,8 +1334,21 @@ $('#addSubmodule').addEventListener('click', openAddSubmoduleDialog); refs.confi
 refs.submoduleUrl.addEventListener('input', () => { if (!refs.submoduleName.dataset.edited) refs.submoduleName.value = suggestedRepositoryName(refs.submoduleUrl.value); validateSubmoduleForm(); });
 refs.submoduleName.addEventListener('input', () => { refs.submoduleName.dataset.edited = refs.submoduleName.value ? '1' : ''; validateSubmoduleForm(); });
 $('#refresh').addEventListener('click', () => state.repository && loadRepository(state.repository.path, { keepPath: true }));
-$('#showChanges').addEventListener('click', () => { state.changesScope = 'global'; renderChanges(); refs.changesDrawer.classList.add('open'); });
-$('#showFolderChanges').addEventListener('click', () => { state.changesScope = 'folder'; renderChanges(); refs.changesDrawer.classList.add('open'); });
+// Opening the drawer with everything already selected (staged) is what most
+// people expect from "here's what changed, commit it" — having to manually
+// tick every file first before Commit even becomes clickable read as "commit
+// doesn't work". This only stages what's genuinely unstaged in scope (real
+// `git add`, so the checkbox state stays truthful); anything you uncheck
+// afterward gets unstaged again, same as before.
+async function stageAllInScope(scope) {
+  if (!invoke || !state.repository) return;
+  const files = state.changes.filter(change => !change.staged && (!scope || change.path === scope || change.path.startsWith(`${scope}/`))).map(change => change.path);
+  if (!files.length) return;
+  try { await invoke('stage_files', { path: state.repository.path, files }); await loadRepository(state.repository.path, { keepPath: true }); renderChanges(); }
+  catch (error) { handleError(error); }
+}
+$('#showChanges').addEventListener('click', async () => { state.changesScope = 'global'; renderChanges(); refs.changesDrawer.classList.add('open'); await stageAllInScope(''); });
+$('#showFolderChanges').addEventListener('click', async () => { state.changesScope = 'folder'; renderChanges(); refs.changesDrawer.classList.add('open'); await stageAllInScope(state.currentPath); });
 $('#showPublish').addEventListener('click', () => openPublish().catch(error => status(String(error), 'error')));
 $('#stashWork').addEventListener('click', stashWork);
 $('#popStash').addEventListener('click', popStash);
@@ -1300,7 +1425,17 @@ $('#initRepo').addEventListener('click', async () => {
   try { const path = await invoke('choose_folder'); if (path) { await invoke('init_repository', { path }); await loadRepository(path); } } catch (error) { handleError(error); }
 });
 $('#newBranch').addEventListener('click', async () => {
-  if (!state.repository) return; const name = await customPrompt('New branch name', '', { title: 'Create branch' }); if (!name) return;
+  if (!state.repository) return;
+  // This button is easy to confuse with a per-submodule action when a
+  // submodule happens to be selected — it always creates the branch (and
+  // switches) on the MAIN project, never the submodule, so make that
+  // unambiguous instead of silently doing the wrong-scope thing.
+  if (state.selectedEntry?.kind === 'submodule') {
+    const entry = state.selectedEntry;
+    const onMain = await customConfirm(`"${entry.name}" (a submodule) is currently selected. This button creates the branch on the MAIN project — the whole project will switch to it. To create a branch inside the submodule instead, cancel this and use "＋ New branch…" in ${entry.name}'s own details panel.`, { title: 'Create branch — choose scope', okLabel: `Create on main project` });
+    if (!onMain) return createSubmoduleBranch(entry);
+  }
+  const name = await customPrompt('New branch name', '', { title: 'Create branch' }); if (!name) return;
   try { await invoke('create_branch', { path: state.repository.path, branch: name }); await loadRepository(state.repository.path); status(`Branch "${name}" created`); } catch (error) { handleError(error); }
 });
 refs.commitButton.addEventListener('click', async () => {
@@ -1308,12 +1443,14 @@ refs.commitButton.addEventListener('click', async () => {
   catch (error) { handleError(error); }
 });
 
-// Command Console — a context-aware command palette. It never runs anything
-// outside the app's own already-tested actions (no raw shell access); the
-// "smart" part is: what's suggested first depends on where you are (a
-// submodule selected, a folder open, a repo not yet loaded…), a short
-// explanation is always shown, and typing a plain word ("push", "merge",
-// "stash") is enough — you don't need to know the exact button label.
+// Command Console — two tabs sharing one input:
+//  - "Commands" is a context-aware palette over the app's own already-tested
+//    actions (no shell access) — suggestions depend on where you are (a
+//    submodule selected, a folder open…), each with a short explanation.
+//  - "Git Console" is a real, persistent terminal-style transcript: every git
+//    command you run (and its actual stdout/stderr) stays visible as a scrolling
+//    log, with ↑↓ command history, and an explicit, always-visible, cyclable
+//    scope pill so "runs on the current location" is never a guess.
 function currentConsoleContext() {
   const entry = state.selectedEntry;
   if (!state.repository) return { label: 'No repository open', tags: ['no-repo'] };
@@ -1329,7 +1466,7 @@ function buildCommands() {
   const list = [
     { id: 'open-repo', name: 'Open Repository', description: 'Choose a local Git folder to open', keys: 'Ctrl+O', tags: ['no-repo'], fn: openRepository },
     { id: 'new-branch', name: 'New Branch', description: 'Create a new local branch from the current one', keys: 'Ctrl+Shift+B', tags: ['explorer', 'graph'], fn: () => $('#newBranch').click() },
-    { id: 'commit', name: 'Commit Changes', description: 'Open the Working tree drawer and write a commit message for staged files', keys: 'Ctrl+Shift+C', keywords: 'save record', tags: ['explorer'], fn: () => { state.changesScope = 'global'; refs.changesDrawer.classList.add('open'); refs.commitMessage.focus(); } },
+    { id: 'commit', name: 'Commit Changes', description: 'Open the Working tree drawer and write a commit message for staged files', keys: 'Ctrl+Shift+C', keywords: 'save record', tags: ['explorer'], fn: () => { state.changesScope = 'global'; renderChanges(); refs.changesDrawer.classList.add('open'); stageAllInScope(''); refs.commitMessage.focus(); } },
     { id: 'push', name: 'Push Current Branch', description: 'Send your local commits on this branch to the server', keys: 'Ctrl+Shift+P', tags: ['explorer', 'graph'], fn: () => $('#pushCurrent').click() },
     { id: 'pull', name: 'Pull Current Branch', description: 'Fetch and fast-forward the current branch from the server', keys: '', tags: ['explorer', 'graph'], fn: () => $('#pullCurrent').click() },
     { id: 'merge', name: 'Merge Branch…', description: 'Bring another branch\'s commits into your current one — stays local, resolves conflicts here if any', keys: '', keywords: 'combine join', tags: ['explorer', 'graph'], fn: () => state.repository && openMergeBranchDialog(mergeTargetForMain()) },
@@ -1375,69 +1512,301 @@ function scoreCommand(cmd, query, tags) {
   return relevant * 10 + nameMatch;
 }
 
+// A word someone very plausibly typed expecting real git output (habit from a
+// terminal) rather than an app-action search — offered as a one-click "run
+// this as raw git instead" suggestion so forgetting the "$" prefix doesn't
+// silently fall back to fuzzy-matching app commands by unrelated description
+// text (e.g. "status" matching "Refresh Repository" because its description
+// happens to mention "status").
+// A small, plain-language git reference — not exhaustive, but covers what
+// someone unfamiliar with git actually reaches for. Powers both the "run as
+// git command" suggestion and the live "what comes next" flag hints while
+// typing in the Git Console.
+const GIT_COMMAND_HELP = {
+  status: { description: 'Shows what changed in your working folder — modified, staged, untracked files.', flags: [
+    { flag: '-s', desc: 'Short format — one compact line per file' },
+    { flag: '-b', desc: 'Also show the current branch and how far ahead/behind it is' },
+    { flag: '--ignored', desc: 'Also list files excluded by .gitignore' },
+  ] },
+  log: { description: 'Shows commit history, newest first.', flags: [
+    { flag: '--oneline', desc: 'One short line per commit instead of the full message' },
+    { flag: '-10', desc: 'Only the last 10 commits' },
+    { flag: '--graph', desc: 'Draw the branch/merge lines in text form' },
+    { flag: '--author=', desc: 'Only commits by a specific author' },
+    { flag: '-- <path>', desc: 'Only commits that touched this file/folder' },
+  ] },
+  diff: { description: 'Shows the exact line-by-line changes that aren\'t committed yet.', flags: [
+    { flag: '--staged', desc: 'Show only what\'s already staged (about to be committed)' },
+    { flag: 'HEAD~1', desc: 'Compare against the previous commit instead of the working copy' },
+    { flag: '-- <path>', desc: 'Limit the diff to one file/folder' },
+  ] },
+  add: { description: 'Stages a file — marks it to be included in the next commit.', flags: [
+    { flag: '.', desc: 'Stage everything changed in the current folder and below' },
+    { flag: '-A', desc: 'Stage everything in the whole repository, including deletions' },
+    { flag: '-p', desc: 'Choose which parts (hunks) of a file to stage, interactively' },
+  ] },
+  commit: { description: 'Records the currently staged changes as a new commit.', flags: [
+    { flag: '-m ""', desc: 'Provide the commit message inline instead of opening an editor' },
+    { flag: '-am ""', desc: 'Stage every already-tracked modified file AND commit, in one step' },
+    { flag: '--amend', desc: 'Edit the message/contents of the last commit instead of making a new one' },
+  ] },
+  branch: { description: 'Lists, creates, or deletes branches.', flags: [
+    { flag: '-a', desc: 'List local AND remote-tracking branches' },
+    { flag: '-d <name>', desc: 'Delete a branch that\'s already merged (safe)' },
+    { flag: '-D <name>', desc: '⚠ Force-delete a branch even if unmerged (can lose commits)' },
+    { flag: '-m <new>', desc: 'Rename the current branch' },
+  ] },
+  checkout: { description: 'Switches branches, or restores files to a previous state.', flags: [
+    { flag: '-b <name>', desc: 'Create a new branch and switch to it in one step' },
+    { flag: '-- <path>', desc: '⚠ Discard local edits to this file, restoring it from the last commit' },
+  ] },
+  switch: { description: 'Switches to a different branch (the modern, safer alternative to checkout).', flags: [
+    { flag: '-c <name>', desc: 'Create a new branch and switch to it' },
+  ] },
+  merge: { description: 'Brings another branch\'s commits into the one you\'re on.', flags: [
+    { flag: '--no-ff', desc: 'Always create a merge commit, even if a fast-forward is possible' },
+    { flag: '--abort', desc: 'Cancel a merge that has conflicts, back to the pre-merge state' },
+  ] },
+  rebase: { description: '⚠ Replays your commits on top of another branch, rewriting history. Avoid on commits you\'ve already pushed/shared.', flags: [
+    { flag: '--abort', desc: 'Cancel an in-progress rebase, back to how it was before' },
+    { flag: '--continue', desc: 'Continue after resolving a conflict' },
+  ] },
+  reset: { description: 'Moves the current branch pointer — how destructive depends on the flag.', flags: [
+    { flag: 'HEAD -- <path>', desc: 'Unstage a file, keep its edits on disk (safe)' },
+    { flag: '--soft HEAD~1', desc: 'Undo the last commit, keep everything staged' },
+    { flag: '--hard HEAD', desc: '⚠ Discard ALL local edits and staged changes — cannot be undone' },
+  ] },
+  clean: { description: '⚠ Deletes untracked files from disk — not recoverable from git afterward.', flags: [
+    { flag: '-n', desc: 'Dry run — show what WOULD be deleted, without deleting anything' },
+    { flag: '-fd', desc: '⚠ Actually delete untracked files AND untracked folders' },
+  ] },
+  remote: { description: 'Lists or manages configured remotes (like "origin").', flags: [
+    { flag: '-v', desc: 'Show the fetch/push URLs for each remote' },
+    { flag: 'add <name> <url>', desc: 'Add a new remote' },
+  ] },
+  fetch: { description: 'Downloads new commits/branches from a remote, without changing your files.', flags: [
+    { flag: '--all', desc: 'Fetch from every configured remote' },
+    { flag: '--prune', desc: 'Also remove local references to branches deleted on the remote' },
+  ] },
+  pull: { description: 'Fetches from a remote AND merges/fast-forwards into your current branch.', flags: [
+    { flag: '--ff-only', desc: 'Only proceed if it can fast-forward — refuse if it would need a real merge' },
+    { flag: '--rebase', desc: 'Replay your local commits on top instead of merging' },
+  ] },
+  push: { description: 'Uploads your local commits to a remote branch.', flags: [
+    { flag: '-u origin <branch>', desc: 'Push and remember this as the branch\'s default upstream' },
+    { flag: '--force-with-lease', desc: '⚠ Overwrite the remote branch, but refuse if someone else pushed since your last fetch' },
+    { flag: '--force', desc: '⚠⚠ Overwrite the remote branch unconditionally — can destroy others\' work' },
+  ] },
+  show: { description: 'Shows the full details (message + diff) of one commit.', flags: [
+    { flag: 'HEAD', desc: 'Show the most recent commit' },
+    { flag: '--stat', desc: 'Show only which files changed and by how much, not the full diff' },
+  ] },
+  blame: { description: 'Shows who last changed each line of a file, and in which commit.', flags: [
+    { flag: '-- <path>', desc: 'The file to blame (required)' },
+  ] },
+  tag: { description: 'Lists or creates tags (named pointers to a specific commit).', flags: [
+    { flag: '-a <name> -m ""', desc: 'Create an annotated tag with a message' },
+    { flag: '-d <name>', desc: 'Delete a local tag' },
+  ] },
+  stash: { description: 'Temporarily sets aside uncommitted changes so your working folder is clean.', flags: [
+    { flag: 'list', desc: 'Show all saved stashes' },
+    { flag: 'pop', desc: 'Restore the most recent stash and remove it from the list' },
+    { flag: 'drop', desc: 'Delete the most recent stash without restoring it' },
+  ] },
+  reflog: { description: 'Shows a log of everywhere HEAD has pointed — a safety net to recover "lost" commits.', flags: [] },
+  submodule: { description: 'Manages submodules (nested repositories inside this one).', flags: [
+    { flag: 'status', desc: 'Show the commit each submodule is on, and whether it\'s changed' },
+    { flag: 'update --init --recursive', desc: 'Fetch and check out every submodule at the commit the parent expects' },
+    { flag: 'foreach "<cmd>"', desc: 'Run a shell command inside every submodule' },
+  ] },
+  'ls-files': { description: 'Lists files git is tracking.', flags: [] },
+};
+const GIT_SUBCOMMAND_HINTS = new Set(Object.keys(GIT_COMMAND_HELP));
+
 function renderCommandList(query) {
   const ctx = currentConsoleContext();
   const q = query.trim().toLowerCase();
   const scored = activeCommands.map(cmd => ({ cmd, score: scoreCommand(cmd, q, ctx.tags) })).filter(entry => entry.score >= 0);
   scored.sort((a, b) => b.score - a.score);
   const list = $('#commandList');
-  list.innerHTML = scored.map(({ cmd, score }, i) => `<div class="command-item ${i === 0 ? 'selected' : ''} ${score >= 10 ? 'relevant' : ''}" data-cmd-id="${esc(cmd.id)}">
+  // Recognize both "add ." and "git add ." — either way of typing it should
+  // surface the "run as raw git" suggestion.
+  const words = q.split(/\s+/).filter(Boolean);
+  const gitWords = words[0] === 'git' ? words.slice(1) : words;
+  const gitArgsText = words[0] === 'git' ? query.trim().replace(/^git\s+/i, '') : query.trim();
+  const gitHint = gitWords[0] && GIT_SUBCOMMAND_HINTS.has(gitWords[0]) ? `<div class="command-item selected raw-git-item" data-raw-git-suggest="${esc(gitArgsText)}">
+    <div class="command-item-head"><span class="command-name">▸ Run as git command: git ${esc(gitArgsText)}</span><span class="command-keys">Enter</span></div>
+    <span class="command-desc">Looks like a git subcommand — run it directly and see real output</span>
+  </div>` : '';
+  list.innerHTML = gitHint + (scored.map(({ cmd, score }, i) => `<div class="command-item ${i === 0 && !gitHint ? 'selected' : ''} ${score >= 10 ? 'relevant' : ''}" data-cmd-id="${esc(cmd.id)}">
     <div class="command-item-head"><span class="command-name">${esc(cmd.name)}</span>${cmd.keys ? `<span class="command-keys">${esc(cmd.keys)}</span>` : ''}</div>
     <span class="command-desc">${esc(cmd.description || '')}</span>
-  </div>`).join('') || '<div class="command-item" style="text-align:center;color:#6b7f96;">No matching commands</div>';
+  </div>`).join('') || (gitHint ? '' : '<div class="command-item" style="text-align:center;color:#6b7f96;">No matching commands</div>'));
 }
 
-// ---- Raw git escape hatch --------------------------------------------------
-// Typing "$ <git args>" runs that literal git subcommand — scoped to wherever
-// you currently are (the selected submodule, or the folder being browsed) —
-// and shows git's actual stdout/stderr. This is real freedom to run any git
-// command, deliberately kept separate from the app's own tested actions above
-// (which never touch a shell) so the two are never confused with each other.
+// ---- Git Console — persistent terminal-style transcript -------------------
+// Real freedom to run any git command, deliberately kept separate from the
+// app's own tested actions above (which never touch a shell) so the two are
+// never confused with each other.
 const RAW_GIT_PREFIX = '$';
 function isRawGitQuery(query) { return query.trimStart().startsWith(RAW_GIT_PREFIX); }
 function rawGitArgs(query) { return query.trimStart().slice(1).trim(); }
 const DESTRUCTIVE_GIT_PATTERN = /(^|\s)(reset\s+--hard|clean\s+-[a-z]*f|push\s+.*(--force|-f\b)|branch\s+-D|checkout\s+.*-f\b|rebase|filter-branch|gc\s+--prune|update-ref\s+-d)/i;
 
+// Every place a git command could plausibly run right now — always at least
+// "repository root"; "current folder" and "selected submodule" are added only
+// when they actually apply. Explicit and cyclable (⇄ scope button) instead of
+// a silent guess, so "does this run where I think it runs" is never in doubt.
+function consoleAvailableScopes() {
+  if (!state.repository) return [];
+  const scopes = [{ key: 'root', path: state.repository.path, label: `${state.repository.name} (repository root)` }];
+  if (state.currentPath) scopes.push({ key: 'folder', path: `${state.repository.path}/${state.currentPath}`, label: `${state.currentPath} (current folder)` });
+  if (state.selectedEntry?.kind === 'submodule') scopes.push({ key: 'submodule', path: `${state.repository.path}/${state.selectedEntry.relative_path}`, label: `${state.selectedEntry.relative_path} (selected submodule)` });
+  return scopes;
+}
+function consoleDefaultScopeKey() {
+  if (state.selectedEntry?.kind === 'submodule') return 'submodule';
+  if (state.currentPath) return 'folder';
+  return 'root';
+}
 function consoleGitTarget() {
-  const entry = state.selectedEntry;
-  if (entry?.kind === 'submodule') return { path: `${state.repository.path}/${entry.relative_path}`, label: entry.relative_path };
-  const folder = state.currentPath ? `${state.repository.path}/${state.currentPath}` : state.repository.path;
-  return { path: folder, label: state.currentPath || '.' };
+  const scopes = consoleAvailableScopes();
+  if (!scopes.length) return { key: 'root', path: '', label: 'No repository open' };
+  const key = scopes.some(s => s.key === state.consoleScopeOverride) ? state.consoleScopeOverride : consoleDefaultScopeKey();
+  return scopes.find(s => s.key === key) || scopes[0];
+}
+function cycleConsoleScope() {
+  const scopes = consoleAvailableScopes(); if (scopes.length < 2) return;
+  const idx = scopes.findIndex(s => s.key === consoleGitTarget().key);
+  state.consoleScopeOverride = scopes[(idx + 1) % scopes.length].key;
+  updateConsoleScopeLabel();
+}
+function updateConsoleScopeLabel() { $('#commandScope').textContent = state.repository ? `📍 ${consoleGitTarget().label}` : ''; }
+
+function renderConsoleTranscript() {
+  const list = $('#commandList'); list.classList.add('console-transcript');
+  list.innerHTML = state.consoleTranscript.map(entry => `<div class="raw-git-output">
+    <div class="raw-git-cmd">$ git ${esc(entry.args)} <span class="raw-git-cwd">(in ${esc(entry.targetLabel)})</span> <b class="raw-git-status ${entry.result.success ? 'ok' : 'fail'}">${entry.result.success ? 'OK' : 'FAILED'}</b></div>
+    ${entry.result.stdout ? `<pre class="raw-git-stdout">${esc(entry.result.stdout)}</pre>` : ''}
+    ${entry.result.stderr ? `<pre class="raw-git-stderr">${esc(entry.result.stderr)}</pre>` : ''}
+    ${!entry.result.stdout && !entry.result.stderr ? '<div class="raw-git-empty">(no output)</div>' : ''}
+  </div>`).join('') || '<div class="console-empty">Type a git command below and press Enter — e.g. "status", "log --oneline -10", "diff HEAD~1".</div>';
+  $('#commandClearTranscript').hidden = state.consoleTranscript.length === 0;
+  list.scrollTop = list.scrollHeight;
 }
 
-function renderRawGitPrompt(args) {
-  const target = consoleGitTarget();
-  $('#commandList').innerHTML = `<div class="command-item selected raw-git-item" data-raw-git="1">
-    <div class="command-item-head"><span class="command-name">▸ Run: git ${esc(args || '…')}</span><span class="command-keys">Enter</span></div>
-    <span class="command-desc">Runs in ${esc(target.label)} — shows git's real output below</span>
-  </div>`;
-}
-
-function renderRawGitOutput(args, result) {
-  const target = consoleGitTarget();
-  $('#commandList').innerHTML = `<div class="raw-git-output">
-    <div class="raw-git-cmd">$ git ${esc(args)} <span class="raw-git-cwd">(in ${esc(target.label)})</span> <b class="raw-git-status ${result.success ? 'ok' : 'fail'}">${result.success ? 'OK' : 'FAILED'}</b></div>
-    ${result.stdout ? `<pre class="raw-git-stdout">${esc(result.stdout)}</pre>` : ''}
-    ${result.stderr ? `<pre class="raw-git-stderr">${esc(result.stderr)}</pre>` : ''}
-    ${!result.stdout && !result.stderr ? '<div class="raw-git-empty">(no output)</div>' : ''}
-  </div>`;
+let consoleHistoryPointer = -1;
+function recallConsoleHistory(direction) {
+  const history = state.consoleCmdHistory; if (!history.length) return;
+  if (consoleHistoryPointer === -1) consoleHistoryPointer = history.length;
+  consoleHistoryPointer = Math.max(0, Math.min(history.length - 1, consoleHistoryPointer + direction));
+  const input = $('#commandInput'); input.value = history[consoleHistoryPointer]; input.setSelectionRange(input.value.length, input.value.length);
 }
 
 async function runRawGitFromConsole(args) {
   if (!args) return;
-  if (!state.repository) { renderRawGitOutput(args, { success: false, stdout: '', stderr: 'Open a repository first.' }); return; }
+  setConsoleMode('console');
+  if (!state.repository) { state.consoleTranscript.push({ args, targetLabel: '—', result: { success: false, stdout: '', stderr: 'Open a repository first.' } }); renderConsoleTranscript(); return; }
   if (DESTRUCTIVE_GIT_PATTERN.test(args)) {
     const target = consoleGitTarget();
     const ok = await customConfirm(`This looks like a destructive command: "git ${args}" in ${target.label}. It can permanently discard commits, branches or uncommitted work. Continue?`, { title: 'Destructive git command', danger: true, okLabel: 'Run it anyway' });
     if (!ok) return;
   }
-  if (!invoke) { renderRawGitOutput(args, { success: true, stdout: '(preview mode — not actually run)', stderr: '' }); return; }
+  state.consoleCmdHistory.push(args); consoleHistoryPointer = -1;
   const target = consoleGitTarget();
+  if (!invoke) { state.consoleTranscript.push({ args, targetLabel: target.label, result: { success: true, stdout: '(preview mode — not actually run)', stderr: '' } }); renderConsoleTranscript(); return; }
   try {
     const result = await invoke('run_git_command', { repositoryPath: target.path, args });
-    renderRawGitOutput(args, result);
+    state.consoleTranscript.push({ args, targetLabel: target.label, result });
+    renderConsoleTranscript();
     directoryCache.clear(); await loadRepository(state.repository.path, { keepPath: true });
-  } catch (error) { renderRawGitOutput(args, { success: false, stdout: '', stderr: String(error) }); }
+  } catch (error) { state.consoleTranscript.push({ args, targetLabel: target.label, result: { success: false, stdout: '', stderr: String(error) } }); renderConsoleTranscript(); }
+}
+
+// Live "what comes next" helper while typing in the Git Console — shows the
+// recognized subcommand's plain-language description plus its common flags
+// (click to append), or, while still typing the subcommand itself, matching
+// subcommand names to autocomplete. Aimed squarely at someone who doesn't
+// already have git's flags memorized.
+// Extra subcommand names worth typo-correcting even though they don't have
+// their own flag reference above.
+const KNOWN_GIT_SUBCOMMANDS = [...Object.keys(GIT_COMMAND_HELP), 'init', 'clone', 'config', 'describe', 'worktree', 'revert', 'bisect', 'cherry-pick', 'archive', 'rm', 'mv', 'gc', 'apply'];
+
+function levenshtein(a, b) {
+  const dp = Array.from({ length: a.length + 1 }, (_, i) => [i, ...Array(b.length).fill(0)]);
+  for (let j = 0; j <= b.length; j++) dp[0][j] = j;
+  for (let i = 1; i <= a.length; i++) for (let j = 1; j <= b.length; j++) {
+    dp[i][j] = a[i - 1] === b[j - 1] ? dp[i - 1][j - 1] : 1 + Math.min(dp[i - 1][j], dp[i][j - 1], dp[i - 1][j - 1]);
+  }
+  return dp[a.length][b.length];
+}
+function closestGitSubcommand(word) {
+  if (word.length < 2) return null;
+  let best = null; let bestDist = Infinity;
+  for (const name of KNOWN_GIT_SUBCOMMANDS) {
+    const dist = levenshtein(word, name);
+    if (dist < bestDist) { bestDist = dist; best = name; }
+  }
+  // Only offer it as a correction when it's plausibly a typo, not just any
+  // vaguely-similar word — scales with length so short typos still match.
+  return bestDist <= Math.max(1, Math.ceil(word.length / 3)) ? best : null;
+}
+
+function renderGitHints() {
+  const box = $('#commandGitHints');
+  if (state.consoleMode !== 'console') { box.hidden = true; return; }
+  const raw = $('#commandInput').value;
+  const words = raw.split(/\s+/).filter(Boolean);
+  const sub = words[0]?.toLowerCase();
+  if (!sub) { box.hidden = true; return; }
+  const entry = GIT_COMMAND_HELP[sub];
+  if (!entry) {
+    const matches = words.length === 1 ? Object.keys(GIT_COMMAND_HELP).filter(name => name.startsWith(sub)) : [];
+    if (matches.length) {
+      box.hidden = false;
+      box.innerHTML = `<div class="hint-subcommands">${matches.map(name => `<button type="button" class="hint-sub" data-fill-sub="${esc(name)}">${esc(name)}</button>`).join('')}</div>`;
+      return;
+    }
+    // Not a known subcommand, and not a prefix of one either — check for a typo.
+    const suggestion = !KNOWN_GIT_SUBCOMMANDS.includes(sub) ? closestGitSubcommand(sub) : null;
+    if (suggestion) {
+      const corrected = [suggestion, ...words.slice(1)].join(' ');
+      box.hidden = false;
+      box.innerHTML = `<div class="hint-typo">Did you mean <button type="button" class="hint-sub" data-fill-sub="${esc(corrected)}">git ${esc(corrected)}</button>?</div>`;
+      return;
+    }
+    box.hidden = true; return;
+  }
+  const already = new Set(words.slice(1).map(w => w.split('=')[0]));
+  const flags = entry.flags.filter(f => !already.has(f.flag.split(/[\s=]/)[0]));
+  box.hidden = false;
+  box.innerHTML = `<p class="hint-desc"><b>git ${esc(sub)}</b> — ${esc(entry.description)}</p>${flags.length ? `<div class="hint-flags">${flags.map(f => `<button type="button" class="hint-flag" data-append-flag="${esc(f.flag)}"><b>${esc(f.flag)}</b><span>${esc(f.desc)}</span></button>`).join('')}</div>` : ''}`;
+}
+$('#commandGitHints').addEventListener('click', (e) => {
+  const fillSub = e.target.closest('[data-fill-sub]');
+  if (fillSub) { $('#commandInput').value = `${fillSub.dataset.fillSub} `; $('#commandInput').focus(); renderGitHints(); return; }
+  const appendFlag = e.target.closest('[data-append-flag]');
+  if (appendFlag) {
+    const input = $('#commandInput');
+    const sep = input.value === '' || input.value.endsWith(' ') ? '' : ' ';
+    input.value = `${input.value}${sep}${appendFlag.dataset.appendFlag} `;
+    input.focus(); renderGitHints();
+  }
+});
+
+function setConsoleMode(mode) {
+  state.consoleMode = mode;
+  document.querySelectorAll('.command-tab').forEach(tab => tab.classList.toggle('active', tab.dataset.mode === mode));
+  const input = $('#commandInput');
+  if (mode === 'console') {
+    input.placeholder = 'Type a git command… (no "$" needed here)'; input.value = '';
+    $('#commandHelp').textContent = '↑↓ command history · Enter to run · "⇄ scope" to change where it runs · Esc to close';
+    updateConsoleScopeLabel(); renderConsoleTranscript(); renderGitHints();
+  } else {
+    input.placeholder = 'Type a command… (Cmd/Ctrl+K)';
+    $('#commandHelp').textContent = '↑↓ to navigate · Enter to run · Esc to close';
+    $('#commandScope').textContent = ''; $('#commandList').classList.remove('console-transcript'); $('#commandGitHints').hidden = true; renderCommandList('');
+  }
 }
 
 function openCommandPalette() {
@@ -1445,39 +1814,50 @@ function openCommandPalette() {
   commandPaletteOpen = true;
   activeCommands = buildCommands();
   input.value = '';
-  const ctx = currentConsoleContext();
-  $('#commandContext').textContent = `CONTEXT: ${ctx.label} — tip: type "$ <git args>" to run any git command here`;
-  renderCommandList('');
+  setConsoleMode('commands');
   $('#commandPalette').showModal();
   input.focus();
 }
-function filterCommands(query) { isRawGitQuery(query) ? renderRawGitPrompt(rawGitArgs(query)) : renderCommandList(query); }
-$('#commandInput').addEventListener('input', (e) => filterCommands(e.target.value));
+function filterCommands(query) {
+  if (isRawGitQuery(query)) { setConsoleMode('console'); $('#commandInput').value = rawGitArgs(query); renderGitHints(); return; }
+  renderCommandList(query);
+}
+$('#commandInput').addEventListener('input', (e) => { if (state.consoleMode === 'console') { consoleHistoryPointer = -1; renderGitHints(); return; } filterCommands(e.target.value); });
 $('#commandInput').addEventListener('keydown', (e) => {
-  if (isRawGitQuery($('#commandInput').value)) {
-    if (e.key === 'Enter') { e.preventDefault(); runRawGitFromConsole(rawGitArgs($('#commandInput').value)); }
+  if (state.consoleMode === 'console') {
+    if (e.key === 'Enter') { e.preventDefault(); const args = $('#commandInput').value.trim(); if (args) { $('#commandInput').value = ''; renderGitHints(); runRawGitFromConsole(args); } }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); recallConsoleHistory(-1); renderGitHints(); }
+    else if (e.key === 'ArrowDown') { e.preventDefault(); recallConsoleHistory(1); renderGitHints(); }
     return;
   }
   const items = Array.from($('#commandList').querySelectorAll('.command-item'));
   const selected = items.find(i => i.classList.contains('selected'));
   if (e.key === 'ArrowDown') { e.preventDefault(); const next = selected?.nextElementSibling || items[0]; items.forEach(i => i.classList.remove('selected')); next?.classList.add('selected'); next?.scrollIntoView({ block: 'nearest' }); }
   else if (e.key === 'ArrowUp') { e.preventDefault(); const prev = selected?.previousElementSibling || items[items.length - 1]; items.forEach(i => i.classList.remove('selected')); prev?.classList.add('selected'); prev?.scrollIntoView({ block: 'nearest' }); }
-  else if (e.key === 'Enter') { e.preventDefault(); const cmd = activeCommands.find(c => c.id === selected?.dataset.cmdId); if (cmd) { $('#commandPalette').close(); cmd.fn(); commandPaletteOpen = false; } }
+  else if (e.key === 'Enter') {
+    e.preventDefault();
+    if (selected?.dataset.rawGitSuggest !== undefined) { runRawGitFromConsole(selected.dataset.rawGitSuggest); return; }
+    const cmd = activeCommands.find(c => c.id === selected?.dataset.cmdId); if (cmd) { $('#commandPalette').close(); cmd.fn(); commandPaletteOpen = false; }
+  }
 });
 $('#commandList').addEventListener('click', (e) => {
-  if (e.target.closest('[data-raw-git]')) { runRawGitFromConsole(rawGitArgs($('#commandInput').value)); return; }
+  const suggest = e.target.closest('[data-raw-git-suggest]');
+  if (suggest) { runRawGitFromConsole(suggest.dataset.rawGitSuggest); return; }
   const item = e.target.closest('.command-item');
   if (item && item.dataset.cmdId) {
     const cmd = activeCommands.find(c => c.id === item.dataset.cmdId);
     if (cmd) { $('#commandPalette').close(); cmd.fn(); commandPaletteOpen = false; }
   }
 });
+document.querySelectorAll('.command-tab').forEach(tab => tab.addEventListener('click', () => { setConsoleMode(tab.dataset.mode); $('#commandInput').focus(); }));
+$('#commandScopeCycle').addEventListener('click', () => { cycleConsoleScope(); if (state.consoleMode === 'console') renderConsoleTranscript(); });
+$('#commandClearTranscript').addEventListener('click', () => { state.consoleTranscript = []; renderConsoleTranscript(); });
 $('#commandPalette').addEventListener('close', () => { commandPaletteOpen = false; });
 $('#openConsole').addEventListener('click', () => openCommandPalette());
 document.addEventListener('keydown', (e) => {
   if ((e.ctrlKey || e.metaKey) && e.key === 'k') { e.preventDefault(); commandPaletteOpen ? $('#commandPalette').close() : openCommandPalette(); }
   else if ((e.ctrlKey || e.metaKey) && e.key === 'o') { e.preventDefault(); openRepository(); }
-  else if ((e.ctrlKey || e.metaKey) && (e.shiftKey && e.key === 'C')) { e.preventDefault(); $('#navExplorer') && (state.changesScope = 'global', refs.changesDrawer.classList.add('open'), refs.commitMessage.focus()); }
+  else if ((e.ctrlKey || e.metaKey) && (e.shiftKey && e.key === 'C')) { e.preventDefault(); state.changesScope = 'global'; renderChanges(); refs.changesDrawer.classList.add('open'); stageAllInScope(''); refs.commitMessage.focus(); }
   else if ((e.ctrlKey || e.metaKey) && (e.shiftKey && e.key === 'P')) { e.preventDefault(); $('#pushCurrent').click(); }
   else if ((e.ctrlKey || e.metaKey) && (e.shiftKey && e.key === 'F')) { e.preventDefault(); $('#fetchCurrent').click(); }
   else if ((e.ctrlKey || e.metaKey) && (e.shiftKey && e.key === 'S')) { e.preventDefault(); state.hasStash ? popStash() : stashWork(); }

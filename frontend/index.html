@@ -153,10 +153,17 @@
 
   <dialog id="commandPalette" class="command-palette">
     <form method="dialog">
-      <div id="commandContext" class="command-context"></div>
-      <input id="commandInput" type="text" placeholder="Type a command, or &quot;$ &lt;git args&gt;&quot; to run raw git…" autocomplete="off" spellcheck="false">
+      <div class="command-tabs">
+        <button type="button" class="command-tab active" data-mode="commands">Commands</button>
+        <button type="button" class="command-tab" data-mode="console">Git Console</button>
+        <span id="commandScope" class="command-scope"></span>
+        <button type="button" id="commandScopeCycle" class="command-scope-cycle" title="Change where git commands run">⇄ scope</button>
+        <button type="button" id="commandClearTranscript" class="command-clear" title="Clear console history" hidden>Clear</button>
+      </div>
+      <input id="commandInput" type="text" placeholder="Type a command… (Cmd/Ctrl+K)" autocomplete="off" spellcheck="false">
+      <div id="commandGitHints" class="command-git-hints" hidden></div>
       <div id="commandList" class="command-list"></div>
-      <div class="command-help">↑↓ to navigate · Enter to run · "$ log --oneline" for raw git · Esc to close</div>
+      <div class="command-help" id="commandHelp">↑↓ to navigate · Enter to run · Esc to close</div>
     </form>
   </dialog>
 

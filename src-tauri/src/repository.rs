@@ -199,9 +199,12 @@ pub struct RawGitResult { stdout: String, stderr: String, success: bool }
 #[tauri::command]
 pub fn run_git_command(repository_path: String, args: String) -> Result<RawGitResult, String> {
     validate_path(&repository_path)?;
-    let parts: Vec<&str> = args.split_whitespace().collect();
+    let mut parts: Vec<&str> = args.split_whitespace().collect();
+    // Typing the full, natural command ("git status") is just as valid as the
+    // short form ("status") — strip a leading "git" token instead of
+    // rejecting it, so this behaves like a real terminal either way.
+    if parts.first() == Some(&"git") { parts.remove(0); }
     if parts.is_empty() { return Err("Type a git subcommand, e.g. \"status\" or \"log --oneline -10\"".into()); }
-    if parts[0] == "git" { return Err("Don't include \"git\" itself — just the subcommand, e.g. \"status\" not \"git status\"".into()); }
     let mut command = Command::new("git");
     command.arg("-C").arg(&repository_path).arg("-c").arg("color.ui=false").args(&parts);
     let output = configure_git_command(&mut command).output().map_err(|e| format!("Cannot start Git: {e}"))?;
@@ -553,9 +556,30 @@ pub fn load_repository(path: String) -> Result<RepositoryData, String> {
     Ok(RepositoryData { repository: RepositoryInfo { path, name, current_branch }, branches, commits, changes, stashes })
 }
 
+// A file living inside a submodule belongs to that submodule's own Git index,
+// not the parent's — the parent's index only ever has one gitlink entry for
+// the whole submodule, never its individual files. Splitting the requested
+// paths by which repository they actually belong to (and recursing into the
+// submodule for its share) is what makes staging/unstaging work no matter
+// which folder you browsed into to select the file.
+fn partition_by_submodule(repository_path: &str, files: Vec<String>) -> (Vec<String>, HashMap<String, Vec<String>>) {
+    let mut own = Vec::new();
+    let mut grouped: HashMap<String, Vec<String>> = HashMap::new();
+    for file in files {
+        match resolve_submodule_boundary(repository_path, &file) {
+            Some((sub_path, inner_relative)) => grouped.entry(sub_path).or_default().push(inner_relative),
+            None => own.push(file),
+        }
+    }
+    (own, grouped)
+}
+
 #[tauri::command]
 pub fn stage_files(path: String, files: Vec<String>) -> Result<(), String> {
     validate_path(&path)?;
+    let (files, submodule_groups) = partition_by_submodule(&path, files);
+    for (sub_path, inner_files) in submodule_groups { stage_files(sub_path, inner_files)?; }
+    if files.is_empty() { return Ok(()); }
     let repo = internal_repository(&path)?;
     let safe_files = files.into_iter().map(|file| safe_relative_path(file.trim_end_matches(|character| character == '/' || character == '\\'))).collect::<Result<Vec<_>, _>>()?;
     let mut submodule_paths = HashSet::new();
@@ -569,6 +593,9 @@ pub fn stage_files(path: String, files: Vec<String>) -> Result<(), String> {
 #[tauri::command]
 pub fn unstage_files(path: String, files: Vec<String>) -> Result<(), String> {
     validate_path(&path)?;
+    let (files, submodule_groups) = partition_by_submodule(&path, files);
+    for (sub_path, inner_files) in submodule_groups { unstage_files(sub_path, inner_files)?; }
+    if files.is_empty() { return Ok(()); }
     let repo = internal_repository(&path)?; let head = repo.head().and_then(|head| head.peel(ObjectType::Commit)).map_err(|error| error.message().to_string())?;
     let safe = files.iter().map(|file| safe_relative_path(file)).collect::<Result<Vec<_>, _>>()?; repo.reset_default(Some(&head), safe.iter()).map_err(|error| error.message().to_string())?; invalidate_git_metadata(&path); Ok(())
 }
@@ -877,7 +904,19 @@ pub fn publish_status(repository_path: String, branch: String, remote: String) -
     if branch.is_empty() || remote.is_empty() { return Err("Choose a local branch and a remote".into()); }
     let repo = internal_repository(&repository_path)?; let local_oid = repo.refname_to_id(&format!("refs/heads/{branch}")).map_err(|error| error.message().to_string())?;
     let remote_branch = format!("{remote}/{branch}");
-    let mut walk = repo.revwalk().map_err(|error| error.message().to_string())?; walk.push(local_oid).map_err(|error| error.message().to_string())?; if let Ok(remote_oid) = repo.refname_to_id(&format!("refs/remotes/{remote}/{branch}")) { let _ = walk.hide(remote_oid); } let mut commits = walk.flatten().take(100).filter_map(|oid| repo.find_commit(oid).ok().map(|commit| PublishCommit { id: oid.to_string(), subject: commit.summary().unwrap_or("No message").into(), author: commit.author().name().unwrap_or("Unknown").into(), date: short_date(commit.time().seconds()) })).collect::<Vec<_>>(); commits.reverse();
+    let mut walk = repo.revwalk().map_err(|error| error.message().to_string())?; walk.push(local_oid).map_err(|error| error.message().to_string())?;
+    // Hide everything reachable from ANY of this remote's branches, not only
+    // the one sharing this local branch's name. A brand new local branch
+    // (e.g. just created, no upstream yet) that descends from — or sits right
+    // at — a commit already on the server under a different branch name
+    // doesn't actually need to re-push that shared history; only what isn't
+    // reachable from anything already on this remote is genuinely new.
+    // Without this, "Publish" on any new branch showed its *entire* ancestry
+    // as "WILL PUSH", even commits from years ago already sitting on origin.
+    if let Ok(references) = repo.references_glob(&format!("refs/remotes/{remote}/*")) {
+        for reference in references.flatten() { if let Some(oid) = reference.target() { let _ = walk.hide(oid); } }
+    }
+    let mut commits = walk.flatten().take(100).filter_map(|oid| repo.find_commit(oid).ok().map(|commit| PublishCommit { id: oid.to_string(), subject: commit.summary().unwrap_or("No message").into(), author: commit.author().name().unwrap_or("Unknown").into(), date: short_date(commit.time().seconds()) })).collect::<Vec<_>>(); commits.reverse();
     Ok(PublishStatus { branch: branch.into(), remote: remote.into(), remote_branch, commits })
 }
 
@@ -916,24 +955,38 @@ pub fn load_directory(repository_path: String, relative_path: String) -> Result<
     let absolute = Path::new(&repository_path).join(&relative);
     if !absolute.is_dir() { return Err("The selected path is not a folder".into()); }
 
-    let git_metadata = cached_git_metadata(&repository_path, &relative_path);
+    // Browsing *into* a submodule crosses into a different Git repository —
+    // the parent's own status/tracked info only ever covers the submodule as
+    // one opaque gitlink entry, never the files inside it (that made every
+    // file inside a submodule look permanently "untracked" from the parent's
+    // point of view, and staging one silently did nothing since it wasn't
+    // part of the parent's tree at all). Source status from the submodule's
+    // own index/worktree instead when we're inside one, while still returning
+    // `relative_path` in the same parent-relative path space the rest of the
+    // UI already navigates in.
+    let boundary = resolve_submodule_boundary(&repository_path, &relative_path);
+    let (status_repo, status_scope) = match &boundary {
+        Some((sub_path, inner_relative)) => (sub_path.as_str(), inner_relative.as_str()),
+        None => (repository_path.as_str(), relative_path.as_str()),
+    };
+    let git_metadata = cached_git_metadata(status_repo, status_scope);
     let mut entries = Vec::new();
 
     for item in fs::read_dir(&absolute).map_err(|error| error.to_string())? {
         let item = item.map_err(|error| error.to_string())?;
         let name = item.file_name().to_string_lossy().into_owned();
         if name == ".git" { continue; }
-        let entry_relative = relative.join(&name);
-        let relative_string = normalized(&entry_relative);
+        let relative_string = normalized(&relative.join(&name));
+        let status_key = if boundary.is_some() { normalized(&Path::new(status_scope).join(&name)) } else { relative_string.clone() };
         let metadata = fs::symlink_metadata(item.path()).map_err(|error| error.to_string())?;
-        let kind = if git_metadata.submodules.contains(&relative_string) { "submodule" }
+        let kind = if git_metadata.submodules.contains(&status_key) { "submodule" }
             else if metadata.file_type().is_symlink() { "symlink" }
             else if metadata.is_dir() { "folder" }
             else { "file" }.to_string();
-        let tracked_prefix = format!("{relative_string}/");
-        let tracked = git_metadata.submodules.contains(&relative_string) || git_metadata.tracked.contains(&relative_string) || git_metadata.tracked.iter().any(|path| path.starts_with(&tracked_prefix));
+        let tracked_prefix = format!("{status_key}/");
+        let tracked = git_metadata.submodules.contains(&status_key) || git_metadata.tracked.contains(&status_key) || git_metadata.tracked.iter().any(|path| path.starts_with(&tracked_prefix));
         let modified = metadata.modified().ok().and_then(|time| time.duration_since(UNIX_EPOCH).ok()).map(|value| value.as_secs()).unwrap_or(0);
-        entries.push(DirectoryEntry { name, relative_path: relative_string.clone(), kind, status: status_for(&relative_string, &git_metadata.statuses), tracked, size: if metadata.is_file() { metadata.len() } else { 0 }, modified });
+        entries.push(DirectoryEntry { name, relative_path: relative_string, kind, status: status_for(&status_key, &git_metadata.statuses), tracked, size: if metadata.is_file() { metadata.len() } else { 0 }, modified });
     }
     entries.sort_by(|a, b| {
         let a_group = matches!(a.kind.as_str(), "folder" | "submodule");
@@ -951,17 +1004,31 @@ pub fn entry_details(repository_path: String, relative_path: String) -> Result<E
     let absolute = Path::new(&repository_path).join(&relative);
     let metadata = fs::symlink_metadata(&absolute).map_err(|error| error.to_string())?;
     let relative_string = normalized(&relative);
-    let git_metadata = cached_git_metadata(&repository_path, &relative_string);
-    let kind = if git_metadata.submodules.contains(&relative_string) { "submodule" }
+    // Same reasoning as `load_directory`: an item strictly inside a submodule
+    // needs status/tracked/history from the submodule's own repository, not
+    // the parent's (which only knows the submodule as one opaque gitlink).
+    // The submodule's own root path is deliberately excluded here (empty
+    // inner path) so it keeps being treated as a submodule object at the
+    // parent level, same as before.
+    let boundary = resolve_submodule_boundary(&repository_path, &relative_string).filter(|(_, inner)| !inner.is_empty());
+    let (status_repo, status_scope): (&str, &str) = match &boundary {
+        Some((sub_path, inner_relative)) => (sub_path.as_str(), inner_relative.as_str()),
+        None => (&repository_path, &relative_string),
+    };
+    let git_metadata = cached_git_metadata(status_repo, status_scope);
+    let kind = if git_metadata.submodules.contains(status_scope) { "submodule" }
         else if metadata.file_type().is_symlink() { "symlink" }
         else if metadata.is_dir() { "folder" } else { "file" }.to_string();
-    let prefix = format!("{relative_string}/");
-    let tracked = git_metadata.tracked.contains(&relative_string) || git_metadata.tracked.iter().any(|path| path.starts_with(&prefix));
-    let status = status_for(&relative_string, &git_metadata.statuses);
+    let prefix = format!("{status_scope}/");
+    let tracked = git_metadata.tracked.contains(status_scope) || git_metadata.tracked.iter().any(|path| path.starts_with(&prefix));
+    let status = status_for(status_scope, &git_metadata.statuses);
     let modified = metadata.modified().ok().and_then(|time| time.duration_since(UNIX_EPOCH).ok()).map(|value| value.as_secs()).unwrap_or(0);
     let item_count = metadata.is_dir().then(|| fs::read_dir(&absolute).map(|items| items.count()).unwrap_or(0));
 
-    let last = last_commit_touching_path(&repository_path, &relative);
+    let last = match &boundary {
+        Some((sub_path, inner_relative)) => last_commit_touching_path(sub_path, Path::new(inner_relative)),
+        None => last_commit_touching_path(&repository_path, &relative),
+    };
     let submodule_url = (kind == "submodule").then(|| submodule_value(&repository_path, &relative_string, "url")).flatten();
     let submodule_branch = (kind == "submodule").then(|| submodule_value(&repository_path, &relative_string, "branch")).flatten();
     let submodule_push_status = (kind == "submodule").then(|| submodule_push_status(&absolute.to_string_lossy())).flatten();
@@ -1209,6 +1276,13 @@ pub fn delete_local_path(repository_path: String, relative_path: String) -> Resu
 pub fn commit_path(repository_path: String, relative_path: String, message: String) -> Result<String, String> {
     validate_path(&repository_path)?;
     if message.trim().is_empty() { return Err("Commit message cannot be empty".into()); }
+    // Only redirect for a path *inside* a submodule (a file within it) — the
+    // submodule's own root path must still commit at the parent level (that's
+    // how the gitlink bump gets recorded); "Commit submodule" is the separate,
+    // existing action for committing changes inside the submodule itself.
+    if let Some((sub_path, inner_relative)) = resolve_submodule_boundary(&repository_path, &relative_path) {
+        if !inner_relative.is_empty() { return commit_path(sub_path, inner_relative, message); }
+    }
     let relative = safe_relative_path(&relative_path)?;
     // An empty string is the sentinel `commit_selected_internal` recognizes as
     // "whole repository" — git2 rejects "." as a literal pathspec outright (see
@@ -2491,6 +2565,100 @@ mod tests {
     }
 
     #[test]
+    fn a_brand_new_branch_only_shows_commits_not_already_on_any_remote_branch() {
+        // Reproduces a real report: after creating a new branch, "Publish"
+        // listed the branch's ENTIRE history (years of commits) as "WILL PUSH",
+        // even though almost all of it already sat on the server under a
+        // different branch name. `publish_status` used to only hide commits
+        // already on `origin/<same-name>` — a brand new branch never has that
+        // ref yet, so nothing was hidden and the whole shared ancestry looked
+        // unpublished. It now hides everything reachable from ANY branch on
+        // that remote, so only commits genuinely new anywhere on the server
+        // show up — usually just the 1-2 commits made since branching.
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let repository = std::env::temp_dir().join(format!("git-integrity-new-branch-publish-{suffix}"));
+        let remote = std::env::temp_dir().join(format!("git-integrity-new-branch-remote-{suffix}.git"));
+        fs::create_dir_all(&repository).unwrap();
+        fs::create_dir_all(&remote).unwrap();
+        run_git(&remote, &["init", "--bare"]);
+        fs::write(repository.join("a.txt"), "one").unwrap();
+        run_git(&repository, &["init", "-b", "main"]);
+        run_git(&repository, &["config", "user.email", "test@example.com"]);
+        run_git(&repository, &["config", "user.name", "Test User"]);
+        run_git(&repository, &["add", "."]);
+        run_git(&repository, &["commit", "-m", "Commit 1"]);
+        fs::write(repository.join("a.txt"), "two").unwrap();
+        run_git(&repository, &["commit", "-am", "Commit 2"]);
+        run_git(&repository, &["remote", "add", "origin", remote.to_str().unwrap()]);
+        run_git(&repository, &["-c", "protocol.file.allow=always", "push", "origin", "HEAD:main"]);
+        let path = repository.to_string_lossy().into_owned();
+
+        // main IS published — nothing unexpected there.
+        assert_eq!(publish_status(path.clone(), "main".into(), "origin".into()).unwrap().commits.len(), 0);
+
+        // A brand new branch created right at main's tip, with no new work of
+        // its own yet, shares 100% of its history with origin/main — it should
+        // have nothing new to publish, not its whole 2-commit ancestry.
+        create_branch(path.clone(), "feature-x".into()).unwrap();
+        let unpublished = publish_status(path.clone(), "feature-x".into(), "origin".into()).unwrap();
+        assert_eq!(unpublished.commits.len(), 0, "a new branch with no commits of its own should have nothing new to publish, even though origin/feature-x doesn't exist yet");
+
+        // Now make one genuinely new commit on it — only *that* should show up.
+        fs::write(repository.join("a.txt"), "three").unwrap();
+        run_git(&repository, &["commit", "-am", "Commit 3 on feature-x"]);
+        let unpublished = publish_status(path.clone(), "feature-x".into(), "origin".into()).unwrap();
+        assert_eq!(unpublished.commits.len(), 1);
+        assert_eq!(unpublished.commits[0].subject, "Commit 3 on feature-x");
+
+        fs::remove_dir_all(repository).unwrap();
+        fs::remove_dir_all(remote).unwrap();
+    }
+
+    #[test]
+    fn staging_a_file_inside_a_submodule_stages_it_in_the_submodule_not_the_parent() {
+        // Reproduces the report: browsing into a submodule's own files via the
+        // plain Explorer (not the dedicated "Submodule branch map" swap) always
+        // showed them as untracked/changed (the parent's status scan never sees
+        // individual submodule files, only the submodule as a whole), and
+        // staging one silently did nothing because `stage_files` only ever
+        // touched the parent's index, which has no entry for it at all.
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-stage-inside-submodule-{suffix}"));
+        let parent = base.join("parent"); let dependency = base.join("dependency");
+        create_libgit2_repository(&parent, "README.md"); create_libgit2_repository(&dependency, "module.txt");
+        let parent_string = parent.to_string_lossy().into_owned();
+        let added = add_submodule(parent_string.clone(), "".into(), dependency.to_string_lossy().into_owned(), "dep".into(), String::new(), String::new()).unwrap();
+        create_commit(parent_string.clone(), "Add dep submodule".into()).unwrap();
+        let file_path = format!("{added}/module.txt");
+
+        fs::write(parent.join(&file_path), "changed content").unwrap();
+
+        // The file must be correctly reported as modified — sourced from the
+        // submodule's own status, not silently invisible to the parent.
+        let listing = load_directory(parent_string.clone(), added.clone()).unwrap();
+        let file_entry = listing.iter().find(|entry| entry.relative_path == file_path).expect("module.txt should be listed");
+        assert_eq!(file_entry.status, "M", "a modified file inside a submodule must show its real status, not look permanently untracked");
+        assert!(file_entry.tracked);
+
+        let details = entry_details(parent_string.clone(), file_path.clone()).unwrap();
+        assert_eq!(details.status, "M");
+
+        stage_files(parent_string.clone(), vec![file_path.clone()]).unwrap();
+
+        let sub_repo = Repository::open(parent.join(&added)).unwrap();
+        let staged = sub_repo.statuses(None).unwrap().iter().any(|entry| entry.path() == Some("module.txt") && entry.status().contains(git2::Status::INDEX_MODIFIED));
+        assert!(staged, "the file must end up staged in the submodule's own index");
+        drop(sub_repo);
+
+        // And the parent's own index must remain untouched by this — no bogus
+        // entry for a path that was never part of its tree.
+        let parent_repo = Repository::open(&parent).unwrap();
+        assert!(parent_repo.index().unwrap().get_path(Path::new(&file_path), 0).is_none());
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
     fn run_git_command_executes_scoped_to_the_given_folder_and_reports_stdout_stderr() {
         let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let repository = std::env::temp_dir().join(format!("git-integrity-run-git-command-{suffix}"));
@@ -2509,8 +2677,8 @@ mod tests {
         let failed = run_git_command(path.clone(), "show refs/heads/does-not-exist".into()).unwrap();
         assert!(!failed.success); assert!(!failed.stderr.is_empty());
 
-        let rejected = run_git_command(path, "git status".into());
-        assert!(rejected.is_err(), "including the literal \"git\" prefix should be rejected with a clear message, not passed through");
+        let with_git_prefix = run_git_command(path, "git status".into()).unwrap();
+        assert!(with_git_prefix.success, "typing the full \"git status\" should work exactly like \"status\", not be rejected");
 
         fs::remove_dir_all(repository).unwrap();
     }
