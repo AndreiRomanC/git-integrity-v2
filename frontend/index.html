@@ -242,6 +242,13 @@
       <footer><span id="publishSummary">Checking…</span><button value="cancel">Cancel</button><button value="default" id="confirmPublish">Publish branch</button></footer>
     </form>
   </dialog>
+  <dialog id="submodulePublishDialog" class="publish-dialog">
+    <form method="dialog"><header><div><h2 id="submodulePublishTitle">Push submodule</h2><p>Sends these commits to the submodule's own remote — the project itself is unaffected.</p></div><button value="cancel">×</button></header>
+      <div id="submodulePublishCommits" class="publish-commits"></div>
+      <p id="submodulePublishStatus" class="submodule-operation-status" role="status"></p>
+      <footer><span id="submodulePublishSummary">Checking…</span><button value="cancel">Cancel</button><button value="default" id="confirmSubmodulePublish" class="confirm">Push</button></footer>
+    </form>
+  </dialog>
   <dialog id="cloneDialog" class="clone-dialog">
     <form method="dialog"><div class="dialog-symbol">↓</div><h2>Clone repository from server</h2><p>Creates one local working copy and opens it automatically.</p>
       <label><span>REPOSITORY URL</span><input id="cloneUrl" placeholder="https://server/team/project.git"></label>

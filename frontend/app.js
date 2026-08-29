@@ -406,6 +406,9 @@ function iconFor(entry) {
 function gitState(entry) {
   const labels = { M: 'Modified locally', A: 'Added locally', D: 'Deleted locally', R: 'Renamed locally', '??': 'New, untracked', '•': 'Modified files inside' };
   if (!entry.tracked) return '<span class="git-state untracked"><i class="git-dot"></i>New, untracked</span>';
+  if (entry.kind === 'submodule' && entry.status === 'M' && entry.submodule_has_unpushed_commits) {
+    return '<span class="git-state new-version"><i class="git-dot"></i>New version</span>';
+  }
   if (entry.status) return `<span class="git-state changed"><i class="git-dot"></i>${esc(labels[entry.status] || entry.status)}</span>`;
   return '<span class="git-state"><i class="git-dot"></i>Tracked</span>';
 }
@@ -556,11 +559,12 @@ function renderEntryDetails(entry) {
   const kindLabel = entry.kind === 'submodule' ? 'Git submodule' : entry.kind.charAt(0).toUpperCase() + entry.kind.slice(1);
   refs.details.innerHTML = `<div class="entry-details"><div class="entry-preview ${esc(entry.kind)}">${entry.kind === 'submodule' ? '◇' : entry.kind === 'folder' ? '▰' : '▤'}</div>
     <h2>${esc(entry.name)}</h2><div class="entry-path">${esc(entry.relative_path)}</div>${entry.kind === 'submodule' ? '<span class="submodule-badge">◇ Git submodule</span>' : ''}
-    ${entry.status || !entry.tracked ? `<div class="local-change-banner"><i></i><div><strong>${entry.tracked ? 'Modified locally' : 'New local file'}</strong><span>This item differs from the committed repository state.</span></div></div>` : ''}
+    ${entry.status || !entry.tracked ? `<div class="local-change-banner"><i></i><div><strong>${entry.kind === 'submodule' && entry.submodule_push_status ? 'New version locally (not pushed yet)' : entry.tracked ? 'Modified locally' : 'New local file'}</strong><span>${entry.kind === 'submodule' && entry.submodule_push_status ? 'Committed here, on this machine — not sent to the submodule\'s server yet.' : 'This item differs from the committed repository state.'}</span></div></div>` : ''}
     <div class="context-actions">${entry.kind === 'file' ? '<button data-detail-action="edit">Edit local file</button>' : '<button data-detail-action="open">Open folder</button>'}<button data-detail-action="server">Open on server ↗</button><button data-detail-action="history">View history</button>${entry.status ? '<button data-detail-action="commit">Commit this item</button>' : ''}${entry.kind === 'file' && (entry.status || !entry.tracked) ? `<button data-detail-action="stage" data-tooltip="git add — add this file's current content to staging">＋ Stage this file</button><button data-detail-action="unstage" data-tooltip="Unstage — git restore --staged. Removes only the staging entry; your edits on disk are kept exactly as they are.">− Unstage</button><button data-detail-action="head" class="danger-action-soft" data-tooltip="Restore from your last local commit (HEAD) — git checkout HEAD -- file. Permanently discards ALL edits; the file on disk becomes identical to what you last committed. Cannot be undone.">↶ Restore from last commit (HEAD)</button><button data-detail-action="compare" data-tooltip="Open side-by-side compare with restore options">⇄ Compare with remote</button>` : ''}${entry.kind === 'submodule' ? `<button data-detail-action="subserver">Open submodule repository ↗</button><button data-detail-action="subgraph">Submodule branch map</button><button data-detail-action="subnewbranch" data-tooltip="Create a new local branch in this submodule, starting from its current commit, and switch to it">＋ New branch…</button><button data-detail-action="versions">Change version</button><button data-detail-action="subcommit" ${entry.status ? '' : 'disabled'} data-tooltip="${entry.status ? 'Commit uncommitted changes inside the submodule' : 'Nothing to commit — no uncommitted changes inside this submodule'}">Commit submodule</button><button data-detail-action="subpull" data-tooltip="Fast-forward pull — brings in new commits from the submodule's remote. Refuses if it would require a manual merge.">Pull submodule</button><button data-detail-action="submerge" data-tooltip="Merge a branch into this submodule's current branch, with conflict resolution if needed">Merge branch…</button><button data-detail-action="subpush">Push submodule</button><button data-detail-action="subforcepush" class="danger-action-soft" data-tooltip="⚠️ Overwrites the remote branch with your local history, discarding any commits there aren't in yours. Only safe if nobody else uses that remote.">Force push submodule…</button><button data-detail-action="subfetch">Fetch submodule</button><button data-detail-action="location">Replace repository URL</button>` : ''}<button class="danger-action" data-detail-action="delete">Delete…</button></div>
     <div class="detail-section"><h3>GENERAL</h3><div class="detail-grid"><span>Type</span><strong>${kindLabel}</strong><span>Git</span><strong>${entry.tracked ? (entry.status || 'Tracked, clean') : 'Untracked'}</strong>
     ${entry.item_count != null ? `<span>Items</span><strong>${entry.item_count}</strong>` : `<span>Size</span><strong>${formatSize(entry.size)}</strong>`}<span>Modified</span><strong>${formatModified(entry.modified)}</strong></div></div>
-    ${entry.kind === 'submodule' ? `<div class="detail-section"><h3>SUBMODULE</h3><div class="detail-grid"><span>Remote</span><strong>${esc(entry.submodule_url || 'Not configured')}</strong><span>Branch</span><strong>${esc(entry.submodule_branch || 'Default')}</strong><span>Status</span><strong>${entry.status ? (entry.status === 'M' ? 'Has local changes' : 'Modified') : 'Clean'}</strong></div>${entry.submodule_push_status ? `<div class="submodule-push-banner"><i></i><span>${esc(entry.submodule_push_status)}</span></div>` : ''}</div>` : ''}
+    ${entry.kind === 'submodule' ? `<div class="detail-section"><h3>SUBMODULE</h3><div class="detail-grid"><span>Remote</span><strong>${esc(entry.submodule_url || 'Not configured')}</strong><span>Branch</span><strong>${esc(entry.submodule_branch || 'Default')}</strong><span>Status</span><strong>${entry.status ? (entry.status === 'M' ? 'Has local changes' : 'Modified') : 'Clean'}</strong></div>
+    ${entry.submodule_unpushed_commits?.length ? `<div class="submodule-push-banner"><i></i><span>${entry.submodule_unpushed_commits.length} commit${entry.submodule_unpushed_commits.length === 1 ? '' : 's'} not yet pushed to its own remote:</span></div><div class="submodule-unpushed-list">${entry.submodule_unpushed_commits.map(commit => `<div class="submodule-unpushed-commit"><strong>${commitSubjectHtml(commit.subject)}</strong><small>${esc(commit.id.slice(0, 8))} · ${esc(commit.author)} · ${esc(commit.date)}</small></div>`).join('')}</div>` : entry.submodule_push_status ? `<div class="submodule-push-banner"><i></i><span>${esc(entry.submodule_push_status)}</span></div>` : ''}</div>` : ''}
     ${entry.kind === 'submodule' ? `<div class="detail-section"><h3>SUBMODULE COMMIT (actual change)</h3><div class="detail-grid"><span>Commit</span><strong>${entry.submodule_commit_id ? `<a href="#" class="commit-server-link" data-commit-id="${esc(entry.submodule_commit_id)}" data-submodule-path="${esc(entry.relative_path)}" title="Open this commit on the submodule's own server">${esc(entry.submodule_commit_id.slice(0, 8))} ↗</a>` : 'No commit'}</strong><span>Message</span><strong>${commitSubjectHtml(entry.submodule_commit_subject || '—')}</strong><span>Author</span><strong>${esc(entry.submodule_commit_author || '—')}</strong><span>Date</span><strong>${esc(entry.submodule_commit_date || '—')}</strong></div></div>` : ''}
     <div class="detail-section"><h3>${entry.kind === 'submodule' ? 'PROJECT COMMIT (gitlink update)' : 'LAST COMMIT'}</h3><div class="detail-grid"><span>Commit</span><strong>${entry.last_commit_id ? `<a href="#" class="commit-server-link" data-commit-id="${esc(entry.last_commit_id)}" title="Open this commit on the server">${esc(entry.last_commit_id.slice(0, 8))} ↗</a>` : 'No commit'}</strong><span>Message</span><strong>${commitSubjectHtml(entry.last_commit_subject || '—')}</strong><span>Author</span><strong>${esc(entry.last_commit_author || '—')}</strong><span>Date</span><strong>${esc(entry.last_commit_date || '—')}</strong></div></div></div>`;
   refs.details.querySelectorAll('[data-detail-action]').forEach(button => button.addEventListener('click', () => { Promise.resolve(handleDetailAction(button.dataset.detailAction, entry, button)).catch(error => handleError(error)); }));
@@ -631,7 +635,7 @@ async function commitSubmoduleChanges(entry) {
     status(`Committing changes in ${entry.name}…`, 'busy');
     await invoke('commit_submodule', { repositoryPath: state.repository.path, relativePath: entry.relative_path, message: message.trim() });
     directoryCache.clear(); await loadRepository(state.repository.path); await openDirectory(state.currentPath, { force: true });
-    const successMsg = `${entry.name}: committed inside the submodule. The parent project's link to it is unchanged — use "Change version" if you want the parent to point at this new commit.`;
+    const successMsg = `${entry.name}: committed inside the submodule. The project's link to it was updated automatically to this new commit — commit/push the project when you're ready to share that.`;
     status(successMsg); showOperationToast(successMsg, 'success');
   }
   catch (error) { const message2 = handleError(error); showOperationToast(`Commit failed: ${message2}`, 'error'); }
@@ -827,10 +831,31 @@ async function forcePushSubmodule(entry) {
   catch (error) { const message = handleError(error); showOperationToast(message, 'error'); }
 }
 
+// Shows the actual commits about to be pushed — before, this was a plain
+// "push this submodule?" confirm with no list, which was the whole complaint:
+// you had no way to see what you were about to send anywhere.
 async function pushSubmodule(entry) {
   if (entry.kind !== 'submodule') return;
-  if (!await customConfirm(`Push commits in submodule ${entry.name} to its own remote repository?`, { title: 'Push submodule', okLabel: 'Push' })) { status('Push cancelled'); return; }
   if (!invoke) return status(`Preview: pushed ${entry.name}`);
+  $('#submodulePublishTitle').textContent = `Push ${entry.name}`;
+  $('#submodulePublishCommits').innerHTML = '<div class="loading-row"><i class="spinner"></i>Checking what needs to be pushed…</div>';
+  $('#submodulePublishSummary').textContent = 'Checking…'; $('#submodulePublishStatus').textContent = '';
+  $('#confirmSubmodulePublish').disabled = true;
+  $('#submodulePublishDialog').showModal();
+  let commits = [];
+  try { const details = await invoke('entry_details', { repositoryPath: state.repository.path, relativePath: entry.relative_path }); commits = details.submodule_unpushed_commits || []; }
+  catch (error) { $('#submodulePublishCommits').innerHTML = `<div class="publish-empty">${esc(String(error))}</div>`; return; }
+  $('#submodulePublishCommits').innerHTML = commits.map((commit, index) => `<div class="publish-commit"><span>${index + 1}</span><i></i><div><strong>${commitSubjectHtml(commit.subject)}</strong><small>${esc(commit.id.slice(0, 8))} · ${esc(commit.author)} · ${esc(commit.date)}</small></div><b>WILL PUSH</b></div>`).join('') || '<div class="publish-empty">Nothing to push — already up to date, or this submodule has no upstream.</div>';
+  $('#submodulePublishSummary').textContent = `${commits.length} commit${commits.length === 1 ? '' : 's'} to push`;
+  $('#confirmSubmodulePublish').disabled = !commits.length;
+
+  const confirmed = await new Promise(resolve => {
+    const dialog = $('#submodulePublishDialog');
+    const onClose = () => { dialog.removeEventListener('close', onClose); resolve(dialog.returnValue === 'default'); };
+    dialog.addEventListener('close', onClose);
+  });
+  if (!confirmed) { status('Push cancelled'); return; }
+
   try {
     status(`Pushing ${entry.name} to its remote…`, 'busy');
     const result = await invoke('push_submodule', { repositoryPath: state.repository.path, relativePath: entry.relative_path });

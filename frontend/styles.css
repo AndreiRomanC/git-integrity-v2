@@ -125,7 +125,7 @@ button { cursor: default; }
 .entry-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; }
 .entry-hint { color: #6f8395; font-size: 10px; }
 .git-state { display: inline-flex; align-items: center; gap: 6px; color: #7f91a2; font-size: 11px; }
-.git-state.changed { color: var(--amber); }.git-state.untracked { color: #8a9aaa; }
+.git-state.changed { color: var(--amber); }.git-state.untracked { color: #8a9aaa; }.git-state.new-version { color: var(--blue); }
 .git-dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
 .file-size, .file-modified { color: #8293a3; font-size: 11px; white-space: nowrap; }
 .folder-arrow { margin-left: auto; color: #64809a; font-size: 18px; }
@@ -247,6 +247,10 @@ button { cursor: default; }
 .context-actions .danger-action-soft { border-color: #a9722e; color: #ffcd8f; background: #241a0d; }.context-actions .danger-action-soft:hover { background: #392710; border-color: #c98c3f; }
 .local-change-banner { display: flex; align-items: center; gap: 9px; margin-top: 15px; padding: 10px; border: 1px solid #765b27; border-radius: 6px; background: #332814; }.local-change-banner > i { width: 10px; height: 10px; flex: none; border-radius: 50%; background: var(--amber); box-shadow: 0 0 9px #f0b65a77; }.local-change-banner div { display: flex; flex-direction: column; gap: 2px; }.local-change-banner strong { color: #ffe2a8; font-size: 11px; }.local-change-banner span { color: #a8916a; font-size: 9px; }
 .submodule-push-banner { display: flex; align-items: center; gap: 9px; margin-top: 10px; padding: 9px 10px; border: 1px solid #765b27; border-radius: 6px; background: #332814; }.submodule-push-banner > i { width: 9px; height: 9px; flex: none; border-radius: 50%; background: var(--amber); box-shadow: 0 0 9px #f0b65a77; }.submodule-push-banner span { color: #ffe2a8; font-size: 11px; line-height: 1.4; }
+.submodule-unpushed-list { margin-top: -1px; border: 1px solid #4a3a17; border-radius: 0 0 6px 6px; background: #241d0e; max-height: 180px; overflow-y: auto; }
+.submodule-unpushed-commit { padding: 7px 10px; border-bottom: 1px solid #3a2e12; }.submodule-unpushed-commit:last-child { border-bottom: 0; }
+.submodule-unpushed-commit strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; color: #f0dcae; font-weight: 500; }
+.submodule-unpushed-commit small { color: #b3966a; font-size: 10px; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
 
 .remotes-view { flex: 1; overflow: auto; padding: 22px; }.remote-cards { display: grid; gap: 12px; max-width: 900px; }.remote-card { display: grid; grid-template-columns: 48px 1fr auto; gap: 15px; align-items: center; padding: 18px; border: 1px solid #30404e; border-radius: 9px; background: #141d25; }.remote-symbol { display: grid; place-items: center; width: 42px; height: 42px; border: 3px solid var(--blue); border-radius: 50%; color: var(--blue); font-size: 20px; }.remote-card h2 { margin: 0 0 10px; font-size: 16px; }.remote-card span { display: block; margin-top: 6px; color: #738697; font-size: 9px; letter-spacing: .7px; }.remote-card code { color: #b8c9d8; font-size: 11px; overflow-wrap: anywhere; }.remote-card button { height: 35px; padding: 0 13px; border: 1px solid #5193cd; border-radius: 6px; background: #24689f; color: white; }.remote-empty { padding: 45px; text-align: center; color: var(--muted); }
 

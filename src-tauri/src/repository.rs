@@ -68,6 +68,11 @@ pub struct DirectoryEntry {
     tracked: bool,
     size: u64,
     modified: u64,
+    // Only set for submodules: true when its "M" status is because it has new
+    // local commits not yet pushed (a version bump), not because its own
+    // working tree has genuinely uncommitted edits — the Explorer row can then
+    // say "New version" instead of "Modified locally".
+    submodule_has_unpushed_commits: bool,
 }
 
 #[derive(Serialize)]
@@ -83,6 +88,7 @@ pub struct EntryDetails {
     submodule_url: Option<String>,
     submodule_branch: Option<String>,
     submodule_push_status: Option<String>,
+    submodule_unpushed_commits: Vec<PublishCommit>,
     last_commit_id: Option<String>,
     last_commit_subject: Option<String>,
     last_commit_author: Option<String>,
@@ -567,8 +573,14 @@ fn partition_by_submodule(repository_path: &str, files: Vec<String>) -> (Vec<Str
     let mut grouped: HashMap<String, Vec<String>> = HashMap::new();
     for file in files {
         match resolve_submodule_boundary(repository_path, &file) {
-            Some((sub_path, inner_relative)) => grouped.entry(sub_path).or_default().push(inner_relative),
-            None => own.push(file),
+            // Only redirect for a path *inside* a submodule (a file within
+            // it). The submodule's own path (empty inner_relative) must stay
+            // in `own` and go through the normal gitlink-staging logic below
+            // — treating it as "recurse into the submodule with an empty
+            // path" silently staged nothing and made the submodule itself
+            // impossible to stage/commit from the Working tree drawer.
+            Some((sub_path, inner_relative)) if !inner_relative.is_empty() => grouped.entry(sub_path).or_default().push(inner_relative),
+            _ => own.push(file),
         }
     }
     (own, grouped)
@@ -986,7 +998,8 @@ pub fn load_directory(repository_path: String, relative_path: String) -> Result<
         let tracked_prefix = format!("{status_key}/");
         let tracked = git_metadata.submodules.contains(&status_key) || git_metadata.tracked.contains(&status_key) || git_metadata.tracked.iter().any(|path| path.starts_with(&tracked_prefix));
         let modified = metadata.modified().ok().and_then(|time| time.duration_since(UNIX_EPOCH).ok()).map(|value| value.as_secs()).unwrap_or(0);
-        entries.push(DirectoryEntry { name, relative_path: relative_string, kind, status: status_for(&status_key, &git_metadata.statuses), tracked, size: if metadata.is_file() { metadata.len() } else { 0 }, modified });
+        let submodule_has_unpushed_commits = kind == "submodule" && submodule_push_status(item.path().to_str().unwrap_or_default()).is_some();
+        entries.push(DirectoryEntry { name, relative_path: relative_string, kind, status: status_for(&status_key, &git_metadata.statuses), tracked, size: if metadata.is_file() { metadata.len() } else { 0 }, modified, submodule_has_unpushed_commits });
     }
     entries.sort_by(|a, b| {
         let a_group = matches!(a.kind.as_str(), "folder" | "submodule");
@@ -1032,6 +1045,7 @@ pub fn entry_details(repository_path: String, relative_path: String) -> Result<E
     let submodule_url = (kind == "submodule").then(|| submodule_value(&repository_path, &relative_string, "url")).flatten();
     let submodule_branch = (kind == "submodule").then(|| submodule_value(&repository_path, &relative_string, "branch")).flatten();
     let submodule_push_status = (kind == "submodule").then(|| submodule_push_status(&absolute.to_string_lossy())).flatten();
+    let submodule_unpushed_commits = if kind == "submodule" { submodule_unpushed_commits(&absolute.to_string_lossy()) } else { Vec::new() };
     let submodule_commit = (kind == "submodule").then(|| {
         let repo = internal_repository(absolute.to_str().unwrap_or_default()).ok()?;
         let commit = repo.head().ok()?.peel_to_commit().ok()?;
@@ -1041,7 +1055,7 @@ pub fn entry_details(repository_path: String, relative_path: String) -> Result<E
 
     Ok(EntryDetails {
         name: absolute.file_name().and_then(|name| name.to_str()).unwrap_or(&relative_string).to_string(), relative_path: relative_string,
-        kind, status, tracked, size: if metadata.is_file() { metadata.len() } else { 0 }, modified, item_count, submodule_url, submodule_branch, submodule_push_status,
+        kind, status, tracked, size: if metadata.is_file() { metadata.len() } else { 0 }, modified, item_count, submodule_url, submodule_branch, submodule_push_status, submodule_unpushed_commits,
         last_commit_id: last.as_ref().map(|value| value.0.clone()),
         last_commit_subject: last.as_ref().map(|value| value.1.clone()), last_commit_author: last.as_ref().map(|value| value.2.clone()), last_commit_date: last.as_ref().map(|value| value.3.clone()),
         submodule_commit_id: submodule_commit.as_ref().map(|value| value.0.clone()),
@@ -1064,6 +1078,29 @@ fn submodule_push_status(sub_path: &str) -> Option<String> {
     let mut walk = repo.revwalk().ok()?; walk.push(local_target).ok()?; let _ = walk.hide(remote_target);
     let ahead = walk.take(50).count();
     Some(if ahead > 0 { format!("{ahead} commit{} not yet pushed to origin/{branch} — needs push", if ahead == 1 { "" } else { "s" }) } else { format!("Diverged from origin/{branch}") })
+}
+
+// The actual commits behind `submodule_push_status`'s summary line — showing
+// "3 commits not pushed" as a sentence and making the user guess which three
+// isn't good enough; list them the same way the main project's "Unpublished
+// commits" dialog already does.
+fn submodule_unpushed_commits(sub_path: &str) -> Vec<PublishCommit> {
+    (|| -> Option<Vec<PublishCommit>> {
+        let repo = internal_repository(sub_path).ok()?;
+        let head = repo.head().ok()?;
+        let local_target = head.target()?;
+        if repo.head_detached().unwrap_or(true) { return Some(Vec::new()); }
+        let branch = head.shorthand()?.to_string();
+        drop(head);
+        let remote_target = repo.find_reference(&format!("refs/remotes/origin/{branch}")).ok()?.target()?;
+        if remote_target == local_target { return Some(Vec::new()); }
+        let mut walk = repo.revwalk().ok()?; walk.push(local_target).ok()?; let _ = walk.hide(remote_target);
+        let mut commits: Vec<PublishCommit> = walk.take(50).flatten().filter_map(|oid| repo.find_commit(oid).ok().map(|commit| PublishCommit {
+            id: oid.to_string(), subject: commit.summary().unwrap_or("No message").into(), author: commit.author().name().unwrap_or("Unknown").into(), date: short_date(commit.time().seconds()),
+        })).collect();
+        commits.reverse();
+        Some(commits)
+    })().unwrap_or_default()
 }
 
 fn validate_submodule(repository_path: &str, relative_path: &str) -> Result<PathBuf, String> {
@@ -1635,6 +1672,13 @@ pub fn commit_submodule(repository_path: String, relative_path: String, message:
     let parents: Vec<&git2::Commit<'_>> = parent.iter().collect();
     let oid = repo.commit(Some("HEAD"), &signature, &signature, message.trim(), &tree, &parents).map_err(|error| error.message().to_string())?;
     invalidate_git_metadata(&sub_path);
+    // Once the submodule itself has a new commit, its working copy already IS
+    // the new version — record that in the parent right away instead of
+    // leaving the two in sync only after a manual "Change version"/stage step.
+    // Not having pushed yet doesn't change this: the parent should show "this
+    // submodule is now on version X", not "modified", the moment X actually
+    // exists as a real commit here, pushed or not.
+    record_pushed_submodule_in_parent(&repository_path, &relative_path, Some(oid))?;
     Ok(oid.to_string())
 }
 
@@ -2334,14 +2378,16 @@ mod tests {
         // Commit through our command only, then push must succeed.
         commit_submodule(repo_path.clone(), "vendor/dep".into(), "Update module".into()).expect("commit_submodule should succeed");
 
-        // The parent repo's recorded gitlink must be untouched by the submodule commit alone.
+        // Committing inside the submodule now updates the parent's recorded
+        // gitlink right away (no push needed) — the submodule's working copy
+        // already IS the new version, so the parent should reflect that
+        // immediately instead of still showing it as "modified".
         let parent_index_oid = { let repo = Repository::open(&repository).unwrap(); repo.index().unwrap().get_path(Path::new("vendor/dep"), 0).unwrap().id };
         let submodule_head_oid = { let repo = Repository::open(&sub_path).unwrap(); let oid = repo.head().unwrap().target().unwrap(); oid };
-        assert_ne!(parent_index_oid, submodule_head_oid, "parent gitlink moved automatically; it should stay put until explicitly updated");
+        assert_eq!(parent_index_oid, submodule_head_oid, "the parent should record the submodule's new commit immediately after committing inside it, push or not");
 
-        // The parent repo shows the submodule as having local (uncommitted-to-parent) content changes.
         let parent_changes = load_repository(repo_path.clone()).unwrap().changes;
-        assert!(parent_changes.iter().any(|change| change.path == "vendor/dep"), "parent status should flag the submodule as differing");
+        assert!(!parent_changes.iter().any(|change| change.path == "vendor/dep"), "the submodule should already show as clean/version-changed, not modified, before any push");
 
         // Now push should succeed, and — since the commit is now safely on the
         // submodule's own server — the parent should be updated automatically so the
@@ -2659,6 +2705,116 @@ mod tests {
     }
 
     #[test]
+    fn a_brand_new_untracked_file_inside_a_submodule_can_be_committed_via_commit_path() {
+        // The exact report: a brand new, never-before-tracked file ("nou.py")
+        // created inside a submodule shows correctly as changed in the UI, but
+        // committing it via the per-item "Commit this item" action (commit_path)
+        // must not be blocked and must land inside the submodule's own history.
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-new-file-in-submodule-{suffix}"));
+        let parent = base.join("parent"); let dependency = base.join("dependency");
+        create_libgit2_repository(&parent, "README.md"); create_libgit2_repository(&dependency, "module.txt");
+        let parent_string = parent.to_string_lossy().into_owned();
+        let added = add_submodule(parent_string.clone(), "".into(), dependency.to_string_lossy().into_owned(), "dep".into(), String::new(), String::new()).unwrap();
+        create_commit(parent_string.clone(), "Add dep submodule".into()).unwrap();
+        let file_path = format!("{added}/nou.py");
+
+        fs::write(parent.join(&file_path), "print('hello')\n").unwrap();
+
+        let listing = load_directory(parent_string.clone(), added.clone()).unwrap();
+        let file_entry = listing.iter().find(|entry| entry.relative_path == file_path).expect("nou.py should be listed");
+        assert_eq!(file_entry.status, "??", "a brand new file inside a submodule must show as untracked/new, not blank");
+
+        let committed = commit_path(parent_string.clone(), file_path.clone(), "Add nou.py".into());
+        assert!(committed.is_ok(), "committing a new file inside a submodule via commit_path must succeed, got: {:?}", committed);
+
+        {
+            let sub_repo = Repository::open(parent.join(&added)).unwrap();
+            let head_files = sub_repo.head().unwrap().peel_to_tree().unwrap();
+            assert!(head_files.get_path(Path::new("nou.py")).is_ok(), "nou.py should be in the submodule's HEAD commit");
+        }
+
+        // Confirm it no longer shows as a pending change afterward.
+        let listing_after = load_directory(parent_string, added).unwrap();
+        let file_entry_after = listing_after.iter().find(|entry| entry.relative_path == file_path).expect("nou.py should still be listed");
+        assert_eq!(file_entry_after.status, "", "nou.py should no longer show as changed right after being committed");
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn staging_and_committing_the_submodule_itself_from_the_working_tree_drawer_works() {
+        // Reproduces the report: the Working tree drawer showed the submodule
+        // itself ("test") as "M" (its checked-out commit had advanced past what
+        // the parent's index recorded), but checking it and hitting Commit did
+        // nothing. Cause: `resolve_submodule_boundary` matches the submodule's
+        // own exact path too (with an empty inner path) — `partition_by_submodule`
+        // was treating "stage/commit the submodule itself" the same as "stage a
+        // file inside it", recursing into the submodule with an empty/bogus path
+        // instead of running the normal gitlink-staging logic for it.
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-stage-submodule-itself-{suffix}"));
+        let parent = base.join("parent"); let dependency = base.join("dependency");
+        create_libgit2_repository(&parent, "README.md"); create_libgit2_repository(&dependency, "module.txt");
+        let parent_string = parent.to_string_lossy().into_owned();
+        let added = add_submodule(parent_string.clone(), "".into(), dependency.to_string_lossy().into_owned(), "test".into(), String::new(), String::new()).unwrap();
+        create_commit(parent_string.clone(), "Add test submodule".into()).unwrap();
+
+        // Advance the submodule's HEAD (e.g. from a plain terminal) so it now
+        // differs from what the parent's index recorded — this is exactly what
+        // makes it show as "M" in the Working tree drawer.
+        run_git(&parent.join(&added), &["commit", "--allow-empty", "-m", "Advance the submodule"]);
+        let sub_repo = Repository::open(parent.join(&added)).unwrap();
+        let expected_oid = sub_repo.head().unwrap().target().unwrap();
+        drop(sub_repo);
+
+        let changes = load_repository(parent_string.clone()).unwrap().changes;
+        assert!(changes.iter().any(|c| c.path == added && c.status == "M"), "the submodule itself should show as M in the Working tree drawer: {:?}", changes.iter().map(|c| (&c.path, &c.status)).collect::<Vec<_>>());
+
+        stage_files(parent_string.clone(), vec![added.clone()]).unwrap();
+        let staged_changes = load_repository(parent_string.clone()).unwrap().changes;
+        assert!(staged_changes.iter().any(|c| c.path == added && c.staged), "the submodule should be staged after checking it, not silently ignored");
+
+        commit_files(parent_string.clone(), vec![added.clone()], "Bump test submodule".into()).unwrap();
+
+        let repo = Repository::open(&parent).unwrap();
+        let recorded_oid = repo.index().unwrap().get_path(Path::new(&added), 0).unwrap().id;
+        assert_eq!(recorded_oid, expected_oid, "the parent's index should now record the submodule's new commit");
+        assert!(!load_repository(parent_string).unwrap().changes.iter().any(|c| c.path == added), "the submodule should no longer show as changed after being committed");
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn commit_submodule_auto_updates_the_parent_even_without_a_push() {
+        // "After committing inside a submodule and it's already on the new
+        // version, it should show as version-changed, not modified — even
+        // without having pushed it yet." `commit_submodule` now records the new
+        // commit in the parent right away (the same way a push already does),
+        // instead of requiring a separate manual "Change version"/stage step.
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-commit-submodule-auto-bump-{suffix}"));
+        let parent = base.join("parent"); let dependency = base.join("dependency");
+        create_libgit2_repository(&parent, "README.md"); create_libgit2_repository(&dependency, "module.txt");
+        let parent_string = parent.to_string_lossy().into_owned();
+        let added = add_submodule(parent_string.clone(), "".into(), dependency.to_string_lossy().into_owned(), "dep".into(), String::new(), String::new()).unwrap();
+        create_commit(parent_string.clone(), "Add dep submodule".into()).unwrap();
+
+        fs::write(parent.join(&added).join("module.txt"), "v2").unwrap();
+        let oid = commit_submodule(parent_string.clone(), added.clone(), "Update module".into()).unwrap();
+
+        let repo = Repository::open(&parent).unwrap();
+        let recorded = repo.index().unwrap().get_path(Path::new(&added), 0).unwrap().id;
+        assert_eq!(recorded.to_string(), oid, "the parent must already record the submodule's new commit, with no push and no separate manual step");
+        drop(repo);
+
+        let changes = load_repository(parent_string).unwrap().changes;
+        assert!(!changes.iter().any(|c| c.path == added), "the submodule must show as clean/version-changed, not modified, right after committing inside it: {:?}", changes.iter().map(|c| (&c.path, &c.status)).collect::<Vec<_>>());
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
     fn run_git_command_executes_scoped_to_the_given_folder_and_reports_stdout_stderr() {
         let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let repository = std::env::temp_dir().join(format!("git-integrity-run-git-command-{suffix}"));
@@ -2889,9 +3045,15 @@ mod tests {
         let status = submodule_push_status(&sub_path.to_string_lossy());
         assert!(status.as_deref().is_some_and(|message| message.contains("1 commit") && message.contains("needs push")), "expected an unpushed-commit message, got: {status:?}");
 
+        // The actual commit(s) behind that summary must be listed, not just counted.
+        let unpushed = submodule_unpushed_commits(&sub_path.to_string_lossy());
+        assert_eq!(unpushed.len(), 1);
+        assert_eq!(unpushed[0].subject, "Local only");
+
         // After a successful push, the warning must clear.
         push_submodule(repo_path, "vendor/dep".into()).unwrap();
         assert_eq!(submodule_push_status(&sub_path.to_string_lossy()), None, "after push, the submodule should no longer report anything unpushed");
+        assert!(submodule_unpushed_commits(&sub_path.to_string_lossy()).is_empty(), "after push, the unpushed commit list should be empty too");
 
         fs::remove_dir_all(base).unwrap();
     }
