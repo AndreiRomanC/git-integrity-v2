@@ -7,6 +7,7 @@ struct GitMetadata {
     tracked: HashSet<String>,
     submodules: HashSet<String>,
     statuses: Vec<(String, String)>,
+    unpushed: HashSet<String>,
 }
 
 // A full status scan (`build_git_metadata`) walks the entire working tree — on a
@@ -38,6 +39,52 @@ fn cached_index_metadata(repository: &str) -> (HashSet<String>, HashSet<String>)
     }
     let data = index_metadata(repository);
     index_metadata_cache().lock().unwrap().insert(repository.to_string(), (Instant::now(), data.clone()));
+    data
+}
+
+// Paths touched by commits that are on the current branch but not yet on its
+// upstream — a file here is fully committed (clean working tree, matches
+// HEAD exactly) but that commit hasn't reached the server. Same TTL-cached
+// pattern as the index metadata above, since it doesn't depend on which
+// folder is being browsed either.
+static UNPUSHED_PATHS_CACHE: OnceLock<Mutex<HashMap<String, (Instant, HashSet<String>)>>> = OnceLock::new();
+
+fn unpushed_paths_cache() -> &'static Mutex<HashMap<String, (Instant, HashSet<String>)>> {
+    UNPUSHED_PATHS_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn unpushed_paths(repository: &str) -> HashSet<String> {
+    (|| -> Option<HashSet<String>> {
+        let repo = internal_repository(repository).ok()?;
+        let head = repo.head().ok()?;
+        if repo.head_detached().unwrap_or(true) { return Some(HashSet::new()); }
+        let local_oid = head.target()?;
+        let branch = head.shorthand()?.to_string();
+        drop(head);
+        let upstream_oid = repo.refname_to_id(&format!("refs/remotes/origin/{branch}")).ok()?;
+        if upstream_oid == local_oid { return Some(HashSet::new()); }
+        let mut walk = repo.revwalk().ok()?; walk.push(local_oid).ok()?; let _ = walk.hide(upstream_oid);
+        let mut paths = HashSet::new();
+        for oid in walk.take(50).flatten() {
+            let Ok(commit) = repo.find_commit(oid) else { continue };
+            let Ok(tree) = commit.tree() else { continue };
+            let parent_tree = commit.parent(0).ok().and_then(|parent| parent.tree().ok());
+            if let Ok(diff) = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), None) {
+                for delta in diff.deltas() {
+                    if let Some(path) = delta.new_file().path().or_else(|| delta.old_file().path()) { paths.insert(normalized(path)); }
+                }
+            }
+        }
+        Some(paths)
+    })().unwrap_or_default()
+}
+
+fn cached_unpushed_paths(repository: &str) -> HashSet<String> {
+    if let Some((cached_at, data)) = unpushed_paths_cache().lock().unwrap().get(repository) {
+        if cached_at.elapsed() < GIT_METADATA_TTL { return data.clone(); }
+    }
+    let data = unpushed_paths(repository);
+    unpushed_paths_cache().lock().unwrap().insert(repository.to_string(), (Instant::now(), data.clone()));
     data
 }
 
@@ -73,6 +120,12 @@ pub struct DirectoryEntry {
     // working tree has genuinely uncommitted edits — the Explorer row can then
     // say "New version" instead of "Modified locally".
     submodule_has_unpushed_commits: bool,
+    // True when this file is fully committed (no working-tree status at all)
+    // but the commit that last touched it isn't on the upstream branch yet —
+    // or, for a folder, when something inside it is in that state. Lets the
+    // UI say "not pushed yet" instead of leaving a just-committed file looking
+    // identical to one that was never touched.
+    unpushed: bool,
 }
 
 #[derive(Serialize)]
@@ -82,6 +135,7 @@ pub struct EntryDetails {
     kind: String,
     status: String,
     tracked: bool,
+    unpushed: bool,
     size: u64,
     modified: u64,
     item_count: Option<usize>,
@@ -341,7 +395,8 @@ fn index_metadata(repository: &str) -> (HashSet<String>, HashSet<String>) {
 
 fn build_git_metadata(repository: &str, scope: Option<&str>, statuses: Option<Vec<(String, String)>>) -> GitMetadata {
     let (tracked, submodules) = cached_index_metadata(repository);
-    GitMetadata { statuses: statuses.unwrap_or_else(|| worktree_status(repository, scope)), tracked, submodules }
+    let unpushed = cached_unpushed_paths(repository);
+    GitMetadata { statuses: statuses.unwrap_or_else(|| worktree_status(repository, scope)), tracked, submodules, unpushed }
 }
 
 // Cache key includes the scope so different folders (and the unscoped "whole
@@ -375,6 +430,7 @@ fn invalidate_git_metadata(repository: &str) {
     let prefix = format!("{repository}\u{0}");
     metadata_cache().lock().unwrap().retain(|key, _| !key.starts_with(&prefix));
     index_metadata_cache().lock().unwrap().remove(repository);
+    unpushed_paths_cache().lock().unwrap().remove(repository);
 }
 
 fn remove_submodule_section(path: &Path, name: &str) -> Result<(), String> {
@@ -933,22 +989,42 @@ pub fn publish_status(repository_path: String, branch: String, remote: String) -
 }
 
 #[tauri::command]
-pub fn publish_branch(repository_path: String, branch: String, remote: String, username: String, access_token: String) -> Result<(), String> {
+pub fn publish_branch(repository_path: String, branch: String, remote: String, username: String, access_token: String, upto_commit: String) -> Result<(), String> {
     validate_path(&repository_path)?;
     if branch.trim().is_empty() || remote.trim().is_empty() { return Err("Choose a local branch and a remote".into()); }
     let repo = internal_repository(&repository_path)?; let branch = branch.trim(); let remote_name = remote.trim(); let local_oid = repo.refname_to_id(&format!("refs/heads/{branch}")).map_err(|error| error.message().to_string())?;
+    // Git can only push a *contiguous* range of history — there's no way to
+    // publish a commit while holding back an older one it depends on. So
+    // "leave some commits unpublished" can only ever mean "stop at an earlier
+    // point": push up to `upto_commit` (an ancestor of the branch tip, or the
+    // tip itself for a normal full push) instead of the tip directly.
+    let push_oid = if upto_commit.trim().is_empty() { local_oid } else {
+        let object = repo.revparse_single(upto_commit.trim()).map_err(|error| format!("Cannot resolve {upto_commit}: {}", error.message()))?;
+        let oid = object.peel_to_commit().map_err(|error| error.message().to_string())?.id();
+        let mut walk = repo.revwalk().map_err(|error| error.message().to_string())?; walk.push(local_oid).map_err(|error| error.message().to_string())?;
+        if !walk.flatten().any(|id| id == oid) { return Err("The selected commit isn't part of this branch's history".into()); }
+        oid
+    };
     if access_token.trim().is_empty() {
         // No explicit token was entered — prefer the system `git` binary, which
         // transparently reuses the user's already-working SSH agent, credential
         // helper, or OS keychain. libgit2's own credential search is much narrower
         // and can fail here ("failed to acquire username/password") even when a
         // plain `git push` in a terminal works fine for the same repository.
-        git(&repository_path, &["push", remote_name, &format!("{branch}:refs/heads/{branch}")])
+        git(&repository_path, &["push", remote_name, &format!("{push_oid}:refs/heads/{branch}")])
             .map_err(|detail| if detail.to_lowercase().contains("authentication") || detail.contains("403") || detail.contains("could not read") { "Push authentication failed. Either make sure `git push` works for this repository from a terminal, or enter a Git username and Personal Access Token in Publish credentials.".to_string() } else if detail.to_lowercase().contains("non-fast-forward") || detail.to_lowercase().contains("fetch first") { "Push rejected because the server branch has newer commits. Pull/fetch those commits first, then publish again.".to_string() } else { format!("Push failed: {detail}") })?;
     } else {
-        let mut remote = repo.find_remote(remote_name).map_err(|error| error.message().to_string())?; let mut options = authenticated_push_options(username, access_token); remote.push(&[&format!("refs/heads/{branch}:refs/heads/{branch}")], Some(&mut options)).map_err(|error| { let detail = error.message(); if detail.contains("username/password") || detail.contains("authentication") || detail.contains("401") || detail.contains("403") { "Push authentication failed. Check the username and Personal Access Token in Publish credentials (not your account password).".to_string() } else if detail.contains("non-fast-forward") { "Push rejected because the server branch has newer commits. Pull/fetch those commits first, then publish again.".to_string() } else { format!("Push failed: {detail}") } })?; drop(remote);
+        // git2's push refspecs need the source side to resolve to a reference,
+        // not a bare commit id — point a scratch local ref at it, push that,
+        // then remove the scratch ref regardless of outcome.
+        let scratch_ref = "refs/heads/__git-integrity-partial-publish__";
+        repo.reference(scratch_ref, push_oid, true, "scratch ref for a partial publish").map_err(|error| error.message().to_string())?;
+        let mut remote = repo.find_remote(remote_name).map_err(|error| error.message().to_string())?; let mut options = authenticated_push_options(username, access_token);
+        let push_result = remote.push(&[&format!("{scratch_ref}:refs/heads/{branch}")], Some(&mut options));
+        let _ = repo.find_reference(scratch_ref).and_then(|mut reference| reference.delete());
+        push_result.map_err(|error| { let detail = error.message(); if detail.contains("username/password") || detail.contains("authentication") || detail.contains("401") || detail.contains("403") { "Push authentication failed. Check the username and Personal Access Token in Publish credentials (not your account password).".to_string() } else if detail.contains("non-fast-forward") { "Push rejected because the server branch has newer commits. Pull/fetch those commits first, then publish again.".to_string() } else { format!("Push failed: {detail}") } })?; drop(remote);
     }
-    repo.reference(&format!("refs/remotes/{remote_name}/{branch}"), local_oid, true, "successful publish").map_err(|error| format!("Push succeeded, but local server tracking could not be updated: {}", error.message()))?;
+    repo.reference(&format!("refs/remotes/{remote_name}/{branch}"), push_oid, true, "successful publish").map_err(|error| format!("Push succeeded, but local server tracking could not be updated: {}", error.message()))?;
     let mut config = repo.config().map_err(|error| error.message().to_string())?; config.set_str(&format!("branch.{branch}.remote"), remote_name).map_err(|error| error.message().to_string())?; config.set_str(&format!("branch.{branch}.merge"), &format!("refs/heads/{branch}")).map_err(|error| error.message().to_string())?;
     invalidate_git_metadata(&repository_path);
     Ok(())
@@ -999,7 +1075,8 @@ pub fn load_directory(repository_path: String, relative_path: String) -> Result<
         let tracked = git_metadata.submodules.contains(&status_key) || git_metadata.tracked.contains(&status_key) || git_metadata.tracked.iter().any(|path| path.starts_with(&tracked_prefix));
         let modified = metadata.modified().ok().and_then(|time| time.duration_since(UNIX_EPOCH).ok()).map(|value| value.as_secs()).unwrap_or(0);
         let submodule_has_unpushed_commits = kind == "submodule" && submodule_push_status(item.path().to_str().unwrap_or_default()).is_some();
-        entries.push(DirectoryEntry { name, relative_path: relative_string, kind, status: status_for(&status_key, &git_metadata.statuses), tracked, size: if metadata.is_file() { metadata.len() } else { 0 }, modified, submodule_has_unpushed_commits });
+        let unpushed = if kind == "folder" { git_metadata.unpushed.iter().any(|path| path == &status_key || path.starts_with(&tracked_prefix)) } else { git_metadata.unpushed.contains(&status_key) };
+        entries.push(DirectoryEntry { name, relative_path: relative_string, kind, status: status_for(&status_key, &git_metadata.statuses), tracked, size: if metadata.is_file() { metadata.len() } else { 0 }, modified, submodule_has_unpushed_commits, unpushed });
     }
     entries.sort_by(|a, b| {
         let a_group = matches!(a.kind.as_str(), "folder" | "submodule");
@@ -1035,6 +1112,7 @@ pub fn entry_details(repository_path: String, relative_path: String) -> Result<E
     let prefix = format!("{status_scope}/");
     let tracked = git_metadata.tracked.contains(status_scope) || git_metadata.tracked.iter().any(|path| path.starts_with(&prefix));
     let status = status_for(status_scope, &git_metadata.statuses);
+    let unpushed = if kind == "folder" { git_metadata.unpushed.iter().any(|path| path == status_scope || path.starts_with(&prefix)) } else { git_metadata.unpushed.contains(status_scope) };
     let modified = metadata.modified().ok().and_then(|time| time.duration_since(UNIX_EPOCH).ok()).map(|value| value.as_secs()).unwrap_or(0);
     let item_count = metadata.is_dir().then(|| fs::read_dir(&absolute).map(|items| items.count()).unwrap_or(0));
 
@@ -1055,7 +1133,7 @@ pub fn entry_details(repository_path: String, relative_path: String) -> Result<E
 
     Ok(EntryDetails {
         name: absolute.file_name().and_then(|name| name.to_str()).unwrap_or(&relative_string).to_string(), relative_path: relative_string,
-        kind, status, tracked, size: if metadata.is_file() { metadata.len() } else { 0 }, modified, item_count, submodule_url, submodule_branch, submodule_push_status, submodule_unpushed_commits,
+        kind, status, tracked, unpushed, size: if metadata.is_file() { metadata.len() } else { 0 }, modified, item_count, submodule_url, submodule_branch, submodule_push_status, submodule_unpushed_commits,
         last_commit_id: last.as_ref().map(|value| value.0.clone()),
         last_commit_subject: last.as_ref().map(|value| value.1.clone()), last_commit_author: last.as_ref().map(|value| value.2.clone()), last_commit_date: last.as_ref().map(|value| value.3.clone()),
         submodule_commit_id: submodule_commit.as_ref().map(|value| value.0.clone()),
@@ -2812,6 +2890,104 @@ mod tests {
         assert!(!changes.iter().any(|c| c.path == added), "the submodule must show as clean/version-changed, not modified, right after committing inside it: {:?}", changes.iter().map(|c| (&c.path, &c.status)).collect::<Vec<_>>());
 
         fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn a_committed_but_unpushed_file_is_flagged_unpushed_not_modified() {
+        // A file that's fully committed (clean working tree, matches HEAD
+        // exactly) but whose commit hasn't reached the branch's upstream yet
+        // should say "not pushed", not look identical to a file that was
+        // never touched — and definitely not "modified" (nothing is modified).
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let repository = std::env::temp_dir().join(format!("git-integrity-unpushed-file-{suffix}"));
+        let remote = std::env::temp_dir().join(format!("git-integrity-unpushed-remote-{suffix}.git"));
+        fs::create_dir_all(&repository).unwrap();
+        fs::create_dir_all(&remote).unwrap();
+        run_git(&remote, &["init", "--bare"]);
+        fs::create_dir_all(repository.join("src")).unwrap();
+        fs::write(repository.join("src/a.txt"), "one").unwrap();
+        run_git(&repository, &["init", "-b", "main"]);
+        run_git(&repository, &["config", "user.email", "test@example.com"]);
+        run_git(&repository, &["config", "user.name", "Test User"]);
+        run_git(&repository, &["add", "."]);
+        run_git(&repository, &["commit", "-m", "Initial"]);
+        run_git(&repository, &["remote", "add", "origin", remote.to_str().unwrap()]);
+        run_git(&repository, &["-c", "protocol.file.allow=always", "push", "-u", "origin", "main"]);
+        let path = repository.to_string_lossy().into_owned();
+
+        // Freshly pushed: nothing should be flagged.
+        let listing = load_directory(path.clone(), "src".into()).unwrap();
+        assert!(!listing.iter().find(|e| e.name == "a.txt").unwrap().unpushed);
+
+        // Commit a change but don't push it.
+        fs::write(repository.join("src/a.txt"), "two").unwrap();
+        commit_path(path.clone(), "src/a.txt".into(), "Update a.txt".into()).unwrap();
+
+        let listing = load_directory(path.clone(), "src".into()).unwrap();
+        let entry = listing.iter().find(|e| e.name == "a.txt").unwrap();
+        assert_eq!(entry.status, "", "the file is fully committed, so it must not show any working-tree status");
+        assert!(entry.unpushed, "a committed-but-unpushed file must be flagged unpushed");
+
+        // The containing folder should reflect it too.
+        let root_listing = load_directory(path.clone(), "".into()).unwrap();
+        let src_entry = root_listing.iter().find(|e| e.name == "src").unwrap();
+        assert!(src_entry.unpushed, "a folder containing an unpushed file should be flagged too");
+
+        let details = entry_details(path.clone(), "src/a.txt".into()).unwrap();
+        assert!(details.unpushed);
+
+        // After pushing (through the app's own command, which invalidates the
+        // cache — a plain external `git push` wouldn't know to), it must clear.
+        sync_repository(path.clone(), "push".into()).unwrap();
+        let after_push = load_directory(path, "src".into()).unwrap();
+        assert!(!after_push.iter().find(|e| e.name == "a.txt").unwrap().unpushed, "after push, the file must no longer be flagged unpushed");
+
+        fs::remove_dir_all(repository).unwrap();
+        fs::remove_dir_all(remote).unwrap();
+    }
+
+    #[test]
+    fn publish_branch_can_stop_at_an_earlier_commit_leaving_newer_ones_local() {
+        // "Deselecting" a commit before publish can only validly mean "stop
+        // pushing here" — publish_branch's `upto_commit` pushes the branch up
+        // to (and including) that commit, leaving anything newer unpublished.
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let repository = std::env::temp_dir().join(format!("git-integrity-partial-publish-{suffix}"));
+        let remote = std::env::temp_dir().join(format!("git-integrity-partial-publish-remote-{suffix}.git"));
+        fs::create_dir_all(&repository).unwrap();
+        fs::create_dir_all(&remote).unwrap();
+        run_git(&remote, &["init", "--bare"]);
+        fs::write(repository.join("a.txt"), "one").unwrap();
+        run_git(&repository, &["init", "-b", "main"]);
+        run_git(&repository, &["config", "user.email", "test@example.com"]);
+        run_git(&repository, &["config", "user.name", "Test User"]);
+        run_git(&repository, &["add", "."]);
+        run_git(&repository, &["commit", "-m", "Commit 1"]);
+        let commit1 = git(&repository.to_string_lossy(), &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+        fs::write(repository.join("a.txt"), "two").unwrap();
+        run_git(&repository, &["commit", "-am", "Commit 2"]);
+        fs::write(repository.join("a.txt"), "three").unwrap();
+        run_git(&repository, &["commit", "-am", "Commit 3"]);
+        run_git(&repository, &["remote", "add", "origin", remote.to_str().unwrap()]);
+        let path = repository.to_string_lossy().into_owned();
+
+        publish_branch(path.clone(), "main".into(), "origin".into(), String::new(), String::new(), commit1.clone()).unwrap();
+
+        let remote_head = git(&remote.to_string_lossy(), &["rev-parse", "refs/heads/main"]).unwrap().trim().to_string();
+        assert_eq!(remote_head, commit1, "the server should be at exactly the chosen commit, not the branch tip");
+
+        // The two newer commits must still show as unpublished locally.
+        let status = publish_status(path.clone(), "main".into(), "origin".into()).unwrap();
+        assert_eq!(status.commits.len(), 2, "commits 2 and 3 should still be pending, since only commit 1 was published");
+        assert_eq!(status.commits[0].subject, "Commit 2");
+        assert_eq!(status.commits[1].subject, "Commit 3");
+
+        // Publishing the rest afterward (a normal full push) must succeed cleanly.
+        publish_branch(path.clone(), "main".into(), "origin".into(), String::new(), String::new(), String::new()).unwrap();
+        assert_eq!(publish_status(path, "main".into(), "origin".into()).unwrap().commits.len(), 0);
+
+        fs::remove_dir_all(repository).unwrap();
+        fs::remove_dir_all(remote).unwrap();
     }
 
     #[test]

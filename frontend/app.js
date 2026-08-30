@@ -19,7 +19,7 @@ function addRecentRepo(path, name) {
 }
 
 const state = { repository: null, branches: [], commits: [], allCommits: [], changes: [], selectedCommit: null, view: 'explorer', currentPath: '', entries: [], selectedEntry: null, historyScope: '', commanderPath: '', commanderRows: [], remoteRef: '', remotes: [], graphContext: null, editingPath: '', editorOriginal: '', publish: null, changesScope: 'global', commanderFocus: '', comparingRow: null, hasStash: false, stashes: [], editingConflict: null, mergeTarget: null,
-  consoleMode: 'commands', consoleTranscript: [], consoleCmdHistory: [], consoleScopeOverride: null, graphPrimaryBranch: null };
+  consoleMode: 'commands', consoleTranscript: [], consoleCmdHistory: [], consoleScopeOverride: null, graphPrimaryBranch: null, publishUpto: null };
 const previewData = {
   repository: { name: 'vehicle-control', path: '/projects/vehicle-control', current_branch: 'feature/diagnostics' },
   branches: [
@@ -410,6 +410,10 @@ function gitState(entry) {
     return '<span class="git-state new-version"><i class="git-dot"></i>New version</span>';
   }
   if (entry.status) return `<span class="git-state changed"><i class="git-dot"></i>${esc(labels[entry.status] || entry.status)}</span>`;
+  // Fully committed (no working-tree status at all) but that commit hasn't
+  // reached the branch's upstream yet — a real, distinct state from both
+  // "clean" and "modified": nothing here needs a commit, it needs a push.
+  if (entry.unpushed) return `<span class="git-state unpushed"><i class="git-dot"></i>${entry.kind === 'folder' ? 'Contains unpushed commits' : 'Not pushed yet'}</span>`;
   return '<span class="git-state"><i class="git-dot"></i>Tracked</span>';
 }
 
@@ -561,7 +565,7 @@ function renderEntryDetails(entry) {
     <h2>${esc(entry.name)}</h2><div class="entry-path">${esc(entry.relative_path)}</div>${entry.kind === 'submodule' ? '<span class="submodule-badge">◇ Git submodule</span>' : ''}
     ${entry.status || !entry.tracked ? `<div class="local-change-banner"><i></i><div><strong>${entry.kind === 'submodule' && entry.submodule_push_status ? 'New version locally (not pushed yet)' : entry.tracked ? 'Modified locally' : 'New local file'}</strong><span>${entry.kind === 'submodule' && entry.submodule_push_status ? 'Committed here, on this machine — not sent to the submodule\'s server yet.' : 'This item differs from the committed repository state.'}</span></div></div>` : ''}
     <div class="context-actions">${entry.kind === 'file' ? '<button data-detail-action="edit">Edit local file</button>' : '<button data-detail-action="open">Open folder</button>'}<button data-detail-action="server">Open on server ↗</button><button data-detail-action="history">View history</button>${entry.status ? '<button data-detail-action="commit">Commit this item</button>' : ''}${entry.kind === 'file' && (entry.status || !entry.tracked) ? `<button data-detail-action="stage" data-tooltip="git add — add this file's current content to staging">＋ Stage this file</button><button data-detail-action="unstage" data-tooltip="Unstage — git restore --staged. Removes only the staging entry; your edits on disk are kept exactly as they are.">− Unstage</button><button data-detail-action="head" class="danger-action-soft" data-tooltip="Restore from your last local commit (HEAD) — git checkout HEAD -- file. Permanently discards ALL edits; the file on disk becomes identical to what you last committed. Cannot be undone.">↶ Restore from last commit (HEAD)</button><button data-detail-action="compare" data-tooltip="Open side-by-side compare with restore options">⇄ Compare with remote</button>` : ''}${entry.kind === 'submodule' ? `<button data-detail-action="subserver">Open submodule repository ↗</button><button data-detail-action="subgraph">Submodule branch map</button><button data-detail-action="subnewbranch" data-tooltip="Create a new local branch in this submodule, starting from its current commit, and switch to it">＋ New branch…</button><button data-detail-action="versions">Change version</button><button data-detail-action="subcommit" ${entry.status ? '' : 'disabled'} data-tooltip="${entry.status ? 'Commit uncommitted changes inside the submodule' : 'Nothing to commit — no uncommitted changes inside this submodule'}">Commit submodule</button><button data-detail-action="subpull" data-tooltip="Fast-forward pull — brings in new commits from the submodule's remote. Refuses if it would require a manual merge.">Pull submodule</button><button data-detail-action="submerge" data-tooltip="Merge a branch into this submodule's current branch, with conflict resolution if needed">Merge branch…</button><button data-detail-action="subpush">Push submodule</button><button data-detail-action="subforcepush" class="danger-action-soft" data-tooltip="⚠️ Overwrites the remote branch with your local history, discarding any commits there aren't in yours. Only safe if nobody else uses that remote.">Force push submodule…</button><button data-detail-action="subfetch">Fetch submodule</button><button data-detail-action="location">Replace repository URL</button>` : ''}<button class="danger-action" data-detail-action="delete">Delete…</button></div>
-    <div class="detail-section"><h3>GENERAL</h3><div class="detail-grid"><span>Type</span><strong>${kindLabel}</strong><span>Git</span><strong>${entry.tracked ? (entry.status || 'Tracked, clean') : 'Untracked'}</strong>
+    <div class="detail-section"><h3>GENERAL</h3><div class="detail-grid"><span>Type</span><strong>${kindLabel}</strong><span>Git</span><strong>${entry.tracked ? (entry.status || (entry.unpushed ? (entry.kind === 'folder' ? 'Clean — contains unpushed commits' : 'Committed, not pushed yet') : 'Tracked, clean')) : 'Untracked'}</strong>
     ${entry.item_count != null ? `<span>Items</span><strong>${entry.item_count}</strong>` : `<span>Size</span><strong>${formatSize(entry.size)}</strong>`}<span>Modified</span><strong>${formatModified(entry.modified)}</strong></div></div>
     ${entry.kind === 'submodule' ? `<div class="detail-section"><h3>SUBMODULE</h3><div class="detail-grid"><span>Remote</span><strong>${esc(entry.submodule_url || 'Not configured')}</strong><span>Branch</span><strong>${esc(entry.submodule_branch || 'Default')}</strong><span>Status</span><strong>${entry.status ? (entry.status === 'M' ? 'Has local changes' : 'Modified') : 'Clean'}</strong></div>
     ${entry.submodule_unpushed_commits?.length ? `<div class="submodule-push-banner"><i></i><span>${entry.submodule_unpushed_commits.length} commit${entry.submodule_unpushed_commits.length === 1 ? '' : 's'} not yet pushed to its own remote:</span></div><div class="submodule-unpushed-list">${entry.submodule_unpushed_commits.map(commit => `<div class="submodule-unpushed-commit"><strong>${commitSubjectHtml(commit.subject)}</strong><small>${esc(commit.id.slice(0, 8))} · ${esc(commit.author)} · ${esc(commit.date)}</small></div>`).join('')}</div>` : entry.submodule_push_status ? `<div class="submodule-push-banner"><i></i><span>${esc(entry.submodule_push_status)}</span></div>` : ''}</div>` : ''}
@@ -1324,19 +1328,60 @@ async function openPublish() {
   refs.publishRemote.innerHTML = state.remotes.map(remote => `<option value="${esc(remote.name)}">${esc(remote.name)}</option>`).join(''); refs.publishDialog.showModal(); await refreshPublish();
 }
 
+// Git can only push a contiguous range — there's no way to publish a newer
+// commit while holding back an older one it depends on. So "leave this one
+// out" can only mean "stop pushing at the commit before it": clicking a
+// commit sets it as the cutoff (included, along with everything older);
+// everything newer than it is left unpublished for now.
+function renderPublishCommits() {
+  const commits = state.publish?.commits || [];
+  const uptoIndex = state.publishUpto ? commits.findIndex(commit => commit.id === state.publishUpto) : commits.length - 1;
+  refs.publishCommits.innerHTML = commits.map((commit, index) => {
+    const willPush = index <= uptoIndex;
+    return `<div class="publish-commit ${willPush ? '' : 'excluded'}" data-commit-id="${esc(commit.id)}">
+      <span>${index + 1}</span><input type="checkbox" class="publish-check" data-index="${index}" ${willPush ? 'checked' : ''}>
+      <div><strong>${esc(commit.subject)}</strong><small>${esc(commit.id.slice(0, 8))} · ${esc(commit.author)} · ${esc(commit.date)}</small></div>
+      ${willPush ? (index === uptoIndex && index < commits.length - 1 ? '<b class="publish-cutoff-badge" data-tooltip="Everything above stays local for now">WILL PUSH · stop here</b>' : '<b>WILL PUSH</b>') : '<b class="publish-held-back">STAYS LOCAL</b>'}
+    </div>`;
+  }).join('') || '<div class="publish-empty">This branch is already up to date on the server.</div>';
+  // Git can only push a contiguous range from the oldest pending commit
+  // forward — unchecking one always means "and everything newer than it
+  // too" (they were built on top of it), checking one always means "and
+  // everything older than it too" (it needs them). So every checkbox here
+  // really sets the same single cutoff point; ticking any box just moves it.
+  refs.publishCommits.querySelectorAll('.publish-check').forEach(box => box.addEventListener('change', () => {
+    const index = Number(box.dataset.index);
+    // '__none__' is a deliberately non-matching id — distinct from `null`,
+    // which means "no cutoff set yet, default to a full push".
+    state.publishUpto = box.checked ? commits[index].id : (index > 0 ? commits[index - 1].id : '__none__');
+    renderPublishCommits(); updatePublishSummary();
+  }));
+}
+
+function updatePublishSummary() {
+  const commits = state.publish?.commits || [];
+  const uptoIndex = state.publishUpto ? commits.findIndex(commit => commit.id === state.publishUpto) : commits.length - 1;
+  const willPushCount = uptoIndex + 1;
+  const heldBack = commits.length - willPushCount;
+  refs.publishSummary.textContent = `${willPushCount} commit${willPushCount === 1 ? '' : 's'} to publish${heldBack ? ` · ${heldBack} staying local for now` : ''}`;
+  $('#confirmPublish').disabled = !willPushCount;
+}
+
 async function refreshPublish() {
   const branch = refs.publishBranch.value, remote = refs.publishRemote.value;
+  state.publishUpto = null;
   if (!branch || !remote) { refs.publishCommits.innerHTML = '<div class="publish-empty">Configure a remote before publishing.</div>'; refs.publishSummary.textContent = 'Nothing to publish'; $('#confirmPublish').disabled = true; return; }
   refs.publishDestination.textContent = `${branch} → ${remote}/${branch}`; refs.publishCommits.innerHTML = '<div class="loading-row"><i class="spinner"></i>Checking server state…</div>';
   if (!invoke) state.publish = { branch, remote, commits: previewData.commits.slice(0, 2) }; else state.publish = await invoke('publish_status', { repositoryPath: state.repository.path, branch, remote });
-  refs.publishCommits.innerHTML = state.publish.commits.map((commit, index) => `<div class="publish-commit"><span>${index + 1}</span><i></i><div><strong>${esc(commit.subject)}</strong><small>${esc(commit.id.slice(0, 8))} · ${esc(commit.author)} · ${esc(commit.date)}</small></div><b>WILL PUSH</b></div>`).join('') || '<div class="publish-empty">This branch is already up to date on the server.</div>';
-  refs.publishSummary.textContent = `${state.publish.commits.length} commit${state.publish.commits.length === 1 ? '' : 's'} to publish`; refs.publishBadge.textContent = state.publish.commits.length; refs.publishSubtitle.textContent = state.publish.commits.length ? `${state.publish.commits.length} local commits not on ${remote}` : 'Everything is on the server'; $('#confirmPublish').disabled = !state.publish.commits.length;
+  renderPublishCommits();
+  refs.publishBadge.textContent = state.publish.commits.length; refs.publishSubtitle.textContent = state.publish.commits.length ? `${state.publish.commits.length} local commits not on ${remote}` : 'Everything is on the server';
+  updatePublishSummary();
 }
 
 async function confirmPublish(event) {
   event.preventDefault(); if (!state.publish?.commits.length) return;
   const operation = $('#publishOperationStatus'); operation.textContent = `Publishing ${state.publish.branch}…`; operation.className = 'submodule-operation-status busy';
-  try { $('#confirmPublish').disabled = true; status(`Publishing ${state.publish.branch}…`, 'busy'); await invoke('publish_branch', { repositoryPath: state.repository.path, branch: state.publish.branch, remote: state.publish.remote, username: $('#publishUsername').value.trim(), accessToken: $('#publishToken').value }); $('#publishToken').value = ''; refs.publishDialog.close(); await loadRepository(state.repository.path); status(`Published ${state.publish.branch} to ${state.publish.remote}`); showOperationToast(`Published ${state.publish.branch} to ${state.publish.remote}`); }
+  try { $('#confirmPublish').disabled = true; status(`Publishing ${state.publish.branch}…`, 'busy'); await invoke('publish_branch', { repositoryPath: state.repository.path, branch: state.publish.branch, remote: state.publish.remote, username: $('#publishUsername').value.trim(), accessToken: $('#publishToken').value, uptoCommit: state.publishUpto || '' }); $('#publishToken').value = ''; refs.publishDialog.close(); await loadRepository(state.repository.path); const msg = state.publishUpto ? `Published part of ${state.publish.branch} to ${state.publish.remote} (up to your chosen commit).` : `Published ${state.publish.branch} to ${state.publish.remote}`; status(msg); showOperationToast(msg); }
   catch (error) { const message = String(error); operation.textContent = message; operation.className = 'submodule-operation-status error'; status(message, 'error'); $('#confirmPublish').disabled = false; }
 }
 
