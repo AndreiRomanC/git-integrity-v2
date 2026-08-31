@@ -572,9 +572,36 @@ pub fn open_commit_on_server(repository_path: String, commit_id: String) -> Resu
     launch_browser(&format!("{base}/commit/{}", commit_id.trim()))
 }
 
+// For every submodule whose own checked-out commit is clean (no uncommitted
+// changes of its own) and differs from what the parent's index currently
+// records, auto-record that new commit into the parent — the same
+// reconciliation `commit_submodule`/push already do explicitly, applied
+// generally here so it doesn't matter *how* the submodule ended up on a new
+// commit (its dedicated "Commit submodule" button, a raw git command typed
+// in the console, or committing one of its files directly): the parent
+// catches up the moment anything reloads it, instead of silently staying
+// unaware and making "Unpublished commits" look wrong by comparison.
+fn sync_submodule_gitlinks(repository_path: &str) {
+    let Ok(parent) = internal_repository(repository_path) else { return };
+    let Ok(index) = parent.index() else { return };
+    let gitlinks: Vec<(String, git2::Oid)> = index.iter().filter(|entry| entry.mode == 0o160000).map(|entry| (String::from_utf8_lossy(&entry.path).into_owned(), entry.id)).collect();
+    drop(index);
+    for (relative, recorded_oid) in gitlinks {
+        let absolute = Path::new(repository_path).join(&relative);
+        let Ok(sub_repo) = internal_repository(absolute.to_str().unwrap_or_default()) else { continue };
+        let Some(head_oid) = sub_repo.head().ok().and_then(|head| head.target()) else { continue };
+        if head_oid == recorded_oid { continue; }
+        let Ok(dirty) = internal_statuses(&sub_repo, None) else { continue };
+        if !dirty.is_empty() { continue; } // has uncommitted changes of its own — leave it for the user to commit first
+        drop(sub_repo);
+        let _ = record_pushed_submodule_in_parent(repository_path, &relative, Some(head_oid));
+    }
+}
+
 #[tauri::command]
 pub fn load_repository(path: String) -> Result<RepositoryData, String> {
     validate_path(&path)?;
+    sync_submodule_gitlinks(&path);
     let mut repo = internal_repository(&path)?;
     let name = Path::new(&path).file_name().and_then(|n| n.to_str()).unwrap_or("repository").to_string();
     let current_branch = repo.head().ok().and_then(|head| head.shorthand().map(String::from)).unwrap_or_default();
@@ -2840,14 +2867,17 @@ mod tests {
 
         // Advance the submodule's HEAD (e.g. from a plain terminal) so it now
         // differs from what the parent's index recorded — this is exactly what
-        // makes it show as "M" in the Working tree drawer.
+        // makes it show as "M" in the Working tree drawer. (`load_repository`
+        // now auto-syncs this on its own — see
+        // `commit_submodule_auto_updates_the_parent_even_without_a_push` and
+        // the dedicated general-reconciliation test — so this exercises
+        // `stage_files`/`commit_files` directly, without an intervening
+        // `load_repository` call, to keep covering the actual regression:
+        // `partition_by_submodule` mishandling the submodule's own path.)
         run_git(&parent.join(&added), &["commit", "--allow-empty", "-m", "Advance the submodule"]);
         let sub_repo = Repository::open(parent.join(&added)).unwrap();
         let expected_oid = sub_repo.head().unwrap().target().unwrap();
         drop(sub_repo);
-
-        let changes = load_repository(parent_string.clone()).unwrap().changes;
-        assert!(changes.iter().any(|c| c.path == added && c.status == "M"), "the submodule itself should show as M in the Working tree drawer: {:?}", changes.iter().map(|c| (&c.path, &c.status)).collect::<Vec<_>>());
 
         stage_files(parent_string.clone(), vec![added.clone()]).unwrap();
         let staged_changes = load_repository(parent_string.clone()).unwrap().changes;
@@ -2888,6 +2918,46 @@ mod tests {
 
         let changes = load_repository(parent_string).unwrap().changes;
         assert!(!changes.iter().any(|c| c.path == added), "the submodule must show as clean/version-changed, not modified, right after committing inside it: {:?}", changes.iter().map(|c| (&c.path, &c.status)).collect::<Vec<_>>());
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn load_repository_reconciles_a_submodule_commit_made_outside_the_app_too() {
+        // Reproduces the report: a submodule's own "N commits not yet pushed"
+        // list showed real commits, but the sidebar's "Unpublished commits"
+        // (the PARENT project's own count) stayed at 0. Cause: the automatic
+        // parent-bump only ever ran from the dedicated `commit_submodule`
+        // command — a commit made any other way inside the submodule (a raw
+        // git command in the console, or committing one of its files
+        // directly) never told the parent. `load_repository` now reconciles
+        // this generally, regardless of how the submodule got its new commit.
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-general-reconcile-{suffix}"));
+        let parent = base.join("parent"); let dependency = base.join("dependency");
+        create_libgit2_repository(&parent, "README.md"); create_libgit2_repository(&dependency, "module.txt");
+        let parent_string = parent.to_string_lossy().into_owned();
+        let added = add_submodule(parent_string.clone(), "".into(), dependency.to_string_lossy().into_owned(), "test".into(), String::new(), String::new()).unwrap();
+        create_commit(parent_string.clone(), "Add test submodule".into()).unwrap();
+
+        // Two commits made directly with git inside the submodule — nothing
+        // in this app's own commands touched it.
+        let sub_path = parent.join(&added);
+        run_git(&sub_path, &["commit", "--allow-empty", "-m", "Test update"]);
+        run_git(&sub_path, &["commit", "--allow-empty", "-m", "Test update"]);
+        let expected_oid = Repository::open(&sub_path).unwrap().head().unwrap().target().unwrap();
+
+        // A single reload must be enough to catch the parent up.
+        load_repository(parent_string.clone()).unwrap();
+
+        let repo = Repository::open(&parent).unwrap();
+        let recorded = repo.index().unwrap().get_path(Path::new(&added), 0).unwrap().id;
+        assert_eq!(recorded, expected_oid, "load_repository should have auto-recorded the submodule's new commit into the parent");
+        assert_eq!(repo.head().unwrap().peel_to_commit().unwrap().summary().unwrap_or(""), "Update submodule test to ".to_string() + &expected_oid.to_string()[..8], "the auto-bump should itself be a real commit in the parent, not just a staged index change");
+        drop(repo);
+
+        // And "Unpublished commits" (the parent's own count) must now see it.
+        assert!(!load_repository(parent_string.clone()).unwrap().changes.iter().any(|c| c.path == added), "the submodule should show clean now that the parent has caught up");
 
         fs::remove_dir_all(base).unwrap();
     }

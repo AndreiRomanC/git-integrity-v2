@@ -22,6 +22,7 @@
         <button id="pushCurrent" title="Push current branch">↑</button>
         <button id="mergeCurrent" title="Merge a branch into the current one">⑂</button>
         <button id="openConsole" title="Command console — type what you want to do (Ctrl/Cmd+K)">⌘</button>
+        <button id="openHelp" title="Help — what everything in this app does">?</button>
       </div>
     </header>
 
@@ -284,6 +285,73 @@
       <p class="conflicts-local-note">This only affects your local repository. Push and continue through your normal PR process once complete.</p>
       <p id="conflictsStatus" class="submodule-operation-status" role="status"></p>
       <footer><button type="button" id="abortMerge" class="danger-action-soft">Abort merge</button><span style="flex:1"></span><button value="cancel">Close</button><button type="button" value="default" id="confirmCompleteMerge" class="confirm">Complete merge</button></footer>
+    </form>
+  </dialog>
+  <dialog id="helpDialog" class="help-dialog">
+    <form method="dialog">
+      <header><div><h2>Help</h2><p>What everything in this app does, in plain terms.</p></div><button value="cancel">×</button></header>
+      <div class="help-body">
+        <details open>
+          <summary>Project Explorer</summary>
+          <p>Browse your repository like a file manager. Double-click a folder to open it. Submodules (◇) look like folders but are actually separate Git repositories nested inside yours.</p>
+          <p><b>Status colors next to a file/folder:</b></p>
+          <ul>
+            <li><b class="help-tag amber">Modified locally</b> — has real uncommitted edits.</li>
+            <li><b class="help-tag amber">New, untracked</b> — a file Git doesn't know about yet.</li>
+            <li><b class="help-tag blue">Not pushed yet</b> — fully committed, but that commit hasn't reached the server. Nothing to commit here — it needs a push.</li>
+            <li><b class="help-tag blue">New version</b> (submodules only) — the submodule has a new commit, already recorded in the project, just not pushed to its own server yet.</li>
+          </ul>
+        </details>
+        <details>
+          <summary>Working tree (Commit)</summary>
+          <p>Click "Working tree" in the sidebar (or "Changes in folder" in the toolbar) to see everything changed. Opening it auto-stages everything in scope, so Commit works immediately — untick anything you don't want included, then write a message and hit Commit.</p>
+          <p>"Commit this item" in a file/folder's details panel commits just that one item, same idea, scoped to it.</p>
+        </details>
+        <details>
+          <summary>Submodules — Pull, Push, Force push</summary>
+          <p>A submodule is its own independent Git repository. Its actions work on <i>that</i> repository and its own remote, separate from your main project.</p>
+          <ul>
+            <li><b>Pull submodule</b> — fast-forward only. Brings in new commits from its remote; refuses safely if that would need a real merge.</li>
+            <li><b>Merge branch…</b> — brings another branch into the submodule's current one, with conflict resolution if needed. Stays entirely local until you push.</li>
+            <li><b>Push submodule</b> — sends the submodule's own commits to its own remote. Shows you the exact list of commits before sending. Refuses if the remote has commits you don't have yet.</li>
+            <li><b class="help-warn">Force push submodule</b> — overwrites the submodule's remote branch with your local history, no matter what. Anything on the server that isn't in your history is <b>permanently lost</b>. Only safe if nobody else uses that remote. Requires double confirmation.</li>
+            <li><b>Commit submodule</b> — commits uncommitted changes inside the submodule. The moment that commit exists, the main project automatically records the new version too — no manual "Change version" step needed, push or not.</li>
+            <li><b>Change version</b> — switches the submodule to a different branch, tag, or commit.</li>
+            <li><b>New branch…</b> — creates and switches to a new branch inside the submodule, from its current commit.</li>
+          </ul>
+        </details>
+        <details>
+          <summary>Branch Map (the commit graph)</summary>
+          <p>Shows commit history as a graph. Pick a branch as "Primary" (top of the graph) — its own history stays on the main lane; anything from another branch not reachable from it gets a side lane, branching off from where the two share history.</p>
+          <p>A dashed ring around a dot marks a branch point (a common ancestor two labels share). "N commits ahead of X" tells you how far a branch has diverged. Stash entries show as a small "⇕ stash" pill on their base commit — never mixed into real history.</p>
+        </details>
+        <details>
+          <summary>Merge branch &amp; conflicts</summary>
+          <p>"Merge branch…" brings another branch's commits into your current one — entirely local, nothing is pushed automatically. If it can fast-forward, it just does. If it merges cleanly, it commits automatically. If there are real conflicts, a dialog lists each file — "Keep mine", "Keep theirs", or "Edit manually" (opens the file with the standard conflict markers) — then "Complete merge" once everything's resolved. "Abort merge" cancels and restores exactly how things were before.</p>
+        </details>
+        <details>
+          <summary>Unpublished commits (Publish)</summary>
+          <p>Shows local commits not yet on the server, for the main project only (not submodules — use "Push submodule" for those). Every commit listed here is checked by default; unchecking one also unchecks everything newer than it (Git can only push a continuous range, so that's the only valid way to "leave some out"). Click "Publish branch" to send what's checked.</p>
+        </details>
+        <details>
+          <summary>Local ↔ Remote (Commander)</summary>
+          <p>Compares your working copy against a chosen remote snapshot, file by file, without checking anything out. Useful to see exactly what differs before deciding what to do about it.</p>
+        </details>
+        <details>
+          <summary>Stash</summary>
+          <p>"Stash work" temporarily sets aside uncommitted changes so your working folder is clean — useful for switching tasks without committing half-finished work. "Pop stash" brings it back. Stashes show up as small markers in the Branch Map, not as real history.</p>
+        </details>
+        <details>
+          <summary>Command Console (⌘ or Ctrl/Cmd+K)</summary>
+          <p><b>Commands tab</b> — a searchable list of everything this app can do. Type what you want ("commit", "merge", "push submodule"); commands relevant to what's currently selected are boosted to the top.</p>
+          <p><b>Git Console tab</b> — run any real git command (with or without typing "git" first) and see its actual output, scoped to wherever you currently are (shown at the top, changeable with "⇄ scope"). As-you-type hints show common flags in plain language, and typos get a "did you mean" suggestion. Commands that look destructive (force push, hard reset, etc.) ask for confirmation first.</p>
+        </details>
+        <details>
+          <summary>Remotes</summary>
+          <p>Lists configured server locations for the main project and lets you fetch from any of them explicitly.</p>
+        </details>
+      </div>
+      <footer><button value="cancel" class="confirm">Close</button></footer>
     </form>
   </dialog>
   <script src="app.js"></script>

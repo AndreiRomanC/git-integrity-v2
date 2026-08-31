@@ -1924,6 +1924,7 @@ $('#commandScopeCycle').addEventListener('click', () => { cycleConsoleScope(); i
 $('#commandClearTranscript').addEventListener('click', () => { state.consoleTranscript = []; renderConsoleTranscript(); });
 $('#commandPalette').addEventListener('close', () => { commandPaletteOpen = false; });
 $('#openConsole').addEventListener('click', () => openCommandPalette());
+$('#openHelp').addEventListener('click', () => $('#helpDialog').showModal());
 document.addEventListener('keydown', (e) => {
   if ((e.ctrlKey || e.metaKey) && e.key === 'k') { e.preventDefault(); commandPaletteOpen ? $('#commandPalette').close() : openCommandPalette(); }
   else if ((e.ctrlKey || e.metaKey) && e.key === 'o') { e.preventDefault(); openRepository(); }
