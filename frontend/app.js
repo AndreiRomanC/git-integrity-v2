@@ -379,13 +379,52 @@ async function applyFileRecovery(forcedAction = '') {
 }
 function updateRecoveryHelp(action = '') { const help = { stage: '`git add` – Stage the current file content', unstage: 'UNSTAGE (`git restore --staged`) – unstages only, your edits on disk stay exactly as they are', head: 'RESTORE FROM LAST COMMIT (`git checkout HEAD -- file`) – no network access; discards edits using what you already have locally', remote: `RESTORE FROM SERVER – fetches ${state.remoteRef || 'remote'} first, then overwrites the file with that server version (can differ from your last local commit if the server has newer changes)` }; if (action) { $('#recoveryHelp').textContent = help[action]; } else { const allOptions = `Stage: ${help.stage} • Unstage: ${help.unstage} • Restore from last commit: ${help.head} • Restore from server: ${help.remote}`; $('#recoveryHelp').textContent = allOptions; } }
 
+// A real line-level diff (LCS-based), not a naive index-by-index compare.
+// Index-by-index compare misaligns everything after a single inserted or
+// deleted line — every line below it then looks "different" even when only
+// one line actually changed, and can even mask a real difference if two
+// unrelated lines happen to line up at the same index. This aligns matching
+// lines wherever they fall on either side and leaves a blank filler row on
+// the other side for a pure insertion/deletion, so only the lines that
+// actually changed are ever highlighted.
+function lcsAlign(a, b) {
+  const n = a.length, m = b.length;
+  if (n * m > 2_000_000) return null; // too large for the O(n*m) table — caller falls back
+  const dp = Array.from({ length: n + 1 }, () => new Uint32Array(m + 1));
+  for (let i = n - 1; i >= 0; i--) for (let j = m - 1; j >= 0; j--) dp[i][j] = a[i] === b[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+  let i = 0, j = 0; const left = []; const right = [];
+  while (i < n && j < m) {
+    if (a[i] === b[j]) { left.push({ text: a[i], same: true }); right.push({ text: b[j], same: true }); i++; j++; }
+    else if (dp[i + 1][j] >= dp[i][j + 1]) { left.push({ text: a[i], same: false }); right.push({ text: null }); i++; }
+    else { left.push({ text: null }); right.push({ text: b[j], same: false }); j++; }
+  }
+  while (i < n) { left.push({ text: a[i], same: false }); right.push({ text: null }); i++; }
+  while (j < m) { left.push({ text: null }); right.push({ text: b[j], same: false }); j++; }
+  return { left, right };
+}
+
 function renderComparisonContents(localText, remoteText) {
-  const localLines = localText.split('\n'); const remoteLines = remoteText.split('\n'); const count = Math.max(localLines.length, remoteLines.length);
-  const renderSide = (lines, other, remoteSide) => Array.from({ length: count }, (_, index) => {
-    const line = lines[index] ?? ''; const different = line !== (other[index] ?? '');
-    return `<span class="${different ? `diff-line${remoteSide ? ' remote-line' : ''}` : 'same-line'}"><i class="line-number">${index + 1}</i>${esc(line) || ' '}</span>`;
-  }).join('');
-  refs.localCompare.innerHTML = renderSide(localLines, remoteLines, false); refs.remoteCompare.innerHTML = renderSide(remoteLines, localLines, true);
+  const localLines = localText.split('\n'); const remoteLines = remoteText.split('\n');
+  const aligned = lcsAlign(localLines, remoteLines);
+  if (!aligned) {
+    // Fallback for very large files: the old, simpler index compare — still
+    // correct for files where nothing was inserted/deleted mid-file, just
+    // not alignment-aware.
+    const count = Math.max(localLines.length, remoteLines.length);
+    const renderSide = (lines, other, remoteSide) => Array.from({ length: count }, (_, index) => {
+      const line = lines[index] ?? ''; const different = line !== (other[index] ?? '');
+      return `<span class="${different ? `diff-line${remoteSide ? ' remote-line' : ''}` : 'same-line'}"><i class="line-number">${index + 1}</i>${esc(line) || ' '}</span>`;
+    }).join('');
+    refs.localCompare.innerHTML = renderSide(localLines, remoteLines, false); refs.remoteCompare.innerHTML = renderSide(remoteLines, localLines, true);
+    return;
+  }
+  const renderSide = (rows, remoteSide) => { let lineNumber = 0; return rows.map(row => {
+    if (row.text === null) return `<span class="filler-line"><i class="line-number"></i></span>`;
+    lineNumber++;
+    const cls = row.same ? 'same-line' : `diff-line${remoteSide ? ' remote-line' : ''}`;
+    return `<span class="${cls}"><i class="line-number">${lineNumber}</i>${esc(row.text) || ' '}</span>`;
+  }).join(''); };
+  refs.localCompare.innerHTML = renderSide(aligned.left, false); refs.remoteCompare.innerHTML = renderSide(aligned.right, true);
 }
 
 function formatSize(bytes) {
