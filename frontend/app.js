@@ -466,10 +466,23 @@ function renderBreadcrumbs() {
   refs.breadcrumbs.querySelectorAll('[data-path]').forEach(crumb => crumb.addEventListener('click', () => openDirectory(crumb.dataset.path)));
 }
 
+let explorerRenderState = { path: null, query: null, entries: null };
 function renderExplorer() {
   if (!state.repository) return;
   renderBreadcrumbs();
   const query = refs.search.value.trim().toLowerCase();
+  // If nothing but the selection changed (a plain click, no folder reload and
+  // no new search), update just the "selected" class in place instead of
+  // rebuilding every row's DOM node. Rebuilding on every click replaces the
+  // very button the user just clicked — on Windows/WebView2 that resets the
+  // browser's double-click sequence (it requires both clicks to land on the
+  // same element), so a folder needed two double-clicks to open. macOS's
+  // WebKit is more lenient about this, which is why it only showed up there.
+  if (explorerRenderState.path === state.currentPath && explorerRenderState.query === query && explorerRenderState.entries === state.entries) {
+    refs.fileList.querySelectorAll('[data-entry]').forEach(row => row.classList.toggle('selected', state.selectedEntry?.relative_path === row.dataset.entry));
+    return;
+  }
+  explorerRenderState = { path: state.currentPath, query, entries: state.entries };
   const entries = state.entries.filter(entry => !query || entry.name.toLowerCase().includes(query));
   const upRow = state.currentPath ? `<button class="file-row file-grid up-row" data-go-up="1">
     <span class="file-main"><span class="entry-icon folder">▲</span><span class="entry-copy"><span class="entry-name">..</span><span class="entry-hint">Parent folder</span></span></span>
@@ -1792,12 +1805,33 @@ function cycleConsoleScope() {
 }
 function updateConsoleScopeLabel() { $('#commandScope').textContent = state.repository ? `📍 ${consoleGitTarget().label}` : ''; }
 
+// Lightly colorizes raw git output so the shape of the answer is clear at a
+// glance — added/removed diff lines, status sections, commit hashes — the
+// same way a real terminal with git's own color output would look, without
+// needing to parse or understand the command itself.
+function colorizeGitOutput(text) {
+  return text.split('\n').map(line => {
+    const escaped = esc(line);
+    if (/^\+\+\+ /.test(line) || /^--- /.test(line)) return `<span class="git-out-meta">${escaped}</span>`;
+    if (/^\+/.test(line)) return `<span class="git-out-add">${escaped}</span>`;
+    if (/^-/.test(line)) return `<span class="git-out-del">${escaped}</span>`;
+    if (/^@@.*@@/.test(line)) return `<span class="git-out-hunk">${escaped}</span>`;
+    if (/^(diff --git|index [0-9a-f])/.test(line)) return `<span class="git-out-meta">${escaped}</span>`;
+    if (/^\s*(modified|new file|deleted|renamed|copied):/.test(line)) return `<span class="git-out-changed">${escaped}</span>`;
+    if (/^\s*\(use "git/.test(line)) return `<span class="git-out-hint">${escaped}</span>`;
+    if (/^(On branch |Your branch)/.test(line)) return `<span class="git-out-branch">${escaped}</span>`;
+    if (/^(Untracked files:|Changes (to be committed|not staged for commit):)/.test(line)) return `<span class="git-out-section">${escaped}</span>`;
+    if (/^[0-9a-f]{7,40}\b/.test(line)) return `<span class="git-out-hash">${escaped}</span>`;
+    return escaped;
+  }).join('\n');
+}
+
 function renderConsoleTranscript() {
   const list = $('#commandList'); list.classList.add('console-transcript');
   list.innerHTML = state.consoleTranscript.map(entry => `<div class="raw-git-output">
     <div class="raw-git-cmd">$ git ${esc(entry.args)} <span class="raw-git-cwd">(in ${esc(entry.targetLabel)})</span> <b class="raw-git-status ${entry.result.success ? 'ok' : 'fail'}">${entry.result.success ? 'OK' : 'FAILED'}</b></div>
-    ${entry.result.stdout ? `<pre class="raw-git-stdout">${esc(entry.result.stdout)}</pre>` : ''}
-    ${entry.result.stderr ? `<pre class="raw-git-stderr">${esc(entry.result.stderr)}</pre>` : ''}
+    ${entry.result.stdout ? `<pre class="raw-git-stdout">${colorizeGitOutput(entry.result.stdout)}</pre>` : ''}
+    ${entry.result.stderr ? `<pre class="raw-git-stderr">${colorizeGitOutput(entry.result.stderr)}</pre>` : ''}
     ${!entry.result.stdout && !entry.result.stderr ? '<div class="raw-git-empty">(no output)</div>' : ''}
   </div>`).join('') || '<div class="console-empty">Type a git command below and press Enter — e.g. "status", "log --oneline -10", "diff HEAD~1".</div>';
   $('#commandClearTranscript').hidden = state.consoleTranscript.length === 0;

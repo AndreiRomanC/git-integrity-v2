@@ -366,6 +366,7 @@ dialog form { padding: 28px; text-align: center; }dialog h2 { margin: 0 0 10px; 
 .raw-git-status.fail { background: #2a1216; color: #ffb0b8; border: 1px solid #8c3a42; }
 .raw-git-stdout, .raw-git-stderr { max-height: 280px; overflow: auto; margin: 0 0 8px; padding: 10px 12px; border-radius: 6px; background: #0b1116; color: #c5d1db; font: 11px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace; white-space: pre-wrap; word-break: break-word; }
 .raw-git-stderr { color: #ffb0b8; background: #1a0f11; }
+.git-out-add { color: var(--green); }.git-out-del { color: #ff8a8a; }.git-out-hunk { color: var(--purple); font-weight: 700; }.git-out-meta { color: #64798c; }.git-out-changed { color: var(--amber); font-weight: 600; }.git-out-hint { color: #56697a; font-style: italic; }.git-out-branch { color: var(--blue); font-weight: 700; }.git-out-section { color: #d9e4ee; font-weight: 700; }.git-out-hash { color: var(--amber); font-weight: 700; }
 .raw-git-empty { padding: 8px 0; color: #6b7f96; font-size: 11px; }
 .console-transcript { display: flex; flex-direction: column; gap: 2px; }
 .console-transcript .raw-git-output { border-bottom: 1px solid var(--border-soft); }
