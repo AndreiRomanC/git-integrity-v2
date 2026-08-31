@@ -1495,7 +1495,7 @@ fn commit_selected_internal(repository_path: &str, files: &[String], message: &s
         }
         let relative = Path::new(file); let absolute = Path::new(repository_path).join(relative);
         if gitlinks.contains_key(file) && absolute.exists() { if let Ok(mut submodule) = repo.find_submodule(file) { let _ = submodule.add_to_index(true); } continue; }
-        if absolute.exists() { index.add_path(relative).map_err(|error| error.message().to_string())?; } else { let _ = index.remove_path(relative); }
+        if absolute.exists() { index.add_all([relative], git2::IndexAddOption::DEFAULT, None).map_err(|error| error.message().to_string())?; } else { let _ = index.remove_all([relative], None); }
     }
     index.write().map_err(|error| error.message().to_string())?;
     invalidate_git_metadata(repository_path); Ok(oid.to_string())
@@ -2303,6 +2303,39 @@ mod tests {
         assert!(head_files.lines().any(|p| p == "a.txt"));
         assert!(head_files.lines().any(|p| p == "new.txt"));
         assert!(load_repository(path).unwrap().changes.is_empty(), "nothing should be left pending after committing the whole repository");
+
+        fs::remove_dir_all(repository).unwrap();
+    }
+
+    #[test]
+    fn committing_a_folder_with_a_modified_file_inside_it_works() {
+        // Reported: "Commit this item" on a folder failed with "cannot create
+        // blob from '<path>/admin': it is a directory" — the post-commit index
+        // re-sync used `index.add_path`, which only accepts an actual file
+        // blob, never a directory. `commit_selected_internal`'s first pass
+        // (building the commit tree) already used `add_all`, which expands a
+        // folder recursively; the second pass (re-syncing the on-disk index
+        // after the commit) must do the same.
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let repository = std::env::temp_dir().join(format!("git-integrity-folder-commit-{suffix}"));
+        let admin = repository.join("admin");
+        fs::create_dir_all(&admin).unwrap();
+        fs::write(admin.join("a.txt"), "one").unwrap();
+        run_git(&repository, &["init"]);
+        run_git(&repository, &["config", "user.email", "test@example.com"]);
+        run_git(&repository, &["config", "user.name", "Test User"]);
+        run_git(&repository, &["add", "."]);
+        run_git(&repository, &["commit", "-m", "Initial commit"]);
+
+        fs::write(admin.join("a.txt"), "two").unwrap();
+        fs::write(admin.join("new.txt"), "brand new").unwrap();
+        let path = repository.to_string_lossy().into_owned();
+        let committed = commit_path(path.clone(), "admin".into(), "Commit admin folder".into()).unwrap();
+        assert!(!committed.is_empty());
+        let head_files = git(&path, &["show", "--pretty=format:", "--name-only", "HEAD"]).unwrap();
+        assert!(head_files.lines().any(|p| p == "admin/a.txt"));
+        assert!(head_files.lines().any(|p| p == "admin/new.txt"));
+        assert!(load_repository(path).unwrap().changes.is_empty(), "nothing should be left pending after committing the folder");
 
         fs::remove_dir_all(repository).unwrap();
     }
