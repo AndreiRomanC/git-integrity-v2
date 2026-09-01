@@ -73,9 +73,12 @@ function commitSubjectHtml(subject = '') {
   // Commit messages carry Polarion work item IDs like "P:OMBMS-21610" (project
   // code, dash, number) — e.g. "P:OMBMS-21610 - 0ADOBD - DEM/FIM ...". The
   // Polarion URL needs the project code on its own (for the /project/ segment)
-  // plus the full ID again for the workitem id.
+  // plus the full ID again for the workitem id. Project codes can start with
+  // a digit too (e.g. "P:0ADOPM-1803"), so the first character must allow
+  // digits, not just letters — a letter-only first character was silently
+  // failing to recognize those as links.
   let cursor = 0; const parts = [];
-  for (const match of subject.matchAll(/P:([A-Za-z][A-Za-z0-9_]*-\d+)/g)) {
+  for (const match of subject.matchAll(/P:([A-Za-z0-9][A-Za-z0-9_]*-\d+)/g)) {
     parts.push(esc(subject.slice(cursor, match.index)));
     const workitemId = match[1]; const project = workitemId.split('-')[0];
     const url = `https://polarion.vitesco.io/polarion/#/project/${project}/workitem?id=${workitemId}`;
@@ -492,10 +495,22 @@ function renderExplorer() {
     <span class="file-main">${iconFor(entry)}<span class="entry-copy"><span class="entry-name">${esc(entry.name)}${entry.kind === 'submodule' ? '<b class="inline-submodule-badge">SUBMODULE</b>' : ''}</span><span class="entry-hint">${entry.kind === 'submodule' ? 'Independent Git repository' : entry.kind}</span></span>${['folder','submodule'].includes(entry.kind) ? '<span class="folder-arrow">›</span>' : ''}</span>
     ${gitState(entry)}<span class="file-size">${entry.kind === 'file' ? formatSize(entry.size) : '—'}</span><span class="file-modified">${formatModified(entry.modified)}</span>
   </button>`).join('') || (state.currentPath ? '' : '<div class="empty-change">This folder is empty</div>');
-  refs.fileList.querySelector('[data-go-up]')?.addEventListener('dblclick', () => { const parent = state.currentPath.split('/').slice(0, -1).join('/'); openDirectory(parent); });
+  refs.fileList.querySelector('[data-go-up]')?.addEventListener('click', () => { const parent = state.currentPath.split('/').slice(0, -1).join('/'); openDirectory(parent); });
   refs.fileList.querySelectorAll('[data-entry]').forEach(row => {
-    row.addEventListener('click', () => selectEntry(row.dataset.entry));
-    row.addEventListener('dblclick', () => { const entry = state.entries.find(item => item.relative_path === row.dataset.entry); if (entry && ['folder','submodule'].includes(entry.kind)) openDirectory(entry.relative_path); });
+    // A plain folder navigates on a single click, like the parent-folder
+    // (".." ) row above — no double-click needed. Double-click requires both
+    // clicks to land on the very same DOM element within a short window,
+    // which Chromium/WebView2 enforces more strictly than macOS's WebKit; on
+    // Windows that made folder navigation feel unreliable ("need to click
+    // twice"). A submodule keeps double-click to open its own file tree,
+    // since a single click there is what shows its action panel (push,
+    // pull, branch…) — going a level further needs a distinct gesture.
+    row.addEventListener('click', () => {
+      const entry = state.entries.find(item => item.relative_path === row.dataset.entry);
+      if (entry?.kind === 'folder') { openDirectory(row.dataset.entry); return; }
+      selectEntry(row.dataset.entry);
+    });
+    row.addEventListener('dblclick', () => { const entry = state.entries.find(item => item.relative_path === row.dataset.entry); if (entry?.kind === 'submodule') openDirectory(entry.relative_path); });
     row.addEventListener('contextmenu', event => {
       const entry = state.entries.find(item => item.relative_path === row.dataset.entry);
       if (entry?.kind !== 'submodule') return;
@@ -1027,7 +1042,8 @@ async function saveEditor(event) {
     } catch (error) { handleError(error); }
     return;
   }
-  try { status(`Saving ${state.editingPath}…`, 'busy'); await saveEditorContent(); refs.editorDialog.close(); directoryCache.clear(); await loadRepository(state.repository.path); status(`Saved ${state.editingPath}`); }
+  const folder = state.currentPath;
+  try { status(`Saving ${state.editingPath}…`, 'busy'); await saveEditorContent(); refs.editorDialog.close(); directoryCache.clear(); await loadRepository(state.repository.path); await openDirectory(folder, { force: true }); status(`Saved ${state.editingPath}`); }
   catch (error) { handleError(error); }
 }
 
