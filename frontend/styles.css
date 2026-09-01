@@ -34,6 +34,7 @@ button { cursor: default; }
 .repo-picker-copy strong, .repo-picker-copy small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .repo-picker-copy small { color: var(--muted); font-size: 11px; }
 .chevron { margin-left: auto; color: var(--muted); font-size: 18px; }
+.default-commit-bar { flex: 1; min-width: 140px; display: flex; align-items: center; gap: 6px; }.default-commit-bar input { width: 100%; height: 32px; border: 1px solid var(--border); border-radius: 7px; padding: 0 10px; background: var(--surface); color: #cddae6; font-size: 11px; }.default-commit-bar input::placeholder { color: #5b6c7c; }.default-commit-bar input:focus { outline: 0; border-color: var(--blue); }.subtle-polarion-link { flex: none; color: #5b7690; font-size: 10px; font-weight: 600; text-decoration: none; opacity: .75; }.subtle-polarion-link:hover { color: var(--blue); opacity: 1; }
 .top-actions { display: flex; margin-left: auto; gap: 6px; }
 .top-actions button { width: 32px; height: 32px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface); color: #aec0d2; font-size: 15px; }
 .top-actions button:hover { border-color: #526273; background: var(--surface-soft); color: white; }
@@ -264,8 +265,10 @@ button { cursor: default; }
 .drawer-head button:hover { background: var(--surface-soft); }
 .drawer-body { height: calc(100% - 52px); display: grid; grid-template-columns: 1fr 390px; }
 .change-list { overflow: auto; border-right: 1px solid var(--border); }
-.change-row { min-height: 39px; display: grid; grid-template-columns: 30px 30px 1fr 85px; align-items: center; padding: 0 13px; border-bottom: 1px solid var(--border-soft); }
+.change-row-wrap { display: flex; align-items: center; border-bottom: 1px solid var(--border-soft); }
+.change-row { flex: 1; min-height: 39px; display: grid; grid-template-columns: 30px 30px 1fr 85px; align-items: center; padding: 0 13px; }
 .change-row input { width: 17px; height: 17px; accent-color: var(--blue); }
+.stash-file-btn { flex: none; width: 26px; height: 26px; margin: 0 10px 0 0; border: 1px solid var(--border); border-radius: 6px; background: transparent; color: #7f92a3; font-size: 12px; }.stash-file-btn:hover { border-color: var(--blue); color: var(--blue); background: #152737; }
 .status-code { color: var(--amber); font: 12px ui-monospace, SFMono-Regular, Consolas, monospace; }
 .change-path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .change-state { color: var(--muted); font-size: 11px; }

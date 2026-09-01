@@ -56,6 +56,7 @@ const refs = {
   statusDot: $('#statusDot'), search: $('#search'), graphSubtitle: $('#graphSubtitle'),
   changeBadge: $('#changeBadge'), workspaceSubtitle: $('#workspaceSubtitle'), changes: $('#changes'),
   changesDrawer: $('#changesDrawer'), changesSummary: $('#changesSummary'), commitMessage: $('#commitMessage'),
+  defaultCommitMessage: $('#defaultCommitMessage'), defaultCommitPolarionLink: $('#defaultCommitPolarionLink'),
   commitButton: $('#commitButton'), selectionText: $('#selectionText'), browserDialog: $('#browserDialog'),
   browserNotice: $('#browserNotice'), explorerView: $('#explorerView'), fileList: $('#fileList'),
   breadcrumbs: $('#breadcrumbs'), viewTitle: $('#viewTitle'), goUp: $('#goUp'), reloadFolder: $('#reloadFolder'),
@@ -610,7 +611,7 @@ function scopeHasChanges(scope) {
 function openScopeCommit() {
   const scope = selectedScope();
   if (!scopeHasChanges(scope)) { const msg = `Nothing to commit — "${scope.name}" has no uncommitted local changes.`; status(msg); showOperationToast(msg, 'error'); return; }
-  refs.commitScopeName.textContent = scope.name; refs.scopeCommitMessage.value = ''; refs.confirmScopeCommit.disabled = true; refs.commitScopeDialog.showModal(); refs.scopeCommitMessage.focus();
+  refs.commitScopeName.textContent = scope.name; refs.scopeCommitMessage.value = refs.defaultCommitMessage.value.trim(); refs.confirmScopeCommit.disabled = !refs.scopeCommitMessage.value.trim(); refs.commitScopeDialog.showModal(); refs.scopeCommitMessage.focus();
 }
 
 async function commitSelectedScope(event) {
@@ -1130,6 +1131,18 @@ async function stashWork() {
   catch (error) { handleError(error); }
 }
 
+async function stashOneFile(path) {
+  if (!state.repository) return;
+  if (!invoke) { status(`Preview: ${path} stashed`); return; }
+  try {
+    status(`Setting ${path} aside…`, 'busy');
+    await invoke('stash_file', { repositoryPath: state.repository.path, relativePath: path });
+    state.hasStash = true; updateStashUI();
+    const folder = state.currentPath; await loadRepository(state.repository.path); if (folder) await openDirectory(folder, { force: true });
+    status(`${path} set aside — use "Pop stash" to bring it back`); showOperationToast(`${path} moved to the stash. It won't be part of any commit until you Pop it back.`);
+  } catch (error) { handleError(error); }
+}
+
 async function popStash() {
   if (!state.repository || !state.hasStash) return;
   if (!invoke) { state.hasStash = false; updateStashUI(); status('Preview: stash restored'); return; }
@@ -1379,9 +1392,21 @@ function renderChanges() {
   const scope = state.changesScope === 'folder' ? state.currentPath : ''; const scopedChanges = state.changes.filter(change => !scope || change.path === scope || change.path.startsWith(`${scope}/`));
   refs.drawerScopeTitle.textContent = state.changesScope === 'folder' ? `Changes in folder · /${scope}` : 'Working tree · entire repository';
   refs.changesSummary.textContent = scopedChanges.length ? `${scopedChanges.length} file${scopedChanges.length === 1 ? '' : 's'} available for staging` : `No changes in ${scope ? `/${scope}` : 'the repository'}`;
-  refs.changes.innerHTML = scopedChanges.map(change => `<label class="change-row"><input type="checkbox" data-change-path="${esc(change.path)}" ${change.staged ? 'checked' : ''}>
-    <span class="status-code">${esc(change.status)}</span><span class="change-path">${esc(change.path)}</span><span class="change-state">${change.staged ? 'Staged' : 'Modified'}</span></label>`).join('') || `<div class="empty-change">No changes inside /${esc(scope)}</div>`;
-  refs.changes.querySelectorAll('[data-change-path]').forEach(input => input.addEventListener('change', () => toggleStage(input.dataset.changePath, input.checked)));
+  refs.changes.innerHTML = scopedChanges.map(change => `<div class="change-row-wrap"><label class="change-row"><input type="checkbox" data-change-path="${esc(change.path)}" ${change.staged ? 'checked' : ''}>
+    <span class="status-code">${esc(change.status)}</span><span class="change-path">${esc(change.path)}</span><span class="change-state">${change.staged ? 'Staged' : 'Modified'}</span></label>
+    <button class="stash-file-btn" data-stash-path="${esc(change.path)}" title="Set aside just this file for now — moves it to a temporary holding area (the stash) so it's left out of any commit until you bring it back with Pop stash">⇕</button></div>`).join('') || `<div class="empty-change">No changes inside /${esc(scope)}</div>`;
+  refs.changes.querySelectorAll('[data-stash-path]').forEach(button => button.addEventListener('click', () => stashOneFile(button.dataset.stashPath)));
+  refs.changes.querySelectorAll('[data-change-path]').forEach(input => {
+    // Belt-and-suspenders against a real Chromium/WebView2 quirk: a checkbox
+    // just toggled by the user can have its *rendered* `checked` attribute
+    // silently overridden by the browser's own form-state-restoration when
+    // the surrounding HTML is replaced right after — the row would then show
+    // the state from before the click. Setting the property explicitly right
+    // after building the HTML always wins over that.
+    const change = scopedChanges.find(item => item.path === input.dataset.changePath);
+    input.checked = Boolean(change?.staged);
+    input.addEventListener('change', () => toggleStage(input.dataset.changePath, input.checked));
+  });
   const staged = scopedChanges.filter(change => change.staged).length;
   refs.selectionText.textContent = `${staged} file${staged === 1 ? '' : 's'} in staging area`;
   refs.commitButton.disabled = !staged || !refs.commitMessage.value.trim();
@@ -1464,6 +1489,12 @@ async function confirmPublish(event) {
 
 async function toggleStage(path, checked) {
   if (!invoke) return;
+  // Reflect the click immediately in state — the round trip to the backend
+  // and back through a full repository reload takes a moment, and the
+  // checkbox should never visibly sit in a stale state (still "Staged" right
+  // after unchecking it) while that's in flight.
+  const change = state.changes.find(item => item.path === path); if (change) change.staged = checked;
+  renderChanges();
   try { const folder = state.currentPath; await invoke(checked ? 'stage_files' : 'unstage_files', { repositoryPath: state.repository.path, files: [path] }); await loadRepository(state.repository.path); if (folder) await openDirectory(folder); }
   catch (error) { handleError(error); }
 }
@@ -1494,8 +1525,20 @@ async function stageAllInScope(scope) {
   try { await invoke('stage_files', { path: state.repository.path, files }); await loadRepository(state.repository.path, { keepPath: true }); renderChanges(); }
   catch (error) { handleError(error); }
 }
-$('#showChanges').addEventListener('click', async () => { state.changesScope = 'global'; renderChanges(); refs.changesDrawer.classList.add('open'); await stageAllInScope(''); });
-$('#showFolderChanges').addEventListener('click', async () => { state.changesScope = 'folder'; renderChanges(); refs.changesDrawer.classList.add('open'); await stageAllInScope(state.currentPath); });
+// Pre-fills the commit message box with whatever is in the "default commit
+// message" field up top — e.g. a Polarion ID you're committing several
+// pieces of work against — every time the Working tree drawer is opened.
+// Only fills it in when the box is empty, so it never clobbers a message
+// you're already partway through typing in a still-open drawer.
+function applyDefaultCommitMessage() { if (!refs.commitMessage.value.trim() && refs.defaultCommitMessage.value.trim()) refs.commitMessage.value = refs.defaultCommitMessage.value.trim(); }
+
+$('#showChanges').addEventListener('click', async () => { state.changesScope = 'global'; renderChanges(); refs.changesDrawer.classList.add('open'); applyDefaultCommitMessage(); await stageAllInScope(''); });
+$('#showFolderChanges').addEventListener('click', async () => { state.changesScope = 'folder'; renderChanges(); refs.changesDrawer.classList.add('open'); applyDefaultCommitMessage(); await stageAllInScope(state.currentPath); });
+refs.defaultCommitMessage.addEventListener('input', () => {
+  const match = refs.defaultCommitMessage.value.match(/P:([A-Za-z0-9][A-Za-z0-9_]*-\d+)/);
+  if (match) { const workitemId = match[1]; const project = workitemId.split('-')[0]; refs.defaultCommitPolarionLink.href = `https://polarion.vitesco.io/polarion/#/project/${project}/workitem?id=${workitemId}`; refs.defaultCommitPolarionLink.hidden = false; }
+  else { refs.defaultCommitPolarionLink.hidden = true; }
+});
 $('#showPublish').addEventListener('click', () => openPublish().catch(error => status(String(error), 'error')));
 $('#stashWork').addEventListener('click', stashWork);
 $('#popStash').addEventListener('click', popStash);
@@ -1613,7 +1656,7 @@ function buildCommands() {
   const list = [
     { id: 'open-repo', name: 'Open Repository', description: 'Choose a local Git folder to open', keys: 'Ctrl+O', tags: ['no-repo'], fn: openRepository },
     { id: 'new-branch', name: 'New Branch', description: 'Create a new local branch from the current one', keys: 'Ctrl+Shift+B', tags: ['explorer', 'graph'], fn: () => $('#newBranch').click() },
-    { id: 'commit', name: 'Commit Changes', description: 'Open the Working tree drawer and write a commit message for staged files', keys: 'Ctrl+Shift+C', keywords: 'save record', tags: ['explorer'], fn: () => { state.changesScope = 'global'; renderChanges(); refs.changesDrawer.classList.add('open'); stageAllInScope(''); refs.commitMessage.focus(); } },
+    { id: 'commit', name: 'Commit Changes', description: 'Open the Working tree drawer and write a commit message for staged files', keys: 'Ctrl+Shift+C', keywords: 'save record', tags: ['explorer'], fn: () => { state.changesScope = 'global'; renderChanges(); refs.changesDrawer.classList.add('open'); applyDefaultCommitMessage(); stageAllInScope(''); refs.commitMessage.focus(); } },
     { id: 'push', name: 'Push Current Branch', description: 'Send your local commits on this branch to the server', keys: 'Ctrl+Shift+P', tags: ['explorer', 'graph'], fn: () => $('#pushCurrent').click() },
     { id: 'pull', name: 'Pull Current Branch', description: 'Fetch and fast-forward the current branch from the server', keys: '', tags: ['explorer', 'graph'], fn: () => $('#pullCurrent').click() },
     { id: 'merge', name: 'Merge Branch…', description: 'Bring another branch\'s commits into your current one — stays local, resolves conflicts here if any', keys: '', keywords: 'combine join', tags: ['explorer', 'graph'], fn: () => state.repository && openMergeBranchDialog(mergeTargetForMain()) },
@@ -2026,7 +2069,7 @@ $('#openHelp').addEventListener('click', () => $('#helpDialog').showModal());
 document.addEventListener('keydown', (e) => {
   if ((e.ctrlKey || e.metaKey) && e.key === 'k') { e.preventDefault(); commandPaletteOpen ? $('#commandPalette').close() : openCommandPalette(); }
   else if ((e.ctrlKey || e.metaKey) && e.key === 'o') { e.preventDefault(); openRepository(); }
-  else if ((e.ctrlKey || e.metaKey) && (e.shiftKey && e.key === 'C')) { e.preventDefault(); state.changesScope = 'global'; renderChanges(); refs.changesDrawer.classList.add('open'); stageAllInScope(''); refs.commitMessage.focus(); }
+  else if ((e.ctrlKey || e.metaKey) && (e.shiftKey && e.key === 'C')) { e.preventDefault(); state.changesScope = 'global'; renderChanges(); refs.changesDrawer.classList.add('open'); applyDefaultCommitMessage(); stageAllInScope(''); refs.commitMessage.focus(); }
   else if ((e.ctrlKey || e.metaKey) && (e.shiftKey && e.key === 'P')) { e.preventDefault(); $('#pushCurrent').click(); }
   else if ((e.ctrlKey || e.metaKey) && (e.shiftKey && e.key === 'F')) { e.preventDefault(); $('#fetchCurrent').click(); }
   else if ((e.ctrlKey || e.metaKey) && (e.shiftKey && e.key === 'S')) { e.preventDefault(); state.hasStash ? popStash() : stashWork(); }

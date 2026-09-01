@@ -1725,6 +1725,26 @@ pub fn stash_changes(repository_path: String) -> Result<(), String> {
     Ok(())
 }
 
+// Stashes a single file/folder instead of the whole working tree. libgit2's
+// stash API has no pathspec filter (it always stashes everything), so this
+// shells out to real `git stash push -- <path>` — exactly what the CLI does
+// under the hood for a scoped stash — through the same guarded `git()`
+// helper used by the raw-console escape hatch (no shell, no credential
+// prompt hang).
+#[tauri::command]
+pub fn stash_file(repository_path: String, relative_path: String) -> Result<(), String> {
+    validate_path(&repository_path)?;
+    if let Some((sub_path, inner_relative)) = resolve_submodule_boundary(&repository_path, &relative_path) {
+        if !inner_relative.is_empty() { return stash_file(sub_path, inner_relative); }
+    }
+    let relative = safe_relative_path(&relative_path)?;
+    let relative_string = normalized(&relative);
+    if relative_string.is_empty() { return Err("Select a specific file or folder to stash".into()); }
+    git(&repository_path, &["stash", "push", "--include-untracked", "--", &relative_string])?;
+    invalidate_git_metadata(&repository_path);
+    Ok(())
+}
+
 #[tauri::command]
 pub fn pop_stash(repository_path: String) -> Result<(), String> {
     validate_path(&repository_path)?;
@@ -2419,6 +2439,37 @@ mod tests {
     }
 
     #[test]
+    fn stash_file_sets_aside_only_the_chosen_file_leaving_others_modified() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let repository = std::env::temp_dir().join(format!("git-integrity-stash-one-file-{suffix}"));
+        fs::create_dir_all(&repository).unwrap();
+        fs::write(repository.join("a.txt"), "one").unwrap();
+        fs::write(repository.join("b.txt"), "one").unwrap();
+        run_git(&repository, &["init"]);
+        run_git(&repository, &["config", "user.email", "test@example.com"]);
+        run_git(&repository, &["config", "user.name", "Test User"]);
+        run_git(&repository, &["add", "."]);
+        run_git(&repository, &["commit", "-m", "Initial commit"]);
+
+        fs::write(repository.join("a.txt"), "two").unwrap();
+        fs::write(repository.join("b.txt"), "two").unwrap();
+        let path = repository.to_string_lossy().into_owned();
+        stash_file(path.clone(), "a.txt".into()).unwrap();
+
+        let data = load_repository(path.clone()).unwrap();
+        assert!(!data.changes.iter().any(|change| change.path == "a.txt"), "a.txt should be set aside by the stash, not showing as a pending change");
+        assert!(data.changes.iter().any(|change| change.path == "b.txt"), "b.txt was never selected — it must stay modified, untouched by the scoped stash");
+        assert_eq!(fs::read_to_string(repository.join("a.txt")).unwrap(), "one", "a.txt on disk should be back to the committed version once stashed");
+        assert_eq!(fs::read_to_string(repository.join("b.txt")).unwrap(), "two", "b.txt's edit must be left alone on disk");
+        assert_eq!(data.stashes.len(), 1);
+
+        pop_stash(path.clone()).unwrap();
+        assert_eq!(fs::read_to_string(repository.join("a.txt")).unwrap(), "two", "popping the stash should bring a.txt's edit back");
+
+        fs::remove_dir_all(repository).unwrap();
+    }
+
+    #[test]
     fn committing_all_staged_files_stops_them_showing_as_staged() {
         let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let repository = std::env::temp_dir().join(format!("git-integrity-commit-clears-staged-{suffix}"));
@@ -2439,6 +2490,41 @@ mod tests {
         assert!(!load_repository(path.clone()).unwrap().changes.iter().any(|change| change.path == "intro.css"), "intro.css should no longer appear as a pending change right after commit");
 
         fs::remove_dir_all(repository).unwrap();
+    }
+
+    #[test]
+    fn staging_and_unstaging_a_nested_file_actually_toggles_its_staged_flag() {
+        // Reported: unchecking a file's checkbox in the Working tree drawer
+        // still showed it as staged afterwards. Reproduces the checkbox's
+        // exact round trip (stage, then unstage) on a file inside a
+        // subfolder — not just at the repo root — since a path-separator
+        // mismatch would only show up once a path has an actual subfolder
+        // component in it.
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-unstage-nested-{suffix}"));
+        create_libgit2_repository(&base, "README.md");
+        fs::create_dir_all(base.join("src")).unwrap();
+        fs::write(base.join("src/lib.rs"), "// existing").unwrap();
+        run_git(&base, &["add", "."]); run_git(&base, &["commit", "-m", "Add src/lib.rs"]);
+        // "src" must already be a tracked folder before this, not a wholly-new
+        // one — a wholly-untracked directory is reported as a single status
+        // entry for the folder itself (a real, separate perf optimization, not
+        // a bug), which would make a nested new file's own path never appear
+        // and produce a false positive here.
+        fs::write(base.join("src/main.rs"), "fn main() {}").unwrap();
+        let path = base.to_string_lossy().into_owned();
+
+        stage_files(path.clone(), vec!["src/main.rs".into()]).unwrap();
+        let staged = load_repository(path.clone()).unwrap();
+        let change = staged.changes.iter().find(|change| change.path == "src/main.rs").expect("src/main.rs should be a pending change");
+        assert!(change.staged, "src/main.rs should be staged after stage_files");
+
+        unstage_files(path.clone(), vec!["src/main.rs".into()]).unwrap();
+        let unstaged = load_repository(path.clone()).unwrap();
+        let change = unstaged.changes.iter().find(|change| change.path == "src/main.rs").expect("src/main.rs should still be a pending change (untracked, not staged)");
+        assert!(!change.staged, "src/main.rs should no longer be staged after unstage_files");
+
+        fs::remove_dir_all(base).unwrap();
     }
 
     #[test]

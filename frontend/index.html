@@ -15,6 +15,10 @@
         <span class="repo-picker-copy"><strong id="repoName">Open a repository</strong><small id="repoPath">Choose an existing Git folder</small></span>
         <span class="chevron">⌄</span>
       </button>
+      <div class="default-commit-bar" title="Pre-fills every commit message box below — still editable there before you commit">
+        <input id="defaultCommitMessage" type="text" placeholder="Default commit message (optional) — e.g. P:OMBMS-21610 - fix X" autocomplete="off">
+        <a id="defaultCommitPolarionLink" class="polarion-link subtle-polarion-link" href="#" target="_blank" rel="noreferrer" hidden title="Open this Polarion work item">P↗</a>
+      </div>
       <div class="top-actions">
         <button id="refresh" title="Refresh repository">↻</button>
         <button id="fetchCurrent" title="Fetch current remote">↓</button>
@@ -44,8 +48,8 @@
         </button>
         <button class="workspace-status publish-status" id="showPublish"><span class="publish-dot">↑</span><span><strong>Unpublished commits</strong><small id="publishSubtitle">Choose what goes to server</small></span><b id="publishBadge">?</b></button>
         <button class="workspace-status" id="mergeConflictsBanner" data-tooltip="A merge is waiting for you to resolve conflicts" title="Resolve merge conflicts" hidden><span class="workspace-dot" style="background:#f06d75;"></span><span><strong>Merge conflicts</strong><small id="mergeConflictsSubtitle">0 files to resolve</small></span></button>
-        <button class="workspace-status" id="stashWork" data-tooltip="Save work in progress (stash)" title="Save work in progress"><span class="workspace-dot" style="background:#b294ff;"></span><span><strong>Stash work</strong><small>Save changes temporarily</small></span></button>
-        <button class="workspace-status" id="popStash" data-tooltip="Restore stashed work (pop)" title="Restore stashed work" style="display:none;"><span class="workspace-dot" style="background:#48cc7e;"></span><span><strong>Pop stash</strong><small>Restore saved changes</small></span></button>
+        <button class="workspace-status" id="stashWork" data-tooltip="Moves ALL uncommitted changes to a temporary holding area — the stash — so they're set aside and not part of any commit until you bring them back" title="Set all uncommitted changes aside temporarily"><span class="workspace-dot" style="background:#b294ff;"></span><span><strong>Stash work</strong><small>Set changes aside temporarily</small></span></button>
+        <button class="workspace-status" id="popStash" data-tooltip="Brings back everything you set aside in the stash" title="Bring the stash back" style="display:none;"><span class="workspace-dot" style="background:#48cc7e;"></span><span><strong>Pop stash</strong><small>Bring saved changes back</small></span></button>
       </aside>
 
       <section class="content">
@@ -339,7 +343,9 @@
         </details>
         <details>
           <summary>Stash</summary>
-          <p>"Stash work" temporarily sets aside uncommitted changes so your working folder is clean — useful for switching tasks without committing half-finished work. "Pop stash" brings it back. Stashes show up as small markers in the Branch Map, not as real history.</p>
+          <p>The stash is a temporary holding area — changes you put there are set aside and won't be part of any commit until you bring them back. "Stash work" (top toolbar) sets aside <i>everything</i> uncommitted, leaving your working folder clean — useful for switching tasks without committing half-finished work. "Pop stash" brings it all back.</p>
+          <p>To set aside just <i>one</i> file instead of everything, use the ⇕ button next to that file in the Working tree drawer — it stashes only that file, leaving every other change untouched.</p>
+          <p>Stashes show up as small ⇕ markers in the Branch Map on the commit they were based on, not as real history.</p>
         </details>
         <details>
           <summary>Command Console (⌘ or Ctrl/Cmd+K)</summary>

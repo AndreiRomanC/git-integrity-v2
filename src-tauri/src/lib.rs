@@ -40,6 +40,7 @@ pub fn run() {
             repository::publish_branch,
             repository::submodule_repository,
             repository::stash_changes,
+            repository::stash_file,
             repository::pop_stash,
             repository::rename_branch,
             repository::delete_branch,
