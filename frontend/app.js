@@ -470,6 +470,7 @@ function renderBreadcrumbs() {
 }
 
 let explorerRenderState = { path: null, query: null, entries: null };
+let lastExplorerClick = { path: null, time: 0 };
 function renderExplorer() {
   if (!state.repository) return;
   renderBreadcrumbs();
@@ -495,22 +496,30 @@ function renderExplorer() {
     <span class="file-main">${iconFor(entry)}<span class="entry-copy"><span class="entry-name">${esc(entry.name)}${entry.kind === 'submodule' ? '<b class="inline-submodule-badge">SUBMODULE</b>' : ''}</span><span class="entry-hint">${entry.kind === 'submodule' ? 'Independent Git repository' : entry.kind}</span></span>${['folder','submodule'].includes(entry.kind) ? '<span class="folder-arrow">›</span>' : ''}</span>
     ${gitState(entry)}<span class="file-size">${entry.kind === 'file' ? formatSize(entry.size) : '—'}</span><span class="file-modified">${formatModified(entry.modified)}</span>
   </button>`).join('') || (state.currentPath ? '' : '<div class="empty-change">This folder is empty</div>');
-  refs.fileList.querySelector('[data-go-up]')?.addEventListener('click', () => { const parent = state.currentPath.split('/').slice(0, -1).join('/'); openDirectory(parent); });
+  refs.fileList.querySelector('[data-go-up]')?.addEventListener('click', () => {
+    const now = Date.now();
+    const isDoubleClick = lastExplorerClick.path === '..' && now - lastExplorerClick.time < 500;
+    lastExplorerClick = { path: '..', time: now };
+    if (isDoubleClick) { lastExplorerClick = { path: null, time: 0 }; openDirectory(state.currentPath.split('/').slice(0, -1).join('/')); }
+  });
   refs.fileList.querySelectorAll('[data-entry]').forEach(row => {
-    // A plain folder navigates on a single click, like the parent-folder
-    // (".." ) row above — no double-click needed. Double-click requires both
-    // clicks to land on the very same DOM element within a short window,
-    // which Chromium/WebView2 enforces more strictly than macOS's WebKit; on
-    // Windows that made folder navigation feel unreliable ("need to click
-    // twice"). A submodule keeps double-click to open its own file tree,
-    // since a single click there is what shows its action panel (push,
-    // pull, branch…) — going a level further needs a distinct gesture.
+    // Single click selects, double click opens a folder/submodule — the
+    // familiar file-explorer convention. The browser's native `dblclick`
+    // event requires both clicks to land on the very same DOM element within
+    // its own timing window; since a click here re-renders (replacing rows
+    // in the general case, and always doing real async work), Chromium/
+    // WebView2 was unreliable about recognizing the second click as part of
+    // the same double-click on Windows — macOS's WebKit is more lenient.
+    // Detecting the double-click ourselves — by comparing the clicked path
+    // and a timestamp, not the DOM node — sidesteps that entirely.
     row.addEventListener('click', () => {
+      const now = Date.now();
+      const isDoubleClick = lastExplorerClick.path === row.dataset.entry && now - lastExplorerClick.time < 500;
+      lastExplorerClick = { path: row.dataset.entry, time: now };
       const entry = state.entries.find(item => item.relative_path === row.dataset.entry);
-      if (entry?.kind === 'folder') { openDirectory(row.dataset.entry); return; }
+      if (isDoubleClick && entry && ['folder', 'submodule'].includes(entry.kind)) { lastExplorerClick = { path: null, time: 0 }; openDirectory(entry.relative_path); return; }
       selectEntry(row.dataset.entry);
     });
-    row.addEventListener('dblclick', () => { const entry = state.entries.find(item => item.relative_path === row.dataset.entry); if (entry?.kind === 'submodule') openDirectory(entry.relative_path); });
     row.addEventListener('contextmenu', event => {
       const entry = state.entries.find(item => item.relative_path === row.dataset.entry);
       if (entry?.kind !== 'submodule') return;
