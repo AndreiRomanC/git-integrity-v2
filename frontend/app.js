@@ -210,7 +210,16 @@ async function loadRepository(path, options = {}) {
     // falls back to the full Branch Map instead of showing stale-looking
     // scoped chrome over full data.
     directoryCache.clear(); Object.assign(state, data); state.allCommits = data.commits; state.historyScope = ''; state.view = keepView; state.commanderPath = options.keepPath ? state.commanderPath : ''; state.commanderRows = options.keepPath ? state.commanderRows : [];
-    state.remoteRef = data.branches.find(branch => branch.remote)?.name || ''; await openDirectory(keepPath, { force: true }); status(`${data.commits.length} commits loaded`);
+    state.remoteRef = data.branches.find(branch => branch.remote)?.name || '';
+    // The toolbar's "Pop stash" visibility must reflect whether a stash
+    // actually exists on disk, not a separately hand-tracked flag — that
+    // flag never got reconciled with reality, so it stayed false (hiding
+    // "Pop stash") if the app was relaunched with a stash already pending,
+    // and stayed true after popping just one of several stashes even when
+    // more were still left (per-file stash makes having several at once
+    // common). Deriving it fresh from the real list every reload fixes both.
+    state.hasStash = state.stashes.length > 0; updateStashUI();
+    await openDirectory(keepPath, { force: true }); status(`${data.commits.length} commits loaded`);
     addRecentRepo(path, data.repository.name);
     updatePublishIndicator();
     await checkForMergeConflicts();
@@ -1496,7 +1505,14 @@ async function toggleStage(path, checked) {
   const change = state.changes.find(item => item.path === path); if (change) change.staged = checked;
   renderChanges();
   try { const folder = state.currentPath; await invoke(checked ? 'stage_files' : 'unstage_files', { repositoryPath: state.repository.path, files: [path] }); await loadRepository(state.repository.path); if (folder) await openDirectory(folder); }
-  catch (error) { handleError(error); }
+  catch (error) {
+    // The backend call failed — the optimistic flip above never actually
+    // happened, so undo it rather than leave the checkbox showing a state
+    // that isn't real.
+    if (change) change.staged = !checked;
+    renderChanges();
+    handleError(error);
+  }
 }
 
 async function switchBranch(branch) {
@@ -1532,8 +1548,8 @@ async function stageAllInScope(scope) {
 // you're already partway through typing in a still-open drawer.
 function applyDefaultCommitMessage() { if (!refs.commitMessage.value.trim() && refs.defaultCommitMessage.value.trim()) refs.commitMessage.value = refs.defaultCommitMessage.value.trim(); }
 
-$('#showChanges').addEventListener('click', async () => { state.changesScope = 'global'; renderChanges(); refs.changesDrawer.classList.add('open'); applyDefaultCommitMessage(); await stageAllInScope(''); });
-$('#showFolderChanges').addEventListener('click', async () => { state.changesScope = 'folder'; renderChanges(); refs.changesDrawer.classList.add('open'); applyDefaultCommitMessage(); await stageAllInScope(state.currentPath); });
+$('#showChanges').addEventListener('click', async () => { state.changesScope = 'global'; applyDefaultCommitMessage(); renderChanges(); refs.changesDrawer.classList.add('open'); await stageAllInScope(''); });
+$('#showFolderChanges').addEventListener('click', async () => { state.changesScope = 'folder'; applyDefaultCommitMessage(); renderChanges(); refs.changesDrawer.classList.add('open'); await stageAllInScope(state.currentPath); });
 refs.defaultCommitMessage.addEventListener('input', () => {
   const match = refs.defaultCommitMessage.value.match(/P:([A-Za-z0-9][A-Za-z0-9_]*-\d+)/);
   if (match) { const workitemId = match[1]; const project = workitemId.split('-')[0]; refs.defaultCommitPolarionLink.href = `https://polarion.vitesco.io/polarion/#/project/${project}/workitem?id=${workitemId}`; refs.defaultCommitPolarionLink.hidden = false; }
@@ -1656,7 +1672,7 @@ function buildCommands() {
   const list = [
     { id: 'open-repo', name: 'Open Repository', description: 'Choose a local Git folder to open', keys: 'Ctrl+O', tags: ['no-repo'], fn: openRepository },
     { id: 'new-branch', name: 'New Branch', description: 'Create a new local branch from the current one', keys: 'Ctrl+Shift+B', tags: ['explorer', 'graph'], fn: () => $('#newBranch').click() },
-    { id: 'commit', name: 'Commit Changes', description: 'Open the Working tree drawer and write a commit message for staged files', keys: 'Ctrl+Shift+C', keywords: 'save record', tags: ['explorer'], fn: () => { state.changesScope = 'global'; renderChanges(); refs.changesDrawer.classList.add('open'); applyDefaultCommitMessage(); stageAllInScope(''); refs.commitMessage.focus(); } },
+    { id: 'commit', name: 'Commit Changes', description: 'Open the Working tree drawer and write a commit message for staged files', keys: 'Ctrl+Shift+C', keywords: 'save record', tags: ['explorer'], fn: () => { state.changesScope = 'global'; applyDefaultCommitMessage(); renderChanges(); refs.changesDrawer.classList.add('open'); stageAllInScope(''); refs.commitMessage.focus(); } },
     { id: 'push', name: 'Push Current Branch', description: 'Send your local commits on this branch to the server', keys: 'Ctrl+Shift+P', tags: ['explorer', 'graph'], fn: () => $('#pushCurrent').click() },
     { id: 'pull', name: 'Pull Current Branch', description: 'Fetch and fast-forward the current branch from the server', keys: '', tags: ['explorer', 'graph'], fn: () => $('#pullCurrent').click() },
     { id: 'merge', name: 'Merge Branch…', description: 'Bring another branch\'s commits into your current one — stays local, resolves conflicts here if any', keys: '', keywords: 'combine join', tags: ['explorer', 'graph'], fn: () => state.repository && openMergeBranchDialog(mergeTargetForMain()) },
@@ -2069,7 +2085,7 @@ $('#openHelp').addEventListener('click', () => $('#helpDialog').showModal());
 document.addEventListener('keydown', (e) => {
   if ((e.ctrlKey || e.metaKey) && e.key === 'k') { e.preventDefault(); commandPaletteOpen ? $('#commandPalette').close() : openCommandPalette(); }
   else if ((e.ctrlKey || e.metaKey) && e.key === 'o') { e.preventDefault(); openRepository(); }
-  else if ((e.ctrlKey || e.metaKey) && (e.shiftKey && e.key === 'C')) { e.preventDefault(); state.changesScope = 'global'; renderChanges(); refs.changesDrawer.classList.add('open'); applyDefaultCommitMessage(); stageAllInScope(''); refs.commitMessage.focus(); }
+  else if ((e.ctrlKey || e.metaKey) && (e.shiftKey && e.key === 'C')) { e.preventDefault(); state.changesScope = 'global'; applyDefaultCommitMessage(); renderChanges(); refs.changesDrawer.classList.add('open'); stageAllInScope(''); refs.commitMessage.focus(); }
   else if ((e.ctrlKey || e.metaKey) && (e.shiftKey && e.key === 'P')) { e.preventDefault(); $('#pushCurrent').click(); }
   else if ((e.ctrlKey || e.metaKey) && (e.shiftKey && e.key === 'F')) { e.preventDefault(); $('#fetchCurrent').click(); }
   else if ((e.ctrlKey || e.metaKey) && (e.shiftKey && e.key === 'S')) { e.preventDefault(); state.hasStash ? popStash() : stashWork(); }
