@@ -650,7 +650,7 @@ function renderEntryDetails(entry) {
   refs.details.innerHTML = `<div class="entry-details"><div class="entry-preview ${esc(entry.kind)}">${entry.kind === 'submodule' ? '◇' : entry.kind === 'folder' ? '▰' : '▤'}</div>
     <h2>${esc(entry.name)}</h2><div class="entry-path">${esc(entry.relative_path)}</div>${entry.kind === 'submodule' ? '<span class="submodule-badge">◇ Git submodule</span>' : ''}
     ${entry.status || !entry.tracked ? `<div class="local-change-banner"><i></i><div><strong>${entry.kind === 'submodule' && entry.submodule_push_status ? 'New version locally (not pushed yet)' : entry.tracked ? 'Modified locally' : 'New local file'}</strong><span>${entry.kind === 'submodule' && entry.submodule_push_status ? 'Committed here, on this machine — not sent to the submodule\'s server yet.' : 'This item differs from the committed repository state.'}</span></div></div>` : ''}
-    <div class="context-actions">${entry.kind === 'file' ? '<button data-detail-action="edit">Edit local file</button>' : '<button data-detail-action="open">Open folder</button>'}<button data-detail-action="server">Open on server ↗</button><button data-detail-action="history">View history</button>${entry.status ? '<button data-detail-action="commit">Commit this item</button>' : ''}${entry.kind === 'file' && (entry.status || !entry.tracked) ? `<button data-detail-action="stage" data-tooltip="git add — add this file's current content to staging">＋ Stage this file</button><button data-detail-action="unstage" data-tooltip="Unstage — git restore --staged. Removes only the staging entry; your edits on disk are kept exactly as they are.">− Unstage</button><button data-detail-action="head" class="danger-action-soft" data-tooltip="Restore from your last local commit (HEAD) — git checkout HEAD -- file. Permanently discards ALL edits; the file on disk becomes identical to what you last committed. Cannot be undone.">↶ Restore from last commit (HEAD)</button><button data-detail-action="compare" data-tooltip="Open side-by-side compare with restore options">⇄ Compare with remote</button>` : ''}${entry.kind === 'submodule' ? `<button data-detail-action="subserver">Open submodule repository ↗</button><button data-detail-action="subgraph">Submodule branch map</button><button data-detail-action="subnewbranch" data-tooltip="Create a new local branch in this submodule, starting from its current commit, and switch to it">＋ New branch…</button><button data-detail-action="versions">Change version</button><button data-detail-action="subcommit" ${entry.status ? '' : 'disabled'} data-tooltip="${entry.status ? 'Commit uncommitted changes inside the submodule' : 'Nothing to commit — no uncommitted changes inside this submodule'}">Commit submodule</button><button data-detail-action="subpull" data-tooltip="Fast-forward pull — brings in new commits from the submodule's remote. Refuses if it would require a manual merge.">Pull submodule</button><button data-detail-action="submerge" data-tooltip="Merge a branch into this submodule's current branch, with conflict resolution if needed">Merge branch…</button><button data-detail-action="subpush">Push submodule</button><button data-detail-action="subforcepush" class="danger-action-soft" data-tooltip="⚠️ Overwrites the remote branch with your local history, discarding any commits there aren't in yours. Only safe if nobody else uses that remote.">Force push submodule…</button><button data-detail-action="subfetch">Fetch submodule</button><button data-detail-action="location">Replace repository URL</button>` : ''}<button class="danger-action" data-detail-action="delete">Delete…</button></div>
+    <div class="context-actions">${entry.kind === 'file' ? '<button data-detail-action="edit">Edit local file</button>' : '<button data-detail-action="open">Open folder</button>'}<button data-detail-action="server">Open on server ↗</button><button data-detail-action="history">View history</button>${entry.status ? '<button data-detail-action="commit">Commit this item</button>' : ''}${entry.kind === 'file' && (entry.status || !entry.tracked) ? `<button data-detail-action="stage" data-tooltip="git add — add this file's current content to staging">＋ Stage this file</button><button data-detail-action="unstage" data-tooltip="Unstage — git restore --staged. Removes only the staging entry; your edits on disk are kept exactly as they are.">− Unstage</button><button data-detail-action="stashfile" data-tooltip="Sets this file aside in a temporary holding area (the stash) — it's left out of any commit, and out of your working folder, until you bring it back with Pop stash">⇕ Stash this file</button><button data-detail-action="head" class="danger-action-soft" data-tooltip="Restore from your last local commit (HEAD) — git checkout HEAD -- file. Permanently discards ALL edits; the file on disk becomes identical to what you last committed. Cannot be undone.">↶ Restore from last commit (HEAD)</button><button data-detail-action="compare" data-tooltip="Open side-by-side compare with restore options">⇄ Compare with remote</button>` : ''}${entry.kind === 'submodule' ? `<button data-detail-action="subserver">Open submodule repository ↗</button><button data-detail-action="subgraph">Submodule branch map</button><button data-detail-action="subnewbranch" data-tooltip="Create a new local branch in this submodule, starting from its current commit, and switch to it">＋ New branch…</button><button data-detail-action="versions">Change version</button><button data-detail-action="subcommit" ${entry.status ? '' : 'disabled'} data-tooltip="${entry.status ? 'Commit uncommitted changes inside the submodule' : 'Nothing to commit — no uncommitted changes inside this submodule'}">Commit submodule</button><button data-detail-action="subpull" data-tooltip="Fast-forward pull — brings in new commits from the submodule's remote. Refuses if it would require a manual merge.">Pull submodule</button><button data-detail-action="submerge" data-tooltip="Merge a branch into this submodule's current branch, with conflict resolution if needed">Merge branch…</button><button data-detail-action="subpush">Push submodule</button><button data-detail-action="subforcepush" class="danger-action-soft" data-tooltip="⚠️ Overwrites the remote branch with your local history, discarding any commits there aren't in yours. Only safe if nobody else uses that remote.">Force push submodule…</button><button data-detail-action="subfetch">Fetch submodule</button><button data-detail-action="location">Replace repository URL</button>` : ''}<button class="danger-action" data-detail-action="delete">Delete…</button></div>
     <div class="detail-section"><h3>GENERAL</h3><div class="detail-grid"><span>Type</span><strong>${kindLabel}</strong><span>Git</span><strong>${entry.tracked ? (entry.status || (entry.unpushed ? (entry.kind === 'folder' ? 'Clean — contains unpushed commits' : 'Committed, not pushed yet') : 'Tracked, clean')) : 'Untracked'}</strong>
     ${entry.item_count != null ? `<span>Items</span><strong>${entry.item_count}</strong>` : `<span>Size</span><strong>${formatSize(entry.size)}</strong>`}<span>Modified</span><strong>${formatModified(entry.modified)}</strong></div></div>
     ${entry.kind === 'submodule' ? `<div class="detail-section"><h3>SUBMODULE</h3><div class="detail-grid"><span>Remote</span><strong>${esc(entry.submodule_url || 'Not configured')}</strong><span>Branch</span><strong>${esc(entry.submodule_branch || 'Default')}</strong><span>Status</span><strong>${entry.status ? (entry.status === 'M' ? 'Has local changes' : 'Modified') : 'Clean'}</strong></div>
@@ -680,6 +680,7 @@ async function handleDetailAction(action, entry, button) {
   if (action === 'subfetch') return fetchSubmodule(entry);
   if (action === 'subnewbranch') return createSubmoduleBranch(entry);
   if (['head','stage','unstage'].includes(action)) return runEntryFileAction(entry, action);
+  if (action === 'stashfile') return stashOneFile(entry.relative_path);
 }
 
 async function createSubmoduleBranch(entry) {
@@ -1148,6 +1149,10 @@ async function stashOneFile(path) {
     await invoke('stash_file', { repositoryPath: state.repository.path, relativePath: path });
     state.hasStash = true; updateStashUI();
     const folder = state.currentPath; await loadRepository(state.repository.path); if (folder) await openDirectory(folder, { force: true });
+    // The stashed file just went back to its committed state, so the details
+    // panel (if it's the one showing) needs to drop its now-stale "Modified"
+    // banner and action buttons rather than keep them around.
+    if (state.selectedEntry?.relative_path === path) await selectEntry(path);
     status(`${path} set aside — use "Pop stash" to bring it back`); showOperationToast(`${path} moved to the stash. It won't be part of any commit until you Pop it back.`);
   } catch (error) { handleError(error); }
 }
@@ -1403,7 +1408,7 @@ function renderChanges() {
   refs.changesSummary.textContent = scopedChanges.length ? `${scopedChanges.length} file${scopedChanges.length === 1 ? '' : 's'} available for staging` : `No changes in ${scope ? `/${scope}` : 'the repository'}`;
   refs.changes.innerHTML = scopedChanges.map(change => `<div class="change-row-wrap"><label class="change-row"><input type="checkbox" data-change-path="${esc(change.path)}" ${change.staged ? 'checked' : ''}>
     <span class="status-code">${esc(change.status)}</span><span class="change-path">${esc(change.path)}</span><span class="change-state">${change.staged ? 'Staged' : 'Modified'}</span></label>
-    <button class="stash-file-btn" data-stash-path="${esc(change.path)}" title="Set aside just this file for now — moves it to a temporary holding area (the stash) so it's left out of any commit until you bring it back with Pop stash">⇕</button></div>`).join('') || `<div class="empty-change">No changes inside /${esc(scope)}</div>`;
+    <button class="stash-file-btn" data-stash-path="${esc(change.path)}" title="Set aside just this file for now — moves it to a temporary holding area (the stash) so it's left out of any commit until you bring it back with Pop stash">⇕ Stash</button></div>`).join('') || `<div class="empty-change">No changes inside /${esc(scope)}</div>`;
   refs.changes.querySelectorAll('[data-stash-path]').forEach(button => button.addEventListener('click', () => stashOneFile(button.dataset.stashPath)));
   refs.changes.querySelectorAll('[data-change-path]').forEach(input => {
     // Belt-and-suspenders against a real Chromium/WebView2 quirk: a checkbox
@@ -1548,6 +1553,21 @@ async function stageAllInScope(scope) {
 // you're already partway through typing in a still-open drawer.
 function applyDefaultCommitMessage() { if (!refs.commitMessage.value.trim() && refs.defaultCommitMessage.value.trim()) refs.commitMessage.value = refs.defaultCommitMessage.value.trim(); }
 
+// Remembers every default commit message you've typed in, most recent
+// first, capped at 10 — persisted in this browser profile so it survives a
+// restart. Shown as a native dropdown under the field (no extra UI needed).
+const COMMIT_MESSAGE_HISTORY_KEY = 'git-integrity-default-commit-message-history';
+function loadCommitMessageHistory() { try { const list = JSON.parse(localStorage.getItem(COMMIT_MESSAGE_HISTORY_KEY) || '[]'); return Array.isArray(list) ? list.slice(0, 10) : []; } catch { return []; } }
+state.commitMessageHistory = loadCommitMessageHistory();
+function renderCommitMessageHistory() { $('#defaultCommitMessageHistory').innerHTML = state.commitMessageHistory.map(msg => `<option value="${esc(msg)}"></option>`).join(''); }
+function recordDefaultCommitMessage() {
+  const trimmed = refs.defaultCommitMessage.value.trim(); if (!trimmed) return;
+  state.commitMessageHistory = [trimmed, ...state.commitMessageHistory.filter(item => item !== trimmed)].slice(0, 10);
+  try { localStorage.setItem(COMMIT_MESSAGE_HISTORY_KEY, JSON.stringify(state.commitMessageHistory)); } catch { /* private-browsing or storage disabled — history just won't persist */ }
+  renderCommitMessageHistory();
+}
+renderCommitMessageHistory();
+
 $('#showChanges').addEventListener('click', async () => { state.changesScope = 'global'; applyDefaultCommitMessage(); renderChanges(); refs.changesDrawer.classList.add('open'); await stageAllInScope(''); });
 $('#showFolderChanges').addEventListener('click', async () => { state.changesScope = 'folder'; applyDefaultCommitMessage(); renderChanges(); refs.changesDrawer.classList.add('open'); await stageAllInScope(state.currentPath); });
 refs.defaultCommitMessage.addEventListener('input', () => {
@@ -1555,6 +1575,7 @@ refs.defaultCommitMessage.addEventListener('input', () => {
   if (match) { const workitemId = match[1]; const project = workitemId.split('-')[0]; refs.defaultCommitPolarionLink.href = `https://polarion.vitesco.io/polarion/#/project/${project}/workitem?id=${workitemId}`; refs.defaultCommitPolarionLink.hidden = false; }
   else { refs.defaultCommitPolarionLink.hidden = true; }
 });
+refs.defaultCommitMessage.addEventListener('change', recordDefaultCommitMessage);
 $('#showPublish').addEventListener('click', () => openPublish().catch(error => status(String(error), 'error')));
 $('#stashWork').addEventListener('click', stashWork);
 $('#popStash').addEventListener('click', popStash);

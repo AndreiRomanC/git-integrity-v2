@@ -268,7 +268,7 @@ button { cursor: default; }
 .change-row-wrap { display: flex; align-items: center; border-bottom: 1px solid var(--border-soft); }
 .change-row { flex: 1; min-height: 39px; display: grid; grid-template-columns: 30px 30px 1fr 85px; align-items: center; padding: 0 13px; }
 .change-row input { width: 17px; height: 17px; accent-color: var(--blue); }
-.stash-file-btn { flex: none; width: 26px; height: 26px; margin: 0 10px 0 0; border: 1px solid var(--border); border-radius: 6px; background: transparent; color: #7f92a3; font-size: 12px; }.stash-file-btn:hover { border-color: var(--blue); color: var(--blue); background: #152737; }
+.stash-file-btn { flex: none; width: auto; height: 26px; margin: 0 10px 0 0; padding: 0 9px; border: 1px solid var(--border); border-radius: 6px; background: transparent; color: #9db0c0; font-size: 10px; font-weight: 600; white-space: nowrap; }.stash-file-btn:hover { border-color: var(--purple); color: var(--purple); background: #241f36; }
 .status-code { color: var(--amber); font: 12px ui-monospace, SFMono-Regular, Consolas, monospace; }
 .change-path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .change-state { color: var(--muted); font-size: 11px; }

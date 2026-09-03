@@ -16,7 +16,8 @@
         <span class="chevron">⌄</span>
       </button>
       <div class="default-commit-bar" title="Pre-fills every commit message box below — still editable there before you commit">
-        <input id="defaultCommitMessage" type="text" placeholder="Default commit message (optional) — e.g. P:OMBMS-21610 - fix X" autocomplete="off">
+        <input id="defaultCommitMessage" type="text" list="defaultCommitMessageHistory" placeholder="Default commit message (optional) — e.g. P:OMBMS-21610 - fix X" autocomplete="off">
+        <datalist id="defaultCommitMessageHistory"></datalist>
         <a id="defaultCommitPolarionLink" class="polarion-link subtle-polarion-link" href="#" target="_blank" rel="noreferrer" hidden title="Open this Polarion work item">P↗</a>
       </div>
       <div class="top-actions">
@@ -310,6 +311,7 @@
           <summary>Working tree (Commit)</summary>
           <p>Click "Working tree" in the sidebar (or "Changes in folder" in the toolbar) to see everything changed. Opening it auto-stages everything in scope, so Commit works immediately — untick anything you don't want included, then write a message and hit Commit.</p>
           <p>"Commit this item" in a file/folder's details panel commits just that one item, same idea, scoped to it.</p>
+          <p>The "Default commit message" field at the top pre-fills every commit box for you — handy when several commits in a row are against the same ticket. It remembers your last 10 messages (click the field to see them again) and shows a small Polarion link when the text matches <code>P:ID</code>.</p>
         </details>
         <details>
           <summary>Submodules — Pull, Push, Force push</summary>
@@ -344,7 +346,7 @@
         <details>
           <summary>Stash</summary>
           <p>The stash is a temporary holding area — changes you put there are set aside and won't be part of any commit until you bring them back. "Stash work" (top toolbar) sets aside <i>everything</i> uncommitted, leaving your working folder clean — useful for switching tasks without committing half-finished work. "Pop stash" brings it all back.</p>
-          <p>To set aside just <i>one</i> file instead of everything, use the ⇕ button next to that file in the Working tree drawer — it stashes only that file, leaving every other change untouched.</p>
+          <p>To set aside just <i>one</i> file instead of everything, use the "⇕ Stash" button next to it in the Working tree drawer, or "⇕ Stash this file" in that file's own details panel (select it in Explorer to see it) — either way, only that file is stashed; every other change stays untouched.</p>
           <p>Stashes show up as small ⇕ markers in the Branch Map on the commit they were based on, not as real history.</p>
         </details>
         <details>
