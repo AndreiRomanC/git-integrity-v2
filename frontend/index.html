@@ -23,6 +23,7 @@
       <div class="top-actions">
         <button id="refresh" title="Refresh repository">↻</button>
         <button id="fetchCurrent" title="Fetch current remote">↓</button>
+        <button id="fetchAll" title="Fetch every configured remote (not just the first one)">⇊</button>
         <button id="pullCurrent" title="Pull current branch">⇣</button>
         <button id="pushCurrent" title="Push current branch">↑</button>
         <button id="mergeCurrent" title="Merge a branch into the current one">⑂</button>
@@ -284,10 +285,10 @@
     </form>
   </dialog>
   <dialog id="conflictsDialog" class="publish-dialog">
-    <form method="dialog"><header><div><h2>Merge conflicts</h2><p id="conflictsSubtitle">Resolve each file, then complete the merge.</p></div><button value="cancel">×</button></header>
+    <form method="dialog"><header><div><h2 id="conflictsTitle">Merge conflicts</h2><p id="conflictsSubtitle">Resolve each file, then complete the merge.</p></div><button value="cancel">×</button></header>
       <div id="conflictsList" class="conflicts-list"></div>
-      <label class="commit-scope-label"><span>MERGE COMMIT MESSAGE</span><input id="conflictsCommitMessage" placeholder="Merge branch …"></label>
-      <p class="conflicts-local-note">This only affects your local repository. Push and continue through your normal PR process once complete.</p>
+      <label class="commit-scope-label" id="conflictsCommitMessageLabel"><span>MERGE COMMIT MESSAGE</span><input id="conflictsCommitMessage" placeholder="Merge branch …"></label>
+      <p class="conflicts-local-note" id="conflictsLocalNote">This only affects your local repository. Push and continue through your normal PR process once complete.</p>
       <p id="conflictsStatus" class="submodule-operation-status" role="status"></p>
       <footer><button type="button" id="abortMerge" class="danger-action-soft">Abort merge</button><span style="flex:1"></span><button value="cancel">Close</button><button type="button" value="default" id="confirmCompleteMerge" class="confirm">Complete merge</button></footer>
     </form>
@@ -334,6 +335,7 @@
         <details>
           <summary>Merge branch &amp; conflicts</summary>
           <p>"Merge branch…" brings another branch's commits into your current one — entirely local, nothing is pushed automatically. If it can fast-forward, it just does. If it merges cleanly, it commits automatically. If there are real conflicts, a dialog lists each file — "Keep mine", "Keep theirs", or "Edit manually" (opens the file with the standard conflict markers) — then "Complete merge" once everything's resolved. "Abort merge" cancels and restores exactly how things were before.</p>
+          <p>The same conflict dialog opens automatically if popping a stash couldn't apply cleanly (see Stash below) — there it says "Stash conflicts" instead, and finishing just says "Done" (no merge commit needed; the resolved files become your regular working-tree changes).</p>
         </details>
         <details>
           <summary>Unpublished commits (Publish)</summary>
@@ -347,7 +349,8 @@
           <summary>Stash</summary>
           <p>The stash is a temporary holding area — changes you put there are set aside and won't be part of any commit until you bring them back. "Stash work" (top toolbar) sets aside <i>everything</i> uncommitted, leaving your working folder clean — useful for switching tasks without committing half-finished work. "Pop stash" brings it all back.</p>
           <p>To set aside just <i>one</i> file instead of everything, use the "⇕ Stash" button next to it in the Working tree drawer, or "⇕ Stash this file" in that file's own details panel (select it in Explorer to see it) — either way, only that file is stashed; every other change stays untouched.</p>
-          <p>Stashes show up as small ⇕ markers in the Branch Map on the commit they were based on, not as real history.</p>
+          <p>Stashes show up as small ⇕ markers in the Branch Map on the commit they were based on, not as real history — click one to expand it and see exactly which files it contains, before you decide to bring it back.</p>
+          <p>If "Pop stash" can't apply cleanly (the file changed since you stashed it), it doesn't fail or lose anything — it opens the same conflict-resolution dialog used for merges, and the stash itself is kept until you finish (or explicitly discard and keep it for later).</p>
         </details>
         <details>
           <summary>Command Console (⌘ or Ctrl/Cmd+K)</summary>
@@ -356,7 +359,7 @@
         </details>
         <details>
           <summary>Remotes</summary>
-          <p>Lists configured server locations for the main project and lets you fetch from any of them explicitly.</p>
+          <p>Lists configured server locations for the main project and lets you fetch from any of them explicitly. The toolbar's ↓ fetches just the first one; ⇊ ("Fetch all") fetches every configured remote in one go — useful when the project has more than one (a mirror, an upstream…).</p>
         </details>
       </div>
       <footer><button value="cancel" class="confirm">Close</button></footer>

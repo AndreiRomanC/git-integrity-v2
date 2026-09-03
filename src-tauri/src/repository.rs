@@ -772,6 +772,17 @@ pub fn fetch_remote(repository_path: String, remote: String) -> Result<(), Strin
     Ok(())
 }
 
+// "Fetch current" only ever fetched the first configured remote — a project
+// with more than one remote (a second push mirror, an upstream, etc.) had no
+// single-click way to update from all of them at once.
+#[tauri::command]
+pub fn fetch_all_remotes(repository_path: String) -> Result<(), String> {
+    validate_path(&repository_path)?;
+    git(&repository_path, &["fetch", "--all"]).map_err(|detail| format!("Fetch failed: {detail}"))?;
+    invalidate_git_metadata(&repository_path);
+    Ok(())
+}
+
 #[tauri::command]
 pub fn sync_repository(repository_path: String, action: String) -> Result<(), String> {
     validate_path(&repository_path)?;
@@ -882,6 +893,19 @@ pub fn merge_branch(repository_path: String, target_path: String, source_ref: St
     drop(index);
     let oid = complete_merge_internal(&mut repo, &repository_path, &format!("Merge {source_ref} into {current_branch}"))?;
     Ok(MergeOutcome { status: "merged".into(), message: format!("Merged {source_ref} into {current_branch} ({}).", &oid[..8.min(oid.len())]), conflicts: vec![] })
+}
+
+// The conflict tools (list/resolve) work generically on whatever the index
+// currently has conflicted — a merge left mid-resolution, or a stash pop
+// that couldn't apply cleanly. Finishing them is different in each case
+// (a merge needs a merge commit; a stash pop doesn't), so the caller needs
+// to know which situation it's actually looking at.
+#[tauri::command]
+pub fn merge_in_progress(repository_path: String, target_path: String) -> Result<bool, String> {
+    let repository_path = resolve_target_repository(&repository_path, &target_path)?;
+    validate_path(&repository_path)?;
+    let repo = internal_repository(&repository_path)?;
+    Ok(repo.state() == git2::RepositoryState::Merge)
 }
 
 #[tauri::command]
@@ -1750,9 +1774,55 @@ pub fn pop_stash(repository_path: String) -> Result<(), String> {
     validate_path(&repository_path)?;
     let mut repo = internal_repository(&repository_path)?;
     let mut options = git2::StashApplyOptions::new();
-    repo.stash_pop(0, Some(&mut options)).map_err(|error| format!("Cannot restore stashed work: {}", error.message()))?;
+    // `stash_pop` (apply + drop) drops the stash entry unconditionally on a
+    // successful *apply* — but libgit2 considers merge-style conflict markers
+    // written into the index/workdir a successful apply, not a failure. Doing
+    // apply and drop as two separate steps, only dropping when the apply left
+    // no conflicts, mirrors the real `git stash pop` CLI's own safety net: a
+    // conflicted pop keeps the stash entry around (the change is now merged
+    // into the working tree either way, conflicted or not) so nothing is
+    // silently lost if the conflict resolution is abandoned instead of
+    // finished.
+    repo.stash_apply(0, Some(&mut options)).map_err(|error| format!("Cannot restore stashed work: {}", error.message()))?;
+    invalidate_git_metadata(&repository_path);
+    let has_conflicts = repo.index().map(|index| index.has_conflicts()).unwrap_or(false);
+    if !has_conflicts { repo.stash_drop(0).map_err(|error| format!("Restored, but could not drop the stash entry: {}", error.message()))?; }
+    Ok(())
+}
+
+// Discards a stash pop's conflict markers (working tree + index reset to
+// HEAD) without touching the stash list — used when the user backs out of
+// resolving a stash conflict instead of finishing it. Since `pop_stash` only
+// drops the stash entry on a clean apply, the stashed change is still there
+// to try again (or to pop and resolve differently) afterward.
+#[tauri::command]
+pub fn abort_stash_conflict(repository_path: String) -> Result<(), String> {
+    validate_path(&repository_path)?;
+    let repo = internal_repository(&repository_path)?;
+    let head_commit = repo.head().map_err(|error| error.message().to_string())?.peel_to_commit().map_err(|error| error.message().to_string())?;
+    let mut checkout = git2::build::CheckoutBuilder::new(); checkout.force();
+    repo.reset(head_commit.as_object(), git2::ResetType::Hard, Some(&mut checkout)).map_err(|error| error.message().to_string())?;
     invalidate_git_metadata(&repository_path);
     Ok(())
+}
+
+// Lists the files a specific stash entry would bring back — so "what's in
+// this stash?" can be answered before popping it, not just after.
+#[tauri::command]
+pub fn stash_entry_files(repository_path: String, stash_index: usize) -> Result<Vec<String>, String> {
+    validate_path(&repository_path)?;
+    let repo = internal_repository(&repository_path)?;
+    let mut target_oid = None;
+    let mut repo_for_walk = internal_repository(&repository_path)?;
+    repo_for_walk.stash_foreach(|index, _, oid| { if index == stash_index { target_oid = Some(*oid); } true }).map_err(|error| error.message().to_string())?;
+    let stash_oid = target_oid.ok_or("That stash entry no longer exists")?;
+    let stash_commit = repo.find_commit(stash_oid).map_err(|error| error.message().to_string())?;
+    let stash_tree = stash_commit.tree().map_err(|error| error.message().to_string())?;
+    // Parent 0 is the commit the stash was based on (HEAD at stash time) —
+    // diffing against it gives exactly the files this stash would change.
+    let base_tree = stash_commit.parent(0).and_then(|commit| commit.tree()).ok();
+    let diff = repo.diff_tree_to_tree(base_tree.as_ref(), Some(&stash_tree), None).map_err(|error| error.message().to_string())?;
+    Ok(diff.deltas().filter_map(|delta| delta.new_file().path().or_else(|| delta.old_file().path()).map(normalized)).collect())
 }
 
 #[tauri::command]
@@ -2216,6 +2286,7 @@ mod tests {
         assert_eq!(outcome.conflicts[0].path, "a.txt");
         let repo = Repository::open(&repository).unwrap();
         assert_eq!(repo.state(), git2::RepositoryState::Merge);
+        assert!(merge_in_progress(path.clone(), "".into()).unwrap(), "a real merge conflict should report merge_in_progress");
         let on_disk = fs::read_to_string(repository.join("a.txt")).unwrap();
         assert!(on_disk.contains("<<<<<<<"), "conflict markers should be written to disk");
 
@@ -2325,6 +2396,57 @@ mod tests {
         assert!(load_repository(path).unwrap().changes.is_empty(), "nothing should be left pending after committing the whole repository");
 
         fs::remove_dir_all(repository).unwrap();
+    }
+
+    #[test]
+    fn fetch_all_remotes_updates_every_configured_remote_not_just_the_first() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-fetch-all-{suffix}"));
+        let repository = base.join("main");
+        let origin_remote = base.join("origin.git");
+        let upstream_remote = base.join("upstream.git");
+        fs::create_dir_all(&repository).unwrap();
+        fs::write(repository.join("a.txt"), "one").unwrap();
+        run_git(&repository, &["init"]);
+        run_git(&repository, &["config", "user.email", "test@example.com"]);
+        run_git(&repository, &["config", "user.name", "Test User"]);
+        run_git(&repository, &["add", "."]);
+        run_git(&repository, &["commit", "-m", "Initial commit"]);
+        run_git(&base, &["init", "--bare", "origin.git"]);
+        run_git(&base, &["init", "--bare", "upstream.git"]);
+        run_git(&repository, &["remote", "add", "origin", origin_remote.to_str().unwrap()]);
+        run_git(&repository, &["remote", "add", "upstream", upstream_remote.to_str().unwrap()]);
+        run_git(&repository, &["push", "origin", "main"]);
+        run_git(&repository, &["push", "upstream", "main"]);
+
+        // Simulate someone else pushing directly to each bare remote, so a
+        // fetch is the only way this checkout would find out about them.
+        let clone_origin = base.join("clone-origin");
+        run_git(&base, &["clone", origin_remote.to_str().unwrap(), clone_origin.to_str().unwrap()]);
+        run_git(&clone_origin, &["config", "user.email", "test@example.com"]);
+        run_git(&clone_origin, &["config", "user.name", "Test User"]);
+        fs::write(clone_origin.join("a.txt"), "from origin").unwrap();
+        run_git(&clone_origin, &["commit", "-am", "New on origin"]);
+        run_git(&clone_origin, &["push", "origin", "main"]);
+
+        let clone_upstream = base.join("clone-upstream");
+        run_git(&base, &["clone", upstream_remote.to_str().unwrap(), clone_upstream.to_str().unwrap()]);
+        run_git(&clone_upstream, &["config", "user.email", "test@example.com"]);
+        run_git(&clone_upstream, &["config", "user.name", "Test User"]);
+        fs::write(clone_upstream.join("a.txt"), "from upstream").unwrap();
+        run_git(&clone_upstream, &["commit", "-am", "New on upstream"]);
+        run_git(&clone_upstream, &["push", "origin", "main"]);
+
+        let path = repository.to_string_lossy().into_owned();
+        fetch_all_remotes(path.clone()).unwrap();
+        let origin_head = git(&path, &["rev-parse", "refs/remotes/origin/main"]).unwrap().trim().to_string();
+        let upstream_head = git(&path, &["rev-parse", "refs/remotes/upstream/main"]).unwrap().trim().to_string();
+        let expected_origin = git(clone_origin.to_str().unwrap(), &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+        let expected_upstream = git(clone_upstream.to_str().unwrap(), &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+        assert_eq!(origin_head, expected_origin, "origin should be up to date after fetch-all");
+        assert_eq!(upstream_head, expected_upstream, "upstream should be up to date after fetch-all too, not just the first remote");
+
+        fs::remove_dir_all(base).unwrap();
     }
 
     #[test]
@@ -2465,6 +2587,96 @@ mod tests {
 
         pop_stash(path.clone()).unwrap();
         assert_eq!(fs::read_to_string(repository.join("a.txt")).unwrap(), "two", "popping the stash should bring a.txt's edit back");
+
+        fs::remove_dir_all(repository).unwrap();
+    }
+
+    #[test]
+    fn popping_a_conflicting_stash_keeps_the_entry_until_resolved_and_finished() {
+        // Reported: "Conflicts while restoring stash. Resolve manually." with
+        // no way to see what the stash contained or actually resolve it.
+        // libgit2's stash_pop drops the stash entry on any *successful apply*
+        // — but it treats conflict markers written into the index/workdir as
+        // a successful apply, so the old implementation (apply+drop as one
+        // call) silently discarded the stash even when conflicted, with no
+        // way to recover it if the user backed out. This verifies the fix:
+        // the entry survives a conflicted pop, resolving it via the normal
+        // conflict tools clears it, and only then is the stash actually gone.
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let repository = std::env::temp_dir().join(format!("git-integrity-stash-conflict-{suffix}"));
+        fs::create_dir_all(&repository).unwrap();
+        fs::write(repository.join("a.txt"), "base\n").unwrap();
+        run_git(&repository, &["init"]);
+        run_git(&repository, &["config", "user.email", "test@example.com"]);
+        run_git(&repository, &["config", "user.name", "Test User"]);
+        run_git(&repository, &["add", "."]);
+        run_git(&repository, &["commit", "-m", "Initial commit"]);
+        let path = repository.to_string_lossy().into_owned();
+
+        fs::write(repository.join("a.txt"), "stashed version\n").unwrap();
+        stash_changes(path.clone()).unwrap();
+        fs::write(repository.join("a.txt"), "conflicting new version\n").unwrap();
+        run_git(&repository, &["commit", "-am", "Conflicting commit"]);
+
+        pop_stash(path.clone()).unwrap();
+        let conflicts = list_conflicts(path.clone(), "".into()).unwrap();
+        assert_eq!(conflicts.len(), 1, "a.txt should be listed as conflicted");
+        assert!(!merge_in_progress(path.clone(), "".into()).unwrap(), "a stash-pop conflict must not be mistaken for a real merge in progress");
+        assert!(load_repository(path.clone()).unwrap().stashes.len() == 1, "the stash entry must survive a conflicted pop, not be silently dropped");
+
+        resolve_conflict(path.clone(), "".into(), "a.txt".into(), "theirs".into()).unwrap();
+        assert!(list_conflicts(path.clone(), "".into()).unwrap().is_empty(), "resolving the only conflict should clear the list");
+        assert_eq!(fs::read_to_string(repository.join("a.txt")).unwrap(), "stashed version\n", "resolving to 'theirs' should keep the stashed content");
+
+        fs::remove_dir_all(repository).unwrap();
+    }
+
+    #[test]
+    fn aborting_a_stash_conflict_restores_head_and_keeps_the_stash_for_another_try() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let repository = std::env::temp_dir().join(format!("git-integrity-stash-conflict-abort-{suffix}"));
+        fs::create_dir_all(&repository).unwrap();
+        fs::write(repository.join("a.txt"), "base\n").unwrap();
+        run_git(&repository, &["init"]);
+        run_git(&repository, &["config", "user.email", "test@example.com"]);
+        run_git(&repository, &["config", "user.name", "Test User"]);
+        run_git(&repository, &["add", "."]);
+        run_git(&repository, &["commit", "-m", "Initial commit"]);
+        let path = repository.to_string_lossy().into_owned();
+
+        fs::write(repository.join("a.txt"), "stashed version\n").unwrap();
+        stash_changes(path.clone()).unwrap();
+        fs::write(repository.join("a.txt"), "conflicting new version\n").unwrap();
+        run_git(&repository, &["commit", "-am", "Conflicting commit"]);
+        pop_stash(path.clone()).unwrap();
+
+        abort_stash_conflict(path.clone()).unwrap();
+        assert!(list_conflicts(path.clone(), "".into()).unwrap().is_empty(), "aborting should clear the conflict");
+        assert_eq!(fs::read_to_string(repository.join("a.txt")).unwrap(), "conflicting new version\n", "the working tree should be back to HEAD, not left half-merged");
+        assert_eq!(load_repository(path.clone()).unwrap().stashes.len(), 1, "the stash itself must still be there to try again");
+
+        fs::remove_dir_all(repository).unwrap();
+    }
+
+    #[test]
+    fn stash_entry_files_lists_what_a_stash_would_change() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let repository = std::env::temp_dir().join(format!("git-integrity-stash-file-list-{suffix}"));
+        fs::create_dir_all(&repository).unwrap();
+        fs::write(repository.join("a.txt"), "one").unwrap();
+        fs::write(repository.join("b.txt"), "one").unwrap();
+        run_git(&repository, &["init"]);
+        run_git(&repository, &["config", "user.email", "test@example.com"]);
+        run_git(&repository, &["config", "user.name", "Test User"]);
+        run_git(&repository, &["add", "."]);
+        run_git(&repository, &["commit", "-m", "Initial commit"]);
+        let path = repository.to_string_lossy().into_owned();
+
+        fs::write(repository.join("a.txt"), "two").unwrap();
+        stash_file(path.clone(), "a.txt".into()).unwrap();
+
+        let files = stash_entry_files(path.clone(), 0).unwrap();
+        assert_eq!(files, vec!["a.txt".to_string()], "only a.txt was stashed — b.txt was never touched");
 
         fs::remove_dir_all(repository).unwrap();
     }

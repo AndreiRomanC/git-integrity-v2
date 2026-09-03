@@ -65,7 +65,7 @@ const refs = {
   commanderView: $('#commanderView'), commanderRows: $('#commanderRows'), commanderBreadcrumbs: $('#commanderBreadcrumbs'), remoteRef: $('#remoteRef'), compareDialog: $('#compareDialog'), compareTitle: $('#compareTitle'), compareSubtitle: $('#compareSubtitle'), localCompare: $('#localCompare'), remoteCompare: $('#remoteCompare'),
   remotesView: $('#remotesView'), remoteCards: $('#remoteCards'), editorDialog: $('#editorDialog'), editorTitle: $('#editorTitle'), editorPath: $('#editorPath'), editorContent: $('#editorContent'), locationRepository: $('#locationRepository'), locationBranch: $('#locationBranch'), locationPath: $('#locationPath'), leaveSubmoduleGraph: $('#leaveSubmoduleGraph'), publishDialog: $('#publishDialog'), publishBranch: $('#publishBranch'), publishRemote: $('#publishRemote'), publishCommits: $('#publishCommits'), publishSummary: $('#publishSummary'), publishDestination: $('#publishDestination'), publishBadge: $('#publishBadge'), publishSubtitle: $('#publishSubtitle'), cloneDialog: $('#cloneDialog'), cloneUrl: $('#cloneUrl'), cloneParent: $('#cloneParent'), cloneName: $('#cloneName'), confirmClone: $('#confirmClone'), submoduleDialog: $('#submoduleDialog'), submoduleUrl: $('#submoduleUrl'), submoduleParent: $('#submoduleParent'), submoduleName: $('#submoduleName'), submoduleUsername: $('#submoduleUsername'), submoduleToken: $('#submoduleToken'), submoduleAddStatus: $('#submoduleAddStatus'), confirmAddSubmodule: $('#confirmAddSubmodule'), operationToast: $('#operationToast'), drawerScopeTitle: $('#drawerScopeTitle'),
   mergeBranchDialog: $('#mergeBranchDialog'), mergeBranchSubtitle: $('#mergeBranchSubtitle'), mergeBranchCurrent: $('#mergeBranchCurrent'), mergeBranchSource: $('#mergeBranchSource'), mergeBranchStatus: $('#mergeBranchStatus'), confirmMergeBranch: $('#confirmMergeBranch'),
-  conflictsDialog: $('#conflictsDialog'), conflictsSubtitle: $('#conflictsSubtitle'), conflictsList: $('#conflictsList'), conflictsCommitMessage: $('#conflictsCommitMessage'), conflictsStatus: $('#conflictsStatus'), confirmCompleteMerge: $('#confirmCompleteMerge'), abortMergeButton: $('#abortMerge'),
+  conflictsDialog: $('#conflictsDialog'), conflictsTitle: $('#conflictsTitle'), conflictsSubtitle: $('#conflictsSubtitle'), conflictsList: $('#conflictsList'), conflictsCommitMessage: $('#conflictsCommitMessage'), conflictsCommitMessageLabel: $('#conflictsCommitMessageLabel'), conflictsLocalNote: $('#conflictsLocalNote'), conflictsStatus: $('#conflictsStatus'), confirmCompleteMerge: $('#confirmCompleteMerge'), abortMergeButton: $('#abortMerge'),
   mergeConflictsBanner: $('#mergeConflictsBanner'), mergeConflictsSubtitle: $('#mergeConflictsSubtitle')
 };
 
@@ -818,8 +818,19 @@ function renderConflictsList(target, conflicts) {
 
 function openConflictsDialog(target, conflicts, introMessage) {
   state.mergeTarget = target;
-  refs.conflictsSubtitle.textContent = introMessage || `${conflicts.length} file${conflicts.length === 1 ? '' : 's'} need resolution before the merge can be completed.`;
+  const isStash = target.kind === 'stash';
+  refs.conflictsTitle.textContent = isStash ? 'Stash conflicts' : 'Merge conflicts';
+  refs.conflictsSubtitle.textContent = introMessage || (isStash
+    ? `${conflicts.length} file${conflicts.length === 1 ? '' : 's'} need resolution before the stashed changes are fully applied.`
+    : `${conflicts.length} file${conflicts.length === 1 ? '' : 's'} need resolution before the merge can be completed.`);
+  // A stash pop needs no merge commit — the resolved content just becomes
+  // your regular working-tree changes, ready for your next normal commit —
+  // so there's nothing to type a message for here.
+  refs.conflictsCommitMessageLabel.hidden = isStash;
+  refs.conflictsLocalNote.hidden = isStash;
   refs.conflictsCommitMessage.value = target.isSubmodule ? `Merge into ${target.label}` : `Merge into ${state.repository.current_branch}`;
+  refs.confirmCompleteMerge.textContent = isStash ? 'Done' : 'Complete merge';
+  refs.abortMergeButton.textContent = isStash ? 'Discard and keep the stash' : 'Abort merge';
   refs.conflictsStatus.textContent = '';
   renderConflictsList(target, conflicts);
   refs.conflictsDialog.showModal();
@@ -829,7 +840,10 @@ async function refreshConflictsDialog(target) {
   try {
     const conflicts = await invoke('list_conflicts', { repositoryPath: state.repository.path, targetPath: target.targetPath });
     renderConflictsList(target, conflicts);
-    refs.conflictsSubtitle.textContent = conflicts.length ? `${conflicts.length} file${conflicts.length === 1 ? '' : 's'} still need resolution.` : 'All conflicts resolved — ready to complete the merge.';
+    const isStash = target.kind === 'stash';
+    refs.conflictsSubtitle.textContent = conflicts.length
+      ? `${conflicts.length} file${conflicts.length === 1 ? '' : 's'} still need resolution.`
+      : (isStash ? 'All conflicts resolved — the stashed changes are now in your working tree.' : 'All conflicts resolved — ready to complete the merge.');
     await checkForMergeConflicts();
   } catch (error) { handleError(error); }
 }
@@ -858,7 +872,21 @@ function editConflictFile(target, path) {
 }
 
 refs.confirmCompleteMerge.addEventListener('click', async () => {
-  const target = state.mergeTarget; const message = refs.conflictsCommitMessage.value.trim();
+  const target = state.mergeTarget;
+  if (target.kind === 'stash') {
+    // No merge commit to make here — just confirm nothing is still
+    // conflicted before letting the user walk away with it.
+    try {
+      const conflicts = await invoke('list_conflicts', { repositoryPath: state.repository.path, targetPath: target.targetPath });
+      if (conflicts.length) { refs.conflictsStatus.textContent = `${conflicts.length} file${conflicts.length === 1 ? '' : 's'} still need resolution first.`; return; }
+      refs.conflictsDialog.close();
+      const msg = 'Stash conflicts resolved — the changes are in your working tree, ready to commit.';
+      status(msg); showOperationToast(msg, 'success');
+      await refreshAfterMerge();
+    } catch (error) { refs.conflictsStatus.textContent = String(error); }
+    return;
+  }
+  const message = refs.conflictsCommitMessage.value.trim();
   if (!message) { refs.conflictsStatus.textContent = 'A merge commit message is required.'; return; }
   refs.confirmCompleteMerge.disabled = true; refs.confirmCompleteMerge.textContent = 'Completing…';
   try {
@@ -868,11 +896,22 @@ refs.confirmCompleteMerge.addEventListener('click', async () => {
     status(msg); showOperationToast(msg, 'success');
     await refreshAfterMerge();
   } catch (error) { refs.conflictsStatus.textContent = String(error); }
-  finally { refs.confirmCompleteMerge.disabled = false; refs.confirmCompleteMerge.textContent = 'Complete merge'; }
+  finally { refs.confirmCompleteMerge.disabled = false; refs.confirmCompleteMerge.textContent = target.kind === 'stash' ? 'Done' : 'Complete merge'; }
 });
 
 refs.abortMergeButton.addEventListener('click', async () => {
   const target = state.mergeTarget;
+  if (target.kind === 'stash') {
+    if (!await customConfirm('Discard the conflict markers and restore your last commit? The stashed change stays in the stash list — nothing is lost, you can pop it again (or resolve it differently) later.', { title: 'Discard stash conflict', danger: true, okLabel: 'Discard' })) return;
+    try {
+      await invoke('abort_stash_conflict', { repositoryPath: state.repository.path });
+      refs.conflictsDialog.close();
+      const msg = 'Discarded — your working tree is back to normal, and the stash is still there.';
+      status(msg); showOperationToast(msg, 'success');
+      await refreshAfterMerge(); state.hasStash = true; updateStashUI();
+    } catch (error) { handleError(error); }
+    return;
+  }
   if (!await customConfirm('Abort this merge? All conflict resolutions made so far will be discarded and the repository will return to its pre-merge state.', { title: 'Abort merge', danger: true, okLabel: 'Abort merge' })) return;
   try {
     await invoke('abort_merge', { repositoryPath: state.repository.path, targetPath: target.targetPath });
@@ -890,12 +929,20 @@ async function checkForMergeConflicts() {
   try {
     const conflicts = await invoke('list_conflicts', { repositoryPath: state.repository.path, targetPath: '' });
     refs.mergeConflictsBanner.hidden = conflicts.length === 0;
-    refs.mergeConflictsSubtitle.textContent = `${conflicts.length} file${conflicts.length === 1 ? '' : 's'} to resolve`;
+    if (conflicts.length) {
+      // The same conflicted-index state can come from a real merge or from a
+      // stash pop that couldn't apply cleanly — they need different finishing
+      // steps (a merge commit vs. nothing at all), so which one this banner
+      // means has to be checked, not assumed.
+      const inMerge = await invoke('merge_in_progress', { repositoryPath: state.repository.path, targetPath: '' }).catch(() => true);
+      state.pendingConflictsKind = inMerge ? 'merge' : 'stash';
+      refs.mergeConflictsSubtitle.textContent = `${conflicts.length} file${conflicts.length === 1 ? '' : 's'} to resolve${inMerge ? '' : ' (from a stash)'}`;
+    }
     state.pendingMainConflicts = conflicts;
   } catch { refs.mergeConflictsBanner.hidden = true; }
 }
 
-refs.mergeConflictsBanner.addEventListener('click', () => openConflictsDialog(mergeTargetForMain(), state.pendingMainConflicts || []));
+refs.mergeConflictsBanner.addEventListener('click', () => openConflictsDialog({ ...mergeTargetForMain(), kind: state.pendingConflictsKind || 'merge' }, state.pendingMainConflicts || []));
 $('#mergeCurrent').addEventListener('click', () => state.repository && openMergeBranchDialog(mergeTargetForMain()));
 
 async function forcePushSubmodule(entry) {
@@ -1133,6 +1180,12 @@ function renderRemotes() {
 
 async function loadRemotes() { state.view = 'remotes'; refs.search.value = ''; clearDetails('Remote configuration'); if (invoke) { try { state.remotes = await invoke('list_remotes', { repositoryPath: state.repository.path }); } catch (error) { handleError(error); } } else state.remotes = [{ name: 'origin', fetch_url: 'git@example.com:vehicle-control.git', push_url: 'git@example.com:vehicle-control.git' }]; render(); }
 async function fetchRemote(name) { try { status(`Fetching ${name}…`, 'busy'); await invoke('fetch_remote', { repositoryPath: state.repository.path, remote: name }); await loadRepository(state.repository.path); await loadRemotes(); status(`${name} updated`); } catch (error) { handleError(error); } }
+async function fetchAllRemotes() {
+  if (!state.repository) return;
+  if (!invoke) return status('Preview: fetched all remotes');
+  try { status('Fetching every remote…', 'busy'); await invoke('fetch_all_remotes', { repositoryPath: state.repository.path }); await loadRepository(state.repository.path); await loadRemotes(); const msg = `${state.remotes.length} remote${state.remotes.length === 1 ? '' : 's'} updated`; status(msg); showOperationToast(msg, 'success'); }
+  catch (error) { handleError(error); }
+}
 
 async function stashWork() {
   if (!state.repository) return;
@@ -1160,8 +1213,23 @@ async function stashOneFile(path) {
 async function popStash() {
   if (!state.repository || !state.hasStash) return;
   if (!invoke) { state.hasStash = false; updateStashUI(); status('Preview: stash restored'); return; }
-  try { status('Restoring stashed work…', 'busy'); await invoke('pop_stash', { repositoryPath: state.repository.path }); state.hasStash = false; updateStashUI(); await loadRepository(state.repository.path); await openDirectory(state.currentPath, { force: true }); status('Stashed work restored'); }
-  catch (error) { const msg = String(error); status(msg, 'error'); if (msg.includes('conflict')) showOperationToast('Conflicts while restoring stash. Resolve manually.', 'error'); }
+  try {
+    status('Restoring stashed work…', 'busy');
+    await invoke('pop_stash', { repositoryPath: state.repository.path });
+    await loadRepository(state.repository.path); await openDirectory(state.currentPath, { force: true });
+    // pop_stash succeeds even when it left conflict markers behind (that's
+    // real git behavior too — a conflicted pop isn't an "error", it just
+    // needs finishing) — check the index directly rather than trust a
+    // resolved promise to mean it's actually done.
+    const conflicts = await invoke('list_conflicts', { repositoryPath: state.repository.path, targetPath: '' });
+    if (conflicts.length) {
+      const msg = `Restored, but ${conflicts.length} file${conflicts.length === 1 ? '' : 's'} conflicted — resolve them below.`;
+      status(msg, 'error'); showOperationToast(msg, 'error');
+      openConflictsDialog({ targetPath: '', label: state.repository.current_branch, isSubmodule: false, kind: 'stash' }, conflicts);
+      return;
+    }
+    status('Stashed work restored');
+  } catch (error) { handleError(error); }
 }
 
 function updateStashUI() { $('#stashWork').hidden = state.hasStash; $('#popStash').hidden = !state.hasStash; }
@@ -1328,7 +1396,10 @@ function renderGraph() {
   const rows = commits.map((commit, index) => {
     const node = model[index]; const color = palette[node.lane % palette.length];
     const stashPills = (stashesByBase.get(commit.id) || []).map(stash => `<b class="stash-pill" data-toggle-stash="${stash.index}" data-tooltip="stash@{${stash.index}} — click for details">⇕ stash</b>`).join('');
-    const stashDetails = (stashesByBase.get(commit.id) || []).map(stash => `<div class="stash-internals" data-stash-detail="${stash.index}" hidden>stash@{${stash.index}}: ${esc(stash.message.replace(/^WIP on [^:]+:\s*[0-9a-f]+\s*/, 'WIP on ') || 'Saved work')} — bundles working-tree changes, staged index${stash.message.includes('untracked') ? ', untracked files' : ''}</div>`).join('');
+    const stashDetails = (stashesByBase.get(commit.id) || []).map(stash => `<div class="stash-internals" data-stash-detail="${stash.index}" hidden>
+      <div>stash@{${stash.index}}: ${esc(stash.message.replace(/^WIP on [^:]+:\s*[0-9a-f]+\s*/, 'WIP on ') || 'Saved work')} — bundles working-tree changes, staged index${stash.message.includes('untracked') ? ', untracked files' : ''}</div>
+      <div class="stash-file-list" data-stash-file-list="${stash.index}"></div>
+    </div>`).join('');
     const ahead = aheadAnnotations.get(index);
     const isBranchPoint = branchPointRows.has(index);
 
@@ -1344,7 +1415,24 @@ function renderGraph() {
 
   refs.graph.innerHTML = `<svg class="graph-overlay"></svg>` + rows;
   refs.graph.querySelectorAll('.commit-row[data-id]').forEach(row => row.addEventListener('click', () => selectCommit(row.dataset.id)));
-  refs.graph.querySelectorAll('[data-toggle-stash]').forEach(pill => pill.addEventListener('click', event => { event.stopPropagation(); pill.closest('.commit-card').parentElement.querySelector(`[data-stash-detail="${pill.dataset.toggleStash}"]`)?.toggleAttribute('hidden'); }));
+  refs.graph.querySelectorAll('[data-toggle-stash]').forEach(pill => pill.addEventListener('click', event => {
+    event.stopPropagation();
+    const index = pill.dataset.toggleStash;
+    const detail = pill.closest('.commit-card').parentElement.querySelector(`[data-stash-detail="${index}"]`);
+    if (!detail) return;
+    detail.toggleAttribute('hidden');
+    const fileList = detail.querySelector(`[data-stash-file-list="${index}"]`);
+    // Load the file list lazily, only the first time this stash is expanded
+    // — "what's actually in there?" answered without needing to pop it first.
+    if (!detail.hidden && fileList && !fileList.dataset.loaded) {
+      fileList.dataset.loaded = '1';
+      fileList.innerHTML = '<i class="spinner"></i>';
+      if (!invoke) { fileList.innerHTML = '<div class="stash-file">preview.txt</div>'; return; }
+      invoke('stash_entry_files', { repositoryPath: state.repository.path, stashIndex: Number(index) })
+        .then(files => { fileList.innerHTML = files.length ? files.map(file => `<div class="stash-file">${esc(file)}</div>`).join('') : '<div class="stash-file">(no files — this stash is empty)</div>'; })
+        .catch(error => { fileList.innerHTML = `<div class="stash-file">${esc(String(error))}</div>`; });
+    }
+  }));
   if (commits.length) drawGraphOverlay(model, lanesWidth);
 }
 
@@ -1612,6 +1700,7 @@ refs.leaveSubmoduleGraph.addEventListener('click', leaveSubmoduleGraph);
 $('#saveFile').addEventListener('click', saveEditor); $('#closeEditor').addEventListener('click', () => refs.editorDialog.close()); $('#cancelEditor').addEventListener('click', () => refs.editorDialog.close());
 refs.editorContent.addEventListener('input', updateEditorSaveState);
 $('#fetchCurrent').addEventListener('click', () => { const first = state.remotes[0]?.name || state.branches.find(branch => branch.remote)?.name.split('/')[0]; if (first) fetchRemote(first); else status('No remote is configured', 'error'); });
+$('#fetchAll').addEventListener('click', () => fetchAllRemotes());
 async function syncCurrent(action) {
   if (!invoke || !state.repository) return;
   try { status(`${action === 'pull' ? 'Pulling' : 'Pushing'} ${state.repository.current_branch}…`, 'busy'); await invoke('sync_repository', { repositoryPath: state.repository.path, action }); await loadRepository(state.repository.path); status(`${action === 'pull' ? 'Pull' : 'Push'} complete`); }
@@ -1698,6 +1787,7 @@ function buildCommands() {
     { id: 'pull', name: 'Pull Current Branch', description: 'Fetch and fast-forward the current branch from the server', keys: '', tags: ['explorer', 'graph'], fn: () => $('#pullCurrent').click() },
     { id: 'merge', name: 'Merge Branch…', description: 'Bring another branch\'s commits into your current one — stays local, resolves conflicts here if any', keys: '', keywords: 'combine join', tags: ['explorer', 'graph'], fn: () => state.repository && openMergeBranchDialog(mergeTargetForMain()) },
     { id: 'fetch', name: 'Fetch Remote', description: 'Download new commits/refs from the server without changing your branch', keys: 'Ctrl+Shift+F', tags: ['explorer', 'graph'], fn: () => $('#fetchCurrent').click() },
+    { id: 'fetchall', name: 'Fetch All Remotes', description: 'Download new commits/refs from every configured remote, not just the first one', keywords: 'multiple upstream mirror', tags: ['explorer', 'graph'], fn: () => fetchAllRemotes() },
     { id: 'stash', name: 'Stash Work in Progress', description: 'Temporarily set aside uncommitted changes, restore them later', keys: 'Ctrl+Shift+S', tags: ['explorer'], fn: stashWork },
     { id: 'pop', name: 'Restore Stashed Work', description: 'Bring back the changes you last stashed', keys: '', tags: ['explorer'], fn: popStash },
     { id: 'conflicts', name: 'Resolve Merge Conflicts', description: 'Open the conflict resolution dialog for a merge in progress', keys: '', keywords: 'merge conflict resolve', tags: state.pendingMainConflicts?.length ? ['explorer', 'graph', 'relevant'] : [], fn: () => openConflictsDialog(mergeTargetForMain(), state.pendingMainConflicts || []) },
