@@ -347,7 +347,8 @@
         </details>
         <details>
           <summary>Stash</summary>
-          <p>The stash is a temporary holding area — changes you put there are set aside and won't be part of any commit until you bring them back. "Stash work" (top toolbar) sets aside <i>everything</i> uncommitted, leaving your working folder clean — useful for switching tasks without committing half-finished work. "Pop stash" brings it all back.</p>
+          <p>The stash is a temporary holding area — changes you put there are set aside and won't be part of any commit until you bring them back. "Stash work" (top toolbar) sets aside <i>everything</i> uncommitted, leaving your working folder clean — useful for switching tasks without committing half-finished work.</p>
+          <p>"Pop stash" opens the full Stashes list — every entry, with the files it contains, and a "Pop" (bring it back) or "Drop" (discard it for good) button on each. Nothing is guessed or hidden: pick exactly the one you want.</p>
           <p>To set aside just <i>one</i> file instead of everything, use the "⇕ Stash" button next to it in the Working tree drawer, or "⇕ Stash this file" in that file's own details panel (select it in Explorer to see it) — either way, only that file is stashed; every other change stays untouched.</p>
           <p>Stashes show up as small ⇕ markers in the Branch Map on the commit they were based on, not as real history — click one to expand it and see exactly which files it contains, before you decide to bring it back.</p>
           <p>If "Pop stash" can't apply cleanly (the file changed since you stashed it), it doesn't fail or lose anything — it opens the same conflict-resolution dialog used for merges, and the stash itself is kept until you finish (or explicitly discard and keep it for later).</p>
@@ -363,6 +364,13 @@
         </details>
       </div>
       <footer><button value="cancel" class="confirm">Close</button></footer>
+    </form>
+  </dialog>
+  <dialog id="stashesDialog" class="publish-dialog">
+    <form method="dialog">
+      <header><div><h2>Stashes</h2><p>Changes set aside temporarily — pick one to bring back, or drop it if you don't need it.</p></div><button value="cancel">×</button></header>
+      <div id="stashesList" class="conflicts-list"></div>
+      <footer><span style="flex:1"></span><button value="cancel">Close</button></footer>
     </form>
   </dialog>
   <script src="app.js"></script>

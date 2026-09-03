@@ -1770,7 +1770,7 @@ pub fn stash_file(repository_path: String, relative_path: String) -> Result<(), 
 }
 
 #[tauri::command]
-pub fn pop_stash(repository_path: String) -> Result<(), String> {
+pub fn pop_stash(repository_path: String, stash_index: usize) -> Result<(), String> {
     validate_path(&repository_path)?;
     let mut repo = internal_repository(&repository_path)?;
     let mut options = git2::StashApplyOptions::new();
@@ -1782,11 +1782,23 @@ pub fn pop_stash(repository_path: String) -> Result<(), String> {
     // conflicted pop keeps the stash entry around (the change is now merged
     // into the working tree either way, conflicted or not) so nothing is
     // silently lost if the conflict resolution is abandoned instead of
-    // finished.
-    repo.stash_apply(0, Some(&mut options)).map_err(|error| format!("Cannot restore stashed work: {}", error.message()))?;
+    // finished. Popping anything other than index 0 (not just the most
+    // recent stash) lets the Stashes list restore a specific entry directly.
+    repo.stash_apply(stash_index, Some(&mut options)).map_err(|error| format!("Cannot restore stashed work: {}", error.message()))?;
     invalidate_git_metadata(&repository_path);
     let has_conflicts = repo.index().map(|index| index.has_conflicts()).unwrap_or(false);
-    if !has_conflicts { repo.stash_drop(0).map_err(|error| format!("Restored, but could not drop the stash entry: {}", error.message()))?; }
+    if !has_conflicts { repo.stash_drop(stash_index).map_err(|error| format!("Restored, but could not drop the stash entry: {}", error.message()))?; }
+    Ok(())
+}
+
+// Discards a stash entry without applying it — for when you decide you don't
+// need it after all, from the Stashes list.
+#[tauri::command]
+pub fn drop_stash(repository_path: String, stash_index: usize) -> Result<(), String> {
+    validate_path(&repository_path)?;
+    let mut repo = internal_repository(&repository_path)?;
+    repo.stash_drop(stash_index).map_err(|error| format!("Cannot drop this stash: {}", error.message()))?;
+    invalidate_git_metadata(&repository_path);
     Ok(())
 }
 
@@ -2585,7 +2597,7 @@ mod tests {
         assert_eq!(fs::read_to_string(repository.join("b.txt")).unwrap(), "two", "b.txt's edit must be left alone on disk");
         assert_eq!(data.stashes.len(), 1);
 
-        pop_stash(path.clone()).unwrap();
+        pop_stash(path.clone(), 0).unwrap();
         assert_eq!(fs::read_to_string(repository.join("a.txt")).unwrap(), "two", "popping the stash should bring a.txt's edit back");
 
         fs::remove_dir_all(repository).unwrap();
@@ -2618,7 +2630,7 @@ mod tests {
         fs::write(repository.join("a.txt"), "conflicting new version\n").unwrap();
         run_git(&repository, &["commit", "-am", "Conflicting commit"]);
 
-        pop_stash(path.clone()).unwrap();
+        pop_stash(path.clone(), 0).unwrap();
         let conflicts = list_conflicts(path.clone(), "".into()).unwrap();
         assert_eq!(conflicts.len(), 1, "a.txt should be listed as conflicted");
         assert!(!merge_in_progress(path.clone(), "".into()).unwrap(), "a stash-pop conflict must not be mistaken for a real merge in progress");
@@ -2648,7 +2660,7 @@ mod tests {
         stash_changes(path.clone()).unwrap();
         fs::write(repository.join("a.txt"), "conflicting new version\n").unwrap();
         run_git(&repository, &["commit", "-am", "Conflicting commit"]);
-        pop_stash(path.clone()).unwrap();
+        pop_stash(path.clone(), 0).unwrap();
 
         abort_stash_conflict(path.clone()).unwrap();
         assert!(list_conflicts(path.clone(), "".into()).unwrap().is_empty(), "aborting should clear the conflict");
@@ -2677,6 +2689,42 @@ mod tests {
 
         let files = stash_entry_files(path.clone(), 0).unwrap();
         assert_eq!(files, vec!["a.txt".to_string()], "only a.txt was stashed — b.txt was never touched");
+
+        fs::remove_dir_all(repository).unwrap();
+    }
+
+    #[test]
+    fn stashes_can_be_popped_or_dropped_individually_by_index() {
+        // The Stashes list needs to act on a *specific* entry, not always
+        // "the most recent one" — verifies both pop_stash and drop_stash
+        // take that index seriously rather than always touching index 0.
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let repository = std::env::temp_dir().join(format!("git-integrity-stash-by-index-{suffix}"));
+        fs::create_dir_all(&repository).unwrap();
+        fs::write(repository.join("a.txt"), "one").unwrap();
+        fs::write(repository.join("b.txt"), "one").unwrap();
+        run_git(&repository, &["init"]);
+        run_git(&repository, &["config", "user.email", "test@example.com"]);
+        run_git(&repository, &["config", "user.name", "Test User"]);
+        run_git(&repository, &["add", "."]);
+        run_git(&repository, &["commit", "-m", "Initial commit"]);
+        let path = repository.to_string_lossy().into_owned();
+
+        fs::write(repository.join("a.txt"), "a changed first").unwrap();
+        stash_file(path.clone(), "a.txt".into()).unwrap();
+        fs::write(repository.join("b.txt"), "b changed second").unwrap();
+        stash_file(path.clone(), "b.txt".into()).unwrap();
+        // Most recent stash (index 0) is now the b.txt one; a.txt's is index 1.
+        assert_eq!(stash_entry_files(path.clone(), 0).unwrap(), vec!["b.txt".to_string()]);
+        assert_eq!(stash_entry_files(path.clone(), 1).unwrap(), vec!["a.txt".to_string()]);
+
+        drop_stash(path.clone(), 1).unwrap();
+        assert_eq!(load_repository(path.clone()).unwrap().stashes.len(), 1, "dropping index 1 should leave only the b.txt stash");
+        assert_eq!(fs::read_to_string(repository.join("a.txt")).unwrap(), "one", "dropping never applies the change — a.txt stays at its committed content");
+
+        pop_stash(path.clone(), 0).unwrap();
+        assert_eq!(fs::read_to_string(repository.join("b.txt")).unwrap(), "b changed second", "popping should bring the change back");
+        assert!(load_repository(path.clone()).unwrap().stashes.is_empty(), "the only remaining stash should be gone after a clean pop");
 
         fs::remove_dir_all(repository).unwrap();
     }

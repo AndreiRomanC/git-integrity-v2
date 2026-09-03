@@ -43,6 +43,7 @@ pub fn run() {
             repository::stash_changes,
             repository::stash_file,
             repository::pop_stash,
+            repository::drop_stash,
             repository::abort_stash_conflict,
             repository::stash_entry_files,
             repository::rename_branch,

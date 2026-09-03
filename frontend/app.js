@@ -65,6 +65,7 @@ const refs = {
   commanderView: $('#commanderView'), commanderRows: $('#commanderRows'), commanderBreadcrumbs: $('#commanderBreadcrumbs'), remoteRef: $('#remoteRef'), compareDialog: $('#compareDialog'), compareTitle: $('#compareTitle'), compareSubtitle: $('#compareSubtitle'), localCompare: $('#localCompare'), remoteCompare: $('#remoteCompare'),
   remotesView: $('#remotesView'), remoteCards: $('#remoteCards'), editorDialog: $('#editorDialog'), editorTitle: $('#editorTitle'), editorPath: $('#editorPath'), editorContent: $('#editorContent'), locationRepository: $('#locationRepository'), locationBranch: $('#locationBranch'), locationPath: $('#locationPath'), leaveSubmoduleGraph: $('#leaveSubmoduleGraph'), publishDialog: $('#publishDialog'), publishBranch: $('#publishBranch'), publishRemote: $('#publishRemote'), publishCommits: $('#publishCommits'), publishSummary: $('#publishSummary'), publishDestination: $('#publishDestination'), publishBadge: $('#publishBadge'), publishSubtitle: $('#publishSubtitle'), cloneDialog: $('#cloneDialog'), cloneUrl: $('#cloneUrl'), cloneParent: $('#cloneParent'), cloneName: $('#cloneName'), confirmClone: $('#confirmClone'), submoduleDialog: $('#submoduleDialog'), submoduleUrl: $('#submoduleUrl'), submoduleParent: $('#submoduleParent'), submoduleName: $('#submoduleName'), submoduleUsername: $('#submoduleUsername'), submoduleToken: $('#submoduleToken'), submoduleAddStatus: $('#submoduleAddStatus'), confirmAddSubmodule: $('#confirmAddSubmodule'), operationToast: $('#operationToast'), drawerScopeTitle: $('#drawerScopeTitle'),
   mergeBranchDialog: $('#mergeBranchDialog'), mergeBranchSubtitle: $('#mergeBranchSubtitle'), mergeBranchCurrent: $('#mergeBranchCurrent'), mergeBranchSource: $('#mergeBranchSource'), mergeBranchStatus: $('#mergeBranchStatus'), confirmMergeBranch: $('#confirmMergeBranch'),
+  stashesDialog: $('#stashesDialog'), stashesList: $('#stashesList'),
   conflictsDialog: $('#conflictsDialog'), conflictsTitle: $('#conflictsTitle'), conflictsSubtitle: $('#conflictsSubtitle'), conflictsList: $('#conflictsList'), conflictsCommitMessage: $('#conflictsCommitMessage'), conflictsCommitMessageLabel: $('#conflictsCommitMessageLabel'), conflictsLocalNote: $('#conflictsLocalNote'), conflictsStatus: $('#conflictsStatus'), confirmCompleteMerge: $('#confirmCompleteMerge'), abortMergeButton: $('#abortMerge'),
   mergeConflictsBanner: $('#mergeConflictsBanner'), mergeConflictsSubtitle: $('#mergeConflictsSubtitle')
 };
@@ -1210,12 +1211,42 @@ async function stashOneFile(path) {
   } catch (error) { handleError(error); }
 }
 
-async function popStash() {
+// "Pop stash" opens the full list rather than blindly restoring whatever
+// happens to be most recent — with per-file stash making it common to have
+// several at once, silently guessing which one you meant was the actual
+// complaint ("I can't find the list of stashes anywhere").
+function popStash() {
   if (!state.repository || !state.hasStash) return;
-  if (!invoke) { state.hasStash = false; updateStashUI(); status('Preview: stash restored'); return; }
+  renderStashesList();
+  refs.stashesDialog.showModal();
+}
+
+function renderStashesList() {
+  const stashes = state.stashes || [];
+  refs.stashesList.innerHTML = stashes.map(stash => `<div class="conflict-row stash-entry-row" data-stash-index="${stash.index}">
+    <div class="conflict-head"><span class="conflict-path">stash@{${stash.index}}: ${esc(stash.message.replace(/^WIP on [^:]+:\s*[0-9a-f]+\s*/, 'WIP on ') || 'Saved work')}</span></div>
+    <div class="stash-file-list" data-stash-file-list="${stash.index}"><i class="spinner"></i></div>
+    <div class="conflict-actions">
+      <button data-pop-stash="${stash.index}">⇈ Pop — bring it back</button>
+      <button data-drop-stash="${stash.index}" class="danger-action-soft">✕ Drop — discard it</button>
+    </div>
+  </div>`).join('') || '<div class="empty-change">Nothing set aside right now.</div>';
+  stashes.forEach(stash => {
+    const fileList = refs.stashesList.querySelector(`[data-stash-file-list="${stash.index}"]`);
+    if (!invoke) { fileList.innerHTML = '<div class="stash-file">preview.txt</div>'; return; }
+    invoke('stash_entry_files', { repositoryPath: state.repository.path, stashIndex: stash.index })
+      .then(files => { fileList.innerHTML = files.length ? files.map(file => `<div class="stash-file">${esc(file)}</div>`).join('') : '<div class="stash-file">(no files)</div>'; })
+      .catch(error => { fileList.innerHTML = `<div class="stash-file">${esc(String(error))}</div>`; });
+  });
+  refs.stashesList.querySelectorAll('[data-pop-stash]').forEach(button => button.addEventListener('click', () => popStashEntry(Number(button.dataset.popStash))));
+  refs.stashesList.querySelectorAll('[data-drop-stash]').forEach(button => button.addEventListener('click', () => dropStashEntry(Number(button.dataset.dropStash))));
+}
+
+async function popStashEntry(index) {
+  if (!invoke) { status('Preview: stash restored'); return; }
   try {
     status('Restoring stashed work…', 'busy');
-    await invoke('pop_stash', { repositoryPath: state.repository.path });
+    await invoke('pop_stash', { repositoryPath: state.repository.path, stashIndex: index });
     await loadRepository(state.repository.path); await openDirectory(state.currentPath, { force: true });
     // pop_stash succeeds even when it left conflict markers behind (that's
     // real git behavior too — a conflicted pop isn't an "error", it just
@@ -1225,10 +1256,23 @@ async function popStash() {
     if (conflicts.length) {
       const msg = `Restored, but ${conflicts.length} file${conflicts.length === 1 ? '' : 's'} conflicted — resolve them below.`;
       status(msg, 'error'); showOperationToast(msg, 'error');
+      refs.stashesDialog.close();
       openConflictsDialog({ targetPath: '', label: state.repository.current_branch, isSubmodule: false, kind: 'stash' }, conflicts);
       return;
     }
-    status('Stashed work restored');
+    refs.stashesDialog.close();
+    status('Stashed work restored'); showOperationToast('Stashed work restored', 'success');
+  } catch (error) { handleError(error); }
+}
+
+async function dropStashEntry(index) {
+  if (!await customConfirm('Discard this stash? Its changes are gone for good — this cannot be undone.', { title: 'Drop stash', danger: true, okLabel: 'Drop' })) return;
+  if (!invoke) { status('Preview: stash dropped'); return; }
+  try {
+    await invoke('drop_stash', { repositoryPath: state.repository.path, stashIndex: index });
+    await loadRepository(state.repository.path);
+    renderStashesList();
+    status('Stash dropped');
   } catch (error) { handleError(error); }
 }
 
