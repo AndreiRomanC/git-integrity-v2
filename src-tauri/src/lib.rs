@@ -44,6 +44,7 @@ pub fn run() {
             repository::stash_file,
             repository::pop_stash,
             repository::drop_stash,
+            repository::restore_stash_paths,
             repository::abort_stash_conflict,
             repository::stash_entry_files,
             repository::rename_branch,

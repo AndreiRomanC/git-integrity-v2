@@ -1802,6 +1802,28 @@ pub fn drop_stash(repository_path: String, stash_index: usize) -> Result<(), Str
     Ok(())
 }
 
+// Applies only the chosen files from a stash — not the whole entry. Uses
+// git2's own checkout-path filtering (the same mechanism `stash_apply` uses
+// internally to write the merged result to disk) so it's a real, correct
+// git merge of just those paths, not a hand-rolled diff. The stash entry
+// itself is left exactly as it was — nothing is dropped or rewritten —
+// so restoring a few files first and the rest later is always safe; picking
+// the same file again just re-applies the same (already-matching) content.
+#[tauri::command]
+pub fn restore_stash_paths(repository_path: String, stash_index: usize, paths: Vec<String>) -> Result<(), String> {
+    validate_path(&repository_path)?;
+    if paths.is_empty() { return Err("Select at least one file to restore".into()); }
+    let safe_paths: Vec<PathBuf> = paths.iter().map(|path| safe_relative_path(path)).collect::<Result<_, _>>()?;
+    let mut repo = internal_repository(&repository_path)?;
+    let mut checkout = git2::build::CheckoutBuilder::new();
+    for path in &safe_paths { checkout.path(path); }
+    let mut options = git2::StashApplyOptions::new();
+    options.checkout_options(checkout);
+    repo.stash_apply(stash_index, Some(&mut options)).map_err(|error| format!("Cannot restore the selected files: {}", error.message()))?;
+    invalidate_git_metadata(&repository_path);
+    Ok(())
+}
+
 // Discards a stash pop's conflict markers (working tree + index reset to
 // HEAD) without touching the stash list — used when the user backs out of
 // resolving a stash conflict instead of finishing it. Since `pop_stash` only
@@ -2725,6 +2747,38 @@ mod tests {
         pop_stash(path.clone(), 0).unwrap();
         assert_eq!(fs::read_to_string(repository.join("b.txt")).unwrap(), "b changed second", "popping should bring the change back");
         assert!(load_repository(path.clone()).unwrap().stashes.is_empty(), "the only remaining stash should be gone after a clean pop");
+
+        fs::remove_dir_all(repository).unwrap();
+    }
+
+    #[test]
+    fn restore_stash_paths_applies_only_the_chosen_files_and_leaves_the_rest_stashed() {
+        // Reported: expected to pick individual files (or folders) out of a
+        // stash one at a time, not always all-or-nothing.
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let repository = std::env::temp_dir().join(format!("git-integrity-stash-partial-restore-{suffix}"));
+        fs::create_dir_all(&repository).unwrap();
+        fs::write(repository.join("a.txt"), "one").unwrap();
+        fs::write(repository.join("b.txt"), "one").unwrap();
+        run_git(&repository, &["init"]);
+        run_git(&repository, &["config", "user.email", "test@example.com"]);
+        run_git(&repository, &["config", "user.name", "Test User"]);
+        run_git(&repository, &["add", "."]);
+        run_git(&repository, &["commit", "-m", "Initial commit"]);
+        let path = repository.to_string_lossy().into_owned();
+
+        fs::write(repository.join("a.txt"), "a changed").unwrap();
+        fs::write(repository.join("b.txt"), "b changed").unwrap();
+        stash_changes(path.clone()).unwrap();
+
+        restore_stash_paths(path.clone(), 0, vec!["a.txt".into()]).unwrap();
+        assert_eq!(fs::read_to_string(repository.join("a.txt")).unwrap(), "a changed", "a.txt should be restored");
+        assert_eq!(fs::read_to_string(repository.join("b.txt")).unwrap(), "one", "b.txt was not selected — it must stay untouched, still only in the stash");
+        assert_eq!(load_repository(path.clone()).unwrap().stashes.len(), 1, "the stash entry itself must survive a partial restore, not be dropped or altered");
+        assert_eq!(stash_entry_files(path.clone(), 0).unwrap(), vec!["a.txt".to_string(), "b.txt".to_string()], "the stash still remembers both files, so b.txt can still be pulled out later");
+
+        restore_stash_paths(path.clone(), 0, vec!["b.txt".into()]).unwrap();
+        assert_eq!(fs::read_to_string(repository.join("b.txt")).unwrap(), "b changed", "b.txt should now be restored too");
 
         fs::remove_dir_all(repository).unwrap();
     }

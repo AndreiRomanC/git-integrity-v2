@@ -213,6 +213,7 @@ button { cursor: default; }
 .stash-pill:hover { background: #2a2340; border-style: solid; }
 .stash-internals { margin-left: 12px; padding: 6px 10px; border-left: 2px dashed #6e5aa0; color: #b3a0e0; font-size: 11px; }
 .stash-file-list { margin-top: 6px; display: flex; flex-direction: column; gap: 2px; }.stash-file { font: 10px ui-monospace, SFMono-Regular, Consolas, monospace; color: #9d8cc4; }
+.stash-file-row { display: flex; align-items: center; gap: 8px; padding: 3px 0; cursor: pointer; }.stash-file-row input { width: 14px; height: 14px; accent-color: var(--purple); }.stash-file-row.restored { opacity: .5; }.stash-file-row.restored .stash-file { text-decoration: line-through; }.stash-file-restored-badge { margin-left: auto; padding: 1px 6px; border-radius: 8px; background: #1d3a26; color: var(--green); font-size: 8px; font-weight: 700; letter-spacing: .4px; }
 .ahead-annotation { margin-left: 12px; color: #6f8daa; font-size: 10px; }
 .ref-pill-more { border-left: 0; background: #202b36; color: #8fa2b4; cursor: default; }
 .branch-point-pill { flex-shrink: 0; display: grid; place-items: center; width: 16px; height: 16px; border-radius: 50%; border: 1px dashed #6f8daa; color: #9db3c8; font-size: 9px; }
