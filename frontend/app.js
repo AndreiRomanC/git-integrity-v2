@@ -1217,74 +1217,62 @@ async function stashOneFile(path) {
 // complaint ("I can't find the list of stashes anywhere").
 function popStash() {
   if (!state.repository || !state.hasStash) return;
-  restoredStashFiles = new Set();
   renderStashesList();
   refs.stashesDialog.showModal();
 }
-
-// Files restored this dialog session, marked so a file you already pulled
-// out doesn't keep looking like it's still waiting to be restored — even
-// though the stash entry itself is left untouched (never silently dropped
-// or rewritten) so grabbing files from it one at a time, whenever you want,
-// is always safe.
-let restoredStashFiles = new Set();
 
 function renderStashesList() {
   const stashes = state.stashes || [];
   refs.stashesList.innerHTML = stashes.map(stash => `<div class="conflict-row stash-entry-row" data-stash-index="${stash.index}">
     <div class="conflict-head"><span class="conflict-path">stash@{${stash.index}}: ${esc(stash.message.replace(/^WIP on [^:]+:\s*[0-9a-f]+\s*/, 'WIP on ') || 'Saved work')}</span></div>
     <div class="stash-file-list" data-stash-file-list="${stash.index}"><i class="spinner"></i></div>
-    <div class="conflict-actions">
-      <button data-restore-selected="${stash.index}">⇈ Restore selected files</button>
-      <button data-drop-stash="${stash.index}" class="danger-action-soft">✕ Drop entire stash</button>
-    </div>
+    <div class="conflict-actions"><button data-drop-stash="${stash.index}" class="danger-action-soft">✕ Drop entire stash</button></div>
   </div>`).join('') || '<div class="empty-change">Nothing set aside right now.</div>';
-  stashes.forEach(stash => {
-    const fileList = refs.stashesList.querySelector(`[data-stash-file-list="${stash.index}"]`);
-    if (!invoke) { fileList.innerHTML = renderStashFileRows(stash.index, ['preview.txt']); return; }
-    invoke('stash_entry_files', { repositoryPath: state.repository.path, stashIndex: stash.index })
-      .then(files => { fileList.innerHTML = files.length ? renderStashFileRows(stash.index, files) : '<div class="stash-file">(no files)</div>'; })
-      .catch(error => { fileList.innerHTML = `<div class="stash-file">${esc(String(error))}</div>`; });
-  });
-  refs.stashesList.querySelectorAll('[data-restore-selected]').forEach(button => button.addEventListener('click', () => restoreSelectedStashFiles(Number(button.dataset.restoreSelected))));
+  stashes.forEach(stash => loadStashFileList(stash.index));
   refs.stashesList.querySelectorAll('[data-drop-stash]').forEach(button => button.addEventListener('click', () => dropStashEntry(Number(button.dataset.dropStash))));
 }
 
-function renderStashFileRows(stashIndex, files) {
-  return files.map(file => {
-    const restored = restoredStashFiles.has(`${stashIndex}:${file}`);
-    return `<label class="stash-file-row ${restored ? 'restored' : ''}">
-      <input type="checkbox" data-stash-file-path="${esc(file)}" ${restored ? 'disabled' : 'checked'}>
+// A plain list — one row per file, one button that restores just that file
+// immediately. Once restored, the row is simply removed from the list
+// (it's back in your working tree now, so there's nothing more to show
+// here for it) rather than left behind marked as done.
+function loadStashFileList(stashIndex) {
+  const fileList = refs.stashesList.querySelector(`[data-stash-file-list="${stashIndex}"]`);
+  if (!fileList) return;
+  const render = files => {
+    fileList.innerHTML = files.length ? files.map(file => `<div class="stash-file-row" data-stash-file-path="${esc(file)}">
       <span class="stash-file">${esc(file)}</span>
-      ${restored ? '<b class="stash-file-restored-badge">✓ restored</b>' : ''}
-    </label>`;
-  }).join('');
+      <button data-restore-file="${esc(file)}" data-restore-stash="${stashIndex}">⇈ Restore</button>
+    </div>`).join('') : '<div class="empty-change">Nothing left in this stash</div>';
+    fileList.querySelectorAll('[data-restore-file]').forEach(button => button.addEventListener('click', () => restoreOneStashFile(Number(button.dataset.restoreStash), button.dataset.restoreFile)));
+  };
+  if (!invoke) { render(['preview.txt']); return; }
+  invoke('stash_entry_files', { repositoryPath: state.repository.path, stashIndex })
+    .then(render)
+    .catch(error => { fileList.innerHTML = `<div class="stash-file-row">${esc(String(error))}</div>`; });
 }
 
-async function restoreSelectedStashFiles(index) {
-  const row = refs.stashesList.querySelector(`[data-stash-index="${index}"]`);
-  const paths = [...row.querySelectorAll('[data-stash-file-path]:checked')].map(input => input.dataset.stashFilePath);
-  if (!paths.length) { status('Select at least one file to restore', 'error'); return; }
-  if (!invoke) { paths.forEach(path => restoredStashFiles.add(`${index}:${path}`)); renderStashesList(); return; }
+async function restoreOneStashFile(index, path) {
+  if (!invoke) { status(`Preview: ${path} restored`); return; }
+  const row = refs.stashesList.querySelector(`[data-stash-index="${index}"] [data-stash-file-path="${CSS.escape(path)}"]`);
+  const button = row?.querySelector('[data-restore-file]'); if (button) { button.disabled = true; button.textContent = 'Restoring…'; }
   try {
-    status(`Restoring ${paths.length} file${paths.length === 1 ? '' : 's'}…`, 'busy');
-    await invoke('restore_stash_paths', { repositoryPath: state.repository.path, stashIndex: index, paths });
+    await invoke('restore_stash_paths', { repositoryPath: state.repository.path, stashIndex: index, paths: [path] });
     await loadRepository(state.repository.path); await openDirectory(state.currentPath, { force: true });
-    // A path-filtered restore can still conflict on an individual file if it
-    // changed since it was stashed — same resolution flow as a full pop.
+    // A path-filtered restore can still conflict if this one file changed
+    // since it was stashed — same resolution flow as a full pop.
     const conflicts = await invoke('list_conflicts', { repositoryPath: state.repository.path, targetPath: '' });
     if (conflicts.length) {
-      const msg = `Restored, but ${conflicts.length} file${conflicts.length === 1 ? '' : 's'} conflicted — resolve them below.`;
+      const msg = `Restored, but ${path} conflicted — resolve it below.`;
       status(msg, 'error'); showOperationToast(msg, 'error');
       refs.stashesDialog.close();
       openConflictsDialog({ targetPath: '', label: state.repository.current_branch, isSubmodule: false, kind: 'stash' }, conflicts);
       return;
     }
-    paths.forEach(path => restoredStashFiles.add(`${index}:${path}`));
-    renderStashesList();
-    const msg = `${paths.length} file${paths.length === 1 ? '' : 's'} restored.`;
+    row?.remove();
+    const msg = `${path} restored.`;
     status(msg); showOperationToast(msg, 'success');
-  } catch (error) { handleError(error); }
+  } catch (error) { handleError(error); if (button) { button.disabled = false; button.textContent = '⇈ Restore'; } }
 }
 
 async function dropStashEntry(index) {
@@ -1293,10 +1281,6 @@ async function dropStashEntry(index) {
   try {
     await invoke('drop_stash', { repositoryPath: state.repository.path, stashIndex: index });
     await loadRepository(state.repository.path);
-    // Dropping one entry shifts every stash after it down by one index, so
-    // any "already restored" marks recorded by index would now point at the
-    // wrong stash.
-    restoredStashFiles = new Set();
     renderStashesList();
     status('Stash dropped');
   } catch (error) { handleError(error); }
