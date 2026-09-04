@@ -217,7 +217,7 @@ async function loadRepository(path, options = {}) {
   // looking at it anymore. Only reset the view for a genuine fresh open.
   const keepView = options.keepPath ? state.view : 'explorer';
   try {
-    const data = await invoke('load_repository', { path });
+    const data = await invoke('load_repository', { path, force: Boolean(options.force) });
     // `data.commits` (assigned onto state.commits below) is always the full,
     // unscoped history — a scoped "History · <path>" view can't stay correctly
     // scoped through a refresh without re-querying that same scope, so it
@@ -596,7 +596,7 @@ async function switchSubmoduleVersion(revision, kind, name) {
   try {
     status('Switching submodule version…', 'busy');
     await invoke('switch_submodule_version', { repositoryPath: state.repository.path, relativePath: submoduleMenuData.path, revision, versionKind: kind, name: name || '' });
-    const folder = state.currentPath; const data = await invoke('load_repository', { path: state.repository.path });
+    const folder = state.currentPath; const data = await invoke('load_repository', { path: state.repository.path, force: false });
     Object.assign(state, data); state.view = 'explorer'; directoryCache.clear(); refs.submoduleMenu.hidden = true; await openDirectory(folder, { force: true });
     const target = kind === 'branch' ? `branch "${name}"` : kind === 'remote' ? `remote branch "${name}" (detached at that commit)` : `commit ${revision.slice(0, 8)} (detached — not on any branch)`;
     const successMsg = `Submodule switched to ${target}. It now shows as "Modified" here — that's expected: the project hasn't recorded the new pointer yet. Select the submodule and use "Commit this item" to save it.`;
@@ -644,7 +644,7 @@ async function commitSelectedScope(event) {
   refs.confirmScopeCommit.disabled = true; refs.confirmScopeCommit.textContent = 'Committing…';
   try {
     await invoke('commit_path', { repositoryPath: state.repository.path, relativePath: scope.path, message });
-    const folder = state.currentPath; refs.commitScopeDialog.close(); const data = await invoke('load_repository', { path: state.repository.path });
+    const folder = state.currentPath; refs.commitScopeDialog.close(); const data = await invoke('load_repository', { path: state.repository.path, force: false });
     Object.assign(state, data); state.allCommits = data.commits; state.selectedEntry = null; directoryCache.clear(); await openDirectory(folder, { force: true });
     const successMsg = `Committed "${scope.name}". Push when you're ready to send it to the server.`;
     status(successMsg); showOperationToast(successMsg, 'success');
@@ -1685,7 +1685,7 @@ refs.cloneUrl.addEventListener('input', () => { if (!refs.cloneName.dataset.edit
 $('#addSubmodule').addEventListener('click', openAddSubmoduleDialog); refs.confirmAddSubmodule.addEventListener('click', confirmAddSubmodule);
 refs.submoduleUrl.addEventListener('input', () => { if (!refs.submoduleName.dataset.edited) refs.submoduleName.value = suggestedRepositoryName(refs.submoduleUrl.value); validateSubmoduleForm(); });
 refs.submoduleName.addEventListener('input', () => { refs.submoduleName.dataset.edited = refs.submoduleName.value ? '1' : ''; validateSubmoduleForm(); });
-$('#refresh').addEventListener('click', () => state.repository && loadRepository(state.repository.path, { keepPath: true }));
+$('#refresh').addEventListener('click', () => state.repository && loadRepository(state.repository.path, { keepPath: true, force: true }));
 // Opening the drawer with everything already selected (staged) is what most
 // people expect from "here's what changed, commit it" — having to manually
 // tick every file first before Commit even becomes clickable read as "commit
