@@ -1831,13 +1831,58 @@ pub fn drop_stash(repository_path: String, stash_index: usize) -> Result<(), Str
 pub fn restore_stash_paths(repository_path: String, stash_index: usize, paths: Vec<String>) -> Result<(), String> {
     validate_path(&repository_path)?;
     if paths.is_empty() { return Err("Select at least one file to restore".into()); }
-    let safe_paths: Vec<PathBuf> = paths.iter().map(|path| safe_relative_path(path)).collect::<Result<_, _>>()?;
+    let selected: HashSet<String> = paths.iter().map(|path| safe_relative_path(path).map(|p| normalized(&p))).collect::<Result<_, _>>()?;
+    let all_files = stash_entry_files(repository_path.clone(), stash_index)?;
+    let remaining: Vec<String> = all_files.into_iter().filter(|file| !selected.contains(file)).collect();
+
+    // The stash this entry becomes is identified by its own commit id, not
+    // its stack position — pushing a fresh stash for the leftover files
+    // below shifts every later entry's index up by one, so this entry has
+    // to be found again afterward rather than assumed to still be at
+    // `stash_index`.
+    let original_oid = {
+        let mut repo = internal_repository(&repository_path)?;
+        let mut oid = None;
+        repo.stash_foreach(|index, _, found| { if index == stash_index { oid = Some(*found); } true }).map_err(|error| error.message().to_string())?;
+        oid.ok_or("That stash entry no longer exists")?
+    };
+
     let mut repo = internal_repository(&repository_path)?;
-    let mut checkout = git2::build::CheckoutBuilder::new();
-    for path in &safe_paths { checkout.path(path); }
     let mut options = git2::StashApplyOptions::new();
-    options.checkout_options(checkout);
-    repo.stash_apply(stash_index, Some(&mut options)).map_err(|error| format!("Cannot restore the selected files: {}", error.message()))?;
+    // Apply the whole entry, not just the selected paths — a path-filtered
+    // apply left the stash's own tree completely unaffected, so a restored
+    // file still looked "still stashed" the moment the list was refreshed.
+    // Applying everything, then re-stashing just the leftovers below, is
+    // what actually makes a restored file gone from the entry for good.
+    repo.stash_apply(stash_index, Some(&mut options)).map_err(|error| format!("Cannot restore: {}", error.message()))?;
+    invalidate_git_metadata(&repository_path);
+
+    if repo.index().map(|index| index.has_conflicts()).unwrap_or(false) {
+        // Leave the entry exactly as it is — same safety net as a full pop
+        // — the caller's conflict-resolution flow takes over from here.
+        return Ok(());
+    }
+
+    if remaining.is_empty() {
+        // Nothing left to keep stashed: this was effectively a full pop.
+        drop(repo);
+        let mut repo = internal_repository(&repository_path)?;
+        repo.stash_drop(stash_index).map_err(|error| format!("Restored, but could not drop the now-empty stash entry: {}", error.message()))?;
+        return Ok(());
+    }
+
+    // Put the untouched files back into a fresh stash entry of their own —
+    // real `git stash push` scoped to just those paths, so the just-restored
+    // files stay exactly as they are: live, ordinary working-tree changes.
+    drop(repo);
+    let mut push_args = vec!["stash", "push", "--include-untracked", "--"];
+    push_args.extend(remaining.iter().map(|path| path.as_str()));
+    git(&repository_path, &push_args)?;
+
+    let mut repo = internal_repository(&repository_path)?;
+    let mut old_index = None;
+    repo.stash_foreach(|index, _, found| { if *found == original_oid { old_index = Some(index); } true }).map_err(|error| error.message().to_string())?;
+    if let Some(index) = old_index { repo.stash_drop(index).map_err(|error| format!("Restored, but could not clean up the original stash entry: {}", error.message()))?; }
     invalidate_git_metadata(&repository_path);
     Ok(())
 }
@@ -2790,7 +2835,10 @@ mod tests {
     #[test]
     fn restore_stash_paths_applies_only_the_chosen_files_and_leaves_the_rest_stashed() {
         // Reported: expected to pick individual files (or folders) out of a
-        // stash one at a time, not always all-or-nothing.
+        // stash one at a time, not always all-or-nothing. (Restoring one
+        // file genuinely removing it from the stash's own list afterward is
+        // covered separately, by restoring_a_file_actually_removes_it_from_
+        // the_stash_afterward.)
         let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let repository = std::env::temp_dir().join(format!("git-integrity-stash-partial-restore-{suffix}"));
         fs::create_dir_all(&repository).unwrap();
@@ -2810,11 +2858,11 @@ mod tests {
         restore_stash_paths(path.clone(), 0, vec!["a.txt".into()]).unwrap();
         assert_eq!(fs::read_to_string(repository.join("a.txt")).unwrap(), "a changed", "a.txt should be restored");
         assert_eq!(fs::read_to_string(repository.join("b.txt")).unwrap(), "one", "b.txt was not selected — it must stay untouched, still only in the stash");
-        assert_eq!(load_repository(path.clone()).unwrap().stashes.len(), 1, "the stash entry itself must survive a partial restore, not be dropped or altered");
-        assert_eq!(stash_entry_files(path.clone(), 0).unwrap(), vec!["a.txt".to_string(), "b.txt".to_string()], "the stash still remembers both files, so b.txt can still be pulled out later");
+        assert_eq!(load_repository(path.clone()).unwrap().stashes.len(), 1, "a stash entry must remain for the still-unrestored b.txt");
 
         restore_stash_paths(path.clone(), 0, vec!["b.txt".into()]).unwrap();
         assert_eq!(fs::read_to_string(repository.join("b.txt")).unwrap(), "b changed", "b.txt should now be restored too");
+        assert!(load_repository(path.clone()).unwrap().stashes.is_empty(), "nothing left stashed once both files are restored");
 
         fs::remove_dir_all(repository).unwrap();
     }
@@ -2858,6 +2906,44 @@ mod tests {
         assert_eq!(stash_entry_files(path.clone(), 0).unwrap(), vec!["a.txt".to_string(), "brand.txt".to_string(), "new.txt".to_string()], "the tracked file and both untracked files must all be listed");
         restore_stash_paths(path.clone(), 0, vec!["a.txt".into()]).unwrap();
         assert_eq!(fs::read_to_string(repository.join("a.txt")).unwrap(), "modified", "restoring the tracked file should still work when the stash also has an untracked one");
+
+        fs::remove_dir_all(repository).unwrap();
+    }
+
+    #[test]
+    fn restoring_a_file_actually_removes_it_from_the_stash_afterward() {
+        // Reported: after restoring a file, it kept showing up in the list
+        // again — because the earlier implementation only checked the
+        // selected files out of the stash without ever touching the stash
+        // entry itself, so the immutable stash commit still "contained" it
+        // regardless. Restoring must leave it genuinely gone from that
+        // stash: remaining files (if any) end up in a fresh stash entry of
+        // their own; if nothing is left, the old entry is dropped outright.
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let repository = std::env::temp_dir().join(format!("git-integrity-stash-shrink-{suffix}"));
+        fs::create_dir_all(&repository).unwrap();
+        fs::write(repository.join("README.md"), "root").unwrap();
+        run_git(&repository, &["init"]);
+        run_git(&repository, &["config", "user.email", "test@example.com"]);
+        run_git(&repository, &["config", "user.name", "Test User"]);
+        run_git(&repository, &["add", "."]);
+        run_git(&repository, &["commit", "-m", "Initial commit"]);
+        let path = repository.to_string_lossy().into_owned();
+
+        fs::create_dir_all(repository.join("OrdersFromSite")).unwrap();
+        fs::write(repository.join("OrdersFromSite/ordersForm.css"), "body{}").unwrap();
+        fs::write(repository.join("README.md"), "changed").unwrap();
+        stash_changes(path.clone()).unwrap();
+        assert_eq!(stash_entry_files(path.clone(), 0).unwrap(), vec!["OrdersFromSite/ordersForm.css".to_string(), "README.md".to_string()]);
+
+        restore_stash_paths(path.clone(), 0, vec!["OrdersFromSite/ordersForm.css".into()]).unwrap();
+        assert!(repository.join("OrdersFromSite/ordersForm.css").exists(), "the restored file should be on disk");
+        assert_eq!(load_repository(path.clone()).unwrap().stashes.len(), 1, "README.md is still unrestored — a stash entry should remain for it");
+        assert_eq!(stash_entry_files(path.clone(), 0).unwrap(), vec!["README.md".to_string()], "the restored file must be gone from the stash's own list now — not still shown as if untouched");
+
+        restore_stash_paths(path.clone(), 0, vec!["README.md".into()]).unwrap();
+        assert_eq!(fs::read_to_string(repository.join("README.md")).unwrap(), "changed");
+        assert!(load_repository(path.clone()).unwrap().stashes.is_empty(), "restoring the last remaining file should drop the now-empty stash entry entirely");
 
         fs::remove_dir_all(repository).unwrap();
     }

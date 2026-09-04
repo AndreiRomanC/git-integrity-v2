@@ -214,7 +214,10 @@ button { cursor: default; }
 .stash-pill:hover { background: #2a2340; border-style: solid; }
 .stash-internals { margin-left: 12px; padding: 6px 10px; border-left: 2px dashed #6e5aa0; color: #b3a0e0; font-size: 11px; }
 .stash-file-list { margin-top: 6px; display: flex; flex-direction: column; gap: 2px; }.stash-file { font: 10px ui-monospace, SFMono-Regular, Consolas, monospace; color: #9d8cc4; }
-.stash-file-row { display: flex; align-items: center; gap: 8px; padding: 4px 0; }.stash-file-row .stash-file { flex: 1; }.stash-file-row button { flex: none; min-height: 24px; padding: 0 9px; border: 1px solid #3a5267; border-radius: 5px; background: #192a39; color: #bfd5e6; font-size: 9px; }.stash-file-row button:hover { border-color: #5794c7; background: #20384c; }.stash-file-row button:disabled { opacity: .6; }
+.stash-file-row { display: flex; align-items: center; gap: 8px; padding: 3px 0; }.stash-file-row .stash-file { flex: 1; font-size: 11px; }
+.stash-restore-icon { flex: none; width: 22px; height: 22px; padding: 0; display: grid; place-items: center; border: 1px solid #3a5267; border-radius: 5px; background: #192a39; color: #bfd5e6; font-size: 11px; line-height: 1; }.stash-restore-icon:hover { border-color: #5794c7; background: #20384c; }.stash-restore-icon:disabled { opacity: .6; }
+.stash-entry-row .conflict-head { display: flex; align-items: center; gap: 8px; }
+.stash-drop-icon { flex: none; width: 20px; height: 20px; margin-left: auto; padding: 0; border: 1px solid transparent; border-radius: 5px; background: transparent; color: #6b7c8c; font-size: 11px; line-height: 1; }.stash-drop-icon:hover { border-color: #a34b53; background: #2a1618; color: #ff9aa2; }
 .ahead-annotation { margin-left: 12px; color: #6f8daa; font-size: 10px; }
 .ref-pill-more { border-left: 0; background: #202b36; color: #8fa2b4; cursor: default; }
 .branch-point-pill { flex-shrink: 0; display: grid; place-items: center; width: 16px; height: 16px; border-radius: 50%; border: 1px dashed #6f8daa; color: #9db3c8; font-size: 9px; }

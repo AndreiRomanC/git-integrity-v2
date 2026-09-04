@@ -1224,25 +1224,23 @@ function popStash() {
 function renderStashesList() {
   const stashes = state.stashes || [];
   refs.stashesList.innerHTML = stashes.map(stash => `<div class="conflict-row stash-entry-row" data-stash-index="${stash.index}">
-    <div class="conflict-head"><span class="conflict-path">stash@{${stash.index}}: ${esc(stash.message.replace(/^WIP on [^:]+:\s*[0-9a-f]+\s*/, 'WIP on ') || 'Saved work')}</span></div>
+    <div class="conflict-head"><span class="conflict-path">stash@{${stash.index}}: ${esc(stash.message.replace(/^WIP on [^:]+:\s*[0-9a-f]+\s*/, 'WIP on ') || 'Saved work')}</span><button class="stash-drop-icon" data-drop-stash="${stash.index}" title="Drop this entire stash — discards everything left in it, for good">✕</button></div>
     <div class="stash-file-list" data-stash-file-list="${stash.index}"><i class="spinner"></i></div>
-    <div class="conflict-actions"><button data-drop-stash="${stash.index}" class="danger-action-soft">✕ Drop entire stash</button></div>
   </div>`).join('') || '<div class="empty-change">Nothing set aside right now.</div>';
   stashes.forEach(stash => loadStashFileList(stash.index));
   refs.stashesList.querySelectorAll('[data-drop-stash]').forEach(button => button.addEventListener('click', () => dropStashEntry(Number(button.dataset.dropStash))));
 }
 
-// A plain list — one row per file, one button that restores just that file
-// immediately. Once restored, the row is simply removed from the list
-// (it's back in your working tree now, so there's nothing more to show
-// here for it) rather than left behind marked as done.
+// A plain list — one row per file, one small icon button that restores just
+// that file immediately. Once restored, it's genuinely gone from this stash
+// (not just hidden), so the row is removed from the list right away.
 function loadStashFileList(stashIndex) {
   const fileList = refs.stashesList.querySelector(`[data-stash-file-list="${stashIndex}"]`);
   if (!fileList) return;
   const render = files => {
     fileList.innerHTML = files.length ? files.map(file => `<div class="stash-file-row" data-stash-file-path="${esc(file)}">
       <span class="stash-file">${esc(file)}</span>
-      <button data-restore-file="${esc(file)}" data-restore-stash="${stashIndex}">⇈ Restore</button>
+      <button class="stash-restore-icon" data-restore-file="${esc(file)}" data-restore-stash="${stashIndex}" title="Restore just this file">⇈</button>
     </div>`).join('') : '<div class="empty-change">Nothing left in this stash</div>';
     fileList.querySelectorAll('[data-restore-file]').forEach(button => button.addEventListener('click', () => restoreOneStashFile(Number(button.dataset.restoreStash), button.dataset.restoreFile)));
   };
@@ -1255,7 +1253,7 @@ function loadStashFileList(stashIndex) {
 async function restoreOneStashFile(index, path) {
   if (!invoke) { status(`Preview: ${path} restored`); return; }
   const row = refs.stashesList.querySelector(`[data-stash-index="${index}"] [data-stash-file-path="${CSS.escape(path)}"]`);
-  const button = row?.querySelector('[data-restore-file]'); if (button) { button.disabled = true; button.textContent = 'Restoring…'; }
+  const button = row?.querySelector('[data-restore-file]'); if (button) { button.disabled = true; button.innerHTML = '<i class="spinner"></i>'; }
   try {
     await invoke('restore_stash_paths', { repositoryPath: state.repository.path, stashIndex: index, paths: [path] });
     await loadRepository(state.repository.path); await openDirectory(state.currentPath, { force: true });
@@ -1272,7 +1270,7 @@ async function restoreOneStashFile(index, path) {
     row?.remove();
     const msg = `${path} restored.`;
     status(msg); showOperationToast(msg, 'success');
-  } catch (error) { handleError(error); if (button) { button.disabled = false; button.textContent = '⇈ Restore'; } }
+  } catch (error) { handleError(error); if (button) { button.disabled = false; button.textContent = '⇈'; } }
 }
 
 async function dropStashEntry(index) {
