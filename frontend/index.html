@@ -368,7 +368,7 @@
   </dialog>
   <dialog id="stashesDialog" class="publish-dialog">
     <form method="dialog">
-      <header><div><h2>Stashes</h2><p>Changes set aside temporarily — pick one to bring back, or drop it if you don't need it.</p></div><button value="cancel">×</button></header>
+      <header><div><h2>Stashes</h2><p>Changes set aside temporarily — pick one to bring back, or drop it if you don't need it.</p></div><button type="button" id="refreshStashes" title="Re-check with the actual state on disk">↻</button><button value="cancel">×</button></header>
       <div id="stashesList" class="conflicts-list"></div>
       <footer><span style="flex:1"></span><button value="cancel">Close</button></footer>
     </form>

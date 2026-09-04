@@ -1230,27 +1230,44 @@ async function stashOneFile(path) {
 // complaint ("I can't find the list of stashes anywhere").
 function popStash() {
   if (!state.repository || !state.hasStash) return;
-  renderStashesList();
   refs.stashesDialog.showModal();
+  refreshStashesList();
+}
+
+// Bumped on every render — a file-list fetch launched by an older render
+// that resolves after a newer one has already started is discarded instead
+// of writing (now-stale) data into the dialog. Without this, restoring two
+// files in quick succession, or restoring one right as the dialog was still
+// loading, could let an earlier, now-outdated response land last and make a
+// just-restored file appear to still be there.
+let stashesRenderGeneration = 0;
+
+async function refreshStashesList() {
+  if (!state.repository) return;
+  try { const data = await invoke('load_repository', { path: state.repository.path, force: true }); state.stashes = data.stashes; state.hasStash = data.stashes.length > 0; updateStashUI(); }
+  catch (error) { handleError(error); }
+  renderStashesList();
 }
 
 function renderStashesList() {
+  const generation = ++stashesRenderGeneration;
   const stashes = state.stashes || [];
   refs.stashesList.innerHTML = stashes.map(stash => `<div class="conflict-row stash-entry-row" data-stash-index="${stash.index}">
     <div class="conflict-head"><span class="conflict-path">stash@{${stash.index}}: ${esc(stash.message.replace(/^WIP on [^:]+:\s*[0-9a-f]+\s*/, 'WIP on ') || 'Saved work')}</span><button class="stash-drop-icon" data-drop-stash="${stash.index}" title="Drop this entire stash — discards everything left in it, for good">✕</button></div>
     <div class="stash-file-list" data-stash-file-list="${stash.index}"><i class="spinner"></i></div>
   </div>`).join('') || '<div class="empty-change">Nothing set aside right now.</div>';
-  stashes.forEach(stash => loadStashFileList(stash.index));
+  stashes.forEach(stash => loadStashFileList(stash.index, generation));
   refs.stashesList.querySelectorAll('[data-drop-stash]').forEach(button => button.addEventListener('click', () => dropStashEntry(Number(button.dataset.dropStash))));
 }
 
 // A plain list — one row per file, one small icon button that restores just
 // that file immediately. Once restored, it's genuinely gone from this stash
 // (not just hidden), so the row is removed from the list right away.
-function loadStashFileList(stashIndex) {
+function loadStashFileList(stashIndex, generation) {
   const fileList = refs.stashesList.querySelector(`[data-stash-file-list="${stashIndex}"]`);
   if (!fileList) return;
   const render = files => {
+    if (generation !== stashesRenderGeneration) return; // a newer render has since started — this response is stale
     fileList.innerHTML = files.length ? files.map(file => `<div class="stash-file-row" data-stash-file-path="${esc(file)}">
       <span class="stash-file">${esc(file)}</span>
       <button class="stash-restore-icon" data-restore-file="${esc(file)}" data-restore-stash="${stashIndex}" title="Restore just this file">⇈</button>
@@ -1260,7 +1277,7 @@ function loadStashFileList(stashIndex) {
   if (!invoke) { render(['preview.txt']); return; }
   invoke('stash_entry_files', { repositoryPath: state.repository.path, stashIndex })
     .then(render)
-    .catch(error => { fileList.innerHTML = `<div class="stash-file-row">${esc(String(error))}</div>`; });
+    .catch(error => { if (generation === stashesRenderGeneration) fileList.innerHTML = `<div class="stash-file-row">${esc(String(error))}</div>`; });
 }
 
 async function restoreOneStashFile(index, path) {
@@ -1280,10 +1297,10 @@ async function restoreOneStashFile(index, path) {
       openConflictsDialog({ targetPath: '', label: state.repository.current_branch, isSubmodule: false, kind: 'stash' }, conflicts);
       return;
     }
-    // Re-render the whole list from what the backend now actually reports,
-    // rather than just removing this one row locally — the authoritative
-    // source of truth, not an assumption that the removal matches it.
-    renderStashesList();
+    // Re-render the whole list from what the backend now actually reports —
+    // force a genuinely fresh read rather than trust the short status cache,
+    // so there's no window where a just-restored file could still show up.
+    await refreshStashesList();
     const msg = `${path} restored.`;
     status(msg); showOperationToast(msg, 'success');
   } catch (error) { handleError(error); if (button) { button.disabled = false; button.textContent = '⇈'; } }
@@ -1735,6 +1752,7 @@ refs.defaultCommitMessage.addEventListener('change', recordDefaultCommitMessage)
 $('#showPublish').addEventListener('click', () => openPublish().catch(error => status(String(error), 'error')));
 $('#stashWork').addEventListener('click', stashWork);
 $('#popStash').addEventListener('click', popStash);
+$('#refreshStashes').addEventListener('click', () => refreshStashesList());
 $('#closeChanges').addEventListener('click', () => refs.changesDrawer.classList.remove('open'));
 let searchTimeout; refs.search.addEventListener('input', () => { clearTimeout(searchTimeout); searchTimeout = setTimeout(() => { state.view === 'explorer' ? renderExplorer() : state.view === 'commander' ? renderCommander() : renderGraph(); }, 200); }); refs.commitMessage.addEventListener('input', renderChanges);
 function returnToProjectNavigator() { const selectedPath = state.selectedEntry?.relative_path; state.view = 'explorer'; state.selectedCommit = null; refs.search.value = ''; render(); if (selectedPath) selectEntry(selectedPath); else clearDetails('Select a file or folder'); }
