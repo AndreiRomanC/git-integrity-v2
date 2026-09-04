@@ -247,6 +247,34 @@ fn configure_git_command(command: &mut Command) {
     if std::env::var_os("GIT_SSH_COMMAND").is_none() { command.env("GIT_SSH_COMMAND", "ssh -o ConnectTimeout=15"); }
 }
 
+// A last-resort backstop for a git subprocess that is well and truly stuck —
+// not just slow (the low-speed-limit config above already handles a stalled
+// HTTP transfer; this catches everything else: a wedged credential/OS-level
+// prompt slipping past GIT_TERMINAL_PROMPT, a filesystem lock held forever,
+// an SSH connection that hangs past its own timeout on some networks). Ten
+// minutes is generous enough that even a real, actively-transferring clone
+// or fetch on the 30GB+ monorepo over a slow connection should finish well
+// within it; a git command that hasn't produced anything in that long is
+// not "big data", it's actually stuck. The child is force-killed on timeout
+// so the app itself is never left waiting on it either.
+const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(600);
+
+fn run_with_timeout(mut command: Command) -> Result<std::process::Output, String> {
+    let child = command.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().map_err(|e| format!("Cannot start Git: {e}"))?;
+    let id = child.id();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || { let _ = tx.send(child.wait_with_output()); });
+    match rx.recv_timeout(GIT_COMMAND_TIMEOUT) {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(error)) => Err(format!("Git process error: {error}")),
+        Err(_) => {
+            #[cfg(unix)] { let _ = Command::new("kill").arg("-9").arg(id.to_string()).status(); }
+            #[cfg(windows)] { let _ = Command::new("taskkill").args(["/F", "/PID"]).arg(id.to_string()).status(); }
+            Err("Git command timed out after 10 minutes — check your network connection and try again".into())
+        }
+    }
+}
+
 fn git(path: &str, args: &[&str]) -> Result<String, String> {
     let mut command = Command::new("git");
     // `-c` overrides must come before the subcommand to be recognized as
@@ -255,7 +283,7 @@ fn git(path: &str, args: &[&str]) -> Result<String, String> {
     // subcommand), not after.
     configure_git_command(&mut command);
     command.arg("-C").arg(path).arg("-c").arg("color.ui=false").args(args);
-    let output = command.output().map_err(|e| format!("Cannot start Git: {e}"))?;
+    let output = run_with_timeout(command)?;
     if output.status.success() { Ok(String::from_utf8_lossy(&output.stdout).into_owned()) }
     else { Err(String::from_utf8_lossy(&output.stderr).trim().to_string()) }
 }
@@ -285,7 +313,7 @@ pub fn run_git_command(repository_path: String, args: String) -> Result<RawGitRe
     let mut command = Command::new("git");
     configure_git_command(&mut command);
     command.arg("-C").arg(&repository_path).arg("-c").arg("color.ui=false").args(&parts);
-    let output = command.output().map_err(|e| format!("Cannot start Git: {e}"))?;
+    let output = run_with_timeout(command)?;
     invalidate_git_metadata(&repository_path);
     Ok(RawGitResult {
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),

@@ -94,6 +94,19 @@ let toastTimer; function showOperationToast(message, kind = '') { clearTimeout(t
 
 function handleError(error) {
   const msg = String(error).toLowerCase();
+  if (msg.includes('timed out')) {
+    // The backend only ever reports this after it has already force-killed
+    // a genuinely stuck git process (10 minutes with zero progress) — by
+    // this point nothing is still running, so it's safe to automatically
+    // bring the repository view back to a clean, known state instead of
+    // leaving it looking frozen. This should be rare: everything short of a
+    // truly wedged process (a stalled network transfer, a held filesystem
+    // lock) finishes on its own well before that backstop ever triggers.
+    const friendly = 'That got stuck and was stopped automatically. Reloading the project…';
+    status(friendly, 'error'); showOperationToast(friendly, 'error');
+    if (state.repository) setTimeout(() => loadRepository(state.repository.path, { keepPath: true }), 300);
+    return friendly;
+  }
   if (msg.includes('no changes to commit')) { const friendly = 'Nothing to commit — this selection has no uncommitted local changes.'; status(friendly, 'error'); return friendly; }
   const adviceMap = {
     'no upstream': 'Go to Branch Map (Ctrl+Shift+G) → Right-click branch → Set upstream',
