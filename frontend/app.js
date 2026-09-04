@@ -1176,14 +1176,14 @@ function showBranchMenu(branchName, event) {
 async function renameBranch(oldName, newName) {
   if (!state.repository) return;
   if (!invoke) { status(`Preview: renamed ${oldName} to ${newName}`); return; }
-  try { status('Renaming branch…', 'busy'); await invoke('rename_branch', { repositoryPath: state.repository.path, oldName, newName }); await loadRepository(state.repository.path); status(`Branch renamed to ${newName}`); }
+  try { status('Renaming branch…', 'busy'); await invoke('rename_branch', { repositoryPath: state.repository.path, oldName, newName }); await loadRepository(state.repository.path, { keepPath: true }); status(`Branch renamed to ${newName}`); }
   catch (error) { handleError(error); }
 }
 
 async function deleteBranch(branchName) {
   if (!state.repository) return;
   if (!invoke) { status(`Preview: deleted ${branchName}`); return; }
-  try { status('Deleting branch…', 'busy'); await invoke('delete_branch', { repositoryPath: state.repository.path, branchName }); await loadRepository(state.repository.path); status(`Branch ${branchName} deleted`); }
+  try { status('Deleting branch…', 'busy'); await invoke('delete_branch', { repositoryPath: state.repository.path, branchName }); await loadRepository(state.repository.path, { keepPath: true }); status(`Branch ${branchName} deleted`); }
   catch (error) { handleError(error); }
 }
 
@@ -1193,11 +1193,11 @@ function renderRemotes() {
 }
 
 async function loadRemotes() { state.view = 'remotes'; refs.search.value = ''; clearDetails('Remote configuration'); if (invoke) { try { state.remotes = await invoke('list_remotes', { repositoryPath: state.repository.path }); } catch (error) { handleError(error); } } else state.remotes = [{ name: 'origin', fetch_url: 'git@example.com:vehicle-control.git', push_url: 'git@example.com:vehicle-control.git' }]; render(); }
-async function fetchRemote(name) { try { status(`Fetching ${name}…`, 'busy'); await invoke('fetch_remote', { repositoryPath: state.repository.path, remote: name }); await loadRepository(state.repository.path); await loadRemotes(); status(`${name} updated`); } catch (error) { handleError(error); } }
+async function fetchRemote(name) { try { status(`Fetching ${name}…`, 'busy'); await invoke('fetch_remote', { repositoryPath: state.repository.path, remote: name }); await loadRepository(state.repository.path, { keepPath: true }); await loadRemotes(); status(`${name} updated`); } catch (error) { handleError(error); } }
 async function fetchAllRemotes() {
   if (!state.repository) return;
   if (!invoke) return status('Preview: fetched all remotes');
-  try { status('Fetching every remote…', 'busy'); await invoke('fetch_all_remotes', { repositoryPath: state.repository.path }); await loadRepository(state.repository.path); await loadRemotes(); const msg = `${state.remotes.length} remote${state.remotes.length === 1 ? '' : 's'} updated`; status(msg); showOperationToast(msg, 'success'); }
+  try { status('Fetching every remote…', 'busy'); await invoke('fetch_all_remotes', { repositoryPath: state.repository.path }); await loadRepository(state.repository.path, { keepPath: true }); await loadRemotes(); const msg = `${state.remotes.length} remote${state.remotes.length === 1 ? '' : 's'} updated`; status(msg); showOperationToast(msg, 'success'); }
   catch (error) { handleError(error); }
 }
 
@@ -1269,7 +1269,7 @@ async function restoreOneStashFile(index, path) {
   const button = row?.querySelector('[data-restore-file]'); if (button) { button.disabled = true; button.innerHTML = '<i class="spinner"></i>'; }
   try {
     await invoke('restore_stash_paths', { repositoryPath: state.repository.path, stashIndex: index, paths: [path] });
-    await loadRepository(state.repository.path); await openDirectory(state.currentPath, { force: true });
+    await loadRepository(state.repository.path, { keepPath: true });
     // A path-filtered restore can still conflict if this one file changed
     // since it was stashed — same resolution flow as a full pop.
     const conflicts = await invoke('list_conflicts', { repositoryPath: state.repository.path, targetPath: '' });
@@ -1280,7 +1280,10 @@ async function restoreOneStashFile(index, path) {
       openConflictsDialog({ targetPath: '', label: state.repository.current_branch, isSubmodule: false, kind: 'stash' }, conflicts);
       return;
     }
-    row?.remove();
+    // Re-render the whole list from what the backend now actually reports,
+    // rather than just removing this one row locally — the authoritative
+    // source of truth, not an assumption that the removal matches it.
+    renderStashesList();
     const msg = `${path} restored.`;
     status(msg); showOperationToast(msg, 'success');
   } catch (error) { handleError(error); if (button) { button.disabled = false; button.textContent = '⇈'; } }
@@ -1291,7 +1294,7 @@ async function dropStashEntry(index) {
   if (!invoke) { status('Preview: stash dropped'); return; }
   try {
     await invoke('drop_stash', { repositoryPath: state.repository.path, stashIndex: index });
-    await loadRepository(state.repository.path);
+    await loadRepository(state.repository.path, { keepPath: true });
     renderStashesList();
     status('Stash dropped');
   } catch (error) { handleError(error); }
@@ -1650,7 +1653,7 @@ async function refreshPublish() {
 async function confirmPublish(event) {
   event.preventDefault(); if (!state.publish?.commits.length) return;
   const operation = $('#publishOperationStatus'); operation.textContent = `Publishing ${state.publish.branch}…`; operation.className = 'submodule-operation-status busy';
-  try { $('#confirmPublish').disabled = true; status(`Publishing ${state.publish.branch}…`, 'busy'); await invoke('publish_branch', { repositoryPath: state.repository.path, branch: state.publish.branch, remote: state.publish.remote, username: $('#publishUsername').value.trim(), accessToken: $('#publishToken').value, uptoCommit: state.publishUpto || '' }); $('#publishToken').value = ''; refs.publishDialog.close(); await loadRepository(state.repository.path); const msg = state.publishUpto ? `Published part of ${state.publish.branch} to ${state.publish.remote} (up to your chosen commit).` : `Published ${state.publish.branch} to ${state.publish.remote}`; status(msg); showOperationToast(msg); }
+  try { $('#confirmPublish').disabled = true; status(`Publishing ${state.publish.branch}…`, 'busy'); await invoke('publish_branch', { repositoryPath: state.repository.path, branch: state.publish.branch, remote: state.publish.remote, username: $('#publishUsername').value.trim(), accessToken: $('#publishToken').value, uptoCommit: state.publishUpto || '' }); $('#publishToken').value = ''; refs.publishDialog.close(); await loadRepository(state.repository.path, { keepPath: true }); const msg = state.publishUpto ? `Published part of ${state.publish.branch} to ${state.publish.remote} (up to your chosen commit).` : `Published ${state.publish.branch} to ${state.publish.remote}`; status(msg); showOperationToast(msg); }
   catch (error) { const message = String(error); operation.textContent = message; operation.className = 'submodule-operation-status error'; status(message, 'error'); $('#confirmPublish').disabled = false; }
 }
 
@@ -1768,7 +1771,7 @@ $('#fetchCurrent').addEventListener('click', () => { const first = state.remotes
 $('#fetchAll').addEventListener('click', () => fetchAllRemotes());
 async function syncCurrent(action) {
   if (!invoke || !state.repository) return;
-  try { status(`${action === 'pull' ? 'Pulling' : 'Pushing'} ${state.repository.current_branch}…`, 'busy'); await invoke('sync_repository', { repositoryPath: state.repository.path, action }); await loadRepository(state.repository.path); status(`${action === 'pull' ? 'Pull' : 'Push'} complete`); }
+  try { status(`${action === 'pull' ? 'Pulling' : 'Pushing'} ${state.repository.current_branch}…`, 'busy'); await invoke('sync_repository', { repositoryPath: state.repository.path, action }); await loadRepository(state.repository.path, { keepPath: true }); status(`${action === 'pull' ? 'Pull' : 'Push'} complete`); }
   catch (error) {
     const message = handleError(error);
     if (action === 'pull' && String(error).toLowerCase().includes('requires a merge')) {
@@ -1817,7 +1820,7 @@ $('#newBranch').addEventListener('click', async () => {
     if (!onMain) return createSubmoduleBranch(entry);
   }
   const name = await customPrompt('New branch name', '', { title: 'Create branch' }); if (!name) return;
-  try { await invoke('create_branch', { path: state.repository.path, branch: name }); await loadRepository(state.repository.path); status(`Branch "${name}" created`); } catch (error) { handleError(error); }
+  try { await invoke('create_branch', { path: state.repository.path, branch: name }); await loadRepository(state.repository.path, { keepPath: true }); status(`Branch "${name}" created`); } catch (error) { handleError(error); }
 });
 refs.commitButton.addEventListener('click', async () => {
   try { const folder = state.changesScope === 'folder' ? state.currentPath : ''; const files = state.changes.filter(change => change.staged && (!folder || change.path === folder || change.path.startsWith(`${folder}/`))).map(change => change.path); await invoke('commit_files', { repositoryPath: state.repository.path, files, message: refs.commitMessage.value }); refs.commitMessage.value = ''; await loadRepository(state.repository.path); if (folder) await openDirectory(folder); }
