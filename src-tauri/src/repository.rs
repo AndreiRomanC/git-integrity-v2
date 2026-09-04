@@ -779,6 +779,38 @@ pub fn create_commit(path: String, message: String) -> Result<(), String> {
     let parent = repo.head().ok().and_then(|head| head.peel_to_commit().ok()); let parents: Vec<&git2::Commit<'_>> = parent.iter().collect(); repo.commit(Some("HEAD"), &signature, &signature, message.trim(), &tree, &parents).map_err(|error| error.message().to_string())?; invalidate_git_metadata(&path); Ok(())
 }
 
+#[derive(Serialize)]
+pub struct BranchCreationContext { current_branch: String, current_commit: String, main_remote_branch: Option<String>, ahead: usize, behind: usize }
+
+// A new branch is always created from wherever HEAD currently is — this
+// tells the caller exactly where that is (so "New branch" is never a
+// mystery about what you're actually branching from), and how that
+// position relates to the project's main integration branch, so it's
+// obvious upfront whether you're branching off the latest main or off
+// something already behind it.
+#[tauri::command]
+pub fn branch_creation_context(repository_path: String) -> Result<BranchCreationContext, String> {
+    validate_path(&repository_path)?;
+    let repo = internal_repository(&repository_path)?;
+    let head = repo.head().map_err(|error| error.message().to_string())?;
+    let current_branch = head.shorthand().unwrap_or("HEAD").to_string();
+    let current_commit = head.peel_to_commit().map_err(|error| error.message().to_string())?.id().to_string();
+    let local_oid = head.target();
+
+    let mut main_remote_branch = None;
+    for candidate in ["origin/main", "origin/master"] {
+        if repo.find_branch(candidate, BranchType::Remote).is_ok() { main_remote_branch = Some(candidate.to_string()); break; }
+    }
+    if main_remote_branch.is_none() { main_remote_branch = default_remote_ref(&repository_path); }
+
+    let (ahead, behind) = local_oid.zip(main_remote_branch.as_deref())
+        .and_then(|(local, remote_name)| repo.find_branch(remote_name, BranchType::Remote).ok()?.get().target().map(|remote_oid| (local, remote_oid)))
+        .and_then(|(local, remote_oid)| repo.graph_ahead_behind(local, remote_oid).ok())
+        .unwrap_or((0, 0));
+
+    Ok(BranchCreationContext { current_branch, current_commit: current_commit[..8.min(current_commit.len())].to_string(), main_remote_branch, ahead, behind })
+}
+
 #[tauri::command]
 pub fn create_branch(path: String, branch: String) -> Result<(), String> {
     if branch.trim().is_empty() { return Err("Branch name cannot be empty".into()); }
@@ -1186,6 +1218,23 @@ pub fn load_directory(repository_path: String, relative_path: String) -> Result<
         None => (repository_path.as_str(), relative_path.as_str()),
     };
     let git_metadata = cached_git_metadata(status_repo, status_scope);
+    // "Does this folder contain any tracked/unpushed file?" used to be a
+    // linear scan over *every* tracked path in the whole repository, for
+    // *every* entry in the folder being listed — O(entries × total tracked
+    // files). On a large monorepo (hundreds of thousands of tracked files)
+    // that made opening a folder with many items dramatically slower than it
+    // needed to be, worse still on Windows where each string comparison in
+    // that scan is itself typically a bit slower. Sorting each set once up
+    // front turns "does anything start with this prefix" into a binary
+    // search (O(log N)) instead of a full scan, for every entry.
+    let mut tracked_sorted: Vec<&str> = git_metadata.tracked.iter().map(String::as_str).collect();
+    tracked_sorted.sort_unstable();
+    let mut unpushed_sorted: Vec<&str> = git_metadata.unpushed.iter().map(String::as_str).collect();
+    unpushed_sorted.sort_unstable();
+    let has_prefix = |sorted: &[&str], prefix: &str| -> bool {
+        let idx = sorted.partition_point(|candidate| *candidate < prefix);
+        sorted.get(idx).map(|candidate| candidate.starts_with(prefix)).unwrap_or(false)
+    };
     let mut entries = Vec::new();
 
     for item in fs::read_dir(&absolute).map_err(|error| error.to_string())? {
@@ -1200,10 +1249,10 @@ pub fn load_directory(repository_path: String, relative_path: String) -> Result<
             else if metadata.is_dir() { "folder" }
             else { "file" }.to_string();
         let tracked_prefix = format!("{status_key}/");
-        let tracked = git_metadata.submodules.contains(&status_key) || git_metadata.tracked.contains(&status_key) || git_metadata.tracked.iter().any(|path| path.starts_with(&tracked_prefix));
+        let tracked = git_metadata.submodules.contains(&status_key) || git_metadata.tracked.contains(&status_key) || has_prefix(&tracked_sorted, &tracked_prefix);
         let modified = metadata.modified().ok().and_then(|time| time.duration_since(UNIX_EPOCH).ok()).map(|value| value.as_secs()).unwrap_or(0);
         let submodule_has_unpushed_commits = kind == "submodule" && submodule_push_status(item.path().to_str().unwrap_or_default()).is_some();
-        let unpushed = if kind == "folder" { git_metadata.unpushed.iter().any(|path| path == &status_key || path.starts_with(&tracked_prefix)) } else { git_metadata.unpushed.contains(&status_key) };
+        let unpushed = if kind == "folder" { git_metadata.unpushed.contains(&status_key) || has_prefix(&unpushed_sorted, &tracked_prefix) } else { git_metadata.unpushed.contains(&status_key) };
         entries.push(DirectoryEntry { name, relative_path: relative_string, kind, status: status_for(&status_key, &git_metadata.statuses), tracked, size: if metadata.is_file() { metadata.len() } else { 0 }, modified, submodule_has_unpushed_commits, unpushed });
     }
     entries.sort_by(|a, b| {
@@ -2619,6 +2668,53 @@ mod tests {
         let expected_upstream = git(clone_upstream.to_str().unwrap(), &["rev-parse", "HEAD"]).unwrap().trim().to_string();
         assert_eq!(origin_head, expected_origin, "origin should be up to date after fetch-all");
         assert_eq!(upstream_head, expected_upstream, "upstream should be up to date after fetch-all too, not just the first remote");
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn branch_creation_context_reports_position_relative_to_origin_main() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-branch-context-{suffix}"));
+        let repository = base.join("main");
+        let origin_remote = base.join("origin.git");
+        fs::create_dir_all(&repository).unwrap();
+        fs::write(repository.join("a.txt"), "one").unwrap();
+        run_git(&repository, &["init", "-b", "main"]);
+        run_git(&repository, &["config", "user.email", "test@example.com"]);
+        run_git(&repository, &["config", "user.name", "Test User"]);
+        run_git(&repository, &["add", "."]);
+        run_git(&repository, &["commit", "-m", "Initial commit"]);
+        run_git(&base, &["init", "--bare", "origin.git"]);
+        run_git(&repository, &["remote", "add", "origin", origin_remote.to_str().unwrap()]);
+        run_git(&repository, &["push", "-u", "origin", "main"]);
+        let path = repository.to_string_lossy().into_owned();
+
+        // Freshly in sync: nothing ahead, nothing behind.
+        let context = branch_creation_context(path.clone()).unwrap();
+        assert_eq!(context.current_branch, "main");
+        assert_eq!(context.main_remote_branch.as_deref(), Some("origin/main"));
+        assert_eq!((context.ahead, context.behind), (0, 0));
+
+        // Someone else pushes to origin directly — this checkout falls behind
+        // until it fetches (branch_creation_context reads the *local* record
+        // of origin/main, same as everything else in this app).
+        let clone = base.join("clone");
+        run_git(&base, &["clone", origin_remote.to_str().unwrap(), clone.to_str().unwrap()]);
+        run_git(&clone, &["config", "user.email", "test@example.com"]);
+        run_git(&clone, &["config", "user.name", "Test User"]);
+        fs::write(clone.join("a.txt"), "two").unwrap();
+        run_git(&clone, &["commit", "-am", "Someone else's commit"]);
+        run_git(&clone, &["push", "origin", "main"]);
+        git(&path, &["fetch", "origin"]).unwrap();
+        let context = branch_creation_context(path.clone()).unwrap();
+        assert_eq!((context.ahead, context.behind), (0, 1), "one commit landed on origin/main that this checkout doesn't have yet");
+
+        // Now also commit locally, without pulling first — genuinely diverged.
+        fs::write(repository.join("a.txt"), "three").unwrap();
+        run_git(&repository, &["commit", "-am", "Local-only commit"]);
+        let context = branch_creation_context(path.clone()).unwrap();
+        assert_eq!((context.ahead, context.behind), (1, 1));
 
         fs::remove_dir_all(base).unwrap();
     }

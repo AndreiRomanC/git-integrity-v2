@@ -373,6 +373,18 @@
       <footer><span style="flex:1"></span><button value="cancel">Close</button></footer>
     </form>
   </dialog>
+  <dialog id="newBranchDialog" class="publish-dialog">
+    <form method="dialog">
+      <header><div><h2>Create branch</h2><p>The new branch starts from exactly where you are right now.</p></div><button value="cancel">×</button></header>
+      <div class="publish-explain" style="margin-top:17px;">
+        <b>Branching from: <span id="newBranchFrom">—</span></b>
+        <span id="newBranchOriginStatus">Checking origin/main…</span>
+      </div>
+      <label class="commit-scope-label" style="margin:0 18px 12px;"><span>NEW BRANCH NAME</span><input id="newBranchName" placeholder="e.g. feature/my-change" autocomplete="off"></label>
+      <p id="newBranchStatus" class="submodule-operation-status" role="status" style="margin:0 18px 12px;"></p>
+      <footer><button value="cancel">Cancel</button><button type="button" value="default" id="confirmNewBranch" class="confirm">Create branch</button></footer>
+    </form>
+  </dialog>
   <script src="app.js"></script>
 </body>
 </html>

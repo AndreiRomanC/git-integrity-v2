@@ -14,6 +14,7 @@ pub fn run() {
             repository::stage_files,
             repository::unstage_files,
             repository::create_commit,
+            repository::branch_creation_context,
             repository::create_branch,
             repository::switch_branch,
             repository::load_directory,

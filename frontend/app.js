@@ -66,6 +66,7 @@ const refs = {
   remotesView: $('#remotesView'), remoteCards: $('#remoteCards'), editorDialog: $('#editorDialog'), editorTitle: $('#editorTitle'), editorPath: $('#editorPath'), editorContent: $('#editorContent'), locationRepository: $('#locationRepository'), locationBranch: $('#locationBranch'), locationPath: $('#locationPath'), leaveSubmoduleGraph: $('#leaveSubmoduleGraph'), publishDialog: $('#publishDialog'), publishBranch: $('#publishBranch'), publishRemote: $('#publishRemote'), publishCommits: $('#publishCommits'), publishSummary: $('#publishSummary'), publishDestination: $('#publishDestination'), publishBadge: $('#publishBadge'), publishSubtitle: $('#publishSubtitle'), cloneDialog: $('#cloneDialog'), cloneUrl: $('#cloneUrl'), cloneParent: $('#cloneParent'), cloneName: $('#cloneName'), confirmClone: $('#confirmClone'), submoduleDialog: $('#submoduleDialog'), submoduleUrl: $('#submoduleUrl'), submoduleParent: $('#submoduleParent'), submoduleName: $('#submoduleName'), submoduleUsername: $('#submoduleUsername'), submoduleToken: $('#submoduleToken'), submoduleAddStatus: $('#submoduleAddStatus'), confirmAddSubmodule: $('#confirmAddSubmodule'), operationToast: $('#operationToast'), drawerScopeTitle: $('#drawerScopeTitle'),
   mergeBranchDialog: $('#mergeBranchDialog'), mergeBranchSubtitle: $('#mergeBranchSubtitle'), mergeBranchCurrent: $('#mergeBranchCurrent'), mergeBranchSource: $('#mergeBranchSource'), mergeBranchStatus: $('#mergeBranchStatus'), confirmMergeBranch: $('#confirmMergeBranch'),
   stashesDialog: $('#stashesDialog'), stashesList: $('#stashesList'),
+  newBranchDialog: $('#newBranchDialog'), newBranchFrom: $('#newBranchFrom'), newBranchOriginStatus: $('#newBranchOriginStatus'), newBranchName: $('#newBranchName'), newBranchStatus: $('#newBranchStatus'), confirmNewBranch: $('#confirmNewBranch'),
   conflictsDialog: $('#conflictsDialog'), conflictsTitle: $('#conflictsTitle'), conflictsSubtitle: $('#conflictsSubtitle'), conflictsList: $('#conflictsList'), conflictsCommitMessage: $('#conflictsCommitMessage'), conflictsCommitMessageLabel: $('#conflictsCommitMessageLabel'), conflictsLocalNote: $('#conflictsLocalNote'), conflictsStatus: $('#conflictsStatus'), confirmCompleteMerge: $('#confirmCompleteMerge'), abortMergeButton: $('#abortMerge'),
   mergeConflictsBanner: $('#mergeConflictsBanner'), mergeConflictsSubtitle: $('#mergeConflictsSubtitle')
 };
@@ -1837,8 +1838,39 @@ $('#newBranch').addEventListener('click', async () => {
     const onMain = await customConfirm(`"${entry.name}" (a submodule) is currently selected. This button creates the branch on the MAIN project — the whole project will switch to it. To create a branch inside the submodule instead, cancel this and use "＋ New branch…" in ${entry.name}'s own details panel.`, { title: 'Create branch — choose scope', okLabel: `Create on main project` });
     if (!onMain) return createSubmoduleBranch(entry);
   }
-  const name = await customPrompt('New branch name', '', { title: 'Create branch' }); if (!name) return;
-  try { await invoke('create_branch', { path: state.repository.path, branch: name }); await loadRepository(state.repository.path, { keepPath: true }); status(`Branch "${name}" created`); } catch (error) { handleError(error); }
+  openNewBranchDialog();
+});
+
+async function openNewBranchDialog() {
+  refs.newBranchName.value = ''; refs.newBranchStatus.textContent = ''; refs.confirmNewBranch.disabled = true;
+  refs.newBranchFrom.textContent = state.repository.current_branch || 'HEAD';
+  refs.newBranchOriginStatus.textContent = 'Checking origin/main…';
+  refs.newBranchDialog.showModal();
+  refs.newBranchName.focus();
+  if (!invoke) { refs.newBranchOriginStatus.textContent = 'In sync with origin/main.'; return; }
+  try {
+    const context = await invoke('branch_creation_context', { repositoryPath: state.repository.path });
+    refs.newBranchFrom.textContent = `${context.current_branch} @ ${context.current_commit}`;
+    if (!context.main_remote_branch) { refs.newBranchOriginStatus.textContent = 'No remote-tracking branch found — fetch first to compare.'; return; }
+    if (context.ahead === 0 && context.behind === 0) { refs.newBranchOriginStatus.textContent = `✓ In sync with ${context.main_remote_branch} — the new branch will start from the latest.`; return; }
+    const parts = [];
+    if (context.ahead) parts.push(`${context.ahead} commit${context.ahead === 1 ? '' : 's'} ahead`);
+    if (context.behind) parts.push(`${context.behind} commit${context.behind === 1 ? '' : 's'} behind`);
+    refs.newBranchOriginStatus.textContent = `⚠ ${parts.join(', ')} of ${context.main_remote_branch} — the new branch starts from here, not from the latest ${context.main_remote_branch}.`;
+  } catch (error) { refs.newBranchOriginStatus.textContent = String(error); }
+}
+
+refs.newBranchName.addEventListener('input', () => { refs.confirmNewBranch.disabled = !refs.newBranchName.value.trim(); });
+refs.confirmNewBranch.addEventListener('click', async () => {
+  const name = refs.newBranchName.value.trim(); if (!name) return;
+  refs.confirmNewBranch.disabled = true; refs.confirmNewBranch.textContent = 'Creating…';
+  try {
+    await invoke('create_branch', { path: state.repository.path, branch: name });
+    refs.newBranchDialog.close();
+    await loadRepository(state.repository.path, { keepPath: true });
+    status(`Branch "${name}" created`); showOperationToast(`Branch "${name}" created and checked out.`, 'success');
+  } catch (error) { refs.newBranchStatus.textContent = String(error); refs.confirmNewBranch.disabled = false; }
+  finally { refs.confirmNewBranch.textContent = 'Create branch'; }
 });
 refs.commitButton.addEventListener('click', async () => {
   try { const folder = state.changesScope === 'folder' ? state.currentPath : ''; const files = state.changes.filter(change => change.staged && (!folder || change.path === folder || change.path.startsWith(`${folder}/`))).map(change => change.path); await invoke('commit_files', { repositoryPath: state.repository.path, files, message: refs.commitMessage.value }); refs.commitMessage.value = ''; await loadRepository(state.repository.path); if (folder) await openDirectory(folder); }
