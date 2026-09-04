@@ -231,14 +231,31 @@ pub struct PublishStatus { branch: String, remote: String, remote_branch: String
 // situation now fails fast with Git's own "could not read... terminal
 // prompts disabled" message, which `handleError` on the frontend already
 // recognizes and gives credential-setup guidance for.
-fn configure_git_command(command: &mut Command) -> &mut Command {
-    command.env("GIT_TERMINAL_PROMPT", "0").stdin(std::process::Stdio::null())
+fn configure_git_command(command: &mut Command) {
+    command.env("GIT_TERMINAL_PROMPT", "0").stdin(std::process::Stdio::null());
+    // A network call that genuinely can't reach the server — a dead proxy, a
+    // firewall silently dropping packets, a VPN that just fell over — has no
+    // built-in way to give up on its own, and could otherwise sit there
+    // forever with the app looking "frozen" (reported specifically on
+    // Windows, where this class of network failure is more common). These
+    // only abort a connection that is making *zero* progress; a real,
+    // actively-transferring clone/fetch/push on a 30GB+ repo is never cut
+    // off just for being slow. `-o ConnectTimeout` only applies when the
+    // user hasn't already customized their own SSH command, so it never
+    // overrides a deliberate existing setup.
+    command.arg("-c").arg("http.lowSpeedLimit=1000").arg("-c").arg("http.lowSpeedTime=20");
+    if std::env::var_os("GIT_SSH_COMMAND").is_none() { command.env("GIT_SSH_COMMAND", "ssh -o ConnectTimeout=15"); }
 }
 
 fn git(path: &str, args: &[&str]) -> Result<String, String> {
     let mut command = Command::new("git");
+    // `-c` overrides must come before the subcommand to be recognized as
+    // global git config, not passed through to it — configure_git_command's
+    // own `-c` flags need to land here, before `args` (which starts with the
+    // subcommand), not after.
+    configure_git_command(&mut command);
     command.arg("-C").arg(path).arg("-c").arg("color.ui=false").args(args);
-    let output = configure_git_command(&mut command).output().map_err(|e| format!("Cannot start Git: {e}"))?;
+    let output = command.output().map_err(|e| format!("Cannot start Git: {e}"))?;
     if output.status.success() { Ok(String::from_utf8_lossy(&output.stdout).into_owned()) }
     else { Err(String::from_utf8_lossy(&output.stderr).trim().to_string()) }
 }
@@ -266,8 +283,9 @@ pub fn run_git_command(repository_path: String, args: String) -> Result<RawGitRe
     if parts.first() == Some(&"git") { parts.remove(0); }
     if parts.is_empty() { return Err("Type a git subcommand, e.g. \"status\" or \"log --oneline -10\"".into()); }
     let mut command = Command::new("git");
+    configure_git_command(&mut command);
     command.arg("-C").arg(&repository_path).arg("-c").arg("color.ui=false").args(&parts);
-    let output = configure_git_command(&mut command).output().map_err(|e| format!("Cannot start Git: {e}"))?;
+    let output = command.output().map_err(|e| format!("Cannot start Git: {e}"))?;
     invalidate_git_metadata(&repository_path);
     Ok(RawGitResult {
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),

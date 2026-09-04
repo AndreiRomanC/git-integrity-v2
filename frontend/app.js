@@ -1651,7 +1651,7 @@ async function toggleStage(path, checked) {
   // after unchecking it) while that's in flight.
   const change = state.changes.find(item => item.path === path); if (change) change.staged = checked;
   renderChanges();
-  try { const folder = state.currentPath; await invoke(checked ? 'stage_files' : 'unstage_files', { repositoryPath: state.repository.path, files: [path] }); await loadRepository(state.repository.path); if (folder) await openDirectory(folder); }
+  try { const folder = state.currentPath; await invoke(checked ? 'stage_files' : 'unstage_files', { path: state.repository.path, files: [path] }); await loadRepository(state.repository.path); if (folder) await openDirectory(folder); }
   catch (error) {
     // The backend call failed — the optimistic flip above never actually
     // happened, so undo it rather than leave the checkbox showing a state
