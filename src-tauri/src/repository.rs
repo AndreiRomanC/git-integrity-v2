@@ -1853,10 +1853,28 @@ pub fn stash_entry_files(repository_path: String, stash_index: usize) -> Result<
     let stash_commit = repo.find_commit(stash_oid).map_err(|error| error.message().to_string())?;
     let stash_tree = stash_commit.tree().map_err(|error| error.message().to_string())?;
     // Parent 0 is the commit the stash was based on (HEAD at stash time) —
-    // diffing against it gives exactly the files this stash would change.
+    // diffing against it gives the tracked files this stash would change.
+    // A brand new (untracked) file stashed with it never showed up in that
+    // diff, though: it isn't recorded in the stash's own top tree at all —
+    // only in a separate third parent commit (present only when the stash
+    // included untracked files), which needs its own diff against the same
+    // base to be found. Missing this made "Stash work" (which includes
+    // untracked files by default) show none of its new files in the list.
     let base_tree = stash_commit.parent(0).and_then(|commit| commit.tree()).ok();
+    let mut paths = std::collections::BTreeSet::new();
     let diff = repo.diff_tree_to_tree(base_tree.as_ref(), Some(&stash_tree), None).map_err(|error| error.message().to_string())?;
-    Ok(diff.deltas().filter_map(|delta| delta.new_file().path().or_else(|| delta.old_file().path()).map(normalized)).collect())
+    for delta in diff.deltas() { if let Some(path) = delta.new_file().path().or_else(|| delta.old_file().path()) { paths.insert(normalized(path)); } }
+    if let Some(untracked_tree) = stash_commit.parent(2).ok().and_then(|commit| commit.tree().ok()) {
+        // The untracked-files parent's tree contains *only* the untracked
+        // files themselves, not a full workdir snapshot — diffing it against
+        // `base_tree` (which has every tracked file) would wrongly report
+        // every tracked file base has and this tree doesn't as "deleted".
+        // Diffing against an empty tree instead just lists what's actually
+        // in it.
+        let untracked_diff = repo.diff_tree_to_tree(None, Some(&untracked_tree), None).map_err(|error| error.message().to_string())?;
+        for delta in untracked_diff.deltas() { if let Some(path) = delta.new_file().path().or_else(|| delta.old_file().path()) { paths.insert(normalized(path)); } }
+    }
+    Ok(paths.into_iter().collect())
 }
 
 #[tauri::command]
@@ -2779,6 +2797,49 @@ mod tests {
 
         restore_stash_paths(path.clone(), 0, vec!["b.txt".into()]).unwrap();
         assert_eq!(fs::read_to_string(repository.join("b.txt")).unwrap(), "b changed", "b.txt should now be restored too");
+
+        fs::remove_dir_all(repository).unwrap();
+    }
+
+    #[test]
+    fn stash_entry_files_includes_untracked_files_not_just_tracked_ones() {
+        // Reported: "the Restore button does nothing" — root cause was that
+        // a stash including an untracked (brand new) file never showed that
+        // file in the list at all, so there was nothing to actually click.
+        // A stash's own top-level tree only reflects *tracked* changes;
+        // untracked files stashed alongside them live only in a separate
+        // third parent commit, present whenever untracked files were
+        // included (the default for "Stash work") — which the original
+        // diff-against-just-the-base-commit missed entirely.
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let repository = std::env::temp_dir().join(format!("git-integrity-stash-untracked-list-{suffix}"));
+        fs::create_dir_all(&repository).unwrap();
+        fs::write(repository.join("a.txt"), "one").unwrap();
+        run_git(&repository, &["init"]);
+        run_git(&repository, &["config", "user.email", "test@example.com"]);
+        run_git(&repository, &["config", "user.name", "Test User"]);
+        run_git(&repository, &["add", "."]);
+        run_git(&repository, &["commit", "-m", "Initial commit"]);
+        let path = repository.to_string_lossy().into_owned();
+
+        // A stash containing *only* a brand new untracked file (nothing
+        // tracked touched at all) — the case that returned an empty list.
+        fs::write(repository.join("new.txt"), "brand new").unwrap();
+        stash_file(path.clone(), "new.txt".into()).unwrap();
+        assert_eq!(stash_entry_files(path.clone(), 0).unwrap(), vec!["new.txt".to_string()]);
+        restore_stash_paths(path.clone(), 0, vec!["new.txt".into()]).unwrap();
+        assert!(repository.join("new.txt").exists(), "the untracked file should actually be restored to disk");
+
+        // The more common case: "Stash work" mixing a tracked-modified file
+        // with a brand new untracked one in the same stash. (new.txt is
+        // still sitting on disk, untracked, from the restore above — it
+        // legitimately gets swept into this stash too.)
+        fs::write(repository.join("a.txt"), "modified").unwrap();
+        fs::write(repository.join("brand.txt"), "brand new too").unwrap();
+        stash_changes(path.clone()).unwrap();
+        assert_eq!(stash_entry_files(path.clone(), 0).unwrap(), vec!["a.txt".to_string(), "brand.txt".to_string(), "new.txt".to_string()], "the tracked file and both untracked files must all be listed");
+        restore_stash_paths(path.clone(), 0, vec!["a.txt".into()]).unwrap();
+        assert_eq!(fs::read_to_string(repository.join("a.txt")).unwrap(), "modified", "restoring the tracked file should still work when the stash also has an untracked one");
 
         fs::remove_dir_all(repository).unwrap();
     }

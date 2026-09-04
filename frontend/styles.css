@@ -38,6 +38,7 @@ button { cursor: default; }
 .top-actions { display: flex; margin-left: auto; gap: 6px; }
 .top-actions button { width: 32px; height: 32px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface); color: #aec0d2; font-size: 15px; }
 .top-actions button:hover { border-color: #526273; background: var(--surface-soft); color: white; }
+.top-actions button.fetch-all-btn { width: auto; padding: 0 8px; font-size: 11px; font-weight: 700; letter-spacing: .3px; }
 
 .main-layout { min-height: 0; display: grid; grid-template-columns: 244px minmax(540px, 1fr) 300px; }
 .sidebar { padding: 13px 10px; background: #111820; border-right: 1px solid var(--border); overflow: auto; }
