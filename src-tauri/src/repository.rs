@@ -6,7 +6,16 @@ use std::{collections::{HashMap, HashSet}, fs, path::{Component, Path, PathBuf},
 // file so real-world slowness can be diagnosed without guessing. Safe to leave
 // in — each write is a single cheap append, guarded so a logging failure never
 // breaks the actual operation. Log path is printed once by `perf_log_path()`.
-fn perf_log_path() -> PathBuf { std::env::temp_dir().join("git-integrity-perf.log") }
+fn perf_log_path() -> PathBuf {
+    // Next to the executable, not the OS temp folder — much easier to find in
+    // practice than hunting through %TEMP%. Falls back to temp dir only if the
+    // exe's own folder isn't writable (e.g. installed under Program Files).
+    if let Ok(exe) = std::env::current_exe() { if let Some(dir) = exe.parent() {
+        let candidate = dir.join("git-integrity-perf.log");
+        if fs::OpenOptions::new().create(true).append(true).open(&candidate).is_ok() { return candidate; }
+    } }
+    std::env::temp_dir().join("git-integrity-perf.log")
+}
 
 fn perf_log(label: &str, elapsed: Duration) {
     use std::io::Write;
