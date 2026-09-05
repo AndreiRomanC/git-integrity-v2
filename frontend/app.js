@@ -700,17 +700,7 @@ async function handleDetailAction(action, entry, button) {
 
 async function createSubmoduleBranch(entry) {
   if (entry.kind !== 'submodule') return;
-  const name = await customPrompt(`New branch name for submodule ${entry.name} (created from its current commit):`, '', { title: 'New submodule branch' });
-  if (!name) return;
-  if (!invoke) return status(`Preview: created branch "${name}" in ${entry.name}`);
-  try {
-    status(`Creating branch "${name}" in ${entry.name}…`, 'busy');
-    await invoke('create_submodule_branch', { repositoryPath: state.repository.path, relativePath: entry.relative_path, branch: name });
-    directoryCache.clear(); await loadRepository(state.repository.path); await openDirectory(state.currentPath, { force: true });
-    if (state.selectedEntry?.relative_path === entry.relative_path) await selectEntry(entry.relative_path);
-    const msg = `${entry.name}: branch "${name}" created and checked out.`;
-    status(msg); showOperationToast(msg, 'success');
-  } catch (error) { const message = handleError(error); showOperationToast(message, 'error'); }
+  openNewBranchDialog(entry);
 }
 
 async function openEntryOnServer(entry, submodule) {
@@ -1396,7 +1386,15 @@ const laneX = lane => LANE_WIDTH / 2 + lane * LANE_WIDTH;
 // single "+N" pill instead of filling the row with badges.
 const MAX_INLINE_REFS = 2;
 function refsBadges(refList, color, isHead) {
-  const grouped = refList.filter(ref => ref !== 'HEAD');
+  // With only a couple of inline slots, whichever refs happened to come
+  // first in the backend's arbitrary reference-iteration order could easily
+  // bump origin/main out to the "+N" overflow (visible only on hover) —
+  // which looked like it had vanished from the graph entirely. The
+  // currently checked-out branch and the project's main remote-tracking
+  // branch are what answering "where am I relative to origin/main" actually
+  // needs, so they always get first claim on the visible slots.
+  const priority = ref => (ref === state.repository?.current_branch ? 0 : /^origin\/(main|master)$/.test(ref) ? 1 : 2);
+  const grouped = refList.filter(ref => ref !== 'HEAD').slice().sort((a, b) => priority(a) - priority(b));
   const headPill = isHead ? '<b class="head-pill">HEAD</b>' : '';
   if (!grouped.length && !headPill) return '';
   const shown = grouped.slice(0, MAX_INLINE_REFS);
@@ -1815,6 +1813,7 @@ refs.reloadFolder.addEventListener('click', () => state.view === 'commander' ? o
 document.addEventListener('keydown', event => { if (event.key !== 'Escape' || state.view !== 'commander' || document.querySelector('dialog[open]')) return; event.preventDefault(); returnToProjectNavigator(); });
 refs.remoteRef.addEventListener('change', () => { state.remoteRef = refs.remoteRef.value; openCommanderDirectory(state.commanderPath); });
 $('#closeSubmoduleMenu').addEventListener('click', () => { refs.submoduleMenu.hidden = true; });
+$('#submoduleMenuNewBranch').addEventListener('click', () => { refs.submoduleMenu.hidden = true; if (state.selectedEntry?.kind === 'submodule') createSubmoduleBranch(state.selectedEntry); });
 document.querySelectorAll('[data-version-filter]').forEach(button => button.addEventListener('click', () => {
   versionFilter = button.dataset.versionFilter; document.querySelectorAll('[data-version-filter]').forEach(item => item.classList.toggle('active', item === button)); renderSubmoduleVersions();
 }));
@@ -1841,16 +1840,22 @@ $('#newBranch').addEventListener('click', async () => {
   openNewBranchDialog();
 });
 
-async function openNewBranchDialog() {
+// Works for both the main project (submoduleEntry omitted) and a submodule
+// (passed in) — same dialog either way, so branching inside a submodule
+// gets exactly the same "where am I relative to origin/main" clarity the
+// main project's "New branch" already has, instead of a bare text prompt.
+async function openNewBranchDialog(submoduleEntry) {
+  state.newBranchTarget = submoduleEntry || null;
   refs.newBranchName.value = ''; refs.newBranchStatus.textContent = ''; refs.confirmNewBranch.disabled = true;
-  refs.newBranchFrom.textContent = state.repository.current_branch || 'HEAD';
+  const targetLabel = submoduleEntry ? `${submoduleEntry.name} (submodule)` : (state.repository.current_branch || 'HEAD');
+  refs.newBranchFrom.textContent = targetLabel;
   refs.newBranchOriginStatus.textContent = 'Checking origin/main…';
   refs.newBranchDialog.showModal();
   refs.newBranchName.focus();
   if (!invoke) { refs.newBranchOriginStatus.textContent = 'In sync with origin/main.'; return; }
   try {
-    const context = await invoke('branch_creation_context', { repositoryPath: state.repository.path });
-    refs.newBranchFrom.textContent = `${context.current_branch} @ ${context.current_commit}`;
+    const context = await invoke('branch_creation_context', { repositoryPath: state.repository.path, targetPath: submoduleEntry?.relative_path || '' });
+    refs.newBranchFrom.textContent = `${submoduleEntry ? `${submoduleEntry.name} — ` : ''}${context.current_branch} @ ${context.current_commit}`;
     if (!context.main_remote_branch) { refs.newBranchOriginStatus.textContent = 'No remote-tracking branch found — fetch first to compare.'; return; }
     if (context.ahead === 0 && context.behind === 0) { refs.newBranchOriginStatus.textContent = `✓ In sync with ${context.main_remote_branch} — the new branch will start from the latest.`; return; }
     const parts = [];
@@ -1862,6 +1867,21 @@ async function openNewBranchDialog() {
 
 refs.newBranchName.addEventListener('input', () => { refs.confirmNewBranch.disabled = !refs.newBranchName.value.trim(); });
 refs.confirmNewBranch.addEventListener('click', async () => {
+  const target = state.newBranchTarget;
+  if (target) {
+    const name = refs.newBranchName.value.trim(); if (!name) return;
+    refs.confirmNewBranch.disabled = true; refs.confirmNewBranch.textContent = 'Creating…';
+    try {
+      await invoke('create_submodule_branch', { repositoryPath: state.repository.path, relativePath: target.relative_path, branch: name });
+      refs.newBranchDialog.close();
+      directoryCache.clear(); await loadRepository(state.repository.path, { keepPath: true }); await openDirectory(state.currentPath, { force: true });
+      if (state.selectedEntry?.relative_path === target.relative_path) await selectEntry(target.relative_path);
+      const msg = `${target.name}: branch "${name}" created and checked out.`;
+      status(msg); showOperationToast(msg, 'success');
+    } catch (error) { refs.newBranchStatus.textContent = String(error); refs.confirmNewBranch.disabled = false; }
+    finally { refs.confirmNewBranch.textContent = 'Create branch'; }
+    return;
+  }
   const name = refs.newBranchName.value.trim(); if (!name) return;
   refs.confirmNewBranch.disabled = true; refs.confirmNewBranch.textContent = 'Creating…';
   try {

@@ -789,7 +789,8 @@ pub struct BranchCreationContext { current_branch: String, current_commit: Strin
 // obvious upfront whether you're branching off the latest main or off
 // something already behind it.
 #[tauri::command]
-pub fn branch_creation_context(repository_path: String) -> Result<BranchCreationContext, String> {
+pub fn branch_creation_context(repository_path: String, target_path: String) -> Result<BranchCreationContext, String> {
+    let repository_path = resolve_target_repository(&repository_path, &target_path)?;
     validate_path(&repository_path)?;
     let repo = internal_repository(&repository_path)?;
     let head = repo.head().map_err(|error| error.message().to_string())?;
@@ -2691,7 +2692,7 @@ mod tests {
         let path = repository.to_string_lossy().into_owned();
 
         // Freshly in sync: nothing ahead, nothing behind.
-        let context = branch_creation_context(path.clone()).unwrap();
+        let context = branch_creation_context(path.clone(), "".into()).unwrap();
         assert_eq!(context.current_branch, "main");
         assert_eq!(context.main_remote_branch.as_deref(), Some("origin/main"));
         assert_eq!((context.ahead, context.behind), (0, 0));
@@ -2707,14 +2708,33 @@ mod tests {
         run_git(&clone, &["commit", "-am", "Someone else's commit"]);
         run_git(&clone, &["push", "origin", "main"]);
         git(&path, &["fetch", "origin"]).unwrap();
-        let context = branch_creation_context(path.clone()).unwrap();
+        let context = branch_creation_context(path.clone(), "".into()).unwrap();
         assert_eq!((context.ahead, context.behind), (0, 1), "one commit landed on origin/main that this checkout doesn't have yet");
 
         // Now also commit locally, without pulling first — genuinely diverged.
         fs::write(repository.join("a.txt"), "three").unwrap();
         run_git(&repository, &["commit", "-am", "Local-only commit"]);
-        let context = branch_creation_context(path.clone()).unwrap();
+        let context = branch_creation_context(path.clone(), "".into()).unwrap();
         assert_eq!((context.ahead, context.behind), (1, 1));
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn branch_creation_context_can_target_a_submodule_by_relative_path() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-branch-context-submodule-{suffix}"));
+        let parent = base.join("parent"); let dependency = base.join("dependency");
+        create_libgit2_repository(&parent, "README.md"); create_libgit2_repository(&dependency, "module.txt");
+        let parent_string = parent.to_string_lossy().into_owned();
+        let added = add_submodule(parent_string.clone(), "".into(), dependency.to_string_lossy().into_owned(), "dep".into(), String::new(), String::new()).unwrap();
+        create_commit(parent_string.clone(), "Add dep submodule".into()).unwrap();
+
+        // Addressed exactly like every other submodule-targeting command in
+        // this app: the parent's path plus the submodule's relative path,
+        // never a raw absolute path.
+        let context = branch_creation_context(parent_string, added).unwrap();
+        assert_eq!(context.current_branch, "master");
 
         fs::remove_dir_all(base).unwrap();
     }
