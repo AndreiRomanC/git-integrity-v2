@@ -28,6 +28,7 @@ pub fn run() {
             repository::delete_local_path,
             repository::commit_path,
             repository::commit_files,
+            repository::commit_staged,
             repository::restore_file,
             repository::restore_remote_file,
             repository::path_history,
@@ -66,6 +67,7 @@ pub fn run() {
             repository::abort_merge,
             repository::create_submodule_branch,
             repository::run_git_command,
+            repository::run_utrud,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Git Integrity");

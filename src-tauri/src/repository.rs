@@ -649,6 +649,38 @@ pub fn open_external_url(url: String) -> Result<(), String> {
     status.map_err(|error| error.to_string()).and_then(|result| result.success().then_some(()).ok_or_else(|| "Could not open the default browser".into()))
 }
 
+// UTRUD is a legacy internal tool, previously only reachable via Windows
+// Explorer's "Send to" menu (a per-user .bat under
+// AppData\Roaming\Microsoft\Windows\SendTo that just forwards whatever's
+// selected as `%*` to "C:\LegacyApp\UTRUD\2.0.0\UTRUD.bat"). This gives the
+// same launch from inside the app for a folder named "r" anywhere in the
+// tree — `spawn` (not `status`/`output`) because UTRUD opens and runs its
+// own window independently, the same "fire and forget" way Send To behaves;
+// waiting on it here would block the app until the user closes UTRUD.
+#[cfg(target_os = "windows")]
+const UTRUD_BATCH_PATH: &str = r"C:\LegacyApp\UTRUD\2.0.0\UTRUD.bat";
+
+#[tauri::command]
+pub fn run_utrud(repository_path: String, relative_path: String) -> Result<(), String> {
+    validate_path(&repository_path)?;
+    let relative = safe_relative_path(&relative_path)?;
+    if relative.file_name().and_then(|name| name.to_str()) != Some("r") {
+        return Err("UTRUD can only be launched from a folder named \"r\"".into());
+    }
+    let absolute = Path::new(&repository_path).join(&relative);
+    if !absolute.is_dir() { return Err("The selected path is not a folder".into()); }
+    #[cfg(target_os = "windows")]
+    {
+        Command::new("cmd").args(["/C", "call", UTRUD_BATCH_PATH]).arg(&absolute).spawn().map_err(|error| format!("Could not start UTRUD: {error}"))?;
+        Ok(())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = absolute;
+        Err("UTRUD is only available on Windows".into())
+    }
+}
+
 fn browser_repository_url(remote: &str) -> Option<String> {
     let value = remote.trim().trim_end_matches('/').trim_end_matches(".git");
     let url = if let Some(rest) = value.strip_prefix("git@") {
@@ -1741,6 +1773,33 @@ pub fn commit_path(repository_path: String, relative_path: String, message: Stri
     // the handling below), so that can't be used here.
     let pathspec = if relative.as_os_str().is_empty() { String::new() } else { normalized(&relative) };
     commit_selected_internal(&repository_path, &[pathspec], message.trim())
+}
+
+// Fast path for the common case — the main Commit button, committing
+// everything currently staged, not some folder-scoped subset. commit_files
+// below has to rebuild a scratch index (parent tree + just the given paths)
+// because it also has to support committing *part* of what's staged; that
+// machinery is unnecessary work here, since "everything staged" already *is*
+// exactly the tree this commit needs — the real on-disk index can be used
+// directly with no rebuilding, no re-adding paths one phase then again,
+// and no post-commit resync (nothing about the index needs to change: it
+// already equals the new HEAD's tree, which is what "nothing staged
+// anymore" after a commit means).
+#[tauri::command]
+pub fn commit_staged(repository_path: String, message: String) -> Result<String, String> {
+    validate_path(&repository_path)?;
+    if message.trim().is_empty() { return Err("Commit message cannot be empty".into()); }
+    let repo = internal_repository(&repository_path)?;
+    let mut index = repo.index().map_err(|error| error.message().to_string())?;
+    let tree_id = index.write_tree_to(&repo).map_err(|error| error.message().to_string())?;
+    let parent = repo.head().ok().and_then(|head| head.peel_to_commit().ok());
+    if parent.as_ref().map(|commit| commit.tree_id()) == Some(tree_id) { return Err("There are no changes to commit in the selected files".into()); }
+    let tree = repo.find_tree(tree_id).map_err(|error| error.message().to_string())?;
+    let signature = repo.signature().map_err(|_| "Configure user.name and user.email for this repository".to_string())?;
+    let parents: Vec<&git2::Commit<'_>> = parent.iter().collect();
+    let oid = repo.commit(Some("HEAD"), &signature, &signature, message.trim(), &tree, &parents).map_err(|error| error.message().to_string())?;
+    invalidate_git_metadata(&repository_path);
+    Ok(oid.to_string())
 }
 
 #[tauri::command]
@@ -4424,5 +4483,39 @@ mod tests {
         assert!(index.get_path(Path::new("new_1.txt"), 0).is_some(), "untouched file should remain staged");
         assert!(index.get_path(Path::new("new_3.txt"), 0).is_some(), "untouched file should remain staged");
         assert!(index.get_path(Path::new("new_4.txt"), 0).is_some(), "untouched file should remain staged");
+    }
+
+    #[test]
+    fn commit_staged_commits_exactly_the_real_index_and_clears_it() {
+        // commit_staged is the fast path for the main Commit button: instead
+        // of rebuilding a scratch index from the parent tree and re-adding
+        // every path (what commit_files does, needed there since it also
+        // supports committing part of what's staged), it should just use the
+        // real on-disk index directly.
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let repo_path = std::env::temp_dir().join(format!("git-integrity-commit-staged-{suffix}"));
+        create_libgit2_repository(&repo_path, "README.md");
+        let repo_string = repo_path.to_string_lossy().into_owned();
+
+        // Nothing staged yet — should refuse, same as commit_files would.
+        assert!(commit_staged(repo_string.clone(), "Empty".into()).is_err());
+
+        let names: Vec<String> = (0..5).map(|i| format!("new_{i}.txt")).collect();
+        for name in &names { fs::write(repo_path.join(name), "content").unwrap(); }
+        stage_files(repo_string.clone(), names.clone()).unwrap();
+
+        let oid = commit_staged(repo_string.clone(), "Add five files".into()).unwrap();
+        let repo = internal_repository(&repo_string).unwrap();
+        let commit = repo.find_commit(git2::Oid::from_str(&oid).unwrap()).unwrap();
+        for name in &names { assert!(commit.tree().unwrap().get_path(Path::new(name)).is_ok(), "{name} should be in the new commit"); }
+
+        // The index shouldn't need any post-commit resync — it already equals
+        // the new HEAD's tree, so nothing should show as staged anymore.
+        let head_tree = repo.head().unwrap().peel_to_commit().unwrap().tree().unwrap();
+        let mut index = repo.index().unwrap();
+        assert_eq!(index.write_tree().unwrap(), head_tree.id(), "index should already match the new HEAD tree with no resync needed");
+
+        // Nothing staged again now — a second call should refuse too.
+        assert!(commit_staged(repo_string.clone(), "Nothing to commit".into()).is_err());
     }
 }
