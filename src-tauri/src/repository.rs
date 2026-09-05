@@ -379,15 +379,20 @@ fn internal_repository(path: &str) -> Result<Repository, String> {
 
 fn internal_statuses(repository: &Repository, scope: Option<&str>) -> Result<Vec<(String, String, bool)>, String> {
     let mut options = StatusOptions::new();
-    // Not recursing into wholly-untracked directories avoids enumerating every file
-    // inside them individually (a major cost on large repos with big non-gitignored
-    // directories, e.g. build output) — libgit2 still reports one entry for the
-    // directory itself, which is all `status_for` needs to flag it as changed.
+    // Correctness over saved time here: not recursing into wholly-untracked
+    // directories was a deliberate speed trade that backfired — copying a new,
+    // non-gitignored folder full of files (e.g. 245 new source files added from
+    // outside the app) collapsed into a *single* status entry for the folder
+    // itself, so those files simply didn't appear in the Changes list at all.
+    // Plain `git status` recurses into untracked directories by default for
+    // exactly this reason; matching that here is what actually makes new files
+    // visible and individually selectable, which matters more than the scan
+    // time saved on the (rare) case of a huge non-gitignored directory.
     // `update_index(true)` opportunistically refreshes the on-disk index's cached
     // file stat info during the scan (the same trick plain `git status` uses) so
     // later scans can trust the cache instead of re-stat'ing unchanged files —
     // pure perf, doesn't change what's reported.
-    options.include_untracked(true).recurse_untracked_dirs(false).include_ignored(false).update_index(true);
+    options.include_untracked(true).recurse_untracked_dirs(true).include_ignored(false).update_index(true);
     // Rename detection (comparing added/deleted file contents to spot moves) is
     // the single most expensive part of a status scan on a huge repository with
     // many pending changes, and it's only cosmetic — a renamed file still shows
@@ -1687,6 +1692,7 @@ pub fn commit_files(repository_path: String, files: Vec<String>, message: String
 }
 
 fn commit_selected_internal(repository_path: &str, files: &[String], message: &str) -> Result<String, String> {
+    let commit_started = Instant::now();
     let repo = internal_repository(repository_path)?;
     // A submodule folder can be deleted straight from disk (Finder/terminal, or a
     // failed clone) without going through this app's own removal flow, leaving it
@@ -1699,6 +1705,15 @@ fn commit_selected_internal(repository_path: &str, files: &[String], message: &s
     let gitlinks: HashMap<String, git2::IndexEntry> = index.iter().filter(|entry| entry.mode == 0o160000).map(|entry| (String::from_utf8_lossy(&entry.path).into_owned(), entry)).collect();
     if let Some(tree) = parent_tree.as_ref() { index.read_tree(tree).map_err(|error| error.message().to_string())?; } else { index.clear().map_err(|error| error.message().to_string())?; }
     let mut includes_submodule = false;
+    // Batched instead of one `add_all`/`remove_all` call per file: each call
+    // re-matches its pathspec against the whole index internally, so on a large
+    // repository calling it once per file (245 calls for a 245-file commit, here
+    // and again in the post-commit sync below — 490 total) scaled with both the
+    // number of files *and* the size of the index, turning what should be a
+    // sub-second commit into minutes. A single call with every path at once does
+    // the same matching pass just once.
+    let mut to_add: Vec<&Path> = Vec::new();
+    let mut to_remove: Vec<&Path> = Vec::new();
     for file in files {
         if file.is_empty() {
             // Whole-repository scope ("Commit repository" with nothing selected).
@@ -1718,10 +1733,17 @@ fn commit_selected_internal(repository_path: &str, files: &[String], message: &s
         // still present on disk — if it was deleted, fall through to the normal
         // add/remove handling below so the deletion actually gets committed.
         if let Some(entry) = gitlinks.get(file) { if absolute.exists() { index.add(entry).map_err(|error| error.message().to_string())?; includes_submodule = true; continue; } }
-        if absolute.exists() { index.add_all([path], git2::IndexAddOption::DEFAULT, None).map_err(|error| error.message().to_string())?; } else { let _ = index.remove_all([path], None); }
+        if absolute.exists() { to_add.push(path); } else { to_remove.push(path); }
     }
+    perf_log(&format!("commit: build scratch index ({} files)", files.len()), commit_started.elapsed());
+    let step = Instant::now();
+    if !to_add.is_empty() { index.add_all(&to_add, git2::IndexAddOption::DEFAULT, None).map_err(|error| error.message().to_string())?; }
+    if !to_remove.is_empty() { index.remove_all(&to_remove, None).map_err(|error| error.message().to_string())?; }
+    perf_log("commit: add_all/remove_all (scratch index)", step.elapsed());
     if includes_submodule && Path::new(repository_path).join(".gitmodules").exists() { index.add_path(Path::new(".gitmodules")).map_err(|error| error.message().to_string())?; }
+    let step = Instant::now();
     let tree_id = index.write_tree_to(&repo).map_err(|error| error.message().to_string())?; if parent_tree.as_ref().map(|tree| tree.id()) == Some(tree_id) { return Err("There are no changes to commit in the selected files".into()); } let tree = repo.find_tree(tree_id).map_err(|error| error.message().to_string())?; let signature = repo.signature().map_err(|_| "Configure user.name and user.email for this repository".to_string())?; let parents: Vec<&git2::Commit<'_>> = parent.iter().collect(); let oid = repo.commit(Some("HEAD"), &signature, &signature, message, &tree, &parents).map_err(|error| error.message().to_string())?;
+    perf_log("commit: write_tree_to + commit", step.elapsed());
     // `index` above was repurposed as an in-memory scratch copy (parent tree plus
     // only the selected files) to build the commit tree, and `repo.index()` returns
     // that same cached instance rather than a fresh read — so it must not be
@@ -1730,7 +1752,10 @@ fn commit_selected_internal(repository_path: &str, files: &[String], message: &s
     // Force-reload the real on-disk index first, then sync just the committed
     // files into it so they stop showing as staged, leaving every other entry
     // (which was never touched on disk) untouched.
+    let step = Instant::now();
     index.read(true).map_err(|error| error.message().to_string())?;
+    let mut to_add: Vec<&Path> = Vec::new();
+    let mut to_remove: Vec<&Path> = Vec::new();
     for file in files {
         if file.is_empty() {
             index.add_all(Vec::<String>::new(), git2::IndexAddOption::DEFAULT, None).map_err(|error| error.message().to_string())?;
@@ -1739,9 +1764,13 @@ fn commit_selected_internal(repository_path: &str, files: &[String], message: &s
         }
         let relative = Path::new(file); let absolute = Path::new(repository_path).join(relative);
         if gitlinks.contains_key(file) && absolute.exists() { if let Ok(mut submodule) = repo.find_submodule(file) { let _ = submodule.add_to_index(true); } continue; }
-        if absolute.exists() { index.add_all([relative], git2::IndexAddOption::DEFAULT, None).map_err(|error| error.message().to_string())?; } else { let _ = index.remove_all([relative], None); }
+        if absolute.exists() { to_add.push(relative); } else { to_remove.push(relative); }
     }
+    if !to_add.is_empty() { index.add_all(&to_add, git2::IndexAddOption::DEFAULT, None).map_err(|error| error.message().to_string())?; }
+    if !to_remove.is_empty() { index.remove_all(&to_remove, None).map_err(|error| error.message().to_string())?; }
     index.write().map_err(|error| error.message().to_string())?;
+    perf_log("commit: sync real index", step.elapsed());
+    perf_log(&format!("commit: TOTAL ({} files)", files.len()), commit_started.elapsed());
     invalidate_git_metadata(repository_path); Ok(oid.to_string())
 }
 
