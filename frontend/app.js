@@ -521,13 +521,30 @@ function renderExplorer() {
     <span class="file-main">${iconFor(entry)}<span class="entry-copy"><span class="entry-name">${esc(entry.name)}${entry.kind === 'submodule' ? '<b class="inline-submodule-badge">SUBMODULE</b>' : ''}</span><span class="entry-hint">${entry.kind === 'submodule' ? 'Independent Git repository' : entry.kind}</span></span>${['folder','submodule'].includes(entry.kind) ? '<span class="folder-arrow">›</span>' : ''}</span>
     ${gitState(entry)}<span class="file-size">${entry.kind === 'file' ? formatSize(entry.size) : '—'}</span><span class="file-modified">${formatModified(entry.modified)}</span>
   </button>`).join('') || (state.currentPath ? '' : '<div class="empty-change">This folder is empty</div>');
-  refs.fileList.querySelector('[data-go-up]')?.addEventListener('click', () => {
-    const now = Date.now();
-    const isDoubleClick = lastExplorerClick.path === '..' && now - lastExplorerClick.time < 500;
-    lastExplorerClick = { path: '..', time: now };
-    if (isDoubleClick) { lastExplorerClick = { path: null, time: 0 }; openDirectory(state.currentPath.split('/').slice(0, -1).join('/')); }
-  });
-  refs.fileList.querySelectorAll('[data-entry]').forEach(row => {
+  // Single delegated listener on the container instead of one click +
+  // one contextmenu listener per row: attaching thousands of individual
+  // listeners (one pair per entry) was itself a real, measurable cost on
+  // folders with many items — this makes listener setup O(1) per render
+  // instead of O(entries), same behavior either way since we only ever
+  // care which row the event happened inside.
+  attachFileListDelegation();
+}
+
+let fileListDelegationAttached = false;
+function attachFileListDelegation() {
+  if (fileListDelegationAttached) return;
+  fileListDelegationAttached = true;
+  refs.fileList.addEventListener('click', event => {
+    const upRow = event.target.closest('[data-go-up]');
+    if (upRow) {
+      const now = Date.now();
+      const isDoubleClick = lastExplorerClick.path === '..' && now - lastExplorerClick.time < 500;
+      lastExplorerClick = { path: '..', time: now };
+      if (isDoubleClick) { lastExplorerClick = { path: null, time: 0 }; openDirectory(state.currentPath.split('/').slice(0, -1).join('/')); }
+      return;
+    }
+    const row = event.target.closest('[data-entry]');
+    if (!row) return;
     // Single click selects, double click opens a folder/submodule — the
     // familiar file-explorer convention. The browser's native `dblclick`
     // event requires both clicks to land on the very same DOM element within
@@ -537,19 +554,19 @@ function renderExplorer() {
     // the same double-click on Windows — macOS's WebKit is more lenient.
     // Detecting the double-click ourselves — by comparing the clicked path
     // and a timestamp, not the DOM node — sidesteps that entirely.
-    row.addEventListener('click', () => {
-      const now = Date.now();
-      const isDoubleClick = lastExplorerClick.path === row.dataset.entry && now - lastExplorerClick.time < 500;
-      lastExplorerClick = { path: row.dataset.entry, time: now };
-      const entry = state.entries.find(item => item.relative_path === row.dataset.entry);
-      if (isDoubleClick && entry && ['folder', 'submodule'].includes(entry.kind)) { lastExplorerClick = { path: null, time: 0 }; openDirectory(entry.relative_path); return; }
-      selectEntry(row.dataset.entry);
-    });
-    row.addEventListener('contextmenu', event => {
-      const entry = state.entries.find(item => item.relative_path === row.dataset.entry);
-      if (entry?.kind !== 'submodule') return;
-      event.preventDefault(); selectEntry(entry.relative_path); openSubmoduleMenu(entry, event.clientX, event.clientY);
-    });
+    const now = Date.now();
+    const isDoubleClick = lastExplorerClick.path === row.dataset.entry && now - lastExplorerClick.time < 500;
+    lastExplorerClick = { path: row.dataset.entry, time: now };
+    const entry = state.entries.find(item => item.relative_path === row.dataset.entry);
+    if (isDoubleClick && entry && ['folder', 'submodule'].includes(entry.kind)) { lastExplorerClick = { path: null, time: 0 }; openDirectory(entry.relative_path); return; }
+    selectEntry(row.dataset.entry);
+  });
+  refs.fileList.addEventListener('contextmenu', event => {
+    const row = event.target.closest('[data-entry]');
+    if (!row) return;
+    const entry = state.entries.find(item => item.relative_path === row.dataset.entry);
+    if (entry?.kind !== 'submodule') return;
+    event.preventDefault(); selectEntry(entry.relative_path); openSubmoduleMenu(entry, event.clientX, event.clientY);
   });
 }
 

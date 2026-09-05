@@ -2,6 +2,20 @@ use serde::Serialize;
 use git2::{BranchType, ObjectType, Repository, Sort, Status, StatusOptions};
 use std::{collections::{HashMap, HashSet}, fs, path::{Component, Path, PathBuf}, process::Command, sync::{Mutex, OnceLock}, time::{Instant, Duration, UNIX_EPOCH}};
 
+// Temporary performance diagnostics: appends "<label>: <ms>ms" lines to a log
+// file so real-world slowness can be diagnosed without guessing. Safe to leave
+// in — each write is a single cheap append, guarded so a logging failure never
+// breaks the actual operation. Log path is printed once by `perf_log_path()`.
+fn perf_log_path() -> PathBuf { std::env::temp_dir().join("git-integrity-perf.log") }
+
+fn perf_log(label: &str, elapsed: Duration) {
+    use std::io::Write;
+    let line = format!("[{:>7.1}ms] {}\n", elapsed.as_secs_f64() * 1000.0, label);
+    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(perf_log_path()) {
+        let _ = file.write_all(line.as_bytes());
+    }
+}
+
 #[derive(Clone, Default)]
 struct GitMetadata {
     tracked: HashSet<String>,
@@ -17,6 +31,19 @@ struct GitMetadata {
 // while still picking up changes made outside the app (another editor, a build
 // tool) within a few seconds, instead of requiring a full app restart to see them.
 const GIT_METADATA_TTL: Duration = Duration::from_secs(4);
+
+// index_metadata/unpushed_paths (tracked files, submodules, unpushed-commit
+// paths) only change on actions that mutate the index or HEAD — staging,
+// committing, checkout, submodule updates — and every such action already
+// calls invalidate_git_metadata() to drop these entries immediately. So,
+// unlike the status-scan cache above (which must stay short-lived to notice
+// changes made *outside* the app), correctness here doesn't depend on time
+// at all — a long TTL is just a safety net for edits made in another editor
+// or a terminal, which Refresh already exists to pick up on demand. Reusing
+// the 4s TTL here forced a full index walk (every tracked file/submodule)
+// on almost every folder click during normal browsing; a much longer TTL
+// keeps that walk to roughly once per browsing session instead.
+const INDEX_METADATA_TTL: Duration = Duration::from_secs(300);
 
 static GIT_METADATA_CACHE: OnceLock<Mutex<HashMap<String, (Instant, GitMetadata)>>> = OnceLock::new();
 
@@ -35,7 +62,7 @@ fn index_metadata_cache() -> &'static Mutex<HashMap<String, (Instant, (HashSet<S
 
 fn cached_index_metadata(repository: &str) -> (HashSet<String>, HashSet<String>) {
     if let Some((cached_at, data)) = index_metadata_cache().lock().unwrap().get(repository) {
-        if cached_at.elapsed() < GIT_METADATA_TTL { return data.clone(); }
+        if cached_at.elapsed() < INDEX_METADATA_TTL { return data.clone(); }
     }
     let data = index_metadata(repository);
     index_metadata_cache().lock().unwrap().insert(repository.to_string(), (Instant::now(), data.clone()));
@@ -105,7 +132,7 @@ fn unpushed_paths(repository: &str) -> HashSet<String> {
 
 fn cached_unpushed_paths(repository: &str) -> HashSet<String> {
     if let Some((cached_at, data)) = unpushed_paths_cache().lock().unwrap().get(repository) {
-        if cached_at.elapsed() < GIT_METADATA_TTL { return data.clone(); }
+        if cached_at.elapsed() < INDEX_METADATA_TTL { return data.clone(); }
     }
     let data = unpushed_paths(repository);
     unpushed_paths_cache().lock().unwrap().insert(repository.to_string(), (Instant::now(), data.clone()));
@@ -671,6 +698,7 @@ fn sync_submodule_gitlinks(repository_path: &str) {
 
 #[tauri::command]
 pub fn load_repository(path: String, force: Option<bool>) -> Result<RepositoryData, String> {
+    let load_started = Instant::now();
     validate_path(&path)?;
     // The manual Refresh action exists specifically for "something changed
     // outside this app (a terminal, VS Code...) and I want a truly fresh
@@ -678,20 +706,25 @@ pub fn load_repository(path: String, force: Option<bool>) -> Result<RepositoryDa
     // scan from moments earlier just because nothing *this app* did
     // triggered an invalidation.
     if force.unwrap_or(false) { invalidate_git_metadata(&path); }
+    let step = Instant::now();
     sync_submodule_gitlinks(&path);
+    perf_log("load_repository: sync_submodule_gitlinks", step.elapsed());
     let mut repo = internal_repository(&path)?;
     let name = Path::new(&path).file_name().and_then(|n| n.to_str()).unwrap_or("repository").to_string();
     let current_branch = repo.head().ok().and_then(|head| head.shorthand().map(String::from)).unwrap_or_default();
+    let step = Instant::now();
     let mut branches = Vec::new();
     for branch_type in [BranchType::Local, BranchType::Remote] { if let Ok(iterator) = repo.branches(Some(branch_type)) { for item in iterator.flatten() {
         let branch_name = item.0.name().ok().flatten().unwrap_or("").to_string(); if branch_name.ends_with("/HEAD") { continue; }
         branches.push(Branch { current: branch_type == BranchType::Local && branch_name == current_branch, name: branch_name, remote: branch_type == BranchType::Remote });
     } } }
+    perf_log("load_repository: branches", step.elapsed());
 
     // `refs/stash` is a real Git ref but its target is a synthetic WIP commit
     // (with an index/untracked-files "merge" parent structure) that has nothing
     // to do with real branch history — excluded here and surfaced separately as
     // `stashes` instead, so the graph only ever shows real ancestry.
+    let step = Instant::now();
     let mut refs_by_oid: HashMap<String, Vec<String>> = HashMap::new();
     if let Ok(references) = repo.references() { for reference in references.flatten() {
         if reference.name() == Some("refs/stash") { continue; }
@@ -705,20 +738,26 @@ pub fn load_repository(path: String, force: Option<bool>) -> Result<RepositoryDa
     for oid in walk.flatten().take(500) { if let Ok(commit) = repo.find_commit(oid) {
         commits.push(Commit { id: oid.to_string(), parents: commit.parent_ids().map(|id| id.to_string()).collect(), subject: commit.summary().unwrap_or("No message").to_string(), author: commit.author().name().unwrap_or("Unknown").to_string(), date: short_date(commit.time().seconds()), refs: refs_by_oid.remove(&oid.to_string()).unwrap_or_default(), lane: 0 });
     } }
+    perf_log("load_repository: refs+revwalk+commits", step.elapsed());
 
+    let step = Instant::now();
     let mut raw_stashes: Vec<(usize, String, git2::Oid)> = Vec::new();
     let _ = repo.stash_foreach(|index, message, oid| { raw_stashes.push((index, message.to_string(), *oid)); true });
     let stashes = raw_stashes.into_iter().map(|(index, message, oid)| {
         let base_commit = repo.find_commit(oid).ok().and_then(|commit| commit.parent_id(0).ok()).map(|id| id.to_string()).unwrap_or_default();
         StashEntry { index, message, base_commit }
     }).collect();
+    perf_log("load_repository: stashes", step.elapsed());
 
+    let step = Instant::now();
     let internal = cached_full_statuses(&repo, &path)?;
+    perf_log("load_repository: cached_full_statuses", step.elapsed());
     let statuses = internal.iter().map(|(path, status, _)| (path.clone(), status.clone())).collect::<Vec<_>>();
     let changes = internal.into_iter().map(|(path, status, staged)| Change { status, path, staged }).collect();
 
     replace_git_metadata(&path, statuses);
 
+    perf_log("load_repository: TOTAL", load_started.elapsed());
     Ok(RepositoryData { repository: RepositoryInfo { path, name, current_branch }, branches, commits, changes, stashes })
 }
 
@@ -1199,6 +1238,7 @@ pub fn submodule_repository(repository_path: String, relative_path: String) -> R
 
 #[tauri::command]
 pub fn load_directory(repository_path: String, relative_path: String) -> Result<Vec<DirectoryEntry>, String> {
+    let load_started = Instant::now();
     validate_path(&repository_path)?;
     let relative = safe_relative_path(&relative_path)?;
     let absolute = Path::new(&repository_path).join(&relative);
@@ -1218,7 +1258,9 @@ pub fn load_directory(repository_path: String, relative_path: String) -> Result<
         Some((sub_path, inner_relative)) => (sub_path.as_str(), inner_relative.as_str()),
         None => (repository_path.as_str(), relative_path.as_str()),
     };
+    let step = Instant::now();
     let git_metadata = cached_git_metadata(status_repo, status_scope);
+    perf_log(&format!("load_directory: cached_git_metadata ({relative_path})"), step.elapsed());
     // "Does this folder contain any tracked/unpushed file?" used to be a
     // linear scan over *every* tracked path in the whole repository, for
     // *every* entry in the folder being listed — O(entries × total tracked
@@ -1251,6 +1293,8 @@ pub fn load_directory(repository_path: String, relative_path: String) -> Result<
         if statuses_sorted.get(idx).map(|(path, _)| path.starts_with(&prefix)).unwrap_or(false) { "•".to_string() } else { String::new() }
     };
     let mut entries = Vec::new();
+    let step = Instant::now();
+    let mut submodule_count = 0usize;
 
     for item in fs::read_dir(&absolute).map_err(|error| error.to_string())? {
         let item = item.map_err(|error| error.to_string())?;
@@ -1274,15 +1318,18 @@ pub fn load_directory(repository_path: String, relative_path: String) -> Result<
         let tracked_prefix = format!("{status_key}/");
         let tracked = git_metadata.submodules.contains(&status_key) || git_metadata.tracked.contains(&status_key) || has_prefix(&tracked_sorted, &tracked_prefix);
         let modified = metadata.modified().ok().and_then(|time| time.duration_since(UNIX_EPOCH).ok()).map(|value| value.as_secs()).unwrap_or(0);
+        if kind == "submodule" { submodule_count += 1; }
         let submodule_has_unpushed_commits = kind == "submodule" && submodule_push_status(item.path().to_str().unwrap_or_default()).is_some();
         let unpushed = if kind == "folder" { git_metadata.unpushed.contains(&status_key) || has_prefix(&unpushed_sorted, &tracked_prefix) } else { git_metadata.unpushed.contains(&status_key) };
         entries.push(DirectoryEntry { name, relative_path: relative_string, kind, status: status_for_entry(&status_key), tracked, size: if metadata.is_file() { metadata.len() } else { 0 }, modified, submodule_has_unpushed_commits, unpushed });
     }
+    perf_log(&format!("load_directory: readdir loop ({} entries, {submodule_count} submodules)", entries.len()), step.elapsed());
     entries.sort_by(|a, b| {
         let a_group = matches!(a.kind.as_str(), "folder" | "submodule");
         let b_group = matches!(b.kind.as_str(), "folder" | "submodule");
         b_group.cmp(&a_group).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
     });
+    perf_log(&format!("load_directory: TOTAL ({relative_path})"), load_started.elapsed());
     Ok(entries)
 }
 
