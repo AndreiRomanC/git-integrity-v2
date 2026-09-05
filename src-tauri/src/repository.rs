@@ -469,8 +469,21 @@ fn validate_path(path: &str) -> Result<(), String> {
     Ok(())
 }
 
+// A trailing '/' or '\' (routinely present when a folder path is pasted from
+// Windows Explorer's address bar, or built by joining path segments with a
+// separator) survives completely unnoticed through `Path` — `components()`
+// treats "foo/" and "foo" the same, but `to_string_lossy()`/`Path::to_path_buf()`
+// preserve the literal trailing separator in the string. That string is what
+// eventually reaches libgit2 as a pathspec (e.g. commit_path -> normalized() ->
+// index.add_all/write_tree), where a trailing separator makes it reject the
+// whole path outright ("invalid path"), even though the folder genuinely
+// exists. Stripped once, here, since virtually every command that accepts a
+// repository-relative path from the frontend already funnels through this —
+// a single fix point instead of every caller having to remember to trim it
+// (stage_files already did its own ad hoc version of this before this fix).
 fn safe_relative_path(value: &str) -> Result<PathBuf, String> {
-    let path = Path::new(value);
+    let trimmed = value.trim_end_matches(['/', '\\']);
+    let path = Path::new(trimmed);
     if path.is_absolute() || path.components().any(|part| matches!(part, Component::ParentDir | Component::RootDir | Component::Prefix(_))) {
         return Err("Invalid repository-relative path".into());
     }
@@ -835,8 +848,12 @@ pub fn load_repository(path: String, force: Option<bool>) -> Result<RepositoryDa
 fn partition_by_submodule(repository_path: &str, files: Vec<String>) -> (Vec<String>, HashMap<String, Vec<String>>) {
     let mut own = Vec::new();
     let mut grouped: HashMap<String, Vec<String>> = HashMap::new();
+    // Fetched once for the whole batch, not once per file — see the comment on
+    // resolve_submodule_boundary_from for why that distinction matters a lot on
+    // a large repository.
+    let (_, submodules) = cached_index_metadata(repository_path);
     for file in files {
-        match resolve_submodule_boundary(repository_path, &file) {
+        match resolve_submodule_boundary_from(&submodules, repository_path, &file) {
             // Only redirect for a path *inside* a submodule (a file within
             // it). The submodule's own path (empty inner_relative) must stay
             // in `own` and go through the normal gitlink-staging logic below
@@ -854,15 +871,30 @@ fn partition_by_submodule(repository_path: &str, files: Vec<String>) -> (Vec<Str
 pub fn stage_files(path: String, files: Vec<String>) -> Result<(), String> {
     let started = Instant::now();
     let file_count = files.len();
+    perf_log(&format!("stage_files: START ({file_count} files)"), Duration::ZERO);
     validate_path(&path)?;
+    let step = Instant::now();
     let (files, submodule_groups) = partition_by_submodule(&path, files);
+    perf_log(&format!("stage_files: partition_by_submodule ({file_count} files)"), step.elapsed());
     for (sub_path, inner_files) in submodule_groups { stage_files(sub_path, inner_files)?; }
     if files.is_empty() { return Ok(()); }
     let repo = internal_repository(&path)?;
     let safe_files = files.into_iter().map(|file| safe_relative_path(file.trim_end_matches(|character| character == '/' || character == '\\'))).collect::<Result<Vec<_>, _>>()?;
+    let step = Instant::now();
+    // `submodules.contains(...)` (an O(1) HashSet lookup against metadata
+    // already fetched once for the whole batch) instead of calling
+    // `repo.find_submodule(...)` — a real libgit2 lookup — for every single
+    // file: only the (typically very few, if any) paths that are actually
+    // submodule roots need that real lookup at all, to get the Submodule
+    // handle add_to_index needs.
+    let (_, submodules) = cached_index_metadata(&path);
     let mut submodule_paths = HashSet::new();
-    for safe in &safe_files { if let Ok(mut submodule) = repo.find_submodule(&normalized(safe)) { submodule.add_to_index(true).map_err(|error| format!("Cannot stage submodule {}: {}", normalized(safe), error.message()))?; submodule_paths.insert(normalized(safe)); } }
-    perf_log(&format!("stage_files: submodule detection ({file_count} files)"), started.elapsed());
+    for safe in &safe_files {
+        let normalized_safe = normalized(safe);
+        if !submodules.contains(&normalized_safe) { continue; }
+        if let Ok(mut submodule) = repo.find_submodule(&normalized_safe) { submodule.add_to_index(true).map_err(|error| format!("Cannot stage submodule {}: {}", normalized_safe, error.message()))?; submodule_paths.insert(normalized_safe); }
+    }
+    perf_log(&format!("stage_files: submodule detection ({file_count} files)"), step.elapsed());
     let step = Instant::now();
     let mut index = repo.index().map_err(|error| error.message().to_string())?;
     perf_log("stage_files: repo.index()", step.elapsed());
@@ -2064,6 +2096,21 @@ fn default_remote_ref(repository: &str) -> Option<String> {
 // permanently show as "local-only" regardless of whether it was ever pushed.
 fn resolve_submodule_boundary(repository_path: &str, relative_path: &str) -> Option<(String, String)> {
     let (_, submodules) = cached_index_metadata(repository_path);
+    resolve_submodule_boundary_from(&submodules, repository_path, relative_path)
+}
+
+// Same lookup, taking an already-fetched submodules set — `cached_index_metadata`
+// returns an owned *clone* of its (tracked, submodules) HashSets on every call
+// (needed since callers mutate/hold their own copy elsewhere), and `tracked` can
+// have hundreds of thousands of entries on a large repository. Calling
+// `resolve_submodule_boundary` once per file in a loop (partition_by_submodule,
+// for every path passed to Stage all / Unstage all) cloned that entire set once
+// per file — for 245 files that's 245 full clones of the tracked-path set before
+// any of the real staging work even starts, and it happens before the first
+// perf_log call, so it never showed up in the timing logs either. Fetching the
+// metadata once per *call* (not per file) and sharing it by reference here
+// fixes both.
+fn resolve_submodule_boundary_from(submodules: &HashSet<String>, repository_path: &str, relative_path: &str) -> Option<(String, String)> {
     let submodule_path = submodules.iter().find(|sub| relative_path == sub.as_str() || relative_path.starts_with(&format!("{sub}/")))?.clone();
     let absolute_sub = Path::new(repository_path).join(&submodule_path);
     let sub_path_string = absolute_sub.to_string_lossy().into_owned();
@@ -4620,5 +4667,66 @@ mod tests {
         let mut index = repo.index().unwrap();
         assert_eq!(index.write_tree().unwrap(), head_tree.id(), "index should equal HEAD with no leftover staged state");
         for name in &names[..5] { assert!(!repo_path.join(name).exists(), "deleted file should still be absent from the working tree"); }
+    }
+
+    // Isolates exactly the regression that was found and fixed: partition_by_submodule
+    // used to call resolve_submodule_boundary once per file, which cloned the
+    // *entire* tracked-paths HashSet (via cached_index_metadata) every single
+    // time — for 245 files that's 245 full clones of the tracked set before any
+    // real staging work even starts. This seeds the cache directly with a large
+    // synthetic tracked set (no need to write 300,000 real files to disk just to
+    // prove the point) and asserts partitioning 245 paths against it stays fast
+    // — if the per-file clone ever comes back, this test's timing catches it
+    // immediately instead of only showing up as "the real repo is slow" again.
+    #[test]
+    fn partition_by_submodule_does_not_reclone_metadata_per_file() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let repo_path = std::env::temp_dir().join(format!("git-integrity-partition-perf-{suffix}"));
+        create_libgit2_repository(&repo_path, "README.md");
+        let repo_string = repo_path.to_string_lossy().into_owned();
+
+        let tracked: HashSet<String> = (0..300_000).map(|i| format!("synthetic_{i}.txt")).collect();
+        index_metadata_cache().lock().unwrap().insert(repo_string.clone(), (Instant::now(), (tracked, HashSet::new())));
+
+        let files: Vec<String> = (0..245).map(|i| format!("incoming_{i}.txt")).collect();
+        let started = Instant::now();
+        let (own, grouped) = partition_by_submodule(&repo_string, files);
+        let elapsed = started.elapsed();
+        println!("PERF partition_by_submodule (300k tracked, 245 files): {elapsed:?}");
+
+        assert_eq!(own.len(), 245, "none of these paths are inside a submodule, so all 245 should pass through unchanged");
+        assert!(grouped.is_empty());
+        assert!(elapsed.as_millis() < 500, "partition_by_submodule took {elapsed:?} for 245 files against a 300k-entry tracked set — looks like metadata is being cloned per file again, not once per call");
+    }
+
+    #[test]
+    fn commit_path_accepts_a_folder_path_with_a_trailing_separator() {
+        // Reported: committing a folder failed with libgit2's "invalid path"
+        // even though the folder genuinely existed. Cause: a trailing '/' or
+        // '\' (e.g. pasted from Windows Explorer's address bar) survives
+        // untouched through Rust's Path into the pathspec string handed to
+        // libgit2, which rejects a pathspec ending in a separator outright.
+        for variant in ["work/asw/aggr/errm/agf/errm_fctdg_test/", "work/asw/aggr/errm/agf/errm_fctdg_test", "work/asw/aggr/errm/agf/errm_fctdg_test//", "work/asw/aggr/errm/agf/errm_fctdg_test\\"] {
+            let repo_path = std::env::temp_dir().join(format!("git-integrity-trailing-slash-variant-{}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+            fs::create_dir_all(repo_path.join("work/asw/aggr/errm/agf/errm_fctdg_test")).unwrap();
+            create_libgit2_repository(&repo_path, "README.md");
+            fs::write(repo_path.join("work/asw/aggr/errm/agf/errm_fctdg_test/file.c"), "content").unwrap();
+            fs::write(repo_path.join("outside_the_folder.txt"), "should not be committed").unwrap();
+            let repo_string = repo_path.to_string_lossy().into_owned();
+            stage_files(repo_string.clone(), vec!["work/asw/aggr/errm/agf/errm_fctdg_test/file.c".into(), "outside_the_folder.txt".into()]).unwrap();
+
+            let oid = commit_path(repo_string.clone(), variant.into(), "Commit the test folder".into())
+                .unwrap_or_else(|error| panic!("commit_path failed for variant {variant:?}: {error}"));
+            let repo = internal_repository(&repo_string).unwrap();
+            let commit = repo.find_commit(git2::Oid::from_str(&oid).unwrap()).unwrap();
+            let tree = commit.tree().unwrap();
+            assert!(tree.get_path(Path::new("work/asw/aggr/errm/agf/errm_fctdg_test/file.c")).is_ok(), "variant {variant:?}: the folder's own file should be committed");
+            assert!(tree.get_path(Path::new("outside_the_folder.txt")).is_err(), "variant {variant:?}: a file outside the selected folder must not be committed alongside it");
+
+            // The other staged file (outside the folder) must still be
+            // staged afterward — a scoped commit must not touch it.
+            let index = repo.index().unwrap();
+            assert!(index.get_path(Path::new("outside_the_folder.txt"), 0).is_some(), "variant {variant:?}: the untouched staged file should remain staged");
+        }
     }
 }
