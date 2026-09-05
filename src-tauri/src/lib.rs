@@ -19,6 +19,7 @@ pub fn run() {
             repository::switch_branch,
             repository::load_directory,
             repository::entry_details,
+            repository::entry_last_commit,
             repository::submodule_versions,
             repository::add_submodule,
             repository::switch_submodule_version,

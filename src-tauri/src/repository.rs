@@ -1294,10 +1294,16 @@ pub fn entry_details(repository_path: String, relative_path: String) -> Result<E
     let modified = metadata.modified().ok().and_then(|time| time.duration_since(UNIX_EPOCH).ok()).map(|value| value.as_secs()).unwrap_or(0);
     let item_count = metadata.is_dir().then(|| fs::read_dir(&absolute).map(|items| items.count()).unwrap_or(0));
 
-    let last = match &boundary {
-        Some((sub_path, inner_relative)) => last_commit_touching_path(sub_path, Path::new(inner_relative)),
-        None => last_commit_touching_path(&repository_path, &relative),
-    };
+    // "Last commit touching this path" walks history diffing every commit
+    // against its parent until it finds a match — up to 2000 commits, each a
+    // real tree-diff computation. On a large monorepo that's genuinely heavy
+    // (this is the same cost `git log -- <path>` has), and it used to run
+    // inline on every single selection click, making clicking around a
+    // large, rarely-touched folder feel badly stuck. Left as None here —
+    // entry_last_commit below computes it as a separate, later call the
+    // frontend fires only after the rest of the (fast) details are already
+    // showing, instead of blocking on it up front.
+    let last: Option<(String, String, String, String)> = None;
     let submodule_url = (kind == "submodule").then(|| submodule_value(&repository_path, &relative_string, "url")).flatten();
     let submodule_branch = (kind == "submodule").then(|| submodule_value(&repository_path, &relative_string, "branch")).flatten();
     let submodule_push_status = (kind == "submodule").then(|| submodule_push_status(&absolute.to_string_lossy())).flatten();
@@ -1317,6 +1323,24 @@ pub fn entry_details(repository_path: String, relative_path: String) -> Result<E
         submodule_commit_id: submodule_commit.as_ref().map(|value| value.0.clone()),
         submodule_commit_subject: submodule_commit.as_ref().map(|value| value.1.clone()), submodule_commit_author: submodule_commit.as_ref().map(|value| value.2.clone()), submodule_commit_date: submodule_commit.as_ref().map(|value| value.3.clone()),
     })
+}
+
+// The "last commit touching this path" lookup entry_details deliberately no
+// longer does inline — a separate, later call the frontend fires only after
+// the fast details above are already on screen, so selecting item after
+// item in a large folder doesn't sit blocked on a potentially-heavy history
+// walk on every single click.
+#[tauri::command]
+pub fn entry_last_commit(repository_path: String, relative_path: String) -> Result<Option<PublishCommit>, String> {
+    validate_path(&repository_path)?;
+    let relative = safe_relative_path(&relative_path)?;
+    let relative_string = normalized(&relative);
+    let boundary = resolve_submodule_boundary(&repository_path, &relative_string).filter(|(_, inner)| !inner.is_empty());
+    let last = match &boundary {
+        Some((sub_path, inner_relative)) => last_commit_touching_path(sub_path, Path::new(inner_relative)),
+        None => last_commit_touching_path(&repository_path, &relative),
+    };
+    Ok(last.map(|(id, subject, author, date)| PublishCommit { id, subject, author, date }))
 }
 
 // Uses only already-known local refs (no fetch) so it's cheap enough to call every
@@ -2344,9 +2368,9 @@ mod tests {
         assert_eq!(repo.index().unwrap().get_path(Path::new("components/engine"), 0).unwrap().mode, 0o160000);
         drop(repo);
         create_commit(parent_string.clone(), "P:89312 add engine".into()).unwrap();
-        assert_eq!(entry_details(parent_string.clone(), "README.md".into()).unwrap().last_commit_subject.as_deref(), Some("Initial commit"));
+        assert_eq!(entry_last_commit(parent_string.clone(), "README.md".into()).unwrap().map(|c| c.subject), Some("Initial commit".to_string()));
         let engine_details = entry_details(parent_string.clone(), "components/engine".into()).unwrap();
-        assert_eq!(engine_details.last_commit_subject.as_deref(), Some("P:89312 add engine"), "last_commit_* must stay the parent's gitlink-bump commit");
+        assert_eq!(entry_last_commit(parent_string.clone(), "components/engine".into()).unwrap().map(|c| c.subject), Some("P:89312 add engine".to_string()), "last-commit-touching-path must stay the parent's gitlink-bump commit");
         assert_eq!(engine_details.submodule_commit_subject.as_deref(), Some("Initial commit"), "submodule_commit_* must be the submodule's own HEAD commit, not the parent's");
         assert!(engine_details.submodule_commit_id.is_some());
         let versions = submodule_versions(parent_string.clone(), added.clone()).unwrap();
@@ -2737,6 +2761,30 @@ mod tests {
         assert_eq!(context.current_branch, "master");
 
         fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn entry_details_stays_fast_by_leaving_last_commit_lookup_to_a_separate_call() {
+        // Reported: selecting items in a large folder was extremely slow.
+        // entry_details used to walk up to 2000 commits, diffing each
+        // against its parent, on *every* selection — the same cost as
+        // `git log -- <path>`, run inline on every click. It must no
+        // longer compute that at all; entry_last_commit does it instead,
+        // as a separate call the frontend fires after the fast details are
+        // already showing.
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let repository = std::env::temp_dir().join(format!("git-integrity-entry-details-fast-{suffix}"));
+        create_libgit2_repository(&repository, "a.txt");
+        let path = repository.to_string_lossy().into_owned();
+
+        let details = entry_details(path.clone(), "a.txt".into()).unwrap();
+        assert!(details.last_commit_id.is_none(), "entry_details must not populate last-commit-touching-path fields itself");
+        assert!(details.last_commit_subject.is_none());
+
+        let last = entry_last_commit(path.clone(), "a.txt".into()).unwrap();
+        assert_eq!(last.unwrap().subject, "Initial commit", "entry_last_commit must still find it correctly when actually asked");
+
+        fs::remove_dir_all(repository).unwrap();
     }
 
     #[test]

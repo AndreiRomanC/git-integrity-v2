@@ -612,8 +612,22 @@ async function selectEntry(path) {
   }
   render();
   if (!invoke) return renderEntryDetails({ ...state.selectedEntry, item_count: state.selectedEntry.kind === 'folder' ? 12 : null, submodule_url: state.selectedEntry.kind === 'submodule' ? 'git@example.com:platform/diagnostics-core.git' : null, submodule_branch: state.selectedEntry.kind === 'submodule' ? 'main' : null, last_commit_id: 'a39f21d', last_commit_subject: 'P:423421431 test', last_commit_author: 'Andrei Pop', last_commit_date: '2026-08-14' });
-  try { renderEntryDetails(await invoke('entry_details', { repositoryPath: state.repository.path, relativePath: path })); }
-  catch (error) { handleError(error); }
+  try {
+    const details = await invoke('entry_details', { repositoryPath: state.repository.path, relativePath: path });
+    renderEntryDetails(details);
+    // "Last commit touching this path" is fetched separately — it can be a
+    // genuinely heavy history walk on a large repository, and blocking the
+    // whole details panel on it made clicking around a large folder feel
+    // stuck. Only patch it in if this is still the selected entry — the
+    // user may well have already clicked elsewhere by the time it resolves.
+    invoke('entry_last_commit', { repositoryPath: state.repository.path, relativePath: path })
+      .then(last => {
+        if (state.selectedEntry?.relative_path !== path) return;
+        const section = $('#entryLastCommitSection'); if (!section) return;
+        section.innerHTML = renderEntryLastCommitInner({ ...details, last_commit_id: last?.id ?? null, last_commit_subject: last?.subject ?? null, last_commit_author: last?.author ?? null, last_commit_date: last?.date ?? null });
+      })
+      .catch(() => { const section = $('#entryLastCommitSection'); if (section && state.selectedEntry?.relative_path === path) section.innerHTML = renderEntryLastCommitInner({ ...details, last_commit_id: null }); });
+  } catch (error) { handleError(error); }
 }
 
 function selectedScope() {
@@ -660,6 +674,18 @@ async function showSelectedHistory() {
   catch (error) { handleError(error); }
 }
 
+// "Last commit touching this path" can be a genuinely heavy history walk on
+// a large repository — computed separately from the rest of entry_details
+// (see selectEntry) so it never blocks the fast details from showing.
+// `entry.last_commit_id === undefined` means "not fetched yet" (as opposed
+// to `null`, a real "nothing found"), so this can tell "still loading" apart
+// from "loaded, no commit".
+function renderEntryLastCommitInner(entry) {
+  const title = entry.kind === 'submodule' ? 'PROJECT COMMIT (gitlink update)' : 'LAST COMMIT';
+  if (entry.last_commit_id === undefined) return `<h3>${title}</h3><div class="detail-grid"><span>Commit</span><strong><i class="spinner"></i> Loading…</strong></div>`;
+  return `<h3>${title}</h3><div class="detail-grid"><span>Commit</span><strong>${entry.last_commit_id ? `<a href="#" class="commit-server-link" data-commit-id="${esc(entry.last_commit_id)}" title="Open this commit on the server">${esc(entry.last_commit_id.slice(0, 8))} ↗</a>` : 'No commit'}</strong><span>Message</span><strong>${commitSubjectHtml(entry.last_commit_subject || '—')}</strong><span>Author</span><strong>${esc(entry.last_commit_author || '—')}</strong><span>Date</span><strong>${esc(entry.last_commit_date || '—')}</strong></div>`;
+}
+
 function renderEntryDetails(entry) {
   const kindLabel = entry.kind === 'submodule' ? 'Git submodule' : entry.kind.charAt(0).toUpperCase() + entry.kind.slice(1);
   refs.details.innerHTML = `<div class="entry-details"><div class="entry-preview ${esc(entry.kind)}">${entry.kind === 'submodule' ? '◇' : entry.kind === 'folder' ? '▰' : '▤'}</div>
@@ -671,7 +697,7 @@ function renderEntryDetails(entry) {
     ${entry.kind === 'submodule' ? `<div class="detail-section"><h3>SUBMODULE</h3><div class="detail-grid"><span>Remote</span><strong>${esc(entry.submodule_url || 'Not configured')}</strong><span>Branch</span><strong>${esc(entry.submodule_branch || 'Default')}</strong><span>Status</span><strong>${entry.status ? (entry.status === 'M' ? 'Has local changes' : 'Modified') : 'Clean'}</strong></div>
     ${entry.submodule_unpushed_commits?.length ? `<div class="submodule-push-banner"><i></i><span>${entry.submodule_unpushed_commits.length} commit${entry.submodule_unpushed_commits.length === 1 ? '' : 's'} not yet pushed to its own remote:</span></div><div class="submodule-unpushed-list">${entry.submodule_unpushed_commits.map(commit => `<div class="submodule-unpushed-commit"><strong>${commitSubjectHtml(commit.subject)}</strong><small>${esc(commit.id.slice(0, 8))} · ${esc(commit.author)} · ${esc(commit.date)}</small></div>`).join('')}</div>` : entry.submodule_push_status ? `<div class="submodule-push-banner"><i></i><span>${esc(entry.submodule_push_status)}</span></div>` : ''}</div>` : ''}
     ${entry.kind === 'submodule' ? `<div class="detail-section"><h3>SUBMODULE COMMIT (actual change)</h3><div class="detail-grid"><span>Commit</span><strong>${entry.submodule_commit_id ? `<a href="#" class="commit-server-link" data-commit-id="${esc(entry.submodule_commit_id)}" data-submodule-path="${esc(entry.relative_path)}" title="Open this commit on the submodule's own server">${esc(entry.submodule_commit_id.slice(0, 8))} ↗</a>` : 'No commit'}</strong><span>Message</span><strong>${commitSubjectHtml(entry.submodule_commit_subject || '—')}</strong><span>Author</span><strong>${esc(entry.submodule_commit_author || '—')}</strong><span>Date</span><strong>${esc(entry.submodule_commit_date || '—')}</strong></div></div>` : ''}
-    <div class="detail-section"><h3>${entry.kind === 'submodule' ? 'PROJECT COMMIT (gitlink update)' : 'LAST COMMIT'}</h3><div class="detail-grid"><span>Commit</span><strong>${entry.last_commit_id ? `<a href="#" class="commit-server-link" data-commit-id="${esc(entry.last_commit_id)}" title="Open this commit on the server">${esc(entry.last_commit_id.slice(0, 8))} ↗</a>` : 'No commit'}</strong><span>Message</span><strong>${commitSubjectHtml(entry.last_commit_subject || '—')}</strong><span>Author</span><strong>${esc(entry.last_commit_author || '—')}</strong><span>Date</span><strong>${esc(entry.last_commit_date || '—')}</strong></div></div></div>`;
+    <div class="detail-section" id="entryLastCommitSection">${renderEntryLastCommitInner(entry)}</div></div>`;
   refs.details.querySelectorAll('[data-detail-action]').forEach(button => button.addEventListener('click', () => { Promise.resolve(handleDetailAction(button.dataset.detailAction, entry, button)).catch(error => handleError(error)); }));
 }
 
