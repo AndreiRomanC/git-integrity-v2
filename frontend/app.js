@@ -317,7 +317,19 @@ function render() {
   $('#navRemotes').classList.toggle('active', state.view === 'remotes');
   refs.locationRepository.textContent = state.graphContext?.name || state.repository?.name || '—'; refs.locationBranch.textContent = state.repository?.current_branch || 'Detached HEAD'; refs.locationPath.textContent = state.view === 'commander' ? `/${state.commanderPath}` : state.view === 'explorer' ? `/${state.currentPath}` : state.view === 'graph' ? 'commit history' : 'remote configuration';
   refs.leaveSubmoduleGraph.hidden = !state.graphContext;
-  renderBranches(); renderExplorer(); renderCommander(); renderGraph(); renderRemotes(); renderChanges();
+  // Every view used to be rebuilt on every render() call regardless of which
+  // one was actually visible — navigating folders in Explorer also rebuilt
+  // the branch graph (up to 500 commits, plus a real layout pass reading
+  // offsetTop/offsetHeight per row), the Commander comparison view, and the
+  // Remotes view, none of which were even on screen. Only the view that's
+  // actually active gets rebuilt now; switching to one calls render() again
+  // right after anyway, which builds it fresh at that point.
+  renderBranches(); renderExplorer();
+  if (state.view === 'commander') renderCommander();
+  if (state.view === 'graph') renderGraph();
+  if (state.view === 'remotes') renderRemotes();
+  updateChangeBadge();
+  if (refs.changesDrawer.classList.contains('open')) renderChanges();
 }
 
 function renderCommanderBreadcrumbs() {
@@ -582,6 +594,12 @@ function attachFileListDelegation() {
 // otherwise arrive *after* B's and overwrite the (correct, already-showing)
 // folder B listing with stale folder A data. Whichever call's result comes
 // back is only applied if no newer navigation has started since.
+// Fire-and-forget: writes into the same perf log the backend uses (see
+// frontend_perf_log's doc comment in repository.rs). Never awaited and never
+// throws into the caller — a logging failure (or running in browser-preview
+// mode with no `invoke`) must never affect the actual operation being timed.
+function jsPerfLog(label, elapsedMs) { if (invoke) invoke('frontend_perf_log', { label, elapsedMs }).catch(() => {}); }
+
 let explorerRequestSeq = 0;
 async function openDirectory(path, options = {}) {
   if (!state.repository) return;
@@ -591,10 +609,14 @@ async function openDirectory(path, options = {}) {
   refs.fileList.innerHTML = '<div class="loading-row"><i class="spinner"></i>Loading folder…</div>';
   if (!invoke) { state.entries = previewData.entries; directoryCache.set(path, state.entries); render(); return; }
   try {
+    const invokeStarted = performance.now();
     const entries = await invoke('load_directory', { repositoryPath: state.repository.path, relativePath: path });
+    jsPerfLog(`openDirectory invoke(load_directory) (${path || '/'})`, performance.now() - invokeStarted);
     directoryCache.set(path, entries);
     if (requestId !== explorerRequestSeq) return;
+    const renderStarted = performance.now();
     state.entries = entries; render();
+    jsPerfLog(`openDirectory render() (${path || '/'}, ${entries.length} entries)`, performance.now() - renderStarted);
   } catch (error) {
     if (requestId !== explorerRequestSeq) return;
     status(String(error), 'error'); refs.fileList.innerHTML = `<div class="empty-change">${esc(String(error))}</div>`;
@@ -1648,9 +1670,19 @@ function selectCommit(id) {
     <span>Parents</span><strong>${esc(c.parents?.join(', ') || 'First commit')}</strong><span>Refs</span><strong>${esc(c.refs?.join(', ') || '—')}</strong></div></div>`;
 }
 
-function renderChanges() {
+// The small always-visible sidebar badge/subtitle, split out from the full
+// drawer rebuild below — these need to stay live even while the Working
+// tree drawer is closed (or another view like Graph/Commander is active),
+// but rebuilding every change row's HTML and re-attaching its listeners
+// doesn't, since none of it is visible until the drawer is actually opened
+// (which already calls renderChanges() itself, in full, when it happens).
+function updateChangeBadge() {
   refs.changeBadge.textContent = state.changes.length;
   refs.workspaceSubtitle.textContent = state.repository ? (state.changes.length ? `${state.changes.length} changed files` : 'Everything committed') : 'No repository loaded';
+}
+
+function renderChanges() {
+  updateChangeBadge();
   const scope = state.changesScope === 'folder' ? state.currentPath : ''; const scopedChanges = state.changes.filter(change => !scope || change.path === scope || change.path.startsWith(`${scope}/`));
   refs.drawerScopeTitle.textContent = state.changesScope === 'folder' ? `Changes in folder · /${scope}` : 'Working tree · entire repository';
   refs.changesSummary.textContent = scopedChanges.length ? `${scopedChanges.length} file${scopedChanges.length === 1 ? '' : 's'} available for staging` : `No changes in ${scope ? `/${scope}` : 'the repository'}`;

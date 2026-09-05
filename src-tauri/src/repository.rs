@@ -1,6 +1,6 @@
 use serde::Serialize;
 use git2::{BranchType, ObjectType, Repository, Sort, Status, StatusOptions};
-use std::{collections::{HashMap, HashSet}, fs, path::{Component, Path, PathBuf}, process::Command, sync::{Mutex, OnceLock}, time::{Instant, Duration, UNIX_EPOCH}};
+use std::{collections::{HashMap, HashSet}, fs, path::{Component, Path, PathBuf}, process::Command, sync::{Arc, Mutex, OnceLock}, time::{Instant, Duration, UNIX_EPOCH}};
 
 // Temporary performance diagnostics: appends "<label>: <ms>ms" lines to a log
 // file so real-world slowness can be diagnosed without guessing. Safe to leave
@@ -26,11 +26,19 @@ fn perf_log(label: &str, elapsed: Duration) {
 }
 
 #[derive(Clone, Default)]
+// tracked/submodules/unpushed are repository-wide (not scoped to whatever
+// folder is being browsed) and can have hundreds of thousands of entries on
+// a large repository — wrapped in Arc so that every place that used to
+// `.clone()` a GitMetadata (once per distinct folder scope cached, and again
+// on every cache hit for it) does an O(1) refcount bump instead of a real
+// O(total tracked files) HashSet deep-copy. `statuses` stays owned: it's
+// already scoped to actual changes, which is normally far smaller than the
+// total tracked set, so cloning it plainly is fine.
 struct GitMetadata {
-    tracked: HashSet<String>,
-    submodules: HashSet<String>,
+    tracked: Arc<HashSet<String>>,
+    submodules: Arc<HashSet<String>>,
     statuses: Vec<(String, String)>,
-    unpushed: HashSet<String>,
+    unpushed: Arc<HashSet<String>>,
 }
 
 // A full status scan (`build_git_metadata`) walks the entire working tree — on a
@@ -63,17 +71,23 @@ fn metadata_cache() -> &'static Mutex<HashMap<String, (Instant, GitMetadata)>> {
 // tracked/submodules (from the index) don't depend on which folder is being
 // browsed, so callers that only need those — not the working-tree status scan —
 // can use this instead of paying for a (possibly scoped) status scan they don't need.
-static INDEX_METADATA_CACHE: OnceLock<Mutex<HashMap<String, (Instant, (HashSet<String>, HashSet<String>))>>> = OnceLock::new();
+static INDEX_METADATA_CACHE: OnceLock<Mutex<HashMap<String, (Instant, (Arc<HashSet<String>>, Arc<HashSet<String>>))>>> = OnceLock::new();
 
-fn index_metadata_cache() -> &'static Mutex<HashMap<String, (Instant, (HashSet<String>, HashSet<String>))>> {
+fn index_metadata_cache() -> &'static Mutex<HashMap<String, (Instant, (Arc<HashSet<String>>, Arc<HashSet<String>>))>> {
     INDEX_METADATA_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn cached_index_metadata(repository: &str) -> (HashSet<String>, HashSet<String>) {
+// Returns Arc-wrapped sets — every caller used to get an owned `.clone()` of
+// these (some, like partition_by_submodule before its fix, once per file in
+// a loop), which on a repository with hundreds of thousands of tracked files
+// meant a real O(total tracked files) HashSet deep-copy every time, cache hit
+// or not. Cloning an Arc is an O(1) refcount bump regardless of set size.
+fn cached_index_metadata(repository: &str) -> (Arc<HashSet<String>>, Arc<HashSet<String>>) {
     if let Some((cached_at, data)) = index_metadata_cache().lock().unwrap().get(repository) {
         if cached_at.elapsed() < INDEX_METADATA_TTL { return data.clone(); }
     }
-    let data = index_metadata(repository);
+    let (tracked, submodules) = index_metadata(repository);
+    let data = (Arc::new(tracked), Arc::new(submodules));
     index_metadata_cache().lock().unwrap().insert(repository.to_string(), (Instant::now(), data.clone()));
     data
 }
@@ -83,9 +97,9 @@ fn cached_index_metadata(repository: &str) -> (HashSet<String>, HashSet<String>)
 // HEAD exactly) but that commit hasn't reached the server. Same TTL-cached
 // pattern as the index metadata above, since it doesn't depend on which
 // folder is being browsed either.
-static UNPUSHED_PATHS_CACHE: OnceLock<Mutex<HashMap<String, (Instant, HashSet<String>)>>> = OnceLock::new();
+static UNPUSHED_PATHS_CACHE: OnceLock<Mutex<HashMap<String, (Instant, Arc<HashSet<String>>)>>> = OnceLock::new();
 
-fn unpushed_paths_cache() -> &'static Mutex<HashMap<String, (Instant, HashSet<String>)>> {
+fn unpushed_paths_cache() -> &'static Mutex<HashMap<String, (Instant, Arc<HashSet<String>>)>> {
     UNPUSHED_PATHS_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -139,11 +153,11 @@ fn unpushed_paths(repository: &str) -> HashSet<String> {
     })().unwrap_or_default()
 }
 
-fn cached_unpushed_paths(repository: &str) -> HashSet<String> {
+fn cached_unpushed_paths(repository: &str) -> Arc<HashSet<String>> {
     if let Some((cached_at, data)) = unpushed_paths_cache().lock().unwrap().get(repository) {
         if cached_at.elapsed() < INDEX_METADATA_TTL { return data.clone(); }
     }
-    let data = unpushed_paths(repository);
+    let data = Arc::new(unpushed_paths(repository));
     unpushed_paths_cache().lock().unwrap().insert(repository.to_string(), (Instant::now(), data.clone()));
     data
 }
@@ -551,6 +565,42 @@ fn cached_git_metadata(repository: &str, scope: &str) -> GitMetadata {
     metadata
 }
 
+// Sorted, binary-searchable views of the (repository-wide, not per-folder)
+// tracked/unpushed sets — built once per repository and reused across every
+// folder navigated to, instead of collecting-and-sorting a fresh Vec on every
+// single `load_directory`/`entry_details` call regardless of whether the
+// underlying sets actually changed since the last one. Same long TTL and the
+// same invalidation point as `cached_index_metadata`/`cached_unpushed_paths`,
+// since it's derived from exactly those and just as unaffected by which
+// folder is being browsed.
+struct SortedLookups { tracked: Vec<String>, unpushed: Vec<String> }
+
+static SORTED_LOOKUPS_CACHE: OnceLock<Mutex<HashMap<String, (Instant, Arc<SortedLookups>)>>> = OnceLock::new();
+
+fn sorted_lookups_cache() -> &'static Mutex<HashMap<String, (Instant, Arc<SortedLookups>)>> {
+    SORTED_LOOKUPS_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cached_sorted_lookups(repository: &str) -> Arc<SortedLookups> {
+    if let Some((cached_at, data)) = sorted_lookups_cache().lock().unwrap().get(repository) {
+        if cached_at.elapsed() < INDEX_METADATA_TTL { return data.clone(); }
+    }
+    let (tracked, _) = cached_index_metadata(repository);
+    let unpushed = cached_unpushed_paths(repository);
+    let mut tracked_sorted: Vec<String> = tracked.iter().cloned().collect();
+    tracked_sorted.sort_unstable();
+    let mut unpushed_sorted: Vec<String> = unpushed.iter().cloned().collect();
+    unpushed_sorted.sort_unstable();
+    let data = Arc::new(SortedLookups { tracked: tracked_sorted, unpushed: unpushed_sorted });
+    sorted_lookups_cache().lock().unwrap().insert(repository.to_string(), (Instant::now(), data.clone()));
+    data
+}
+
+fn has_sorted_prefix(sorted: &[String], prefix: &str) -> bool {
+    let idx = sorted.partition_point(|candidate| candidate.as_str() < prefix);
+    sorted.get(idx).map(|candidate| candidate.starts_with(prefix)).unwrap_or(false)
+}
+
 fn replace_git_metadata(repository: &str, statuses: Vec<(String, String)>) {
     // `statuses` here is always a full, unscoped scan (from load_repository, which
     // needs every change for the Changes drawer regardless of folder) — seed the
@@ -568,6 +618,7 @@ fn invalidate_git_metadata(repository: &str) {
     index_metadata_cache().lock().unwrap().remove(repository);
     unpushed_paths_cache().lock().unwrap().remove(repository);
     full_status_cache().lock().unwrap().remove(repository);
+    sorted_lookups_cache().lock().unwrap().remove(repository);
 }
 
 fn remove_submodule_section(path: &Path, name: &str) -> Result<(), String> {
@@ -619,6 +670,16 @@ fn status_for(path: &str, statuses: &[(String, String)]) -> String {
 // what caused a stale Windows executable to go untested for hours.
 #[tauri::command]
 pub fn build_info() -> String { env!("GIT_INTEGRITY_BUILD_SHA").to_string() }
+
+// Lets the frontend write into the exact same perf log the backend uses (see
+// `perf_log` above) — `elapsed_ms` comes from `performance.now()` on the JS
+// side, since that's real wall-clock time for work that happens entirely in
+// the webview (invoke round-trip, DOM rebuild) and never touches Rust at all.
+// One combined log instead of "check the file, then also open devtools"
+// makes it obvious whether a slow navigation is the backend call or the
+// frontend's own rendering.
+#[tauri::command]
+pub fn frontend_perf_log(label: String, elapsed_ms: f64) { perf_log(&format!("frontend: {label}"), Duration::from_secs_f64(elapsed_ms.max(0.0) / 1000.0)); }
 
 #[tauri::command]
 pub fn choose_folder() -> Option<String> {
@@ -1392,17 +1453,17 @@ pub fn load_directory(repository_path: String, relative_path: String) -> Result<
     // files). On a large monorepo (hundreds of thousands of tracked files)
     // that made opening a folder with many items dramatically slower than it
     // needed to be, worse still on Windows where each string comparison in
-    // that scan is itself typically a bit slower. Sorting each set once up
-    // front turns "does anything start with this prefix" into a binary
-    // search (O(log N)) instead of a full scan, for every entry.
-    let mut tracked_sorted: Vec<&str> = git_metadata.tracked.iter().map(String::as_str).collect();
-    tracked_sorted.sort_unstable();
-    let mut unpushed_sorted: Vec<&str> = git_metadata.unpushed.iter().map(String::as_str).collect();
-    unpushed_sorted.sort_unstable();
-    let has_prefix = |sorted: &[&str], prefix: &str| -> bool {
-        let idx = sorted.partition_point(|candidate| *candidate < prefix);
-        sorted.get(idx).map(|candidate| candidate.starts_with(prefix)).unwrap_or(false)
-    };
+    // that scan is itself typically a bit slower. Sorting turns "does
+    // anything start with this prefix" into a binary search (O(log N))
+    // instead of a full scan — and since tracked/unpushed don't depend on
+    // which folder is open, the sorted lists themselves are now built once
+    // per repository (cached_sorted_lookups) and reused across every folder
+    // navigated to, instead of collecting-and-sorting a fresh copy on every
+    // single call regardless of whether anything actually changed.
+    let sorted_lookups = cached_sorted_lookups(status_repo);
+    let tracked_sorted = &sorted_lookups.tracked;
+    let unpushed_sorted = &sorted_lookups.unpushed;
+    let has_prefix = has_sorted_prefix;
     // Same fix, same reason, for the third and last O(entries × something)
     // scan in this loop: status_for did up to two linear scans through every
     // *changed* file for every entry being listed. Usually small, but not
@@ -1441,11 +1502,11 @@ pub fn load_directory(repository_path: String, relative_path: String) -> Result<
             else if metadata.is_dir() { "folder" }
             else { "file" }.to_string();
         let tracked_prefix = format!("{status_key}/");
-        let tracked = git_metadata.submodules.contains(&status_key) || git_metadata.tracked.contains(&status_key) || has_prefix(&tracked_sorted, &tracked_prefix);
+        let tracked = git_metadata.submodules.contains(&status_key) || git_metadata.tracked.contains(&status_key) || has_prefix(tracked_sorted, &tracked_prefix);
         let modified = metadata.modified().ok().and_then(|time| time.duration_since(UNIX_EPOCH).ok()).map(|value| value.as_secs()).unwrap_or(0);
         if kind == "submodule" { submodule_count += 1; }
         let submodule_has_unpushed_commits = kind == "submodule" && submodule_push_status(item.path().to_str().unwrap_or_default()).is_some();
-        let unpushed = if kind == "folder" { git_metadata.unpushed.contains(&status_key) || has_prefix(&unpushed_sorted, &tracked_prefix) } else { git_metadata.unpushed.contains(&status_key) };
+        let unpushed = if kind == "folder" { git_metadata.unpushed.contains(&status_key) || has_prefix(unpushed_sorted, &tracked_prefix) } else { git_metadata.unpushed.contains(&status_key) };
         entries.push(DirectoryEntry { name, relative_path: relative_string, kind, status: status_for_entry(&status_key), tracked, size: if metadata.is_file() { metadata.len() } else { 0 }, modified, submodule_has_unpushed_commits, unpushed });
     }
     perf_log(&format!("load_directory: readdir loop ({} entries, {submodule_count} submodules)", entries.len()), step.elapsed());
@@ -1482,9 +1543,14 @@ pub fn entry_details(repository_path: String, relative_path: String) -> Result<E
         else if metadata.file_type().is_symlink() { "symlink" }
         else if metadata.is_dir() { "folder" } else { "file" }.to_string();
     let prefix = format!("{status_scope}/");
-    let tracked = git_metadata.tracked.contains(status_scope) || git_metadata.tracked.iter().any(|path| path.starts_with(&prefix));
+    // Same fix as load_directory: these were linear scans over the *entire*
+    // tracked/unpushed sets on every single selection, not just every
+    // navigation — the pre-sorted, once-per-repository lookup turns each into
+    // a binary search instead.
+    let sorted_lookups = cached_sorted_lookups(status_repo);
+    let tracked = git_metadata.tracked.contains(status_scope) || has_sorted_prefix(&sorted_lookups.tracked, &prefix);
     let status = status_for(status_scope, &git_metadata.statuses);
-    let unpushed = if kind == "folder" { git_metadata.unpushed.iter().any(|path| path == status_scope || path.starts_with(&prefix)) } else { git_metadata.unpushed.contains(status_scope) };
+    let unpushed = if kind == "folder" { git_metadata.unpushed.contains(status_scope) || has_sorted_prefix(&sorted_lookups.unpushed, &prefix) } else { git_metadata.unpushed.contains(status_scope) };
     let modified = metadata.modified().ok().and_then(|time| time.duration_since(UNIX_EPOCH).ok()).map(|value| value.as_secs()).unwrap_or(0);
     let item_count = metadata.is_dir().then(|| fs::read_dir(&absolute).map(|items| items.count()).unwrap_or(0));
 
@@ -4686,7 +4752,7 @@ mod tests {
         let repo_string = repo_path.to_string_lossy().into_owned();
 
         let tracked: HashSet<String> = (0..300_000).map(|i| format!("synthetic_{i}.txt")).collect();
-        index_metadata_cache().lock().unwrap().insert(repo_string.clone(), (Instant::now(), (tracked, HashSet::new())));
+        index_metadata_cache().lock().unwrap().insert(repo_string.clone(), (Instant::now(), (Arc::new(tracked), Arc::new(HashSet::new()))));
 
         let files: Vec<String> = (0..245).map(|i| format!("incoming_{i}.txt")).collect();
         let started = Instant::now();
@@ -4728,5 +4794,43 @@ mod tests {
             let index = repo.index().unwrap();
             assert!(index.get_path(Path::new("outside_the_folder.txt"), 0).is_some(), "variant {variant:?}: the untouched staged file should remain staged");
         }
+    }
+
+    // The real-world shape this is meant to catch: a huge monorepo (here,
+    // simulated with a 300,000-entry tracked set seeded directly into the
+    // cache rather than writing 300,000 real files to disk, which would make
+    // this test itself impractically slow) where any *one* folder you
+    // actually navigate into is small. Before the fix, tracked/unpushed were
+    // collected into a fresh Vec and sorted from scratch on every single
+    // load_directory call regardless of which folder — successive navigation
+    // through different folders paid that O(total tracked) cost every time.
+    #[test]
+    fn load_directory_stays_fast_across_folders_with_a_300k_entry_index() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let repo_path = std::env::temp_dir().join(format!("git-integrity-nav-perf-{suffix}"));
+        create_libgit2_repository(&repo_path, "README.md");
+        let repo_string = repo_path.to_string_lossy().into_owned();
+
+        let mut tracked: HashSet<String> = (0..300_000).map(|i| format!("elsewhere_{i}.txt")).collect();
+        for folder in 0..20 {
+            let dir = format!("folder_{folder}");
+            fs::create_dir_all(repo_path.join(&dir)).unwrap();
+            for file in 0..10 {
+                let name = format!("{dir}/file_{file}.txt");
+                fs::write(repo_path.join(&name), "x").unwrap();
+                tracked.insert(name);
+            }
+        }
+        index_metadata_cache().lock().unwrap().insert(repo_string.clone(), (Instant::now(), (Arc::new(tracked), Arc::new(HashSet::new()))));
+
+        let mut total = Duration::ZERO;
+        for folder in 0..20 {
+            let started = Instant::now();
+            let entries = load_directory(repo_string.clone(), format!("folder_{folder}")).unwrap();
+            total += started.elapsed();
+            assert_eq!(entries.len(), 10, "folder_{folder} should list exactly the 10 real files created in it");
+        }
+        println!("PERF load_directory x20 folders (300k tracked): {total:?} total, {:?} avg", total / 20);
+        assert!(total.as_millis() < 2000, "navigating 20 folders took {total:?} against a 300k-entry tracked set — looks like the sorted lookups are being rebuilt per navigation again instead of cached per repository");
     }
 }
