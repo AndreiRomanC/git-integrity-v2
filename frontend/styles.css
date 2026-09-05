@@ -303,6 +303,7 @@ button { cursor: default; }
 
 footer { display: flex; align-items: center; gap: 8px; padding: 0 12px; background: #0b1015; border-top: 1px solid var(--border); color: #7f8f9f; font-size: 11px; }
 .footer-spacer { flex: 1; }.status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); }.status-dot.error { background: var(--red); }.status-dot.busy { background: var(--amber); }.branch-footer { padding-left: 14px; border-left: 1px solid var(--border); }.branch-footer b { color: #a8b8c7; }
+.build-footer { padding-left: 14px; border-left: 1px solid var(--border); font-family: ui-monospace, monospace; color: #5c6b7a; }
 
 dialog { width: 430px; border: 1px solid #465563; border-radius: 10px; padding: 0; background: #19222c; color: var(--text); box-shadow: 0 25px 80px #000b; }
 dialog::backdrop { background: #05080cbf; }.dialog-symbol { display: grid; place-items: center; width: 48px; height: 48px; margin: 0 auto 16px; border-radius: 50%; background: #203f5d; color: var(--blue); font-size: 24px; }

@@ -600,6 +600,13 @@ fn status_for(path: &str, statuses: &[(String, String)]) -> String {
         .unwrap_or_default()
 }
 
+// Lets the UI show exactly which commit this binary was built from — set at
+// compile time in build.rs. Answers "am I actually running the new build?"
+// by looking at the app itself instead of a file's modified date, which is
+// what caused a stale Windows executable to go untested for hours.
+#[tauri::command]
+pub fn build_info() -> String { env!("GIT_INTEGRITY_BUILD_SHA").to_string() }
+
 #[tauri::command]
 pub fn choose_folder() -> Option<String> {
     rfd::FileDialog::new().pick_folder().map(|p| p.to_string_lossy().into_owned())
@@ -845,6 +852,8 @@ fn partition_by_submodule(repository_path: &str, files: Vec<String>) -> (Vec<Str
 
 #[tauri::command]
 pub fn stage_files(path: String, files: Vec<String>) -> Result<(), String> {
+    let started = Instant::now();
+    let file_count = files.len();
     validate_path(&path)?;
     let (files, submodule_groups) = partition_by_submodule(&path, files);
     for (sub_path, inner_files) in submodule_groups { stage_files(sub_path, inner_files)?; }
@@ -853,11 +862,15 @@ pub fn stage_files(path: String, files: Vec<String>) -> Result<(), String> {
     let safe_files = files.into_iter().map(|file| safe_relative_path(file.trim_end_matches(|character| character == '/' || character == '\\'))).collect::<Result<Vec<_>, _>>()?;
     let mut submodule_paths = HashSet::new();
     for safe in &safe_files { if let Ok(mut submodule) = repo.find_submodule(&normalized(safe)) { submodule.add_to_index(true).map_err(|error| format!("Cannot stage submodule {}: {}", normalized(safe), error.message()))?; submodule_paths.insert(normalized(safe)); } }
+    perf_log(&format!("stage_files: submodule detection ({file_count} files)"), started.elapsed());
+    let step = Instant::now();
     let mut index = repo.index().map_err(|error| error.message().to_string())?;
+    perf_log("stage_files: repo.index()", step.elapsed());
     // Batched like commit_selected_internal, same reason: one add_all/remove_path
     // call per file re-matches its pathspec against the whole index each time —
     // for "Stage all" on a large add (hundreds of new files, on a large repo)
     // that turned a sub-second stage into minutes. One call per phase instead.
+    let step = Instant::now();
     let mut to_add: Vec<&Path> = Vec::new();
     let mut to_remove: Vec<&Path> = Vec::new();
     for safe in &safe_files {
@@ -865,10 +878,20 @@ pub fn stage_files(path: String, files: Vec<String>) -> Result<(), String> {
         let absolute = Path::new(&path).join(safe);
         if absolute.exists() { to_add.push(safe.as_path()); } else { to_remove.push(safe.as_path()); }
     }
+    perf_log(&format!("stage_files: partition add/remove ({} to add, {} to remove)", to_add.len(), to_remove.len()), step.elapsed());
+    let step = Instant::now();
     if !to_add.is_empty() { index.add_all(&to_add, git2::IndexAddOption::DEFAULT, None).map_err(|error| error.message().to_string())?; }
+    perf_log(&format!("stage_files: add_all ({} files)", to_add.len()), step.elapsed());
+    let step = Instant::now();
     for safe in &to_remove { let _ = index.remove_path(safe); }
+    perf_log(&format!("stage_files: remove_path loop ({} files)", to_remove.len()), step.elapsed());
     if !submodule_paths.is_empty() && Path::new(&path).join(".gitmodules").exists() { index.add_path(Path::new(".gitmodules")).map_err(|error| error.message().to_string())?; }
-    index.write().map_err(|error| error.message().to_string())?; invalidate_git_metadata(&path); Ok(())
+    let step = Instant::now();
+    index.write().map_err(|error| error.message().to_string())?;
+    perf_log("stage_files: index.write()", step.elapsed());
+    invalidate_git_metadata(&path);
+    perf_log(&format!("stage_files: TOTAL ({file_count} files)"), started.elapsed());
+    Ok(())
 }
 
 #[tauri::command]
@@ -1787,18 +1810,30 @@ pub fn commit_path(repository_path: String, relative_path: String, message: Stri
 // anymore" after a commit means).
 #[tauri::command]
 pub fn commit_staged(repository_path: String, message: String) -> Result<String, String> {
+    let started = Instant::now();
     validate_path(&repository_path)?;
     if message.trim().is_empty() { return Err("Commit message cannot be empty".into()); }
+    let step = Instant::now();
     let repo = internal_repository(&repository_path)?;
+    perf_log("commit_staged: internal_repository (open)", step.elapsed());
+    let step = Instant::now();
     let mut index = repo.index().map_err(|error| error.message().to_string())?;
+    perf_log("commit_staged: repo.index()", step.elapsed());
+    let step = Instant::now();
     let tree_id = index.write_tree_to(&repo).map_err(|error| error.message().to_string())?;
+    perf_log(&format!("commit_staged: write_tree_to ({} index entries)", index.len()), step.elapsed());
     let parent = repo.head().ok().and_then(|head| head.peel_to_commit().ok());
     if parent.as_ref().map(|commit| commit.tree_id()) == Some(tree_id) { return Err("There are no changes to commit in the selected files".into()); }
+    let step = Instant::now();
     let tree = repo.find_tree(tree_id).map_err(|error| error.message().to_string())?;
     let signature = repo.signature().map_err(|_| "Configure user.name and user.email for this repository".to_string())?;
     let parents: Vec<&git2::Commit<'_>> = parent.iter().collect();
     let oid = repo.commit(Some("HEAD"), &signature, &signature, message.trim(), &tree, &parents).map_err(|error| error.message().to_string())?;
+    perf_log("commit_staged: find_tree + signature + repo.commit", step.elapsed());
+    let step = Instant::now();
     invalidate_git_metadata(&repository_path);
+    perf_log("commit_staged: invalidate_git_metadata", step.elapsed());
+    perf_log("commit_staged: TOTAL", started.elapsed());
     Ok(oid.to_string())
 }
 
@@ -4517,5 +4552,73 @@ mod tests {
 
         // Nothing staged again now — a second call should refuse too.
         assert!(commit_staged(repo_string.clone(), "Nothing to commit".into()).is_err());
+    }
+
+    // Ignored by default (`cargo test` skips it; run explicitly with
+    // `cargo test -- --ignored large_index_reproduces_the_245_file_report`)
+    // — building a 50k+-entry index takes real time and would otherwise slow
+    // down the normal test suite on every run. This is the actual reported
+    // scenario at a scale close to the real repository: a large pre-existing
+    // index, 245 new files copied in from outside, staged, a few deleted
+    // afterward, staged again, then committed — with per-phase timings
+    // printed so a real slowdown shows exactly which phase it's in.
+    #[test]
+    #[ignore]
+    fn large_index_reproduces_the_245_file_report() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let repo_path = std::env::temp_dir().join(format!("git-integrity-large-index-{suffix}"));
+        fs::create_dir_all(&repo_path).unwrap();
+        let repo = Repository::init(&repo_path).unwrap();
+
+        let setup_started = Instant::now();
+        {
+            let mut index = repo.index().unwrap();
+            for dir in 0..500 {
+                let dir_path = repo_path.join(format!("existing_{dir}"));
+                fs::create_dir_all(&dir_path).unwrap();
+                for file in 0..100 {
+                    fs::write(dir_path.join(format!("f{file}.txt")), b"x").unwrap();
+                }
+                index.add_all([format!("existing_{dir}").as_str()], git2::IndexAddOption::DEFAULT, None).unwrap();
+            }
+            index.write().unwrap();
+            let tree_id = index.write_tree().unwrap();
+            let tree = repo.find_tree(tree_id).unwrap();
+            let signature = git2::Signature::now("Test User", "test@example.com").unwrap();
+            repo.commit(Some("HEAD"), &signature, &signature, "Large initial import", &tree, &[]).unwrap();
+        }
+        println!("PERF setup: {} entries built in {:?}", repo.index().unwrap().len(), setup_started.elapsed());
+        let repo_string = repo_path.to_string_lossy().into_owned();
+
+        // "Copied in from outside": 245 new files, not yet known to Git at all.
+        let names: Vec<String> = (0..245).map(|i| format!("incoming_{i}.txt")).collect();
+        for name in &names { fs::write(repo_path.join(name), "new content").unwrap(); }
+
+        let stage_started = Instant::now();
+        stage_files(repo_string.clone(), names.clone()).unwrap();
+        println!("PERF stage_files (245 new): {:?}", stage_started.elapsed());
+
+        // Delete 5 of the just-staged files straight from disk, then resync —
+        // exactly what "Stage all" now does (sends the full set again, not
+        // just the ones still marked unstaged).
+        for name in &names[..5] { fs::remove_file(repo_path.join(name)).unwrap(); }
+        let restage_started = Instant::now();
+        stage_files(repo_string.clone(), names.clone()).unwrap();
+        println!("PERF stage_files (resync after 5 deletions): {:?}", restage_started.elapsed());
+
+        let commit_started = Instant::now();
+        let oid = commit_staged(repo_string.clone(), "Add 240 incoming files".into()).unwrap();
+        println!("PERF commit_staged: {:?}", commit_started.elapsed());
+
+        let repo = internal_repository(&repo_string).unwrap();
+        let commit = repo.find_commit(git2::Oid::from_str(&oid).unwrap()).unwrap();
+        let tree = commit.tree().unwrap();
+        for name in &names[..5] { assert!(tree.get_path(Path::new(name)).is_err(), "{name} was deleted before commit and must not be in it"); }
+        for name in &names[5..] { assert!(tree.get_path(Path::new(name)).is_ok(), "{name} should be in the commit"); }
+
+        let head_tree = repo.head().unwrap().peel_to_commit().unwrap().tree().unwrap();
+        let mut index = repo.index().unwrap();
+        assert_eq!(index.write_tree().unwrap(), head_tree.id(), "index should equal HEAD with no leftover staged state");
+        for name in &names[..5] { assert!(!repo_path.join(name).exists(), "deleted file should still be absent from the working tree"); }
     }
 }

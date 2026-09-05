@@ -2474,3 +2474,4 @@ if (!invoke) {
 }
 renderRecentRepos();
 render();
+if (invoke) invoke('build_info').then(sha => { $('#buildInfo').textContent = `build ${sha}`; }).catch(() => {});

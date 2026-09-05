@@ -4,6 +4,7 @@ mod repository;
 pub fn run() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
+            repository::build_info,
             repository::choose_folder,
             repository::init_repository,
             repository::clone_repository,
