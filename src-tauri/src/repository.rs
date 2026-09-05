@@ -822,7 +822,19 @@ pub fn stage_files(path: String, files: Vec<String>) -> Result<(), String> {
     let mut submodule_paths = HashSet::new();
     for safe in &safe_files { if let Ok(mut submodule) = repo.find_submodule(&normalized(safe)) { submodule.add_to_index(true).map_err(|error| format!("Cannot stage submodule {}: {}", normalized(safe), error.message()))?; submodule_paths.insert(normalized(safe)); } }
     let mut index = repo.index().map_err(|error| error.message().to_string())?;
-    for safe in safe_files { let normalized_safe = normalized(&safe); if submodule_paths.contains(&normalized_safe) { continue; } let absolute = Path::new(&path).join(&safe); if absolute.exists() { index.add_all([safe.as_path()], git2::IndexAddOption::DEFAULT, None).map_err(|error| error.message().to_string())?; } else { let _ = index.remove_path(&safe); } }
+    // Batched like commit_selected_internal, same reason: one add_all/remove_path
+    // call per file re-matches its pathspec against the whole index each time —
+    // for "Stage all" on a large add (hundreds of new files, on a large repo)
+    // that turned a sub-second stage into minutes. One call per phase instead.
+    let mut to_add: Vec<&Path> = Vec::new();
+    let mut to_remove: Vec<&Path> = Vec::new();
+    for safe in &safe_files {
+        let normalized_safe = normalized(safe); if submodule_paths.contains(&normalized_safe) { continue; }
+        let absolute = Path::new(&path).join(safe);
+        if absolute.exists() { to_add.push(safe.as_path()); } else { to_remove.push(safe.as_path()); }
+    }
+    if !to_add.is_empty() { index.add_all(&to_add, git2::IndexAddOption::DEFAULT, None).map_err(|error| error.message().to_string())?; }
+    for safe in &to_remove { let _ = index.remove_path(safe); }
     if !submodule_paths.is_empty() && Path::new(&path).join(".gitmodules").exists() { index.add_path(Path::new(".gitmodules")).map_err(|error| error.message().to_string())?; }
     index.write().map_err(|error| error.message().to_string())?; invalidate_git_metadata(&path); Ok(())
 }
@@ -4370,5 +4382,47 @@ mod tests {
         let base = browser_repository_url("git@github.vitesco.io:eng/sw-prj-OMBMS_000U0.git").expect("should parse an SSH enterprise GitHub URL");
         assert_eq!(base, "https://github.vitesco.io/eng/sw-prj-OMBMS_000U0");
         assert_eq!(format!("{base}/commit/49032750e188cfb56b0c72834feef071a4d9cc13"), "https://github.vitesco.io/eng/sw-prj-OMBMS_000U0/commit/49032750e188cfb56b0c72834feef071a4d9cc13");
+    }
+
+    #[test]
+    fn stage_all_resyncs_a_staged_file_that_was_since_deleted_from_disk() {
+        // Reproduces the report: copy many files in from outside, stage all of
+        // them, then delete a few before committing — "Stage all" (which used
+        // to only ever send still-*unstaged* paths) never touched the ones
+        // already marked staged, so a deleted-after-staging file stayed
+        // staged in the index forever, no matter how many times "Stage all"
+        // was pressed. Fixed by having the frontend include already-staged
+        // paths too; this test exercises the backend half directly: calling
+        // stage_files again with a path that's staged but no longer on disk
+        // must actually remove it from the index, not leave the stale entry.
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let repo_path = std::env::temp_dir().join(format!("git-integrity-stage-resync-{suffix}"));
+        create_libgit2_repository(&repo_path, "README.md");
+        let repo_string = repo_path.to_string_lossy().into_owned();
+
+        // Simulate "245 files copied in from outside": several new files at once.
+        let names: Vec<String> = (0..5).map(|i| format!("new_{i}.txt")).collect();
+        for name in &names { fs::write(repo_path.join(name), "content").unwrap(); }
+        stage_files(repo_string.clone(), names.clone()).unwrap();
+        {
+            let repo = internal_repository(&repo_string).unwrap();
+            let index = repo.index().unwrap();
+            for name in &names { assert!(index.get_path(Path::new(name), 0).is_some(), "{name} should be staged"); }
+        }
+
+        // Delete two of the now-staged files straight from disk, then ask
+        // stage_files to resync the *same* full set again — as "Stage all"
+        // now does, instead of skipping paths it already thinks are staged.
+        fs::remove_file(repo_path.join("new_0.txt")).unwrap();
+        fs::remove_file(repo_path.join("new_2.txt")).unwrap();
+        stage_files(repo_string.clone(), names.clone()).unwrap();
+
+        let repo = internal_repository(&repo_string).unwrap();
+        let index = repo.index().unwrap();
+        assert!(index.get_path(Path::new("new_0.txt"), 0).is_none(), "deleted file should be gone from the index after resyncing");
+        assert!(index.get_path(Path::new("new_2.txt"), 0).is_none(), "deleted file should be gone from the index after resyncing");
+        assert!(index.get_path(Path::new("new_1.txt"), 0).is_some(), "untouched file should remain staged");
+        assert!(index.get_path(Path::new("new_3.txt"), 0).is_some(), "untouched file should remain staged");
+        assert!(index.get_path(Path::new("new_4.txt"), 0).is_some(), "untouched file should remain staged");
     }
 }

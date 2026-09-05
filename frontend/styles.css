@@ -269,9 +269,11 @@ button { cursor: default; }
 .drawer-head span { color: var(--muted); font-size: 11px; }
 .drawer-head button { width: 32px; height: 32px; margin-left: auto; border: 0; border-radius: 6px; background: transparent; color: #9aabba; font-size: 24px; }
 .drawer-head button:hover { background: var(--surface-soft); }
-.drawer-head #stageAllButton { width: auto; height: 30px; margin-left: auto; padding: 0 12px; border: 1px solid var(--border); border-radius: 6px; background: transparent; color: var(--blue); font-size: 12px; font-weight: 600; }
-.drawer-head #stageAllButton:hover { background: var(--surface-soft); }
-.drawer-head #stageAllButton:disabled { opacity: 0.4; }
+.drawer-head #stageAllButton, .drawer-head #unstageAllButton { width: auto; height: 30px; padding: 0 12px; border: 1px solid var(--border); border-radius: 6px; background: transparent; color: var(--blue); font-size: 12px; font-weight: 600; }
+.drawer-head #stageAllButton { margin-left: auto; }
+.drawer-head #unstageAllButton { margin-left: 8px; color: #9db0c0; }
+.drawer-head #stageAllButton:hover, .drawer-head #unstageAllButton:hover { background: var(--surface-soft); }
+.drawer-head #stageAllButton:disabled, .drawer-head #unstageAllButton:disabled { opacity: 0.4; }
 .drawer-head #closeChanges { margin-left: 10px; }
 .drawer-body { height: calc(100% - 52px); display: grid; grid-template-columns: 1fr 390px; }
 .change-list { overflow: auto; border-right: 1px solid var(--border); }

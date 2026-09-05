@@ -1646,7 +1646,8 @@ function renderChanges() {
   const scope = state.changesScope === 'folder' ? state.currentPath : ''; const scopedChanges = state.changes.filter(change => !scope || change.path === scope || change.path.startsWith(`${scope}/`));
   refs.drawerScopeTitle.textContent = state.changesScope === 'folder' ? `Changes in folder · /${scope}` : 'Working tree · entire repository';
   refs.changesSummary.textContent = scopedChanges.length ? `${scopedChanges.length} file${scopedChanges.length === 1 ? '' : 's'} available for staging` : `No changes in ${scope ? `/${scope}` : 'the repository'}`;
-  $('#stageAllButton').disabled = !scopedChanges.some(change => !change.staged);
+  $('#stageAllButton').disabled = scopedChanges.length === 0;
+  $('#unstageAllButton').disabled = !scopedChanges.some(change => change.staged);
   refs.changes.innerHTML = scopedChanges.map(change => `<div class="change-row-wrap"><label class="change-row"><input type="checkbox" data-change-path="${esc(change.path)}" ${change.staged ? 'checked' : ''}>
     <span class="status-code">${esc(change.status)}</span><span class="change-path">${esc(change.path)}</span><span class="change-state">${change.staged ? 'Staged' : 'Modified'}</span></label>
     <button class="stash-file-btn" data-stash-path="${esc(change.path)}" title="Set aside just this file for now — moves it to a temporary holding area (the stash) so it's left out of any commit until you bring it back with Pop stash">⇕ Stash</button></div>`).join('') || `<div class="empty-change">No changes inside /${esc(scope)}</div>`;
@@ -1782,10 +1783,30 @@ $('#refresh').addEventListener('click', () => state.repository && loadRepository
 // afterward gets unstaged again, same as before.
 async function stageAllInScope(scope) {
   if (!invoke || !state.repository) return;
-  const files = state.changes.filter(change => !change.staged && (!scope || change.path === scope || change.path.startsWith(`${scope}/`))).map(change => change.path);
+  // Includes already-staged paths too, not just `!change.staged` ones — a file
+  // that was staged and then deleted from disk (or changed again) needs
+  // stage_files to re-touch it so the index catches up with what's actually on
+  // disk now (it removes a since-deleted path from the index). Only sending
+  // still-unstaged paths meant "Stage all" could never clear that: a file
+  // already marked staged was permanently excluded from every future
+  // "Stage all", so the index kept the stale staged copy no matter how many
+  // times it was pressed.
+  const files = state.changes.filter(change => !scope || change.path === scope || change.path.startsWith(`${scope}/`)).map(change => change.path);
   if (!files.length) return;
+  const button = $('#stageAllButton'); const label = button.textContent; button.disabled = true; button.textContent = `Staging ${files.length} file${files.length === 1 ? '' : 's'}…`;
   try { await invoke('stage_files', { path: state.repository.path, files }); await loadRepository(state.repository.path, { keepPath: true }); renderChanges(); }
   catch (error) { handleError(error); }
+  finally { button.textContent = label; }
+}
+
+async function unstageAllInScope(scope) {
+  if (!invoke || !state.repository) return;
+  const files = state.changes.filter(change => change.staged && (!scope || change.path === scope || change.path.startsWith(`${scope}/`))).map(change => change.path);
+  if (!files.length) return;
+  const button = $('#unstageAllButton'); const label = button.textContent; button.disabled = true; button.textContent = `Unstaging ${files.length} file${files.length === 1 ? '' : 's'}…`;
+  try { await invoke('unstage_files', { path: state.repository.path, files }); await loadRepository(state.repository.path, { keepPath: true }); renderChanges(); }
+  catch (error) { handleError(error); }
+  finally { button.textContent = label; }
 }
 // Pre-fills the commit message box with whatever is in the "default commit
 // message" field up top — e.g. a Polarion ID you're committing several
@@ -1818,6 +1839,7 @@ renderCommitMessageHistory();
 $('#showChanges').addEventListener('click', () => { state.changesScope = 'global'; applyDefaultCommitMessage(); renderChanges(); refs.changesDrawer.classList.add('open'); });
 $('#showFolderChanges').addEventListener('click', () => { state.changesScope = 'folder'; applyDefaultCommitMessage(); renderChanges(); refs.changesDrawer.classList.add('open'); });
 $('#stageAllButton').addEventListener('click', () => stageAllInScope(state.changesScope === 'folder' ? state.currentPath : ''));
+$('#unstageAllButton').addEventListener('click', () => unstageAllInScope(state.changesScope === 'folder' ? state.currentPath : ''));
 refs.defaultCommitMessage.addEventListener('input', () => {
   const match = refs.defaultCommitMessage.value.match(/P:([A-Za-z0-9][A-Za-z0-9_]*-\d+)/);
   if (match) { const workitemId = match[1]; const project = workitemId.split('-')[0]; refs.defaultCommitPolarionLink.href = `https://polarion.vitesco.io/polarion/#/project/${project}/workitem?id=${workitemId}`; refs.defaultCommitPolarionLink.hidden = false; }
