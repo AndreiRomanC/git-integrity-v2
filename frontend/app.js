@@ -202,7 +202,7 @@ async function confirmAddSubmodule() {
   refs.confirmAddSubmodule.disabled = true; refs.confirmAddSubmodule.textContent = 'Adding…'; refs.submoduleAddStatus.textContent = `Cloning into /${parentPath ? `${parentPath}/` : ''}${folderName}…`; refs.submoduleAddStatus.className = 'submodule-operation-status busy'; status(`Cloning submodule ${folderName}…`, 'busy');
   try {
     const addedPath = await invoke('add_submodule', { repositoryPath: state.repository.path, parentPath, url, folderName, username, accessToken });
-    refs.submoduleDialog.close(); directoryCache.clear(); await loadRepository(state.repository.path); await openDirectory(parentPath, { force: true }); selectEntry(addedPath);
+    refs.submoduleDialog.close(); directoryCache.clear(); await loadRepository(state.repository.path, { reopenPath: parentPath }); selectEntry(addedPath);
     state.changesScope = 'global'; refs.changesDrawer.classList.add('open');
     const message = `${addedPath} added. Commit .gitmodules + the submodule link, then Publish/Push that commit to the server.`; status(message); showOperationToast(message);
   } catch (error) { const message = String(error); refs.submoduleAddStatus.textContent = `Not added: ${message}`; refs.submoduleAddStatus.className = 'submodule-operation-status error'; status(message, 'error'); showOperationToast(`Submodule was not added: ${message}`, 'error'); refs.confirmAddSubmodule.disabled = false; }
@@ -212,6 +212,13 @@ async function confirmAddSubmodule() {
 async function loadRepository(path, options = {}) {
   status('Reading repository…', 'busy');
   const keepPath = options.keepPath ? state.currentPath : '';
+  // Most callers already know exactly which folder they want open again after
+  // the reload (the one the action just happened in) — without this, they'd
+  // have to call openDirectory a second time themselves right after this
+  // function's own internal one below, reloading the folder twice (once for
+  // whatever keepPath resolves to, immediately discarded, then again for the
+  // folder they actually wanted). Passing it here makes this the only load.
+  const reopenPath = options.reopenPath !== undefined ? options.reopenPath : keepPath;
   // A plain refresh must not silently kick you out of whatever view you were
   // looking at (e.g. Branch Map) back to Project Explorer — that made a
   // just-refreshed history look unchanged when really you just weren't
@@ -234,7 +241,7 @@ async function loadRepository(path, options = {}) {
     // more were still left (per-file stash makes having several at once
     // common). Deriving it fresh from the real list every reload fixes both.
     state.hasStash = state.stashes.length > 0; updateStashUI();
-    await openDirectory(keepPath, { force: true }); status(`${data.commits.length} commits loaded`);
+    await openDirectory(reopenPath, { force: true }); status(`${data.commits.length} commits loaded`);
     addRecentRepo(path, data.repository.name);
     updatePublishIndicator();
     await checkForMergeConflicts();
@@ -570,14 +577,28 @@ function attachFileListDelegation() {
   });
 }
 
+// Bumped on every call and captured per-call below — if the user opens folder
+// A then quickly folder B before A's backend call returns, A's result would
+// otherwise arrive *after* B's and overwrite the (correct, already-showing)
+// folder B listing with stale folder A data. Whichever call's result comes
+// back is only applied if no newer navigation has started since.
+let explorerRequestSeq = 0;
 async function openDirectory(path, options = {}) {
   if (!state.repository) return;
   state.currentPath = path; state.selectedEntry = null;
+  const requestId = ++explorerRequestSeq;
   if (!options.force && directoryCache.has(path)) { state.entries = directoryCache.get(path); render(); return; }
   refs.fileList.innerHTML = '<div class="loading-row"><i class="spinner"></i>Loading folder…</div>';
   if (!invoke) { state.entries = previewData.entries; directoryCache.set(path, state.entries); render(); return; }
-  try { state.entries = await invoke('load_directory', { repositoryPath: state.repository.path, relativePath: path }); directoryCache.set(path, state.entries); render(); }
-  catch (error) { status(String(error), 'error'); refs.fileList.innerHTML = `<div class="empty-change">${esc(String(error))}</div>`; }
+  try {
+    const entries = await invoke('load_directory', { repositoryPath: state.repository.path, relativePath: path });
+    directoryCache.set(path, entries);
+    if (requestId !== explorerRequestSeq) return;
+    state.entries = entries; render();
+  } catch (error) {
+    if (requestId !== explorerRequestSeq) return;
+    status(String(error), 'error'); refs.fileList.innerHTML = `<div class="empty-change">${esc(String(error))}</div>`;
+  }
 }
 
 async function openSubmoduleMenu(entry, x, y) {
@@ -631,6 +652,10 @@ async function selectEntry(path) {
   if (!invoke) return renderEntryDetails({ ...state.selectedEntry, item_count: state.selectedEntry.kind === 'folder' ? 12 : null, submodule_url: state.selectedEntry.kind === 'submodule' ? 'git@example.com:platform/diagnostics-core.git' : null, submodule_branch: state.selectedEntry.kind === 'submodule' ? 'main' : null, last_commit_id: 'a39f21d', last_commit_subject: 'P:423421431 test', last_commit_author: 'Andrei Pop', last_commit_date: '2026-08-14' });
   try {
     const details = await invoke('entry_details', { repositoryPath: state.repository.path, relativePath: path });
+    // Same staleness guard already used below for entry_last_commit: the user
+    // may have already clicked a different entry by the time this resolves —
+    // don't let an older selection's details overwrite what's now showing.
+    if (state.selectedEntry?.relative_path !== path) return;
     renderEntryDetails(details);
     // "Last commit touching this path" is fetched separately — it can be a
     // genuinely heavy history walk on a large repository, and blocking the
@@ -761,7 +786,7 @@ async function replaceSubmoduleLocation(entry) {
   if (!url || url.trim() === (entry.submodule_url || '')) return;
   if (!await customConfirm(`Replace the source repository for ${entry.relative_path}?\n\nThe .gitmodules URL and local origin will change, then the new origin will be fetched.`, { title: 'Replace repository URL', danger: true, okLabel: 'Replace' })) return;
   if (!invoke) return status(`Preview: change submodule URL to ${url.trim()}`);
-  try { status('Changing submodule repository and fetching refs…', 'busy'); await invoke('change_submodule_url', { repositoryPath: state.repository.path, relativePath: entry.relative_path, url: url.trim() }); const folder = state.currentPath; directoryCache.clear(); await loadRepository(state.repository.path); await openDirectory(folder, { force: true }); status(`${entry.name}: repository location updated`); }
+  try { status('Changing submodule repository and fetching refs…', 'busy'); await invoke('change_submodule_url', { repositoryPath: state.repository.path, relativePath: entry.relative_path, url: url.trim() }); const folder = state.currentPath; directoryCache.clear(); await loadRepository(state.repository.path, { reopenPath: folder }); status(`${entry.name}: repository location updated`); }
   catch (error) { handleError(error); }
 }
 
@@ -773,7 +798,7 @@ async function commitSubmoduleChanges(entry) {
   try {
     status(`Committing changes in ${entry.name}…`, 'busy');
     await invoke('commit_submodule', { repositoryPath: state.repository.path, relativePath: entry.relative_path, message: message.trim() });
-    directoryCache.clear(); await loadRepository(state.repository.path); await openDirectory(state.currentPath, { force: true });
+    directoryCache.clear(); await loadRepository(state.repository.path, { reopenPath: state.currentPath });
     const successMsg = `${entry.name}: committed inside the submodule. The project's link to it was updated automatically to this new commit — commit/push the project when you're ready to share that.`;
     status(successMsg); showOperationToast(successMsg, 'success');
   }
@@ -786,7 +811,7 @@ async function pullSubmodule(entry) {
   try {
     status(`Pulling ${entry.name} from its remote…`, 'busy');
     await invoke('pull_submodule', { repositoryPath: state.repository.path, relativePath: entry.relative_path });
-    directoryCache.clear(); await loadRepository(state.repository.path); await openDirectory(state.currentPath, { force: true });
+    directoryCache.clear(); await loadRepository(state.repository.path, { reopenPath: state.currentPath });
     if (state.selectedEntry?.relative_path === entry.relative_path) await selectEntry(entry.relative_path);
     const successMsg = `${entry.name}: pulled the latest commits from its remote (fast-forward).`;
     status(successMsg); showOperationToast(successMsg, 'success');
@@ -1009,7 +1034,7 @@ async function forcePushSubmodule(entry) {
   try {
     status(`Force pushing ${entry.name}…`, 'busy');
     const result = await invoke('force_push_submodule', { repositoryPath: state.repository.path, relativePath: entry.relative_path });
-    directoryCache.clear(); await loadRepository(state.repository.path); await openDirectory(state.currentPath, { force: true });
+    directoryCache.clear(); await loadRepository(state.repository.path, { reopenPath: state.currentPath });
     const shortSha = (result?.revision || '').slice(0, 8);
     const successMsg = `${entry.name}: force pushed to branch "${result?.branch}" (now at ${shortSha}). This project now has a new local commit recording that — see "Unpublished commits" in the sidebar to push it too.`;
     status(successMsg); showOperationToast(successMsg, 'success');
@@ -1045,7 +1070,7 @@ async function pushSubmodule(entry) {
   try {
     status(`Pushing ${entry.name} to its remote…`, 'busy');
     const result = await invoke('push_submodule', { repositoryPath: state.repository.path, relativePath: entry.relative_path });
-    directoryCache.clear(); await loadRepository(state.repository.path); await openDirectory(state.currentPath, { force: true });
+    directoryCache.clear(); await loadRepository(state.repository.path, { reopenPath: state.currentPath });
     const shortSha = (result?.revision || '').slice(0, 8);
     const successMsg = `${entry.name}: pushed to branch "${result?.branch}" on its remote (now at ${shortSha}). This project now has a new local commit recording that — see "Unpublished commits" in the sidebar to push it too.`;
     status(successMsg); showOperationToast(successMsg, 'success');
@@ -1064,7 +1089,7 @@ async function removeEntryFromGit(entry) {
   const label = entry.kind === 'submodule' ? 'submodule, its working folder and its Git link' : entry.kind === 'folder' ? 'folder and all tracked files inside it' : 'file';
   if (!await customConfirm(`REMOVE FROM GIT: delete ${label} locally and stage the deletion of "${entry.relative_path}".\n\nNothing is removed from the server until you commit and push. Continue?`, { title: 'Remove from Git', danger: true, okLabel: 'Remove' })) return;
   if (!invoke) return status(`Preview: remove ${entry.name} from Git`);
-  try { status(`Removing ${entry.name} from Git…`, 'busy'); const folder = state.currentPath; await invoke('remove_git_path', { repositoryPath: state.repository.path, relativePath: entry.relative_path }); directoryCache.clear(); await loadRepository(state.repository.path); await openDirectory(folder, { force: true }); state.changesScope = 'global'; refs.changesDrawer.classList.add('open'); const message = `${entry.name} deleted locally. Commit the staged deletion, then Publish/Push it to update the server.`; status(message); showOperationToast(message); }
+  try { status(`Removing ${entry.name} from Git…`, 'busy'); const folder = state.currentPath; await invoke('remove_git_path', { repositoryPath: state.repository.path, relativePath: entry.relative_path }); directoryCache.clear(); await loadRepository(state.repository.path, { reopenPath: folder }); state.changesScope = 'global'; refs.changesDrawer.classList.add('open'); const message = `${entry.name} deleted locally. Commit the staged deletion, then Publish/Push it to update the server.`; status(message); showOperationToast(message); }
   catch (error) { handleError(error); }
 }
 
@@ -1085,7 +1110,7 @@ async function deleteEntry(entry, button) {
   }
   button.disabled = true;
   if (!invoke) return status(`Preview: delete ${entry.name}`);
-  try { status(`Deleting ${entry.name} locally…`, 'busy'); const folder = state.currentPath; await invoke(entry.tracked ? 'remove_git_path' : 'delete_local_path', { repositoryPath: state.repository.path, relativePath: entry.relative_path }); directoryCache.clear(); await loadRepository(state.repository.path); await openDirectory(folder, { force: true }); if (entry.tracked) { state.changesScope = 'global'; refs.changesDrawer.classList.add('open'); } const message = entry.tracked ? `${entry.name} deleted locally. Its deletion is in Workspace; commit it, then Push to update the server.` : `${entry.name} deleted locally. It was local-only, so no commit or push is needed.`; status(message); showOperationToast(message); }
+  try { status(`Deleting ${entry.name} locally…`, 'busy'); const folder = state.currentPath; await invoke(entry.tracked ? 'remove_git_path' : 'delete_local_path', { repositoryPath: state.repository.path, relativePath: entry.relative_path }); directoryCache.clear(); await loadRepository(state.repository.path, { reopenPath: folder }); if (entry.tracked) { state.changesScope = 'global'; refs.changesDrawer.classList.add('open'); } const message = entry.tracked ? `${entry.name} deleted locally. Its deletion is in Workspace; commit it, then Push to update the server.` : `${entry.name} deleted locally. It was local-only, so no commit or push is needed.`; status(message); showOperationToast(message); }
   catch (error) { status(String(error), 'error'); showOperationToast(String(error), 'error'); }
 }
 
@@ -1098,7 +1123,7 @@ async function runEntryFileAction(entry, action) {
   if (!invoke) { status(`Preview: ${action} ${entry.name}`); showOperationToast(`Preview: ${action} ${entry.name}`); return; }
   try {
     if (action === 'head') await invoke('restore_file', { repositoryPath: state.repository.path, relativePath: entry.relative_path, sourceRef: 'HEAD' }); else await invoke(action === 'stage' ? 'stage_files' : 'unstage_files', { path: state.repository.path, files: [entry.relative_path] });
-    const folder = state.currentPath; directoryCache.clear(); await loadRepository(state.repository.path); if (folder) await openDirectory(folder, { force: true });
+    const folder = state.currentPath; directoryCache.clear(); await loadRepository(state.repository.path, { reopenPath: folder });
     if (state.selectedEntry?.relative_path === entry.relative_path) await selectEntry(entry.relative_path);
     status(successMessages[action]); showOperationToast(successMessages[action], 'success');
   } catch (error) { const message = handleError(error); showOperationToast(`Failed: ${message}`, 'error'); }
@@ -1158,7 +1183,7 @@ async function saveEditor(event) {
     return;
   }
   const folder = state.currentPath;
-  try { status(`Saving ${state.editingPath}…`, 'busy'); await saveEditorContent(); refs.editorDialog.close(); directoryCache.clear(); await loadRepository(state.repository.path); await openDirectory(folder, { force: true }); status(`Saved ${state.editingPath}`); }
+  try { status(`Saving ${state.editingPath}…`, 'busy'); await saveEditorContent(); refs.editorDialog.close(); directoryCache.clear(); await loadRepository(state.repository.path, { reopenPath: folder }); status(`Saved ${state.editingPath}`); }
   catch (error) { handleError(error); }
 }
 
@@ -1238,7 +1263,7 @@ async function fetchAllRemotes() {
 async function stashWork() {
   if (!state.repository) return;
   if (!invoke) { state.hasStash = true; updateStashUI(); status('Preview: work stashed'); return; }
-  try { status('Saving work in progress…', 'busy'); await invoke('stash_changes', { repositoryPath: state.repository.path }); state.hasStash = true; updateStashUI(); refs.commitMessage.value = ''; await loadRepository(state.repository.path); await openDirectory(state.currentPath, { force: true }); status('Work saved to stash'); showOperationToast('Work stashed. Use "Pop stash" to restore it.'); }
+  try { status('Saving work in progress…', 'busy'); await invoke('stash_changes', { repositoryPath: state.repository.path }); state.hasStash = true; updateStashUI(); refs.commitMessage.value = ''; await loadRepository(state.repository.path, { reopenPath: state.currentPath }); status('Work saved to stash'); showOperationToast('Work stashed. Use "Pop stash" to restore it.'); }
   catch (error) { handleError(error); }
 }
 
@@ -1249,7 +1274,7 @@ async function stashOneFile(path) {
     status(`Setting ${path} aside…`, 'busy');
     await invoke('stash_file', { repositoryPath: state.repository.path, relativePath: path });
     state.hasStash = true; updateStashUI();
-    const folder = state.currentPath; await loadRepository(state.repository.path); if (folder) await openDirectory(folder, { force: true });
+    const folder = state.currentPath; await loadRepository(state.repository.path, { reopenPath: folder });
     // The stashed file just went back to its committed state, so the details
     // panel (if it's the one showing) needs to drop its now-stale "Modified"
     // banner and action buttons rather than keep them around.
@@ -1724,7 +1749,7 @@ async function toggleStage(path, checked) {
   // after unchecking it) while that's in flight.
   const change = state.changes.find(item => item.path === path); if (change) change.staged = checked;
   renderChanges();
-  try { const folder = state.currentPath; await invoke(checked ? 'stage_files' : 'unstage_files', { path: state.repository.path, files: [path] }); await loadRepository(state.repository.path); if (folder) await openDirectory(folder); }
+  try { const folder = state.currentPath; await invoke(checked ? 'stage_files' : 'unstage_files', { path: state.repository.path, files: [path] }); await loadRepository(state.repository.path, { reopenPath: folder }); }
   catch (error) {
     // The backend call failed — the optimistic flip above never actually
     // happened, so undo it rather than leave the checkbox showing a state
@@ -1936,8 +1961,17 @@ refs.confirmNewBranch.addEventListener('click', async () => {
   finally { refs.confirmNewBranch.textContent = 'Create branch'; }
 });
 refs.commitButton.addEventListener('click', async () => {
-  try { const folder = state.changesScope === 'folder' ? state.currentPath : ''; const files = state.changes.filter(change => change.staged && (!folder || change.path === folder || change.path.startsWith(`${folder}/`))).map(change => change.path); await invoke('commit_files', { repositoryPath: state.repository.path, files, message: refs.commitMessage.value }); refs.commitMessage.value = ''; await loadRepository(state.repository.path); if (folder) await openDirectory(folder); }
+  // Without this, the button gave no sign anything was happening — for a
+  // commit touching many files (real work happens on the backend: staging,
+  // writing the tree, then a full status/history reload) that looked
+  // indistinguishable from the app being frozen, and nothing stopped a
+  // second click from firing a second commit while the first was still busy.
+  const folder = state.changesScope === 'folder' ? state.currentPath : '';
+  const files = state.changes.filter(change => change.staged && (!folder || change.path === folder || change.path.startsWith(`${folder}/`))).map(change => change.path);
+  refs.commitButton.disabled = true; refs.commitButton.textContent = `Committing ${files.length} file${files.length === 1 ? '' : 's'}…`;
+  try { await invoke('commit_files', { repositoryPath: state.repository.path, files, message: refs.commitMessage.value }); refs.commitMessage.value = ''; refs.commitButton.textContent = 'Updating status…'; await loadRepository(state.repository.path, { reopenPath: folder }); }
   catch (error) { handleError(error); }
+  finally { refs.commitButton.textContent = 'Commit changes'; renderChanges(); }
 });
 
 // Command Console — two tabs sharing one input:

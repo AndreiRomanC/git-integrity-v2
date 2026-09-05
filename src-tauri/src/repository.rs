@@ -481,9 +481,21 @@ fn normalized(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
+// Returns (url, branch) from a single `repo.submodules()` scan/find — callers
+// that need both (entry_details did) used to call a single-field version of
+// this twice, each re-parsing .gitmodules/config and re-scanning the
+// submodule list from scratch just to read one field out of the same entry.
+fn submodule_url_and_branch(repository: &str, path: &str) -> (Option<String>, Option<String>) {
+    (|| -> Option<(Option<String>, Option<String>)> {
+        let repo = internal_repository(repository).ok()?;
+        let submodule = repo.submodules().ok()?.into_iter().find(|item| normalized(item.path()) == path)?;
+        Some((submodule.url().map(String::from), submodule.branch().map(String::from)))
+    })().unwrap_or((None, None))
+}
+
 fn submodule_value(repository: &str, path: &str, field: &str) -> Option<String> {
-    let repo = internal_repository(repository).ok()?; let submodule = repo.submodules().ok()?.into_iter().find(|item| normalized(item.path()) == path)?;
-    match field { "url" => submodule.url().map(String::from), "branch" => submodule.branch().map(String::from), _ => None }
+    let (url, branch) = submodule_url_and_branch(repository, path);
+    match field { "url" => url, "branch" => branch, _ => None }
 }
 
 fn worktree_status(repository: &str, scope: Option<&str>) -> Vec<(String, String)> {
@@ -1387,16 +1399,28 @@ pub fn entry_details(repository_path: String, relative_path: String) -> Result<E
     // frontend fires only after the rest of the (fast) details are already
     // showing, instead of blocking on it up front.
     let last: Option<(String, String, String, String)> = None;
-    let submodule_url = (kind == "submodule").then(|| submodule_value(&repository_path, &relative_string, "url")).flatten();
-    let submodule_branch = (kind == "submodule").then(|| submodule_value(&repository_path, &relative_string, "branch")).flatten();
-    let submodule_push_status = (kind == "submodule").then(|| submodule_push_status(&absolute.to_string_lossy())).flatten();
-    let submodule_unpushed_commits = if kind == "submodule" { submodule_unpushed_commits(&absolute.to_string_lossy()) } else { Vec::new() };
-    let submodule_commit = (kind == "submodule").then(|| {
-        let repo = internal_repository(absolute.to_str().unwrap_or_default()).ok()?;
-        let commit = repo.head().ok()?.peel_to_commit().ok()?;
-        let author_name = commit.author().name().unwrap_or("Unknown").to_string();
-        Some((commit.id().to_string(), commit.summary().unwrap_or("No message").to_string(), author_name, short_date(commit.time().seconds())))
-    }).flatten();
+    // For a submodule entry, this used to independently open/discover its
+    // repository up to 5 times (url, branch, push status, unpushed commits,
+    // HEAD commit) plus re-scan the parent's .gitmodules twice (url, branch)
+    // — each of those was real, avoidable disk I/O for what's logically one
+    // "describe this submodule" read. Open the submodule's own repo once
+    // here and share it; the parent-side url/branch lookup is now a single
+    // scan too (submodule_url_and_branch), not two.
+    let (submodule_url, submodule_branch, submodule_push_status, submodule_unpushed_commits, submodule_commit) = if kind == "submodule" {
+        let (url, branch) = submodule_url_and_branch(&repository_path, &relative_string);
+        match internal_repository(absolute.to_str().unwrap_or_default()) {
+            Ok(sub_repo) => {
+                let push_status = submodule_push_status_in(&sub_repo);
+                let unpushed_commits = submodule_unpushed_commits_in(&sub_repo);
+                let commit = sub_repo.head().ok().and_then(|head| head.peel_to_commit().ok()).map(|commit| {
+                    let author_name = commit.author().name().unwrap_or("Unknown").to_string();
+                    (commit.id().to_string(), commit.summary().unwrap_or("No message").to_string(), author_name, short_date(commit.time().seconds()))
+                });
+                (url, branch, push_status, unpushed_commits, commit)
+            }
+            Err(_) => (url, branch, None, Vec::new(), None),
+        }
+    } else { (None, None, None, Vec::new(), None) };
 
     Ok(EntryDetails {
         name: absolute.file_name().and_then(|name| name.to_str()).unwrap_or(&relative_string).to_string(), relative_path: relative_string,
@@ -1430,7 +1454,14 @@ pub fn entry_last_commit(repository_path: String, relative_path: String) -> Resu
 // time a submodule is selected. Tells the user, at a glance, whether the commit
 // they're looking at has actually reached the submodule's own remote yet.
 fn submodule_push_status(sub_path: &str) -> Option<String> {
-    let repo = internal_repository(sub_path).ok()?;
+    submodule_push_status_in(&internal_repository(sub_path).ok()?)
+}
+
+// Same check, taking an already-open Repository — lets a caller that needs
+// several pieces of a submodule's state at once (entry_details opens the
+// submodule's repo for `submodule_commit` right next to this) share the one
+// `internal_repository`/`Repository::discover` instead of repeating it.
+fn submodule_push_status_in(repo: &Repository) -> Option<String> {
     let head = repo.head().ok()?;
     let local_target = head.target()?;
     if repo.head_detached().unwrap_or(true) { return Some("Detached — not on a branch, so it cannot be pushed as-is. Use \"Change version\" to switch to a branch first.".into()); }
@@ -1447,9 +1478,18 @@ fn submodule_push_status(sub_path: &str) -> Option<String> {
 // "3 commits not pushed" as a sentence and making the user guess which three
 // isn't good enough; list them the same way the main project's "Unpublished
 // commits" dialog already does.
+// Path-based wrapper around `submodule_unpushed_commits_in` — production code
+// now always already has the submodule's `Repository` open for something else
+// by the time it needs this (entry_details shares it with submodule_push_status
+// and the HEAD commit lookup) and calls the `_in` version directly instead of
+// re-opening the repo here; kept for tests, which exercise it standalone.
+#[cfg(test)]
 fn submodule_unpushed_commits(sub_path: &str) -> Vec<PublishCommit> {
+    match internal_repository(sub_path) { Ok(repo) => submodule_unpushed_commits_in(&repo), Err(_) => Vec::new() }
+}
+
+fn submodule_unpushed_commits_in(repo: &Repository) -> Vec<PublishCommit> {
     (|| -> Option<Vec<PublishCommit>> {
-        let repo = internal_repository(sub_path).ok()?;
         let head = repo.head().ok()?;
         let local_target = head.target()?;
         if repo.head_detached().unwrap_or(true) { return Some(Vec::new()); }
