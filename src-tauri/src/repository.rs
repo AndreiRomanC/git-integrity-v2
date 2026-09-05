@@ -1236,6 +1236,20 @@ pub fn load_directory(repository_path: String, relative_path: String) -> Result<
         let idx = sorted.partition_point(|candidate| *candidate < prefix);
         sorted.get(idx).map(|candidate| candidate.starts_with(prefix)).unwrap_or(false)
     };
+    // Same fix, same reason, for the third and last O(entries × something)
+    // scan in this loop: status_for did up to two linear scans through every
+    // *changed* file for every entry being listed. Usually small, but not
+    // when there's a large uncommitted change (a big refactor, an unstaged
+    // submodule bump touching many files) — sorted once, it's a binary
+    // search here too.
+    let mut statuses_sorted: Vec<&(String, String)> = git_metadata.statuses.iter().collect();
+    statuses_sorted.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    let status_for_entry = |key: &str| -> String {
+        if let Ok(idx) = statuses_sorted.binary_search_by(|(path, _)| path.as_str().cmp(key)) { return statuses_sorted[idx].1.clone(); }
+        let prefix = format!("{key}/");
+        let idx = statuses_sorted.partition_point(|(path, _)| path.as_str() < prefix.as_str());
+        if statuses_sorted.get(idx).map(|(path, _)| path.starts_with(&prefix)).unwrap_or(false) { "•".to_string() } else { String::new() }
+    };
     let mut entries = Vec::new();
 
     for item in fs::read_dir(&absolute).map_err(|error| error.to_string())? {
@@ -1244,7 +1258,15 @@ pub fn load_directory(repository_path: String, relative_path: String) -> Result<
         if name == ".git" { continue; }
         let relative_string = normalized(&relative.join(&name));
         let status_key = if boundary.is_some() { normalized(&Path::new(status_scope).join(&name)) } else { relative_string.clone() };
-        let metadata = fs::symlink_metadata(item.path()).map_err(|error| error.to_string())?;
+        // `entry.metadata()` (not `fs::symlink_metadata(entry.path())`) —
+        // on Windows the directory enumeration itself (FindNextFile) already
+        // returns each entry's basic attributes, so DirEntry::metadata()
+        // is free; a separate fs::symlink_metadata call forces one full
+        // extra per-file system call that Windows is, per Rust's own docs,
+        // specifically slower at than macOS/Linux. For a folder with many
+        // items that redundant stat, doubled for every single entry, was a
+        // real and avoidable cost.
+        let metadata = item.metadata().map_err(|error| error.to_string())?;
         let kind = if git_metadata.submodules.contains(&status_key) { "submodule" }
             else if metadata.file_type().is_symlink() { "symlink" }
             else if metadata.is_dir() { "folder" }
@@ -1254,7 +1276,7 @@ pub fn load_directory(repository_path: String, relative_path: String) -> Result<
         let modified = metadata.modified().ok().and_then(|time| time.duration_since(UNIX_EPOCH).ok()).map(|value| value.as_secs()).unwrap_or(0);
         let submodule_has_unpushed_commits = kind == "submodule" && submodule_push_status(item.path().to_str().unwrap_or_default()).is_some();
         let unpushed = if kind == "folder" { git_metadata.unpushed.contains(&status_key) || has_prefix(&unpushed_sorted, &tracked_prefix) } else { git_metadata.unpushed.contains(&status_key) };
-        entries.push(DirectoryEntry { name, relative_path: relative_string, kind, status: status_for(&status_key, &git_metadata.statuses), tracked, size: if metadata.is_file() { metadata.len() } else { 0 }, modified, submodule_has_unpushed_commits, unpushed });
+        entries.push(DirectoryEntry { name, relative_path: relative_string, kind, status: status_for_entry(&status_key), tracked, size: if metadata.is_file() { metadata.len() } else { 0 }, modified, submodule_has_unpushed_commits, unpushed });
     }
     entries.sort_by(|a, b| {
         let a_group = matches!(a.kind.as_str(), "folder" | "submodule");
@@ -1843,7 +1865,10 @@ pub fn compare_remote_directory(repository_path: String, relative_path: String, 
         let name = item.file_name().to_string_lossy().into_owned();
         if name == ".git" { continue; }
         let path = if relative_path.is_empty() { name.clone() } else { format!("{relative_path}/{name}") };
-        let metadata = fs::symlink_metadata(item.path()).map_err(|error| error.to_string())?;
+        // Same reasoning as load_directory: DirEntry::metadata() reuses what
+        // the directory enumeration already returned instead of paying for
+        // an extra per-file system call.
+        let metadata = item.metadata().map_err(|error| error.to_string())?;
         let kind = if git_metadata.submodules.contains(&path) { "submodule" } else if metadata.is_dir() { "folder" } else { "file" };
         let local = CommanderEntry { name: name.clone(), relative_path: path.clone(), kind: kind.into(), size: if metadata.is_file() { metadata.len() } else { 0 } };
         let remote_entry = remote.remove(&name);
