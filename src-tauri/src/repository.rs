@@ -529,6 +529,23 @@ fn normalized(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
+// A directory with its own `.git` (file or folder) inside it — an
+// unregistered embedded repository (not a registered submodule; those are
+// already routed elsewhere before a path would reach this check) — makes
+// libgit2 treat it as an opaque repository boundary and reject the whole
+// pathspec with a bare "invalid path: '<dir>/'" that gives no indication
+// why. Confirmed by direct reproduction: staging a directory containing
+// `.git` fails with exactly that message. Checked explicitly wherever a
+// directory is about to be handed to index.add_all, so the real cause is
+// reported instead.
+fn embedded_git_repo_path(absolute: &Path) -> bool {
+    absolute.join(".git").exists()
+}
+
+fn embedded_git_repo_error(relative: &str) -> String {
+    format!("\"{relative}\" contains its own .git and can't be staged as a plain folder. Either delete its .git folder and stage it as regular files, or add it properly as a Git submodule instead (Explorer → right-click the parent folder → Add submodule).")
+}
+
 // Returns (url, branch) from a single `repo.submodules()` scan/find — callers
 // that need both (entry_details did) used to call a single-field version of
 // this twice, each re-parsing .gitmodules/config and re-scanning the
@@ -789,6 +806,23 @@ pub fn open_external_url(url: String) -> Result<(), String> {
 #[cfg(target_os = "windows")]
 const UTRUD_BATCH_PATH: &str = r"C:\LegacyApp\UTRUD\2.0.0\UTRUD.bat";
 
+// Split out so the cwd/argument logic can be exercised by a plain unit test
+// without actually spawning a Windows process. UTRUD's own script builds its
+// results path by appending the selected folder's *name* to its process's
+// current directory — mirroring Explorer's "Send to", where the current
+// directory is the *parent* of whatever you right-clicked, not the item
+// itself. Setting current_dir to the selected folder itself (an earlier fix,
+// needed to make UTRUD find the right folder at all after it inherited this
+// app's own directory) overcorrected: with cwd == the "r" folder itself,
+// UTRUD's own `cwd + name` logic doubled it into ".../r/r", confirmed by the
+// reported "Default Result directory structures created: ...\r\r". The
+// absolute path stays the argument either way (some of UTRUD's own logic
+// does use it directly, per the first fix); only cwd needed to move up one.
+fn utrud_command_parts(absolute: &Path) -> (PathBuf, PathBuf) {
+    let cwd = absolute.parent().map(Path::to_path_buf).unwrap_or_else(|| absolute.to_path_buf());
+    (cwd, absolute.to_path_buf())
+}
+
 #[tauri::command]
 pub fn run_utrud(repository_path: String, relative_path: String) -> Result<(), String> {
     validate_path(&repository_path)?;
@@ -798,24 +832,16 @@ pub fn run_utrud(repository_path: String, relative_path: String) -> Result<(), S
     }
     let absolute = Path::new(&repository_path).join(&relative);
     if !absolute.is_dir() { return Err("The selected path is not a folder".into()); }
+    let (cwd, argument) = utrud_command_parts(&absolute);
     #[cfg(target_os = "windows")]
     {
-        // Without an explicit working directory, the spawned process inherits
-        // *this app's own* current directory (wherever git-integrity.exe was
-        // launched from) — not the selected folder. UTRUD's own script
-        // apparently determines "Selected folder" and resolves git paths
-        // relative to its process's current directory rather than purely
-        // from the argument, exactly mirroring how Explorer's "Send to"
-        // launches it with the current directory already set to the
-        // selected item. Reported symptom without this: UTRUD printed the
-        // app's own folder as "Selected folder" and then failed to find any
-        // .git relative to it.
-        Command::new("cmd").args(["/C", "call", UTRUD_BATCH_PATH]).arg(&absolute).current_dir(&absolute).spawn().map_err(|error| format!("Could not start UTRUD: {error}"))?;
+        perf_log(&format!("run_utrud: cwd={} arg={}", cwd.display(), argument.display()), Duration::ZERO);
+        Command::new("cmd").args(["/C", "call", UTRUD_BATCH_PATH]).arg(&argument).current_dir(&cwd).spawn().map_err(|error| format!("Could not start UTRUD: {error}"))?;
         Ok(())
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = absolute;
+        let _ = (cwd, argument);
         Err("UTRUD is only available on Windows".into())
     }
 }
@@ -1094,7 +1120,10 @@ fn stage_files_inner(path: &str, files: Vec<String>) -> Result<(), String> {
     for safe in &safe_files {
         let normalized_safe = normalized(safe); if submodule_paths.contains(&normalized_safe) { continue; }
         let absolute = Path::new(path).join(safe);
-        if absolute.is_dir() { dirs_to_add.push(safe.as_path()); }
+        if absolute.is_dir() {
+            if embedded_git_repo_path(&absolute) { return Err(embedded_git_repo_error(&normalized_safe)); }
+            dirs_to_add.push(safe.as_path());
+        }
         else if absolute.exists() { files_to_add.push(safe.as_path()); }
         else { to_remove.push(safe.as_path()); }
     }
@@ -2142,7 +2171,10 @@ fn commit_selected_internal(repository_path: &str, files: &[String], message: &s
         // still present on disk — if it was deleted, fall through to the normal
         // add/remove handling below so the deletion actually gets committed.
         if let Some(entry) = gitlinks.get(file) { if absolute.exists() { index.add(entry).map_err(|error| error.message().to_string())?; includes_submodule = true; continue; } }
-        if absolute.is_dir() { dirs_to_add.push(path); } else if absolute.exists() { files_to_add.push(path); } else { to_remove.push(path); }
+        if absolute.is_dir() {
+            if embedded_git_repo_path(&absolute) { return Err(embedded_git_repo_error(file)); }
+            dirs_to_add.push(path);
+        } else if absolute.exists() { files_to_add.push(path); } else { to_remove.push(path); }
     }
     perf_log(&format!("commit: build scratch index ({} files)", files.len()), commit_started.elapsed());
     let step = Instant::now();
@@ -5078,5 +5110,71 @@ mod tests {
 
         let still_recorded_at = *submodule_sync_cache().lock().unwrap().get(&parent_string).expect("the cache entry should not have been dropped by an unrelated mutation");
         assert_eq!(recorded_at, still_recorded_at, "an ordinary stage/commit must not force the next load_repository to rescan every submodule");
+    }
+
+    #[test]
+    fn staging_a_folder_with_an_embedded_git_repo_fails_clearly_instead_of_invalid_path() {
+        // Reproduces the report exactly: staging a directory that contains
+        // its own .git (an unregistered embedded repository — copied in from
+        // elsewhere, or created by another tool) used to fail deep inside
+        // libgit2 with a bare "invalid path: '<dir>/'", with nothing telling
+        // the user what was actually wrong or how to fix it.
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let repo_path = std::env::temp_dir().join(format!("git-integrity-embedded-git-{suffix}"));
+        create_libgit2_repository(&repo_path, "README.md");
+        let repo_string = repo_path.to_string_lossy().into_owned();
+
+        fs::create_dir_all(repo_path.join("embedded")).unwrap();
+        run_git(&repo_path.join("embedded"), &["init"]);
+        fs::write(repo_path.join("embedded/file.txt"), "content").unwrap();
+
+        let error = stage_files(repo_string.clone(), vec!["embedded".into()]).unwrap_err();
+        assert!(error.contains("embedded"), "error should name the problem path, got: {error}");
+        assert!(error.contains(".git"), "error should explain *why*, not just fail, got: {error}");
+        assert!(!error.contains("invalid path"), "should never surface libgit2's bare, unexplained error to the user, got: {error}");
+    }
+
+    #[test]
+    fn stage_all_with_a_mix_of_ordinary_files_and_an_embedded_git_folder() {
+        // The exact real-world shape: "Stage all" sends every changed path in
+        // one call, most of them ordinary files, one of them a problem
+        // folder — that one folder must produce a clear, actionable error,
+        // not silently abort or corrupt the staging of everything else.
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let repo_path = std::env::temp_dir().join(format!("git-integrity-mixed-stage-all-{suffix}"));
+        create_libgit2_repository(&repo_path, "README.md");
+        let repo_string = repo_path.to_string_lossy().into_owned();
+
+        fs::write(repo_path.join("a.txt"), "a").unwrap();
+        fs::write(repo_path.join("b.txt"), "b").unwrap();
+        fs::create_dir_all(repo_path.join("embedded")).unwrap();
+        run_git(&repo_path.join("embedded"), &["init"]);
+        fs::write(repo_path.join("embedded/file.txt"), "content").unwrap();
+
+        let error = stage_files(repo_string.clone(), vec!["a.txt".into(), "b.txt".into(), "embedded".into()]).unwrap_err();
+        assert!(error.contains("embedded") && error.contains(".git"), "got: {error}");
+
+        // Since this whole call errored out before ever writing the index,
+        // the two ordinary files must be exactly as unstaged as before —
+        // no partial, half-applied state.
+        let repo = internal_repository(&repo_string).unwrap();
+        let index = repo.index().unwrap();
+        assert!(index.get_path(Path::new("a.txt"), 0).is_none(), "a.txt should not have been staged by a call that errored");
+        assert!(index.get_path(Path::new("b.txt"), 0).is_none(), "b.txt should not have been staged by a call that errored");
+    }
+
+    #[test]
+    fn utrud_command_uses_the_parent_as_cwd_and_the_full_path_as_the_argument() {
+        // Reproduces the report: with cwd set to the "r" folder itself (an
+        // earlier fix), UTRUD's own script appended the selected folder's
+        // name to its current directory and produced ".../r/r" instead of
+        // ".../r". cwd must be the *parent* of the selected folder — the
+        // same relationship Explorer's "Send to" has with whatever you
+        // right-clicked — while the argument stays the full path to "r".
+        let absolute = Path::new("/int_opm/sw-prj-OMBMS_000U0/work/asw/aggr/errm/agf/errm_envd1/r");
+        let (cwd, argument) = utrud_command_parts(absolute);
+        assert_eq!(cwd, Path::new("/int_opm/sw-prj-OMBMS_000U0/work/asw/aggr/errm/agf/errm_envd1"));
+        assert_eq!(argument, absolute);
+        assert_ne!(cwd.file_name(), argument.file_name(), "cwd must not itself be named \"r\" — that's what caused the doubled \"r\\r\" path");
     }
 }
