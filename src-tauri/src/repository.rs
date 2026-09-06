@@ -752,7 +752,17 @@ pub fn run_utrud(repository_path: String, relative_path: String) -> Result<(), S
     if !absolute.is_dir() { return Err("The selected path is not a folder".into()); }
     #[cfg(target_os = "windows")]
     {
-        Command::new("cmd").args(["/C", "call", UTRUD_BATCH_PATH]).arg(&absolute).spawn().map_err(|error| format!("Could not start UTRUD: {error}"))?;
+        // Without an explicit working directory, the spawned process inherits
+        // *this app's own* current directory (wherever git-integrity.exe was
+        // launched from) — not the selected folder. UTRUD's own script
+        // apparently determines "Selected folder" and resolves git paths
+        // relative to its process's current directory rather than purely
+        // from the argument, exactly mirroring how Explorer's "Send to"
+        // launches it with the current directory already set to the
+        // selected item. Reported symptom without this: UTRUD printed the
+        // app's own folder as "Selected folder" and then failed to find any
+        // .git relative to it.
+        Command::new("cmd").args(["/C", "call", UTRUD_BATCH_PATH]).arg(&absolute).current_dir(&absolute).spawn().map_err(|error| format!("Could not start UTRUD: {error}"))?;
         Ok(())
     }
     #[cfg(not(target_os = "windows"))]
