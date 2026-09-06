@@ -210,6 +210,12 @@ async function confirmAddSubmodule() {
 }
 
 async function loadRepository(path, options = {}) {
+  // Must happen before anything else here reads/mutates state.repository —
+  // this flushes (or discards, per flushPendingTogglesNow's own guards)
+  // whatever's pending against the repository that's *currently* open,
+  // before this call potentially switches to a different one or refreshes
+  // this one out from under a still-in-flight checkbox click.
+  await flushPendingTogglesNow();
   status('Reading repository…', 'busy');
   const keepPath = options.keepPath ? state.currentPath : '';
   // Most callers already know exactly which folder they want open again after
@@ -1823,11 +1829,19 @@ async function confirmPublish(event) {
 // call and a single reload is both faster and avoids relying on the lock to
 // paper over a burst of many redundant round trips.
 let pendingToggles = new Map(); // path -> desired checked state
+let pendingToggleRepo = null; // which repository's index the queued paths belong to
 let pendingToggleTimeout = null;
 let pendingToggleGeneration = 0;
+let pendingToggleFlight = null; // Promise of a flush already in flight, if any
 
 function toggleStage(path, checked) {
-  if (!invoke) return;
+  if (!invoke || !state.repository) return;
+  // Defensive: the queue should never carry entries from a repository that's
+  // no longer open (every path that switches repository/branch is expected
+  // to flush first, via flushPendingTogglesNow — this only guards against
+  // some other path having missed that).
+  if (pendingToggleRepo && pendingToggleRepo !== state.repository.path) pendingToggles = new Map();
+  pendingToggleRepo = state.repository.path;
   // Reflect the click immediately in state — the round trip to the backend
   // and back through a full repository reload takes a moment, and the
   // checkbox should never visibly sit in a stale state (still "Staged" right
@@ -1836,39 +1850,63 @@ function toggleStage(path, checked) {
   renderChanges();
   pendingToggles.set(path, checked);
   if (pendingToggleTimeout) clearTimeout(pendingToggleTimeout);
-  pendingToggleTimeout = setTimeout(flushPendingToggles, 300);
+  pendingToggleTimeout = setTimeout(() => { pendingToggleFlight = flushPendingToggles(); }, 300);
+}
+
+// Call this before anything that must not race a still-pending stage/unstage
+// batch — Commit, Stage all, Unstage all, switching branch, or opening a
+// different repository. Cancels the debounce timer and waits for anything
+// queued (or already mid-flight, if the timer had just fired) to actually
+// reach the backend first, so e.g. Commit never runs against an index that's
+// missing a checkbox click from a moment ago just because 300ms hadn't
+// elapsed yet.
+async function flushPendingTogglesNow() {
+  if (pendingToggleTimeout) { clearTimeout(pendingToggleTimeout); pendingToggleTimeout = null; }
+  if (pendingToggles.size && !pendingToggleFlight) pendingToggleFlight = flushPendingToggles();
+  if (pendingToggleFlight) { await pendingToggleFlight; pendingToggleFlight = null; }
 }
 
 async function flushPendingToggles() {
-  pendingToggleTimeout = null;
   if (!pendingToggles.size) return;
   const batch = pendingToggles; pendingToggles = new Map();
+  const repositoryPath = pendingToggleRepo; pendingToggleRepo = null;
   const toStage = [...batch].filter(([, checked]) => checked).map(([path]) => path);
   const toUnstage = [...batch].filter(([, checked]) => !checked).map(([path]) => path);
+  const stillSameRepo = () => state.repository?.path === repositoryPath;
   const folder = state.currentPath;
   const generation = ++pendingToggleGeneration;
   try {
-    if (toStage.length) await invoke('stage_files', { path: state.repository.path, files: toStage });
-    if (toUnstage.length) await invoke('unstage_files', { path: state.repository.path, files: toUnstage });
+    if (toStage.length) await invoke('stage_files', { path: repositoryPath, files: toStage });
+    if (toUnstage.length) await invoke('unstage_files', { path: repositoryPath, files: toUnstage });
     // A newer batch already started (and will do its own reload) while this
     // one's backend calls were in flight — its reload covers this too.
     if (generation !== pendingToggleGeneration) return;
-    await loadRepository(state.repository.path, { reopenPath: folder });
+    // Cleared *before* the reload below, not after: loadRepository calls
+    // flushPendingTogglesNow itself (so it never races a queue that's still
+    // pending), and that would otherwise await this exact still-in-flight
+    // call — a real deadlock, since this call can only finish by finishing
+    // the reload it would be stuck awaiting.
+    pendingToggleFlight = null;
+    if (stillSameRepo()) await loadRepository(repositoryPath, { reopenPath: folder });
   } catch (error) {
-    // The backend call failed — undo the optimistic flip for exactly the
-    // paths in this batch, rather than leaving checkboxes showing a state
-    // that isn't real.
-    for (const [path, checked] of batch) {
-      const change = state.changes.find(item => item.path === path);
-      if (change) change.staged = !checked;
-    }
-    renderChanges();
+    pendingToggleFlight = null;
+    // A partial failure inside this batch (the stage call succeeded but the
+    // following unstage call then failed, say) means we genuinely don't know
+    // which half actually landed on disk — blindly flipping every optimistic
+    // bit in the batch back could just as easily show the wrong state as
+    // leave it right. An authoritative reload replaces every guess with
+    // whatever git actually has, instead.
+    if (stillSameRepo()) { try { await loadRepository(repositoryPath, { reopenPath: state.currentPath }); } catch { /* handleError below still reports the original failure */ } }
     handleError(error);
   }
 }
 
 async function switchBranch(branch) {
   if (!invoke || !state.repository) return;
+  // Must land before the checkout itself, not just before the reload after
+  // it — a checkout racing a still-pending stage/unstage call is exactly
+  // the kind of thing this exists to prevent.
+  await flushPendingTogglesNow();
   try { status(`Switching to ${branch}…`, 'busy'); await invoke('switch_branch', { path: state.repository.path, branch }); await loadRepository(state.repository.path); }
   catch (error) { handleError(error); }
 }
@@ -1888,6 +1926,11 @@ $('#refresh').addEventListener('click', () => state.repository && loadRepository
 // afterward gets unstaged again, same as before.
 async function stageAllInScope(scope) {
   if (!invoke || !state.repository) return;
+  // A pending per-checkbox toggle must land first — otherwise this reads
+  // state.changes (already optimistically updated by that toggle) and could
+  // send a stage_files call that overlaps with, or precedes, the toggle's
+  // own not-yet-sent one.
+  await flushPendingTogglesNow();
   // Includes already-staged paths too, not just `!change.staged` ones — a file
   // that was staged and then deleted from disk (or changed again) needs
   // stage_files to re-touch it so the index catches up with what's actually on
@@ -1906,6 +1949,7 @@ async function stageAllInScope(scope) {
 
 async function unstageAllInScope(scope) {
   if (!invoke || !state.repository) return;
+  await flushPendingTogglesNow();
   const files = state.changes.filter(change => change.staged && (!scope || change.path === scope || change.path.startsWith(`${scope}/`))).map(change => change.path);
   if (!files.length) return;
   const button = $('#unstageAllButton'); const label = button.textContent; button.disabled = true; button.textContent = `Unstaging ${files.length} file${files.length === 1 ? '' : 's'}…`;
@@ -2101,9 +2145,18 @@ refs.commitButton.addEventListener('click', async () => {
   // writing the tree, then a full status/history reload) that looked
   // indistinguishable from the app being frozen, and nothing stopped a
   // second click from firing a second commit while the first was still busy.
+  // Disabled *before* the flush below too — a second click landing during
+  // that flush (waiting on a checkbox toggle from a moment ago) must not be
+  // able to fire a second, overlapping commit.
+  refs.commitButton.disabled = true; refs.commitButton.textContent = 'Committing…';
+  // A checkbox ticked in the last 300ms may not have reached the backend
+  // yet — committing now would silently leave it out, since the index on
+  // disk wouldn't have caught up. state.changes is read *after* this so the
+  // files list below reflects what will actually be in the index.
+  await flushPendingTogglesNow();
   const folder = state.changesScope === 'folder' ? state.currentPath : '';
   const files = state.changes.filter(change => change.staged && (!folder || change.path === folder || change.path.startsWith(`${folder}/`))).map(change => change.path);
-  refs.commitButton.disabled = true; refs.commitButton.textContent = `Committing ${files.length} file${files.length === 1 ? '' : 's'}…`;
+  refs.commitButton.textContent = `Committing ${files.length} file${files.length === 1 ? '' : 's'}…`;
   try {
     // Global scope (no folder filter) means `files` is already exactly
     // everything staged — commit_staged skips rebuilding a scratch index for

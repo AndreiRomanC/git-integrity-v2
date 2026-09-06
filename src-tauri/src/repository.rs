@@ -659,8 +659,14 @@ fn invalidate_git_metadata(repository: &str) {
     index_metadata_cache().lock().unwrap().remove(repository);
     unpushed_paths_cache().lock().unwrap().remove(repository);
     full_status_cache().lock().unwrap().remove(repository);
-    submodule_sync_cache().lock().unwrap().remove(repository);
     sorted_lookups_cache().lock().unwrap().remove(repository);
+    // submodule_sync_cache is deliberately NOT cleared here: invalidate_git_metadata
+    // runs after essentially every mutation, including an ordinary file
+    // stage/commit that has nothing to do with submodules — clearing it here
+    // would force the next load_repository to redo the whole (18.5s, on a
+    // real repository with many submodules) submodule scan regardless,
+    // defeating the TTL entirely. It's invalidated explicitly instead,
+    // wherever it's actually relevant: see invalidate_submodule_sync below.
 }
 
 fn remove_submodule_section(path: &Path, name: &str) -> Result<(), String> {
@@ -891,15 +897,28 @@ fn submodule_sync_cache() -> &'static Mutex<HashMap<String, Instant>> {
     SUBMODULE_SYNC_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+// Called explicitly wherever it's actually relevant — a forced Refresh, or a
+// command that specifically changes a submodule's own commit/registration —
+// rather than from the general invalidate_git_metadata (which also fires on
+// every ordinary file stage/commit that has nothing to do with submodules).
+fn invalidate_submodule_sync(repository: &str) {
+    submodule_sync_cache().lock().unwrap().remove(repository);
+}
+
 fn sync_submodule_gitlinks(repository_path: &str) {
+    let scan_started = Instant::now();
     if let Some(last_run) = submodule_sync_cache().lock().unwrap().get(repository_path) {
-        if last_run.elapsed() < INDEX_METADATA_TTL { return; }
+        if last_run.elapsed() < INDEX_METADATA_TTL {
+            perf_log(&format!("sync_submodule_gitlinks: cache HIT (skipped, {:.1}s old)", last_run.elapsed().as_secs_f64()), scan_started.elapsed());
+            return;
+        }
     }
-    submodule_sync_cache().lock().unwrap().insert(repository_path.to_string(), Instant::now());
+    perf_log("sync_submodule_gitlinks: cache MISS, scanning", Duration::ZERO);
     let Ok(parent) = internal_repository(repository_path) else { return };
     let Ok(index) = parent.index() else { return };
     let gitlinks: Vec<(String, git2::Oid)> = index.iter().filter(|entry| entry.mode == 0o160000).map(|entry| (String::from_utf8_lossy(&entry.path).into_owned(), entry.id)).collect();
     drop(index);
+    let submodule_count = gitlinks.len();
     for (relative, recorded_oid) in gitlinks {
         let absolute = Path::new(repository_path).join(&relative);
         let Ok(sub_repo) = internal_repository(absolute.to_str().unwrap_or_default()) else { continue };
@@ -910,6 +929,12 @@ fn sync_submodule_gitlinks(repository_path: &str) {
         drop(sub_repo);
         let _ = record_pushed_submodule_in_parent(repository_path, &relative, Some(head_oid));
     }
+    // Marked done only now, after the scan actually completed — marking it
+    // up front (before doing the work) would let a run that errored out
+    // partway through (e.g. internal_repository failing) still count as a
+    // fresh scan for the next TTL window, silently skipping the real one.
+    submodule_sync_cache().lock().unwrap().insert(repository_path.to_string(), Instant::now());
+    perf_log(&format!("sync_submodule_gitlinks: scan complete ({submodule_count} submodules)"), scan_started.elapsed());
 }
 
 #[tauri::command]
@@ -921,7 +946,7 @@ pub fn load_repository(path: String, force: Option<bool>) -> Result<RepositoryDa
     // read" — the short status-scan cache below must never serve it a stale
     // scan from moments earlier just because nothing *this app* did
     // triggered an invalidation.
-    if force.unwrap_or(false) { invalidate_git_metadata(&path); }
+    if force.unwrap_or(false) { invalidate_git_metadata(&path); invalidate_submodule_sync(&path); }
     let step = Instant::now();
     sync_submodule_gitlinks(&path);
     perf_log("load_repository: sync_submodule_gitlinks", step.elapsed());
@@ -1166,6 +1191,7 @@ pub fn create_submodule_branch(repository_path: String, relative_path: String, b
     let mut submodule = parent.find_submodule(&relative_path).map_err(|error| error.message().to_string())?;
     submodule.add_to_index(true).map_err(|error| format!("Branch created, but the parent index could not be updated: {}", error.message()))?;
     invalidate_git_metadata(&repository_path);
+    invalidate_submodule_sync(&repository_path); // this app just changed a submodule's registration/version
     Ok(())
 }
 
@@ -1864,6 +1890,7 @@ pub fn add_submodule(repository_path: String, parent_path: String, url: String, 
     if let Err(error) = submodule.add_to_index(true) { return rollback(format!("Cannot add the submodule link to the parent index: {}", error.message())); }
     if let Ok(mut index) = repo.index() { if let Err(error) = index.add_path(Path::new(".gitmodules")).and_then(|_| index.write()) { return rollback(format!("Cannot stage .gitmodules: {}", error.message())); } }
     invalidate_git_metadata(&repository_path);
+    invalidate_submodule_sync(&repository_path); // this app just changed a submodule's registration/version
     Ok(relative_string)
 }
 
@@ -1912,6 +1939,7 @@ pub fn switch_submodule_version(repository_path: String, relative_path: String, 
     let mut submodule = parent.find_submodule(&relative_path).map_err(|error| error.message().to_string())?;
     submodule.add_to_index(true).map_err(|error| format!("Version changed, but the parent index could not be updated: {}", error.message()))?;
     invalidate_git_metadata(&repository_path);
+    invalidate_submodule_sync(&repository_path); // this app just changed a submodule's registration/version
     Ok(selected)
 }
 
@@ -1925,6 +1953,7 @@ pub fn change_submodule_url(repository_path: String, relative_path: String, url:
     let mut repo = internal_repository(&repository_path)?; let name = repo.submodules().map_err(|error| error.message().to_string())?.into_iter().find(|item| normalized(item.path()) == relative).map(|item| item.name().unwrap_or("").to_string()).ok_or("Submodule configuration was not found")?; repo.submodule_set_url(&name, url).map_err(|error| error.message().to_string())?;
     let subrepo = internal_repository(absolute.to_str().unwrap_or_default())?; subrepo.remote_set_url("origin", url).map_err(|error| error.message().to_string())?; subrepo.find_remote("origin").map_err(|error| error.message().to_string())?; git(absolute.to_str().unwrap_or_default(), &["fetch", "origin"]).map_err(|detail| format!("Fetch failed: {detail}"))?;
     invalidate_git_metadata(&repository_path);
+    invalidate_submodule_sync(&repository_path); // this app just changed a submodule's registration/version
     Ok(())
 }
 
@@ -1957,6 +1986,7 @@ pub fn remove_git_path(repository_path: String, relative_path: String) -> Result
     else { let _ = index.remove_path(Path::new(".gitmodules")); }
     index.write().map_err(|error| error.message().to_string())?;
     invalidate_git_metadata(&repository_path);
+    invalidate_submodule_sync(&repository_path); // this app just changed a submodule's registration/version
     Ok(())
 }
 
@@ -2613,6 +2643,7 @@ pub fn commit_submodule(repository_path: String, relative_path: String, message:
     let parents: Vec<&git2::Commit<'_>> = parent.iter().collect();
     let oid = repo.commit(Some("HEAD"), &signature, &signature, message.trim(), &tree, &parents).map_err(|error| error.message().to_string())?;
     invalidate_git_metadata(&sub_path);
+    invalidate_submodule_sync(&repository_path); // this app just changed the submodule's own commit
     // Once the submodule itself has a new commit, its working copy already IS
     // the new version — record that in the parent right away instead of
     // leaving the two in sync only after a manual "Change version"/stage step.
@@ -2685,6 +2716,7 @@ pub fn push_submodule(repository_path: String, relative_path: String) -> Result<
     // the submodule as its own repository view right after a push could still show
     // its pre-push status for up to the cache's TTL.
     invalidate_git_metadata(&sub_path);
+    invalidate_submodule_sync(&repository_path); // this app just changed the submodule's own commit
     record_pushed_submodule_in_parent(&repository_path, &relative_path, local_target)?;
     Ok(PushSubmoduleResult { revision: local_target.map(|oid| oid.to_string()).unwrap_or_default(), branch })
 }
@@ -2736,6 +2768,7 @@ pub fn force_push_submodule(repository_path: String, relative_path: String) -> R
     git(&sub_path, &["push", "--force", "origin", &format!("HEAD:refs/heads/{branch}")]).map_err(|detail| format!("Force push failed: {detail}"))?;
 
     invalidate_git_metadata(&sub_path);
+    invalidate_submodule_sync(&repository_path); // this app just changed the submodule's own commit
     record_pushed_submodule_in_parent(&repository_path, &relative_path, local_target)?;
     Ok(PushSubmoduleResult { revision: local_target.map(|oid| oid.to_string()).unwrap_or_default(), branch })
 }
@@ -2749,6 +2782,7 @@ pub fn fetch_submodule(repository_path: String, relative_path: String) -> Result
     repo.find_remote("origin").map_err(|_| "No 'origin' remote configured for this submodule".to_string())?;
     git(&sub_path, &["fetch", "origin"])?;
     invalidate_git_metadata(&sub_path);
+    invalidate_submodule_sync(&repository_path); // this app just changed the submodule's own commit
     Ok(())
 }
 
@@ -2789,6 +2823,7 @@ pub fn pull_submodule(repository_path: String, relative_path: String) -> Result<
     let mut checkout = git2::build::CheckoutBuilder::new(); checkout.force();
     repo.checkout_head(Some(&mut checkout)).map_err(|error| error.message().to_string())?;
     invalidate_git_metadata(&sub_path);
+    invalidate_submodule_sync(&repository_path); // this app just changed the submodule's own commit
     Ok(())
 }
 
@@ -5014,5 +5049,34 @@ mod tests {
         let entries = load_directory(repo_string.clone(), "big_folder".into()).unwrap();
         println!("PERF load_directory third call (expired status cache, fresh scoped scan): {:?}", third.elapsed());
         assert_eq!(entries.len(), 20_000);
+    }
+
+    #[test]
+    fn ordinary_stage_does_not_invalidate_submodule_sync_cache() {
+        // The submodule scan is expensive (18.5s on a real repository with
+        // many submodules, per a Windows perf log) and is deliberately given
+        // a long TTL for that reason — but invalidate_git_metadata, which
+        // runs after essentially *any* mutation, used to also clear this
+        // cache, defeating the TTL for the common case of staging/committing
+        // a file that has nothing to do with any submodule. This asserts the
+        // cached timestamp survives an ordinary stage+commit untouched.
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-submodule-cache-separation-{suffix}"));
+        let parent = base.join("parent"); let dependency = base.join("dependency");
+        create_libgit2_repository(&parent, "README.md"); create_libgit2_repository(&dependency, "module.txt");
+        let parent_string = parent.to_string_lossy().into_owned();
+        add_submodule(parent_string.clone(), "".into(), dependency.to_string_lossy().into_owned(), "dep".into(), String::new(), String::new()).unwrap();
+        create_commit(parent_string.clone(), "Add submodule".into()).unwrap();
+
+        load_repository(parent_string.clone(), Some(true)).unwrap();
+        let recorded_at = *submodule_sync_cache().lock().unwrap().get(&parent_string).expect("should have cached a sync timestamp after the forced load");
+
+        // An ordinary file stage + commit — nothing to do with the submodule.
+        fs::write(parent.join("plain.txt"), "content").unwrap();
+        stage_files(parent_string.clone(), vec!["plain.txt".into()]).unwrap();
+        commit_staged(parent_string.clone(), "Add plain file".into()).unwrap();
+
+        let still_recorded_at = *submodule_sync_cache().lock().unwrap().get(&parent_string).expect("the cache entry should not have been dropped by an unrelated mutation");
+        assert_eq!(recorded_at, still_recorded_at, "an ordinary stage/commit must not force the next load_repository to rescan every submodule");
     }
 }
