@@ -197,6 +197,62 @@ fn cached_full_statuses(repository: &Repository, repository_path: &str) -> Resul
     Ok(statuses)
 }
 
+// A real macOS perf log on a ~14GB/100,000-file repository caught this
+// precisely: opening the Working tree drawer (refresh_status, ~0.9s)
+// immediately followed by Stage all running its *own*, separately-scanned
+// ~0.9s full status scan of the exact same thing a moment later — and,
+// separately, two refresh_status calls firing back to back. Neither
+// refresh_status nor stage_all can just use cached_full_statuses above
+// (GIT_METADATA_TTL is 300s, tuned for *navigation*, where staleness toward
+// external changes matters much less than not re-scanning on every click) —
+// that would undo the whole reason refresh_status/stage_all exist: catching
+// a file that was just added or removed from outside the app right now, not
+// up to 5 minutes from now. But genuinely fresh external changes happen on a
+// human timescale of several seconds at minimum; two calls to either of
+// these within a couple hundred milliseconds of each other are essentially
+// always the same "what changed" question asked twice in one user gesture,
+// not two different moments worth separately scanning for. Shares the same
+// full_status_cache entry as cached_full_statuses above (whichever ran more
+// recently benefits both), just with a much shorter freshness threshold.
+const FRESH_STATUS_REUSE_WINDOW: Duration = Duration::from_secs(2);
+
+static STATUS_SCAN_LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
+
+fn status_scan_lock(repository: &str) -> Arc<Mutex<()>> {
+    let mut locks = STATUS_SCAN_LOCKS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
+    locks.entry(repository.to_string()).or_insert_with(|| Arc::new(Mutex::new(()))).clone()
+}
+
+fn recent_full_statuses(repository: &Repository, repository_path: &str) -> Result<Vec<(String, String, bool)>, String> {
+    // Fast path — no lock needed if a scan from a moment ago is still fresh
+    // enough (the common case this exists for: refresh_status then stage_all
+    // right after, or two refresh_status calls close together).
+    if let Some((cached_at, statuses)) = full_status_cache().lock().unwrap().get(repository_path) {
+        if cached_at.elapsed() < FRESH_STATUS_REUSE_WINDOW {
+            perf_log("recent_full_statuses: HIT (reuse window)", Duration::ZERO);
+            return Ok(statuses.clone());
+        }
+    }
+    // Single-flight for genuinely concurrent callers (both arriving before
+    // either has written a result yet): the second one blocks here instead
+    // of starting its own redundant scan, then re-checks the cache — which
+    // the first caller will have just populated — before ever falling
+    // through to an actual second scan.
+    let lock_handle = status_scan_lock(repository_path);
+    let _guard = lock_handle.lock().unwrap();
+    if let Some((cached_at, statuses)) = full_status_cache().lock().unwrap().get(repository_path) {
+        if cached_at.elapsed() < FRESH_STATUS_REUSE_WINDOW {
+            perf_log("recent_full_statuses: HIT (reuse window, after a concurrent scan)", Duration::ZERO);
+            return Ok(statuses.clone());
+        }
+    }
+    let step = Instant::now();
+    let statuses = internal_statuses(repository, None)?;
+    perf_log("recent_full_statuses: MISS, fresh scan", step.elapsed());
+    full_status_cache().lock().unwrap().insert(repository_path.to_string(), (Instant::now(), statuses.clone()));
+    Ok(statuses)
+}
+
 fn unpushed_paths(repository: &str) -> HashSet<String> {
     (|| -> Option<HashSet<String>> {
         let repo = internal_repository(repository).ok()?;
@@ -1131,9 +1187,7 @@ pub fn refresh_status(repository_path: String) -> Result<Vec<Change>, String> {
     let started = Instant::now();
     validate_path(&repository_path)?;
     let repo = internal_repository(&repository_path)?;
-    let step = Instant::now();
-    let internal = internal_statuses(&repo, None)?;
-    perf_log(&format!("refresh_status: fresh scan ({} changes)", internal.len()), step.elapsed());
+    let internal = recent_full_statuses(&repo, &repository_path)?;
     let statuses = internal.iter().map(|(path, status, _)| (path.clone(), status.clone())).collect::<Vec<_>>();
     let changes = internal.into_iter().map(|(path, status, staged)| Change { status, path, staged }).collect();
     replace_git_metadata(&repository_path, statuses);
@@ -1196,12 +1250,20 @@ fn stage_all_inner(repository_path: &str, scope: &str) -> Result<usize, String> 
     }
     let step = Instant::now();
     let repo = internal_repository(repository_path)?;
-    let scope_opt = if scope.is_empty() { None } else { Some(scope) };
-    // Deliberately not the cached status scan — this needs the true current
-    // disk state every time it's called, not whatever's still valid under
-    // the (now much longer) status-scan TTL.
-    let paths: Vec<String> = internal_statuses(&repo, scope_opt)?.into_iter().map(|(path, _, _)| path).collect();
-    perf_log(&format!("stage_all: fresh status scan ({} paths, scope={scope:?})", paths.len()), step.elapsed());
+    // recent_full_statuses (not a plain fresh scan) — this still needs the
+    // true current disk state, but shares that requirement with
+    // refresh_status via the same short reuse window/single-flight instead
+    // of always paying for its own separate scan: opening the Working tree
+    // drawer immediately followed by Stage all is exactly the case that
+    // used to mean two full scans back to back.
+    let full = recent_full_statuses(&repo, repository_path)?;
+    let paths: Vec<String> = if scope.is_empty() {
+        full.into_iter().map(|(path, _, _)| path).collect()
+    } else {
+        let prefix = format!("{scope}/");
+        full.into_iter().filter(|(path, _, _)| path == scope || path.starts_with(&prefix)).map(|(path, _, _)| path).collect()
+    };
+    perf_log(&format!("stage_all: status ready ({} paths, scope={scope:?})", paths.len()), step.elapsed());
     let count = paths.len();
     if paths.is_empty() { return Ok(0); }
     stage_files(repository_path.to_string(), paths)?;
@@ -5374,5 +5436,39 @@ mod tests {
         let commit = repo.find_commit(git2::Oid::from_str(&oid).unwrap()).unwrap();
         let tree = commit.tree().unwrap();
         for name in &names[7..] { assert!(tree.get_path(Path::new(name)).is_ok(), "{name} should be in the commit"); }
+    }
+
+    #[test]
+    fn refresh_status_then_stage_all_reuse_the_same_recent_scan() {
+        // Reproduces the report exactly: opening Working tree (refresh_status)
+        // immediately followed by Stage all used to each pay for their own
+        // separate full status scan of the same thing a moment apart. Seeds
+        // full_status_cache directly with a recognizable fake entry (a path
+        // that could never come from a real scan of this repo) so a HIT can
+        // be told apart from a real scan with certainty, rather than
+        // inferring it from timing.
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let repo_path = std::env::temp_dir().join(format!("git-integrity-status-reuse-{suffix}"));
+        create_libgit2_repository(&repo_path, "README.md");
+        let repo_string = repo_path.to_string_lossy().into_owned();
+
+        let fake_marker = "__unmistakably_fake_marker__.txt".to_string();
+        full_status_cache().lock().unwrap().insert(repo_string.clone(), (Instant::now(), vec![(fake_marker.clone(), "??".into(), false)]));
+
+        let changes = refresh_status(repo_string.clone()).unwrap();
+        assert_eq!(changes.len(), 1, "should have reused the seeded entry, not scanned the (actually empty) real repository");
+        assert_eq!(changes[0].path, fake_marker);
+
+        let staged = stage_all(repo_string.clone(), String::new()).unwrap();
+        assert_eq!(staged, 1, "stage_all right after should reuse the same still-fresh scan, not run its own");
+
+        // Age the cache entry past the reuse window (without a real sleep) —
+        // the next call must fall through to a genuine fresh scan and stop
+        // seeing the fake marker, since it was never a real file on disk.
+        if let Some(entry) = full_status_cache().lock().unwrap().get_mut(&repo_string) {
+            entry.0 = Instant::now() - FRESH_STATUS_REUSE_WINDOW - Duration::from_millis(500);
+        }
+        let changes_after_expiry = refresh_status(repo_string.clone()).unwrap();
+        assert!(changes_after_expiry.is_empty(), "past the reuse window, this must be a real fresh scan of the (clean) repository, not the stale fake entry");
     }
 }

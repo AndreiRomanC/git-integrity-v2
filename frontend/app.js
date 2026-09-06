@@ -2244,7 +2244,7 @@ function buildCommands() {
   const list = [
     { id: 'open-repo', name: 'Open Repository', description: 'Choose a local Git folder to open', keys: 'Ctrl+O', tags: ['no-repo'], fn: openRepository },
     { id: 'new-branch', name: 'New Branch', description: 'Create a new local branch from the current one', keys: 'Ctrl+Shift+B', tags: ['explorer', 'graph'], fn: () => $('#newBranch').click() },
-    { id: 'commit', name: 'Commit Changes', description: 'Open the Working tree drawer and write a commit message for staged files', keys: 'Ctrl+Shift+C', keywords: 'save record', tags: ['explorer'], fn: () => { state.changesScope = 'global'; applyDefaultCommitMessage(); renderChanges(); refs.changesDrawer.classList.add('open'); refs.commitMessage.focus(); } },
+    { id: 'commit', name: 'Commit Changes', description: 'Open the Working tree drawer and write a commit message for staged files', keys: 'Ctrl+Shift+C', keywords: 'save record', tags: ['explorer'], fn: () => { state.changesScope = 'global'; applyDefaultCommitMessage(); renderChanges(); refs.changesDrawer.classList.add('open'); refreshChangesLightweight(); refs.commitMessage.focus(); } },
     { id: 'push', name: 'Push Current Branch', description: 'Send your local commits on this branch to the server', keys: 'Ctrl+Shift+P', tags: ['explorer', 'graph'], fn: () => $('#pushCurrent').click() },
     { id: 'pull', name: 'Pull Current Branch', description: 'Fetch and fast-forward the current branch from the server', keys: '', tags: ['explorer', 'graph'], fn: () => $('#pullCurrent').click() },
     { id: 'merge', name: 'Merge Branch…', description: 'Bring another branch\'s commits into your current one — stays local, resolves conflicts here if any', keys: '', keywords: 'combine join', tags: ['explorer', 'graph'], fn: () => state.repository && openMergeBranchDialog(mergeTargetForMain()) },
@@ -2658,7 +2658,7 @@ $('#openHelp').addEventListener('click', () => $('#helpDialog').showModal());
 document.addEventListener('keydown', (e) => {
   if ((e.ctrlKey || e.metaKey) && e.key === 'k') { e.preventDefault(); commandPaletteOpen ? $('#commandPalette').close() : openCommandPalette(); }
   else if ((e.ctrlKey || e.metaKey) && e.key === 'o') { e.preventDefault(); openRepository(); }
-  else if ((e.ctrlKey || e.metaKey) && (e.shiftKey && e.key === 'C')) { e.preventDefault(); state.changesScope = 'global'; applyDefaultCommitMessage(); renderChanges(); refs.changesDrawer.classList.add('open'); refs.commitMessage.focus(); }
+  else if ((e.ctrlKey || e.metaKey) && (e.shiftKey && e.key === 'C')) { e.preventDefault(); state.changesScope = 'global'; applyDefaultCommitMessage(); renderChanges(); refs.changesDrawer.classList.add('open'); refreshChangesLightweight(); refs.commitMessage.focus(); }
   else if ((e.ctrlKey || e.metaKey) && (e.shiftKey && e.key === 'P')) { e.preventDefault(); $('#pushCurrent').click(); }
   else if ((e.ctrlKey || e.metaKey) && (e.shiftKey && e.key === 'F')) { e.preventDefault(); $('#fetchCurrent').click(); }
   else if ((e.ctrlKey || e.metaKey) && (e.shiftKey && e.key === 'S')) { e.preventDefault(); state.hasStash ? popStash() : stashWork(); }
