@@ -103,6 +103,27 @@ fn unpushed_paths_cache() -> &'static Mutex<HashMap<String, (Instant, Arc<HashSe
     UNPUSHED_PATHS_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+// Real evidence from a Windows perf log: rapid checkbox clicking in the
+// Working tree drawer fires one stage_files/unstage_files call per click,
+// with nothing serializing them — Tauri dispatches each to its own thread,
+// so they genuinely run concurrently. Of 19 stage_files calls logged, only 5
+// ever reached their own TOTAL line; the other 14 stopped right after
+// building the add/remove lists and never logged add_all at all, which only
+// happens if add_all itself returned an Err (aborting the function via `?`
+// before that log line) — almost certainly libgit2 failing to acquire
+// `.git/index.lock` because another concurrent call already held it. Best
+// case that's a failed operation the user has to retry; worst case, two
+// racing reads-then-writes of the index silently drop one side's staging
+// with no error at all. One lock per repository, held for the duration of
+// any command that mutates the index or HEAD, makes them queue up instead
+// of racing.
+static REPO_WRITE_LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
+
+fn repo_write_lock(repository: &str) -> Arc<Mutex<()>> {
+    let mut locks = REPO_WRITE_LOCKS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
+    locks.entry(repository.to_string()).or_insert_with(|| Arc::new(Mutex::new(()))).clone()
+}
+
 // `load_repository` runs a full, unscoped status scan (every file in the
 // working tree) on essentially every action — this app calls it again right
 // after almost anything (stage, commit, stash, fetch...). On a large repo
@@ -638,6 +659,7 @@ fn invalidate_git_metadata(repository: &str) {
     index_metadata_cache().lock().unwrap().remove(repository);
     unpushed_paths_cache().lock().unwrap().remove(repository);
     full_status_cache().lock().unwrap().remove(repository);
+    submodule_sync_cache().lock().unwrap().remove(repository);
     sorted_lookups_cache().lock().unwrap().remove(repository);
 }
 
@@ -848,7 +870,32 @@ pub fn open_commit_on_server(repository_path: String, commit_id: String) -> Resu
 // in the console, or committing one of its files directly): the parent
 // catches up the moment anything reloads it, instead of silently staying
 // unaware and making "Unpublished commits" look wrong by comparison.
+// A real Windows perf log caught this taking 18.5 SECONDS on one
+// load_repository call. This opens every submodule (a Repository::discover
+// each) and reads its HEAD on *every single* load_repository call — which
+// runs after almost every action in this app — purely to notice a submodule
+// commit made *outside* the app (a raw git command, or committing directly
+// inside the submodule's own folder) that this app wasn't told about any
+// other way. On a repository with many submodules that's real, repeated
+// cost paid on essentially every click. Not removed outright: an existing
+// test (load_repository_reconciles_a_submodule_commit_made_outside_the_app_too)
+// deliberately relies on load_repository catching this, and losing that
+// guarantee entirely would be a real regression, not just a perf tweak.
+// Instead, same long TTL already used for index_metadata for the same
+// reasoning: correctness here doesn't depend on doing this on literally
+// every call, just periodically (and immediately after any submodule action
+// this app itself performs, which already calls invalidate_git_metadata).
+static SUBMODULE_SYNC_CACHE: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+
+fn submodule_sync_cache() -> &'static Mutex<HashMap<String, Instant>> {
+    SUBMODULE_SYNC_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 fn sync_submodule_gitlinks(repository_path: &str) {
+    if let Some(last_run) = submodule_sync_cache().lock().unwrap().get(repository_path) {
+        if last_run.elapsed() < INDEX_METADATA_TTL { return; }
+    }
+    submodule_sync_cache().lock().unwrap().insert(repository_path.to_string(), Instant::now());
     let Ok(parent) = internal_repository(repository_path) else { return };
     let Ok(index) = parent.index() else { return };
     let gitlinks: Vec<(String, git2::Oid)> = index.iter().filter(|entry| entry.mode == 0o160000).map(|entry| (String::from_utf8_lossy(&entry.path).into_owned(), entry.id)).collect();
@@ -963,13 +1010,27 @@ pub fn stage_files(path: String, files: Vec<String>) -> Result<(), String> {
     let started = Instant::now();
     let file_count = files.len();
     perf_log(&format!("stage_files: START ({file_count} files)"), Duration::ZERO);
-    validate_path(&path)?;
+    let result = stage_files_inner(&path, files);
+    match &result {
+        Ok(()) => perf_log(&format!("stage_files: TOTAL ({file_count} files)"), started.elapsed()),
+        Err(error) => perf_log(&format!("stage_files: ERROR ({file_count} files): {error}"), started.elapsed()),
+    }
+    result
+}
+
+fn stage_files_inner(path: &str, files: Vec<String>) -> Result<(), String> {
+    validate_path(path)?;
+    // Real evidence this was needed, not theoretical: see repo_write_lock's
+    // doc comment. Held for the rest of this function, so a burst of rapid
+    // checkbox clicks queues up instead of racing on the same index.
+    let lock_handle = repo_write_lock(path);
+    let _lock = lock_handle.lock().unwrap();
     let step = Instant::now();
-    let (files, submodule_groups) = partition_by_submodule(&path, files);
-    perf_log(&format!("stage_files: partition_by_submodule ({file_count} files)"), step.elapsed());
+    let (files, submodule_groups) = partition_by_submodule(path, files);
+    perf_log(&format!("stage_files: partition_by_submodule ({} files)", files.len()), step.elapsed());
     for (sub_path, inner_files) in submodule_groups { stage_files(sub_path, inner_files)?; }
     if files.is_empty() { return Ok(()); }
-    let repo = internal_repository(&path)?;
+    let repo = internal_repository(path)?;
     let safe_files = files.into_iter().map(|file| safe_relative_path(file.trim_end_matches(|character| character == '/' || character == '\\'))).collect::<Result<Vec<_>, _>>()?;
     let step = Instant::now();
     // `submodules.contains(...)` (an O(1) HashSet lookup against metadata
@@ -978,48 +1039,65 @@ pub fn stage_files(path: String, files: Vec<String>) -> Result<(), String> {
     // file: only the (typically very few, if any) paths that are actually
     // submodule roots need that real lookup at all, to get the Submodule
     // handle add_to_index needs.
-    let (_, submodules) = cached_index_metadata(&path);
+    let (_, submodules) = cached_index_metadata(path);
     let mut submodule_paths = HashSet::new();
     for safe in &safe_files {
         let normalized_safe = normalized(safe);
         if !submodules.contains(&normalized_safe) { continue; }
         if let Ok(mut submodule) = repo.find_submodule(&normalized_safe) { submodule.add_to_index(true).map_err(|error| format!("Cannot stage submodule {}: {}", normalized_safe, error.message()))?; submodule_paths.insert(normalized_safe); }
     }
-    perf_log(&format!("stage_files: submodule detection ({file_count} files)"), step.elapsed());
+    perf_log("stage_files: submodule detection", step.elapsed());
     let step = Instant::now();
     let mut index = repo.index().map_err(|error| error.message().to_string())?;
     perf_log("stage_files: repo.index()", step.elapsed());
-    // Batched like commit_selected_internal, same reason: one add_all/remove_path
-    // call per file re-matches its pathspec against the whole index each time —
-    // for "Stage all" on a large add (hundreds of new files, on a large repo)
-    // that turned a sub-second stage into minutes. One call per phase instead.
+    // A real Windows perf log caught this precisely: staging a single known
+    // file took 1.6-1.9 SECONDS, entirely inside a single add_all call for
+    // that one exact path. add_all always does pathspec *matching* — a diff
+    // between the working directory and the index — even for a literal,
+    // exact path with nothing to expand; its cost scales with the size of
+    // the working tree being diffed, not with how many paths were given.
+    // add_path, by contrast, is a direct "hash this known file and insert an
+    // entry for it" with no worktree-wide matching at all — the right tool
+    // for a file whose exact path is already known (which is every ordinary
+    // "stage this file" click). add_all is now used only for an actual
+    // directory pathspec, which genuinely needs matching to discover what's
+    // inside it.
     let step = Instant::now();
-    let mut to_add: Vec<&Path> = Vec::new();
+    let mut files_to_add: Vec<&Path> = Vec::new();
+    let mut dirs_to_add: Vec<&Path> = Vec::new();
     let mut to_remove: Vec<&Path> = Vec::new();
     for safe in &safe_files {
         let normalized_safe = normalized(safe); if submodule_paths.contains(&normalized_safe) { continue; }
-        let absolute = Path::new(&path).join(safe);
-        if absolute.exists() { to_add.push(safe.as_path()); } else { to_remove.push(safe.as_path()); }
+        let absolute = Path::new(path).join(safe);
+        if absolute.is_dir() { dirs_to_add.push(safe.as_path()); }
+        else if absolute.exists() { files_to_add.push(safe.as_path()); }
+        else { to_remove.push(safe.as_path()); }
     }
-    perf_log(&format!("stage_files: partition add/remove ({} to add, {} to remove)", to_add.len(), to_remove.len()), step.elapsed());
+    perf_log(&format!("stage_files: partition add/remove ({} files, {} dirs to add, {} to remove)", files_to_add.len(), dirs_to_add.len(), to_remove.len()), step.elapsed());
     let step = Instant::now();
-    if !to_add.is_empty() { index.add_all(&to_add, git2::IndexAddOption::DEFAULT, None).map_err(|error| error.message().to_string())?; }
-    perf_log(&format!("stage_files: add_all ({} files)", to_add.len()), step.elapsed());
+    for file in &files_to_add { index.add_path(file).map_err(|error| error.message().to_string())?; }
+    perf_log(&format!("stage_files: add_path ({} files)", files_to_add.len()), step.elapsed());
+    let step = Instant::now();
+    if !dirs_to_add.is_empty() { index.add_all(&dirs_to_add, git2::IndexAddOption::DEFAULT, None).map_err(|error| error.message().to_string())?; }
+    perf_log(&format!("stage_files: add_all for folders ({} dirs)", dirs_to_add.len()), step.elapsed());
     let step = Instant::now();
     for safe in &to_remove { let _ = index.remove_path(safe); }
     perf_log(&format!("stage_files: remove_path loop ({} files)", to_remove.len()), step.elapsed());
-    if !submodule_paths.is_empty() && Path::new(&path).join(".gitmodules").exists() { index.add_path(Path::new(".gitmodules")).map_err(|error| error.message().to_string())?; }
+    if !submodule_paths.is_empty() && Path::new(path).join(".gitmodules").exists() { index.add_path(Path::new(".gitmodules")).map_err(|error| error.message().to_string())?; }
     let step = Instant::now();
     index.write().map_err(|error| error.message().to_string())?;
     perf_log("stage_files: index.write()", step.elapsed());
-    invalidate_git_metadata(&path);
-    perf_log(&format!("stage_files: TOTAL ({file_count} files)"), started.elapsed());
+    invalidate_git_metadata(path);
     Ok(())
 }
 
 #[tauri::command]
 pub fn unstage_files(path: String, files: Vec<String>) -> Result<(), String> {
     validate_path(&path)?;
+    // See repo_write_lock's doc comment — same concurrent-index race as
+    // stage_files, from the exact same rapid-checkbox-click pattern.
+    let lock_handle = repo_write_lock(&path);
+    let _lock = lock_handle.lock().unwrap();
     let (files, submodule_groups) = partition_by_submodule(&path, files);
     for (sub_path, inner_files) in submodule_groups { unstage_files(sub_path, inner_files)?; }
     if files.is_empty() { return Ok(()); }
@@ -1945,6 +2023,10 @@ pub fn commit_staged(repository_path: String, message: String) -> Result<String,
     let started = Instant::now();
     validate_path(&repository_path)?;
     if message.trim().is_empty() { return Err("Commit message cannot be empty".into()); }
+    // See repo_write_lock's doc comment — a commit right as a staging click
+    // is still mid-flight would otherwise race the same index.
+    let lock_handle = repo_write_lock(&repository_path);
+    let _lock = lock_handle.lock().unwrap();
     let step = Instant::now();
     let repo = internal_repository(&repository_path)?;
     perf_log("commit_staged: internal_repository (open)", step.elapsed());
@@ -1980,6 +2062,10 @@ pub fn commit_files(repository_path: String, files: Vec<String>, message: String
 
 fn commit_selected_internal(repository_path: &str, files: &[String], message: &str) -> Result<String, String> {
     let commit_started = Instant::now();
+    // See repo_write_lock's doc comment — shared by both commit_files and
+    // commit_path, both of which mutate the index.
+    let lock_handle = repo_write_lock(repository_path);
+    let _lock = lock_handle.lock().unwrap();
     let repo = internal_repository(repository_path)?;
     // A submodule folder can be deleted straight from disk (Finder/terminal, or a
     // failed clone) without going through this app's own removal flow, leaving it
@@ -1999,7 +2085,13 @@ fn commit_selected_internal(repository_path: &str, files: &[String], message: &s
     // number of files *and* the size of the index, turning what should be a
     // sub-second commit into minutes. A single call with every path at once does
     // the same matching pass just once.
-    let mut to_add: Vec<&Path> = Vec::new();
+    // Same fix as stage_files, same reason: add_path for a known exact file
+    // (a direct hash-and-insert) instead of add_all (a working-directory-wide
+    // pathspec match/diff even for one literal path) — a real Windows log
+    // showed a single add_all call taking 1.6-1.9 SECONDS for exactly one
+    // file. add_all is kept only for an actual directory needing expansion.
+    let mut files_to_add: Vec<&Path> = Vec::new();
+    let mut dirs_to_add: Vec<&Path> = Vec::new();
     let mut to_remove: Vec<&Path> = Vec::new();
     for file in files {
         if file.is_empty() {
@@ -2020,13 +2112,14 @@ fn commit_selected_internal(repository_path: &str, files: &[String], message: &s
         // still present on disk — if it was deleted, fall through to the normal
         // add/remove handling below so the deletion actually gets committed.
         if let Some(entry) = gitlinks.get(file) { if absolute.exists() { index.add(entry).map_err(|error| error.message().to_string())?; includes_submodule = true; continue; } }
-        if absolute.exists() { to_add.push(path); } else { to_remove.push(path); }
+        if absolute.is_dir() { dirs_to_add.push(path); } else if absolute.exists() { files_to_add.push(path); } else { to_remove.push(path); }
     }
     perf_log(&format!("commit: build scratch index ({} files)", files.len()), commit_started.elapsed());
     let step = Instant::now();
-    if !to_add.is_empty() { index.add_all(&to_add, git2::IndexAddOption::DEFAULT, None).map_err(|error| error.message().to_string())?; }
+    for file in &files_to_add { index.add_path(file).map_err(|error| error.message().to_string())?; }
+    if !dirs_to_add.is_empty() { index.add_all(&dirs_to_add, git2::IndexAddOption::DEFAULT, None).map_err(|error| error.message().to_string())?; }
     if !to_remove.is_empty() { index.remove_all(&to_remove, None).map_err(|error| error.message().to_string())?; }
-    perf_log("commit: add_all/remove_all (scratch index)", step.elapsed());
+    perf_log("commit: add_path/add_all/remove_all (scratch index)", step.elapsed());
     if includes_submodule && Path::new(repository_path).join(".gitmodules").exists() { index.add_path(Path::new(".gitmodules")).map_err(|error| error.message().to_string())?; }
     let step = Instant::now();
     let tree_id = index.write_tree_to(&repo).map_err(|error| error.message().to_string())?; if parent_tree.as_ref().map(|tree| tree.id()) == Some(tree_id) { return Err("There are no changes to commit in the selected files".into()); } let tree = repo.find_tree(tree_id).map_err(|error| error.message().to_string())?; let signature = repo.signature().map_err(|_| "Configure user.name and user.email for this repository".to_string())?; let parents: Vec<&git2::Commit<'_>> = parent.iter().collect(); let oid = repo.commit(Some("HEAD"), &signature, &signature, message, &tree, &parents).map_err(|error| error.message().to_string())?;
@@ -2041,7 +2134,8 @@ fn commit_selected_internal(repository_path: &str, files: &[String], message: &s
     // (which was never touched on disk) untouched.
     let step = Instant::now();
     index.read(true).map_err(|error| error.message().to_string())?;
-    let mut to_add: Vec<&Path> = Vec::new();
+    let mut files_to_add: Vec<&Path> = Vec::new();
+    let mut dirs_to_add: Vec<&Path> = Vec::new();
     let mut to_remove: Vec<&Path> = Vec::new();
     for file in files {
         if file.is_empty() {
@@ -2051,9 +2145,10 @@ fn commit_selected_internal(repository_path: &str, files: &[String], message: &s
         }
         let relative = Path::new(file); let absolute = Path::new(repository_path).join(relative);
         if gitlinks.contains_key(file) && absolute.exists() { if let Ok(mut submodule) = repo.find_submodule(file) { let _ = submodule.add_to_index(true); } continue; }
-        if absolute.exists() { to_add.push(relative); } else { to_remove.push(relative); }
+        if absolute.is_dir() { dirs_to_add.push(relative); } else if absolute.exists() { files_to_add.push(relative); } else { to_remove.push(relative); }
     }
-    if !to_add.is_empty() { index.add_all(&to_add, git2::IndexAddOption::DEFAULT, None).map_err(|error| error.message().to_string())?; }
+    for file in &files_to_add { index.add_path(file).map_err(|error| error.message().to_string())?; }
+    if !dirs_to_add.is_empty() { index.add_all(&dirs_to_add, git2::IndexAddOption::DEFAULT, None).map_err(|error| error.message().to_string())?; }
     if !to_remove.is_empty() { index.remove_all(&to_remove, None).map_err(|error| error.message().to_string())?; }
     index.write().map_err(|error| error.message().to_string())?;
     perf_log("commit: sync real index", step.elapsed());

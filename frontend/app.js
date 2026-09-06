@@ -1810,7 +1810,23 @@ async function confirmPublish(event) {
   catch (error) { const message = String(error); operation.textContent = message; operation.className = 'submodule-operation-status error'; status(message, 'error'); $('#confirmPublish').disabled = false; }
 }
 
-async function toggleStage(path, checked) {
+// Rapid checkbox clicking (e.g. "Stage all" material, ticked one-by-one, or
+// just working through a long change list) used to fire one stage_files/
+// unstage_files call *and* one full repository reload per click, with
+// nothing serializing them — a Windows perf log showed exactly this in the
+// wild: 19 stage_files calls fired in quick succession, only 5 of them ever
+// completed. The rest failed silently mid-way through (almost certainly
+// libgit2 unable to acquire .git/index.lock against another concurrent
+// call). The backend now serializes all of these per-repository regardless
+// (see repo_write_lock), but that alone still means one real round trip and
+// one full reload per click — grouping rapid clicks into a single batched
+// call and a single reload is both faster and avoids relying on the lock to
+// paper over a burst of many redundant round trips.
+let pendingToggles = new Map(); // path -> desired checked state
+let pendingToggleTimeout = null;
+let pendingToggleGeneration = 0;
+
+function toggleStage(path, checked) {
   if (!invoke) return;
   // Reflect the click immediately in state — the round trip to the backend
   // and back through a full repository reload takes a moment, and the
@@ -1818,12 +1834,34 @@ async function toggleStage(path, checked) {
   // after unchecking it) while that's in flight.
   const change = state.changes.find(item => item.path === path); if (change) change.staged = checked;
   renderChanges();
-  try { const folder = state.currentPath; await invoke(checked ? 'stage_files' : 'unstage_files', { path: state.repository.path, files: [path] }); await loadRepository(state.repository.path, { reopenPath: folder }); }
-  catch (error) {
-    // The backend call failed — the optimistic flip above never actually
-    // happened, so undo it rather than leave the checkbox showing a state
+  pendingToggles.set(path, checked);
+  if (pendingToggleTimeout) clearTimeout(pendingToggleTimeout);
+  pendingToggleTimeout = setTimeout(flushPendingToggles, 300);
+}
+
+async function flushPendingToggles() {
+  pendingToggleTimeout = null;
+  if (!pendingToggles.size) return;
+  const batch = pendingToggles; pendingToggles = new Map();
+  const toStage = [...batch].filter(([, checked]) => checked).map(([path]) => path);
+  const toUnstage = [...batch].filter(([, checked]) => !checked).map(([path]) => path);
+  const folder = state.currentPath;
+  const generation = ++pendingToggleGeneration;
+  try {
+    if (toStage.length) await invoke('stage_files', { path: state.repository.path, files: toStage });
+    if (toUnstage.length) await invoke('unstage_files', { path: state.repository.path, files: toUnstage });
+    // A newer batch already started (and will do its own reload) while this
+    // one's backend calls were in flight — its reload covers this too.
+    if (generation !== pendingToggleGeneration) return;
+    await loadRepository(state.repository.path, { reopenPath: folder });
+  } catch (error) {
+    // The backend call failed — undo the optimistic flip for exactly the
+    // paths in this batch, rather than leaving checkboxes showing a state
     // that isn't real.
-    if (change) change.staged = !checked;
+    for (const [path, checked] of batch) {
+      const change = state.changes.find(item => item.path === path);
+      if (change) change.staged = !checked;
+    }
     renderChanges();
     handleError(error);
   }
