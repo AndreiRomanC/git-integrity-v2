@@ -526,6 +526,26 @@ fn submodule_value(repository: &str, path: &str, field: &str) -> Option<String> 
 }
 
 fn worktree_status(repository: &str, scope: Option<&str>) -> Vec<(String, String)> {
+    // If a full, unscoped scan is already sitting fresh in cache (load_repository
+    // needs one anyway, for the Changes drawer, on essentially every action), reuse
+    // it here filtered by prefix instead of asking libgit2 for a second scan of
+    // this one folder right after. Deliberately NOT a replacement for the scoped
+    // scan below, only an opportunistic skip of it: a scoped, pathspec-limited
+    // scan of one small folder is far cheaper than a *fresh* full-repository scan
+    // when browsing far from any recent reload (the common case on a large
+    // repository, and the reason the scoped scan exists at all) — this only
+    // helps the case where a full scan was *just* computed for something else.
+    if let Some((cached_at, statuses)) = full_status_cache().lock().unwrap().get(repository) {
+        if cached_at.elapsed() < GIT_METADATA_TTL {
+            return match scope {
+                None | Some("") => statuses.iter().map(|(path, status, _)| (path.clone(), status.clone())).collect(),
+                Some(scope) => {
+                    let prefix = format!("{scope}/");
+                    statuses.iter().filter(|(path, _, _)| path == scope || path.starts_with(&prefix)).map(|(path, status, _)| (path.clone(), status.clone())).collect()
+                }
+            };
+        }
+    }
     internal_repository(repository).ok().and_then(|repo| internal_statuses(&repo, scope).ok()).unwrap_or_default().into_iter().map(|(path, status, _)| (path, status)).collect()
 }
 

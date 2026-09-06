@@ -577,8 +577,17 @@ function attachFileListDelegation() {
     const isDoubleClick = lastExplorerClick.path === row.dataset.entry && now - lastExplorerClick.time < 500;
     lastExplorerClick = { path: row.dataset.entry, time: now };
     const entry = state.entries.find(item => item.relative_path === row.dataset.entry);
-    if (isDoubleClick && entry && ['folder', 'submodule'].includes(entry.kind)) { lastExplorerClick = { path: null, time: 0 }; openDirectory(entry.relative_path); return; }
-    selectEntry(row.dataset.entry);
+    if (isDoubleClick && entry && ['folder', 'submodule'].includes(entry.kind)) {
+      lastExplorerClick = { path: null, time: 0 };
+      if (pendingEntryDetailsTimeout) { clearTimeout(pendingEntryDetailsTimeout); pendingEntryDetailsTimeout = null; }
+      openDirectory(entry.relative_path);
+      return;
+    }
+    // Folders/submodules defer their entry_details fetch (see selectEntry) —
+    // this first click is the common case where a second one follows right
+    // after to navigate in, at which point the branch above cancels this
+    // before it ever reaches the backend.
+    selectEntry(row.dataset.entry, { deferMs: entry && ['folder', 'submodule'].includes(entry.kind) ? 500 : 0 });
   });
   refs.fileList.addEventListener('contextmenu', event => {
     const row = event.target.closest('[data-entry]');
@@ -665,33 +674,51 @@ async function switchSubmoduleVersion(revision, kind, name) {
   } catch (error) { const message = handleError(error); showOperationToast(`Could not switch version: ${message}`, 'error'); }
 }
 
-async function selectEntry(path) {
+// Cancelable handle for the deferred entry_details fetch below — shared so
+// the double-click handler that navigates into a folder can cancel a
+// still-pending one before it ever calls the backend.
+let pendingEntryDetailsTimeout = null;
+
+async function selectEntry(path, options = {}) {
   state.selectedEntry = state.entries.find(entry => entry.relative_path === path);
   if (state.selectedEntry?.kind === 'file' && refs.editorDialog.open) {
     openEditor(state.selectedEntry);
   }
   render();
+  if (pendingEntryDetailsTimeout) { clearTimeout(pendingEntryDetailsTimeout); pendingEntryDetailsTimeout = null; }
   if (!invoke) return renderEntryDetails({ ...state.selectedEntry, item_count: state.selectedEntry.kind === 'folder' ? 12 : null, submodule_url: state.selectedEntry.kind === 'submodule' ? 'git@example.com:platform/diagnostics-core.git' : null, submodule_branch: state.selectedEntry.kind === 'submodule' ? 'main' : null, last_commit_id: 'a39f21d', last_commit_subject: 'P:423421431 test', last_commit_author: 'Andrei Pop', last_commit_date: '2026-08-14' });
-  try {
-    const details = await invoke('entry_details', { repositoryPath: state.repository.path, relativePath: path });
-    // Same staleness guard already used below for entry_last_commit: the user
-    // may have already clicked a different entry by the time this resolves —
-    // don't let an older selection's details overwrite what's now showing.
-    if (state.selectedEntry?.relative_path !== path) return;
-    renderEntryDetails(details);
-    // "Last commit touching this path" is fetched separately — it can be a
-    // genuinely heavy history walk on a large repository, and blocking the
-    // whole details panel on it made clicking around a large folder feel
-    // stuck. Only patch it in if this is still the selected entry — the
-    // user may well have already clicked elsewhere by the time it resolves.
-    invoke('entry_last_commit', { repositoryPath: state.repository.path, relativePath: path })
-      .then(last => {
-        if (state.selectedEntry?.relative_path !== path) return;
-        const section = $('#entryLastCommitSection'); if (!section) return;
-        section.innerHTML = renderEntryLastCommitInner({ ...details, last_commit_id: last?.id ?? null, last_commit_subject: last?.subject ?? null, last_commit_author: last?.author ?? null, last_commit_date: last?.date ?? null });
-      })
-      .catch(() => { const section = $('#entryLastCommitSection'); if (section && state.selectedEntry?.relative_path === path) section.innerHTML = renderEntryLastCommitInner({ ...details, last_commit_id: null }); });
-  } catch (error) { handleError(error); }
+  const fetchDetails = async () => {
+    try {
+      const details = await invoke('entry_details', { repositoryPath: state.repository.path, relativePath: path });
+      // Same staleness guard already used below for entry_last_commit: the user
+      // may have already clicked a different entry by the time this resolves —
+      // don't let an older selection's details overwrite what's now showing.
+      if (state.selectedEntry?.relative_path !== path) return;
+      renderEntryDetails(details);
+      // "Last commit touching this path" is fetched separately — it can be a
+      // genuinely heavy history walk on a large repository, and blocking the
+      // whole details panel on it made clicking around a large folder feel
+      // stuck. Only patch it in if this is still the selected entry — the
+      // user may well have already clicked elsewhere by the time it resolves.
+      invoke('entry_last_commit', { repositoryPath: state.repository.path, relativePath: path })
+        .then(last => {
+          if (state.selectedEntry?.relative_path !== path) return;
+          const section = $('#entryLastCommitSection'); if (!section) return;
+          section.innerHTML = renderEntryLastCommitInner({ ...details, last_commit_id: last?.id ?? null, last_commit_subject: last?.subject ?? null, last_commit_author: last?.author ?? null, last_commit_date: last?.date ?? null });
+        })
+        .catch(() => { const section = $('#entryLastCommitSection'); if (section && state.selectedEntry?.relative_path === path) section.innerHTML = renderEntryLastCommitInner({ ...details, last_commit_id: null }); });
+    } catch (error) { handleError(error); }
+  };
+  // Selecting a folder/submodule this way happens on the *first* click of
+  // what's very often actually a double-click to navigate into it — without
+  // this, that first click always fired a real backend scan
+  // (entry_details -> cached_git_metadata, a full scoped status scan) for a
+  // details panel that gets thrown away a moment later when the second
+  // click navigates away. Deferring it, and letting the double-click
+  // handler cancel it outright, means a genuine double-click costs one scan
+  // (openDirectory's) instead of two.
+  if (options.deferMs) { pendingEntryDetailsTimeout = setTimeout(() => { pendingEntryDetailsTimeout = null; fetchDetails(); }, options.deferMs); }
+  else { await fetchDetails(); }
 }
 
 function selectedScope() {
