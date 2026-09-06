@@ -1833,6 +1833,13 @@ let pendingToggleRepo = null; // which repository's index the queued paths belon
 let pendingToggleTimeout = null;
 let pendingToggleGeneration = 0;
 let pendingToggleFlight = null; // Promise of a flush already in flight, if any
+// Promise of whichever backend stage/unstage call — a checkbox flush, Stage
+// all, or Unstage all — is currently in flight, regardless of which of the
+// three it is. Commit awaits this (with visible "Waiting for staging…"
+// feedback) instead of racing it, so a commit can never run against an
+// index a moment away from still catching up with a click that already
+// happened.
+let activeStagingOperation = null;
 
 function toggleStage(path, checked) {
   if (!invoke || !state.repository) return;
@@ -1860,13 +1867,16 @@ function toggleStage(path, checked) {
 // reach the backend first, so e.g. Commit never runs against an index that's
 // missing a checkbox click from a moment ago just because 300ms hadn't
 // elapsed yet.
-async function flushPendingTogglesNow() {
+async function flushPendingTogglesNow(options = {}) {
   if (pendingToggleTimeout) { clearTimeout(pendingToggleTimeout); pendingToggleTimeout = null; }
-  if (pendingToggles.size && !pendingToggleFlight) pendingToggleFlight = flushPendingToggles();
+  // Only applies to a flush *this call* is the one starting — one already
+  // mid-flight (the debounce timer had already fired) committed to its own
+  // reload the moment it started, too late to skip now.
+  if (pendingToggles.size && !pendingToggleFlight) pendingToggleFlight = flushPendingToggles(options);
   if (pendingToggleFlight) { await pendingToggleFlight; pendingToggleFlight = null; }
 }
 
-async function flushPendingToggles() {
+async function flushPendingToggles(options = {}) {
   if (!pendingToggles.size) return;
   const batch = pendingToggles; pendingToggles = new Map();
   const repositoryPath = pendingToggleRepo; pendingToggleRepo = null;
@@ -1875,9 +1885,14 @@ async function flushPendingToggles() {
   const stillSameRepo = () => state.repository?.path === repositoryPath;
   const folder = state.currentPath;
   const generation = ++pendingToggleGeneration;
-  try {
+  const run = (async () => {
     if (toStage.length) await invoke('stage_files', { path: repositoryPath, files: toStage });
     if (toUnstage.length) await invoke('unstage_files', { path: repositoryPath, files: toUnstage });
+  })();
+  activeStagingOperation = run;
+  try {
+    await run;
+    if (activeStagingOperation === run) activeStagingOperation = null;
     // A newer batch already started (and will do its own reload) while this
     // one's backend calls were in flight — its reload covers this too.
     if (generation !== pendingToggleGeneration) return;
@@ -1887,8 +1902,13 @@ async function flushPendingToggles() {
     // call — a real deadlock, since this call can only finish by finishing
     // the reload it would be stuck awaiting.
     pendingToggleFlight = null;
-    if (stillSameRepo()) await loadRepository(repositoryPath, { reopenPath: folder });
+    // Commit calls flushPendingTogglesNow({ skipReload: true }) right before
+    // doing its own commit-then-reload — without this, a checkbox ticked
+    // just before Commit was clicked would trigger two full reloads back to
+    // back (this one, then Commit's) instead of one.
+    if (stillSameRepo() && !options.skipReload) await loadRepository(repositoryPath, { reopenPath: folder });
   } catch (error) {
+    if (activeStagingOperation === run) activeStagingOperation = null;
     pendingToggleFlight = null;
     // A partial failure inside this batch (the stage call succeeded but the
     // following unstage call then failed, say) means we genuinely don't know
@@ -1926,25 +1946,26 @@ $('#refresh').addEventListener('click', () => state.repository && loadRepository
 // afterward gets unstaged again, same as before.
 async function stageAllInScope(scope) {
   if (!invoke || !state.repository) return;
-  // A pending per-checkbox toggle must land first — otherwise this reads
-  // state.changes (already optimistically updated by that toggle) and could
-  // send a stage_files call that overlaps with, or precedes, the toggle's
-  // own not-yet-sent one.
+  // A pending per-checkbox toggle must land first — otherwise it could
+  // overlap with, or race, stage_all's own backend call.
   await flushPendingTogglesNow();
-  // Includes already-staged paths too, not just `!change.staged` ones — a file
-  // that was staged and then deleted from disk (or changed again) needs
-  // stage_files to re-touch it so the index catches up with what's actually on
-  // disk now (it removes a since-deleted path from the index). Only sending
-  // still-unstaged paths meant "Stage all" could never clear that: a file
-  // already marked staged was permanently excluded from every future
-  // "Stage all", so the index kept the stale staged copy no matter how many
-  // times it was pressed.
-  const files = state.changes.filter(change => !scope || change.path === scope || change.path.startsWith(`${scope}/`)).map(change => change.path);
-  if (!files.length) return;
-  const button = $('#stageAllButton'); const label = button.textContent; button.disabled = true; button.textContent = `Staging ${files.length} file${files.length === 1 ? '' : 's'}…`;
-  try { await invoke('stage_files', { path: state.repository.path, files }); await loadRepository(state.repository.path, { keepPath: true }); renderChanges(); }
-  catch (error) { handleError(error); }
-  finally { button.textContent = label; }
+  const button = $('#stageAllButton'); const label = button.textContent; button.disabled = true; button.textContent = 'Staging…';
+  // stage_all reads the real, current disk state itself (see its own doc
+  // comment) instead of trusting state.changes, which can already be stale
+  // by the time this button is pressed — files added or removed from
+  // outside the app since the last load wouldn't be in it at all.
+  const run = (async () => {
+    try { const count = await invoke('stage_all', { repositoryPath: state.repository.path, scope }); return count; }
+    finally { button.textContent = label; }
+  })();
+  activeStagingOperation = run;
+  try {
+    const count = await run;
+    if (!count) return;
+    await loadRepository(state.repository.path, { keepPath: true });
+    renderChanges();
+  } catch (error) { handleError(error); }
+  finally { if (activeStagingOperation === run) activeStagingOperation = null; }
 }
 
 async function unstageAllInScope(scope) {
@@ -1953,9 +1974,11 @@ async function unstageAllInScope(scope) {
   const files = state.changes.filter(change => change.staged && (!scope || change.path === scope || change.path.startsWith(`${scope}/`))).map(change => change.path);
   if (!files.length) return;
   const button = $('#unstageAllButton'); const label = button.textContent; button.disabled = true; button.textContent = `Unstaging ${files.length} file${files.length === 1 ? '' : 's'}…`;
-  try { await invoke('unstage_files', { path: state.repository.path, files }); await loadRepository(state.repository.path, { keepPath: true }); renderChanges(); }
+  const run = invoke('unstage_files', { path: state.repository.path, files }).finally(() => { button.textContent = label; });
+  activeStagingOperation = run;
+  try { await run; await loadRepository(state.repository.path, { keepPath: true }); renderChanges(); }
   catch (error) { handleError(error); }
-  finally { button.textContent = label; }
+  finally { if (activeStagingOperation === run) activeStagingOperation = null; }
 }
 // Pre-fills the commit message box with whatever is in the "default commit
 // message" field up top — e.g. a Polarion ID you're committing several
@@ -1985,8 +2008,24 @@ renderCommitMessageHistory();
 // you closed and reopened the drawer, or ran any action that reopens it: it
 // came right back. Staging is now only ever something you ask for, via the
 // checkboxes or the explicit "Stage all" button below.
-$('#showChanges').addEventListener('click', () => { state.changesScope = 'global'; applyDefaultCommitMessage(); renderChanges(); refs.changesDrawer.classList.add('open'); });
-$('#showFolderChanges').addEventListener('click', () => { state.changesScope = 'folder'; applyDefaultCommitMessage(); renderChanges(); refs.changesDrawer.classList.add('open'); });
+// The app can't watch the filesystem itself, so a file copied in from
+// outside only ever showed up after a full manual Refresh or some unrelated
+// action's own reload. This re-checks status — nothing else, no branches/
+// commits/submodule sync — at the one moment it matters most: opening the
+// drawer that's specifically about "what changed". Fires after the drawer
+// is already shown with whatever data was already there (never blocks
+// opening it), and fails silently — this is a best-effort background
+// top-up, not a user-initiated action worth its own error toast.
+async function refreshChangesLightweight() {
+  if (!invoke || !state.repository) return;
+  try {
+    const changes = await invoke('refresh_status', { repositoryPath: state.repository.path });
+    if (state.repository) { state.changes = changes; updateChangeBadge(); if (refs.changesDrawer.classList.contains('open')) renderChanges(); }
+  } catch { /* best-effort — a manual Refresh remains the explicit fallback */ }
+}
+
+$('#showChanges').addEventListener('click', () => { state.changesScope = 'global'; applyDefaultCommitMessage(); renderChanges(); refs.changesDrawer.classList.add('open'); refreshChangesLightweight(); });
+$('#showFolderChanges').addEventListener('click', () => { state.changesScope = 'folder'; applyDefaultCommitMessage(); renderChanges(); refs.changesDrawer.classList.add('open'); refreshChangesLightweight(); });
 $('#stageAllButton').addEventListener('click', () => stageAllInScope(state.changesScope === 'folder' ? state.currentPath : ''));
 $('#unstageAllButton').addEventListener('click', () => unstageAllInScope(state.changesScope === 'folder' ? state.currentPath : ''));
 refs.defaultCommitMessage.addEventListener('input', () => {
@@ -2148,12 +2187,23 @@ refs.commitButton.addEventListener('click', async () => {
   // Disabled *before* the flush below too — a second click landing during
   // that flush (waiting on a checkbox toggle from a moment ago) must not be
   // able to fire a second, overlapping commit.
-  refs.commitButton.disabled = true; refs.commitButton.textContent = 'Committing…';
+  refs.commitButton.disabled = true;
+  refs.commitButton.textContent = (activeStagingOperation || pendingToggles.size) ? 'Waiting for staging…' : 'Committing…';
   // A checkbox ticked in the last 300ms may not have reached the backend
   // yet — committing now would silently leave it out, since the index on
   // disk wouldn't have caught up. state.changes is read *after* this so the
   // files list below reflects what will actually be in the index.
-  await flushPendingTogglesNow();
+  // { skipReload: true } — this commit does its own reload right after
+  // anyway, so a checkbox flush landing right here doesn't need to do one
+  // of its own too; without this, ticking a box and immediately hitting
+  // Commit did two full reloads back to back instead of one.
+  await flushPendingTogglesNow({ skipReload: true });
+  // A Stage all / Unstage all in flight (not the checkbox queue above, a
+  // separate mechanism) still needs waiting for — its own reload isn't
+  // skippable the same way (unlike a toggle flush, its caller doesn't know
+  // in advance that a commit will follow), so this does mean two reloads in
+  // that specific interleaving; correctness matters more than avoiding it.
+  if (activeStagingOperation) { try { await activeStagingOperation; } catch { /* already reported by whichever button started it */ } }
   const folder = state.changesScope === 'folder' ? state.currentPath : '';
   const files = state.changes.filter(change => change.staged && (!folder || change.path === folder || change.path.startsWith(`${folder}/`))).map(change => change.path);
   refs.commitButton.textContent = `Committing ${files.length} file${files.length === 1 ? '' : 's'}…`;

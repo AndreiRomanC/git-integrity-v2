@@ -1117,6 +1117,30 @@ pub fn load_repository(path: String, force: Option<bool>) -> Result<RepositoryDa
     Ok(RepositoryData { repository: RepositoryInfo { path, name, current_branch }, branches, commits, changes, stashes })
 }
 
+// A lightweight "what changed" refresh — status only, no branches/commits/
+// stashes and no sync_submodule_gitlinks (which alone was 10-18s on a
+// repository with many submodules, per earlier perf logs). For "files copied
+// in from outside the app should just show up" — the app can't watch the
+// filesystem itself, but it can cheaply re-check status at the moments that
+// actually matter (regaining window focus, opening the Working tree drawer)
+// instead of only on a full manual Refresh or the next unrelated action.
+// Always a fresh scan, deliberately bypassing the status cache — the whole
+// point is "what's actually on disk right now".
+#[tauri::command]
+pub fn refresh_status(repository_path: String) -> Result<Vec<Change>, String> {
+    let started = Instant::now();
+    validate_path(&repository_path)?;
+    let repo = internal_repository(&repository_path)?;
+    let step = Instant::now();
+    let internal = internal_statuses(&repo, None)?;
+    perf_log(&format!("refresh_status: fresh scan ({} changes)", internal.len()), step.elapsed());
+    let statuses = internal.iter().map(|(path, status, _)| (path.clone(), status.clone())).collect::<Vec<_>>();
+    let changes = internal.into_iter().map(|(path, status, staged)| Change { status, path, staged }).collect();
+    replace_git_metadata(&repository_path, statuses);
+    perf_log("refresh_status: TOTAL", started.elapsed());
+    Ok(changes)
+}
+
 // A file living inside a submodule belongs to that submodule's own Git index,
 // not the parent's — the parent's index only ever has one gitlink entry for
 // the whole submodule, never its individual files. Splitting the requested
@@ -1143,6 +1167,45 @@ fn partition_by_submodule(repository_path: &str, files: Vec<String>) -> (Vec<Str
         }
     }
     (own, grouped)
+}
+
+// "Stage all" used to just be the frontend sending every path from its own
+// `state.changes` — a snapshot from whenever that was last loaded, which can
+// already be stale by the time the button is pressed (files added/deleted
+// from outside the app since then wouldn't be in it at all). This reads the
+// real, current disk state directly instead — a genuine `git add -A`
+// equivalent — then reuses stage_files_inner's already-tested logic
+// (add_path for files, add_all for real directories, the embedded-.git
+// check) to apply it, so it inherits that protection automatically instead
+// of needing its own copy of it.
+#[tauri::command]
+pub fn stage_all(repository_path: String, scope: String) -> Result<usize, String> {
+    let started = Instant::now();
+    perf_log(&format!("stage_all: START (scope={scope:?})"), Duration::ZERO);
+    let result = stage_all_inner(&repository_path, &scope);
+    match &result {
+        Ok(count) => perf_log(&format!("stage_all: TOTAL ({count} paths)"), started.elapsed()),
+        Err(error) => perf_log(&format!("stage_all: ERROR: {error}"), started.elapsed()),
+    }
+    result
+}
+
+fn stage_all_inner(repository_path: &str, scope: &str) -> Result<usize, String> {
+    if let Some((sub_path, inner_scope)) = resolve_submodule_boundary(repository_path, scope) {
+        return stage_all_inner(&sub_path, &inner_scope);
+    }
+    let step = Instant::now();
+    let repo = internal_repository(repository_path)?;
+    let scope_opt = if scope.is_empty() { None } else { Some(scope) };
+    // Deliberately not the cached status scan — this needs the true current
+    // disk state every time it's called, not whatever's still valid under
+    // the (now much longer) status-scan TTL.
+    let paths: Vec<String> = internal_statuses(&repo, scope_opt)?.into_iter().map(|(path, _, _)| path).collect();
+    perf_log(&format!("stage_all: fresh status scan ({} paths, scope={scope:?})", paths.len()), step.elapsed());
+    let count = paths.len();
+    if paths.is_empty() { return Ok(0); }
+    stage_files(repository_path.to_string(), paths)?;
+    Ok(count)
 }
 
 #[tauri::command]
@@ -5270,5 +5333,46 @@ mod tests {
         assert_eq!(cwd, Path::new("/int_opm/sw-prj-OMBMS_000U0/work/asw/aggr/errm/agf/errm_envd1"));
         assert_eq!(argument, absolute);
         assert_ne!(cwd.file_name(), argument.file_name(), "cwd must not itself be named \"r\" — that's what caused the doubled \"r\\r\" path");
+    }
+
+    #[test]
+    fn stage_all_reflects_external_changes_without_any_prior_frontend_state() {
+        // The full real-world scenario: open a repository, then — entirely
+        // outside anything the app was told about — 245 files appear and a
+        // few of them disappear again. refresh_status must see all of it
+        // fresh (no reliance on any previously loaded state), and stage_all
+        // must stage exactly what's really on disk right now, not whatever
+        // an earlier snapshot said. Named for the specific bug: "Stage all"
+        // used to be driven by the frontend's own (possibly stale)
+        // state.changes; stage_all instead re-derives everything from a
+        // fresh status scan every time.
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let repo_path = std::env::temp_dir().join(format!("git-integrity-stage-all-{suffix}"));
+        create_libgit2_repository(&repo_path, "README.md");
+        let repo_string = repo_path.to_string_lossy().into_owned();
+
+        // Nothing has ever staged/loaded anything for this repository yet —
+        // no prior invoke of any kind — before the 245 files show up.
+        let names: Vec<String> = (0..245).map(|i| format!("incoming_{i}.txt")).collect();
+        for name in &names { fs::write(repo_path.join(name), "content").unwrap(); }
+        for name in &names[..7] { fs::remove_file(repo_path.join(name)).unwrap(); }
+
+        let statuses = refresh_status(repo_string.clone()).unwrap();
+        let untracked_new: Vec<&Change> = statuses.iter().filter(|c| names[7..].contains(&c.path) && c.status == "??").collect();
+        assert_eq!(untracked_new.len(), 238, "the 238 files that still exist on disk should all show up as untracked (??)");
+        assert!(statuses.iter().all(|c| !names[..7].contains(&c.path)), "a file that was created and then deleted before ever being staged shouldn't show up as a change at all — git never knew about it");
+
+        let staged_count = stage_all(repo_string.clone(), String::new()).unwrap();
+        assert_eq!(staged_count, 238, "stage_all should have processed exactly the 238 real, current files");
+
+        let repo = internal_repository(&repo_string).unwrap();
+        let index = repo.index().unwrap();
+        for name in &names[7..] { assert!(index.get_path(Path::new(name), 0).is_some(), "{name} should be staged"); }
+        for name in &names[..7] { assert!(index.get_path(Path::new(name), 0).is_none(), "{name} was deleted before ever being staged and must not appear in the index"); }
+
+        let oid = commit_staged(repo_string.clone(), "Add 238 incoming files".into()).unwrap();
+        let commit = repo.find_commit(git2::Oid::from_str(&oid).unwrap()).unwrap();
+        let tree = commit.tree().unwrap();
+        for name in &names[7..] { assert!(tree.get_path(Path::new(name)).is_ok(), "{name} should be in the commit"); }
     }
 }
