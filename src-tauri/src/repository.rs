@@ -1540,11 +1540,15 @@ pub fn load_directory(repository_path: String, relative_path: String) -> Result<
         entries.push(DirectoryEntry { name, relative_path: relative_string, kind, status: status_for_entry(&status_key), tracked, size: if metadata.is_file() { metadata.len() } else { 0 }, modified, submodule_has_unpushed_commits, unpushed });
     }
     perf_log(&format!("load_directory: readdir loop ({} entries, {submodule_count} submodules)", entries.len()), step.elapsed());
-    entries.sort_by(|a, b| {
-        let a_group = matches!(a.kind.as_str(), "folder" | "submodule");
-        let b_group = matches!(b.kind.as_str(), "folder" | "submodule");
-        b_group.cmp(&a_group).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-    });
+    let step = Instant::now();
+    // sort_by_cached_key computes each entry's sort key exactly once (O(n)
+    // lowercase allocations total) instead of `sort_by` with `.to_lowercase()`
+    // inside the comparator, which re-allocates two new Strings on *every*
+    // comparison the sort makes — O(n log n) allocations. For a folder with
+    // 20,000 direct entries that's the difference between ~20,000 and
+    // ~570,000 allocations just to sort the listing.
+    entries.sort_by_cached_key(|entry| (!matches!(entry.kind.as_str(), "folder" | "submodule"), entry.name.to_lowercase()));
+    perf_log(&format!("load_directory: sort ({} entries)", entries.len()), step.elapsed());
     perf_log(&format!("load_directory: TOTAL ({relative_path})"), load_started.elapsed());
     Ok(entries)
 }
@@ -4862,5 +4866,58 @@ mod tests {
         }
         println!("PERF load_directory x20 folders (300k tracked): {total:?} total, {:?} avg", total / 20);
         assert!(total.as_millis() < 2000, "navigating 20 folders took {total:?} against a 300k-entry tracked set — looks like the sorted lookups are being rebuilt per navigation again instead of cached per repository");
+    }
+
+    // Ignored by default (writing 20,000 real files makes setup itself slow)
+    // — the earlier navigation benchmark used 20 folders of 10 files each,
+    // which never exercises a single *large* folder listing on its own.
+    // This one folder has 20,000 direct entries, and the third call forces
+    // the status-scan cache to look expired (rather than waiting the real
+    // 4-second TTL) to measure the worst case: a fresh scoped status scan
+    // plus the full readdir+sort pass, for the folder size this was
+    // actually reported slow on.
+    #[test]
+    #[ignore]
+    fn load_directory_handles_a_folder_with_20000_direct_entries() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let repo_path = std::env::temp_dir().join(format!("git-integrity-big-folder-{suffix}"));
+        fs::create_dir_all(repo_path.join("big_folder")).unwrap();
+        let repo = Repository::init(&repo_path).unwrap();
+
+        let setup_started = Instant::now();
+        for i in 0..20_000 { fs::write(repo_path.join("big_folder").join(format!("file_{i:05}.txt")), b"x").unwrap(); }
+        {
+            let mut index = repo.index().unwrap();
+            index.add_all(["big_folder"], git2::IndexAddOption::DEFAULT, None).unwrap();
+            index.write().unwrap();
+            let tree_id = index.write_tree().unwrap();
+            let tree = repo.find_tree(tree_id).unwrap();
+            let signature = git2::Signature::now("Test User", "test@example.com").unwrap();
+            repo.commit(Some("HEAD"), &signature, &signature, "Add 20000 files", &tree, &[]).unwrap();
+        }
+        println!("PERF setup (20,000 files, committed): {:?}", setup_started.elapsed());
+        let repo_string = repo_path.to_string_lossy().into_owned();
+
+        let first = Instant::now();
+        let entries = load_directory(repo_string.clone(), "big_folder".into()).unwrap();
+        println!("PERF load_directory first call (cold caches): {:?}", first.elapsed());
+        assert_eq!(entries.len(), 20_000);
+        assert!(entries.iter().all(|entry| entry.kind == "file" && entry.tracked));
+
+        let second = Instant::now();
+        let entries = load_directory(repo_string.clone(), "big_folder".into()).unwrap();
+        println!("PERF load_directory second call (warm caches): {:?}", second.elapsed());
+        assert_eq!(entries.len(), 20_000);
+
+        // Simulate the status-scan cache having expired (GIT_METADATA_TTL,
+        // normally 4s) without actually waiting for it in this test.
+        let key = metadata_cache_key(&repo_string, "big_folder");
+        if let Some(entry) = metadata_cache().lock().unwrap().get_mut(&key) {
+            entry.0 = Instant::now() - GIT_METADATA_TTL - Duration::from_secs(1);
+        }
+        let third = Instant::now();
+        let entries = load_directory(repo_string.clone(), "big_folder".into()).unwrap();
+        println!("PERF load_directory third call (expired status cache, fresh scoped scan): {:?}", third.elapsed());
+        assert_eq!(entries.len(), 20_000);
     }
 }
