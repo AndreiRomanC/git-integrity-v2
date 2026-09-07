@@ -23,6 +23,7 @@ pub fn run() {
             repository::create_branch,
             repository::switch_branch,
             repository::load_directory,
+            repository::list_directory_fast,
             repository::entry_details,
             repository::entry_last_commit,
             repository::submodule_versions,

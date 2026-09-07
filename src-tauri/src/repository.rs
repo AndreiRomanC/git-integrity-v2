@@ -333,6 +333,13 @@ pub struct DirectoryEntry {
     // UI say "not pushed yet" instead of leaving a just-committed file looking
     // identical to one that was never touched.
     unpushed: bool,
+    // False only from list_directory_fast (the filesystem-only listing used
+    // for the very first render while opening a repository) — status/tracked/
+    // unpushed above are meaningless placeholders in that case, not "clean"
+    // or "untracked", and the frontend must show a loading state instead of
+    // treating them as real answers. Always true from the normal
+    // load_directory, which always has real status by the time it returns.
+    status_known: bool,
 }
 
 #[derive(Serialize)]
@@ -1148,6 +1155,17 @@ pub fn open_repository_fast(path: String) -> Result<FastRepositoryData, String> 
     perf_log(&format!("open_repository_fast: START ({})", anonymized_repository_id(&path)), Duration::ZERO);
     validate_path(&path)?;
     let mut repo = internal_repository(&path)?;
+    // The path passed in is whatever the user selected (Repository::discover
+    // walks *up* from it to find .git) — not necessarily the repository's
+    // actual root. Everywhere else in this command uses `path` as-is only
+    // for cosmetic purposes (the display name) or gets superseded by the
+    // frontend's own subsequent calls anyway; the one place that genuinely
+    // matters is the `repository.path` this returns, which the frontend then
+    // uses for every follow-up call (refresh_status, load_directory, every
+    // mutation) — using the real canonical workdir here, not the raw
+    // selection, is what makes those consistently address the same root
+    // regardless of which subfolder the user happened to pick when opening.
+    let path = repo.workdir().and_then(|dir| dir.to_str()).map(str::to_string).unwrap_or(path);
     let name = Path::new(&path).file_name().and_then(|n| n.to_str()).unwrap_or("repository").to_string();
     let current_branch = repo.head().ok().and_then(|head| head.shorthand().map(String::from)).unwrap_or_default();
     let step = Instant::now();
@@ -1879,6 +1897,43 @@ pub fn submodule_repository(repository_path: String, relative_path: String) -> R
     load_repository(absolute.to_string_lossy().into_owned(), None)
 }
 
+// Pure filesystem read — no Git calls of any kind, not even the cheap index
+// read cached_index_metadata does, so this genuinely never blocks on
+// anything Git-related. A real perf log caught the actual bug this exists
+// to fix: openRepositoryFast's very first render called the *normal*
+// openDirectory('') for the root folder, whose scope is the empty string —
+// which internal_statuses treats as "no pathspec restriction", i.e. a full,
+// UNSCOPED status scan (2.67-4.58s measured), completely defeating the
+// point of open_repository_fast skipping that exact cost a moment earlier.
+// This never touches status at all: kind is never reported as "submodule"
+// here (that needs the index), just "folder" — briefly imprecise until the
+// real reload moments later corrects it, an acceptable trade for a listing
+// that's instant regardless of repository size. status_known is false
+// throughout; the frontend shows a loading state instead of treating
+// tracked/status as real answers.
+#[tauri::command]
+pub fn list_directory_fast(repository_path: String, relative_path: String) -> Result<Vec<DirectoryEntry>, String> {
+    let started = Instant::now();
+    validate_path(&repository_path)?;
+    let relative = safe_relative_path(&relative_path)?;
+    let absolute = Path::new(&repository_path).join(&relative);
+    if !absolute.is_dir() { return Err("The selected path is not a folder".into()); }
+    let mut entries = Vec::new();
+    for item in fs::read_dir(&absolute).map_err(|error| error.to_string())? {
+        let item = item.map_err(|error| error.to_string())?;
+        let name = item.file_name().to_string_lossy().into_owned();
+        if name == ".git" { continue; }
+        let relative_string = normalized(&relative.join(&name));
+        let metadata = item.metadata().map_err(|error| error.to_string())?;
+        let kind = if metadata.file_type().is_symlink() { "symlink" } else if metadata.is_dir() { "folder" } else { "file" }.to_string();
+        let modified = metadata.modified().ok().and_then(|time| time.duration_since(UNIX_EPOCH).ok()).map(|value| value.as_secs()).unwrap_or(0);
+        entries.push(DirectoryEntry { name, relative_path: relative_string, kind, status: String::new(), tracked: false, size: if metadata.is_file() { metadata.len() } else { 0 }, modified, submodule_has_unpushed_commits: false, unpushed: false, status_known: false });
+    }
+    entries.sort_by_cached_key(|entry| (!matches!(entry.kind.as_str(), "folder" | "submodule"), entry.name.to_lowercase()));
+    perf_log(&format!("list_directory_fast: TOTAL ({} entries, {relative_path})", entries.len()), started.elapsed());
+    Ok(entries)
+}
+
 #[tauri::command]
 pub fn load_directory(repository_path: String, relative_path: String) -> Result<Vec<DirectoryEntry>, String> {
     let load_started = Instant::now();
@@ -1964,7 +2019,7 @@ pub fn load_directory(repository_path: String, relative_path: String) -> Result<
         if kind == "submodule" { submodule_count += 1; }
         let submodule_has_unpushed_commits = kind == "submodule" && submodule_push_status(item.path().to_str().unwrap_or_default()).is_some();
         let unpushed = if kind == "folder" { git_metadata.unpushed.contains(&status_key) || has_prefix(unpushed_sorted, &tracked_prefix) } else { git_metadata.unpushed.contains(&status_key) };
-        entries.push(DirectoryEntry { name, relative_path: relative_string, kind, status: status_for_entry(&status_key), tracked, size: if metadata.is_file() { metadata.len() } else { 0 }, modified, submodule_has_unpushed_commits, unpushed });
+        entries.push(DirectoryEntry { name, relative_path: relative_string, kind, status: status_for_entry(&status_key), tracked, size: if metadata.is_file() { metadata.len() } else { 0 }, modified, submodule_has_unpushed_commits, unpushed, status_known: true });
     }
     perf_log(&format!("load_directory: readdir loop ({} entries, {submodule_count} submodules)", entries.len()), step.elapsed());
     let step = Instant::now();
@@ -5649,5 +5704,66 @@ mod tests {
 
         println!("PERF speedup: open_repository_fast was {:.1}x faster", full_elapsed.as_secs_f64() / fast_elapsed.as_secs_f64().max(0.0001));
         assert!(fast_elapsed < full_elapsed, "open_repository_fast ({fast_elapsed:?}) should be faster than load_repository ({full_elapsed:?}) by skipping sync_submodule_gitlinks and the full status scan");
+    }
+
+    // Isolated from the test above deliberately (a fresh repository, not
+    // reusing its cache state) — this specifically verifies the actual
+    // frontend flow's acceptance criteria: the root is visible near-
+    // instantly via list_directory_fast (no Git calls at all), and the
+    // *single* real status scan that follows (refresh_status) is the only
+    // one — a subsequent load_directory for the same repository must reuse
+    // it, not run a second one. Read-only throughout; the combined-stress
+    // repository itself is never mutated by this test.
+    #[test]
+    #[ignore]
+    fn combined_stress_root_visible_fast_with_exactly_one_status_scan() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-combined-stress-flow-{suffix}"));
+        let parent = base.join("parent");
+        create_libgit2_repository(&parent, "README.md");
+        let parent_string = parent.to_string_lossy().into_owned();
+
+        for dir in 0..50 {
+            let dir_path = parent.join(format!("existing_{dir}"));
+            fs::create_dir_all(&dir_path).unwrap();
+            for file in 0..100 { fs::write(dir_path.join(format!("f{file}.txt")), b"x").unwrap(); }
+        }
+        stage_all(parent_string.clone(), String::new()).unwrap();
+        commit_staged(parent_string.clone(), "Add 5000 tracked files".into()).unwrap();
+        for i in 0..30 {
+            let dependency = base.join(format!("dep_{i}"));
+            create_libgit2_repository(&dependency, "module.txt");
+            add_submodule(parent_string.clone(), "".into(), dependency.to_string_lossy().into_owned(), format!("sub_{i}"), String::new(), String::new()).unwrap();
+        }
+        commit_staged(parent_string.clone(), "Add 30 submodules".into()).unwrap();
+
+        // 1. Root visible near-instantly, zero Git calls.
+        let fast_started = Instant::now();
+        let fast = open_repository_fast(parent_string.clone()).unwrap();
+        let fast_list_started = Instant::now();
+        let root_entries = list_directory_fast(fast.repository.path.clone(), String::new()).unwrap();
+        let fast_total = fast_started.elapsed();
+        println!("PERF open_repository_fast + list_directory_fast (root): {fast_total:?} ({} entries)", root_entries.len());
+        assert!(root_entries.iter().all(|entry| !entry.status_known), "list_directory_fast entries must be marked status-unknown, never clean/untracked");
+        assert!(fast_total.as_millis() < 200, "root should be visible in under 200ms, took {fast_total:?}");
+        let _ = fast_list_started;
+
+        // 2. The one and only real full status scan.
+        let scan_started = Instant::now();
+        let changes = refresh_status(fast.repository.path.clone()).unwrap();
+        let scan_elapsed = scan_started.elapsed();
+        println!("PERF refresh_status (the one real scan): {scan_elapsed:?} ({} changes)", changes.len());
+        assert!(changes.is_empty(), "a freshly committed combined-stress repo should be clean");
+
+        // 3. Reloading the same (root) folder now must reuse that scan, not
+        // run a second one — proven the same way as the earlier reuse test:
+        // if it reused the cache, this stays fast; a real second scan on
+        // 5000 files/30 submodules would be measurably slower.
+        let reload_started = Instant::now();
+        let real_entries = load_directory(fast.repository.path.clone(), String::new()).unwrap();
+        let reload_elapsed = reload_started.elapsed();
+        println!("PERF load_directory (root, reusing refresh_status's scan): {reload_elapsed:?} ({} entries)", real_entries.len());
+        assert!(real_entries.iter().all(|entry| entry.status_known), "the real load_directory must always report status_known");
+        assert!(reload_elapsed < scan_elapsed, "reloading the same folder right after refresh_status ({reload_elapsed:?}) should be much faster than the real scan ({scan_elapsed:?}) it reuses, not run a second one");
     }
 }

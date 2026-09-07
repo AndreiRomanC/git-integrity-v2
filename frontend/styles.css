@@ -141,7 +141,7 @@ button { cursor: default; }
    folder used to do exactly that, deforming the whole row). */
 .git-state { display: inline-flex; align-items: center; gap: 6px; min-width: 0; max-width: 100%; color: #7f91a2; font-size: 11px; }
 .git-state > span { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
-.git-state.changed { color: var(--amber); }.git-state.untracked { color: #8a9aaa; }.git-state.new-version { color: var(--blue); }.git-state.unpushed { color: var(--blue); }
+.git-state.changed { color: var(--amber); }.git-state.untracked { color: #8a9aaa; }.git-state.new-version { color: var(--blue); }.git-state.unpushed { color: var(--blue); }.git-state.loading { color: #5c6b7a; font-style: italic; }
 .git-dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; flex-shrink: 0; }
 .file-size, .file-modified { color: #8293a3; font-size: 11px; white-space: nowrap; }
 .folder-arrow { margin-left: auto; color: #64809a; font-size: 18px; }

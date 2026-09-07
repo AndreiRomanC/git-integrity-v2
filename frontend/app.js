@@ -1,4 +1,31 @@
-const invoke = window.__TAURI__?.core?.invoke;
+// Every command that mutates the repository (index, HEAD, branches, stashes,
+// submodules, remotes, files on disk...) is refused centrally, right here,
+// while state.statusReady is false — right after opening a repository,
+// before its background status fetch completes. This used to be a manual
+// `if (!state.statusReady) ...` check duplicated at the top of every
+// individual action's own function; several were missing it entirely
+// (delete, folder-scoped commit, stash actions, some branch/submodule
+// actions) simply because nothing forced every future one to remember it.
+// One list here, checked once, covers every call site — present and future —
+// without relying on each new mutating action to add its own copy.
+const MUTATING_COMMANDS = new Set([
+  'stage_files', 'unstage_files', 'stage_all', 'commit_files', 'commit_staged', 'commit_path',
+  'remove_git_path', 'delete_local_path', 'switch_branch', 'create_branch', 'rename_branch', 'delete_branch',
+  'stash_changes', 'stash_file', 'pop_stash', 'drop_stash', 'restore_stash_paths', 'abort_stash_conflict',
+  'restore_file', 'restore_remote_file', 'add_submodule', 'switch_submodule_version', 'change_submodule_url',
+  'commit_submodule', 'push_submodule', 'pull_submodule', 'force_push_submodule', 'fetch_submodule',
+  'create_submodule_branch', 'merge_branch', 'resolve_conflict', 'complete_merge', 'abort_merge',
+  'sync_repository', 'publish_branch', 'fetch_remote', 'fetch_all_remotes', 'write_text_file', 'run_git_command',
+]);
+const rawInvoke = window.__TAURI__?.core?.invoke;
+const invoke = rawInvoke && ((command, args) => {
+  if (MUTATING_COMMANDS.has(command) && !state.statusReady) {
+    const message = 'Still loading status — please wait a moment.';
+    status(message, 'error');
+    return Promise.reject(message);
+  }
+  return rawInvoke(command, args);
+});
 const $ = selector => document.querySelector(selector);
 // Lane colors only — never branch identity, never commit state. Deliberately no
 // red: that's reserved elsewhere in the app for danger/conflict/delete states,
@@ -300,17 +327,24 @@ async function openRepositoryFast(path) {
     state.allCommits = data.commits; state.historyScope = ''; state.view = 'explorer'; state.commanderPath = ''; state.commanderRows = [];
     state.remoteRef = data.branches.find(branch => branch.remote)?.name || '';
     state.hasStash = state.stashes.length > 0; updateStashUI();
-    await openDirectory('', { force: true });
+    // Filesystem-only, no Git calls at all — see list_directory_fast's own
+    // doc comment for exactly what this replaces: calling the *normal*
+    // openDirectory('') here (root's scope is the empty string) was actually
+    // triggering a full, unscoped status scan of its own, on top of the one
+    // open_repository_fast was built to skip — a real perf log caught this
+    // directly (2.67-4.58s). The root is now visible with zero Git work at all.
+    await openDirectoryFast('');
     status(`${data.commits.length} commits loaded — checking status…`, 'busy');
     addRecentRepo(path, data.repository.name);
     updatePublishIndicator();
     await checkForMergeConflicts();
-    completeRepositoryOpenStatus(path, generation);
+    completeRepositoryOpenStatus(state.repository.path, generation);
   } catch (error) { handleError(error); }
 }
 
 async function completeRepositoryOpenStatus(path, generation) {
   try {
+    // The one and only full status scan in this whole flow.
     const changes = await invoke('refresh_status', { repositoryPath: path });
     // A newer open, or the real loadRepository, already ran (or is running)
     // since this fast-open started — its own state is what should stay on
@@ -318,12 +352,11 @@ async function completeRepositoryOpenStatus(path, generation) {
     if (generation !== repoOpenGeneration || state.repository?.path !== path) return;
     state.changes = changes; state.statusReady = true;
     updateChangeBadge();
-    // The folder currently on screen was listed by the fast open above
-    // without tracked/status info (backend still reports it correctly per
-    // its own always-fresh scoped scan, but this refreshes the cache this
-    // pass just populated so the Explorer/details view reflects it without
-    // waiting for the next click) — reopening it now applies real status to
-    // what's actually visible right now.
+    // Reloads whatever folder is actually on screen with real status —
+    // *not* a second full scan: refresh_status just populated the backend's
+    // full-scan cache, and load_directory's own status lookup opportunistically
+    // reuses a fresh full scan instead of running its own scoped one when
+    // one's already sitting there (see worktree_status's own doc comment).
     await openDirectory(state.currentPath, { force: true });
     render();
     status(`${state.commits.length} commits loaded`);
@@ -573,6 +606,11 @@ function iconFor(entry) {
 
 function gitState(entry) {
   const labels = { M: 'Modified locally', A: 'Added locally', D: 'Deleted locally', R: 'Renamed locally', '??': 'New, untracked', '•': 'Modified files inside' };
+  // Not the same as tracked === false ("genuinely untracked", a real answer)
+  // — this is list_directory_fast's placeholder data, where tracked/status
+  // mean nothing at all yet. Showing "New, untracked" here would be an
+  // outright wrong answer, not just an imprecise one.
+  if (entry.status_known === false) return '<span class="git-state loading"><i class="git-dot"></i><span>Loading…</span></span>';
   // The label is wrapped in its own <span> (not just a bare text node next
   // to the dot) so an overly long one truncates itself with an ellipsis in
   // this fixed-width grid column instead of overflowing and squashing the
@@ -713,6 +751,28 @@ async function openDirectory(path, options = {}) {
     const renderStarted = performance.now();
     state.entries = entries; render();
     jsPerfLog(`openDirectory render() (${path || '/'}, ${entries.length} entries)`, performance.now() - renderStarted);
+  } catch (error) {
+    if (requestId !== explorerRequestSeq) return;
+    status(String(error), 'error'); refs.fileList.innerHTML = `<div class="empty-change">${esc(String(error))}</div>`;
+  }
+}
+
+// Filesystem-only variant of openDirectory used only for the very first
+// render of the root folder while opening a repository (see
+// list_directory_fast's doc comment) — never populates directoryCache, so a
+// later, real openDirectory(force:false) for the same folder can never
+// accidentally serve this incomplete data back as if it were a real,
+// status-complete listing.
+async function openDirectoryFast(path) {
+  if (!state.repository) return;
+  state.currentPath = path; state.selectedEntry = null;
+  const requestId = ++explorerRequestSeq;
+  refs.fileList.innerHTML = '<div class="loading-row"><i class="spinner"></i>Loading folder…</div>';
+  if (!invoke) { state.entries = previewData.entries; render(); return; }
+  try {
+    const entries = await invoke('list_directory_fast', { repositoryPath: state.repository.path, relativePath: path });
+    if (requestId !== explorerRequestSeq) return;
+    state.entries = entries; render();
   } catch (error) {
     if (requestId !== explorerRequestSeq) return;
     status(String(error), 'error'); refs.fileList.innerHTML = `<div class="empty-change">${esc(String(error))}</div>`;
@@ -1238,7 +1298,6 @@ async function removeEntryFromGit(entry) {
 }
 
 async function deleteEntry(entry, button) {
-  if (!state.statusReady) { status('Still loading status — please wait a moment.', 'error'); return; }
   if (!button?.dataset.confirmed) {
     button.dataset.confirmed = 'true';
     button.textContent = `Confirm delete “${entry.name}”`;
@@ -1939,7 +1998,6 @@ let activeStagingOperation = null;
 
 function toggleStage(path, checked) {
   if (!invoke || !state.repository) return;
-  if (!state.statusReady) { status('Still loading status — please wait a moment.', 'error'); return; }
   // Defensive: the queue should never carry entries from a repository that's
   // no longer open (every path that switches repository/branch is expected
   // to flush first, via flushPendingTogglesNow — this only guards against
@@ -2020,7 +2078,6 @@ async function flushPendingToggles(options = {}) {
 
 async function switchBranch(branch) {
   if (!invoke || !state.repository) return;
-  if (!state.statusReady) { status('Still loading status — please wait a moment.', 'error'); return; }
   // Must land before the checkout itself, not just before the reload after
   // it — a checkout racing a still-pending stage/unstage call is exactly
   // the kind of thing this exists to prevent.
@@ -2044,7 +2101,6 @@ $('#refresh').addEventListener('click', () => state.repository && loadRepository
 // afterward gets unstaged again, same as before.
 async function stageAllInScope(scope) {
   if (!invoke || !state.repository) return;
-  if (!state.statusReady) { status('Still loading status — please wait a moment.', 'error'); return; }
   // A pending per-checkbox toggle must land first — otherwise it could
   // overlap with, or race, stage_all's own backend call.
   await flushPendingTogglesNow();
@@ -2069,7 +2125,6 @@ async function stageAllInScope(scope) {
 
 async function unstageAllInScope(scope) {
   if (!invoke || !state.repository) return;
-  if (!state.statusReady) { status('Still loading status — please wait a moment.', 'error'); return; }
   await flushPendingTogglesNow();
   const files = state.changes.filter(change => change.staged && (!scope || change.path === scope || change.path.startsWith(`${scope}/`))).map(change => change.path);
   if (!files.length) return;
@@ -2279,7 +2334,6 @@ refs.confirmNewBranch.addEventListener('click', async () => {
   finally { refs.confirmNewBranch.textContent = 'Create branch'; }
 });
 refs.commitButton.addEventListener('click', async () => {
-  if (!state.statusReady) { status('Still loading status — please wait a moment.', 'error'); return; }
   // Without this, the button gave no sign anything was happening — for a
   // commit touching many files (real work happens on the backend: staging,
   // writing the tree, then a full status/history reload) that looked
