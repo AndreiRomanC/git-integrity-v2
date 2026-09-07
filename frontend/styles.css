@@ -134,9 +134,15 @@ button { cursor: default; }
 .entry-copy { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
 .entry-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; }
 .entry-hint { color: #6f8395; font-size: 10px; }
-.git-state { display: inline-flex; align-items: center; gap: 6px; color: #7f91a2; font-size: 11px; }
+/* The label lives in its own inner <span> (not a bare text node) so it can
+   shrink and truncate with an ellipsis on its own — the dot (flex-shrink: 0)
+   never gets squashed by an overly long label regardless of column width or
+   how long any future label ends up being ("Contains unpushed commits" on a
+   folder used to do exactly that, deforming the whole row). */
+.git-state { display: inline-flex; align-items: center; gap: 6px; min-width: 0; max-width: 100%; color: #7f91a2; font-size: 11px; }
+.git-state > span { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .git-state.changed { color: var(--amber); }.git-state.untracked { color: #8a9aaa; }.git-state.new-version { color: var(--blue); }.git-state.unpushed { color: var(--blue); }
-.git-dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
+.git-dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; flex-shrink: 0; }
 .file-size, .file-modified { color: #8293a3; font-size: 11px; white-space: nowrap; }
 .folder-arrow { margin-left: auto; color: #64809a; font-size: 18px; }
 .loading-row { display: flex; align-items: center; justify-content: center; gap: 9px; height: 90px; color: var(--muted); }

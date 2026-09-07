@@ -573,16 +573,21 @@ function iconFor(entry) {
 
 function gitState(entry) {
   const labels = { M: 'Modified locally', A: 'Added locally', D: 'Deleted locally', R: 'Renamed locally', '??': 'New, untracked', '•': 'Modified files inside' };
-  if (!entry.tracked) return '<span class="git-state untracked"><i class="git-dot"></i>New, untracked</span>';
+  // The label is wrapped in its own <span> (not just a bare text node next
+  // to the dot) so an overly long one truncates itself with an ellipsis in
+  // this fixed-width grid column instead of overflowing and squashing the
+  // dot or deforming the row — "Contains unpushed commits" on a folder used
+  // to do exactly that.
+  if (!entry.tracked) return '<span class="git-state untracked"><i class="git-dot"></i><span>New, untracked</span></span>';
   if (entry.kind === 'submodule' && entry.status === 'M' && entry.submodule_has_unpushed_commits) {
-    return '<span class="git-state new-version"><i class="git-dot"></i>New version</span>';
+    return '<span class="git-state new-version"><i class="git-dot"></i><span>New version</span></span>';
   }
-  if (entry.status) return `<span class="git-state changed"><i class="git-dot"></i>${esc(labels[entry.status] || entry.status)}</span>`;
+  if (entry.status) return `<span class="git-state changed"><i class="git-dot"></i><span>${esc(labels[entry.status] || entry.status)}</span></span>`;
   // Fully committed (no working-tree status at all) but that commit hasn't
   // reached the branch's upstream yet — a real, distinct state from both
   // "clean" and "modified": nothing here needs a commit, it needs a push.
-  if (entry.unpushed) return `<span class="git-state unpushed"><i class="git-dot"></i>${entry.kind === 'folder' ? 'Contains unpushed commits' : 'Not pushed yet'}</span>`;
-  return '<span class="git-state"><i class="git-dot"></i>Tracked</span>';
+  if (entry.unpushed) return `<span class="git-state unpushed"><i class="git-dot"></i><span>${entry.kind === 'folder' ? 'Unpushed commits' : 'Not pushed yet'}</span></span>`;
+  return '<span class="git-state"><i class="git-dot"></i><span>Tracked</span></span>';
 }
 
 function renderBreadcrumbs() {
