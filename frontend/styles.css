@@ -64,18 +64,26 @@ button { cursor: default; }
 .workspace-status { width: 100%; display: grid; grid-template-columns: 13px 1fr auto; align-items: center; gap: 9px; padding: 11px 9px; border: 0; border-radius: 7px; background: transparent; text-align: left; }
 .workspace-status:hover { background: #19222c; }
 .workspace-status > span:nth-child(2) { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.workspace-status strong, .workspace-status small { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .workspace-status small { color: var(--muted); font-size: 11px; }
 .workspace-status b { min-width: 22px; padding: 2px 6px; border-radius: 10px; background: #313e4b; text-align: center; font-size: 11px; }
 .workspace-dot { width: 10px; height: 10px; border-radius: 3px; background: var(--amber); }
 .publish-status { margin-top: 2px; border-top: 1px solid var(--border-soft); border-radius: 0 0 7px 7px; }.publish-dot { width: 18px; height: 18px; display: grid !important; place-items: center; border-radius: 50%; background: #215f91; color: #d9efff; font-size: 12px; }
 
 .content { min-width: 0; min-height: 0; display: flex; flex-direction: column; background: var(--bg); }
-.content-head { min-height: 62px; display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; padding: 10px 18px; border-bottom: 1px solid var(--border); }
+/* Was flex-wrap: wrap with an unconstrained subtitle (the current folder
+   path, which varies a lot in length between folders) — a long path pushed
+   the whole row past its width and wrapped, shoving the toolbar buttons on
+   the right around or down to a second line depending on exactly how long
+   that one folder's path happened to be. Truncating the title/subtitle with
+   an ellipsis and keeping the row itself non-wrapping means the toolbar
+   stays in the same place every time, regardless of path length. */
+.content-head { min-height: 62px; display: flex; flex-wrap: nowrap; align-items: center; gap: 8px 14px; padding: 10px 18px; border-bottom: 1px solid var(--border); }
 .content-head h1 { margin: 0 0 2px; font-size: 18px; }
-.content-head > div:first-child { min-width: 130px; }
-.content-head h1 { white-space: nowrap; }
-.content-head p { margin: 0; color: var(--muted); font-size: 11px; }
-.view-tools { display: flex; flex-wrap: nowrap; align-items: center; gap: 5px; margin-left: auto; max-width: 100%; overflow-x: auto; scrollbar-width: none; }
+.content-head > div:first-child { min-width: 0; flex: 1 1 auto; overflow: hidden; }
+.content-head h1 { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.content-head p { margin: 0; color: var(--muted); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.view-tools { display: flex; flex-wrap: nowrap; flex-shrink: 0; align-items: center; gap: 5px; margin-left: auto; max-width: 100%; overflow-x: auto; scrollbar-width: none; }
 .view-tools::-webkit-scrollbar { display: none; }
 .search { width: 130px; height: 28px; display: flex; align-items: center; gap: 6px; margin-right: 3px; padding: 0 8px; border: 1px solid var(--border); border-radius: 6px; background: #10161c; flex-shrink: 1; min-width: 60px; }
 .search span { color: #8294a6; font-size: 15px; }
