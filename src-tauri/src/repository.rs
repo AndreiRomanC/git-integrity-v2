@@ -2008,7 +2008,7 @@ pub fn list_directory_fast(repository_path: String, relative_path: String) -> Re
 }
 
 #[tauri::command]
-pub fn load_directory(repository_path: String, relative_path: String) -> Result<Vec<DirectoryEntry>, String> {
+pub fn load_directory(repository_path: String, relative_path: String, force: Option<bool>) -> Result<Vec<DirectoryEntry>, String> {
     let load_started = Instant::now();
     validate_path(&repository_path)?;
     let relative = safe_relative_path(&relative_path)?;
@@ -2029,6 +2029,13 @@ pub fn load_directory(repository_path: String, relative_path: String) -> Result<
         Some((sub_path, inner_relative)) => (sub_path.as_str(), inner_relative.as_str()),
         None => (repository_path.as_str(), relative_path.as_str()),
     };
+    // The 300s TTL below is tuned for ordinary navigation, where a moment's
+    // staleness is an acceptable trade for not re-scanning on every folder
+    // click. An explicit refresh click is a different signal — the user just
+    // told us they expect to see whatever changed on disk *right now* (e.g.
+    // files edited by another program), so it must bypass that cache instead
+    // of silently serving up to 5-minute-old data back at them.
+    if force.unwrap_or(false) { invalidate_git_metadata(status_repo); }
     let step = Instant::now();
     let git_metadata = cached_git_metadata(status_repo, status_scope);
     perf_log(&format!("load_directory: cached_git_metadata ({relative_path})"), step.elapsed());
@@ -2419,6 +2426,37 @@ pub fn switch_submodule_version(repository_path: String, relative_path: String, 
     invalidate_git_metadata(&repository_path);
     invalidate_submodule_sync(&repository_path); // this app just changed a submodule's registration/version
     Ok(selected)
+}
+
+// Discards whatever local state a submodule has drifted into — a dirty
+// working tree, local commits, or an uncommitted "switch version" done from
+// this app or by hand — and forces it back to exactly the commit the parent
+// repository currently has recorded for it (its index entry, so a *staged*
+// version bump is respected as the target, not silently discarded too; only
+// HEAD's committed tree wins when nothing is staged, since the index then
+// mirrors it). Equivalent to `git submodule update --force <path>`, which is
+// why the submodule ends up in detached HEAD afterward — same as ordinary
+// `git submodule update` always does.
+#[tauri::command]
+pub fn reset_submodule(repository_path: String, relative_path: String) -> Result<String, String> {
+    validate_path(&repository_path)?;
+    let absolute = validate_submodule(&repository_path, &relative_path)?;
+    let relative = safe_relative_path(&relative_path)?;
+    let relative_string = normalized(&relative);
+    let parent = internal_repository(&repository_path)?;
+    let index = parent.index().map_err(|error| error.message().to_string())?;
+    let entry = index.iter().find(|entry| String::from_utf8_lossy(&entry.path) == relative_string)
+        .ok_or("This path is not a registered submodule in the parent index")?;
+    let target_oid = entry.id;
+    let sub_repo = internal_repository(absolute.to_str().unwrap_or_default())?;
+    sub_repo.set_head_detached(target_oid).map_err(|error| error.message().to_string())?;
+    let mut checkout = git2::build::CheckoutBuilder::new();
+    checkout.force(); // discard dirty working-tree edits too, not just move HEAD
+    sub_repo.checkout_head(Some(&mut checkout)).map_err(|error| error.message().to_string())?;
+    drop(sub_repo);
+    invalidate_git_metadata(&repository_path);
+    invalidate_submodule_sync(&repository_path); // this app just changed a submodule's registration/version
+    Ok(target_oid.to_string())
 }
 
 #[tauri::command]
@@ -3453,13 +3491,13 @@ mod tests {
         run_git(&repository, &["commit", "-am", "Add dependency"]);
 
         let path = repository.to_string_lossy().into_owned();
-        let entries = load_directory(path.clone(), "".into()).unwrap();
+        let entries = load_directory(path.clone(), "".into(), None).unwrap();
         assert!(entries.iter().any(|entry| entry.relative_path == "src" && entry.kind == "folder"));
         assert!(entries.iter().any(|entry| entry.relative_path == "vendor" && entry.kind == "folder"));
         let cached_start = std::time::Instant::now();
-        for _ in 0..100 { assert!(!load_directory(path.clone(), "".into()).unwrap().is_empty()); }
+        for _ in 0..100 { assert!(!load_directory(path.clone(), "".into(), None).unwrap().is_empty()); }
         assert!(cached_start.elapsed().as_millis() < 1000, "cached navigation took {:?}", cached_start.elapsed());
-        let nested = load_directory(path.clone(), "vendor".into()).unwrap();
+        let nested = load_directory(path.clone(), "vendor".into(), None).unwrap();
         assert!(nested.iter().any(|entry| entry.relative_path == "vendor/dependency" && entry.kind == "submodule"));
         let details = entry_details(path, "vendor/dependency".into()).unwrap();
         assert_eq!(details.kind, "submodule");
@@ -4286,7 +4324,7 @@ mod tests {
         fs::write(base.join("brand-new-folder/nested/two.txt"), "b").unwrap();
 
         let path = base.to_string_lossy().into_owned();
-        let entries = load_directory(path.clone(), "".into()).unwrap();
+        let entries = load_directory(path.clone(), "".into(), None).unwrap();
         let folder_entry = entries.iter().find(|entry| entry.relative_path == "brand-new-folder").expect("the new folder should be listed");
         assert!(!folder_entry.tracked, "a wholly new folder should not be marked as tracked");
         assert!(!folder_entry.status.is_empty(), "load_directory should flag the new folder with a status (e.g. untracked/changed), got empty status");
@@ -4294,6 +4332,40 @@ mod tests {
         let details = entry_details(path, "brand-new-folder".into()).unwrap();
         assert!(!details.tracked, "entry_details should also report the new folder as untracked");
         assert!(!details.status.is_empty(), "entry_details should flag the new folder with a status too, got empty status");
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn forced_reload_bypasses_the_status_cache_to_show_an_external_edit_immediately() {
+        // Reproduces the report: editing a file with an external program (not
+        // through this app), then clicking Refresh, used to still show the old
+        // status — because load_directory's status cache has a 300s TTL tuned for
+        // ordinary navigation, and an explicit refresh click used to have no way
+        // to bypass it. `force: true` must see the change right away, without
+        // waiting out the TTL.
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-forced-reload-{suffix}"));
+        create_libgit2_repository(&base, "README.md");
+        let path = base.to_string_lossy().into_owned();
+
+        // Warm the status cache with a clean tree (no `force`, like ordinary navigation).
+        let clean = load_directory(path.clone(), "".into(), None).unwrap();
+        let readme = clean.iter().find(|entry| entry.relative_path == "README.md").expect("README.md should be listed");
+        assert!(readme.status.is_empty(), "a freshly committed file should start with no status");
+
+        // Simulate an external program editing the file on disk, bypassing this app entirely.
+        fs::write(base.join("README.md"), "edited externally, not through this app").unwrap();
+
+        // Without force, the cache is still fresh (TTL is 300s) and unaware of the edit.
+        let stale = load_directory(path.clone(), "".into(), None).unwrap();
+        let stale_readme = stale.iter().find(|entry| entry.relative_path == "README.md").unwrap();
+        assert!(stale_readme.status.is_empty(), "sanity check: without force, the pre-existing cache should still be serving the stale, clean status");
+
+        // A forced reload (what the Refresh button now sends) must reflect the edit immediately.
+        let refreshed = load_directory(path.clone(), "".into(), Some(true)).unwrap();
+        let refreshed_readme = refreshed.iter().find(|entry| entry.relative_path == "README.md").unwrap();
+        assert!(!refreshed_readme.status.is_empty(), "force:true must bypass the status cache and show the external edit immediately, got status={:?}", refreshed_readme.status);
 
         fs::remove_dir_all(base).unwrap();
     }
@@ -4516,6 +4588,49 @@ mod tests {
     }
 
     #[test]
+    fn reset_submodule_discards_local_commits_dirty_edits_and_an_uncommitted_version_switch() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-reset-submodule-{suffix}"));
+        let repository = base.join("main");
+        let dependency = base.join("dependency");
+        fs::create_dir_all(&repository).unwrap();
+        fs::create_dir_all(&dependency).unwrap();
+        fs::write(repository.join("README.md"), "root").unwrap();
+        fs::write(dependency.join("module.txt"), "v1").unwrap();
+        for path in [&repository, &dependency] {
+            run_git(path, &["init"]);
+            run_git(path, &["config", "user.email", "test@example.com"]);
+            run_git(path, &["config", "user.name", "Test User"]);
+            run_git(path, &["add", "."]);
+            run_git(path, &["commit", "-m", "Initial"]);
+        }
+        run_git(&repository, &["-c", "protocol.file.allow=always", "submodule", "add", dependency.to_str().unwrap(), "vendor/dep"]);
+        run_git(&repository, &["commit", "-am", "Add dep submodule"]);
+
+        let repo_path = repository.to_string_lossy().into_owned();
+        let sub_path = repository.join("vendor/dep");
+        let recorded_commit = Repository::open(&sub_path).unwrap().head().unwrap().target().unwrap().to_string();
+
+        // Drift the submodule: a local commit ahead of what the parent has
+        // recorded (like an uncommitted "switch version"), plus a dirty,
+        // uncommitted edit on top of that — both must be discarded by reset.
+        fs::write(sub_path.join("module.txt"), "v2 (local commit)").unwrap();
+        run_git(&sub_path, &["commit", "-am", "Local-only change, never recorded by the parent"]);
+        fs::write(sub_path.join("module.txt"), "v3 (dirty, uncommitted)").unwrap();
+        assert!(!Repository::open(&sub_path).unwrap().statuses(None).unwrap().is_empty(), "sanity check: the submodule should be dirty before reset");
+
+        let reset_to = reset_submodule(repo_path, "vendor/dep".into()).unwrap();
+        assert_eq!(reset_to, recorded_commit, "reset should land on the commit the parent has recorded, not wherever the submodule had drifted to");
+
+        let sub_repo = Repository::open(&sub_path).unwrap();
+        assert_eq!(sub_repo.head().unwrap().target().unwrap().to_string(), recorded_commit, "HEAD must be back at the parent-recorded commit");
+        assert!(sub_repo.statuses(None).unwrap().is_empty(), "the dirty edit must be discarded — reset means overwritten, not merged or preserved");
+        assert_eq!(fs::read_to_string(sub_path.join("module.txt")).unwrap(), "v1", "working tree content must match the recorded commit exactly");
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
     fn switching_to_a_remote_branch_lands_attached_not_detached() {
         // Picking a remote-tracking entry like "origin/main" from "Change version"
         // used to always leave the submodule in detached HEAD, even when a local
@@ -4700,7 +4815,7 @@ mod tests {
 
         // The file must be correctly reported as modified — sourced from the
         // submodule's own status, not silently invisible to the parent.
-        let listing = load_directory(parent_string.clone(), added.clone()).unwrap();
+        let listing = load_directory(parent_string.clone(), added.clone(), None).unwrap();
         let file_entry = listing.iter().find(|entry| entry.relative_path == file_path).expect("module.txt should be listed");
         assert_eq!(file_entry.status, "M", "a modified file inside a submodule must show its real status, not look permanently untracked");
         assert!(file_entry.tracked);
@@ -4740,7 +4855,7 @@ mod tests {
 
         fs::write(parent.join(&file_path), "print('hello')\n").unwrap();
 
-        let listing = load_directory(parent_string.clone(), added.clone()).unwrap();
+        let listing = load_directory(parent_string.clone(), added.clone(), None).unwrap();
         let file_entry = listing.iter().find(|entry| entry.relative_path == file_path).expect("nou.py should be listed");
         assert_eq!(file_entry.status, "??", "a brand new file inside a submodule must show as untracked/new, not blank");
 
@@ -4754,7 +4869,7 @@ mod tests {
         }
 
         // Confirm it no longer shows as a pending change afterward.
-        let listing_after = load_directory(parent_string, added).unwrap();
+        let listing_after = load_directory(parent_string, added, None).unwrap();
         let file_entry_after = listing_after.iter().find(|entry| entry.relative_path == file_path).expect("nou.py should still be listed");
         assert_eq!(file_entry_after.status, "", "nou.py should no longer show as changed right after being committed");
 
@@ -4900,20 +5015,20 @@ mod tests {
         let path = repository.to_string_lossy().into_owned();
 
         // Freshly pushed: nothing should be flagged.
-        let listing = load_directory(path.clone(), "src".into()).unwrap();
+        let listing = load_directory(path.clone(), "src".into(), None).unwrap();
         assert!(!listing.iter().find(|e| e.name == "a.txt").unwrap().unpushed);
 
         // Commit a change but don't push it.
         fs::write(repository.join("src/a.txt"), "two").unwrap();
         commit_path(path.clone(), "src/a.txt".into(), "Update a.txt".into()).unwrap();
 
-        let listing = load_directory(path.clone(), "src".into()).unwrap();
+        let listing = load_directory(path.clone(), "src".into(), None).unwrap();
         let entry = listing.iter().find(|e| e.name == "a.txt").unwrap();
         assert_eq!(entry.status, "", "the file is fully committed, so it must not show any working-tree status");
         assert!(entry.unpushed, "a committed-but-unpushed file must be flagged unpushed");
 
         // The containing folder should reflect it too.
-        let root_listing = load_directory(path.clone(), "".into()).unwrap();
+        let root_listing = load_directory(path.clone(), "".into(), None).unwrap();
         let src_entry = root_listing.iter().find(|e| e.name == "src").unwrap();
         assert!(src_entry.unpushed, "a folder containing an unpushed file should be flagged too");
 
@@ -4923,7 +5038,7 @@ mod tests {
         // After pushing (through the app's own command, which invalidates the
         // cache — a plain external `git push` wouldn't know to), it must clear.
         sync_repository(path.clone(), "push".into()).unwrap();
-        let after_push = load_directory(path, "src".into()).unwrap();
+        let after_push = load_directory(path, "src".into(), None).unwrap();
         assert!(!after_push.iter().find(|e| e.name == "a.txt").unwrap().unpushed, "after push, the file must no longer be flagged unpushed");
 
         fs::remove_dir_all(repository).unwrap();
@@ -5094,7 +5209,7 @@ mod tests {
         let changes = load_repository(repo_path.clone(), Some(true)).unwrap().changes;
         assert!(!changes.iter().any(|change| change.path == "vendor/dep"), "load_repository still lists the submodule as changed: {:?}", changes.iter().map(|c| (&c.path, &c.status)).collect::<Vec<_>>());
 
-        let entries = load_directory(repo_path.clone(), "vendor".into()).unwrap();
+        let entries = load_directory(repo_path.clone(), "vendor".into(), None).unwrap();
         let dep_entry = entries.iter().find(|entry| entry.relative_path == "vendor/dep").expect("submodule entry should be listed");
         assert_eq!(dep_entry.status, "", "load_directory still reports a status for the submodule: {:?}", dep_entry.status);
 
@@ -5550,7 +5665,7 @@ mod tests {
         let mut total = Duration::ZERO;
         for folder in 0..20 {
             let started = Instant::now();
-            let entries = load_directory(repo_string.clone(), format!("folder_{folder}")).unwrap();
+            let entries = load_directory(repo_string.clone(), format!("folder_{folder}"), None).unwrap();
             total += started.elapsed();
             assert_eq!(entries.len(), 10, "folder_{folder} should list exactly the 10 real files created in it");
         }
@@ -5594,13 +5709,13 @@ mod tests {
         let repo_string = repo_path.to_string_lossy().into_owned();
 
         let first = Instant::now();
-        let entries = load_directory(repo_string.clone(), "big_folder".into()).unwrap();
+        let entries = load_directory(repo_string.clone(), "big_folder".into(), None).unwrap();
         println!("PERF load_directory first call (cold caches): {:?}", first.elapsed());
         assert_eq!(entries.len(), 20_000);
         assert!(entries.iter().all(|entry| entry.kind == "file" && entry.tracked));
 
         let second = Instant::now();
-        let entries = load_directory(repo_string.clone(), "big_folder".into()).unwrap();
+        let entries = load_directory(repo_string.clone(), "big_folder".into(), None).unwrap();
         println!("PERF load_directory second call (warm caches): {:?}", second.elapsed());
         assert_eq!(entries.len(), 20_000);
 
@@ -5611,7 +5726,7 @@ mod tests {
             entry.0 = Instant::now() - GIT_METADATA_TTL - Duration::from_secs(1);
         }
         let third = Instant::now();
-        let entries = load_directory(repo_string.clone(), "big_folder".into()).unwrap();
+        let entries = load_directory(repo_string.clone(), "big_folder".into(), None).unwrap();
         println!("PERF load_directory third call (expired status cache, fresh scoped scan): {:?}", third.elapsed());
         assert_eq!(entries.len(), 20_000);
     }
@@ -5805,7 +5920,7 @@ mod tests {
         fs::write(repo_path.join("folder/new_file.txt"), "content").unwrap();
         let repo_string = repo_path.to_string_lossy().into_owned();
 
-        let entries = load_directory(repo_string.clone(), "folder".into()).unwrap();
+        let entries = load_directory(repo_string.clone(), "folder".into(), None).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].status, "??", "a brand-new file must show as untracked even though nothing has loaded this repository before");
         assert!(!entries[0].tracked);
@@ -5910,7 +6025,7 @@ mod tests {
         // if it reused the cache, this stays fast; a real second scan on
         // 5000 files/30 submodules would be measurably slower.
         let reload_started = Instant::now();
-        let real_entries = load_directory(fast.repository.path.clone(), String::new()).unwrap();
+        let real_entries = load_directory(fast.repository.path.clone(), String::new(), None).unwrap();
         let reload_elapsed = reload_started.elapsed();
         println!("PERF load_directory (root, reusing refresh_status's scan): {reload_elapsed:?} ({} entries)", real_entries.len());
         assert!(real_entries.iter().all(|entry| entry.status_known), "the real load_directory must always report status_known");

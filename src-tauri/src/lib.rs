@@ -29,6 +29,7 @@ pub fn run() {
             repository::submodule_versions,
             repository::add_submodule,
             repository::switch_submodule_version,
+            repository::reset_submodule,
             repository::change_submodule_url,
             repository::remove_git_path,
             repository::delete_local_path,
