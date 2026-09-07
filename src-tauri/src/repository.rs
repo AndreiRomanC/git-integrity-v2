@@ -380,6 +380,10 @@ pub struct SubmoduleVersion {
     subject: String,
     author: String,
     date: String,
+    // Only populated for kind == "tag": the local branch (if any) whose tip
+    // currently sits on the same commit the tag points to. None means the
+    // tag's commit isn't the tip of any local branch (detached if checked out).
+    attached_branch: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -2274,9 +2278,26 @@ pub fn submodule_versions(repository_path: String, relative_path: String) -> Res
     let current_revision = repo.head().ok().and_then(|head| head.target()).map(|id| id.to_string()).unwrap_or_default();
     let current_branch = repo.head().ok().and_then(|head| head.shorthand().map(String::from)).unwrap_or_default();
     let mut versions = Vec::new();
-    for branch_type in [BranchType::Local, BranchType::Remote] { if let Ok(iterator) = repo.branches(Some(branch_type)) { for item in iterator.flatten() { let name = item.0.name().ok().flatten().unwrap_or("").to_string(); if name.ends_with("/HEAD") { continue; } if let Some(oid) = item.0.get().target() { if let Ok(commit) = repo.find_commit(oid) { let kind = if branch_type == BranchType::Local { "branch" } else { "remote" }; versions.push(SubmoduleVersion { name: name.clone(), revision: oid.to_string(), kind: kind.into(), current: kind == "branch" && name == current_branch, subject: commit.summary().unwrap_or("").into(), author: commit.author().name().unwrap_or("Unknown").into(), date: short_date(commit.time().seconds()) }); } } } } }
+    // Local branch tips, indexed by the commit they currently point at — used
+    // below to report which branch (if any) is "attached" to a given tag.
+    let mut branch_tip_names: HashMap<String, String> = HashMap::new();
+    for branch_type in [BranchType::Local, BranchType::Remote] { if let Ok(iterator) = repo.branches(Some(branch_type)) { for item in iterator.flatten() { let name = item.0.name().ok().flatten().unwrap_or("").to_string(); if name.ends_with("/HEAD") { continue; } if let Some(oid) = item.0.get().target() { if branch_type == BranchType::Local { branch_tip_names.entry(oid.to_string()).or_insert_with(|| name.clone()); } if let Ok(commit) = repo.find_commit(oid) { let kind = if branch_type == BranchType::Local { "branch" } else { "remote" }; versions.push(SubmoduleVersion { name: name.clone(), revision: oid.to_string(), kind: kind.into(), current: kind == "branch" && name == current_branch, subject: commit.summary().unwrap_or("").into(), author: commit.author().name().unwrap_or("Unknown").into(), date: short_date(commit.time().seconds()), attached_branch: None }); } } } } }
+    if let Ok(tag_names) = repo.tag_names(None) {
+        for name in tag_names.iter().flatten() {
+            let reference = match repo.find_reference(&format!("refs/tags/{name}")) { Ok(reference) => reference, Err(_) => continue };
+            let target = match reference.target() { Some(target) => target, None => continue };
+            let object = match repo.find_object(target, None) { Ok(object) => object, Err(_) => continue };
+            let commit = match object.peel_to_commit() { Ok(commit) => commit, Err(_) => continue };
+            versions.push(SubmoduleVersion {
+                name: name.to_string(), revision: commit.id().to_string(), kind: "tag".into(),
+                current: commit.id().to_string() == current_revision,
+                subject: commit.summary().unwrap_or("").into(), author: commit.author().name().unwrap_or("Unknown").into(),
+                date: short_date(commit.time().seconds()), attached_branch: branch_tip_names.get(&commit.id().to_string()).cloned(),
+            });
+        }
+    }
     let mut walk = repo.revwalk().map_err(|error| error.message().to_string())?; let _ = walk.set_sorting(Sort::TIME); if let Ok(head) = repo.head() { if let Some(oid) = head.target() { let _ = walk.push(oid); } }
-    for oid in walk.flatten().take(30) { if let Ok(commit) = repo.find_commit(oid) { versions.push(SubmoduleVersion { name: oid.to_string()[..8].into(), revision: oid.to_string(), kind: "commit".into(), current: oid.to_string() == current_revision, subject: commit.summary().unwrap_or("").into(), author: commit.author().name().unwrap_or("Unknown").into(), date: short_date(commit.time().seconds()) }); } }
+    for oid in walk.flatten().take(30) { if let Ok(commit) = repo.find_commit(oid) { versions.push(SubmoduleVersion { name: oid.to_string()[..8].into(), revision: oid.to_string(), kind: "commit".into(), current: oid.to_string() == current_revision, subject: commit.summary().unwrap_or("").into(), author: commit.author().name().unwrap_or("Unknown").into(), date: short_date(commit.time().seconds()), attached_branch: None }); } }
     Ok(SubmoduleVersions { path: relative_path, current_revision, current_branch, versions })
 }
 
@@ -2376,6 +2397,16 @@ pub fn switch_submodule_version(repository_path: String, relative_path: String, 
                 repo.set_head(&format!("refs/heads/{local_name}")).map_err(|error| error.message().to_string())?;
             }
         }
+    } else if version_kind == "tag" {
+        // `revision` here is already the commit the tag points at (resolved by
+        // submodule_versions, which peels annotated tags to their commit), but
+        // resolve by tag name and peel again defensively in case a caller passes
+        // the tag name as `revision` instead.
+        let tag_name = if name.is_empty() { revision.clone() } else { name.clone() };
+        let object = repo.find_reference(&format!("refs/tags/{tag_name}")).and_then(|reference| reference.peel(git2::ObjectType::Commit))
+            .or_else(|_| repo.revparse_single(&revision).and_then(|object| object.peel(git2::ObjectType::Commit)))
+            .map_err(|error| error.message().to_string())?;
+        repo.set_head_detached(object.id()).map_err(|error| error.message().to_string())?;
     } else {
         let object = repo.revparse_single(&revision).map_err(|error| error.message().to_string())?; repo.set_head_detached(object.id()).map_err(|error| error.message().to_string())?;
     }
@@ -4430,6 +4461,56 @@ mod tests {
         assert!(switched.is_ok(), "switching to a local branch by name should succeed, got: {:?}", switched);
         assert!(!Repository::open(&sub_path).unwrap().head_detached().unwrap(), "switching to a branch must leave HEAD attached to it, not detached");
         assert_eq!(Repository::open(&sub_path).unwrap().head().unwrap().shorthand(), Some("feature-x"));
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn submodule_versions_lists_tags_with_attached_branch_and_switch_lands_on_the_commit() {
+        // Reproduces two things at once: (1) tags weren't listed at all by
+        // submodule_versions, so there was no way to browse/checkout them from
+        // "Change version"; (2) an ANNOTATED tag's ref target is the tag object,
+        // not the commit — naively detaching at that id used to be wrong (it must
+        // resolve to the commit the tag points at, exactly like `git checkout <tag>`).
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-switch-tag-{suffix}"));
+        let repository = base.join("main");
+        let dependency = base.join("dependency");
+        fs::create_dir_all(&repository).unwrap();
+        fs::create_dir_all(&dependency).unwrap();
+        fs::write(repository.join("README.md"), "root").unwrap();
+        fs::write(dependency.join("module.txt"), "v1").unwrap();
+        for path in [&repository, &dependency] {
+            run_git(path, &["init"]);
+            run_git(path, &["config", "user.email", "test@example.com"]);
+            run_git(path, &["config", "user.name", "Test User"]);
+            run_git(path, &["add", "."]);
+            run_git(path, &["commit", "-m", "Initial"]);
+        }
+        run_git(&repository, &["-c", "protocol.file.allow=always", "submodule", "add", dependency.to_str().unwrap(), "vendor/dep"]);
+        run_git(&repository, &["commit", "-am", "Add dep submodule"]);
+
+        let repo_path = repository.to_string_lossy().into_owned();
+        let sub_path = repository.join("vendor/dep");
+        // Lightweight tag on the tip commit (main branch is attached there too),
+        // and an annotated tag — both should be listed, and the annotated one is
+        // the case that used to be handled wrong.
+        run_git(&sub_path, &["tag", "v1.0-light"]);
+        run_git(&sub_path, &["tag", "-a", "v1.0-annotated", "-m", "Release 1.0"]);
+        let tip_commit = Repository::open(&sub_path).unwrap().head().unwrap().target().unwrap().to_string();
+
+        let versions = submodule_versions(repo_path.clone(), "vendor/dep".into()).unwrap();
+        let light = versions.versions.iter().find(|v| v.kind == "tag" && v.name == "v1.0-light").expect("lightweight tag should be listed");
+        let annotated = versions.versions.iter().find(|v| v.kind == "tag" && v.name == "v1.0-annotated").expect("annotated tag should be listed");
+        assert_eq!(light.revision, tip_commit, "a lightweight tag should resolve to the commit it points at");
+        assert_eq!(annotated.revision, tip_commit, "an annotated tag must resolve to the commit it points at, not the tag object id");
+        assert_eq!(annotated.attached_branch.as_deref(), Some("main"), "the tag sits on the same commit as the 'main' branch tip, so main should be reported as attached");
+
+        let switched = switch_submodule_version(repo_path.clone(), "vendor/dep".into(), annotated.revision.clone(), annotated.kind.clone(), annotated.name.clone());
+        assert!(switched.is_ok(), "switching to an annotated tag should succeed, got: {:?}", switched);
+        let sub_repo = Repository::open(&sub_path).unwrap();
+        assert!(sub_repo.head_detached().unwrap(), "checking out a tag must detach HEAD, exactly like `git checkout <tag>`");
+        assert_eq!(sub_repo.head().unwrap().target().unwrap().to_string(), tip_commit, "HEAD must land on the commit the tag points at, not on the tag object itself");
 
         fs::remove_dir_all(base).unwrap();
     }

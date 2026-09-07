@@ -47,6 +47,7 @@ const $ = selector => document.querySelector(selector);
 const palette = ['#58a6ff', '#39c5cf', '#48cc7e', '#f0b65a', '#b294ff', '#e17fd5'];
 const directoryCache = new Map();
 let submoduleMenuData = null;
+let submoduleMenuEntry = null;
 let versionFilter = 'branch';
 const recentRepos = JSON.parse(localStorage.getItem('recentRepos') || '[]');
 
@@ -108,7 +109,7 @@ const refs = {
   commitButton: $('#commitButton'), selectionText: $('#selectionText'), browserDialog: $('#browserDialog'),
   browserNotice: $('#browserNotice'), explorerView: $('#explorerView'), fileList: $('#fileList'),
   breadcrumbs: $('#breadcrumbs'), viewTitle: $('#viewTitle'), goUp: $('#goUp'), reloadFolder: $('#reloadFolder'),
-  submoduleMenu: $('#submoduleMenu'), submoduleVersions: $('#submoduleVersions'), submoduleMenuName: $('#submoduleMenuName'), currentSubmoduleVersion: $('#currentSubmoduleVersion'),
+  submoduleMenu: $('#submoduleMenu'), submoduleVersions: $('#submoduleVersions'), submoduleMenuName: $('#submoduleMenuName'), currentSubmoduleVersion: $('#currentSubmoduleVersion'), submoduleVersionSearch: $('#submoduleVersionSearch'), submoduleOpenGraph: $('#submoduleOpenGraph'),
   commitScope: $('#commitScope'), showPathHistory: $('#showPathHistory'), commitScopeDialog: $('#commitScopeDialog'), commitScopeName: $('#commitScopeName'), scopeCommitMessage: $('#scopeCommitMessage'), confirmScopeCommit: $('#confirmScopeCommit'),
   commanderView: $('#commanderView'), commanderRows: $('#commanderRows'), commanderBreadcrumbs: $('#commanderBreadcrumbs'), remoteRef: $('#remoteRef'), compareDialog: $('#compareDialog'), compareTitle: $('#compareTitle'), compareSubtitle: $('#compareSubtitle'), localCompare: $('#localCompare'), remoteCompare: $('#remoteCompare'),
   remotesView: $('#remotesView'), remoteCards: $('#remoteCards'), editorDialog: $('#editorDialog'), editorTitle: $('#editorTitle'), editorPath: $('#editorPath'), editorContent: $('#editorContent'), locationRepository: $('#locationRepository'), locationBranch: $('#locationBranch'), locationPath: $('#locationPath'), leaveSubmoduleGraph: $('#leaveSubmoduleGraph'), publishDialog: $('#publishDialog'), publishBranch: $('#publishBranch'), publishRemote: $('#publishRemote'), publishCommits: $('#publishCommits'), publishSummary: $('#publishSummary'), publishDestination: $('#publishDestination'), publishBadge: $('#publishBadge'), publishSubtitle: $('#publishSubtitle'), cloneDialog: $('#cloneDialog'), cloneUrl: $('#cloneUrl'), cloneParent: $('#cloneParent'), cloneName: $('#cloneName'), confirmClone: $('#confirmClone'), submoduleDialog: $('#submoduleDialog'), submoduleUrl: $('#submoduleUrl'), submoduleParent: $('#submoduleParent'), submoduleName: $('#submoduleName'), submoduleUsername: $('#submoduleUsername'), submoduleToken: $('#submoduleToken'), submoduleAddStatus: $('#submoduleAddStatus'), confirmAddSubmodule: $('#confirmAddSubmodule'), operationToast: $('#operationToast'), drawerScopeTitle: $('#drawerScopeTitle'),
@@ -794,16 +795,20 @@ async function openDirectoryFast(path) {
 }
 
 async function openSubmoduleMenu(entry, x, y) {
+  submoduleMenuEntry = entry;
   refs.submoduleMenu.hidden = false;
   refs.submoduleMenu.style.left = `${Math.min(x, innerWidth - 460)}px`;
   refs.submoduleMenu.style.top = `${Math.min(y, innerHeight - 590)}px`;
   refs.submoduleMenuName.textContent = entry.name; refs.currentSubmoduleVersion.textContent = 'Loading…';
-  refs.submoduleVersions.innerHTML = '<div class="version-loading"><i class="spinner"></i>Reading branches and commits…</div>';
+  refs.submoduleVersionSearch.value = '';
+  refs.submoduleVersions.innerHTML = '<div class="version-loading"><i class="spinner"></i>Reading branches, tags and commits…</div>';
   if (!invoke) {
     submoduleMenuData = { path: entry.relative_path, current_revision: 'a39f21d81ce0', current_branch: 'main', versions: [
       { name: 'main', revision: 'a39f21d81ce0', kind: 'branch', current: true, subject: 'Stable diagnostics API', author: 'Andrei Pop', date: '2026-08-14' },
       { name: 'release/2.4', revision: 'bd51e40ca112', kind: 'branch', current: false, subject: 'Release configuration', author: 'Maria Ionescu', date: '2026-08-12' },
       { name: 'origin/feature/events', revision: 'de91822aef33', kind: 'remote', current: false, subject: 'Add event mapping', author: 'Victor Ene', date: '2026-08-11' },
+      { name: 'v1.0', revision: 'a39f21d81ce0', kind: 'tag', current: true, subject: 'Stable diagnostics API', author: 'Andrei Pop', date: '2026-08-14', attached_branch: 'main' },
+      { name: 'v0.9', revision: 'bd51e40ca112', kind: 'tag', current: false, subject: 'Release configuration', author: 'Maria Ionescu', date: '2026-08-12', attached_branch: null },
       { name: 'a39f21d', revision: 'a39f21d81ce0', kind: 'commit', current: true, subject: 'Stable diagnostics API', author: 'Andrei Pop', date: '2026-08-14' },
       { name: 'bd51e40', revision: 'bd51e40ca112', kind: 'commit', current: false, subject: 'Release configuration', author: 'Maria Ionescu', date: '2026-08-12' }
     ] }; renderSubmoduleVersions(); return;
@@ -815,10 +820,14 @@ async function openSubmoduleMenu(entry, x, y) {
 function renderSubmoduleVersions() {
   if (!submoduleMenuData) return;
   refs.currentSubmoduleVersion.textContent = `${submoduleMenuData.current_branch || 'detached'} · ${submoduleMenuData.current_revision.slice(0, 8)}`;
-  const versions = submoduleMenuData.versions.filter(item => versionFilter === 'branch' ? ['branch','remote'].includes(item.kind) : item.kind === 'commit');
-  const kindLabel = { branch: 'BRANCH', remote: 'REMOTE BRANCH', commit: 'COMMIT (detached)' };
+  const query = refs.submoduleVersionSearch.value.trim().toLowerCase();
+  const versions = submoduleMenuData.versions
+    .filter(item => versionFilter === 'branch' ? ['branch', 'remote'].includes(item.kind) : versionFilter === 'tag' ? item.kind === 'tag' : item.kind === 'commit')
+    .filter(item => !query || `${item.name} ${item.attached_branch || ''}`.toLowerCase().includes(query));
+  const kindLabel = { branch: 'BRANCH', remote: 'REMOTE BRANCH', tag: 'TAG', commit: 'COMMIT (detached)' };
+  const symbol = { commit: '●', tag: '◆' };
   refs.submoduleVersions.innerHTML = versions.map(item => `<button class="version-row ${item.current ? 'current' : ''}" data-revision="${esc(item.revision)}" data-version-kind="${esc(item.kind)}" data-name="${esc(item.name)}">
-    <span class="version-symbol">${item.kind === 'commit' ? '●' : '⑂'}</span><span class="version-name">${esc(item.name)}<b class="version-kind-badge">${esc(kindLabel[item.kind] || item.kind)}</b></span><span class="version-copy"><span class="version-subject">${esc(item.subject)}</span><span class="version-meta">${esc(item.author)} · ${esc(item.date)}</span></span>${item.current ? '<span class="current-label">CURRENT</span>' : ''}</button>`).join('') || '<div class="version-loading">No versions found</div>';
+    <span class="version-symbol">${symbol[item.kind] || '⑂'}</span><span class="version-name">${esc(item.name)}<b class="version-kind-badge">${esc(kindLabel[item.kind] || item.kind)}</b>${item.kind === 'tag' ? `<span class="version-attached-branch">${item.attached_branch ? `on ⑂ ${esc(item.attached_branch)}` : 'no branch here (detached)'}</span>` : ''}</span><span class="version-copy"><span class="version-subject">${esc(item.subject)}</span><span class="version-meta">${esc(item.author)} · ${esc(item.date)}</span></span>${item.current ? '<span class="current-label">CURRENT</span>' : ''}</button>`).join('') || `<div class="version-loading">${query ? 'No matches' : versionFilter === 'tag' ? 'No tags in this submodule' : 'No versions found'}</div>`;
   refs.submoduleVersions.querySelectorAll('[data-revision]').forEach(row => row.addEventListener('click', () => switchSubmoduleVersion(row.dataset.revision, row.dataset.versionKind, row.dataset.name)));
 }
 
@@ -829,7 +838,7 @@ async function switchSubmoduleVersion(revision, kind, name) {
     await invoke('switch_submodule_version', { repositoryPath: state.repository.path, relativePath: submoduleMenuData.path, revision, versionKind: kind, name: name || '' });
     const folder = state.currentPath; const data = await invoke('load_repository', { path: state.repository.path, force: false });
     Object.assign(state, data); state.view = 'explorer'; directoryCache.clear(); refs.submoduleMenu.hidden = true; await openDirectory(folder, { force: true });
-    const target = kind === 'branch' ? `branch "${name}"` : kind === 'remote' ? `remote branch "${name}" (detached at that commit)` : `commit ${revision.slice(0, 8)} (detached — not on any branch)`;
+    const target = kind === 'branch' ? `branch "${name}"` : kind === 'remote' ? `remote branch "${name}" (detached at that commit)` : kind === 'tag' ? `tag "${name}" (detached at that commit)` : `commit ${revision.slice(0, 8)} (detached — not on any branch)`;
     const successMsg = `Submodule switched to ${target}. It now shows as "Modified" here — that's expected: the project hasn't recorded the new pointer yet. Select the submodule and use "Commit this item" to save it.`;
     status(successMsg); showOperationToast(successMsg, 'success');
   } catch (error) { const message = handleError(error); showOperationToast(`Could not switch version: ${message}`, 'error'); }
@@ -2272,6 +2281,8 @@ $('#submoduleMenuNewBranch').addEventListener('click', () => { refs.submoduleMen
 document.querySelectorAll('[data-version-filter]').forEach(button => button.addEventListener('click', () => {
   versionFilter = button.dataset.versionFilter; document.querySelectorAll('[data-version-filter]').forEach(item => item.classList.toggle('active', item === button)); renderSubmoduleVersions();
 }));
+refs.submoduleVersionSearch.addEventListener('input', renderSubmoduleVersions);
+refs.submoduleOpenGraph.addEventListener('click', () => { if (submoduleMenuEntry) { refs.submoduleMenu.hidden = true; openSubmoduleGraph(submoduleMenuEntry); } });
 document.addEventListener('click', event => { if (!refs.submoduleMenu.hidden && !refs.submoduleMenu.contains(event.target) && !event.target.closest('[data-entry]') && !event.target.closest('[data-detail-action="versions"]')) refs.submoduleMenu.hidden = true; });
 refs.commitScope.addEventListener('click', openScopeCommit);
 refs.showPathHistory.addEventListener('click', showSelectedHistory);

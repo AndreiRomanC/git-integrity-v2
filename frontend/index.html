@@ -148,7 +148,13 @@
         <button id="closeSubmoduleMenu">×</button>
       </header>
       <div class="version-current"><span>Current</span><code id="currentSubmoduleVersion">—</code><button id="submoduleMenuNewBranch" title="Create a new branch in this submodule, from its current commit">＋ New branch…</button></div>
-      <div class="version-tabs"><button class="active" data-version-filter="branch">Branches</button><button data-version-filter="commit">Recent commits</button></div>
+      <div class="version-tabs">
+        <button class="active" data-version-filter="branch">Branches</button>
+        <button data-version-filter="tag">Tags</button>
+        <button data-version-filter="commit">Recent commits</button>
+        <button id="submoduleOpenGraph" class="version-graph-link" title="Open the full graphical branch map for this submodule, with search">Branch map ↗</button>
+      </div>
+      <input id="submoduleVersionSearch" class="version-search" type="text" placeholder="Search branches or tags…" autocomplete="off" spellcheck="false">
       <div id="submoduleVersions" class="version-list"></div>
       <footer class="version-help">Select a version to update the submodule reference.</footer>
     </section>
