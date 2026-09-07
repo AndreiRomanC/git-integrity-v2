@@ -19,7 +19,14 @@ function addRecentRepo(path, name) {
 }
 
 const state = { repository: null, branches: [], commits: [], allCommits: [], changes: [], selectedCommit: null, view: 'explorer', currentPath: '', entries: [], selectedEntry: null, historyScope: '', commanderPath: '', commanderRows: [], remoteRef: '', remotes: [], graphContext: null, editingPath: '', editorOriginal: '', publish: null, changesScope: 'global', commanderFocus: '', comparingRow: null, hasStash: false, stashes: [], editingConflict: null, mergeTarget: null,
-  consoleMode: 'commands', consoleTranscript: [], consoleCmdHistory: [], consoleScopeOverride: null, graphPrimaryBranch: null, publishUpto: null };
+  consoleMode: 'commands', consoleTranscript: [], consoleCmdHistory: [], consoleScopeOverride: null, graphPrimaryBranch: null, publishUpto: null,
+  // False only right after openRepositoryFast, until its background
+  // refresh_status completes — mutations (stage/unstage, delete, commit,
+  // switching branch) are refused while this is false, since they'd act on
+  // an index/status this app hasn't actually read yet. Every other load
+  // path (loadRepository, used for Refresh and after any action) already
+  // includes real status and leaves this true.
+  statusReady: true };
 const previewData = {
   repository: { name: 'vehicle-control', path: '/projects/vehicle-control', current_branch: 'feature/diagnostics' },
   branches: [
@@ -171,7 +178,7 @@ function customPrompt(message, defaultValue = '', options = {}) {
 function openRepository() {
   if (!invoke) { refs.browserDialog.showModal(); return; }
   status('Choose a repository folder…', 'busy');
-  invoke('choose_folder').then(path => path && loadRepository(path)).catch(error => handleError(error));
+  invoke('choose_folder').then(path => path && openRepositoryFast(path)).catch(error => handleError(error));
 }
 
 function validateCloneForm() { refs.confirmClone.disabled = !refs.cloneUrl.value.trim() || !refs.cloneParent.value.trim() || !refs.cloneName.value.trim(); }
@@ -181,7 +188,7 @@ async function confirmClone(event) {
   event.preventDefault(); const url = refs.cloneUrl.value.trim(); const parentPath = refs.cloneParent.value.trim(); const folderName = refs.cloneName.value.trim(); if (!url || !parentPath || !folderName) return;
   if (!invoke) { refs.cloneDialog.close(); status(`Preview: cloned ${folderName}`); return; }
   refs.confirmClone.disabled = true; refs.confirmClone.textContent = 'Cloning…'; status(`Cloning ${folderName}…`, 'busy');
-  try { const path = await invoke('clone_repository', { url, parentPath, folderName }); refs.cloneDialog.close(); await loadRepository(path); status(`Cloned and opened ${folderName}`); }
+  try { const path = await invoke('clone_repository', { url, parentPath, folderName }); refs.cloneDialog.close(); await openRepositoryFast(path); status(`Cloned and opened ${folderName}`); }
   catch (error) { status(String(error), 'error'); refs.confirmClone.disabled = false; }
   finally { refs.confirmClone.textContent = 'Clone repository'; }
 }
@@ -209,6 +216,15 @@ async function confirmAddSubmodule() {
   finally { refs.confirmAddSubmodule.textContent = 'Add submodule'; }
 }
 
+// Shared by loadRepository and openRepositoryFast — whichever of the two
+// runs *most recently* wins. Without this, opening a repository (fast phase
+// shown immediately) followed quickly by some action that itself calls the
+// full, synchronous loadRepository (e.g. Refresh, or any mutation's own
+// reload) could have the fast-open's background status fetch finish *after*
+// that fuller load and stomp its already-complete, more accurate state with
+// stale data.
+let repoOpenGeneration = 0;
+
 async function loadRepository(path, options = {}) {
   // Must happen before anything else here reads/mutates state.repository —
   // this flushes (or discards, per flushPendingTogglesNow's own guards)
@@ -216,6 +232,7 @@ async function loadRepository(path, options = {}) {
   // before this call potentially switches to a different one or refreshes
   // this one out from under a still-in-flight checkbox click.
   await flushPendingTogglesNow();
+  const generation = ++repoOpenGeneration;
   status('Reading repository…', 'busy');
   const keepPath = options.keepPath ? state.currentPath : '';
   // Most callers already know exactly which folder they want open again after
@@ -232,12 +249,19 @@ async function loadRepository(path, options = {}) {
   const keepView = options.keepPath ? state.view : 'explorer';
   try {
     const data = await invoke('load_repository', { path, force: Boolean(options.force) });
+    // A newer open/reload already started (and will do its own render) while
+    // this one's backend call was in flight — applying this one now would
+    // stomp whatever that newer one already showed.
+    if (generation !== repoOpenGeneration) return;
     // `data.commits` (assigned onto state.commits below) is always the full,
     // unscoped history — a scoped "History · <path>" view can't stay correctly
     // scoped through a refresh without re-querying that same scope, so it
     // falls back to the full Branch Map instead of showing stale-looking
     // scoped chrome over full data.
     directoryCache.clear(); Object.assign(state, data); state.allCommits = data.commits; state.historyScope = ''; state.view = keepView; state.commanderPath = options.keepPath ? state.commanderPath : ''; state.commanderRows = options.keepPath ? state.commanderRows : [];
+    // load_repository always includes real, complete status — whatever
+    // openRepositoryFast's still-pending background fetch was doing is moot now.
+    state.statusReady = true;
     state.remoteRef = data.branches.find(branch => branch.remote)?.name || '';
     // The toolbar's "Pop stash" visibility must reflect whether a stash
     // actually exists on disk, not a separately hand-tracked flag — that
@@ -254,12 +278,64 @@ async function loadRepository(path, options = {}) {
   } catch (error) { handleError(error); }
 }
 
+// The fast, read-only first phase for *opening a repository specifically* —
+// see open_repository_fast's own doc comment for the full reasoning
+// (skips the two genuinely expensive parts: the submodule reconciliation
+// scan and the full status scan, measured 62x faster on a synthetic
+// combined-stress case). Shows structure — folders, files, branches,
+// commits — immediately; Stage/Delete/Commit/switch branch stay refused
+// (state.statusReady = false) until the background completion below applies
+// real status. Refresh and every action's own reload keep using the
+// unchanged, fully synchronous loadRepository above, not this.
+async function openRepositoryFast(path) {
+  await flushPendingTogglesNow();
+  const generation = ++repoOpenGeneration;
+  status('Opening repository…', 'busy');
+  try {
+    const data = await invoke('open_repository_fast', { path });
+    if (generation !== repoOpenGeneration) return;
+    directoryCache.clear();
+    Object.assign(state, data);
+    state.changes = []; state.statusReady = false;
+    state.allCommits = data.commits; state.historyScope = ''; state.view = 'explorer'; state.commanderPath = ''; state.commanderRows = [];
+    state.remoteRef = data.branches.find(branch => branch.remote)?.name || '';
+    state.hasStash = state.stashes.length > 0; updateStashUI();
+    await openDirectory('', { force: true });
+    status(`${data.commits.length} commits loaded — checking status…`, 'busy');
+    addRecentRepo(path, data.repository.name);
+    updatePublishIndicator();
+    await checkForMergeConflicts();
+    completeRepositoryOpenStatus(path, generation);
+  } catch (error) { handleError(error); }
+}
+
+async function completeRepositoryOpenStatus(path, generation) {
+  try {
+    const changes = await invoke('refresh_status', { repositoryPath: path });
+    // A newer open, or the real loadRepository, already ran (or is running)
+    // since this fast-open started — its own state is what should stay on
+    // screen, not this catching up a moment later and overwriting it.
+    if (generation !== repoOpenGeneration || state.repository?.path !== path) return;
+    state.changes = changes; state.statusReady = true;
+    updateChangeBadge();
+    // The folder currently on screen was listed by the fast open above
+    // without tracked/status info (backend still reports it correctly per
+    // its own always-fresh scoped scan, but this refreshes the cache this
+    // pass just populated so the Explorer/details view reflects it without
+    // waiting for the next click) — reopening it now applies real status to
+    // what's actually visible right now.
+    await openDirectory(state.currentPath, { force: true });
+    render();
+    status(`${state.commits.length} commits loaded`);
+  } catch (error) { handleError(error); }
+}
+
 function renderRecentRepos() {
   const list = $('#recentReposList');
   if (recentRepos.length === 0) { $('#recentReposBar').hidden = true; return; }
   $('#recentReposBar').hidden = false;
   list.innerHTML = recentRepos.map(repo => `<button class="recent-repo-btn" data-path="${esc(repo.path)}" title="${esc(repo.path)}">${esc(repo.name)}</button>`).join('');
-  list.querySelectorAll('.recent-repo-btn').forEach(btn => btn.addEventListener('click', () => loadRepository(btn.dataset.path)));
+  list.querySelectorAll('.recent-repo-btn').forEach(btn => btn.addEventListener('click', () => openRepositoryFast(btn.dataset.path)));
 }
 
 $('#closeRecentRepos').addEventListener('click', () => $('#recentReposBar').hidden = true);
@@ -1157,6 +1233,7 @@ async function removeEntryFromGit(entry) {
 }
 
 async function deleteEntry(entry, button) {
+  if (!state.statusReady) { status('Still loading status — please wait a moment.', 'error'); return; }
   if (!button?.dataset.confirmed) {
     button.dataset.confirmed = 'true';
     button.textContent = `Confirm delete “${entry.name}”`;
@@ -1724,8 +1801,8 @@ function selectCommit(id) {
 // doesn't, since none of it is visible until the drawer is actually opened
 // (which already calls renderChanges() itself, in full, when it happens).
 function updateChangeBadge() {
-  refs.changeBadge.textContent = state.changes.length;
-  refs.workspaceSubtitle.textContent = state.repository ? (state.changes.length ? `${state.changes.length} changed files` : 'Everything committed') : 'No repository loaded';
+  refs.changeBadge.textContent = state.statusReady ? state.changes.length : '…';
+  refs.workspaceSubtitle.textContent = !state.repository ? 'No repository loaded' : !state.statusReady ? 'Loading status…' : state.changes.length ? `${state.changes.length} changed files` : 'Everything committed';
 }
 
 function renderChanges() {
@@ -1857,6 +1934,7 @@ let activeStagingOperation = null;
 
 function toggleStage(path, checked) {
   if (!invoke || !state.repository) return;
+  if (!state.statusReady) { status('Still loading status — please wait a moment.', 'error'); return; }
   // Defensive: the queue should never carry entries from a repository that's
   // no longer open (every path that switches repository/branch is expected
   // to flush first, via flushPendingTogglesNow — this only guards against
@@ -1937,6 +2015,7 @@ async function flushPendingToggles(options = {}) {
 
 async function switchBranch(branch) {
   if (!invoke || !state.repository) return;
+  if (!state.statusReady) { status('Still loading status — please wait a moment.', 'error'); return; }
   // Must land before the checkout itself, not just before the reload after
   // it — a checkout racing a still-pending stage/unstage call is exactly
   // the kind of thing this exists to prevent.
@@ -1960,6 +2039,7 @@ $('#refresh').addEventListener('click', () => state.repository && loadRepository
 // afterward gets unstaged again, same as before.
 async function stageAllInScope(scope) {
   if (!invoke || !state.repository) return;
+  if (!state.statusReady) { status('Still loading status — please wait a moment.', 'error'); return; }
   // A pending per-checkbox toggle must land first — otherwise it could
   // overlap with, or race, stage_all's own backend call.
   await flushPendingTogglesNow();
@@ -1984,6 +2064,7 @@ async function stageAllInScope(scope) {
 
 async function unstageAllInScope(scope) {
   if (!invoke || !state.repository) return;
+  if (!state.statusReady) { status('Still loading status — please wait a moment.', 'error'); return; }
   await flushPendingTogglesNow();
   const files = state.changes.filter(change => change.staged && (!scope || change.path === scope || change.path.startsWith(`${scope}/`))).map(change => change.path);
   if (!files.length) return;
@@ -2124,7 +2205,7 @@ refs.scopeCommitMessage.addEventListener('input', () => { refs.confirmScopeCommi
 refs.confirmScopeCommit.addEventListener('click', commitSelectedScope);
 $('#initRepo').addEventListener('click', async () => {
   if (!invoke) return refs.browserDialog.showModal();
-  try { const path = await invoke('choose_folder'); if (path) { await invoke('init_repository', { path }); await loadRepository(path); } } catch (error) { handleError(error); }
+  try { const path = await invoke('choose_folder'); if (path) { await invoke('init_repository', { path }); await openRepositoryFast(path); } } catch (error) { handleError(error); }
 });
 $('#newBranch').addEventListener('click', async () => {
   if (!state.repository) return;
@@ -2193,6 +2274,7 @@ refs.confirmNewBranch.addEventListener('click', async () => {
   finally { refs.confirmNewBranch.textContent = 'Create branch'; }
 });
 refs.commitButton.addEventListener('click', async () => {
+  if (!state.statusReady) { status('Still loading status — please wait a moment.', 'error'); return; }
   // Without this, the button gave no sign anything was happening — for a
   // commit touching many files (real work happens on the backend: staging,
   // writing the tree, then a full status/history reload) that looked

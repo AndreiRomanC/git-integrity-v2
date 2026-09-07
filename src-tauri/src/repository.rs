@@ -306,6 +306,13 @@ pub struct StashEntry { index: usize, message: String, base_commit: String }
 #[derive(Serialize)]
 pub struct RepositoryData { repository: RepositoryInfo, branches: Vec<Branch>, commits: Vec<Commit>, changes: Vec<Change>, stashes: Vec<StashEntry> }
 
+// Deliberately no `changes` field at all — status isn't computed yet when
+// this returns. The frontend treats its absence as "status pending" (shows
+// "Loading status…", disables Stage/Delete/Commit/checkout) until a
+// follow-up refresh_status call fills it in.
+#[derive(Serialize)]
+pub struct FastRepositoryData { repository: RepositoryInfo, branches: Vec<Branch>, commits: Vec<Commit>, stashes: Vec<StashEntry> }
+
 #[derive(Serialize)]
 pub struct DirectoryEntry {
     name: String,
@@ -1111,6 +1118,73 @@ fn sync_submodule_gitlinks_inner(repository_path: &str) -> Result<usize, &'stati
         }
     });
     Ok(submodule_count)
+}
+
+// A fast, read-only, additive first phase for *opening a repository specifically*
+// — validates and canonicalizes it (via internal_repository/Repository::discover,
+// same as everywhere else), reads its name/current branch, and returns
+// branches/commits/stashes, but does none of the two genuinely expensive parts
+// (a real Windows perf log measured 10-18s in sync_submodule_gitlinks and
+// 15-23s in the full status scan, on repositories with many submodules or many
+// files): no sync_submodule_gitlinks, no status scan. The frontend shows this
+// immediately (folders/files navigable, tracked/status shown as "Loading
+// status…", Stage/Delete/Commit/checkout disabled) then calls refresh_status
+// in the background to complete it.
+//
+// Deliberately a separate command, not a new mode of load_repository: that
+// function is relied on (and tested) to do a single, synchronous, fully
+// reconciled load — used for Refresh and after every mutating action, where
+// "did an externally-made submodule commit get caught" and "is status
+// correct right now" are exactly the guarantees needed. This only replaces
+// the *very first* open of a repository, where showing structure immediately
+// and filling in status a moment later is a better trade than blocking on
+// both up front. The modest duplication with load_repository's own
+// branches/commits/stashes logic is intentional: reusing a shared helper
+// would mean any future change to it risks affecting both, when only one of
+// them needs to change here.
+#[tauri::command]
+pub fn open_repository_fast(path: String) -> Result<FastRepositoryData, String> {
+    let started = Instant::now();
+    perf_log(&format!("open_repository_fast: START ({})", anonymized_repository_id(&path)), Duration::ZERO);
+    validate_path(&path)?;
+    let mut repo = internal_repository(&path)?;
+    let name = Path::new(&path).file_name().and_then(|n| n.to_str()).unwrap_or("repository").to_string();
+    let current_branch = repo.head().ok().and_then(|head| head.shorthand().map(String::from)).unwrap_or_default();
+    let step = Instant::now();
+    let mut branches = Vec::new();
+    for branch_type in [BranchType::Local, BranchType::Remote] { if let Ok(iterator) = repo.branches(Some(branch_type)) { for item in iterator.flatten() {
+        let branch_name = item.0.name().ok().flatten().unwrap_or("").to_string(); if branch_name.ends_with("/HEAD") { continue; }
+        branches.push(Branch { current: branch_type == BranchType::Local && branch_name == current_branch, name: branch_name, remote: branch_type == BranchType::Remote });
+    } } }
+    perf_log("open_repository_fast: branches", step.elapsed());
+
+    let step = Instant::now();
+    let mut refs_by_oid: HashMap<String, Vec<String>> = HashMap::new();
+    if let Ok(references) = repo.references() { for reference in references.flatten() {
+        if reference.name() == Some("refs/stash") { continue; }
+        if let (Some(oid), Some(name)) = (reference.target(), reference.shorthand()) { refs_by_oid.entry(oid.to_string()).or_default().push(name.to_string()); }
+    } }
+    let mut commits = Vec::new(); let mut walk = repo.revwalk().map_err(|error| error.message().to_string())?; walk.set_sorting(Sort::TOPOLOGICAL | Sort::TIME).map_err(|error| error.message().to_string())?;
+    if let Ok(references) = repo.references() { for reference in references.flatten() {
+        if reference.name() == Some("refs/stash") { continue; }
+        if let Ok(object) = reference.peel(ObjectType::Commit) { let _ = walk.push(object.id()); }
+    } }
+    for oid in walk.flatten().take(500) { if let Ok(commit) = repo.find_commit(oid) {
+        commits.push(Commit { id: oid.to_string(), parents: commit.parent_ids().map(|id| id.to_string()).collect(), subject: commit.summary().unwrap_or("No message").to_string(), author: commit.author().name().unwrap_or("Unknown").to_string(), date: short_date(commit.time().seconds()), refs: refs_by_oid.remove(&oid.to_string()).unwrap_or_default(), lane: 0 });
+    } }
+    perf_log("open_repository_fast: refs+revwalk+commits", step.elapsed());
+
+    let step = Instant::now();
+    let mut raw_stashes: Vec<(usize, String, git2::Oid)> = Vec::new();
+    let _ = repo.stash_foreach(|index, message, oid| { raw_stashes.push((index, message.to_string(), *oid)); true });
+    let stashes = raw_stashes.into_iter().map(|(index, message, oid)| {
+        let base_commit = repo.find_commit(oid).ok().and_then(|commit| commit.parent_id(0).ok()).map(|id| id.to_string()).unwrap_or_default();
+        StashEntry { index, message, base_commit }
+    }).collect();
+    perf_log("open_repository_fast: stashes", step.elapsed());
+
+    perf_log("open_repository_fast: TOTAL", started.elapsed());
+    Ok(FastRepositoryData { repository: RepositoryInfo { path, name, current_branch }, branches, commits, stashes })
 }
 
 #[tauri::command]
@@ -5505,5 +5579,75 @@ mod tests {
         }
         let changes_after_expiry = refresh_status(repo_string.clone()).unwrap();
         assert!(changes_after_expiry.is_empty(), "past the reuse window, this must be a real fresh scan of the (clean) repository, not the stale fake entry");
+    }
+
+    #[test]
+    fn open_directory_works_before_any_load_repository_call_at_all() {
+        // The core guarantee open_repository_fast's whole design depends on:
+        // load_directory is fully self-sufficient and doesn't need
+        // load_repository (or open_repository_fast) to have run first at
+        // all — navigating a repository that's had *no* prior load of any
+        // kind must just work, with correct tracked/status information,
+        // exactly as if a full load_repository had already primed the
+        // caches. This is what makes "show structure, fetch status in the
+        // background" safe: the frontend can let the user click into a
+        // folder before the background status fetch finishes and still see
+        // correct data, not placeholder/stale data.
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let repo_path = std::env::temp_dir().join(format!("git-integrity-fast-open-nav-{suffix}"));
+        fs::create_dir_all(repo_path.join("folder")).unwrap();
+        create_libgit2_repository(&repo_path, "README.md");
+        fs::write(repo_path.join("folder/new_file.txt"), "content").unwrap();
+        let repo_string = repo_path.to_string_lossy().into_owned();
+
+        let entries = load_directory(repo_string.clone(), "folder".into()).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].status, "??", "a brand-new file must show as untracked even though nothing has loaded this repository before");
+        assert!(!entries[0].tracked);
+    }
+
+    // Ignored by default (creating many real submodules is itself slow) — a
+    // "combined stress" case: many submodules plus a real, moderately large
+    // tracked file set, measuring open_repository_fast against the existing
+    // load_repository on the *same*, unmutated repository. Run explicitly
+    // with `cargo test --release -- --ignored open_repository_fast_is_much_faster`.
+    #[test]
+    #[ignore]
+    fn open_repository_fast_is_much_faster_than_load_repository_on_a_combined_stress_repo() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-combined-stress-{suffix}"));
+        let parent = base.join("parent");
+        create_libgit2_repository(&parent, "README.md");
+        let parent_string = parent.to_string_lossy().into_owned();
+
+        let setup_started = Instant::now();
+        for dir in 0..50 {
+            let dir_path = parent.join(format!("existing_{dir}"));
+            fs::create_dir_all(&dir_path).unwrap();
+            for file in 0..100 { fs::write(dir_path.join(format!("f{file}.txt")), b"x").unwrap(); }
+        }
+        stage_all(parent_string.clone(), String::new()).unwrap();
+        commit_staged(parent_string.clone(), "Add 5000 tracked files".into()).unwrap();
+        for i in 0..30 {
+            let dependency = base.join(format!("dep_{i}"));
+            create_libgit2_repository(&dependency, "module.txt");
+            add_submodule(parent_string.clone(), "".into(), dependency.to_string_lossy().into_owned(), format!("sub_{i}"), String::new(), String::new()).unwrap();
+        }
+        commit_staged(parent_string.clone(), "Add 30 submodules".into()).unwrap();
+        println!("PERF combined-stress setup (5000 files, 30 submodules): {:?}", setup_started.elapsed());
+
+        // Neither call below mutates the repository — pure reads, back to back.
+        let fast_started = Instant::now();
+        let fast = open_repository_fast(parent_string.clone()).unwrap();
+        let fast_elapsed = fast_started.elapsed();
+        println!("PERF open_repository_fast: {fast_elapsed:?} ({} branches, {} commits)", fast.branches.len(), fast.commits.len());
+
+        let full_started = Instant::now();
+        let full = load_repository(parent_string.clone(), Some(true)).unwrap();
+        let full_elapsed = full_started.elapsed();
+        println!("PERF load_repository (force, same repo, no mutation between calls): {full_elapsed:?} ({} branches, {} commits, {} changes)", full.branches.len(), full.commits.len(), full.changes.len());
+
+        println!("PERF speedup: open_repository_fast was {:.1}x faster", full_elapsed.as_secs_f64() / fast_elapsed.as_secs_f64().max(0.0001));
+        assert!(fast_elapsed < full_elapsed, "open_repository_fast ({fast_elapsed:?}) should be faster than load_repository ({full_elapsed:?}) by skipping sync_submodule_gitlinks and the full status scan");
     }
 }

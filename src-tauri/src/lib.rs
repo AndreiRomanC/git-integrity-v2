@@ -12,6 +12,7 @@ pub fn run() {
             repository::open_external_url,
             repository::open_repository_item,
             repository::open_commit_on_server,
+            repository::open_repository_fast,
             repository::load_repository,
             repository::refresh_status,
             repository::stage_files,
