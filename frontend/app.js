@@ -38,6 +38,16 @@ const invoke = rawInvoke && ((command, args) => {
     status(message, 'error');
     return Promise.reject(message);
   }
+  // Same idea as state.statusReady above, scoped to whichever submodule is
+  // currently being browsed: the first entry into a submodule shows its
+  // filesystem-only listing immediately (see openDirectory) while its one
+  // real status scan runs in the background — mutating anything before that
+  // scan lands would act on a status this app hasn't actually confirmed yet.
+  if (MUTATING_COMMANDS.has(command) && state.activeSubmodule && !state.activeSubmodule.statusReady) {
+    const message = 'Still checking this submodule\'s status — please wait a moment.';
+    status(message, 'error');
+    return Promise.reject(message);
+  }
   return rawInvoke(command, args);
 });
 const $ = selector => document.querySelector(selector);
@@ -68,7 +78,19 @@ const state = { repository: null, branches: [], commits: [], allCommits: [], cha
   // an index/status this app hasn't actually read yet. Every other load
   // path (loadRepository, used for Refresh and after any action) already
   // includes real status and leaves this true.
-  statusReady: true, consoleCommandRunning: false };
+  // Non-null while state.currentPath is inside a submodule whose own status
+  // hasn't been (or hasn't yet finished being) scanned this session:
+  // { path: submodule's parent-relative path, statusReady: bool }. See
+  // openDirectory's submodule branch and the invoke wrapper's gate above.
+  // The repository's known submodule paths (from load_repository/
+  // open_repository_fast's own index read, landed here by the same
+  // Object.assign(state, data) every load already does — hence snake_case,
+  // matching every other backend-sourced field name in this file) — purely
+  // client-side lookup so recognizing "this navigation is inside a
+  // submodule" costs nothing extra on ordinary (non-submodule) folder
+  // clicks. See submoduleBoundaryFor.
+  submodule_paths: [],
+  statusReady: true, consoleCommandRunning: false, activeSubmodule: null };
 const previewData = {
   repository: { name: 'vehicle-control', path: '/projects/vehicle-control', current_branch: 'feature/diagnostics' },
   branches: [
@@ -337,8 +359,9 @@ async function openRepositoryFast(path) {
     const data = await invoke('open_repository_fast', { path });
     if (generation !== repoOpenGeneration) return;
     directoryCache.clear();
+    warmSubmodules = new Set(); // a different repository's submodule paths mean nothing here
     Object.assign(state, data);
-    state.changes = []; state.statusReady = false;
+    state.changes = []; state.statusReady = false; state.activeSubmodule = null;
     state.allCommits = data.commits; state.historyScope = ''; state.view = 'explorer'; state.commanderPath = ''; state.commanderRows = [];
     state.remoteRef = data.branches.find(branch => branch.remote)?.name || '';
     state.hasStash = state.stashes.length > 0; updateStashUI();
@@ -750,24 +773,30 @@ function attachFileListDelegation() {
 function jsPerfLog(label, elapsedMs) { if (invoke) invoke('frontend_perf_log', { label, elapsedMs }).catch(() => {}); }
 
 let explorerRequestSeq = 0;
-// options.force only bypasses the *frontend* directoryCache (re-read this
-// folder from the backend instead of trusting whatever was cached from an
-// earlier navigation) — it does NOT, by itself, mean "the backend's Git
-// status is stale". Those are two different questions: right after
-// refresh_status/load_repository just computed a full, current status scan,
-// every caller here wants a repaint with that freshly-scanned data (bypass
-// the frontend cache, since it may hold pre-mutation entries) but must NOT
-// throw that same-second scan away and pay for a second one. Only
-// options.invalidateGit (the explicit "Reload folder" button — the one
-// place the user is explicitly saying "show me whatever's on disk right
-// now, I don't trust anything cached") asks the backend to invalidate and
-// rescan. Conflating the two here previously meant every post-mutation
-// repaint re-triggered a full backend rescan a few hundred milliseconds
-// after the mutation's own reload had just paid for one.
-async function openDirectory(path, options = {}) {
-  if (!state.repository) return;
-  state.currentPath = path; state.selectedEntry = null;
-  const requestId = ++explorerRequestSeq;
+// Submodules this session has already confirmed have a warm, current status
+// snapshot on the backend — either because openDirectory's own background
+// scan (below) finished, or because submodule_navigation_status found one
+// already sitting there (from Submodule branch map, a submodule commit/push/
+// pull, or any other flow that happens to read that submodule's status).
+// Session-only and never assumed stale on its own — a submodule that goes
+// unvisited long enough for the backend's own TTL to expire just falls back
+// to load_directory's ordinary per-folder scoped scan next time, same as
+// before this existed; nothing here depends on tracking that expiry too.
+// Cleared whenever a different repository is opened (paths aren't
+// meaningfully comparable across repositories).
+let warmSubmodules = new Set();
+
+// Purely client-side, no backend call: state.submodule_paths comes from
+// load_repository/open_repository_fast's own index read, so this costs
+// nothing beyond an array scan — every ordinary (non-submodule) folder click
+// resolves to null here without ever reaching the backend for the question.
+function submoduleBoundaryFor(path) {
+  return state.submodule_paths.find(sub => path === sub || path.startsWith(`${sub}/`)) || null;
+}
+
+// The actual load_directory round-trip + render, shared by the normal path
+// and by the two-phase submodule flow's repaint once its scan lands.
+async function fetchAndRenderDirectory(path, requestId, options) {
   if (!options.force && directoryCache.has(path)) { state.entries = directoryCache.get(path); render(); return; }
   refs.fileList.innerHTML = '<div class="loading-row"><i class="spinner"></i>Loading folder…</div>';
   if (!invoke) { state.entries = previewData.entries; directoryCache.set(path, state.entries); render(); return; }
@@ -786,16 +815,84 @@ async function openDirectory(path, options = {}) {
   }
 }
 
-// Filesystem-only variant of openDirectory used only for the very first
-// render of the root folder while opening a repository (see
-// list_directory_fast's doc comment) — never populates directoryCache, so a
-// later, real openDirectory(force:false) for the same folder can never
-// accidentally serve this incomplete data back as if it were a real,
-// status-complete listing.
-async function openDirectoryFast(path) {
+// options.force only bypasses the *frontend* directoryCache (re-read this
+// folder from the backend instead of trusting whatever was cached from an
+// earlier navigation) — it does NOT, by itself, mean "the backend's Git
+// status is stale". Those are two different questions: right after
+// refresh_status/load_repository just computed a full, current status scan,
+// every caller here wants a repaint with that freshly-scanned data (bypass
+// the frontend cache, since it may hold pre-mutation entries) but must NOT
+// throw that same-second scan away and pay for a second one. Only
+// options.invalidateGit (the explicit "Reload folder" button — the one
+// place the user is explicitly saying "show me whatever's on disk right
+// now, I don't trust anything cached") asks the backend to invalidate and
+// rescan. Conflating the two here previously meant every post-mutation
+// repaint re-triggered a full backend rescan a few hundred milliseconds
+// after the mutation's own reload had just paid for one.
+//
+// A first navigation into a submodule (per warmSubmodules above) is a third,
+// separate case: rather than block on that submodule's own status scan
+// synchronously — which used to mean every single folder browsed inside a
+// submodule paid for its own ~220-600ms scoped Git scan — this shows the
+// existing filesystem-only listing immediately (status marked Loading/
+// unknown), starts the submodule's one real, read-only, single-flight status
+// scan in the background, and repaints with real status once it lands.
+// Every subsequent folder inside that same submodule (this call, from then
+// on) goes through the normal path below and reuses that one scan via the
+// backend's existing cache-reuse path — no scoped rescan per folder. Never
+// pre-scans any *other* submodule; only the one just entered.
+async function openDirectory(path, options = {}) {
   if (!state.repository) return;
   state.currentPath = path; state.selectedEntry = null;
   const requestId = ++explorerRequestSeq;
+
+  const boundary = submoduleBoundaryFor(path);
+  if (!boundary) {
+    state.activeSubmodule = null;
+  } else if (warmSubmodules.has(boundary)) {
+    state.activeSubmodule = { path: boundary, statusReady: true };
+  } else {
+    state.activeSubmodule = { path: boundary, statusReady: false };
+    let alreadyWarm = false;
+    if (invoke) {
+      try {
+        const nav = await invoke('submodule_navigation_status', { repositoryPath: state.repository.path, relativePath: path });
+        alreadyWarm = Boolean(nav?.ready);
+      } catch { /* treat as cold — the fast path below is always correct, just not free */ }
+    }
+    if (requestId !== explorerRequestSeq) return; // navigated away while checking
+    if (alreadyWarm) {
+      warmSubmodules.add(boundary);
+      state.activeSubmodule = { path: boundary, statusReady: true };
+    } else {
+      await paintDirectoryFast(path, requestId);
+      if (requestId !== explorerRequestSeq) return;
+      if (invoke) {
+        try { await invoke('submodule_folder_status', { repositoryPath: state.repository.path, relativePath: path }); }
+        catch (error) { status(String(error), 'error'); /* fall through: mutations must not stay disabled forever over a failed scan */ }
+      }
+      warmSubmodules.add(boundary);
+      if (requestId !== explorerRequestSeq || state.currentPath !== path) return;
+      state.activeSubmodule = { path: boundary, statusReady: true };
+      // Real status is in cache now — repaint with it. `force` alone (never
+      // invalidateGit, even if the original call asked for it): the scan
+      // above already *is* the fresh, read-only rescan the caller wanted —
+      // reuse what it just computed, don't ask the backend to throw it away
+      // and pay for a second one right behind it.
+      return fetchAndRenderDirectory(path, requestId, { ...options, force: true, invalidateGit: false });
+    }
+  }
+  return fetchAndRenderDirectory(path, requestId, options);
+}
+
+// Filesystem-only variant of openDirectory used for the very first render of
+// the repository root while opening it (see list_directory_fast's doc
+// comment) and, via paintDirectoryFast below, for the first render of a
+// submodule folder while its own status scan warms up — never populates
+// directoryCache, so a later, real openDirectory(force:false) for the same
+// folder can never accidentally serve this incomplete data back as if it
+// were a real, status-complete listing.
+async function paintDirectoryFast(path, requestId) {
   refs.fileList.innerHTML = '<div class="loading-row"><i class="spinner"></i>Loading folder…</div>';
   if (!invoke) { state.entries = previewData.entries; render(); return; }
   try {
@@ -806,6 +903,13 @@ async function openDirectoryFast(path) {
     if (requestId !== explorerRequestSeq) return;
     status(String(error), 'error'); refs.fileList.innerHTML = `<div class="empty-change">${esc(String(error))}</div>`;
   }
+}
+
+async function openDirectoryFast(path) {
+  if (!state.repository) return;
+  state.currentPath = path; state.selectedEntry = null;
+  const requestId = ++explorerRequestSeq;
+  await paintDirectoryFast(path, requestId);
 }
 
 async function openSubmoduleMenu(entry, x, y) {
@@ -2303,7 +2407,15 @@ document.addEventListener('click', event => {
   invoke('open_commit_on_server', { repositoryPath, commitId }).catch(error => handleError(error));
 });
 refs.goUp.addEventListener('click', () => { const commander = state.view === 'commander'; const parts = (commander ? state.commanderPath : state.currentPath).split('/').filter(Boolean); parts.pop(); commander ? openCommanderDirectory(parts.join('/')) : openDirectory(parts.join('/')); });
-refs.reloadFolder.addEventListener('click', () => state.view === 'commander' ? openCommanderDirectory(state.commanderPath) : openDirectory(state.currentPath, { force: true, invalidateGit: true }));
+refs.reloadFolder.addEventListener('click', () => {
+  if (state.view === 'commander') return openCommanderDirectory(state.commanderPath);
+  // An explicit reload invalidates the submodule's backend snapshot too (see
+  // load_directory's `force`/status_repo) — forget it was warm so the next
+  // navigation inside it redoes the fast-paint + single background scan
+  // instead of relying on a snapshot that was just thrown away.
+  if (state.activeSubmodule) warmSubmodules.delete(state.activeSubmodule.path);
+  return openDirectory(state.currentPath, { force: true, invalidateGit: true });
+});
 document.addEventListener('keydown', event => { if (event.key !== 'Escape' || state.view !== 'commander' || document.querySelector('dialog[open]')) return; event.preventDefault(); returnToProjectNavigator(); });
 refs.remoteRef.addEventListener('change', () => { state.remoteRef = refs.remoteRef.value; openCommanderDirectory(state.commanderPath); });
 $('#closeSubmoduleMenu').addEventListener('click', () => { refs.submoduleMenu.hidden = true; });

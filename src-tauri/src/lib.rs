@@ -24,6 +24,8 @@ pub fn run() {
             repository::switch_branch,
             repository::load_directory,
             repository::list_directory_fast,
+            repository::submodule_navigation_status,
+            repository::submodule_folder_status,
             repository::entry_details,
             repository::entry_last_commit,
             repository::submodule_versions,

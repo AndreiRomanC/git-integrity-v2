@@ -304,14 +304,14 @@ pub struct Change { status: String, path: String, staged: bool }
 pub struct StashEntry { index: usize, message: String, base_commit: String }
 
 #[derive(Serialize)]
-pub struct RepositoryData { repository: RepositoryInfo, branches: Vec<Branch>, commits: Vec<Commit>, changes: Vec<Change>, stashes: Vec<StashEntry> }
+pub struct RepositoryData { repository: RepositoryInfo, branches: Vec<Branch>, commits: Vec<Commit>, changes: Vec<Change>, stashes: Vec<StashEntry>, submodule_paths: Vec<String> }
 
 // Deliberately no `changes` field at all — status isn't computed yet when
 // this returns. The frontend treats its absence as "status pending" (shows
 // "Loading status…", disables Stage/Delete/Commit/checkout) until a
 // follow-up refresh_status call fills it in.
 #[derive(Serialize)]
-pub struct FastRepositoryData { repository: RepositoryInfo, branches: Vec<Branch>, commits: Vec<Commit>, stashes: Vec<StashEntry> }
+pub struct FastRepositoryData { repository: RepositoryInfo, branches: Vec<Branch>, commits: Vec<Commit>, stashes: Vec<StashEntry>, submodule_paths: Vec<String> }
 
 #[derive(Serialize)]
 pub struct DirectoryEntry {
@@ -1274,8 +1274,14 @@ pub fn open_repository_fast(path: String) -> Result<FastRepositoryData, String> 
     }).collect();
     perf_log("open_repository_fast: stashes", step.elapsed());
 
+    // Index-only (no working-tree scan) — cheap and exactly what lets the
+    // frontend recognize "this path is inside a submodule" purely client-side
+    // on every navigation click, without asking the backend each time (see
+    // submodule_navigation_status, used only when this list disagrees with
+    // what the frontend already believes, e.g. a submodule added since).
+    let submodule_paths: Vec<String> = cached_index_metadata(&path).1.iter().cloned().collect();
     perf_log("open_repository_fast: TOTAL", started.elapsed());
-    Ok(FastRepositoryData { repository: RepositoryInfo { path, name, current_branch }, branches, commits, stashes })
+    Ok(FastRepositoryData { repository: RepositoryInfo { path, name, current_branch }, branches, commits, stashes, submodule_paths })
 }
 
 #[tauri::command]
@@ -1339,9 +1345,10 @@ pub fn load_repository(path: String, force: Option<bool>) -> Result<RepositoryDa
     let changes = internal.into_iter().map(|(path, status, staged)| Change { status, path, staged }).collect();
 
     replace_git_metadata(&path, statuses);
+    let submodule_paths: Vec<String> = cached_index_metadata(&path).1.iter().cloned().collect();
 
     perf_log("load_repository: TOTAL", load_started.elapsed());
-    Ok(RepositoryData { repository: RepositoryInfo { path, name, current_branch }, branches, commits, changes, stashes })
+    Ok(RepositoryData { repository: RepositoryInfo { path, name, current_branch }, branches, commits, changes, stashes, submodule_paths })
 }
 
 // A lightweight "what changed" refresh — status only, no branches/commits/
@@ -1984,6 +1991,63 @@ pub fn submodule_repository(repository_path: String, relative_path: String) -> R
 // that's instant regardless of repository size. status_known is false
 // throughout; the frontend shows a loading state instead of treating
 // tracked/status as real answers.
+#[derive(Serialize)]
+pub struct SubmoduleNavigationStatus {
+    // Parent-relative path of the submodule `relative_path` is inside — lets
+    // the frontend recognize "still inside the same submodule" on later
+    // navigation without asking the backend again on every click.
+    submodule_path: String,
+    // Whether a full, current status snapshot for that submodule is already
+    // sitting in full_status_cache (seeded by submodule_folder_status below,
+    // or by anything else that scanned this exact submodule recently) — an
+    // index-only, no-Git-calls check.
+    ready: bool,
+}
+
+// Cheap (index lookup + one cache-timestamp check, no Git process, no status
+// scan) — the frontend calls this on navigating into a folder to decide
+// whether it can go straight to the normal load_directory (submodule not
+// involved, or already warm) or must show the filesystem-only listing first
+// while a background scan warms this one specific submodule.
+#[tauri::command]
+pub fn submodule_navigation_status(repository_path: String, relative_path: String) -> Result<Option<SubmoduleNavigationStatus>, String> {
+    validate_path(&repository_path)?;
+    let relative = safe_relative_path(&relative_path)?;
+    let relative_string = normalized(&relative);
+    let (_, submodules) = cached_index_metadata(&repository_path);
+    let Some(submodule_path) = submodules.iter()
+        .find(|sub| relative_string == sub.as_str() || relative_string.starts_with(&format!("{sub}/")))
+        .cloned() else { return Ok(None) };
+    let absolute_sub = Path::new(&repository_path).join(&submodule_path).to_string_lossy().into_owned();
+    let ready = full_status_cache().lock().unwrap().get(&absolute_sub).map(|(cached_at, _)| cached_at.elapsed() < GIT_METADATA_TTL).unwrap_or(false);
+    Ok(Some(SubmoduleNavigationStatus { submodule_path, ready }))
+}
+
+// The one read-only, single-flight full status scan of *one specific*
+// submodule's own repository — never every submodule (a repository with
+// hundreds of submodules must never pay for scanning ones the user hasn't
+// even opened, especially not on Windows where each Git subprocess/libgit2
+// call is comparatively more expensive). Reuses recent_full_statuses, the
+// same single-flight + short reuse-window machinery refresh_status already
+// relies on, so a second call landing while the first is still scanning
+// blocks and reuses its result instead of starting a redundant scan of its
+// own. Seeds full_status_cache (keyed by the submodule's own absolute path)
+// — every subsequent load_directory/entry_details call for *any* folder or
+// file inside this submodule then reuses that one snapshot via the existing
+// worktree_status/cached_git_metadata reuse path, instead of each running
+// its own scoped scan.
+#[tauri::command]
+pub fn submodule_folder_status(repository_path: String, relative_path: String) -> Result<(), String> {
+    validate_path(&repository_path)?;
+    let (sub_path, _inner) = resolve_submodule_boundary(&repository_path, &relative_path)
+        .ok_or("This path is not inside a submodule")?;
+    let repo = internal_repository(&sub_path)?;
+    let statuses = recent_full_statuses(&repo, &sub_path)?;
+    let mapped = statuses.into_iter().map(|(path, status, _)| (path, status)).collect();
+    replace_git_metadata(&sub_path, mapped);
+    Ok(())
+}
+
 #[tauri::command]
 pub fn list_directory_fast(repository_path: String, relative_path: String) -> Result<Vec<DirectoryEntry>, String> {
     let started = Instant::now();
@@ -4409,6 +4473,117 @@ mod tests {
         let forced = load_directory(path, "".into(), Some(true)).unwrap();
         let forced_readme = forced.iter().find(|e| e.relative_path == "README.md").unwrap();
         assert!(!forced_readme.status.is_empty(), "an explicit forced reload must see the external edit");
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn submodule_navigation_status_reports_none_outside_a_submodule_and_tracks_readiness() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-subnav-status-{suffix}"));
+        let repository = base.join("main");
+        let dependency = base.join("dependency");
+        create_libgit2_repository(&repository, "README.md");
+        create_libgit2_repository(&dependency, "module.txt");
+        run_git(&repository, &["-c", "protocol.file.allow=always", "submodule", "add", dependency.to_str().unwrap(), "vendor/dep"]);
+        run_git(&repository, &["commit", "-am", "Add dep submodule"]);
+        let repo_path = repository.to_string_lossy().into_owned();
+
+        assert!(submodule_navigation_status(repo_path.clone(), "".into()).unwrap().is_none(), "the repository root is not inside a submodule");
+        assert!(submodule_navigation_status(repo_path.clone(), "README.md".into()).unwrap().is_none(), "an ordinary parent-repo file is not inside a submodule");
+
+        let before = submodule_navigation_status(repo_path.clone(), "vendor/dep".into()).unwrap().expect("vendor/dep should be recognized as a submodule");
+        assert_eq!(before.submodule_path, "vendor/dep");
+        assert!(!before.ready, "no scan has happened yet — must not be reported ready");
+
+        submodule_folder_status(repo_path.clone(), "vendor/dep".into()).unwrap();
+
+        let after = submodule_navigation_status(repo_path, "vendor/dep".into()).unwrap().unwrap();
+        assert!(after.ready, "after submodule_folder_status scans it, the submodule must be reported ready");
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn submodule_folder_status_scans_only_the_requested_submodule_not_every_submodule() {
+        // "Nu pre-scana toate submodulele" — a repository with several
+        // submodules must never have entering one of them trigger a scan of
+        // the others too (an I/O storm on a project with hundreds, especially
+        // on Windows). Proven the same way as the other cache-reuse tests: an
+        // external edit made right after scanning submodule A must still be
+        // invisible through A's own snapshot reuse, while submodule B (never
+        // scanned) must show its own real, current status when read directly.
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-subnav-isolated-{suffix}"));
+        let repository = base.join("main");
+        let dep_a = base.join("dep-a");
+        let dep_b = base.join("dep-b");
+        create_libgit2_repository(&repository, "README.md");
+        create_libgit2_repository(&dep_a, "a.txt");
+        create_libgit2_repository(&dep_b, "b.txt");
+        run_git(&repository, &["-c", "protocol.file.allow=always", "submodule", "add", dep_a.to_str().unwrap(), "vendor/a"]);
+        run_git(&repository, &["-c", "protocol.file.allow=always", "submodule", "add", dep_b.to_str().unwrap(), "vendor/b"]);
+        run_git(&repository, &["commit", "-am", "Add both submodules"]);
+        let repo_path = repository.to_string_lossy().into_owned();
+
+        submodule_folder_status(repo_path.clone(), "vendor/a".into()).unwrap();
+        assert!(submodule_navigation_status(repo_path.clone(), "vendor/a".into()).unwrap().unwrap().ready, "the requested submodule should now be ready");
+        assert!(!submodule_navigation_status(repo_path.clone(), "vendor/b".into()).unwrap().unwrap().ready, "a sibling submodule that was never entered must not have been scanned too");
+
+        // b's real, current status must still be answered correctly on demand
+        // (just not pre-emptively) — add an untracked file and confirm load_directory sees it.
+        fs::write(repository.join("vendor/b/new.txt"), "new").unwrap();
+        let listing = load_directory(repo_path, "vendor/b".into(), None).unwrap();
+        let new_entry = listing.iter().find(|entry| entry.name == "new.txt").expect("the new file in the never-prescanned submodule should still be listed with real status");
+        assert!(!new_entry.status.is_empty(), "vendor/b must still get its own correct, current status when actually read, despite never being pre-scanned");
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn one_submodule_folder_status_scan_serves_every_subsequent_folder_and_entry_details_in_that_submodule() {
+        // The core acceptance criteria: one scan per submodule, then cache
+        // HIT for its folders (load_directory) *and* for entry_details on
+        // files inside it — reproduced the same way as the parent-repository
+        // version of this test: an external edit right after the one scan
+        // must not show up in any of the reads that follow, since seeing it
+        // would mean one of them rescanned instead of reusing the snapshot.
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-subnav-reuse-{suffix}"));
+        let repository = base.join("main");
+        let dependency = base.join("dependency");
+        create_libgit2_repository(&repository, "README.md");
+        fs::create_dir_all(dependency.join("nested")).unwrap();
+        fs::write(dependency.join("top.txt"), "a").unwrap();
+        fs::write(dependency.join("nested/deep.txt"), "b").unwrap();
+        run_git(&dependency, &["init"]);
+        run_git(&dependency, &["config", "user.email", "test@example.com"]);
+        run_git(&dependency, &["config", "user.name", "Test User"]);
+        run_git(&dependency, &["add", "."]);
+        run_git(&dependency, &["commit", "-m", "Initial"]);
+        run_git(&repository, &["-c", "protocol.file.allow=always", "submodule", "add", dependency.to_str().unwrap(), "vendor/dep"]);
+        run_git(&repository, &["commit", "-am", "Add dep submodule"]);
+        let repo_path = repository.to_string_lossy().into_owned();
+
+        // The one full scan for this submodule.
+        submodule_folder_status(repo_path.clone(), "vendor/dep".into()).unwrap();
+
+        // External edits, made right after that one scan, to a file in the
+        // submodule's root listing, one in a nested folder, and one that will
+        // be looked up individually via entry_details.
+        fs::write(repository.join("vendor/dep/top.txt"), "edited after the scan").unwrap();
+        fs::write(repository.join("vendor/dep/nested/deep.txt"), "edited after the scan too").unwrap();
+
+        let root_listing = load_directory(repo_path.clone(), "vendor/dep".into(), None).unwrap();
+        let top = root_listing.iter().find(|e| e.name == "top.txt").unwrap();
+        assert!(top.status.is_empty(), "listing the submodule's own root must reuse the one scan, not rescan");
+
+        let nested_listing = load_directory(repo_path.clone(), "vendor/dep/nested".into(), None).unwrap();
+        let deep = nested_listing.iter().find(|e| e.name == "deep.txt").unwrap();
+        assert!(deep.status.is_empty(), "a nested folder inside the submodule must also reuse the same scan, not run its own scoped scan");
+
+        let details = entry_details(repo_path, "vendor/dep/nested/deep.txt".into()).unwrap();
+        assert!(details.status.is_empty(), "entry_details for a file inside the submodule must reuse the same snapshot too, not trigger a duplicate scan");
 
         fs::remove_dir_all(base).unwrap();
     }
