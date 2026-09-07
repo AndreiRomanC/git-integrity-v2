@@ -503,7 +503,50 @@ fn git(path: &str, args: &[&str]) -> Result<String, String> {
 }
 
 #[derive(Serialize)]
-pub struct RawGitResult { stdout: String, stderr: String, success: bool }
+pub struct RawGitResult { stdout: String, stderr: String, success: bool, exit_code: Option<i32>, read_only: bool }
+
+// A minimal shell-like tokenizer — single/double-quoted segments (with
+// backslash-escaping *inside* double quotes only, matching common shell
+// behavior closely enough for this) are kept together as one argument, so
+// `commit -m "fix bug in parser"` produces the 3 arguments a real shell
+// would, not `split_whitespace`'s 6. That bug was real, not theoretical: any
+// commit message, path, or branch name containing a space was silently
+// mangled into multiple bogus arguments before this.
+fn tokenize_git_args(input: &str) -> Result<Vec<String>, String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut has_current = false;
+    let mut chars = input.chars().peekable();
+    let mut quote: Option<char> = None;
+    while let Some(ch) = chars.next() {
+        match quote {
+            Some(q) => {
+                if ch == '\\' && q == '"' { if let Some(&next) = chars.peek() { if next == '"' || next == '\\' { current.push(next); chars.next(); continue; } } current.push(ch); }
+                else if ch == q { quote = None; }
+                else { current.push(ch); }
+            }
+            None => {
+                if ch == '"' || ch == '\'' { quote = Some(ch); has_current = true; }
+                else if ch.is_whitespace() { if has_current { tokens.push(std::mem::take(&mut current)); has_current = false; } }
+                else { current.push(ch); has_current = true; }
+            }
+        }
+    }
+    if quote.is_some() { return Err("Unclosed quote in command".into()); }
+    if has_current { tokens.push(current); }
+    Ok(tokens)
+}
+
+// A command whose *subcommand alone* (ignoring every flag/argument after it)
+// can never mutate the repository, its index, or the working tree — matched
+// against a strict, deliberately short allowlist. Anything not on this list
+// is treated conservatively as possibly mutating, even if it's actually
+// read-only in practice (e.g. `remote -v`) — the cost of a false negative
+// here (an unnecessary reload) is far lower than a false positive (skipping
+// a reload after something that actually changed state).
+fn is_read_only_git_subcommand(subcommand: &str) -> bool {
+    matches!(subcommand, "status" | "log" | "diff" | "show" | "blame" | "ls-files")
+}
 
 // The command console's "run any git command" escape hatch — scoped to whatever
 // folder the caller passes (the folder currently being browsed, or a selected
@@ -517,22 +560,48 @@ pub struct RawGitResult { stdout: String, stderr: String, success: bool }
 // again (a common typo: pasting "git status" here instead of just "status").
 #[tauri::command]
 pub fn run_git_command(repository_path: String, args: String) -> Result<RawGitResult, String> {
+    let started = Instant::now();
     validate_path(&repository_path)?;
-    let mut parts: Vec<&str> = args.split_whitespace().collect();
+    // Held for the whole command, including a genuinely read-only one — the
+    // frontend already refuses to start a second console command while one
+    // is running, but this is what makes that actually safe against every
+    // *other* mutation too (Stage/Commit/Delete/checkout/stash), not just
+    // against another console command, the same as every other
+    // index/HEAD-mutating command in this file.
+    let lock_handle = repo_write_lock(&repository_path);
+    let _lock = lock_handle.lock().unwrap();
+    let mut parts = tokenize_git_args(&args)?;
     // Typing the full, natural command ("git status") is just as valid as the
     // short form ("status") — strip a leading "git" token instead of
     // rejecting it, so this behaves like a real terminal either way.
-    if parts.first() == Some(&"git") { parts.remove(0); }
+    if parts.first().map(String::as_str) == Some("git") { parts.remove(0); }
     if parts.is_empty() { return Err("Type a git subcommand, e.g. \"status\" or \"log --oneline -10\"".into()); }
+    let read_only = is_read_only_git_subcommand(&parts[0]);
+    // Never the full argument list — it can contain commit messages, file
+    // contents, tokens embedded in a URL, or anything else the user typed.
+    // Only the subcommand itself, which repo this ran against, the duration,
+    // and the outcome are safe to write to a log file that might get shared
+    // back for diagnosis.
+    let repo_id = anonymized_repository_id(&repository_path);
     let mut command = Command::new("git");
     configure_git_command(&mut command);
     command.arg("-C").arg(&repository_path).arg("-c").arg("color.ui=false").args(&parts);
-    let output = run_with_timeout(command)?;
+    let output = run_with_timeout(command);
+    let output = match output {
+        Ok(output) => output,
+        Err(error) => {
+            perf_log(&format!("run_git_command: {} ({repo_id}, read_only={read_only}) TIMED_OUT", parts[0]), started.elapsed());
+            return Err(error);
+        }
+    };
+    perf_log(&format!("run_git_command: {} ({repo_id}, read_only={read_only}) exit_code={:?}", parts[0], output.status.code()), started.elapsed());
     invalidate_git_metadata(&repository_path);
     Ok(RawGitResult {
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         success: output.status.success(),
+        exit_code: output.status.code(),
+        read_only,
     })
 }
 
@@ -5765,5 +5834,69 @@ mod tests {
         println!("PERF load_directory (root, reusing refresh_status's scan): {reload_elapsed:?} ({} entries)", real_entries.len());
         assert!(real_entries.iter().all(|entry| entry.status_known), "the real load_directory must always report status_known");
         assert!(reload_elapsed < scan_elapsed, "reloading the same folder right after refresh_status ({reload_elapsed:?}) should be much faster than the real scan ({scan_elapsed:?}) it reuses, not run a second one");
+    }
+
+    #[test]
+    fn tokenize_git_args_respects_quotes_with_spaces() {
+        // The actual reported bug: split_whitespace on `commit -m "fix bug
+        // in parser"` produced 6 bogus arguments instead of the 3 a real
+        // shell would.
+        assert_eq!(
+            tokenize_git_args(r#"commit -m "fix bug in parser""#).unwrap(),
+            vec!["commit", "-m", "fix bug in parser"]
+        );
+        assert_eq!(tokenize_git_args("status").unwrap(), vec!["status"]);
+        assert_eq!(tokenize_git_args("log --oneline -10").unwrap(), vec!["log", "--oneline", "-10"]);
+        assert_eq!(tokenize_git_args("checkout 'my branch'").unwrap(), vec!["checkout", "my branch"]);
+        assert_eq!(tokenize_git_args(r#"commit -m "say \"hi\"""#).unwrap(), vec!["commit", "-m", "say \"hi\""]);
+        assert_eq!(tokenize_git_args("  status   --short  ").unwrap(), vec!["status", "--short"]);
+        assert_eq!(tokenize_git_args("").unwrap(), Vec::<String>::new());
+        assert!(tokenize_git_args(r#"commit -m "unclosed"#).is_err(), "an unclosed quote should be a clear error, not silently mis-split");
+    }
+
+    #[test]
+    fn read_only_git_subcommand_allowlist_is_strict() {
+        for allowed in ["status", "log", "diff", "show", "blame", "ls-files"] {
+            assert!(is_read_only_git_subcommand(allowed), "{allowed} should be read-only");
+        }
+        // Conservative by design: anything not explicitly listed is treated
+        // as possibly mutating, even a command that's usually read-only in
+        // practice (e.g. `remote -v`) — a missed reload is a worse bug than
+        // an unnecessary one.
+        for not_allowed in ["remote", "commit", "checkout", "reset", "push", "pull", "branch", "fetch", "stash", "rebase", "merge", "tag"] {
+            assert!(!is_read_only_git_subcommand(not_allowed), "{not_allowed} should NOT be treated as read-only");
+        }
+    }
+
+    #[test]
+    fn run_git_command_reports_exit_code_and_read_only_classification() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let repo_path = std::env::temp_dir().join(format!("git-integrity-console-{suffix}"));
+        create_libgit2_repository(&repo_path, "README.md");
+        let repo_string = repo_path.to_string_lossy().into_owned();
+
+        let status_result = run_git_command(repo_string.clone(), "status".into()).unwrap();
+        assert!(status_result.success);
+        assert_eq!(status_result.exit_code, Some(0));
+        assert!(status_result.read_only, "status must be classified read-only");
+
+        // A quoted commit message with spaces — the exact reported bug —
+        // must reach git as one argument, not get mangled into several.
+        fs::write(repo_path.join("new_file.txt"), "content").unwrap();
+        stage_files(repo_string.clone(), vec!["new_file.txt".into()]).unwrap();
+        let commit_result = run_git_command(repo_string.clone(), r#"commit -m "a message with spaces""#.into()).unwrap();
+        assert!(commit_result.success, "stdout={} stderr={}", commit_result.stdout, commit_result.stderr);
+        assert_eq!(commit_result.exit_code, Some(0));
+        assert!(!commit_result.read_only, "commit must NOT be classified read-only");
+
+        let repo = internal_repository(&repo_string).unwrap();
+        let subject = repo.head().unwrap().peel_to_commit().unwrap().summary().unwrap_or("").to_string();
+        assert_eq!(subject, "a message with spaces", "the quoted message must have reached git intact, not split into separate bogus arguments");
+
+        // A subcommand that fails should still report its real exit code, not error out.
+        let bad_result = run_git_command(repo_string.clone(), "log --this-flag-does-not-exist".into()).unwrap();
+        assert!(!bad_result.success);
+        assert_ne!(bad_result.exit_code, Some(0));
+        assert!(bad_result.read_only, "log must be classified read-only regardless of whether the specific invocation succeeded");
     }
 }

@@ -17,10 +17,24 @@ const MUTATING_COMMANDS = new Set([
   'create_submodule_branch', 'merge_branch', 'resolve_conflict', 'complete_merge', 'abort_merge',
   'sync_repository', 'publish_branch', 'fetch_remote', 'fetch_all_remotes', 'write_text_file', 'run_git_command',
 ]);
+// While a Git Console command is running, every mutation *and* switching to
+// a different repository (which would otherwise let that command's delayed
+// result try to reload/affect a repository the user isn't even looking at
+// anymore) are refused the same centralized way. run_git_command itself is
+// excluded here deliberately — runRawGitFromConsole's own check is what
+// actually prevents a second console command from starting, before this
+// wrapper is ever reached; blocking it here too would just refuse the
+// legitimate call that's about to set consoleCommandRunning in the first place.
+const REPO_SWITCH_COMMANDS = new Set(['load_repository', 'open_repository_fast']);
 const rawInvoke = window.__TAURI__?.core?.invoke;
 const invoke = rawInvoke && ((command, args) => {
   if (MUTATING_COMMANDS.has(command) && !state.statusReady) {
     const message = 'Still loading status — please wait a moment.';
+    status(message, 'error');
+    return Promise.reject(message);
+  }
+  if (command !== 'run_git_command' && state.consoleCommandRunning && (MUTATING_COMMANDS.has(command) || REPO_SWITCH_COMMANDS.has(command))) {
+    const message = 'A Git command is still running in the console — please wait for it to finish.';
     status(message, 'error');
     return Promise.reject(message);
   }
@@ -53,7 +67,7 @@ const state = { repository: null, branches: [], commits: [], allCommits: [], cha
   // an index/status this app hasn't actually read yet. Every other load
   // path (loadRepository, used for Refresh and after any action) already
   // includes real status and leaves this true.
-  statusReady: true };
+  statusReady: true, consoleCommandRunning: false };
 const previewData = {
   repository: { name: 'vehicle-control', path: '/projects/vehicle-control', current_branch: 'feature/diagnostics' },
   branches: [
@@ -2640,12 +2654,19 @@ function colorizeGitOutput(text) {
 
 function renderConsoleTranscript() {
   const list = $('#commandList'); list.classList.add('console-transcript');
-  list.innerHTML = state.consoleTranscript.map(entry => `<div class="raw-git-output">
-    <div class="raw-git-cmd">$ git ${esc(entry.args)} <span class="raw-git-cwd">(in ${esc(entry.targetLabel)})</span> <b class="raw-git-status ${entry.result.success ? 'ok' : 'fail'}">${entry.result.success ? 'OK' : 'FAILED'}</b></div>
-    ${entry.result.stdout ? `<pre class="raw-git-stdout">${colorizeGitOutput(entry.result.stdout)}</pre>` : ''}
-    ${entry.result.stderr ? `<pre class="raw-git-stderr">${colorizeGitOutput(entry.result.stderr)}</pre>` : ''}
-    ${!entry.result.stdout && !entry.result.stderr ? '<div class="raw-git-empty">(no output)</div>' : ''}
-  </div>`).join('') || '<div class="console-empty">Type a git command below and press Enter — e.g. "status", "log --oneline -10", "diff HEAD~1".</div>';
+  list.innerHTML = state.consoleTranscript.map(entry => {
+    const elapsed = entry.status === 'RUNNING' ? ((performance.now() - entry.startedAt) / 1000).toFixed(1) : (entry.elapsedMs / 1000).toFixed(1);
+    const badge = { RUNNING: '<i class="spinner"></i> RUNNING', SUCCESS: 'SUCCESS', FAILED: 'FAILED', TIMED_OUT: 'TIMED OUT' }[entry.status];
+    const badgeClass = { RUNNING: 'running', SUCCESS: 'ok', FAILED: 'fail', TIMED_OUT: 'fail' }[entry.status];
+    const result = entry.result;
+    const exitCodeLabel = result && result.exit_code != null ? ` · exit ${result.exit_code}` : '';
+    return `<div class="raw-git-output">
+    <div class="raw-git-cmd">$ git ${esc(entry.args)} <span class="raw-git-cwd">(in ${esc(entry.targetLabel)})</span> <b class="raw-git-status ${badgeClass}">${badge}</b><span class="raw-git-elapsed">${elapsed}s${exitCodeLabel}</span></div>
+    ${result?.stdout ? `<pre class="raw-git-stdout">${colorizeGitOutput(result.stdout)}</pre>` : ''}
+    ${result?.stderr ? `<pre class="raw-git-stderr">${colorizeGitOutput(result.stderr)}</pre>` : ''}
+    ${entry.status === 'SUCCESS' && !result?.stdout && !result?.stderr ? '<div class="raw-git-empty">Completed successfully — no output</div>' : ''}
+  </div>`;
+  }).join('') || '<div class="console-empty">Type a git command below and press Enter — e.g. "status", "log --oneline -10", "diff HEAD~1".</div>';
   $('#commandClearTranscript').hidden = state.consoleTranscript.length === 0;
   list.scrollTop = list.scrollHeight;
 }
@@ -2658,24 +2679,61 @@ function recallConsoleHistory(direction) {
   const input = $('#commandInput'); input.value = history[consoleHistoryPointer]; input.setSelectionRange(input.value.length, input.value.length);
 }
 
+let consoleRunningTicker = null;
+
 async function runRawGitFromConsole(args) {
   if (!args) return;
   setConsoleMode('console');
-  if (!state.repository) { state.consoleTranscript.push({ args, targetLabel: '—', result: { success: false, stdout: '', stderr: 'Open a repository first.' } }); renderConsoleTranscript(); return; }
+  if (!state.repository) { state.consoleTranscript.push({ args, targetLabel: '—', status: 'FAILED', elapsedMs: 0, result: { success: false, stdout: '', stderr: 'Open a repository first.' } }); renderConsoleTranscript(); return; }
+  // Repeated Enter while one is already running is a no-op, not a queued-up
+  // second command — only one Git command is ever active at a time, and the
+  // centralized invoke wrapper enforces this the same way for every other
+  // mutation too, not just another console command.
+  if (state.consoleCommandRunning) { status('A Git command is already running — wait for it to finish.', 'error'); return; }
   if (DESTRUCTIVE_GIT_PATTERN.test(args)) {
     const target = consoleGitTarget();
     const ok = await customConfirm(`This looks like a destructive command: "git ${args}" in ${target.label}. It can permanently discard commits, branches or uncommitted work. Continue?`, { title: 'Destructive git command', danger: true, okLabel: 'Run it anyway' });
     if (!ok) return;
   }
   state.consoleCmdHistory.push(args); consoleHistoryPointer = -1;
+  // Captured now, before anything async — a delayed result must act on the
+  // repository/scope this command actually ran against, never on whatever
+  // happens to be open by the time it resolves (though the invoke wrapper
+  // already refuses to switch repositories while consoleCommandRunning is
+  // true, so this is belt-and-suspenders, not the only thing preventing it).
   const target = consoleGitTarget();
-  if (!invoke) { state.consoleTranscript.push({ args, targetLabel: target.label, result: { success: true, stdout: '(preview mode — not actually run)', stderr: '' } }); renderConsoleTranscript(); return; }
+  const capturedRepositoryPath = state.repository.path;
+  if (!invoke) { state.consoleTranscript.push({ args, targetLabel: target.label, status: 'SUCCESS', elapsedMs: 0, result: { success: true, stdout: '(preview mode — not actually run)', stderr: '' } }); renderConsoleTranscript(); return; }
+
+  const entry = { args, targetLabel: target.label, status: 'RUNNING', startedAt: performance.now(), elapsedMs: 0, result: null };
+  state.consoleTranscript.push(entry);
+  renderConsoleTranscript();
+  state.consoleCommandRunning = true;
+  consoleRunningTicker = setInterval(renderConsoleTranscript, 200);
   try {
     const result = await invoke('run_git_command', { repositoryPath: target.path, args });
-    state.consoleTranscript.push({ args, targetLabel: target.label, result });
+    entry.status = result.success ? 'SUCCESS' : 'FAILED';
+    entry.result = result;
+    entry.elapsedMs = performance.now() - entry.startedAt;
+    clearInterval(consoleRunningTicker); consoleRunningTicker = null;
+    state.consoleCommandRunning = false;
     renderConsoleTranscript();
-    directoryCache.clear(); await loadRepository(state.repository.path, { keepPath: true });
-  } catch (error) { state.consoleTranscript.push({ args, targetLabel: target.label, result: { success: false, stdout: '', stderr: String(error) } }); renderConsoleTranscript(); }
+    // The strict read-only allowlist (status/log/diff/show/blame/ls-files,
+    // matched on the subcommand alone) is the only case that skips a full
+    // reload — anything else, including a command this app has never heard
+    // of, is treated conservatively as possibly mutating.
+    if (!result.read_only && state.repository?.path === capturedRepositoryPath) {
+      directoryCache.clear(); await loadRepository(capturedRepositoryPath, { keepPath: true });
+    }
+  } catch (error) {
+    const message = String(error);
+    entry.status = message.toLowerCase().includes('timed out') ? 'TIMED_OUT' : 'FAILED';
+    entry.result = { success: false, stdout: '', stderr: message, exit_code: null };
+    entry.elapsedMs = performance.now() - entry.startedAt;
+    clearInterval(consoleRunningTicker); consoleRunningTicker = null;
+    state.consoleCommandRunning = false;
+    renderConsoleTranscript();
+  }
 }
 
 // Live "what comes next" helper while typing in the Git Console — shows the
