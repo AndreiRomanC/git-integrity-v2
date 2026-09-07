@@ -2202,34 +2202,63 @@ pub fn change_submodule_url(repository_path: String, relative_path: String, url:
 
 #[tauri::command]
 pub fn remove_git_path(repository_path: String, relative_path: String) -> Result<(), String> {
-    validate_path(&repository_path)?;
-    let relative = normalized(&safe_relative_path(&relative_path)?);
+    let started = Instant::now();
+    perf_log(&format!("remove_git_path: START ({relative_path})"), Duration::ZERO);
+    let result = remove_git_path_inner(&repository_path, &relative_path);
+    match &result {
+        Ok(()) => perf_log(&format!("remove_git_path: TOTAL ({relative_path})"), started.elapsed()),
+        Err(error) => perf_log(&format!("remove_git_path: ERROR ({relative_path}): {error}"), started.elapsed()),
+    }
+    result
+}
+
+fn remove_git_path_inner(repository_path: &str, relative_path: &str) -> Result<(), String> {
+    validate_path(repository_path)?;
+    let relative = normalized(&safe_relative_path(relative_path)?);
     if relative.is_empty() { return Err("The repository root cannot be removed".into()); }
-    let (tracked, _) = cached_index_metadata(&repository_path);
+    let (tracked, _) = cached_index_metadata(repository_path);
     let prefix = format!("{relative}/");
     if !tracked.contains(&relative) && !tracked.iter().any(|path| path.starts_with(&prefix)) {
         return Err("This item is not tracked by Git. Remove it with the operating system if intended".into());
     }
-    let repo = internal_repository(&repository_path)?;
+    let repo = internal_repository(repository_path)?;
+    let step = Instant::now();
     let submodule_name = repo.submodules().ok().and_then(|items| items.into_iter().find(|item| normalized(item.path()) == relative).map(|item| item.name().unwrap_or(&relative).to_string()));
-    let target = Path::new(&repository_path).join(&relative); if target.is_dir() { fs::remove_dir_all(&target).map_err(|error| error.to_string())?; } else if target.exists() { fs::remove_file(&target).map_err(|error| error.to_string())?; }
+    perf_log("remove_git_path: repo.submodules() lookup", step.elapsed());
+    // Deleting a submodule's own working copy means deleting its own real
+    // .git directory too — a full, independent object database, not just a
+    // gitlink pointer. That's genuinely real data (git objects, one file
+    // per blob/tree/commit in the simple case) with a real disk-I/O cost to
+    // remove, worse on Windows specifically (already documented elsewhere in
+    // this codebase as slower at exactly this kind of per-file filesystem
+    // work) — logged separately here so a real "this is just how much data
+    // there was" case can be told apart from an actual bug.
+    let step = Instant::now();
+    let target = Path::new(repository_path).join(&relative); if target.is_dir() { fs::remove_dir_all(&target).map_err(|error| error.to_string())?; } else if target.exists() { fs::remove_file(&target).map_err(|error| error.to_string())?; }
+    perf_log(&format!("remove_git_path: remove working copy from disk ({relative})"), step.elapsed());
     if let Some(name) = submodule_name {
+        let step = Instant::now();
         cleanup_submodule_registration(&repo, &name, Path::new(&relative))?;
+        perf_log("remove_git_path: cleanup_submodule_registration", step.elapsed());
+        let step = Instant::now();
         let modules = repo.path().join("modules").join(safe_relative_path(&name)?);
         if modules.is_dir() { fs::remove_dir_all(modules).map_err(|error| format!("Cannot remove internal submodule data: {error}"))?; }
+        perf_log("remove_git_path: remove .git/modules copy", step.elapsed());
     }
+    let step = Instant::now();
     let mut index = repo.index().map_err(|error| error.message().to_string())?;
     let paths: Vec<PathBuf> = index.iter().filter_map(|entry| {
         let path = String::from_utf8_lossy(&entry.path);
         (path == relative || path.starts_with(&prefix)).then(|| PathBuf::from(path.as_ref()))
     }).collect();
     for path in paths { index.remove_path(&path).map_err(|error| error.message().to_string())?; }
-    let gitmodules = Path::new(&repository_path).join(".gitmodules");
+    let gitmodules = Path::new(repository_path).join(".gitmodules");
     if gitmodules.exists() { index.add_path(Path::new(".gitmodules")).map_err(|error| error.message().to_string())?; }
     else { let _ = index.remove_path(Path::new(".gitmodules")); }
     index.write().map_err(|error| error.message().to_string())?;
-    invalidate_git_metadata(&repository_path);
-    invalidate_submodule_sync(&repository_path); // this app just changed a submodule's registration/version
+    perf_log("remove_git_path: sync index", step.elapsed());
+    invalidate_git_metadata(repository_path);
+    invalidate_submodule_sync(repository_path); // this app just changed a submodule's registration/version
     Ok(())
 }
 

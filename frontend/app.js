@@ -1171,10 +1171,24 @@ async function deleteEntry(entry, button) {
     }, 8000);
     return;
   }
-  button.disabled = true;
-  if (!invoke) return status(`Preview: delete ${entry.name}`);
+  // Without this, the button stayed on "Confirm delete X" for the entire
+  // operation — deleting a submodule in particular means removing its own
+  // real .git directory (a genuine, possibly large object database, not
+  // just a pointer), which can take a real amount of time on a large one —
+  // with nothing distinguishing "still waiting for a second click" from
+  // "already working on it". A failure used to also leave the button
+  // permanently disabled with no way to retry, since disabled was never
+  // reset back on that path — restored in `finally` regardless of outcome.
+  button.disabled = true; button.textContent = `Deleting “${entry.name}”…`;
+  if (!invoke) { button.disabled = false; return status(`Preview: delete ${entry.name}`); }
   try { status(`Deleting ${entry.name} locally…`, 'busy'); const folder = state.currentPath; await invoke(entry.tracked ? 'remove_git_path' : 'delete_local_path', { repositoryPath: state.repository.path, relativePath: entry.relative_path }); directoryCache.clear(); await loadRepository(state.repository.path, { reopenPath: folder }); if (entry.tracked) { state.changesScope = 'global'; refs.changesDrawer.classList.add('open'); } const message = entry.tracked ? `${entry.name} deleted locally. Its deletion is in Workspace; commit it, then Push to update the server.` : `${entry.name} deleted locally. It was local-only, so no commit or push is needed.`; status(message); showOperationToast(message); }
   catch (error) { status(String(error), 'error'); showOperationToast(String(error), 'error'); }
+  finally {
+    // Only touch the button if it's still the one showing — a successful
+    // delete already replaced/re-rendered the details panel by this point,
+    // so `button` may no longer be in the document at all.
+    if (button.isConnected) { button.disabled = false; delete button.dataset.confirmed; button.textContent = 'Delete…'; button.classList.remove('confirm-danger'); }
+  }
 }
 
 async function compareEntryWithRemote(entry) { state.commanderFocus = entry.relative_path; state.commanderPath = entry.relative_path.split('/').slice(0, -1).join('/'); state.view = 'commander'; state.commanderRows = []; render(); await openCommanderDirectory(state.commanderPath); const row = state.commanderRows.find(item => item.relative_path === entry.relative_path); if (row?.local?.kind === 'file' && row.remote?.kind === 'file') openFileCompare(row); else status('This file is not available on both local and selected remote', 'error'); }
