@@ -537,11 +537,17 @@ fn internal_statuses(repository: &Repository, scope: Option<&str>) -> Result<Vec
     // exactly this reason; matching that here is what actually makes new files
     // visible and individually selectable, which matters more than the scan
     // time saved on the (rare) case of a huge non-gitignored directory.
-    // `update_index(true)` opportunistically refreshes the on-disk index's cached
-    // file stat info during the scan (the same trick plain `git status` uses) so
-    // later scans can trust the cache instead of re-stat'ing unchanged files —
-    // pure perf, doesn't change what's reported.
-    options.include_untracked(true).recurse_untracked_dirs(true).include_ignored(false).update_index(true);
+    // Deliberately NOT update_index(true): it opportunistically refreshes the
+    // on-disk index's cached file stat info *during the scan* (the same
+    // trick plain `git status` uses) — which means it writes to .git/index.
+    // A status scan is called from many places that never take
+    // repo_write_lock (navigation, refresh_status, the submodule dirty-check
+    // inside sync_submodule_gitlinks) — a scan racing an actual stage/commit
+    // (which does hold that lock, but only around its *own* write, not
+    // around every concurrent status scan elsewhere) could interleave writes
+    // to the same index file. A function documented and relied on as
+    // read-only must not write at all, regardless of the perf upside.
+    options.include_untracked(true).recurse_untracked_dirs(true).include_ignored(false);
     // Rename detection (comparing added/deleted file contents to spot moves) is
     // the single most expensive part of a status scan on a huge repository with
     // many pending changes, and it's only cosmetic — a renamed file still shows
