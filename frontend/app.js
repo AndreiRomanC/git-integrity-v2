@@ -750,6 +750,20 @@ function attachFileListDelegation() {
 function jsPerfLog(label, elapsedMs) { if (invoke) invoke('frontend_perf_log', { label, elapsedMs }).catch(() => {}); }
 
 let explorerRequestSeq = 0;
+// options.force only bypasses the *frontend* directoryCache (re-read this
+// folder from the backend instead of trusting whatever was cached from an
+// earlier navigation) — it does NOT, by itself, mean "the backend's Git
+// status is stale". Those are two different questions: right after
+// refresh_status/load_repository just computed a full, current status scan,
+// every caller here wants a repaint with that freshly-scanned data (bypass
+// the frontend cache, since it may hold pre-mutation entries) but must NOT
+// throw that same-second scan away and pay for a second one. Only
+// options.invalidateGit (the explicit "Reload folder" button — the one
+// place the user is explicitly saying "show me whatever's on disk right
+// now, I don't trust anything cached") asks the backend to invalidate and
+// rescan. Conflating the two here previously meant every post-mutation
+// repaint re-triggered a full backend rescan a few hundred milliseconds
+// after the mutation's own reload had just paid for one.
 async function openDirectory(path, options = {}) {
   if (!state.repository) return;
   state.currentPath = path; state.selectedEntry = null;
@@ -759,7 +773,7 @@ async function openDirectory(path, options = {}) {
   if (!invoke) { state.entries = previewData.entries; directoryCache.set(path, state.entries); render(); return; }
   try {
     const invokeStarted = performance.now();
-    const entries = await invoke('load_directory', { repositoryPath: state.repository.path, relativePath: path, force: !!options.force });
+    const entries = await invoke('load_directory', { repositoryPath: state.repository.path, relativePath: path, force: !!options.invalidateGit });
     jsPerfLog(`openDirectory invoke(load_directory) (${path || '/'})`, performance.now() - invokeStarted);
     directoryCache.set(path, entries);
     if (requestId !== explorerRequestSeq) return;
@@ -2289,7 +2303,7 @@ document.addEventListener('click', event => {
   invoke('open_commit_on_server', { repositoryPath, commitId }).catch(error => handleError(error));
 });
 refs.goUp.addEventListener('click', () => { const commander = state.view === 'commander'; const parts = (commander ? state.commanderPath : state.currentPath).split('/').filter(Boolean); parts.pop(); commander ? openCommanderDirectory(parts.join('/')) : openDirectory(parts.join('/')); });
-refs.reloadFolder.addEventListener('click', () => state.view === 'commander' ? openCommanderDirectory(state.commanderPath) : openDirectory(state.currentPath, { force: true }));
+refs.reloadFolder.addEventListener('click', () => state.view === 'commander' ? openCommanderDirectory(state.commanderPath) : openDirectory(state.currentPath, { force: true, invalidateGit: true }));
 document.addEventListener('keydown', event => { if (event.key !== 'Escape' || state.view !== 'commander' || document.querySelector('dialog[open]')) return; event.preventDefault(); returnToProjectNavigator(); });
 refs.remoteRef.addEventListener('change', () => { state.remoteRef = refs.remoteRef.value; openCommanderDirectory(state.commanderPath); });
 $('#closeSubmoduleMenu').addEventListener('click', () => { refs.submoduleMenu.hidden = true; });

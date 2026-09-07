@@ -4371,6 +4371,49 @@ mod tests {
     }
 
     #[test]
+    fn a_repaint_after_load_repository_reuses_the_fresh_scan_instead_of_rescanning() {
+        // Reproduces the redundant-scan report: load_repository (or
+        // refresh_status) already computes a full, current status scan and
+        // seeds the cache with it via replace_git_metadata. The frontend then
+        // repaints the folder on screen — that repaint must reuse the scan
+        // that was *just* paid for, for the root folder and for a child folder
+        // alike, not immediately invalidate and redo it. Only an explicit
+        // force:true (the "Reload folder" button) should ask for a rescan.
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-repaint-reuse-{suffix}"));
+        create_libgit2_repository(&base, "README.md");
+        fs::create_dir_all(base.join("sub")).unwrap();
+        fs::write(base.join("sub/file.txt"), "a").unwrap();
+        run_git(&base, &["add", "sub/file.txt"]);
+        run_git(&base, &["commit", "-m", "Add sub/file.txt"]);
+        let path = base.to_string_lossy().into_owned();
+
+        // The one full scan: what "opening the repository" does.
+        load_repository(path.clone(), None).unwrap();
+
+        // An external program edits files after that scan — a repaint must
+        // not see this, since seeing it would mean it rescanned instead of
+        // reusing what load_repository just computed.
+        fs::write(base.join("README.md"), "edited after the scan").unwrap();
+        fs::write(base.join("sub/file.txt"), "edited after the scan too").unwrap();
+
+        let root_repaint = load_directory(path.clone(), "".into(), None).unwrap();
+        let readme = root_repaint.iter().find(|e| e.relative_path == "README.md").unwrap();
+        assert!(readme.status.is_empty(), "a root repaint without force must reuse load_repository's fresh scan, not rescan and see the external edit");
+
+        let child_repaint = load_directory(path.clone(), "sub".into(), None).unwrap();
+        let child_file = child_repaint.iter().find(|e| e.relative_path == "sub/file.txt").unwrap();
+        assert!(child_file.status.is_empty(), "a child-folder repaint without force must also reuse the same fresh scan (via the full-scan reuse path), not run its own scoped rescan");
+
+        // Only the explicit "Reload folder" action (force:true) should invalidate and rescan.
+        let forced = load_directory(path, "".into(), Some(true)).unwrap();
+        let forced_readme = forced.iter().find(|e| e.relative_path == "README.md").unwrap();
+        assert!(!forced_readme.status.is_empty(), "an explicit forced reload must see the external edit");
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
     fn submodule_commit_and_push_are_scoped_to_the_submodule() {
         let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let base = std::env::temp_dir().join(format!("git-integrity-subpush-{suffix}"));
