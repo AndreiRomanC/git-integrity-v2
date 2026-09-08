@@ -451,6 +451,18 @@ async function updatePublishIndicator() {
   try { state.remotes = await invoke('list_remotes', { repositoryPath: state.repository.path }); const remote = state.remotes[0]?.name, branch = state.repository.current_branch; if (!remote || !branch) { refs.publishBadge.textContent = '—'; refs.publishSubtitle.textContent = 'No remote or detached HEAD'; return; } const info = await invoke('publish_status', { repositoryPath: state.repository.path, branch, remote }); refs.publishBadge.textContent = info.commits.length; refs.publishSubtitle.textContent = info.commits.length ? `${info.commits.length} commit${info.commits.length === 1 ? '' : 's'} not on ${remote}` : 'Everything is on the server'; } catch (_) { refs.publishBadge.textContent = '!'; refs.publishSubtitle.textContent = 'Cannot compare with server branch'; }
 }
 
+// Never displays the literal string "HEAD" as if it were a branch name —
+// see RepositoryInfo's own doc comment in repository.rs: current_branch is
+// always "" when head_detached, specifically so callers can't accidentally
+// do that. Shows the real commit instead, which is the only reliable
+// "where am I" for a detached checkout (routine for a submodule right after
+// `git submodule update` or "Reset submodule").
+function describeBranch(repositoryInfo) {
+  if (!repositoryInfo) return 'No branch';
+  if (repositoryInfo.head_detached) return repositoryInfo.head_oid ? `Detached HEAD at ${repositoryInfo.head_oid.slice(0, 8)}` : 'Detached HEAD';
+  return repositoryInfo.current_branch || 'No branch';
+}
+
 function render() {
   const loaded = Boolean(state.repository);
   document.body.classList.toggle('commander-mode', ['commander','remotes'].includes(state.view));
@@ -458,7 +470,7 @@ function render() {
   refs.emptyState.hidden = loaded; refs.explorerView.hidden = !loaded || state.view !== 'explorer'; refs.commanderView.hidden = !loaded || state.view !== 'commander'; refs.graphView.hidden = !loaded || state.view !== 'graph'; refs.remotesView.hidden = !loaded || state.view !== 'remotes';
   refs.repoName.textContent = loaded ? state.repository.name : 'Open a repository';
   refs.repoPath.textContent = loaded ? state.repository.path : 'Choose an existing Git folder';
-  refs.currentBranch.textContent = loaded ? (state.repository.current_branch || 'Detached HEAD') : 'No branch';
+  refs.currentBranch.textContent = loaded ? describeBranch(state.repository) : 'No branch';
   refs.viewTitle.textContent = state.view === 'explorer' ? 'Project Explorer' : state.view === 'commander' ? 'Local ↔ Remote' : state.view === 'remotes' ? 'Remotes' : state.submoduleGraph ? `Submodule Map · ${state.submoduleGraph.name}` : state.historyScope ? `History · ${state.historyScope}` : 'Branch Map';
   refs.graphSubtitle.textContent = !loaded ? 'Navigate folders and inspect every item in your repository.' : state.view === 'explorer' ? `${state.entries.length} items in ${state.currentPath || state.repository.name}` : state.view === 'commander' ? 'Compare the workspace with a cached remote snapshot—no second checkout.' : state.view === 'remotes' ? 'Configured server locations and explicit fetch controls.' : (() => { const g = activeGraphData(); return `${(g.commits || []).length} commits across ${(g.branches || []).length} branches`; })();
   refs.search.placeholder = state.view === 'explorer' ? 'Filter this folder' : state.view === 'commander' ? 'Filter comparison' : 'Find commit or author';
@@ -478,7 +490,7 @@ function render() {
   $('#navExplorer').classList.toggle('active', state.view === 'explorer'); $('#navGraph').classList.toggle('active', state.view === 'graph');
   $('#navCommander').classList.toggle('active', state.view === 'commander');
   $('#navRemotes').classList.toggle('active', state.view === 'remotes');
-  refs.locationRepository.textContent = state.submoduleGraph?.name || state.repository?.name || '—'; refs.locationBranch.textContent = (state.submoduleGraph ? state.submoduleGraph.repository.current_branch : state.repository?.current_branch) || 'Detached HEAD'; refs.locationPath.textContent = state.view === 'commander' ? `/${state.commanderPath}` : state.view === 'explorer' ? `/${state.currentPath}` : state.view === 'graph' ? 'commit history' : 'remote configuration';
+  refs.locationRepository.textContent = state.submoduleGraph?.name || state.repository?.name || '—'; refs.locationBranch.textContent = describeBranch(state.submoduleGraph ? state.submoduleGraph.repository : state.repository); refs.locationPath.textContent = state.view === 'commander' ? `/${state.commanderPath}` : state.view === 'explorer' ? `/${state.currentPath}` : state.view === 'graph' ? 'commit history' : 'remote configuration';
   refs.leaveSubmoduleGraph.hidden = !state.submoduleGraph;
   // Every view used to be rebuilt on every render() call regardless of which
   // one was actually visible — navigating folders in Explorer also rebuilt
@@ -1966,15 +1978,34 @@ function refsBadges(refList, color, isHead) {
 function activeGraphData() {
   if (state.submoduleGraph) {
     const g = state.submoduleGraph;
-    return { path: g.repository.path, currentBranch: g.repository.current_branch, branches: g.branches, commits: g.commits, stashes: g.stashes || [], commitsTruncated: !!g.commits_truncated };
+    return { path: g.repository.path, currentBranch: g.repository.current_branch, headOid: g.repository.head_oid, headDetached: !!g.repository.head_detached, branches: g.branches, commits: g.commits, stashes: g.stashes || [], commitsTruncated: !!g.commits_truncated };
   }
-  return { path: state.repository?.path, currentBranch: state.repository?.current_branch, branches: state.branches, commits: state.commits, stashes: state.stashes, commitsTruncated: !!state.commits_truncated };
+  return { path: state.repository?.path, currentBranch: state.repository?.current_branch, headOid: state.repository?.head_oid, headDetached: !!state.repository?.head_detached, branches: state.branches, commits: state.commits, stashes: state.stashes, commitsTruncated: !!state.commits_truncated };
 }
 // state.graphPrimaryBranch (the parent's own "Primary" picker choice) must
 // never leak into a submodule's graph, or vice versa — each submodule (and
 // the parent) keeps its own choice, isolated in state.submoduleGraph.primaryBranch.
 function activeGraphPrimaryBranch() { return state.submoduleGraph ? state.submoduleGraph.primaryBranch : state.graphPrimaryBranch; }
 function setActiveGraphPrimaryBranch(name) { if (state.submoduleGraph) state.submoduleGraph.primaryBranch = name; else state.graphPrimaryBranch = name; }
+
+// The one place that decodes activeGraphPrimaryBranch()'s stored value
+// ("detached" / "branch:<name>" / "remote:<name>", or nothing yet — see the
+// picker in renderGraph) into an actual {kind, name} — used by renderGraph
+// itself and by ensureBranchDivergence's own staleness check below, so both
+// always agree on what "primary" currently resolves to instead of the
+// latter recomputing it with a different (and, after the picker started
+// accepting detached HEAD and remote-tracking refs, no longer matching)
+// scheme of its own.
+function resolvePrimarySelection(g) {
+  const localBranchNames = (g.branches || []).filter(b => !b.remote).map(b => b.name);
+  const remoteBranchNames = (g.branches || []).filter(b => b.remote).map(b => b.name);
+  const selection = activeGraphPrimaryBranch();
+  if (selection === 'detached' && g.headDetached) return { kind: 'detached', name: null };
+  if (selection?.startsWith('branch:') && localBranchNames.includes(selection.slice(7))) return { kind: 'branch', name: selection.slice(7) };
+  if (selection?.startsWith('remote:') && remoteBranchNames.includes(selection.slice(7))) return { kind: 'remote', name: selection.slice(7) };
+  if (g.headDetached) return { kind: 'detached', name: null };
+  return { kind: 'branch', name: g.currentBranch };
+}
 
 // The 500-commit window load_repository/open_repository_fast return is never
 // presented as "this is all of history" — activeGraphData().commitsTruncated
@@ -2040,10 +2071,8 @@ function ensureBranchDivergence(repositoryPath, primaryBranchName) {
       // result silently paint over what's on screen now.
       const g = activeGraphData();
       if (g.path !== repositoryPath) return;
-      const localBranchNames = (g.branches || []).filter(b => !b.remote).map(b => b.name);
-      const primary = activeGraphPrimaryBranch();
-      const currentPrimary = primary && localBranchNames.includes(primary) ? primary : g.currentBranch;
-      if (currentPrimary !== primaryBranchName) return;
+      const resolved = resolvePrimarySelection(g);
+      if (resolved.kind !== 'branch' || resolved.name !== primaryBranchName) return;
       branchDivergenceCache = { key, data };
       if (state.view === 'graph') renderGraph();
     })
@@ -2063,27 +2092,47 @@ function ensureBranchDivergence(repositoryPath, primaryBranchName) {
 function renderGraph() {
   const query = refs.search.value.trim().toLowerCase();
   const g = activeGraphData();
-  const commits = (g.commits || []).filter(c => !query || `${c.subject} ${c.author} ${c.id} ${(c.refs || []).join(' ')}`.toLowerCase().includes(query));
+  // Search never removes a commit from the graph being built — doing that
+  // used to let a matching commit's non-matching parent silently vanish
+  // from `commits` while buildGraphModel still tried to route an edge to
+  // it, landing on whatever row happened to come next instead (a wrong
+  // edge, not just a missing one). Every commit stays in the model
+  // unconditionally; a query only decides which rows get highlighted.
+  const commits = g.commits || [];
+  const matchesQuery = c => !query || `${c.subject} ${c.author} ${c.id} ${(c.refs || []).join(' ')}`.toLowerCase().includes(query);
+  const matchCount = query ? commits.filter(matchesQuery).length : 0;
   const currentBranch = g.currentBranch;
-  // "Selected branch" drives which lane is primary — defaults to whatever is
-  // currently checked out. Any branch whose tip isn't reachable from it (a
-  // sibling that's diverged, even if newer) gets pushed to its own lane
-  // instead of ever sharing the primary one.
+  // "Primary" drives which lane is lane 0 — defaults to whatever is
+  // currently checked out (or, for a detached checkout, HEAD's exact
+  // commit — there's no branch to default to). Any commit whose tip isn't
+  // reachable from it (a sibling that's diverged, even if newer) gets
+  // pushed to its own lane instead of ever sharing the primary one. The
+  // picker accepts the detached HEAD itself, any local branch, or any
+  // remote-tracking ref — encoded as "detached" / "branch:<name>" /
+  // "remote:<name>" so all three can share the one <select>.
   const localBranchNames = (g.branches || []).filter(b => !b.remote).map(b => b.name);
-  const primary = activeGraphPrimaryBranch();
-  const primaryBranchName = primary && localBranchNames.includes(primary) ? primary : currentBranch;
-  const primaryTip = primaryBranchName ? commits.find(c => (c.refs || []).includes(primaryBranchName)) : null;
+  const remoteBranchNames = (g.branches || []).filter(b => b.remote).map(b => b.name);
+  const { kind: primaryKind, name: primaryName } = resolvePrimarySelection(g);
+  const primaryTip = primaryKind === 'detached' ? commits.find(c => c.id === g.headOid) : primaryName ? commits.find(c => (c.refs || []).includes(primaryName)) : null;
   const model = buildGraphModel(commits, primaryTip?.id);
   const nodeById = new Map(commits.map((commit, index) => [commit.id, model[index]]));
-  const headEntry = currentBranch ? commits.find(commit => (commit.refs || []).includes(currentBranch)) : null;
+  const headEntry = g.headDetached ? commits.find(c => c.id === g.headOid) : currentBranch ? commits.find(commit => (commit.refs || []).includes(currentBranch)) : null;
   if (headEntry) { nodeById.get(headEntry.id).isHead = true; }
   const maxLanes = Math.max(1, ...model.map(n => Math.max(n.before.length, n.after.length)));
   const lanesWidth = maxLanes * LANE_WIDTH;
 
+  const pickerOptions = [
+    ...(g.headDetached ? [{ value: 'detached', label: `Detached HEAD (${(g.headOid || '').slice(0, 8)})` }] : []),
+    ...localBranchNames.map(name => ({ value: `branch:${name}`, label: name })),
+    ...remoteBranchNames.map(name => ({ value: `remote:${name}`, label: name })),
+  ];
+  const selectedPickerValue = primaryKind === 'detached' ? 'detached' : `${primaryKind}:${primaryName}`;
+
   refs.laneLegend.style.setProperty('--lanes-width', `${lanesWidth}px`);
   refs.laneLegend.innerHTML = `<span class="time-direction"><b>NEWEST</b><i>↓</i><b>OLDEST</b></span>
-    ${currentBranch ? `<span class="head-banner">HEAD <i>→</i> <b>${esc(currentBranch)}</b></span>` : ''}
-    ${localBranchNames.length > 1 ? `<label class="primary-branch-picker"><span>Primary</span><select id="graphPrimaryBranch">${localBranchNames.map(name => `<option value="${esc(name)}" ${name === primaryBranchName ? 'selected' : ''}>${esc(name)}</option>`).join('')}</select></label>` : ''}
+    ${g.headDetached ? `<span class="head-banner">HEAD <i>→</i> <b>Detached at ${esc((g.headOid || '').slice(0, 8))}</b></span>` : currentBranch ? `<span class="head-banner">HEAD <i>→</i> <b>${esc(currentBranch)}</b></span>` : ''}
+    ${query ? `<span class="search-match-count">${matchCount} match${matchCount === 1 ? '' : 'es'} — rest shown as context</span>` : ''}
+    ${pickerOptions.length > 1 ? `<label class="primary-branch-picker"><span>Primary</span><select id="graphPrimaryBranch">${pickerOptions.map(opt => `<option value="${esc(opt.value)}" ${opt.value === selectedPickerValue ? 'selected' : ''}>${esc(opt.label)}</option>`).join('')}</select></label>` : ''}
     <span class="lane-header"><span>GRAPH</span><span>COMMIT</span></span>`;
   $('#graphPrimaryBranch')?.addEventListener('change', event => { setActiveGraphPrimaryBranch(event.target.value); renderGraph(); });
 
@@ -2104,17 +2153,20 @@ function renderGraph() {
   // old lane-distance heuristic could and did label that as if it were one.
   // ensureBranchDivergence is non-blocking: it renders without annotations
   // immediately, fetches once per (repository, primary branch), and
-  // re-renders itself when the real data lands.
-  const divergence = ensureBranchDivergence(g.path, primaryBranchName);
+  // re-renders itself when the real data lands. Only meaningful — and only
+  // supported by the backend — when a real local branch is primary; a
+  // detached HEAD or a remote-tracking ref has no "ahead of X" to compute
+  // against itself.
+  const divergence = primaryKind === 'branch' && primaryName ? ensureBranchDivergence(g.path, primaryName) : null;
   const aheadAnnotations = new Map(); // row index -> short text
   const branchPointRows = new Set(); // row indices that are a shared-ancestor base
   if (divergence) {
     const rowByCommitId = new Map(commits.map((c, i) => [c.id, i]));
     for (const entry of divergence) {
-      if (entry.name === primaryBranchName) continue;
+      if (entry.name === primaryName) continue;
       const tipRow = rowByCommitId.get(entry.tip);
       if (tipRow != null && entry.ahead > 0) {
-        aheadAnnotations.set(tipRow, `↳ ${entry.ahead} commit${entry.ahead === 1 ? '' : 's'} ahead of ${primaryBranchName}`);
+        aheadAnnotations.set(tipRow, `↳ ${entry.ahead} commit${entry.ahead === 1 ? '' : 's'} ahead of ${primaryName}`);
       }
       // The merge-base may be outside the currently loaded (newest-500)
       // window — only mark it when it's actually a row on screen.
@@ -2143,8 +2195,13 @@ function renderGraph() {
     </div>`).join('');
     const ahead = aheadAnnotations.get(index);
     const isBranchPoint = branchPointRows.has(index);
+    // A query highlights matches instead of removing anything from the
+    // graph — a non-matching commit stays exactly where it is, still fully
+    // connected, as the real context for whichever matches surround it.
+    const isMatch = query && matchesQuery(commit);
+    const isDimmed = query && !isMatch;
 
-    return `<article class="commit-row ${node.isHead ? 'is-head' : ''} ${isBranchPoint ? 'is-branch-point' : ''}" data-id="${esc(commit.id)}" data-lane="${node.lane}">
+    return `<article class="commit-row ${node.isHead ? 'is-head' : ''} ${isBranchPoint ? 'is-branch-point' : ''} ${isMatch ? 'is-search-match' : ''} ${isDimmed ? 'is-search-dimmed' : ''}" data-id="${esc(commit.id)}" data-lane="${node.lane}">
       <div class="graph-cell" style="width:${lanesWidth}px"></div>
       <div class="commit-body">
         <div class="commit-card"><div class="commit-main">${isBranchPoint ? '<b class="branch-point-pill" data-tooltip="Common ancestor — where the newer branch above split off">⑂</b>' : ''}<span class="commit-title">${commitSubjectHtml(commit.subject)}</span>${refsBadges(node.refs, color, node.isHead)}${stashPills}</div><span class="commit-id">${esc(commit.id.slice(0, 8))}</span>
@@ -2152,7 +2209,7 @@ function renderGraph() {
         ${ahead ? `<div class="ahead-annotation">${esc(ahead)}</div>` : ''}${stashDetails}
       </div>
     </article>`;
-  }).join('') || '<div class="empty-change">No commits match this filter</div>';
+  }).join('') || '<div class="empty-change">No commits in this history</div>';
 
   // Real, backend-confirmed truncation (never "exactly 500 came back") —
   // never presented as if this were the whole history. Search filtering the

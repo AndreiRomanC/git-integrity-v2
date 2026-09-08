@@ -319,7 +319,15 @@ fn cached_submodule_unpushed_set(repository: &str) -> Arc<HashSet<String>> {
 }
 
 #[derive(Serialize)]
-pub struct RepositoryInfo { path: String, name: String, current_branch: String }
+// current_branch is "" (never the literal string "HEAD" — git2's own
+// Reference::shorthand() returns exactly that for a detached HEAD, which
+// this app used to pass straight through and display/treat as if it were a
+// real branch name) whenever head_detached is true. head_oid is always the
+// real commit HEAD points at, valid whether attached or not — the only
+// reliable "where am I" for a detached checkout (extremely common for a
+// submodule right after `git submodule update`/"Reset submodule", both of
+// which intentionally leave it that way).
+pub struct RepositoryInfo { path: String, name: String, current_branch: String, head_oid: String, head_detached: bool }
 
 #[derive(Serialize)]
 pub struct Branch { name: String, current: bool, remote: bool }
@@ -1287,7 +1295,9 @@ pub fn open_repository_fast(path: String) -> Result<FastRepositoryData, String> 
     // regardless of which subfolder the user happened to pick when opening.
     let path = repo.workdir().and_then(|dir| dir.to_str()).map(str::to_string).unwrap_or(path);
     let name = Path::new(&path).file_name().and_then(|n| n.to_str()).unwrap_or("repository").to_string();
-    let current_branch = repo.head().ok().and_then(|head| head.shorthand().map(String::from)).unwrap_or_default();
+    let head_detached = repo.head_detached().unwrap_or(false);
+    let current_branch = if head_detached { String::new() } else { repo.head().ok().and_then(|head| head.shorthand().map(String::from)).unwrap_or_default() };
+    let head_oid = repo.head().ok().and_then(|head| head.target()).map(|id| id.to_string()).unwrap_or_default();
     let step = Instant::now();
     let mut branches = Vec::new();
     for branch_type in [BranchType::Local, BranchType::Remote] { if let Ok(iterator) = repo.branches(Some(branch_type)) { for item in iterator.flatten() {
@@ -1332,7 +1342,7 @@ pub fn open_repository_fast(path: String) -> Result<FastRepositoryData, String> 
     // what the frontend already believes, e.g. a submodule added since).
     let submodule_paths: Vec<String> = cached_index_metadata(&path).1.iter().cloned().collect();
     perf_log("open_repository_fast: TOTAL", started.elapsed());
-    Ok(FastRepositoryData { repository: RepositoryInfo { path, name, current_branch }, branches, commits, stashes, submodule_paths, commits_truncated })
+    Ok(FastRepositoryData { repository: RepositoryInfo { path, name, current_branch, head_oid, head_detached }, branches, commits, stashes, submodule_paths, commits_truncated })
 }
 
 #[tauri::command]
@@ -1351,7 +1361,9 @@ pub fn load_repository(path: String, force: Option<bool>) -> Result<RepositoryDa
     perf_log("load_repository: sync_submodule_gitlinks", step.elapsed());
     let mut repo = internal_repository(&path)?;
     let name = Path::new(&path).file_name().and_then(|n| n.to_str()).unwrap_or("repository").to_string();
-    let current_branch = repo.head().ok().and_then(|head| head.shorthand().map(String::from)).unwrap_or_default();
+    let head_detached = repo.head_detached().unwrap_or(false);
+    let current_branch = if head_detached { String::new() } else { repo.head().ok().and_then(|head| head.shorthand().map(String::from)).unwrap_or_default() };
+    let head_oid = repo.head().ok().and_then(|head| head.target()).map(|id| id.to_string()).unwrap_or_default();
     let step = Instant::now();
     let mut branches = Vec::new();
     for branch_type in [BranchType::Local, BranchType::Remote] { if let Ok(iterator) = repo.branches(Some(branch_type)) { for item in iterator.flatten() {
@@ -1403,7 +1415,7 @@ pub fn load_repository(path: String, force: Option<bool>) -> Result<RepositoryDa
     let submodule_paths: Vec<String> = cached_index_metadata(&path).1.iter().cloned().collect();
 
     perf_log("load_repository: TOTAL", load_started.elapsed());
-    Ok(RepositoryData { repository: RepositoryInfo { path, name, current_branch }, branches, commits, changes, stashes, submodule_paths, commits_truncated })
+    Ok(RepositoryData { repository: RepositoryInfo { path, name, current_branch, head_oid, head_detached }, branches, commits, changes, stashes, submodule_paths, commits_truncated })
 }
 
 #[derive(Serialize)]
@@ -4821,6 +4833,38 @@ mod tests {
         assert!(!refreshed_readme.status.is_empty(), "force:true must bypass the status cache and show the external edit immediately, got status={:?}", refreshed_readme.status);
 
         fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn detached_head_reports_empty_branch_name_and_the_real_head_oid_not_the_string_head() {
+        // git2's own Reference::shorthand() returns the literal string "HEAD"
+        // for a detached checkout — this app used to pass that straight
+        // through as current_branch, so a detached submodule (extremely
+        // common right after `git submodule update` / "Reset submodule",
+        // both of which always leave it detached) looked like it was on an
+        // actual branch named "HEAD". Both open_repository_fast and
+        // load_repository must instead report current_branch: "" and
+        // head_detached: true, with head_oid holding the real commit.
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-detached-head-{suffix}"));
+        create_libgit2_repository(&base, "README.md");
+        let head_commit = run_git_capture(&base, &["rev-parse", "HEAD"]);
+        run_git(&base, &["checkout", "--detach", "HEAD"]);
+        let path = base.to_string_lossy().into_owned();
+
+        let fast = open_repository_fast(path.clone()).unwrap();
+        assert!(fast.repository.head_detached, "open_repository_fast must report a detached checkout as such");
+        assert_eq!(fast.repository.current_branch, "", "current_branch must never be the literal string \"HEAD\"");
+        assert_eq!(fast.repository.head_oid, head_commit);
+
+        let full = load_repository(path, None).unwrap();
+        assert!(full.repository.head_detached);
+        assert_eq!(full.repository.current_branch, "");
+        assert_eq!(full.repository.head_oid, head_commit);
+
+        // Sanity check the non-detached case is unaffected: a normal
+        // checkout must still report its real branch name and head_detached: false.
+        fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]

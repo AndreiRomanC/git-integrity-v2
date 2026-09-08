@@ -246,6 +246,10 @@ button { cursor: default; }
 .commit-row:hover { background: #121c26; }
 .commit-row.selected { background: #17283a; box-shadow: inset 0 0 0 1px #315b82; }
 .commit-row.is-head .commit-card { border-color: #4f8fc8; box-shadow: 0 0 0 1px #4f8fc855, 0 3px 10px #0004; }
+.commit-row.is-search-match .commit-card { border-color: #d9a25c; box-shadow: 0 0 0 1px #d9a25c55; }
+.commit-row.is-search-dimmed .commit-card { opacity: .38; }
+.commit-row.is-search-dimmed:hover .commit-card { opacity: .7; }
+.search-match-count { color: #d9a25c; font-size: 10px; font-weight: 700; }
 .graph-cell { flex-shrink: 0; }
 .ref-pills { display: flex; flex-wrap: nowrap; gap: 4px; flex-shrink: 0; }
 .ref-pill { max-width: 130px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 2px 7px; border-left: 3px solid var(--lane-color); border-radius: 3px; background: #1b2a36; color: #d6e5f0; font-size: 10px; font-weight: 700; }
