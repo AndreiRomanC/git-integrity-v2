@@ -334,6 +334,10 @@ button { cursor: default; }
 .change-path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .change-state { color: var(--muted); font-size: 11px; }
 .empty-change { display: grid; place-items: center; height: 100%; color: var(--muted); }
+.history-truncated-stub { display: flex; align-items: center; justify-content: center; gap: 12px; padding: 16px 12px; margin: 4px 0; border: 1px dashed var(--border-soft); border-radius: 8px; color: #748596; font-size: 11px; }
+.history-truncated-stub button { height: 26px; padding: 0 12px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); color: #aec0d2; font-size: 10px; display: inline-flex; align-items: center; gap: 6px; }
+.history-truncated-stub button:hover:not(:disabled) { border-color: #526273; background: var(--surface-soft); color: white; }
+.history-truncated-stub button:disabled { opacity: .6; }
 .commit-area { display: flex; flex-direction: column; padding: 12px; }
 .commit-area textarea { flex: 1; resize: none; outline: 0; border: 1px solid var(--border); border-radius: 7px; padding: 10px; background: #0d1319; }
 .commit-area textarea:focus { border-color: var(--blue); }

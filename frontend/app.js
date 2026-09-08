@@ -460,7 +460,7 @@ function render() {
   refs.repoPath.textContent = loaded ? state.repository.path : 'Choose an existing Git folder';
   refs.currentBranch.textContent = loaded ? (state.repository.current_branch || 'Detached HEAD') : 'No branch';
   refs.viewTitle.textContent = state.view === 'explorer' ? 'Project Explorer' : state.view === 'commander' ? 'Local ↔ Remote' : state.view === 'remotes' ? 'Remotes' : state.submoduleGraph ? `Submodule Map · ${state.submoduleGraph.name}` : state.historyScope ? `History · ${state.historyScope}` : 'Branch Map';
-  refs.graphSubtitle.textContent = !loaded ? 'Navigate folders and inspect every item in your repository.' : state.view === 'explorer' ? `${state.entries.length} items in ${state.currentPath || state.repository.name}` : state.view === 'commander' ? 'Compare the workspace with a cached remote snapshot—no second checkout.' : state.view === 'remotes' ? 'Configured server locations and explicit fetch controls.' : `${state.commits.length} commits across ${state.branches.length} branches`;
+  refs.graphSubtitle.textContent = !loaded ? 'Navigate folders and inspect every item in your repository.' : state.view === 'explorer' ? `${state.entries.length} items in ${state.currentPath || state.repository.name}` : state.view === 'commander' ? 'Compare the workspace with a cached remote snapshot—no second checkout.' : state.view === 'remotes' ? 'Configured server locations and explicit fetch controls.' : (() => { const g = activeGraphData(); return `${(g.commits || []).length} commits across ${(g.branches || []).length} branches`; })();
   refs.search.placeholder = state.view === 'explorer' ? 'Filter this folder' : state.view === 'commander' ? 'Filter comparison' : 'Find commit or author';
   refs.search.closest('label').hidden = state.view === 'remotes';
   refs.goUp.hidden = refs.reloadFolder.hidden = !['explorer','commander'].includes(state.view); refs.goUp.disabled = state.view === 'explorer' ? !state.currentPath : !state.commanderPath;
@@ -1584,15 +1584,33 @@ function updateEditorSaveState() { const dirty = refs.editorContent.value !== st
 // submodule's graph open. The submodule's own data lives only in
 // state.submoduleGraph, read exclusively through activeGraphData() (see its
 // own comment) by the graph view's own rendering code.
+// Bumped by every openSubmoduleGraph call and by closeSubmoduleGraph — a
+// response belonging to an older generation (a different submodule opened
+// right after this one, or the user having left the graph view entirely
+// before this request came back) must never overwrite whatever's on screen
+// now. Without this, opening submodule A then quickly submodule B, with A's
+// backend call happening to finish after B's, would silently replace B's
+// graph with A's data.
+let submoduleGraphGeneration = 0;
+
 async function openSubmoduleGraph(entry) {
   clearDetails('Select a submodule commit');
-  if (!invoke) { state.submoduleGraph = { name: entry.name, repository: { path: '', name: entry.name, current_branch: '' }, branches: [], commits: [], changes: [], stashes: [], primaryBranch: null }; state.view = 'graph'; render(); return; }
+  // Captured immutably, synchronously, before any await — entry (and
+  // state.repository) could otherwise change while this is in flight, and
+  // this request must keep addressing exactly the submodule it was asked
+  // for, in exactly the parent repository it was asked from.
+  const parentRepositoryPath = state.repository?.path;
+  const relativePath = entry.relative_path;
+  const name = entry.name;
+  const generation = ++submoduleGraphGeneration;
+  if (!invoke) { state.submoduleGraph = { name, repository: { path: '', name, current_branch: '' }, branches: [], commits: [], changes: [], stashes: [], primaryBranch: null }; state.view = 'graph'; render(); return; }
   try {
-    const data = await invoke('submodule_repository', { repositoryPath: state.repository.path, relativePath: entry.relative_path });
-    state.submoduleGraph = { name: entry.name, repository: data.repository, branches: data.branches, commits: data.commits, changes: data.changes, stashes: data.stashes || [], primaryBranch: null };
+    const data = await invoke('submodule_repository', { repositoryPath: parentRepositoryPath, relativePath });
+    if (generation !== submoduleGraphGeneration) return; // superseded — see the doc comment on submoduleGraphGeneration
+    state.submoduleGraph = { name, repository: data.repository, branches: data.branches, commits: data.commits, changes: data.changes, stashes: data.stashes || [], primaryBranch: null, commits_truncated: !!data.commits_truncated };
     state.view = 'graph'; render();
   }
-  catch (error) { handleError(error); }
+  catch (error) { if (generation === submoduleGraphGeneration) handleError(error); }
 }
 
 // Closes the submodule context (see closeSubmoduleGraph below for the same
@@ -1609,7 +1627,7 @@ function leaveSubmoduleGraph() { if (!state.submoduleGraph) return; state.submod
 // whatever's navigated to next (a stale "Back to parent" later restoring a
 // repository that isn't even open anymore, or a leftover primaryBranch
 // picked for a submodule bleeding into the parent's own Branch Map).
-function closeSubmoduleGraph() { state.submoduleGraph = null; }
+function closeSubmoduleGraph() { state.submoduleGraph = null; submoduleGraphGeneration++; }
 
 function renderBranches() {
   refs.branches.innerHTML = state.branches.map((branch, index) => `<div class="branch-row ${branch.current ? 'active' : ''}" data-branch="${esc(branch.name)}" data-is-remote="${branch.remote ? 'true' : 'false'}">
@@ -1908,6 +1926,10 @@ function buildGraphModel(commits, primaryTipId) {
 }
 
 const LANE_WIDTH = 30;
+// Mirrors the backend's own GRAPH_COMMIT_WINDOW — used only as the page size
+// for "Load older" requests; the backend is always the actual source of
+// truth for whether more history exists (commitsTruncated/has_more).
+const GRAPH_COMMIT_WINDOW = 500;
 const laneX = lane => LANE_WIDTH / 2 + lane * LANE_WIDTH;
 
 // Show at most a couple of ref labels inline — the graph's shape is the main
@@ -1922,7 +1944,7 @@ function refsBadges(refList, color, isHead) {
   // currently checked-out branch and the project's main remote-tracking
   // branch are what answering "where am I relative to origin/main" actually
   // needs, so they always get first claim on the visible slots.
-  const priority = ref => (ref === state.repository?.current_branch ? 0 : /^origin\/(main|master)$/.test(ref) ? 1 : 2);
+  const priority = ref => (ref === activeGraphData().currentBranch ? 0 : /^origin\/(main|master)$/.test(ref) ? 1 : 2);
   const grouped = refList.filter(ref => ref !== 'HEAD').slice().sort((a, b) => priority(a) - priority(b));
   const headPill = isHead ? '<b class="head-pill">HEAD</b>' : '';
   if (!grouped.length && !headPill) return '';
@@ -1944,15 +1966,51 @@ function refsBadges(refList, color, isHead) {
 function activeGraphData() {
   if (state.submoduleGraph) {
     const g = state.submoduleGraph;
-    return { path: g.repository.path, currentBranch: g.repository.current_branch, branches: g.branches, commits: g.commits, stashes: g.stashes || [] };
+    return { path: g.repository.path, currentBranch: g.repository.current_branch, branches: g.branches, commits: g.commits, stashes: g.stashes || [], commitsTruncated: !!g.commits_truncated };
   }
-  return { path: state.repository?.path, currentBranch: state.repository?.current_branch, branches: state.branches, commits: state.commits, stashes: state.stashes };
+  return { path: state.repository?.path, currentBranch: state.repository?.current_branch, branches: state.branches, commits: state.commits, stashes: state.stashes, commitsTruncated: !!state.commits_truncated };
 }
 // state.graphPrimaryBranch (the parent's own "Primary" picker choice) must
 // never leak into a submodule's graph, or vice versa — each submodule (and
 // the parent) keeps its own choice, isolated in state.submoduleGraph.primaryBranch.
 function activeGraphPrimaryBranch() { return state.submoduleGraph ? state.submoduleGraph.primaryBranch : state.graphPrimaryBranch; }
 function setActiveGraphPrimaryBranch(name) { if (state.submoduleGraph) state.submoduleGraph.primaryBranch = name; else state.graphPrimaryBranch = name; }
+
+// The 500-commit window load_repository/open_repository_fast return is never
+// presented as "this is all of history" — activeGraphData().commitsTruncated
+// (real, from the backend's own one-past-the-limit peek, never guessed from
+// "exactly 500 came back") drives a "continues in older history" stub with
+// an explicit, read-only "Load older" action; nothing here is ever fetched
+// automatically. Read-only and side-effect-free beyond appending commits to
+// whichever context (parent or submodule) actually asked for them.
+let loadingOlderCommits = false;
+async function loadOlderGraphCommits() {
+  if (loadingOlderCommits || !invoke) return;
+  const g = activeGraphData();
+  if (!g.commits.length) return;
+  const oldest = g.commits[g.commits.length - 1];
+  // Identity, not just a path string — correctly distinguishes "still this
+  // exact submodule graph" from "left it and came back" (a fresh object) or
+  // "switched to a different submodule" (a different object), so a response
+  // landing after either can never silently append onto the wrong context.
+  const targetContext = state.submoduleGraph;
+  const targetPath = g.path;
+  loadingOlderCommits = true;
+  if (state.view === 'graph') renderGraph();
+  try {
+    const page = await invoke('load_older_commits', { repositoryPath: targetPath, afterCommitId: oldest.id, limit: GRAPH_COMMIT_WINDOW });
+    if (state.submoduleGraph !== targetContext || activeGraphData().path !== targetPath) return; // superseded — see the comment above
+    if (state.submoduleGraph) {
+      state.submoduleGraph.commits = state.submoduleGraph.commits.concat(page.commits);
+      state.submoduleGraph.commits_truncated = page.has_more;
+    } else {
+      state.commits = state.commits.concat(page.commits);
+      state.allCommits = state.commits;
+      state.commits_truncated = page.has_more;
+    }
+  } catch (error) { status(String(error), 'error'); }
+  finally { loadingOlderCommits = false; if (state.view === 'graph') renderGraph(); }
+}
 
 // Real, backend-computed ahead/behind + merge-base per local branch relative
 // to whichever branch is currently "primary" in the graph view — see
@@ -2096,7 +2154,14 @@ function renderGraph() {
     </article>`;
   }).join('') || '<div class="empty-change">No commits match this filter</div>';
 
-  refs.graph.innerHTML = `<svg class="graph-overlay"></svg>` + rows;
+  // Real, backend-confirmed truncation (never "exactly 500 came back") —
+  // never presented as if this were the whole history. Search filtering the
+  // *visible* rows doesn't change this: the underlying loaded set is still
+  // truncated at the same point regardless of what's currently matched.
+  const truncationStub = g.commitsTruncated ? `<div class="history-truncated-stub"><span>⋯ continues in older history</span><button id="loadOlderCommits" ${loadingOlderCommits ? 'disabled' : ''}>${loadingOlderCommits ? '<i class="spinner"></i> Loading…' : 'Load older'}</button></div>` : '';
+
+  refs.graph.innerHTML = `<svg class="graph-overlay"></svg>` + rows + truncationStub;
+  $('#loadOlderCommits')?.addEventListener('click', loadOlderGraphCommits);
   refs.graph.querySelectorAll('.commit-row[data-id]').forEach(row => row.addEventListener('click', () => selectCommit(row.dataset.id)));
   refs.graph.querySelectorAll('[data-toggle-stash]').forEach(pill => pill.addEventListener('click', event => {
     event.stopPropagation();
@@ -2115,8 +2180,30 @@ function renderGraph() {
         .then(files => { fileList.innerHTML = files.length ? files.map(file => `<div class="stash-file">${esc(file)}</div>`).join('') : '<div class="stash-file">(no files — this stash is empty)</div>'; })
         .catch(error => { fileList.innerHTML = `<div class="stash-file">${esc(String(error))}</div>`; });
     }
+    // The stash toggle above changes this row's height without a full
+    // renderGraph — the SVG lines/dots were positioned from row.offsetTop
+    // measurements taken before that change, so they'd drift out of
+    // alignment with every row below it otherwise.
+    scheduleGraphOverlayRedraw();
   }));
+  lastGraphModel = model; lastGraphLanesWidth = lanesWidth;
   if (commits.length) drawGraphOverlay(model, lanesWidth);
+}
+
+// Redraws the SVG overlay against whatever the DOM's *current* row layout
+// actually is, without rebuilding the graph model/rows themselves — for
+// anything that changes row heights without a full renderGraph (a stash
+// entry expanding/collapsing, or the window/pane being resized). Debounced
+// so a burst of resize events collapses into one redraw, and guarded so it
+// only ever touches a still-current graph, in a still-current view.
+let graphOverlayRedrawTimer = null;
+let lastGraphModel = null;
+let lastGraphLanesWidth = 0;
+function scheduleGraphOverlayRedraw() {
+  clearTimeout(graphOverlayRedrawTimer);
+  graphOverlayRedrawTimer = setTimeout(() => {
+    if (state.view === 'graph' && lastGraphModel && lastGraphModel.length) drawGraphOverlay(lastGraphModel, lastGraphLanesWidth);
+  }, 80);
 }
 
 function drawGraphOverlay(model, lanesWidth) {
@@ -2163,7 +2250,14 @@ function drawGraphOverlay(model, lanesWidth) {
 }
 
 function selectCommit(id) {
-  state.selectedCommit = state.commits.find(commit => commit.id === id);
+  // Must search whichever repository's history is actually on screen — while
+  // a submodule's graph is open, state.commits is still the *parent's* list
+  // (see activeGraphData's own doc comment), so searching it directly here
+  // would either find nothing (a submodule-only commit id) and throw right
+  // below, or — worse — silently match an unrelated parent commit that
+  // happens to share the same id prefix. This was a real, reproducible
+  // crash: clicking a row in the Submodule Map's own graph.
+  state.selectedCommit = activeGraphData().commits.find(commit => commit.id === id);
   refs.graph.querySelectorAll('.commit-row').forEach(row => row.classList.toggle('selected', row.dataset.id === id));
   const c = state.selectedCommit;
   refs.details.innerHTML = `<div class="commit-details"><div class="large-node"></div><h2>${commitSubjectHtml(c.subject)}</h2><div class="hash"><a href="#" class="commit-server-link" data-commit-id="${esc(c.id)}" title="Open this commit on the server">${esc(c.id)} ↗</a></div>
@@ -2514,6 +2608,12 @@ $('#navCommander').addEventListener('click', () => { closeSubmoduleGraph(); cons
 $('#navGraph').addEventListener('click', () => { closeSubmoduleGraph(); state.commits = state.allCommits.length ? state.allCommits : state.commits; state.historyScope = ''; state.selectedEntry = null; state.selectedCommit = null; state.view = 'graph'; refs.search.value = ''; clearDetails('Select a commit'); render(); });
 $('#navRemotes').addEventListener('click', () => { closeSubmoduleGraph(); loadRemotes(); });
 refs.leaveSubmoduleGraph.addEventListener('click', leaveSubmoduleGraph);
+// Covers window/pane resizes (a narrower details panel, dragging the app
+// window, DevTools opening) the same way the stash-toggle case above covers
+// content-driven height changes — anything that could leave the SVG
+// overlay's lines/dots pointing at stale row positions gets the same
+// debounced redraw, never a full graph rebuild just to fix alignment.
+if (typeof ResizeObserver !== 'undefined') { new ResizeObserver(() => scheduleGraphOverlayRedraw()).observe(refs.graph); }
 (() => {
   const mainLayout = document.querySelector('.main-layout'); const toggle = $('#toggleDetailsPanel');
   const collapsed = localStorage.getItem('detailsPanelCollapsed') === '1';

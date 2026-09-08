@@ -333,15 +333,20 @@ pub struct Change { status: String, path: String, staged: bool }
 #[derive(Serialize)]
 pub struct StashEntry { index: usize, message: String, base_commit: String }
 
+// commits_truncated is true when the DAG actually has more history beyond
+// `commits` — never inferred by the frontend from "exactly 500 came back" (a
+// repository with precisely 500 reachable commits would falsely look
+// truncated); the backend already knows for certain, from one extra peek
+// past the limit.
 #[derive(Serialize)]
-pub struct RepositoryData { repository: RepositoryInfo, branches: Vec<Branch>, commits: Vec<Commit>, changes: Vec<Change>, stashes: Vec<StashEntry>, submodule_paths: Vec<String> }
+pub struct RepositoryData { repository: RepositoryInfo, branches: Vec<Branch>, commits: Vec<Commit>, changes: Vec<Change>, stashes: Vec<StashEntry>, submodule_paths: Vec<String>, commits_truncated: bool }
 
 // Deliberately no `changes` field at all — status isn't computed yet when
 // this returns. The frontend treats its absence as "status pending" (shows
 // "Loading status…", disables Stage/Delete/Commit/checkout) until a
 // follow-up refresh_status call fills it in.
 #[derive(Serialize)]
-pub struct FastRepositoryData { repository: RepositoryInfo, branches: Vec<Branch>, commits: Vec<Commit>, stashes: Vec<StashEntry>, submodule_paths: Vec<String> }
+pub struct FastRepositoryData { repository: RepositoryInfo, branches: Vec<Branch>, commits: Vec<Commit>, stashes: Vec<StashEntry>, submodule_paths: Vec<String>, commits_truncated: bool }
 
 #[derive(Serialize)]
 pub struct DirectoryEntry {
@@ -1257,6 +1262,13 @@ fn sync_submodule_gitlinks_inner(repository_path: &str) -> Result<usize, &'stati
 // branches/commits/stashes logic is intentional: reusing a shared helper
 // would mean any future change to it risks affecting both, when only one of
 // them needs to change here.
+// The first page of history load_repository/open_repository_fast return —
+// not "all of history", however small a repository's real total is. Kept
+// small on purpose (perf, not a hard protocol limit): load_older_commits
+// below is how the graph view gets the rest, one page at a time, on
+// explicit request.
+const GRAPH_COMMIT_WINDOW: usize = 500;
+
 #[tauri::command]
 pub fn open_repository_fast(path: String) -> Result<FastRepositoryData, String> {
     let started = Instant::now();
@@ -1295,9 +1307,13 @@ pub fn open_repository_fast(path: String) -> Result<FastRepositoryData, String> 
         if reference.name() == Some("refs/stash") { continue; }
         if let Ok(object) = reference.peel(ObjectType::Commit) { let _ = walk.push(object.id()); }
     } }
-    for oid in walk.flatten().take(500) { if let Ok(commit) = repo.find_commit(oid) {
-        commits.push(Commit { id: oid.to_string(), parents: commit.parent_ids().map(|id| id.to_string()).collect(), subject: commit.summary().unwrap_or("No message").to_string(), author: commit.author().name().unwrap_or("Unknown").to_string(), date: short_date(commit.time().seconds()), refs: refs_by_oid.remove(&oid.to_string()).unwrap_or_default(), lane: 0 });
-    } }
+    let mut commits_truncated = false;
+    for (index, oid) in walk.flatten().enumerate() {
+        if index >= GRAPH_COMMIT_WINDOW { commits_truncated = true; break; }
+        if let Ok(commit) = repo.find_commit(oid) {
+            commits.push(Commit { id: oid.to_string(), parents: commit.parent_ids().map(|id| id.to_string()).collect(), subject: commit.summary().unwrap_or("No message").to_string(), author: commit.author().name().unwrap_or("Unknown").to_string(), date: short_date(commit.time().seconds()), refs: refs_by_oid.remove(&oid.to_string()).unwrap_or_default(), lane: 0 });
+        }
+    }
     perf_log("open_repository_fast: refs+revwalk+commits", step.elapsed());
 
     let step = Instant::now();
@@ -1316,7 +1332,7 @@ pub fn open_repository_fast(path: String) -> Result<FastRepositoryData, String> 
     // what the frontend already believes, e.g. a submodule added since).
     let submodule_paths: Vec<String> = cached_index_metadata(&path).1.iter().cloned().collect();
     perf_log("open_repository_fast: TOTAL", started.elapsed());
-    Ok(FastRepositoryData { repository: RepositoryInfo { path, name, current_branch }, branches, commits, stashes, submodule_paths })
+    Ok(FastRepositoryData { repository: RepositoryInfo { path, name, current_branch }, branches, commits, stashes, submodule_paths, commits_truncated })
 }
 
 #[tauri::command]
@@ -1359,9 +1375,13 @@ pub fn load_repository(path: String, force: Option<bool>) -> Result<RepositoryDa
         if reference.name() == Some("refs/stash") { continue; }
         if let Ok(object) = reference.peel(ObjectType::Commit) { let _ = walk.push(object.id()); }
     } }
-    for oid in walk.flatten().take(500) { if let Ok(commit) = repo.find_commit(oid) {
-        commits.push(Commit { id: oid.to_string(), parents: commit.parent_ids().map(|id| id.to_string()).collect(), subject: commit.summary().unwrap_or("No message").to_string(), author: commit.author().name().unwrap_or("Unknown").to_string(), date: short_date(commit.time().seconds()), refs: refs_by_oid.remove(&oid.to_string()).unwrap_or_default(), lane: 0 });
-    } }
+    let mut commits_truncated = false;
+    for (index, oid) in walk.flatten().enumerate() {
+        if index >= GRAPH_COMMIT_WINDOW { commits_truncated = true; break; }
+        if let Ok(commit) = repo.find_commit(oid) {
+            commits.push(Commit { id: oid.to_string(), parents: commit.parent_ids().map(|id| id.to_string()).collect(), subject: commit.summary().unwrap_or("No message").to_string(), author: commit.author().name().unwrap_or("Unknown").to_string(), date: short_date(commit.time().seconds()), refs: refs_by_oid.remove(&oid.to_string()).unwrap_or_default(), lane: 0 });
+        }
+    }
     perf_log("load_repository: refs+revwalk+commits", step.elapsed());
 
     let step = Instant::now();
@@ -1383,7 +1403,48 @@ pub fn load_repository(path: String, force: Option<bool>) -> Result<RepositoryDa
     let submodule_paths: Vec<String> = cached_index_metadata(&path).1.iter().cloned().collect();
 
     perf_log("load_repository: TOTAL", load_started.elapsed());
-    Ok(RepositoryData { repository: RepositoryInfo { path, name, current_branch }, branches, commits, changes, stashes, submodule_paths })
+    Ok(RepositoryData { repository: RepositoryInfo { path, name, current_branch }, branches, commits, changes, stashes, submodule_paths, commits_truncated })
+}
+
+#[derive(Serialize)]
+pub struct OlderCommitsPage { commits: Vec<Commit>, has_more: bool }
+
+// The graph view's explicit "Load older" — never triggered automatically.
+// Re-walks the same ref set load_repository/open_repository_fast used (so
+// the ordering is identical), skips everything up to and including
+// `after_commit_id` (the oldest commit currently on screen), then returns
+// the next page. Read-only: no HEAD/branch/index/remote change of any kind.
+#[tauri::command]
+pub fn load_older_commits(repository_path: String, after_commit_id: String, limit: Option<usize>) -> Result<OlderCommitsPage, String> {
+    validate_path(&repository_path)?;
+    let repo = internal_repository(&repository_path)?;
+    let limit = limit.unwrap_or(GRAPH_COMMIT_WINDOW);
+    let after_oid = git2::Oid::from_str(&after_commit_id).map_err(|error| error.message().to_string())?;
+
+    let mut refs_by_oid: HashMap<String, Vec<String>> = HashMap::new();
+    if let Ok(references) = repo.references() { for reference in references.flatten() {
+        if reference.name() == Some("refs/stash") { continue; }
+        if let (Some(oid), Some(name)) = (reference.target(), reference.shorthand()) { refs_by_oid.entry(oid.to_string()).or_default().push(name.to_string()); }
+    } }
+    let mut walk = repo.revwalk().map_err(|error| error.message().to_string())?;
+    walk.set_sorting(Sort::TOPOLOGICAL | Sort::TIME).map_err(|error| error.message().to_string())?;
+    if let Ok(references) = repo.references() { for reference in references.flatten() {
+        if reference.name() == Some("refs/stash") { continue; }
+        if let Ok(object) = reference.peel(ObjectType::Commit) { let _ = walk.push(object.id()); }
+    } }
+
+    let mut found_marker = false;
+    let mut commits = Vec::new();
+    let mut has_more = false;
+    for oid in walk.flatten() {
+        if !found_marker { if oid == after_oid { found_marker = true; } continue; }
+        if commits.len() >= limit { has_more = true; break; }
+        if let Ok(commit) = repo.find_commit(oid) {
+            commits.push(Commit { id: oid.to_string(), parents: commit.parent_ids().map(|id| id.to_string()).collect(), subject: commit.summary().unwrap_or("No message").to_string(), author: commit.author().name().unwrap_or("Unknown").to_string(), date: short_date(commit.time().seconds()), refs: refs_by_oid.remove(&oid.to_string()).unwrap_or_default(), lane: 0 });
+        }
+    }
+    if !found_marker { return Err("This history has moved on since it was last loaded — refresh and try again.".into()); }
+    Ok(OlderCommitsPage { commits, has_more })
 }
 
 // A lightweight "what changed" refresh — status only, no branches/commits/
@@ -4758,6 +4819,100 @@ mod tests {
         let refreshed = load_directory(path.clone(), "".into(), Some(true)).unwrap();
         let refreshed_readme = refreshed.iter().find(|entry| entry.relative_path == "README.md").unwrap();
         assert!(!refreshed_readme.status.is_empty(), "force:true must bypass the status cache and show the external edit immediately, got status={:?}", refreshed_readme.status);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn load_older_commits_paginates_correctly_and_reports_has_more() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-load-older-{suffix}"));
+        create_libgit2_repository(&base, "README.md");
+        // 4 more commits on top of the initial one — 5 total: c0 (oldest) .. c4 (HEAD, newest).
+        let mut ids = Vec::new();
+        {
+            let repo = Repository::open(&base).unwrap();
+            ids.push(repo.head().unwrap().target().unwrap().to_string());
+        }
+        for i in 1..5 {
+            fs::write(base.join("README.md"), format!("v{i}")).unwrap();
+            run_git(&base, &["commit", "-am", &format!("commit {i}")]);
+            let repo = Repository::open(&base).unwrap();
+            ids.push(repo.head().unwrap().target().unwrap().to_string());
+        }
+        let repo_path = base.to_string_lossy().into_owned();
+
+        // First page: the 2 newest (c4, c3) — matches what load_repository
+        // itself would show first, oldest-last.
+        let first_page = load_repository(repo_path.clone(), None).unwrap();
+        assert_eq!(first_page.commits.len(), 5, "small repository — nothing should be truncated");
+        assert!(!first_page.commits_truncated);
+
+        // "Load older" after the oldest commit currently on screen (c0, the
+        // very first commit) — nothing further back exists.
+        let after_oldest = load_older_commits(repo_path.clone(), ids[0].clone(), Some(2)).unwrap();
+        assert!(after_oldest.commits.is_empty(), "there is nothing older than the very first commit");
+        assert!(!after_oldest.has_more);
+
+        // Paginate with a small page size from the newest commit (c4): must
+        // return exactly [c3, c2] in that order, and report more remain.
+        let page1 = load_older_commits(repo_path.clone(), ids[4].clone(), Some(2)).unwrap();
+        assert_eq!(page1.commits.iter().map(|c| c.id.clone()).collect::<Vec<_>>(), vec![ids[3].clone(), ids[2].clone()]);
+        assert!(page1.has_more, "c1 and c0 still remain after this page");
+
+        // Continuing from the last commit of page1 must yield the rest ([c1, c0]) with no more left.
+        let page2 = load_older_commits(repo_path.clone(), ids[2].clone(), Some(2)).unwrap();
+        assert_eq!(page2.commits.iter().map(|c| c.id.clone()).collect::<Vec<_>>(), vec![ids[1].clone(), ids[0].clone()]);
+        assert!(!page2.has_more);
+
+        // A marker commit that isn't actually in this repository's history must fail clearly, not silently return an empty/wrong page.
+        assert!(load_older_commits(repo_path, "0".repeat(40), Some(2)).is_err());
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn load_repository_truncates_at_the_graph_commit_window_and_load_older_continues_past_it() {
+        // Real truncation, not a small-repo simulation: builds a genuine
+        // linear chain of GRAPH_COMMIT_WINDOW + 5 commits directly through
+        // git2 (in-process tree/commit writes — fast; no per-commit `git`
+        // subprocess) and confirms load_repository stops at exactly the
+        // window, flags commits_truncated, and load_older_commits picks up
+        // the real remainder from there.
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-truncation-{suffix}"));
+        fs::create_dir_all(&base).unwrap();
+        let repo = Repository::init(&base).unwrap();
+        let signature = git2::Signature::now("Test User", "test@example.com").unwrap();
+        let total = GRAPH_COMMIT_WINDOW + 5;
+        let mut last_commit: Option<git2::Oid> = None;
+        let mut all_ids = Vec::with_capacity(total);
+        for i in 0..total {
+            fs::write(base.join("file.txt"), format!("{i}")).unwrap();
+            let mut index = repo.index().unwrap();
+            index.add_path(Path::new("file.txt")).unwrap();
+            index.write().unwrap();
+            let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+            let parents: Vec<git2::Commit> = last_commit.map(|oid| repo.find_commit(oid).unwrap()).into_iter().collect();
+            let parent_refs: Vec<&git2::Commit> = parents.iter().collect();
+            let oid = repo.commit(Some("HEAD"), &signature, &signature, &format!("commit {i}"), &tree, &parent_refs).unwrap();
+            last_commit = Some(oid);
+            all_ids.push(oid.to_string());
+        }
+        drop(repo);
+        let repo_path = base.to_string_lossy().into_owned();
+
+        let data = load_repository(repo_path.clone(), None).unwrap();
+        assert_eq!(data.commits.len(), GRAPH_COMMIT_WINDOW, "must stop at exactly the window, not the repository's real total");
+        assert!(data.commits_truncated, "a repository with more history than the window must say so");
+        // Newest-first: the window's oldest (last) entry is commit total-window.
+        let oldest_in_window = data.commits.last().unwrap().id.clone();
+        assert_eq!(oldest_in_window, all_ids[total - GRAPH_COMMIT_WINDOW]);
+
+        let older = load_older_commits(repo_path, oldest_in_window, Some(500)).unwrap();
+        assert_eq!(older.commits.len(), 5, "exactly the 5 real commits older than the window must come back");
+        assert!(!older.has_more, "that really is the entire rest of the history");
+        assert_eq!(older.commits.last().unwrap().id, all_ids[0], "must end at the true root commit");
 
         fs::remove_dir_all(base).unwrap();
     }
