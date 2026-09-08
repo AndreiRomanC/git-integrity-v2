@@ -20,6 +20,7 @@ pub fn run() {
             repository::unstage_files,
             repository::create_commit,
             repository::branch_creation_context,
+            repository::graph_branch_divergence,
             repository::create_branch,
             repository::switch_branch,
             repository::load_directory,

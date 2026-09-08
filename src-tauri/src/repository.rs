@@ -1565,6 +1565,51 @@ pub fn create_commit(path: String, message: String) -> Result<(), String> {
 #[derive(Serialize)]
 pub struct BranchCreationContext { current_branch: String, current_commit: String, main_remote_branch: Option<String>, ahead: usize, behind: usize }
 
+#[derive(Serialize)]
+pub struct BranchDivergence {
+    name: String,
+    tip: String,
+    // How many commits are reachable from `name`'s tip but not from
+    // `primary_branch`'s tip, and vice versa — real `git rev-list
+    // --left-right --count primary...name` via git2's graph_ahead_behind,
+    // never inferred from where two refs happen to land in the rendered
+    // graph (lane, row distance, color).
+    ahead: usize,
+    behind: usize,
+    // The real common ancestor (`git merge-base`), when both tips exist and
+    // share one — this is the commit the frontend should mark as the actual
+    // divergence point, not "whatever commit is next in the same lane".
+    merge_base: Option<String>,
+}
+
+// Real, OID-based divergence for every local branch relative to one chosen
+// "primary" branch — the backend counterpart to what the graph view shows
+// per branch ("N commits ahead of <primary>"). Deliberately independent of
+// any lane/row layout: the frontend decides how to *draw* this, this only
+// answers what's actually true in the DAG. A branch with no real ancestry
+// relationship to `primary_branch` (merge_base: None, from an unrelated
+// history — e.g. two truly disconnected root commits) is reported as such
+// instead of a fabricated ahead/behind count.
+#[tauri::command]
+pub fn graph_branch_divergence(repository_path: String, primary_branch: String) -> Result<Vec<BranchDivergence>, String> {
+    validate_path(&repository_path)?;
+    let repo = internal_repository(&repository_path)?;
+    let Some(primary_tip) = repo.find_branch(&primary_branch, BranchType::Local).ok().and_then(|b| b.get().target()) else {
+        return Ok(Vec::new()); // no such local branch (e.g. detached HEAD) — nothing to compare against
+    };
+    let mut result = Vec::new();
+    if let Ok(iterator) = repo.branches(Some(BranchType::Local)) {
+        for item in iterator.flatten() {
+            let name = match item.0.name().ok().flatten() { Some(name) => name.to_string(), None => continue };
+            let Some(tip) = item.0.get().target() else { continue };
+            let (ahead, behind) = repo.graph_ahead_behind(tip, primary_tip).unwrap_or((0, 0));
+            let merge_base = repo.merge_base(tip, primary_tip).ok().map(|oid| oid.to_string());
+            result.push(BranchDivergence { name, tip: tip.to_string(), ahead, behind, merge_base });
+        }
+    }
+    Ok(result)
+}
+
 // A new branch is always created from wherever HEAD currently is — this
 // tells the caller exactly where that is (so "New branch" is never a
 // mystery about what you're actually branching from), and how that
@@ -3655,6 +3700,12 @@ mod tests {
         assert!(status.success(), "git command failed: {args:?}");
     }
 
+    fn run_git_capture(path: &Path, args: &[&str]) -> String {
+        let output = Command::new("git").arg("-C").arg(path).args(args).output().unwrap();
+        assert!(output.status.success(), "git command failed: {args:?}");
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
     fn create_libgit2_repository(path: &Path, file: &str) {
         fs::create_dir_all(path).unwrap();
         fs::write(path.join(file), "content").unwrap();
@@ -4058,6 +4109,75 @@ mod tests {
         run_git(&repository, &["commit", "-am", "Local-only commit"]);
         let context = branch_creation_context(path.clone(), "".into()).unwrap();
         assert_eq!((context.ahead, context.behind), (1, 1));
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn graph_branch_divergence_reports_real_ahead_behind_and_merge_base_not_lane_position() {
+        // A controlled DAG exercising exactly what the graph view's "N commits
+        // ahead" annotation must be based on: real merge-base/ahead/behind per
+        // branch, computed from OIDs — never from which row/lane a ref happens
+        // to render on.
+        //
+        //   A ── B (feature) ── (feature merged into main below)
+        //   └── C (main) ── M (merge: parents C, B)
+        //   A ── D (old-diverged, never merged)
+        //   (unrelated) — orphan root, no shared history with main at all
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-graph-divergence-{suffix}"));
+        create_libgit2_repository(&base, "a.txt");
+        run_git(&base, &["branch", "-M", "main"]);
+        let commit_a = run_git_capture(&base, &["rev-parse", "HEAD"]);
+
+        run_git(&base, &["checkout", "-b", "feature"]);
+        fs::write(base.join("b.txt"), "b").unwrap();
+        run_git(&base, &["add", "."]); run_git(&base, &["commit", "-m", "B on feature"]);
+        let commit_b = run_git_capture(&base, &["rev-parse", "HEAD"]);
+
+        run_git(&base, &["checkout", "main"]);
+        fs::write(base.join("c.txt"), "c").unwrap();
+        run_git(&base, &["add", "."]); run_git(&base, &["commit", "-m", "C on main"]);
+
+        run_git(&base, &["merge", "--no-ff", "-m", "Merge feature into main", "feature"]);
+        let merge_commit = run_git_capture(&base, &["rev-parse", "HEAD"]);
+        let parents = run_git_capture(&base, &["log", "-1", "--pretty=%P", &merge_commit]);
+        assert_eq!(parents.split_whitespace().count(), 2, "sanity check: the merge commit must have exactly two parents");
+
+        run_git(&base, &["checkout", "-b", "old-diverged", &commit_a]);
+        fs::write(base.join("d.txt"), "d").unwrap();
+        run_git(&base, &["add", "."]); run_git(&base, &["commit", "-m", "D, never merged"]);
+
+        run_git(&base, &["checkout", "--orphan", "unrelated"]);
+        run_git(&base, &["reset", "--hard"]);
+        fs::write(base.join("u.txt"), "u").unwrap();
+        run_git(&base, &["add", "."]); run_git(&base, &["commit", "-m", "Unrelated root, no shared history"]);
+
+        run_git(&base, &["checkout", "main"]);
+        let repo_path = base.to_string_lossy().into_owned();
+
+        let divergence = graph_branch_divergence(repo_path, "main".into()).unwrap();
+        let by_name = |name: &str| divergence.iter().find(|d| d.name == name).unwrap_or_else(|| panic!("branch {name} should be reported"));
+
+        let main = by_name("main");
+        assert_eq!(main.tip, merge_commit);
+        assert_eq!((main.ahead, main.behind), (0, 0), "main compared against itself must be exactly in sync");
+        assert_eq!(main.merge_base.as_deref(), Some(merge_commit.as_str()));
+
+        let feature = by_name("feature");
+        assert_eq!(feature.tip, commit_b);
+        assert_eq!(feature.ahead, 0, "feature's only commit (B) is reachable from main after the merge — it must not be reported as still ahead");
+        assert_eq!(feature.behind, 2, "main has C and the merge commit that feature's tip doesn't — real count, not a lane-distance guess");
+        assert_eq!(feature.merge_base.as_deref(), Some(commit_b.as_str()), "B is itself an ancestor of the merge commit, so it IS the real merge-base");
+
+        let old_diverged = by_name("old-diverged");
+        assert_eq!(old_diverged.ahead, 1, "exactly one commit (D) exists only on old-diverged");
+        assert_eq!(old_diverged.behind, 3, "main has C, B and the merge commit that old-diverged doesn't");
+        assert_eq!(old_diverged.merge_base.as_deref(), Some(commit_a.as_str()), "the real divergence point is A, not whatever commit happens to share a lane in the rendered graph");
+
+        let unrelated = by_name("unrelated");
+        assert!(unrelated.merge_base.is_none(), "two branches with genuinely disconnected histories must be reported as having no merge-base, never a fabricated one");
+        assert!(unrelated.ahead >= 1, "an orphan branch's own commit(s) must count as ahead");
 
         fs::remove_dir_all(base).unwrap();
     }
