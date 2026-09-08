@@ -850,54 +850,52 @@ async function fetchAndRenderDirectory(path, requestId, options) {
 // synchronously — which used to mean every single folder browsed inside a
 // submodule paid for its own ~220-600ms scoped Git scan — this shows the
 // existing filesystem-only listing immediately (status marked Loading/
-// unknown), starts the submodule's one real, read-only, single-flight status
-// scan in the background, and repaints with real status once it lands.
-// Every subsequent folder inside that same submodule (this call, from then
-// on) goes through the normal path below and reuses that one scan via the
-// backend's existing cache-reuse path — no scoped rescan per folder. Never
-// pre-scans any *other* submodule; only the one just entered.
+// unknown) with NO awaited call in front of it, not even the cheap,
+// index-only submodule_navigation_status check: a real click→first-paint
+// measurement is what this app promises everywhere else, and an IPC round
+// trip in front of it — however fast — is still a real, avoidable delay the
+// user asked never to reintroduce. The status check and the submodule's one
+// real, read-only, single-flight status scan both happen only *after* that
+// paint, in the background; the folder repaints with real status once they
+// land. Every subsequent folder inside that same submodule (this call, from
+// then on) goes through the normal path below and reuses that one scan via
+// the backend's existing cache-reuse path — no scoped rescan per folder.
+// Never pre-scans any *other* submodule; only the one just entered.
 async function openDirectory(path, options = {}) {
   if (!state.repository) return;
   state.currentPath = path; state.selectedEntry = null;
   const requestId = ++explorerRequestSeq;
 
   const boundary = submoduleBoundaryFor(path);
-  if (!boundary) {
-    state.activeSubmodule = null;
-  } else if (warmSubmodules.has(boundary)) {
-    state.activeSubmodule = { path: boundary, statusReady: true };
-  } else {
-    state.activeSubmodule = { path: boundary, statusReady: false };
-    let alreadyWarm = false;
-    if (invoke) {
-      try {
-        const nav = await invoke('submodule_navigation_status', { repositoryPath: state.repository.path, relativePath: path });
-        alreadyWarm = Boolean(nav?.ready);
-      } catch { /* treat as cold — the fast path below is always correct, just not free */ }
-    }
-    if (requestId !== explorerRequestSeq) return; // navigated away while checking
-    if (alreadyWarm) {
-      warmSubmodules.add(boundary);
-      state.activeSubmodule = { path: boundary, statusReady: true };
-    } else {
-      await paintDirectoryFast(path, requestId);
-      if (requestId !== explorerRequestSeq) return;
-      if (invoke) {
-        try { await invoke('submodule_folder_status', { repositoryPath: state.repository.path, relativePath: path }); }
-        catch (error) { status(String(error), 'error'); /* fall through: mutations must not stay disabled forever over a failed scan */ }
-      }
-      warmSubmodules.add(boundary);
-      if (requestId !== explorerRequestSeq || state.currentPath !== path) return;
-      state.activeSubmodule = { path: boundary, statusReady: true };
-      // Real status is in cache now — repaint with it. `force` alone (never
-      // invalidateGit, even if the original call asked for it): the scan
-      // above already *is* the fresh, read-only rescan the caller wanted —
-      // reuse what it just computed, don't ask the backend to throw it away
-      // and pay for a second one right behind it.
-      return fetchAndRenderDirectory(path, requestId, { ...options, force: true, invalidateGit: false });
-    }
+  if (!boundary) { state.activeSubmodule = null; return fetchAndRenderDirectory(path, requestId, options); }
+  if (warmSubmodules.has(boundary)) { state.activeSubmodule = { path: boundary, statusReady: true }; return fetchAndRenderDirectory(path, requestId, options); }
+
+  // Cold submodule: paint first, decide/scan after — see the comment above.
+  state.activeSubmodule = { path: boundary, statusReady: false };
+  await paintDirectoryFast(path, requestId);
+  if (requestId !== explorerRequestSeq) return; // navigated away while the fast paint itself was in flight
+
+  let alreadyWarm = false;
+  if (invoke) {
+    try {
+      const nav = await invoke('submodule_navigation_status', { repositoryPath: state.repository.path, relativePath: path });
+      alreadyWarm = Boolean(nav?.ready);
+    } catch { /* treat as cold — the scan below is always correct, just not free */ }
   }
-  return fetchAndRenderDirectory(path, requestId, options);
+  if (requestId !== explorerRequestSeq) return; // navigated away while checking
+  if (!alreadyWarm && invoke) {
+    try { await invoke('submodule_folder_status', { repositoryPath: state.repository.path, relativePath: path }); }
+    catch (error) { status(String(error), 'error'); /* fall through: mutations must not stay disabled forever over a failed scan */ }
+  }
+  warmSubmodules.add(boundary);
+  if (requestId !== explorerRequestSeq || state.currentPath !== path) return;
+  state.activeSubmodule = { path: boundary, statusReady: true };
+  // Real status is in cache now — repaint with it. `force` alone (never
+  // invalidateGit, even if the original call asked for it): the scan above
+  // already *is* the fresh, read-only rescan the caller wanted — reuse what
+  // it just computed, don't ask the backend to throw it away and pay for a
+  // second one right behind it.
+  return fetchAndRenderDirectory(path, requestId, { ...options, force: true, invalidateGit: false });
 }
 
 // Filesystem-only variant of openDirectory used for the very first render of

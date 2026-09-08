@@ -288,6 +288,36 @@ fn cached_unpushed_paths(repository: &str) -> Arc<HashSet<String>> {
     data
 }
 
+// Which of this repository's submodules (by their parent-relative path) have
+// local commits not yet pushed to their own origin — same shape and TTL as
+// cached_unpushed_paths above, and the same reason: load_directory used to
+// answer this by calling submodule_push_status (opens a whole separate
+// Repository, walks up to 50 commits) *synchronously, once per submodule
+// entry, on every single folder listing* — real, serial cost in the
+// critical path of just showing a folder, paid again on every navigation
+// since nothing cached it. Computed once per repository here instead, and
+// reused (a cheap HashSet lookup) for every folder browsed afterward, same
+// as the tracked/unpushed-file sets already are.
+static SUBMODULE_UNPUSHED_CACHE: OnceLock<Mutex<HashMap<String, (Instant, Arc<HashSet<String>>)>>> = OnceLock::new();
+
+fn submodule_unpushed_cache() -> &'static Mutex<HashMap<String, (Instant, Arc<HashSet<String>>)>> {
+    SUBMODULE_UNPUSHED_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cached_submodule_unpushed_set(repository: &str) -> Arc<HashSet<String>> {
+    if let Some((cached_at, data)) = submodule_unpushed_cache().lock().unwrap().get(repository) {
+        if cached_at.elapsed() < INDEX_METADATA_TTL { return data.clone(); }
+    }
+    let (_, submodules) = cached_index_metadata(repository);
+    let data: HashSet<String> = submodules.iter()
+        .filter(|relative| Path::new(repository).join(relative).is_dir())
+        .filter(|relative| submodule_push_status(Path::new(repository).join(relative).to_str().unwrap_or_default()).is_some())
+        .cloned().collect();
+    let data = Arc::new(data);
+    submodule_unpushed_cache().lock().unwrap().insert(repository.to_string(), (Instant::now(), data.clone()));
+    data
+}
+
 #[derive(Serialize)]
 pub struct RepositoryInfo { path: String, name: String, current_branch: String }
 
@@ -884,6 +914,7 @@ fn invalidate_git_metadata(repository: &str) {
     unpushed_paths_cache().lock().unwrap().remove(repository);
     full_status_cache().lock().unwrap().remove(repository);
     sorted_lookups_cache().lock().unwrap().remove(repository);
+    submodule_unpushed_cache().lock().unwrap().remove(repository);
     // submodule_sync_cache is deliberately NOT cleared here: invalidate_git_metadata
     // runs after essentially every mutation, including an ordinary file
     // stage/commit that has nothing to do with submodules — clearing it here
@@ -2352,6 +2383,10 @@ pub fn load_directory(repository_path: String, relative_path: String, force: Opt
         let idx = statuses_sorted.partition_point(|(path, _)| path.as_str() < prefix.as_str());
         if statuses_sorted.get(idx).map(|(path, _)| path.starts_with(&prefix)).unwrap_or(false) { "•".to_string() } else { String::new() }
     };
+    // Computed once for the whole folder (cached per repository — see its own
+    // doc comment) instead of opening each submodule's own repo again right
+    // here, once per submodule entry, on every single listing.
+    let submodule_unpushed = cached_submodule_unpushed_set(status_repo);
     let mut entries = Vec::new();
     let step = Instant::now();
     let mut submodule_count = 0usize;
@@ -2379,7 +2414,7 @@ pub fn load_directory(repository_path: String, relative_path: String, force: Opt
         let tracked = git_metadata.submodules.contains(&status_key) || git_metadata.tracked.contains(&status_key) || has_prefix(tracked_sorted, &tracked_prefix);
         let modified = metadata.modified().ok().and_then(|time| time.duration_since(UNIX_EPOCH).ok()).map(|value| value.as_secs()).unwrap_or(0);
         if kind == "submodule" { submodule_count += 1; }
-        let submodule_has_unpushed_commits = kind == "submodule" && submodule_push_status(item.path().to_str().unwrap_or_default()).is_some();
+        let submodule_has_unpushed_commits = kind == "submodule" && submodule_unpushed.contains(&status_key);
         let unpushed = if kind == "folder" { git_metadata.unpushed.contains(&status_key) || has_prefix(unpushed_sorted, &tracked_prefix) } else { git_metadata.unpushed.contains(&status_key) };
         entries.push(DirectoryEntry { name, relative_path: relative_string, kind, status: status_for_entry(&status_key), tracked, size: if metadata.is_file() { metadata.len() } else { 0 }, modified, submodule_has_unpushed_commits, unpushed, status_known: true });
     }
@@ -5899,6 +5934,67 @@ mod tests {
         push_submodule(repo_path, "vendor/dep".into()).unwrap();
         assert_eq!(submodule_push_status(&sub_path.to_string_lossy()), None, "after push, the submodule should no longer report anything unpushed");
         assert!(submodule_unpushed_commits(&sub_path.to_string_lossy()).is_empty(), "after push, the unpushed commit list should be empty too");
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn load_directory_caches_submodule_unpushed_status_instead_of_rescanning_every_call() {
+        // Reproduces and fixes the confirmed critical-path cost: load_directory
+        // used to call submodule_push_status — opening a whole separate
+        // Repository and walking commits — synchronously, once per submodule
+        // entry, on *every single* folder listing. Proven the same way as the
+        // other cache-reuse tests in this file: after the folder is listed
+        // once (seeding the cache), a change to the submodule's push status
+        // made without going through this app must NOT show up on a second,
+        // unforced listing — that would only happen if it reused the cache
+        // rather than rescanning. An explicit force:true must still see it.
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-load-directory-submodule-cache-{suffix}"));
+        let repository = base.join("main");
+        let dep_remote = base.join("dep-remote.git");
+        let dep_seed = base.join("dep-seed");
+        fs::create_dir_all(&repository).unwrap();
+        fs::create_dir_all(&dep_seed).unwrap();
+        fs::create_dir_all(&dep_remote).unwrap();
+        fs::write(repository.join("README.md"), "root").unwrap();
+        fs::write(dep_seed.join("module.txt"), "v1").unwrap();
+        run_git(&dep_remote, &["init", "--bare"]);
+        for path in [&repository, &dep_seed] {
+            run_git(path, &["init"]);
+            run_git(path, &["config", "user.email", "test@example.com"]);
+            run_git(path, &["config", "user.name", "Test User"]);
+            run_git(path, &["add", "."]);
+            run_git(path, &["commit", "-m", "Initial"]);
+        }
+        run_git(&dep_seed, &["remote", "add", "origin", dep_remote.to_str().unwrap()]);
+        run_git(&dep_seed, &["-c", "protocol.file.allow=always", "push", "origin", "HEAD:main"]);
+        run_git(&repository, &["-c", "protocol.file.allow=always", "submodule", "add", dep_remote.to_str().unwrap(), "vendor/dep"]);
+        run_git(&repository, &["commit", "-am", "Add dep submodule"]);
+
+        let repo_path = repository.to_string_lossy().into_owned();
+        let sub_path = repository.join("vendor/dep");
+        run_git(&sub_path, &["config", "user.email", "test@example.com"]);
+        run_git(&sub_path, &["config", "user.name", "Test User"]);
+
+        // First listing: freshly in sync, nothing unpushed — also seeds the cache.
+        let listing = load_directory(repo_path.clone(), "vendor".into(), None).unwrap();
+        let entry = listing.iter().find(|e| e.name == "dep").unwrap();
+        assert!(!entry.submodule_has_unpushed_commits, "freshly synced submodule should not be flagged");
+
+        // A commit lands in the submodule without going through load_directory again.
+        fs::write(sub_path.join("module.txt"), "v2").unwrap();
+        run_git(&sub_path, &["commit", "-am", "Local only, not pushed"]);
+
+        // Without force, the cache seeded above is still fresh (TTL is 300s) and unaware of it.
+        let stale = load_directory(repo_path.clone(), "vendor".into(), None).unwrap();
+        let stale_entry = stale.iter().find(|e| e.name == "dep").unwrap();
+        assert!(!stale_entry.submodule_has_unpushed_commits, "sanity check: without force, the cached (clean) submodule-unpushed set must still be reused, proving load_directory didn't rescan on its own");
+
+        // A forced reload (Reload folder) must invalidate and see the real, current state.
+        let forced = load_directory(repo_path, "vendor".into(), Some(true)).unwrap();
+        let forced_entry = forced.iter().find(|e| e.name == "dep").unwrap();
+        assert!(forced_entry.submodule_has_unpushed_commits, "force:true must invalidate the cache and report the real, current unpushed commit");
 
         fs::remove_dir_all(base).unwrap();
     }
