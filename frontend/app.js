@@ -137,6 +137,7 @@ const refs = {
   remotesView: $('#remotesView'), remoteCards: $('#remoteCards'), editorDialog: $('#editorDialog'), editorTitle: $('#editorTitle'), editorPath: $('#editorPath'), editorContent: $('#editorContent'), locationRepository: $('#locationRepository'), locationBranch: $('#locationBranch'), locationPath: $('#locationPath'), leaveSubmoduleGraph: $('#leaveSubmoduleGraph'), publishDialog: $('#publishDialog'), publishBranch: $('#publishBranch'), publishRemote: $('#publishRemote'), publishCommits: $('#publishCommits'), publishSummary: $('#publishSummary'), publishDestination: $('#publishDestination'), publishBadge: $('#publishBadge'), publishSubtitle: $('#publishSubtitle'), cloneDialog: $('#cloneDialog'), cloneUrl: $('#cloneUrl'), cloneParent: $('#cloneParent'), cloneName: $('#cloneName'), confirmClone: $('#confirmClone'), submoduleDialog: $('#submoduleDialog'), submoduleUrl: $('#submoduleUrl'), submoduleParent: $('#submoduleParent'), submoduleName: $('#submoduleName'), submoduleUsername: $('#submoduleUsername'), submoduleToken: $('#submoduleToken'), submoduleAddStatus: $('#submoduleAddStatus'), confirmAddSubmodule: $('#confirmAddSubmodule'), operationToast: $('#operationToast'), drawerScopeTitle: $('#drawerScopeTitle'),
   mergeBranchDialog: $('#mergeBranchDialog'), mergeBranchSubtitle: $('#mergeBranchSubtitle'), mergeBranchCurrent: $('#mergeBranchCurrent'), mergeBranchSource: $('#mergeBranchSource'), mergeBranchStatus: $('#mergeBranchStatus'), confirmMergeBranch: $('#confirmMergeBranch'),
   stashesDialog: $('#stashesDialog'), stashesList: $('#stashesList'),
+  togglePrStatus: $('#togglePrStatus'), prStatusArrow: $('#prStatusArrow'), prStatusPanel: $('#prStatusPanel'),
   newBranchDialog: $('#newBranchDialog'), newBranchFrom: $('#newBranchFrom'), newBranchOriginStatus: $('#newBranchOriginStatus'), newBranchName: $('#newBranchName'), newBranchStatus: $('#newBranchStatus'), confirmNewBranch: $('#confirmNewBranch'),
   conflictsDialog: $('#conflictsDialog'), conflictsTitle: $('#conflictsTitle'), conflictsSubtitle: $('#conflictsSubtitle'), conflictsList: $('#conflictsList'), conflictsCommitMessage: $('#conflictsCommitMessage'), conflictsCommitMessageLabel: $('#conflictsCommitMessageLabel'), conflictsLocalNote: $('#conflictsLocalNote'), conflictsStatus: $('#conflictsStatus'), confirmCompleteMerge: $('#confirmCompleteMerge'), abortMergeButton: $('#abortMerge'),
   mergeConflictsBanner: $('#mergeConflictsBanner'), mergeConflictsSubtitle: $('#mergeConflictsSubtitle')
@@ -483,6 +484,11 @@ function render() {
   if (state.view === 'remotes') renderRemotes();
   updateChangeBadge();
   if (refs.changesDrawer.classList.contains('open')) renderChanges();
+  // Independent of everything above: never blocks or is blocked by the rest
+  // of this render — only refetches if the repository/branch actually
+  // changed since its last check, and only when the panel is expanded (see
+  // createPrStatusPanel's own doc comment for why).
+  mainPrStatusPanel?.refreshIfContextChanged();
 }
 
 function renderCommanderBreadcrumbs() {
@@ -3037,6 +3043,134 @@ document.addEventListener('keydown', (e) => {
   else if ((e.ctrlKey || e.metaKey) && e.key === 'f' && !['input','textarea'].includes(document.activeElement.tagName.toLowerCase())) { e.preventDefault(); refs.search.focus(); }
 });
 
+// ---- Pull request status panel (read-only, first incremental step) ----
+//
+// A self-contained factory, not a singleton tied to the sidebar: it owns its
+// own DOM subtree, its own load/poll lifecycle, and takes its repository
+// path and branch through callbacks instead of reading global `state`
+// directly — so a later "Project Status" view can create one instance per
+// repository (the parent, and one per submodule) just by pointing each at a
+// different root element and a different {path, branch} pair, with no
+// changes needed here. `pr_status` never receives or returns a token — the
+// backend shells out to the `gh` CLI, which owns its own credential storage
+// entirely outside this app.
+//
+// Loading is independent of the rest of the repository UI: this never awaits
+// anything the explorer/graph/commander views depend on, and nothing here
+// blocks them — a slow or failed PR check only ever affects this one panel.
+// Polling only runs while `setExpanded(true)` — collapsed (the default) or
+// hidden, no requests are made at all, satisfies "don't poll while hidden"
+// without a separate visibility flag to keep in sync.
+const PR_STATE_LABELS = {
+  loading: 'Checking pull request status…',
+  no_remote: 'No remote configured for this repository.',
+  unsupported_provider: null, // uses the backend's own detail message verbatim
+  auth_missing: null,
+  api_error: null,
+  no_open_pr: null,
+};
+const PR_LIFECYCLE_LABEL = { draft: 'Draft', open: 'Open', merged: 'Merged', closed: 'Closed' };
+const PR_MERGEABLE_LABEL = { mergeable: 'Mergeable', conflicting: 'Conflicting', calculating: 'Calculating…', unknown: 'Unknown' };
+const PR_REVIEW_LABEL = { approved: 'Approved', changes_requested: 'Changes requested', review_required: 'Review required', none: 'No reviews yet' };
+const PR_CHECKS_LABEL = { passing: 'Checks passing', failing: 'Checks failing', pending: 'Checks running…', none: 'No checks' };
+
+function prCardHtml(pr) {
+  return `<div class="pr-card">
+    <div class="pr-card-top"><span class="pr-number">#${pr.number}</span><span class="pr-badge pr-lifecycle-${esc(pr.state)}">${esc(PR_LIFECYCLE_LABEL[pr.state] || pr.state)}</span></div>
+    <div class="pr-title">${esc(pr.title || '(no title)')}</div>
+    <div class="pr-branches"><code>${esc(pr.source_branch)}</code><span class="pr-branch-arrow">→</span><code>${esc(pr.target_branch)}</code></div>
+    <div class="pr-badges">
+      <span class="pr-badge pr-mergeable-${esc(pr.mergeable)}">${esc(PR_MERGEABLE_LABEL[pr.mergeable] || pr.mergeable)}</span>
+      <span class="pr-badge pr-review-${esc(pr.review_summary)}">${esc(PR_REVIEW_LABEL[pr.review_summary] || pr.review_summary)}</span>
+      <span class="pr-badge pr-checks-${esc(pr.checks_status)}">${esc(PR_CHECKS_LABEL[pr.checks_status] || pr.checks_status)}</span>
+    </div>
+    <button class="pr-open-link" data-open-url="${esc(pr.url)}" ${pr.url ? '' : 'disabled'}>Open pull request ↗</button>
+  </div>`;
+}
+
+function createPrStatusPanel(root, options) {
+  let expanded = false;
+  let generation = 0;
+  let pollTimer = null;
+  let lastKey = null;
+
+  function renderState(result) {
+    if (result.state === 'loading') { root.innerHTML = '<div class="pr-status-loading"><i class="spinner"></i>Checking pull request status…</div>'; return; }
+    if (result.state === 'ok' && result.pull_requests.length) {
+      const heading = result.pull_requests.length > 1 ? `<div class="pr-status-count">${result.pull_requests.length} open pull requests for <code>${esc(result.branch || '')}</code></div>` : '';
+      root.innerHTML = heading + result.pull_requests.map(prCardHtml).join('');
+      return;
+    }
+    const message = PR_STATE_LABELS[result.state] || result.detail || 'Pull request status unavailable.';
+    const detail = result.state === 'no_open_pr' ? `No open pull request for <code>${esc(result.branch || 'this branch')}</code>.` : esc(message);
+    const retryable = ['api_error', 'auth_missing'].includes(result.state);
+    root.innerHTML = `<div class="pr-status-empty pr-status-${esc(result.state)}">${detail}${retryable ? '<button class="pr-status-retry" id="prStatusRetry">Retry</button>' : ''}</div>`;
+    if (retryable) root.querySelector('#prStatusRetry')?.addEventListener('click', load);
+  }
+
+  async function load() {
+    const repositoryPath = options.getRepositoryPath();
+    const branch = options.getBranch();
+    lastKey = `${repositoryPath || ''}::${branch || ''}`;
+    if (!repositoryPath) { renderState({ state: 'no_repository', detail: 'No repository open.', pull_requests: [] }); return; }
+    const myGeneration = ++generation;
+    renderState({ state: 'loading', pull_requests: [] });
+    if (!invoke) { renderState({ state: 'no_open_pr', branch, pull_requests: [] }); return; }
+    try {
+      const result = await invoke('pr_status', { repositoryPath, branch: branch || null });
+      if (myGeneration !== generation) return; // a newer load (or context change) superseded this one
+      renderState(result);
+    } catch (error) {
+      if (myGeneration !== generation) return;
+      renderState({ state: 'api_error', detail: String(error), pull_requests: [] });
+    }
+  }
+
+  function schedulePoll() {
+    clearTimeout(pollTimer); pollTimer = null;
+    if (!expanded) return;
+    pollTimer = setTimeout(async () => { await load(); schedulePoll(); }, options.pollMs || 60000);
+  }
+
+  function setExpanded(next) {
+    expanded = next;
+    root.classList.toggle('collapsed', !expanded);
+    if (expanded) { load(); schedulePoll(); }
+    else { clearTimeout(pollTimer); pollTimer = null; }
+  }
+
+  // Called from the main render() on every state change — cheap (a string
+  // comparison) when nothing relevant changed, and if the panel is currently
+  // collapsed this only remembers that a refetch is owed, it doesn't do one:
+  // load() itself recomputes and stores lastKey, so simply expanding the
+  // panel later always fetches for whatever repository/branch is current
+  // then, never a stale one from before it was opened.
+  function refreshIfContextChanged() {
+    const key = `${options.getRepositoryPath() || ''}::${options.getBranch() || ''}`;
+    if (key === lastKey) return;
+    if (expanded) load(); else lastKey = key;
+  }
+
+  return { setExpanded, refreshIfContextChanged, isExpanded: () => expanded };
+}
+
+const mainPrStatusPanel = createPrStatusPanel(refs.prStatusPanel, {
+  getRepositoryPath: () => state.repository?.path || null,
+  getBranch: () => state.repository?.current_branch || null,
+  pollMs: 60000,
+});
+refs.togglePrStatus.addEventListener('click', () => {
+  const next = !mainPrStatusPanel.isExpanded();
+  refs.prStatusArrow.textContent = next ? '▾' : '▸';
+  mainPrStatusPanel.setExpanded(next);
+});
+refs.prStatusPanel.addEventListener('click', event => {
+  const link = event.target.closest('[data-open-url]');
+  if (!link || link.disabled) return;
+  const url = link.dataset.openUrl;
+  if (invoke) invoke('open_external_url', { url }).catch(error => status(String(error), 'error'));
+  else window.open(url, '_blank', 'noopener');
+});
 
 if (!invoke) {
   refs.browserNotice.hidden = false;

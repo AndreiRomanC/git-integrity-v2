@@ -46,6 +46,7 @@ pub fn run() {
             repository::read_text_file,
             repository::write_text_file,
             repository::list_remotes,
+            repository::pr_status,
             repository::fetch_remote,
             repository::fetch_all_remotes,
             repository::sync_repository,

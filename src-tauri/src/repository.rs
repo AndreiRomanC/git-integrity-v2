@@ -477,18 +477,22 @@ fn configure_git_command(command: &mut Command) {
 // so the app itself is never left waiting on it either.
 const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(600);
 
-fn run_with_timeout(mut command: Command) -> Result<std::process::Output, String> {
-    let child = command.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().map_err(|e| format!("Cannot start Git: {e}"))?;
+fn run_with_timeout(command: Command) -> Result<std::process::Output, String> {
+    run_with_timeout_labeled(command, GIT_COMMAND_TIMEOUT, "Git", "10 minutes")
+}
+
+fn run_with_timeout_labeled(mut command: Command, timeout: Duration, program_label: &str, timeout_label: &str) -> Result<std::process::Output, String> {
+    let child = command.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().map_err(|e| format!("Cannot start {program_label}: {e}"))?;
     let id = child.id();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || { let _ = tx.send(child.wait_with_output()); });
-    match rx.recv_timeout(GIT_COMMAND_TIMEOUT) {
+    match rx.recv_timeout(timeout) {
         Ok(Ok(output)) => Ok(output),
-        Ok(Err(error)) => Err(format!("Git process error: {error}")),
+        Ok(Err(error)) => Err(format!("{program_label} process error: {error}")),
         Err(_) => {
             #[cfg(unix)] { let _ = Command::new("kill").arg("-9").arg(id.to_string()).status(); }
             #[cfg(windows)] { let _ = Command::new("taskkill").args(["/F", "/PID"]).arg(id.to_string()).status(); }
-            Err("Git command timed out after 10 minutes — check your network connection and try again".into())
+            Err(format!("{program_label} command timed out after {timeout_label} — check your network connection and try again"))
         }
     }
 }
@@ -1640,6 +1644,175 @@ pub fn write_text_file(repository_path: String, relative_path: String, content: 
     fs::write(target, content).map_err(|error| error.to_string())?;
     invalidate_git_metadata(&repository_path);
     Ok(())
+}
+
+// ---- Pull request status (read-only, first incremental step) ----
+//
+// The frontend never receives or stores any GitHub token — this shells out
+// to the `gh` CLI (same trust model this app already uses for plain `git`:
+// reuse whatever credentials are already working outside this app — SSH
+// agent, credential helper, OS keychain — instead of asking the user to
+// paste a secret into it). `gh` owns its own token storage entirely; this
+// process only ever sees `gh`'s stdout/stderr, never the token itself.
+
+#[derive(Serialize)]
+pub struct PullRequestSummary {
+    number: u64,
+    title: String,
+    source_branch: String,
+    target_branch: String,
+    // "draft" | "open" | "merged" | "closed"
+    state: String,
+    // "mergeable" | "conflicting" | "calculating" | "unknown"
+    mergeable: String,
+    // "approved" | "changes_requested" | "review_required" | "none"
+    review_summary: String,
+    // "passing" | "failing" | "pending" | "none"
+    checks_status: String,
+    url: String,
+}
+
+#[derive(Serialize)]
+pub struct PrStatusResult {
+    // "no_remote" | "unsupported_provider" | "auth_missing" | "api_error" |
+    // "no_open_pr" | "ok" (one or more PRs — the frontend distinguishes
+    // "one" vs "multiple" from pull_requests.len() itself)
+    state: String,
+    detail: String,
+    branch: Option<String>,
+    pull_requests: Vec<PullRequestSummary>,
+}
+
+impl PrStatusResult {
+    fn plain(state: &str, detail: impl Into<String>) -> Self {
+        PrStatusResult { state: state.into(), detail: detail.into(), branch: None, pull_requests: Vec::new() }
+    }
+}
+
+// Accepts the handful of real-world GitHub remote URL shapes this app's own
+// remotes are likely to be in: `git@github.com:owner/repo.git`,
+// `https://github.com/owner/repo.git`, `https://github.com/owner/repo`, and
+// the `ssh://git@github.com/owner/repo.git` form. Anything else (a self-hosted
+// Git server, GitLab, Bitbucket, Azure DevOps...) is deliberately left
+// unrecognized — reported as "unsupported provider" rather than guessed at.
+fn parse_github_slug(url: &str) -> Option<String> {
+    let trimmed = url.trim().trim_end_matches(".git");
+    let after_host = if let Some(rest) = trimmed.strip_prefix("git@github.com:") { rest }
+        else if let Some(rest) = trimmed.strip_prefix("https://github.com/") { rest }
+        else if let Some(rest) = trimmed.strip_prefix("http://github.com/") { rest }
+        else if let Some(rest) = trimmed.strip_prefix("ssh://git@github.com/") { rest }
+        else { return None };
+    let mut parts = after_host.splitn(2, '/');
+    let owner = parts.next()?.trim();
+    let repo = parts.next()?.trim();
+    if owner.is_empty() || repo.is_empty() || repo.contains('/') { return None; }
+    Some(format!("{owner}/{repo}"))
+}
+
+fn map_pr_state(state: &str, is_draft: bool) -> String {
+    if is_draft { return "draft".into(); }
+    match state { "OPEN" => "open", "MERGED" => "merged", "CLOSED" => "closed", _ => "open" }.into()
+}
+
+fn map_mergeable(mergeable: &str) -> String {
+    match mergeable { "MERGEABLE" => "mergeable", "CONFLICTING" => "conflicting", _ => "calculating" }.into()
+}
+
+fn map_review_summary(review_decision: &str) -> String {
+    match review_decision {
+        "APPROVED" => "approved",
+        "CHANGES_REQUESTED" => "changes_requested",
+        "REVIEW_REQUIRED" => "review_required",
+        _ => "none",
+    }.into()
+}
+
+// gh's statusCheckRollup is an array of check-run/status-context objects,
+// each with its own conclusion/state — rolled up here into one overall
+// answer the same way GitHub's own PR page badge does: any real failure
+// wins, then anything still running, then "all passing", then "no checks
+// configured at all".
+fn map_checks_status(rollup: &[serde_json::Value]) -> String {
+    if rollup.is_empty() { return "none".into(); }
+    let mut any_pending = false;
+    let mut any_success = false;
+    for entry in rollup {
+        let outcome = entry.get("conclusion").and_then(|v| v.as_str())
+            .or_else(|| entry.get("state").and_then(|v| v.as_str()))
+            .unwrap_or("").to_uppercase();
+        match outcome.as_str() {
+            "FAILURE" | "ERROR" | "TIMED_OUT" | "CANCELLED" | "FAILED" => return "failing".into(),
+            "SUCCESS" | "SUCCESSFUL" | "COMPLETED" | "NEUTRAL" => any_success = true,
+            "PENDING" | "IN_PROGRESS" | "QUEUED" | "EXPECTED" | "STARTUP_FAILURE" => any_pending = true,
+            _ => {}
+        }
+    }
+    if any_pending { "pending".into() } else if any_success { "passing".into() } else { "none".into() }
+}
+
+#[tauri::command]
+pub fn pr_status(repository_path: String, branch: Option<String>) -> Result<PrStatusResult, String> {
+    validate_path(&repository_path)?;
+    let repo = internal_repository(&repository_path)?;
+
+    let remote_url = repo.find_remote("origin").ok().and_then(|remote| remote.url().map(str::to_string))
+        .or_else(|| repo.remotes().ok().and_then(|names| {
+            names.iter().flatten().next().and_then(|name| repo.find_remote(name).ok()).and_then(|remote| remote.url().map(str::to_string))
+        }));
+    let Some(remote_url) = remote_url else { return Ok(PrStatusResult::plain("no_remote", "This repository has no configured remote.")); };
+
+    let Some(repo_slug) = parse_github_slug(&remote_url) else {
+        return Ok(PrStatusResult::plain("unsupported_provider", format!("Pull request status isn't available for this remote yet — only GitHub is supported so far ({remote_url})")));
+    };
+
+    let current_branch = branch.filter(|b| !b.trim().is_empty())
+        .or_else(|| repo.head().ok().and_then(|head| head.shorthand().map(String::from)));
+    drop(repo);
+    let Some(current_branch) = current_branch else {
+        return Ok(PrStatusResult::plain("no_open_pr", "No branch is currently checked out."));
+    };
+
+    let mut command = Command::new("gh");
+    command.args(["pr", "list", "--repo", &repo_slug, "--head", &current_branch, "--state", "open",
+        "--json", "number,title,headRefName,baseRefName,state,isDraft,mergeable,reviewDecision,statusCheckRollup,url"]);
+    command.stdin(std::process::Stdio::null());
+    let output = match run_with_timeout_labeled(command, Duration::from_secs(20), "gh", "20 seconds") {
+        Ok(output) => output,
+        Err(error) => {
+            let not_found = error.contains("Cannot start gh") || error.to_lowercase().contains("no such file");
+            let message = if not_found { "The GitHub CLI (`gh`) isn't installed — install it and run `gh auth login` to see pull request status.".to_string() } else { error };
+            return Ok(PrStatusResult { state: "auth_missing".into(), detail: message, branch: Some(current_branch), pull_requests: Vec::new() });
+        }
+    };
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let lower = stderr.to_lowercase();
+        let state = if lower.contains("auth") || lower.contains("not logged") || lower.contains("credentials") { "auth_missing" } else { "api_error" };
+        let detail = if stderr.trim().is_empty() { "The GitHub API request failed.".to_string() } else { stderr.trim().to_string() };
+        return Ok(PrStatusResult { state: state.into(), detail, branch: Some(current_branch), pull_requests: Vec::new() });
+    }
+
+    let raw: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("Could not read the GitHub CLI's response: {error}"))?;
+
+    let pull_requests: Vec<PullRequestSummary> = raw.iter().map(|item| {
+        let rollup = item.get("statusCheckRollup").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+        PullRequestSummary {
+            number: item.get("number").and_then(|v| v.as_u64()).unwrap_or(0),
+            title: item.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            source_branch: item.get("headRefName").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            target_branch: item.get("baseRefName").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            state: map_pr_state(item.get("state").and_then(|v| v.as_str()).unwrap_or(""), item.get("isDraft").and_then(|v| v.as_bool()).unwrap_or(false)),
+            mergeable: map_mergeable(item.get("mergeable").and_then(|v| v.as_str()).unwrap_or("")),
+            review_summary: map_review_summary(item.get("reviewDecision").and_then(|v| v.as_str()).unwrap_or("")),
+            checks_status: map_checks_status(&rollup),
+            url: item.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        }
+    }).collect();
+
+    let state = if pull_requests.is_empty() { "no_open_pr" } else { "ok" };
+    Ok(PrStatusResult { state: state.into(), detail: String::new(), branch: Some(current_branch), pull_requests })
 }
 
 #[tauri::command]
@@ -4585,6 +4758,65 @@ mod tests {
         let details = entry_details(repo_path, "vendor/dep/nested/deep.txt".into()).unwrap();
         assert!(details.status.is_empty(), "entry_details for a file inside the submodule must reuse the same snapshot too, not trigger a duplicate scan");
 
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn parse_github_slug_accepts_the_real_world_url_shapes_and_rejects_other_hosts() {
+        assert_eq!(parse_github_slug("git@github.com:AndreiRomanC/git-integrity.git"), Some("AndreiRomanC/git-integrity".into()));
+        assert_eq!(parse_github_slug("https://github.com/AndreiRomanC/git-integrity.git"), Some("AndreiRomanC/git-integrity".into()));
+        assert_eq!(parse_github_slug("https://github.com/AndreiRomanC/git-integrity"), Some("AndreiRomanC/git-integrity".into()));
+        assert_eq!(parse_github_slug("ssh://git@github.com/AndreiRomanC/git-integrity.git"), Some("AndreiRomanC/git-integrity".into()));
+        assert_eq!(parse_github_slug("https://gitlab.com/AndreiRomanC/git-integrity.git"), None, "a non-GitHub host must be reported as unsupported, not guessed at");
+        assert_eq!(parse_github_slug("https://git.internal.example.com/team/repo.git"), None, "a self-hosted server must be reported as unsupported, not guessed at");
+        assert_eq!(parse_github_slug(""), None);
+    }
+
+    #[test]
+    fn pr_status_mapping_helpers_translate_gh_json_vocabulary_correctly() {
+        assert_eq!(map_pr_state("OPEN", false), "open");
+        assert_eq!(map_pr_state("OPEN", true), "draft", "a draft PR must be reported as draft even though gh's own `state` field still says OPEN");
+        assert_eq!(map_pr_state("MERGED", false), "merged");
+        assert_eq!(map_pr_state("CLOSED", false), "closed");
+
+        assert_eq!(map_mergeable("MERGEABLE"), "mergeable");
+        assert_eq!(map_mergeable("CONFLICTING"), "conflicting");
+        assert_eq!(map_mergeable("UNKNOWN"), "calculating", "GitHub reports UNKNOWN while it's still computing mergeability — must read as calculating, not as a hard unknown/error");
+
+        assert_eq!(map_review_summary("APPROVED"), "approved");
+        assert_eq!(map_review_summary("CHANGES_REQUESTED"), "changes_requested");
+        assert_eq!(map_review_summary("REVIEW_REQUIRED"), "review_required");
+        assert_eq!(map_review_summary(""), "none");
+
+        let failing = vec![serde_json::json!({"conclusion": "SUCCESS"}), serde_json::json!({"conclusion": "FAILURE"})];
+        assert_eq!(map_checks_status(&failing), "failing", "any real failure must win over other passing/pending checks");
+        let pending = vec![serde_json::json!({"conclusion": "SUCCESS"}), serde_json::json!({"state": "PENDING"})];
+        assert_eq!(map_checks_status(&pending), "pending");
+        let passing = vec![serde_json::json!({"conclusion": "SUCCESS"}), serde_json::json!({"conclusion": "NEUTRAL"})];
+        assert_eq!(map_checks_status(&passing), "passing");
+        assert_eq!(map_checks_status(&[]), "none", "no checks configured at all must read as none, not as passing");
+    }
+
+    #[test]
+    fn pr_status_reports_no_remote_when_the_repository_has_none() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-pr-status-no-remote-{suffix}"));
+        create_libgit2_repository(&base, "README.md");
+        let result = pr_status(base.to_string_lossy().into_owned(), None).unwrap();
+        assert_eq!(result.state, "no_remote");
+        assert!(result.pull_requests.is_empty());
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn pr_status_reports_unsupported_provider_for_a_non_github_remote() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-pr-status-unsupported-{suffix}"));
+        create_libgit2_repository(&base, "README.md");
+        run_git(&base, &["remote", "add", "origin", "https://gitlab.com/team/repo.git"]);
+        let result = pr_status(base.to_string_lossy().into_owned(), None).unwrap();
+        assert_eq!(result.state, "unsupported_provider");
+        assert!(result.pull_requests.is_empty());
         fs::remove_dir_all(base).unwrap();
     }
 
