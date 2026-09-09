@@ -31,11 +31,13 @@ const invoke = rawInvoke && ((command, args) => {
   if (MUTATING_COMMANDS.has(command) && !state.statusReady) {
     const message = 'Still loading status — please wait a moment.';
     status(message, 'error');
+    jsPerfLog(`invoke wrapper REFUSED ${command} (statusReady=false)`, 0);
     return Promise.reject(message);
   }
   if (command !== 'run_git_command' && state.consoleCommandRunning && (MUTATING_COMMANDS.has(command) || REPO_SWITCH_COMMANDS.has(command))) {
     const message = 'A Git command is still running in the console — please wait for it to finish.';
     status(message, 'error');
+    jsPerfLog(`invoke wrapper REFUSED ${command} (consoleCommandRunning)`, 0);
     return Promise.reject(message);
   }
   // Same idea as state.statusReady above, scoped to whichever submodule is
@@ -46,6 +48,7 @@ const invoke = rawInvoke && ((command, args) => {
   if (MUTATING_COMMANDS.has(command) && state.activeSubmodule && !state.activeSubmodule.statusReady) {
     const message = 'Still checking this submodule\'s status — please wait a moment.';
     status(message, 'error');
+    jsPerfLog(`invoke wrapper REFUSED ${command} (activeSubmodule status not ready)`, 0);
     return Promise.reject(message);
   }
   return rawInvoke(command, args);
@@ -250,7 +253,11 @@ function customPrompt(message, defaultValue = '', options = {}) {
 function openRepository() {
   if (!invoke) { refs.browserDialog.showModal(); return; }
   status('Choose a repository folder…', 'busy');
-  invoke('choose_folder').then(path => path && openRepositoryFast(path)).catch(error => handleError(error));
+  jsPerfLog('choose_folder START', 0);
+  const startedAt = performance.now();
+  invoke('choose_folder')
+    .then(path => { jsPerfLog(`choose_folder result (${(performance.now() - startedAt).toFixed(0)}ms): ${path || '(cancelled — no path chosen)'}`, 0); return path && openRepositoryFast(path); })
+    .catch(error => { jsPerfLog(`choose_folder ERROR (${(performance.now() - startedAt).toFixed(0)}ms): ${String(error)}`, 0); handleError(error); });
 }
 
 function validateCloneForm() { refs.confirmClone.disabled = !refs.cloneUrl.value.trim() || !refs.cloneParent.value.trim() || !refs.cloneName.value.trim(); }
@@ -298,28 +305,35 @@ async function confirmAddSubmodule() {
 let repoOpenGeneration = 0;
 
 async function loadRepository(path, options = {}) {
-  // Must happen before anything else here reads/mutates state.repository —
-  // this flushes (or discards, per flushPendingTogglesNow's own guards)
-  // whatever's pending against the repository that's *currently* open,
-  // before this call potentially switches to a different one or refreshes
-  // this one out from under a still-in-flight checkbox click.
-  await flushPendingTogglesNow();
-  const generation = ++repoOpenGeneration;
-  status('Reading repository…', 'busy');
-  const keepPath = options.keepPath ? state.currentPath : '';
-  // Most callers already know exactly which folder they want open again after
-  // the reload (the one the action just happened in) — without this, they'd
-  // have to call openDirectory a second time themselves right after this
-  // function's own internal one below, reloading the folder twice (once for
-  // whatever keepPath resolves to, immediately discarded, then again for the
-  // folder they actually wanted). Passing it here makes this the only load.
-  const reopenPath = options.reopenPath !== undefined ? options.reopenPath : keepPath;
-  // A plain refresh must not silently kick you out of whatever view you were
-  // looking at (e.g. Branch Map) back to Project Explorer — that made a
-  // just-refreshed history look unchanged when really you just weren't
-  // looking at it anymore. Only reset the view for a genuine fresh open.
-  const keepView = options.keepPath ? state.view : 'explorer';
+  // Everything here, including the flush below, is inside this try —
+  // flushPendingTogglesNow used to be called *before* this try started, so
+  // its safety-net timeout (or any other rejection) would propagate as an
+  // unhandled promise rejection straight out of loadRepository: no status
+  // message, no log, the caller silently never reaching load_repository at
+  // all — exactly the symptom reported ("Open Repository" doing nothing,
+  // no open_repository_fast in the log, no visible error).
   try {
+    // Must happen before anything else here reads/mutates state.repository —
+    // this flushes (or discards, per flushPendingTogglesNow's own guards)
+    // whatever's pending against the repository that's *currently* open,
+    // before this call potentially switches to a different one or refreshes
+    // this one out from under a still-in-flight checkbox click.
+    await flushPendingTogglesNow({}, 'the Stage operation');
+    const generation = ++repoOpenGeneration;
+    status('Reading repository…', 'busy');
+    const keepPath = options.keepPath ? state.currentPath : '';
+    // Most callers already know exactly which folder they want open again after
+    // the reload (the one the action just happened in) — without this, they'd
+    // have to call openDirectory a second time themselves right after this
+    // function's own internal one below, reloading the folder twice (once for
+    // whatever keepPath resolves to, immediately discarded, then again for the
+    // folder they actually wanted). Passing it here makes this the only load.
+    const reopenPath = options.reopenPath !== undefined ? options.reopenPath : keepPath;
+    // A plain refresh must not silently kick you out of whatever view you were
+    // looking at (e.g. Branch Map) back to Project Explorer — that made a
+    // just-refreshed history look unchanged when really you just weren't
+    // looking at it anymore. Only reset the view for a genuine fresh open.
+    const keepView = options.keepPath ? state.view : 'explorer';
     const data = await invoke('load_repository', { path, force: Boolean(options.force) });
     // A newer open/reload already started (and will do its own render) while
     // this one's backend call was in flight — applying this one now would
@@ -360,12 +374,31 @@ async function loadRepository(path, options = {}) {
 // real status. Refresh and every action's own reload keep using the
 // unchanged, fully synchronous loadRepository above, not this.
 async function openRepositoryFast(path) {
-  await flushPendingTogglesNow();
-  const generation = ++repoOpenGeneration;
-  status('Opening repository…', 'busy');
+  // Real "Open Repository" — always a genuine backend call, never served
+  // from directoryCache (that cache only ever holds *folder listings* inside
+  // an already-open repository, keyed by relative path within it; opening a
+  // repository, this one included, has no cache-hit path at all). Logged
+  // explicitly so a missing open_repository_fast line in the log is never
+  // ambiguous with "it was served from somewhere else".
+  jsPerfLog(`openRepositoryFast START (${path})`, 0);
+  const openStarted = performance.now();
+  // Everything, including the flush, is inside this try — see loadRepository's
+  // identical comment for why: this call used to happen before any try
+  // started here, so its safety-net timeout (or any other rejection) would
+  // silently abort this function with no status message and no log entry —
+  // exactly the reported symptom (choosing "Open Repository" again did
+  // nothing, open_repository_fast never appeared in the log, no error shown).
   try {
-    const data = await invoke('open_repository_fast', { path });
-    if (generation !== repoOpenGeneration) return;
+    await flushPendingTogglesNow({}, 'the Stage operation');
+    const generation = ++repoOpenGeneration;
+    status('Opening repository…', 'busy');
+    jsPerfLog(`invoke(open_repository_fast) START (${path})`, 0);
+    const invokeStarted = performance.now();
+    const data = await invoke('open_repository_fast', { path }).then(
+      result => { jsPerfLog(`invoke(open_repository_fast) SUCCESS (${(performance.now() - invokeStarted).toFixed(0)}ms)`, 0); return result; },
+      error => { jsPerfLog(`invoke(open_repository_fast) ERROR (${(performance.now() - invokeStarted).toFixed(0)}ms): ${String(error)}`, 0); throw error; },
+    );
+    if (generation !== repoOpenGeneration) { jsPerfLog('openRepositoryFast generation mismatch, discarding result', 0); return; }
     directoryCache.clear();
     warmSubmodules = new Set(); // a different repository's submodule paths mean nothing here
     closeSubmoduleGraph(); // a stale submodule context must never survive switching repositories
@@ -387,7 +420,8 @@ async function openRepositoryFast(path) {
     updatePublishIndicator();
     await checkForMergeConflicts();
     completeRepositoryOpenStatus(state.repository.path, generation);
-  } catch (error) { handleError(error); }
+    jsPerfLog(`openRepositoryFast END (${(performance.now() - openStarted).toFixed(0)}ms)`, 0);
+  } catch (error) { jsPerfLog(`openRepositoryFast ERROR (${(performance.now() - openStarted).toFixed(0)}ms): ${String(error)}`, 0); handleError(error); }
 }
 
 async function completeRepositoryOpenStatus(path, generation) {
@@ -2463,7 +2497,22 @@ let pendingToggles = new Map(); // path -> desired checked state
 let pendingToggleRepo = null; // which repository's index the queued paths belong to
 let pendingToggleTimeout = null;
 let pendingToggleGeneration = 0;
-let pendingToggleFlight = null; // Promise of a flush already in flight, if any
+// Promise of the single currently-running flush loop, or null when none is
+// active. The ONLY two places that ever assign to this are ensureFlushRunning
+// (starts one) and flushLoop's own `finally` (clears it once the loop is
+// genuinely drained — nothing left queued, not just "this one batch done").
+// No other code path touches it, specifically to close a real race that used
+// to exist here: the debounce timer used to assign a fresh
+// flushPendingToggles() call directly to this variable every time it fired —
+// two toggles a little over 300ms apart, with the first batch's backend call
+// still in flight, meant the second timer's assignment silently overwrote
+// the first's promise reference here. A caller awaiting this variable at
+// that exact moment would only ever wait for the second batch, with no way
+// to know whether the first's backend call — and its own reload — had
+// actually finished. flushLoop's while-loop below is what replaces that:
+// one loop drains everything, including anything queued while it's already
+// running, so there is never a second, overlapping flush to race with.
+let pendingToggleFlight = null;
 // Promise of whichever backend stage/unstage call — a checkbox flush, Stage
 // all, or Unstage all — is currently in flight, regardless of which of the
 // three it is. Commit awaits this (with visible "Waiting for staging…"
@@ -2471,6 +2520,15 @@ let pendingToggleFlight = null; // Promise of a flush already in flight, if any
 // index a moment away from still catching up with a click that already
 // happened.
 let activeStagingOperation = null;
+
+// A last-resort safety net for flushPendingTogglesNow, not a normal code
+// path — under ordinary conditions a flush finishes in well under a second.
+// If this ever fires, the real backend stage/unstage call is NOT cancelled
+// and its eventual outcome is NOT assumed either way; it keeps running
+// completely on its own. This only stops the *caller* from waiting forever
+// and lets it refuse to proceed (e.g. switching repositories, committing)
+// with a visible message instead of hanging silently with no explanation.
+const STAGE_FLUSH_TIMEOUT_MS = 20000;
 
 function toggleStage(path, checked) {
   if (!invoke || !state.repository) return;
@@ -2487,28 +2545,43 @@ function toggleStage(path, checked) {
   const change = state.changes.find(item => item.path === path); if (change) change.staged = checked;
   renderChanges();
   pendingToggles.set(path, checked);
+  jsPerfLog(`toggleStage queued ${path}=${checked} (pendingToggles.size=${pendingToggles.size})`, 0);
   if (pendingToggleTimeout) clearTimeout(pendingToggleTimeout);
-  pendingToggleTimeout = setTimeout(() => { pendingToggleFlight = flushPendingToggles(); }, 300);
+  pendingToggleTimeout = setTimeout(() => { pendingToggleTimeout = null; ensureFlushRunning(); }, 300);
 }
 
-// Call this before anything that must not race a still-pending stage/unstage
-// batch — Commit, Stage all, Unstage all, switching branch, or opening a
-// different repository. Cancels the debounce timer and waits for anything
-// queued (or already mid-flight, if the timer had just fired) to actually
-// reach the backend first, so e.g. Commit never runs against an index that's
-// missing a checkbox click from a moment ago just because 300ms hadn't
-// elapsed yet.
-async function flushPendingTogglesNow(options = {}) {
-  if (pendingToggleTimeout) { clearTimeout(pendingToggleTimeout); pendingToggleTimeout = null; }
-  // Only applies to a flush *this call* is the one starting — one already
-  // mid-flight (the debounce timer had already fired) committed to its own
-  // reload the moment it started, too late to skip now.
-  if (pendingToggles.size && !pendingToggleFlight) pendingToggleFlight = flushPendingToggles(options);
-  if (pendingToggleFlight) { await pendingToggleFlight; pendingToggleFlight = null; }
+// Starts the single flush loop if none is currently running; a no-op if one
+// already is — the running loop's own while-loop (see flushLoop) picks up
+// anything just added to pendingToggles on its next iteration, so nothing
+// queued while a flush is already in progress is ever dropped or needs a
+// second, overlapping flush of its own.
+function ensureFlushRunning(options = {}) {
+  if (!pendingToggleFlight) pendingToggleFlight = flushLoop(options);
+  return pendingToggleFlight;
 }
 
-async function flushPendingToggles(options = {}) {
-  if (!pendingToggles.size) return;
+async function flushLoop(options) {
+  const startedAt = performance.now();
+  jsPerfLog(`flushLoop START (pendingToggles.size=${pendingToggles.size})`, 0);
+  try {
+    // Drains for as long as new toggles keep showing up — e.g. a click
+    // arriving while the previous batch's backend call was still in flight.
+    // Whoever is awaiting pendingToggleFlight is guaranteed every toggle
+    // queued before or during this loop has actually reached the backend by
+    // the time it resolves, not just whatever happened to be queued the
+    // moment the loop started.
+    while (pendingToggles.size) { await flushOneBatch(options); }
+  } finally {
+    // The one and only place pendingToggleFlight is ever cleared — on every
+    // exit path (the loop draining cleanly, or a batch throwing out of it) —
+    // so no exit can leave a stale promise reference sitting behind a truthy
+    // pendingToggleFlight for a later caller to wait on forever.
+    pendingToggleFlight = null;
+    jsPerfLog(`flushLoop END (${(performance.now() - startedAt).toFixed(0)}ms)`, 0);
+  }
+}
+
+async function flushOneBatch(options) {
   const batch = pendingToggles; pendingToggles = new Map();
   const repositoryPath = pendingToggleRepo; pendingToggleRepo = null;
   const toStage = [...batch].filter(([, checked]) => checked).map(([path]) => path);
@@ -2516,6 +2589,8 @@ async function flushPendingToggles(options = {}) {
   const stillSameRepo = () => state.repository?.path === repositoryPath;
   const folder = state.currentPath;
   const generation = ++pendingToggleGeneration;
+  jsPerfLog(`flushOneBatch START (stage=${toStage.length}, unstage=${toUnstage.length}, generation=${generation})`, 0);
+  const batchStarted = performance.now();
   const run = (async () => {
     if (toStage.length) await invoke('stage_files', { path: repositoryPath, files: toStage });
     if (toUnstage.length) await invoke('unstage_files', { path: repositoryPath, files: toUnstage });
@@ -2524,45 +2599,86 @@ async function flushPendingToggles(options = {}) {
   try {
     await run;
     if (activeStagingOperation === run) activeStagingOperation = null;
+    jsPerfLog(`flushOneBatch backend calls done (generation=${generation}, ${(performance.now() - batchStarted).toFixed(0)}ms)`, 0);
     // A newer batch already started (and will do its own reload) while this
     // one's backend calls were in flight — its reload covers this too.
-    if (generation !== pendingToggleGeneration) return;
-    // Cleared *before* the reload below, not after: loadRepository calls
-    // flushPendingTogglesNow itself (so it never races a queue that's still
-    // pending), and that would otherwise await this exact still-in-flight
-    // call — a real deadlock, since this call can only finish by finishing
-    // the reload it would be stuck awaiting.
-    pendingToggleFlight = null;
-    // Commit calls flushPendingTogglesNow({ skipReload: true }) right before
-    // doing its own commit-then-reload — without this, a checkbox ticked
-    // just before Commit was clicked would trigger two full reloads back to
-    // back (this one, then Commit's) instead of one.
+    if (generation !== pendingToggleGeneration) { jsPerfLog(`flushOneBatch generation mismatch, skipping reload (was ${generation}, now ${pendingToggleGeneration})`, 0); return; }
     // Stage/unstage only ever changes status — never branches, history,
     // stashes, or anything a submodule-gitlink reconciliation pass would
     // catch, so a full loadRepository (which redoes all of that) was
-    // unnecessary work paid on every single checkbox click.
-    if (stillSameRepo() && !options.skipReload) await refreshStatusAndFolder(repositoryPath, folder);
+    // unnecessary work paid on every single checkbox click. Commit calls
+    // flushPendingTogglesNow({ skipReload: true }) right before doing its
+    // own commit-then-reload, so a checkbox ticked just before Commit was
+    // clicked doesn't trigger two reloads back to back.
+    if (stillSameRepo() && !options.skipReload) {
+      const refreshStarted = performance.now();
+      await refreshStatusAndFolder(repositoryPath, folder);
+      jsPerfLog(`flushOneBatch refresh (generation=${generation}, ${(performance.now() - refreshStarted).toFixed(0)}ms)`, 0);
+    }
   } catch (error) {
     if (activeStagingOperation === run) activeStagingOperation = null;
-    pendingToggleFlight = null;
+    jsPerfLog(`flushOneBatch ERROR (generation=${generation}): ${String(error)}`, 0);
     // A partial failure inside this batch (the stage call succeeded but the
     // following unstage call then failed, say) means we genuinely don't know
     // which half actually landed on disk — blindly flipping every optimistic
     // bit in the batch back could just as easily show the wrong state as
-    // leave it right. An authoritative reload replaces every guess with
-    // whatever git actually has, instead.
-    if (stillSameRepo()) { try { await loadRepository(repositoryPath, { reopenPath: state.currentPath }); } catch { /* handleError below still reports the original failure */ } }
+    // leave it right. An authoritative status refresh replaces every guess
+    // with whatever git actually has, instead — refreshStatusAndFolder
+    // specifically, NOT loadRepository: loadRepository itself calls
+    // flushPendingTogglesNow first, and pendingToggleFlight is still set to
+    // *this exact flushLoop's own promise* at this point (only cleared once
+    // the whole loop drains, in flushLoop's finally) — calling something
+    // that awaits it here would deadlock this recovery on itself until the
+    // safety-net timeout. Status is all a stage/unstage failure could ever
+    // have left uncertain anyway, same as the success path just above.
+    if (stillSameRepo()) { try { await refreshStatusAndFolder(repositoryPath, state.currentPath); } catch { /* handleError below still reports the original failure */ } }
     handleError(error);
+  }
+}
+
+// Call this before anything that must not race a still-pending stage/unstage
+// batch — Commit, Stage all, Unstage all, switching branch, or opening a
+// different repository. Cancels the debounce timer and waits for the flush
+// loop (starting one first if a toggle is queued but no loop is running yet)
+// to fully drain, so e.g. Commit never runs against an index that's missing
+// a checkbox click from a moment ago just because 300ms hadn't elapsed yet.
+//
+// `context` only affects the message on the safety-net timeout below — it
+// never changes normal behavior, and normal behavior (a flush that finishes
+// in well under a second) is the only thing that runs in practice.
+async function flushPendingTogglesNow(options = {}, context = 'the previous Stage/Unstage operation') {
+  if (pendingToggleTimeout) { clearTimeout(pendingToggleTimeout); pendingToggleTimeout = null; }
+  const flight = pendingToggles.size ? ensureFlushRunning(options) : pendingToggleFlight;
+  jsPerfLog(`flushPendingTogglesNow START (pendingToggles.size=${pendingToggles.size}, hasFlight=${!!flight}, activeStagingOperation=${!!activeStagingOperation})`, 0);
+  if (!flight) { jsPerfLog('flushPendingTogglesNow END (nothing pending)', 0); return; }
+  const startedAt = performance.now();
+  let timedOut = false;
+  let timeoutHandle;
+  const timeoutPromise = new Promise(resolve => { timeoutHandle = setTimeout(() => { timedOut = true; resolve(); }, STAGE_FLUSH_TIMEOUT_MS); });
+  await Promise.race([flight, timeoutPromise]);
+  clearTimeout(timeoutHandle);
+  jsPerfLog(`flushPendingTogglesNow END (${timedOut ? 'TIMEOUT' : 'done'}, ${(performance.now() - startedAt).toFixed(0)}ms)`, 0);
+  if (timedOut) {
+    // pendingToggleFlight is deliberately left exactly as it is — it still
+    // points at the real, still-running flight, and nothing here knows its
+    // outcome yet, so nothing here is "demonstrably stale" and safe to
+    // clear. Only this caller is told to stop waiting and refuse to proceed.
+    throw new Error(`Cannot continue: ${context} has not finished yet. Please wait a moment and try again.`);
   }
 }
 
 async function switchBranch(branch) {
   if (!invoke || !state.repository) return;
-  // Must land before the checkout itself, not just before the reload after
-  // it — a checkout racing a still-pending stage/unstage call is exactly
-  // the kind of thing this exists to prevent.
-  await flushPendingTogglesNow();
-  try { status(`Switching to ${branch}…`, 'busy'); await invoke('switch_branch', { path: state.repository.path, branch }); await loadRepository(state.repository.path); }
+  try {
+    // Must land before the checkout itself, not just before the reload after
+    // it — a checkout racing a still-pending stage/unstage call is exactly
+    // the kind of thing this exists to prevent. Inside this try (not before
+    // it, as before): the safety-net timeout must surface as a visible
+    // error, not an unhandled rejection that silently leaves the branch
+    // switch never attempted.
+    await flushPendingTogglesNow({}, 'the Stage operation');
+    status(`Switching to ${branch}…`, 'busy'); await invoke('switch_branch', { path: state.repository.path, branch }); await loadRepository(state.repository.path);
+  }
   catch (error) { handleError(error); }
 }
 
@@ -2581,20 +2697,25 @@ $('#refresh').addEventListener('click', () => state.repository && loadRepository
 // afterward gets unstaged again, same as before.
 async function stageAllInScope(scope) {
   if (!invoke || !state.repository) return;
-  // A pending per-checkbox toggle must land first — otherwise it could
-  // overlap with, or race, stage_all's own backend call.
-  await flushPendingTogglesNow();
-  const button = $('#stageAllButton'); const label = button.textContent; button.disabled = true; button.textContent = 'Staging…';
-  // stage_all reads the real, current disk state itself (see its own doc
-  // comment) instead of trusting state.changes, which can already be stale
-  // by the time this button is pressed — files added or removed from
-  // outside the app since the last load wouldn't be in it at all.
-  const run = (async () => {
-    try { return await invoke('stage_all', { repositoryPath: state.repository.path, scope }); }
-    finally { button.textContent = label; }
-  })();
-  activeStagingOperation = run;
+  const button = $('#stageAllButton'); const label = button.textContent;
+  let run = null;
   try {
+    // A pending per-checkbox toggle must land first — otherwise it could
+    // overlap with, or race, stage_all's own backend call. Before the button
+    // is even disabled, and inside this try: if the flush can't finish (the
+    // safety-net timeout), the button must never end up stuck disabled with
+    // no explanation — the catch below reports it and the finally restores it.
+    await flushPendingTogglesNow({}, 'the previous Stage operation');
+    button.disabled = true; button.textContent = 'Staging…';
+    // stage_all reads the real, current disk state itself (see its own doc
+    // comment) instead of trusting state.changes, which can already be stale
+    // by the time this button is pressed — files added or removed from
+    // outside the app since the last load wouldn't be in it at all.
+    run = (async () => {
+      try { return await invoke('stage_all', { repositoryPath: state.repository.path, scope }); }
+      finally { button.textContent = label; }
+    })();
+    activeStagingOperation = run;
     // The backend tells apart what genuinely landed in the index
     // (staged_paths) from a submodule that was only dirty *inside* it, with
     // no real gitlink change to record (skipped_dirty_submodules) — a
@@ -2624,22 +2745,30 @@ async function stageAllInScope(scope) {
     const refreshStarted = performance.now();
     await refreshStatusAndFolder(state.repository.path, state.currentPath);
     jsPerfLog('stageAllInScope refreshStatusAndFolder', performance.now() - refreshStarted);
-    renderChanges();
   } catch (error) { handleError(error); }
-  finally { if (activeStagingOperation === run) activeStagingOperation = null; }
+  finally { if (activeStagingOperation === run) activeStagingOperation = null; button.disabled = false; renderChanges(); }
 }
 
 async function unstageAllInScope(scope) {
   if (!invoke || !state.repository) return;
-  await flushPendingTogglesNow();
-  const files = state.changes.filter(change => change.staged && (!scope || change.path === scope || change.path.startsWith(`${scope}/`))).map(change => change.path);
-  if (!files.length) return;
-  const button = $('#unstageAllButton'); const label = button.textContent; button.disabled = true; button.textContent = `Unstaging ${files.length} file${files.length === 1 ? '' : 's'}…`;
-  const run = invoke('unstage_files', { path: state.repository.path, files }).finally(() => { button.textContent = label; });
-  activeStagingOperation = run;
-  try { await run; await loadRepository(state.repository.path, { keepPath: true }); renderChanges(); }
+  const button = $('#unstageAllButton'); const label = button.textContent;
+  let run = null;
+  try {
+    // See stageAllInScope's identical comment: inside this try, before the
+    // button is disabled, so the safety-net timeout can never leave it stuck.
+    await flushPendingTogglesNow({}, 'the previous Stage operation');
+    const files = state.changes.filter(change => change.staged && (!scope || change.path === scope || change.path.startsWith(`${scope}/`))).map(change => change.path);
+    if (!files.length) return;
+    button.disabled = true; button.textContent = `Unstaging ${files.length} file${files.length === 1 ? '' : 's'}…`;
+    run = invoke('unstage_files', { path: state.repository.path, files }).finally(() => { button.textContent = label; });
+    activeStagingOperation = run;
+    await run;
+    // Unstage all only ever changes status — same reasoning as
+    // flushOneBatch/stageAllInScope, a full loadRepository was unnecessary.
+    await refreshStatusAndFolder(state.repository.path, state.currentPath);
+  }
   catch (error) { handleError(error); }
-  finally { if (activeStagingOperation === run) activeStagingOperation = null; }
+  finally { if (activeStagingOperation === run) activeStagingOperation = null; button.disabled = false; renderChanges(); }
 }
 // Pre-fills the commit message box with whatever is in the "default commit
 // message" field up top — e.g. a Polarion ID you're committing several
@@ -2891,26 +3020,31 @@ refs.commitButton.addEventListener('click', async () => {
   refs.commitButton.disabled = true;
   refs.commitButton.textContent = (activeStagingOperation || pendingToggles.size) ? 'Waiting for staging…' : 'Committing…';
   status(refs.commitButton.textContent, 'busy');
-  // A checkbox ticked in the last 300ms may not have reached the backend
-  // yet — committing now would silently leave it out, since the index on
-  // disk wouldn't have caught up. state.changes is read *after* this so the
-  // files list below reflects what will actually be in the index.
-  // { skipReload: true } — this commit does its own reload right after
-  // anyway, so a checkbox flush landing right here doesn't need to do one
-  // of its own too; without this, ticking a box and immediately hitting
-  // Commit did two full reloads back to back instead of one.
-  await flushPendingTogglesNow({ skipReload: true });
-  // A Stage all / Unstage all in flight (not the checkbox queue above, a
-  // separate mechanism) still needs waiting for — its own reload isn't
-  // skippable the same way (unlike a toggle flush, its caller doesn't know
-  // in advance that a commit will follow), so this does mean two reloads in
-  // that specific interleaving; correctness matters more than avoiding it.
-  if (activeStagingOperation) { try { await activeStagingOperation; } catch { /* already reported by whichever button started it */ } }
-  const folder = state.changesScope === 'folder' ? state.currentPath : '';
-  const files = state.changes.filter(change => change.staged && (!folder || change.path === folder || change.path.startsWith(`${folder}/`))).map(change => change.path);
-  refs.commitButton.textContent = `Committing ${files.length} file${files.length === 1 ? '' : 's'}…`;
-  status(refs.commitButton.textContent, 'busy');
+  // Everything from here on is inside one try/finally — flushPendingTogglesNow
+  // used to be called outside any try, so its safety-net timeout (or any
+  // other rejection) would leave the button permanently disabled, showing
+  // "Waiting for staging…" forever with no error and no way to click Commit
+  // again, since the finally that resets it was never reached.
   try {
+    // A checkbox ticked in the last 300ms may not have reached the backend
+    // yet — committing now would silently leave it out, since the index on
+    // disk wouldn't have caught up. state.changes is read *after* this so the
+    // files list below reflects what will actually be in the index.
+    // { skipReload: true } — this commit does its own reload right after
+    // anyway, so a checkbox flush landing right here doesn't need to do one
+    // of its own too; without this, ticking a box and immediately hitting
+    // Commit did two full reloads back to back instead of one.
+    await flushPendingTogglesNow({ skipReload: true }, 'the Stage operation');
+    // A Stage all / Unstage all in flight (not the checkbox queue above, a
+    // separate mechanism) still needs waiting for — its own reload isn't
+    // skippable the same way (unlike a toggle flush, its caller doesn't know
+    // in advance that a commit will follow), so this does mean two reloads in
+    // that specific interleaving; correctness matters more than avoiding it.
+    if (activeStagingOperation) { try { await activeStagingOperation; } catch { /* already reported by whichever button started it */ } }
+    const folder = state.changesScope === 'folder' ? state.currentPath : '';
+    const files = state.changes.filter(change => change.staged && (!folder || change.path === folder || change.path.startsWith(`${folder}/`))).map(change => change.path);
+    refs.commitButton.textContent = `Committing ${files.length} file${files.length === 1 ? '' : 's'}…`;
+    status(refs.commitButton.textContent, 'busy');
     // Global scope (no folder filter) means `files` is already exactly
     // everything staged — commit_staged skips rebuilding a scratch index for
     // that case (real work on a large repo/index) since the real on-disk
