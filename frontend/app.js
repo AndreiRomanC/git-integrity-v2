@@ -505,7 +505,11 @@ function render() {
   refs.repoName.textContent = loaded ? state.repository.name : 'Open a repository';
   refs.repoPath.textContent = loaded ? state.repository.path : 'Choose an existing Git folder';
   refs.currentBranch.textContent = loaded ? describeBranch(state.repository) : 'No branch';
-  refs.viewTitle.textContent = state.view === 'explorer' ? 'Project Explorer' : state.view === 'commander' ? 'Local ↔ Remote' : state.view === 'remotes' ? 'Remotes' : state.submoduleGraph ? `Submodule Branch Map · ${state.submoduleGraph.name}` : state.historyScope ? `History · ${state.historyScope}` : 'Branch Map';
+  // Includes the short HEAD OID for a submodule's own map, not just its name
+  // — lets the user confirm at a glance exactly which commit this view is
+  // actually showing, the same way the diagnostic log lines added for the
+  // "does this ever show the wrong submodule" report do.
+  refs.viewTitle.textContent = state.view === 'explorer' ? 'Project Explorer' : state.view === 'commander' ? 'Local ↔ Remote' : state.view === 'remotes' ? 'Remotes' : state.submoduleGraph ? `Submodule Branch Map · ${state.submoduleGraph.name} · HEAD ${(state.submoduleGraph.repository?.head_oid || '').slice(0, 8) || '—'}` : state.historyScope ? `History · ${state.historyScope}` : 'Branch Map';
   refs.graphSubtitle.textContent = !loaded ? 'Navigate folders and inspect every item in your repository.' : state.view === 'explorer' ? `${state.entries.length} items in ${state.currentPath || state.repository.name}` : state.view === 'commander' ? 'Compare the workspace with a cached remote snapshot—no second checkout.' : state.view === 'remotes' ? 'Configured server locations and explicit fetch controls.' : (() => { const g = activeGraphData(); return `${(g.commits || []).length} commits across ${(g.branches || []).length} branches`; })();
   refs.search.placeholder = state.view === 'explorer' ? 'Filter this folder' : state.view === 'commander' ? 'Filter comparison' : 'Find commit or author';
   refs.search.closest('label').hidden = state.view === 'remotes';
@@ -1683,9 +1687,17 @@ async function openSubmoduleGraph(entry) {
       handleError('Could not open this submodule\'s own repository — its Git metadata may be missing or invalid. Initialize/reset the submodule first.');
       return;
     }
-    jsPerfLog(`openSubmoduleGraph APPLIED (resolved=${anonymizeForLog(resultPath)})`, 0);
+    // Temporary, deliberately verbose diagnostic for the "does the graph
+    // ever show the wrong submodule" report — same shape as the backend's
+    // own log line, so the two can be compared directly: a real
+    // cross-contamination bug would show two different relativePath
+    // requests resolving to the same HEAD/commit OIDs here.
+    const firstThree = (data.commits || []).slice(0, 3).map(c => `${(c.id || '').slice(0, 8)}:${c.subject}`).join(' | ');
+    jsPerfLog(`openSubmoduleGraph APPLIED (generation=${generation}, name=${name}, relativePath=${relativePath}, resolved=${anonymizeForLog(resultPath)}, head=${(data.repository?.head_oid || '').slice(0, 8)}, branches=${(data.branches || []).length}, commits=${(data.commits || []).length}, first_commits=[${firstThree}])`, 0);
     state.submoduleGraph = { name, repository: data.repository, branches: data.branches, commits: data.commits, changes: data.changes, stashes: data.stashes || [], primaryBranch: null, commits_truncated: !!data.commits_truncated };
-    state.view = 'graph'; render();
+    state.view = 'graph';
+    jsPerfLog(`openSubmoduleGraph before renderGraph (generation=${generation}, submoduleGraph.name=${state.submoduleGraph.name}, submoduleGraph.repository.path=${anonymizeForLog(state.submoduleGraph.repository.path)}, submoduleGraph.commits.length=${state.submoduleGraph.commits.length})`, 0);
+    render();
   }
   catch (error) { if (generation === submoduleGraphGeneration) { jsPerfLog(`openSubmoduleGraph ERROR: ${String(error)}`, 0); handleError(error); } }
 }

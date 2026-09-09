@@ -2439,7 +2439,22 @@ pub fn submodule_repository(repository_path: String, relative_path: String) -> R
     let absolute = validate_submodule(&repository_path, &relative_path)?;
     let result = load_repository(absolute.to_string_lossy().into_owned(), None);
     match &result {
-        Ok(data) => perf_log(&format!("submodule_repository: resolved to {} (branch={})", anonymized_repository_id(&data.repository.path), data.repository.current_branch), Duration::ZERO),
+        Ok(data) => {
+            // Temporary, deliberately verbose diagnostic for the "does the
+            // Submodule Branch Map ever show the wrong submodule's history"
+            // report — enough to confirm from the log alone, without a
+            // debugger, exactly which repository and commits this call
+            // resolved to: a real cross-contamination bug would show two
+            // different relative_path requests resolving to the same HEAD/
+            // commit OIDs; two genuinely different (if superficially
+            // similar-looking) submodules would not.
+            let first_three: Vec<String> = data.commits.iter().take(3).map(|c| format!("{}:{}", &c.id[..8.min(c.id.len())], c.subject)).collect();
+            perf_log(&format!(
+                "submodule_repository: resolved to {} (branch={}, head={}, branches={}, commits={}, first_commits=[{}])",
+                anonymized_repository_id(&data.repository.path), data.repository.current_branch, &data.repository.head_oid[..8.min(data.repository.head_oid.len())],
+                data.branches.len(), data.commits.len(), first_three.join(" | "),
+            ), Duration::ZERO);
+        }
         Err(error) => perf_log(&format!("submodule_repository: ERROR: {error}"), Duration::ZERO),
     }
     result
@@ -5594,6 +5609,86 @@ mod tests {
         assert!(data.commits.iter().any(|c| c.subject == "Submodule second commit"), "the submodule's own commit must be present");
         assert!(!data.commits.iter().any(|c| c.subject == "Parent second commit"), "the parent's commit must NOT leak into the submodule's history");
         assert!(!data.commits.iter().any(|c| c.subject == "Add dep submodule"), "the parent's own commit that merely references the submodule must not appear either — this is the submodule's history, not the parent's view of it");
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn submodule_repository_never_mixes_two_sibling_submodules_with_the_same_branch_name() {
+        // The report's own point: a parent-vs-submodule comparison isn't
+        // enough to catch cross-contamination *between two submodules* — the
+        // one actual reported symptom ("Submodule Branch Map looks the same
+        // for every submodule"). Two real sibling submodules under the same
+        // parent, both on a branch literally named "main" (so a bug that
+        // mixed them up by branch name, not by repository, would also be
+        // caught), each with its own unique commit subjects, OIDs, and
+        // topology (A is a straight 3-commit line; B has a real merge with
+        // two parents) — deliberately not just "different text", but a
+        // different *shape* too, so a bug that mixed up the DAG structure
+        // itself (not just labels) would also show up.
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-sibling-submodules-{suffix}"));
+        let parent = base.join("parent");
+        let dep_a = base.join("dep-a");
+        let dep_b = base.join("dep-b");
+        create_libgit2_repository(&parent, "README.md");
+        run_git(&parent, &["branch", "-M", "main"]);
+
+        // A: straight line of 3 commits, all named "main".
+        create_libgit2_repository(&dep_a, "a.txt");
+        run_git(&dep_a, &["branch", "-M", "main"]);
+        for i in 1..3 { fs::write(dep_a.join("a.txt"), format!("A v{i}")).unwrap(); run_git(&dep_a, &["commit", "-am", &format!("A-only commit {i}")]); }
+
+        // B: a real merge — a feature branch merged back into main, giving B
+        // a genuinely different topology from A's straight line, not just
+        // different commit text.
+        create_libgit2_repository(&dep_b, "b.txt");
+        run_git(&dep_b, &["branch", "-M", "main"]);
+        run_git(&dep_b, &["checkout", "-b", "feature"]);
+        fs::write(dep_b.join("feature.txt"), "B feature work").unwrap();
+        run_git(&dep_b, &["add", "."]); run_git(&dep_b, &["commit", "-m", "B-only feature commit"]);
+        run_git(&dep_b, &["checkout", "main"]);
+        fs::write(dep_b.join("b.txt"), "B main work").unwrap();
+        run_git(&dep_b, &["commit", "-am", "B-only main commit"]);
+        run_git(&dep_b, &["merge", "--no-ff", "-m", "B-only merge commit", "feature"]);
+
+        let parent_string = parent.to_string_lossy().into_owned();
+        let added_a = add_submodule(parent_string.clone(), "".into(), dep_a.to_string_lossy().into_owned(), "dep-a".into(), String::new(), String::new()).unwrap();
+        let added_b = add_submodule(parent_string.clone(), "".into(), dep_b.to_string_lossy().into_owned(), "dep-b".into(), String::new(), String::new()).unwrap();
+        create_commit(parent_string.clone(), "Add both sibling submodules".into()).unwrap();
+
+        let sub_a_head = Repository::open(parent.join(&added_a)).unwrap().head().unwrap().target().unwrap().to_string();
+        let sub_b_head = Repository::open(parent.join(&added_b)).unwrap().head().unwrap().target().unwrap().to_string();
+        assert_ne!(sub_a_head, sub_b_head, "sanity check");
+
+        let data_a = submodule_repository(parent_string.clone(), added_a).unwrap();
+        let data_b = submodule_repository(parent_string, added_b).unwrap();
+
+        // Each resolved to its own, distinct repository and HEAD.
+        assert_eq!(data_a.repository.head_oid, sub_a_head);
+        assert_eq!(data_b.repository.head_oid, sub_b_head);
+        assert_ne!(data_a.repository.path, data_b.repository.path, "A and B must resolve to two different repository paths");
+        assert_eq!(data_a.repository.current_branch, "main");
+        assert_eq!(data_b.repository.current_branch, "main");
+
+        // A's history: only A's commits, never B's, and no merge (a straight line).
+        let a_subjects: Vec<&str> = data_a.commits.iter().map(|c| c.subject.as_str()).collect();
+        assert!(a_subjects.iter().any(|s| s.starts_with("A-only")), "A's own commits must be present: {a_subjects:?}");
+        assert!(!a_subjects.iter().any(|s| s.starts_with("B-only")), "B's commits must never appear in A's history: {a_subjects:?}");
+        assert!(data_a.commits.iter().all(|c| c.parents.len() <= 1), "A has no merge commit — none of its commits should show 2 parents");
+
+        // B's history: only B's commits, never A's, and its real merge commit
+        // (two parents) must be present.
+        let b_subjects: Vec<&str> = data_b.commits.iter().map(|c| c.subject.as_str()).collect();
+        assert!(b_subjects.iter().any(|s| s.starts_with("B-only")), "B's own commits must be present: {b_subjects:?}");
+        assert!(!b_subjects.iter().any(|s| s.starts_with("A-only")), "A's commits must never appear in B's history: {b_subjects:?}");
+        let merge_commit = data_b.commits.iter().find(|c| c.subject == "B-only merge commit").expect("B's merge commit must be present");
+        assert_eq!(merge_commit.parents.len(), 2, "B's merge commit must show both real parents");
+
+        // No OID overlap at all between the two histories.
+        let a_ids: std::collections::HashSet<&str> = data_a.commits.iter().map(|c| c.id.as_str()).collect();
+        let b_ids: std::collections::HashSet<&str> = data_b.commits.iter().map(|c| c.id.as_str()).collect();
+        assert!(a_ids.is_disjoint(&b_ids), "A and B must share zero commit OIDs — any overlap here is real cross-contamination, not a fixture-similarity artifact");
 
         fs::remove_dir_all(base).unwrap();
     }
