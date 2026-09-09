@@ -681,6 +681,42 @@ fn internal_repository(path: &str) -> Result<Repository, String> {
     Repository::discover(path).map_err(|error| format!("Cannot open Git repository: {error}"))
 }
 
+// Repository::discover (what internal_repository above uses — correct there,
+// since a user opening a repository may have picked any subfolder and
+// expects the enclosing root to be found) walks *up* through parent
+// directories looking for a `.git`. That is exactly wrong for a submodule:
+// this app always already knows precisely which directory the submodule's
+// own repository must be rooted at, from the parent's own index — if that
+// directory's own Git metadata is missing or broken, the only correct
+// answer is a clear error, never silently climbing to the *parent* and
+// treating it as if it were the submodule. Reproduced and confirmed: a
+// submodule directory registered in the index but with .git deleted (an
+// interrupted clone, manual tampering, or a submodule left over from a
+// failed operation) made every submodule-targeting command sharing this
+// resolution — Submodule Branch Map chief among them, but also commit/push/
+// pull/reset/switch-version — silently operate on the *parent* repository's
+// own branches and commits, while still showing the submodule's own name
+// and path in the UI (those come from the request parameters, not from
+// whichever repository actually got opened) — a correctness/safety issue,
+// not just a display glitch.
+fn internal_submodule_repository(absolute_path: &Path) -> Result<Repository, String> {
+    let not_initialized = "Submodule repository is not initialized or its Git metadata is missing. Initialize/reset the submodule first.";
+    // Repository::open, unlike discover, never searches parent directories —
+    // it finds valid Git metadata rooted exactly at this path (a .git
+    // directory, or the gitlink *file* pointing at .git/modules/<name>,
+    // which open() follows correctly, matching a real submodule checkout) or
+    // it fails outright.
+    let repo = Repository::open(absolute_path).map_err(|_| not_initialized.to_string())?;
+    // Defense in depth, not a substitute for open()'s own no-search
+    // guarantee: confirm the workdir actually opened, canonicalized, really
+    // is this exact directory.
+    let workdir = repo.workdir().ok_or_else(|| not_initialized.to_string())?;
+    let canonical_workdir = workdir.canonicalize().map_err(|_| not_initialized.to_string())?;
+    let canonical_expected = absolute_path.canonicalize().map_err(|_| not_initialized.to_string())?;
+    if canonical_workdir != canonical_expected { return Err(not_initialized.to_string()); }
+    Ok(repo)
+}
+
 fn internal_statuses(repository: &Repository, scope: Option<&str>) -> Result<Vec<(String, String, bool)>, String> {
     let mut options = StatusOptions::new();
     // Correctness over saved time here: not recursing into wholly-untracked
@@ -1279,7 +1315,7 @@ fn sync_submodule_gitlinks_inner(repository_path: &str, write: bool) -> Result<u
             scope.spawn(move || {
                 for (relative, recorded_oid) in chunk {
                     let absolute = Path::new(repository_path).join(relative);
-                    let Ok(sub_repo) = internal_repository(absolute.to_str().unwrap_or_default()) else { continue };
+                    let Ok(sub_repo) = internal_submodule_repository(&absolute) else { continue };
                     let Some(head_oid) = sub_repo.head().ok().and_then(|head| head.target()) else { continue };
                     if head_oid == *recorded_oid { continue; }
                     let Ok(dirty) = internal_statuses(&sub_repo, None) else { continue };
@@ -1689,7 +1725,7 @@ fn stage_files_inner(path: &str, files: Vec<String>) -> Result<StageResult, Stri
         submodule_paths.insert(normalized_safe.clone());
         let recorded = index_for_read.get_path(Path::new(&normalized_safe), 0).map(|entry| entry.id);
         let absolute = Path::new(path).join(safe);
-        let current_head = internal_repository(absolute.to_str().unwrap_or_default()).ok().and_then(|sub_repo| sub_repo.head().ok().and_then(|head| head.target()));
+        let current_head = internal_submodule_repository(&absolute).ok().and_then(|sub_repo| sub_repo.head().ok().and_then(|head| head.target()));
         if recorded == current_head {
             // Nothing to stage — see stage_files_inner's own doc comment.
             result.skipped_dirty_submodules.push(normalized_safe);
@@ -2399,8 +2435,14 @@ pub fn publish_branch(repository_path: String, branch: String, remote: String, u
 
 #[tauri::command]
 pub fn submodule_repository(repository_path: String, relative_path: String) -> Result<RepositoryData, String> {
+    perf_log(&format!("submodule_repository: requested (parent={}, relative_path={relative_path})", anonymized_repository_id(&repository_path)), Duration::ZERO);
     let absolute = validate_submodule(&repository_path, &relative_path)?;
-    load_repository(absolute.to_string_lossy().into_owned(), None)
+    let result = load_repository(absolute.to_string_lossy().into_owned(), None);
+    match &result {
+        Ok(data) => perf_log(&format!("submodule_repository: resolved to {} (branch={})", anonymized_repository_id(&data.repository.path), data.repository.current_branch), Duration::ZERO),
+        Err(error) => perf_log(&format!("submodule_repository: ERROR: {error}"), Duration::ZERO),
+    }
+    result
 }
 
 // Pure filesystem read — no Git calls of any kind, not even the cheap index
@@ -2467,7 +2509,7 @@ pub fn submodule_folder_status(repository_path: String, relative_path: String) -
     validate_path(&repository_path)?;
     let (sub_path, _inner) = resolve_submodule_boundary(&repository_path, &relative_path)
         .ok_or("This path is not inside a submodule")?;
-    let repo = internal_repository(&sub_path)?;
+    let repo = internal_submodule_repository(Path::new(&sub_path))?;
     let statuses = recent_full_statuses(&repo, &sub_path)?;
     let mapped = statuses.into_iter().map(|(path, status, _)| (path, status)).collect();
     replace_git_metadata(&sub_path, mapped);
@@ -2673,7 +2715,7 @@ pub fn entry_details(repository_path: String, relative_path: String) -> Result<E
     // scan too (submodule_url_and_branch), not two.
     let (submodule_url, submodule_branch, submodule_push_status, submodule_unpushed_commits, submodule_commit) = if kind == "submodule" {
         let (url, branch) = submodule_url_and_branch(&repository_path, &relative_string);
-        match internal_repository(absolute.to_str().unwrap_or_default()) {
+        match internal_submodule_repository(&absolute) {
             Ok(sub_repo) => {
                 let push_status = submodule_push_status_in(&sub_repo);
                 let unpushed_commits = submodule_unpushed_commits_in(&sub_repo);
@@ -2719,7 +2761,7 @@ pub fn entry_last_commit(repository_path: String, relative_path: String) -> Resu
 // time a submodule is selected. Tells the user, at a glance, whether the commit
 // they're looking at has actually reached the submodule's own remote yet.
 fn submodule_push_status(sub_path: &str) -> Option<String> {
-    submodule_push_status_in(&internal_repository(sub_path).ok()?)
+    submodule_push_status_in(&internal_submodule_repository(Path::new(sub_path)).ok()?)
 }
 
 // Same check, taking an already-open Repository — lets a caller that needs
@@ -2750,7 +2792,7 @@ fn submodule_push_status_in(repo: &Repository) -> Option<String> {
 // re-opening the repo here; kept for tests, which exercise it standalone.
 #[cfg(test)]
 fn submodule_unpushed_commits(sub_path: &str) -> Vec<PublishCommit> {
-    match internal_repository(sub_path) { Ok(repo) => submodule_unpushed_commits_in(&repo), Err(_) => Vec::new() }
+    match internal_submodule_repository(Path::new(sub_path)) { Ok(repo) => submodule_unpushed_commits_in(&repo), Err(_) => Vec::new() }
 }
 
 fn submodule_unpushed_commits_in(repo: &Repository) -> Vec<PublishCommit> {
@@ -2771,13 +2813,20 @@ fn submodule_unpushed_commits_in(repo: &Repository) -> Vec<PublishCommit> {
     })().unwrap_or_default()
 }
 
+// The shared gate essentially every submodule-targeting command calls
+// first (Submodule Branch Map, commit/push/pull/reset/switch-version,
+// change URL, new branch...) — using the strict opener here, and only here,
+// protects all of them at once: each of those returns immediately via `?`
+// on a validate_submodule error, so a submodule with missing/broken .git
+// never reaches whatever `internal_repository` call it might otherwise have
+// made next.
 fn validate_submodule(repository_path: &str, relative_path: &str) -> Result<PathBuf, String> {
     let relative = safe_relative_path(relative_path)?;
     let normalized_path = normalized(&relative);
     if !cached_index_metadata(repository_path).1.contains(&normalized_path) { return Err("The selected folder is not a Git submodule".into()); }
     let absolute = Path::new(repository_path).join(relative);
     if !absolute.is_dir() { return Err("The submodule is not initialized".into()); }
-    internal_repository(absolute.to_str().unwrap_or_default())?;
+    internal_submodule_repository(&absolute)?;
     Ok(absolute)
 }
 
@@ -2785,7 +2834,7 @@ fn validate_submodule(repository_path: &str, relative_path: &str) -> Result<Path
 pub fn submodule_versions(repository_path: String, relative_path: String) -> Result<SubmoduleVersions, String> {
     validate_path(&repository_path)?;
     let absolute = validate_submodule(&repository_path, &relative_path)?;
-    let repo = internal_repository(absolute.to_str().unwrap_or_default())?;
+    let repo = internal_submodule_repository(&absolute)?;
     let current_revision = repo.head().ok().and_then(|head| head.target()).map(|id| id.to_string()).unwrap_or_default();
     let current_branch = repo.head().ok().and_then(|head| head.shorthand().map(String::from)).unwrap_or_default();
     let mut versions = Vec::new();
@@ -2877,7 +2926,7 @@ pub fn add_submodule(repository_path: String, parent_path: String, url: String, 
 pub fn switch_submodule_version(repository_path: String, relative_path: String, revision: String, version_kind: String, name: String) -> Result<String, String> {
     validate_path(&repository_path)?;
     let absolute = validate_submodule(&repository_path, &relative_path)?;
-    let repo = internal_repository(absolute.to_str().unwrap_or_default())?;
+    let repo = internal_submodule_repository(&absolute)?;
     if version_kind == "branch" {
         // `name` is the actual branch name (e.g. "main"); `revision` is only the SHA
         // it currently points at and is NOT a valid ref on its own — using it here
@@ -2952,7 +3001,7 @@ pub fn reset_submodule(repository_path: String, relative_path: String) -> Result
     let entry = index.iter().find(|entry| String::from_utf8_lossy(&entry.path) == relative_string)
         .ok_or("This path is not a registered submodule in the parent index")?;
     let target_oid = entry.id;
-    let sub_repo = internal_repository(absolute.to_str().unwrap_or_default())?;
+    let sub_repo = internal_submodule_repository(&absolute)?;
     sub_repo.set_head_detached(target_oid).map_err(|error| error.message().to_string())?;
     let mut checkout = git2::build::CheckoutBuilder::new();
     checkout.force(); // discard dirty working-tree edits too, not just move HEAD
@@ -2971,7 +3020,7 @@ pub fn change_submodule_url(repository_path: String, relative_path: String, url:
     let url = url.trim();
     if url.is_empty() || url.starts_with('-') { return Err("Enter a valid Git repository URL".into()); }
     let mut repo = internal_repository(&repository_path)?; let name = repo.submodules().map_err(|error| error.message().to_string())?.into_iter().find(|item| normalized(item.path()) == relative).map(|item| item.name().unwrap_or("").to_string()).ok_or("Submodule configuration was not found")?; repo.submodule_set_url(&name, url).map_err(|error| error.message().to_string())?;
-    let subrepo = internal_repository(absolute.to_str().unwrap_or_default())?; subrepo.remote_set_url("origin", url).map_err(|error| error.message().to_string())?; subrepo.find_remote("origin").map_err(|error| error.message().to_string())?; git(absolute.to_str().unwrap_or_default(), &["fetch", "origin"]).map_err(|detail| format!("Fetch failed: {detail}"))?;
+    let subrepo = internal_submodule_repository(&absolute)?; subrepo.remote_set_url("origin", url).map_err(|error| error.message().to_string())?; subrepo.find_remote("origin").map_err(|error| error.message().to_string())?; git(absolute.to_str().unwrap_or_default(), &["fetch", "origin"]).map_err(|detail| format!("Fetch failed: {detail}"))?;
     invalidate_git_metadata(&repository_path);
     invalidate_submodule_sync(&repository_path); // this app just changed a submodule's registration/version
     Ok(())
@@ -3682,7 +3731,7 @@ pub fn commit_submodule(repository_path: String, relative_path: String, message:
     if message.trim().is_empty() { return Err("Commit message cannot be empty".into()); }
     let absolute = validate_submodule(&repository_path, &relative_path)?;
     let sub_path = absolute.to_string_lossy().into_owned();
-    let repo = internal_repository(&sub_path)?;
+    let repo = internal_submodule_repository(&absolute)?;
     let mut index = repo.index().map_err(|error| error.message().to_string())?;
     index.add_all(["*"], git2::IndexAddOption::DEFAULT, None).map_err(|error| error.message().to_string())?;
     index.write().map_err(|error| error.message().to_string())?;
@@ -3714,7 +3763,7 @@ pub fn push_submodule(repository_path: String, relative_path: String) -> Result<
     validate_path(&repository_path)?;
     let absolute = validate_submodule(&repository_path, &relative_path)?;
     let sub_path = absolute.to_string_lossy().into_owned();
-    let repo = internal_repository(&sub_path)?;
+    let repo = internal_submodule_repository(&absolute)?;
     let local_target = repo.head().ok().and_then(|head| head.target());
 
     // Warn explicitly about uncommitted edits before pushing — otherwise a push can
@@ -3806,7 +3855,7 @@ pub fn force_push_submodule(repository_path: String, relative_path: String) -> R
     validate_path(&repository_path)?;
     let absolute = validate_submodule(&repository_path, &relative_path)?;
     let sub_path = absolute.to_string_lossy().into_owned();
-    let repo = internal_repository(&sub_path)?;
+    let repo = internal_submodule_repository(&absolute)?;
     let local_target = repo.head().ok().and_then(|head| head.target());
 
     let dirty = internal_statuses(&repo, None)?;
@@ -3838,7 +3887,7 @@ pub fn fetch_submodule(repository_path: String, relative_path: String) -> Result
     validate_path(&repository_path)?;
     let absolute = validate_submodule(&repository_path, &relative_path)?;
     let sub_path = absolute.to_string_lossy().into_owned();
-    let repo = internal_repository(&sub_path)?;
+    let repo = internal_submodule_repository(&absolute)?;
     repo.find_remote("origin").map_err(|_| "No 'origin' remote configured for this submodule".to_string())?;
     git(&sub_path, &["fetch", "origin"])?;
     invalidate_git_metadata(&sub_path);
@@ -3851,7 +3900,7 @@ pub fn pull_submodule(repository_path: String, relative_path: String) -> Result<
     validate_path(&repository_path)?;
     let absolute = validate_submodule(&repository_path, &relative_path)?;
     let sub_path = absolute.to_string_lossy().into_owned();
-    let repo = internal_repository(&sub_path)?;
+    let repo = internal_submodule_repository(&absolute)?;
 
     let dirty = internal_statuses(&repo, None)?;
     if !dirty.is_empty() {
@@ -5459,6 +5508,92 @@ mod tests {
         assert!(switched.is_ok(), "switching to a local branch by name should succeed, got: {:?}", switched);
         assert!(!Repository::open(&sub_path).unwrap().head_detached().unwrap(), "switching to a branch must leave HEAD attached to it, not detached");
         assert_eq!(Repository::open(&sub_path).unwrap().head().unwrap().shorthand(), Some("feature-x"));
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn submodule_repository_never_falls_back_to_the_parent_when_the_submodules_git_is_missing() {
+        // Reproduces the report exactly, before any fix: a submodule
+        // registered in the index, its directory present on disk, but its
+        // own .git missing (a common real state — an interrupted clone, a
+        // manually deleted .git, a submodule checked out some other way).
+        // Repository::discover (what internal_repository used everywhere)
+        // walks *up* from a path with no .git of its own until it finds one
+        // — which is the parent's .git, right above vendor/dep — and opens
+        // that instead of failing. submodule_repository (what "Submodule
+        // Branch Map" calls) must error clearly instead, never silently
+        // return the parent's own branches/commits under the submodule's
+        // name.
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-submodule-git-missing-{suffix}"));
+        let parent = base.join("parent"); let dependency = base.join("dependency");
+        create_libgit2_repository(&parent, "README.md");
+        create_libgit2_repository(&dependency, "module.txt");
+        let parent_string = parent.to_string_lossy().into_owned();
+        let added = add_submodule(parent_string.clone(), "".into(), dependency.to_string_lossy().into_owned(), "dep".into(), String::new(), String::new()).unwrap();
+        create_commit(parent_string.clone(), "Add dep submodule".into()).unwrap();
+        let sub_path = parent.join(&added);
+
+        // Confirm the parent really does have its own distinct history the
+        // bug could leak — a second commit only the parent has.
+        fs::write(parent.join("README.md"), "parent-only change").unwrap();
+        create_commit(parent_string.clone(), "Parent-only commit".into()).unwrap();
+        let parent_head = Repository::open(&parent).unwrap().head().unwrap().target().unwrap().to_string();
+
+        // Delete the submodule's own .git (directory or gitlink file, matches
+        // what a real "the submodule's Git metadata went missing" looks like)
+        // while its working directory and index registration stay exactly as
+        // they were.
+        let sub_git = sub_path.join(".git");
+        if sub_git.is_dir() { fs::remove_dir_all(&sub_git).unwrap(); } else { fs::remove_file(&sub_git).unwrap(); }
+        assert!(sub_path.is_dir(), "sanity check: the submodule's working directory must still exist");
+        assert!(!sub_git.exists(), "sanity check: its own .git must genuinely be gone");
+
+        let result = submodule_repository(parent_string, added);
+        match result {
+            Err(message) => assert!(message.contains("not initialized") || message.contains("Git metadata"), "expected a clear 'not initialized' error, got: {message}"),
+            Ok(data) => panic!("submodule_repository must never succeed here — it silently returned the PARENT's own repository instead of erroring (head commit: {}, which {} the parent's real HEAD {parent_head})", data.repository.head_oid, if data.repository.head_oid == parent_head { "IS" } else { "is not" }),
+        }
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn submodule_repository_returns_only_the_submodules_own_data_even_when_both_are_named_main() {
+        // Both the parent and the submodule use the conventional "main"
+        // branch name — the case most likely to look "the same" if the two
+        // ever got mixed up. A real, valid submodule (its own .git present
+        // and correct, the case Repository::open must succeed for, not just
+        // reject) must return exactly its own history, never the parent's.
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-submodule-main-vs-main-{suffix}"));
+        let parent = base.join("parent"); let dependency = base.join("dependency");
+        create_libgit2_repository(&parent, "README.md");
+        create_libgit2_repository(&dependency, "module.txt");
+        run_git(&parent, &["branch", "-M", "main"]);
+        run_git(&dependency, &["branch", "-M", "main"]);
+        let parent_string = parent.to_string_lossy().into_owned();
+        let added = add_submodule(parent_string.clone(), "".into(), dependency.to_string_lossy().into_owned(), "dep".into(), String::new(), String::new()).unwrap();
+        create_commit(parent_string.clone(), "Add dep submodule".into()).unwrap();
+        let sub_path = parent.join(&added);
+        // A second commit each, so their histories genuinely diverge, not
+        // just their tips.
+        fs::write(parent.join("README.md"), "parent v2").unwrap();
+        create_commit(parent_string.clone(), "Parent second commit".into()).unwrap();
+        fs::write(sub_path.join("module.txt"), "dep v2").unwrap();
+        run_git(&sub_path, &["commit", "-am", "Submodule second commit"]);
+
+        let parent_head = Repository::open(&parent).unwrap().head().unwrap().target().unwrap().to_string();
+        let sub_head = Repository::open(&sub_path).unwrap().head().unwrap().target().unwrap().to_string();
+        assert_ne!(parent_head, sub_head, "sanity check: the two must genuinely have different HEADs for this test to mean anything");
+
+        let data = submodule_repository(parent_string, added).unwrap();
+        assert_eq!(data.repository.current_branch, "main");
+        assert_eq!(data.repository.head_oid, sub_head, "must be the submodule's own HEAD, never the parent's");
+        assert!(data.commits.iter().any(|c| c.subject == "Submodule second commit"), "the submodule's own commit must be present");
+        assert!(!data.commits.iter().any(|c| c.subject == "Parent second commit"), "the parent's commit must NOT leak into the submodule's history");
+        assert!(!data.commits.iter().any(|c| c.subject == "Add dep submodule"), "the parent's own commit that merely references the submodule must not appear either — this is the submodule's history, not the parent's view of it");
 
         fs::remove_dir_all(base).unwrap();
     }
