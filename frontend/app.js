@@ -1523,7 +1523,10 @@ async function runEntryFileAction(entry, action) {
   if (!invoke) { status(`Preview: ${action} ${entry.name}`); showOperationToast(`Preview: ${action} ${entry.name}`); return; }
   try {
     if (action === 'head') await invoke('restore_file', { repositoryPath: state.repository.path, relativePath: entry.relative_path, sourceRef: 'HEAD' }); else await invoke(action === 'stage' ? 'stage_files' : 'unstage_files', { path: state.repository.path, files: [entry.relative_path] });
-    const folder = state.currentPath; directoryCache.clear(); await loadRepository(state.repository.path, { reopenPath: folder });
+    // Stage/unstage/restore-from-HEAD only ever change status and this one
+    // file's content — never branches, history, stashes, or a submodule
+    // sync pass, so a full loadRepository isn't needed to reflect it.
+    await refreshStatusAndFolder(state.repository.path, state.currentPath);
     if (state.selectedEntry?.relative_path === entry.relative_path) await selectEntry(entry.relative_path);
     status(successMessages[action]); showOperationToast(successMessages[action], 'success');
   } catch (error) { const message = handleError(error); showOperationToast(`Failed: ${message}`, 'error'); }
@@ -2525,7 +2528,11 @@ async function flushPendingToggles(options = {}) {
     // doing its own commit-then-reload — without this, a checkbox ticked
     // just before Commit was clicked would trigger two full reloads back to
     // back (this one, then Commit's) instead of one.
-    if (stillSameRepo() && !options.skipReload) await loadRepository(repositoryPath, { reopenPath: folder });
+    // Stage/unstage only ever changes status — never branches, history,
+    // stashes, or anything a submodule-gitlink reconciliation pass would
+    // catch, so a full loadRepository (which redoes all of that) was
+    // unnecessary work paid on every single checkbox click.
+    if (stillSameRepo() && !options.skipReload) await refreshStatusAndFolder(repositoryPath, folder);
   } catch (error) {
     if (activeStagingOperation === run) activeStagingOperation = null;
     pendingToggleFlight = null;
@@ -2641,6 +2648,24 @@ async function refreshChangesLightweight() {
     const changes = await invoke('refresh_status', { repositoryPath: state.repository.path });
     if (state.repository) { state.changes = changes; updateChangeBadge(); if (refs.changesDrawer.classList.contains('open')) renderChanges(); }
   } catch { /* best-effort — a manual Refresh remains the explicit fallback */ }
+}
+
+// What an ordinary Stage/Unstage/single-file-restore actually needs to
+// reflect afterward: current status and the folder on screen — never
+// branches, commit history, stashes, or a submodule-gitlink reconciliation
+// pass, none of which a plain staging change can affect. Replaces a full
+// loadRepository() in exactly those flows; anything that genuinely can
+// touch history/refs (a commit, a branch switch, a fetch) keeps using
+// loadRepository as before. openDirectory's own force (not invalidateGit)
+// reuses the status this refresh_status call just computed instead of
+// paying for a second backend scan right behind it — same reasoning as
+// every other post-mutation repaint in this file.
+async function refreshStatusAndFolder(repositoryPath, folder) {
+  const changes = await invoke('refresh_status', { repositoryPath });
+  if (state.repository?.path !== repositoryPath) return; // switched to a different repository while this was in flight
+  state.changes = changes; updateChangeBadge();
+  if (refs.changesDrawer.classList.contains('open')) renderChanges();
+  await openDirectory(folder, { force: true });
 }
 
 $('#showChanges').addEventListener('click', () => { state.changesScope = 'global'; applyDefaultCommitMessage(); renderChanges(); refs.changesDrawer.classList.add('open'); refreshChangesLightweight(); });
