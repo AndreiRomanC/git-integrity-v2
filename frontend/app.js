@@ -1108,7 +1108,16 @@ function renderEntryDetails(entry) {
 async function handleDetailAction(action, entry, button) {
   if (action === 'edit') return openEditor(entry);
   if (action === 'open') return openDirectory(entry.relative_path);
-  if (action === 'history') return showSelectedHistory();
+  // "View history" for a submodule used to run path_history against the
+  // *parent* repository, scoped to the submodule's own path — which shows
+  // which PARENT commits touched the gitlink pointer, not the submodule's
+  // own branches/commits at all. That's a real, different, narrower
+  // question nobody was actually asking here; what "View history" on a
+  // submodule row means is its own branch map, same as the dedicated
+  // "Submodule branch map" button already gives — so route both to the same
+  // place instead of leaving a second, confusingly similar option that
+  // shows the wrong repository's history.
+  if (action === 'history') return entry.kind === 'submodule' ? openSubmoduleGraph(entry) : showSelectedHistory();
   if (action === 'commit') return openScopeCommit();
   if (action === 'versions') return await openSubmoduleMenu(entry, innerWidth - 480, 110);
   if (action === 'subgraph') return openSubmoduleGraph(entry);
