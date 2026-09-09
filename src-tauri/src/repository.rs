@@ -1570,18 +1570,18 @@ fn partition_by_submodule(repository_path: &str, files: Vec<String>) -> (Vec<Str
 // check) to apply it, so it inherits that protection automatically instead
 // of needing its own copy of it.
 #[tauri::command]
-pub fn stage_all(repository_path: String, scope: String) -> Result<usize, String> {
+pub fn stage_all(repository_path: String, scope: String) -> Result<StageResult, String> {
     let started = Instant::now();
     perf_log(&format!("stage_all: START (scope={scope:?})"), Duration::ZERO);
     let result = stage_all_inner(&repository_path, &scope);
     match &result {
-        Ok(count) => perf_log(&format!("stage_all: TOTAL ({count} paths)"), started.elapsed()),
+        Ok(outcome) => perf_log(&format!("stage_all: TOTAL ({} staged, {} skipped dirty submodules)", outcome.staged_paths.len(), outcome.skipped_dirty_submodules.len()), started.elapsed()),
         Err(error) => perf_log(&format!("stage_all: ERROR: {error}"), started.elapsed()),
     }
     result
 }
 
-fn stage_all_inner(repository_path: &str, scope: &str) -> Result<usize, String> {
+fn stage_all_inner(repository_path: &str, scope: &str) -> Result<StageResult, String> {
     if let Some((sub_path, inner_scope)) = resolve_submodule_boundary(repository_path, scope) {
         return stage_all_inner(&sub_path, &inner_scope);
     }
@@ -1601,26 +1601,58 @@ fn stage_all_inner(repository_path: &str, scope: &str) -> Result<usize, String> 
         full.into_iter().filter(|(path, _, _)| path == scope || path.starts_with(&prefix)).map(|(path, _, _)| path).collect()
     };
     perf_log(&format!("stage_all: status ready ({} paths, scope={scope:?})", paths.len()), step.elapsed());
-    let count = paths.len();
-    if paths.is_empty() { return Ok(0); }
-    stage_files(repository_path.to_string(), paths)?;
-    Ok(count)
+    if paths.is_empty() { return Ok(StageResult::default()); }
+    // stage_files_inner itself already tells apart what genuinely changed in
+    // the index from a submodule that was merely dirty inside with no real
+    // gitlink change to record — reused verbatim as stage_all's own result
+    // instead of stage_all reporting "N paths asked for" as if that were
+    // "N paths staged" (the report this fixes: 4 submodules, each with an
+    // unchanged HEAD, "staged" and counted as 4 while the index recorded
+    // nothing new at all).
+    stage_files(repository_path.to_string(), paths)
+}
+
+// What actually happened, path by path — never just a count of what was
+// *asked for*. staged_paths is exactly what really changed in the index
+// (a real file, a real directory's contents, or a submodule whose HEAD
+// genuinely differs from what the parent had recorded); skipped_dirty_submodules
+// is a submodule that was asked for but had nothing meaningful to stage —
+// its own working tree has uncommitted changes, but its HEAD hasn't moved
+// past what the parent already records, so there is no new gitlink pointer
+// to write. See stage_files_inner's own doc comment for why this distinction
+// is load-bearing, not cosmetic.
+#[derive(Serialize, Default, Debug)]
+pub struct StageResult {
+    staged_paths: Vec<String>,
+    skipped_dirty_submodules: Vec<String>,
 }
 
 #[tauri::command]
-pub fn stage_files(path: String, files: Vec<String>) -> Result<(), String> {
+pub fn stage_files(path: String, files: Vec<String>) -> Result<StageResult, String> {
     let started = Instant::now();
     let file_count = files.len();
     perf_log(&format!("stage_files: START ({file_count} files)"), Duration::ZERO);
     let result = stage_files_inner(&path, files);
     match &result {
-        Ok(()) => perf_log(&format!("stage_files: TOTAL ({file_count} files)"), started.elapsed()),
+        Ok(outcome) => perf_log(&format!("stage_files: TOTAL ({file_count} requested, {} staged, {} skipped dirty submodules)", outcome.staged_paths.len(), outcome.skipped_dirty_submodules.len()), started.elapsed()),
         Err(error) => perf_log(&format!("stage_files: ERROR ({file_count} files): {error}"), started.elapsed()),
     }
     result
 }
 
-fn stage_files_inner(path: &str, files: Vec<String>) -> Result<(), String> {
+// A submodule path being *asked* to stage is not the same as there being
+// anything real to stage: the parent can only ever record one thing for a
+// submodule — a commit SHA (the gitlink) — never the raw contents of
+// whatever's uncommitted inside it. Confirmed against a real report: 4
+// submodules, each with uncommitted internal changes but HEAD unchanged from
+// what the parent already recorded, were "staged" (add_to_index wrote back
+// the exact same SHA that was already there — a real no-op, but git2 doesn't
+// error on it) and reported as 4 successfully staged paths, while the
+// parent's index genuinely had nothing new in it. Only stage (and count) a
+// submodule whose HEAD actually differs from the parent's currently recorded
+// pointer for it; one that's merely dirty inside is left alone entirely —
+// not staged, not silently reported as if it were.
+fn stage_files_inner(path: &str, files: Vec<String>) -> Result<StageResult, String> {
     validate_path(path)?;
     // Real evidence this was needed, not theoretical: see repo_write_lock's
     // doc comment. Held for the rest of this function, so a burst of rapid
@@ -1630,8 +1662,13 @@ fn stage_files_inner(path: &str, files: Vec<String>) -> Result<(), String> {
     let step = Instant::now();
     let (files, submodule_groups) = partition_by_submodule(path, files);
     perf_log(&format!("stage_files: partition_by_submodule ({} files)", files.len()), step.elapsed());
-    for (sub_path, inner_files) in submodule_groups { stage_files(sub_path, inner_files)?; }
-    if files.is_empty() { return Ok(()); }
+    let mut result = StageResult::default();
+    for (sub_path, inner_files) in submodule_groups {
+        let inner = stage_files(sub_path, inner_files)?;
+        result.staged_paths.extend(inner.staged_paths);
+        result.skipped_dirty_submodules.extend(inner.skipped_dirty_submodules);
+    }
+    if files.is_empty() { return Ok(result); }
     let repo = internal_repository(path)?;
     let safe_files = files.into_iter().map(|file| safe_relative_path(file.trim_end_matches(|character| character == '/' || character == '\\'))).collect::<Result<Vec<_>, _>>()?;
     let step = Instant::now();
@@ -1643,11 +1680,26 @@ fn stage_files_inner(path: &str, files: Vec<String>) -> Result<(), String> {
     // handle add_to_index needs.
     let (_, submodules) = cached_index_metadata(path);
     let mut submodule_paths = HashSet::new();
+    let step2 = Instant::now();
+    let index_for_read = repo.index().map_err(|error| error.message().to_string())?;
+    perf_log("stage_files: repo.index() (read, for submodule HEAD comparison)", step2.elapsed());
     for safe in &safe_files {
         let normalized_safe = normalized(safe);
         if !submodules.contains(&normalized_safe) { continue; }
-        if let Ok(mut submodule) = repo.find_submodule(&normalized_safe) { submodule.add_to_index(true).map_err(|error| format!("Cannot stage submodule {}: {}", normalized_safe, error.message()))?; submodule_paths.insert(normalized_safe); }
+        submodule_paths.insert(normalized_safe.clone());
+        let recorded = index_for_read.get_path(Path::new(&normalized_safe), 0).map(|entry| entry.id);
+        let absolute = Path::new(path).join(safe);
+        let current_head = internal_repository(absolute.to_str().unwrap_or_default()).ok().and_then(|sub_repo| sub_repo.head().ok().and_then(|head| head.target()));
+        if recorded == current_head {
+            // Nothing to stage — see stage_files_inner's own doc comment.
+            result.skipped_dirty_submodules.push(normalized_safe);
+            continue;
+        }
+        let mut submodule = repo.find_submodule(&normalized_safe).map_err(|error| format!("Cannot stage submodule {}: {}", normalized_safe, error.message()))?;
+        submodule.add_to_index(true).map_err(|error| format!("Cannot stage submodule {}: {}", normalized_safe, error.message()))?;
+        result.staged_paths.push(normalized_safe);
     }
+    drop(index_for_read);
     perf_log("stage_files: submodule detection", step.elapsed());
     let step = Instant::now();
     let mut index = repo.index().map_err(|error| error.message().to_string())?;
@@ -1693,7 +1745,8 @@ fn stage_files_inner(path: &str, files: Vec<String>) -> Result<(), String> {
     index.write().map_err(|error| error.message().to_string())?;
     perf_log("stage_files: index.write()", step.elapsed());
     invalidate_git_metadata(path);
-    Ok(())
+    result.staged_paths.extend(files_to_add.iter().chain(dirs_to_add.iter()).chain(to_remove.iter()).map(|p| normalized(p)));
+    Ok(result)
 }
 
 #[tauri::command]
@@ -6887,7 +6940,8 @@ mod tests {
         assert!(statuses.iter().all(|c| !names[..7].contains(&c.path)), "a file that was created and then deleted before ever being staged shouldn't show up as a change at all — git never knew about it");
 
         let staged_count = stage_all(repo_string.clone(), String::new()).unwrap();
-        assert_eq!(staged_count, 238, "stage_all should have processed exactly the 238 real, current files");
+        assert_eq!(staged_count.staged_paths.len(), 238, "stage_all should have processed exactly the 238 real, current files");
+        assert!(staged_count.skipped_dirty_submodules.is_empty());
 
         let repo = internal_repository(&repo_string).unwrap();
         let index = repo.index().unwrap();
@@ -6922,7 +6976,7 @@ mod tests {
         assert_eq!(changes[0].path, fake_marker);
 
         let staged = stage_all(repo_string.clone(), String::new()).unwrap();
-        assert_eq!(staged, 1, "stage_all right after should reuse the same still-fresh scan, not run its own");
+        assert_eq!(staged.staged_paths.len(), 1, "stage_all right after should reuse the same still-fresh scan, not run its own");
 
         // Age the cache entry past the reuse window (without a real sleep) —
         // the next call must fall through to a genuine fresh scan and stop
@@ -6932,6 +6986,97 @@ mod tests {
         }
         let changes_after_expiry = refresh_status(repo_string.clone()).unwrap();
         assert!(changes_after_expiry.is_empty(), "past the reuse window, this must be a real fresh scan of the (clean) repository, not the stale fake entry");
+    }
+
+    fn setup_parent_with_two_submodules(base: &Path) -> (String, PathBuf, PathBuf) {
+        let parent = base.join("parent"); let dep_a = base.join("dep-a"); let dep_b = base.join("dep-b");
+        create_libgit2_repository(&parent, "README.md");
+        create_libgit2_repository(&dep_a, "a.txt");
+        create_libgit2_repository(&dep_b, "b.txt");
+        run_git(&parent, &["-c", "protocol.file.allow=always", "submodule", "add", dep_a.to_str().unwrap(), "vendor/a"]);
+        run_git(&parent, &["-c", "protocol.file.allow=always", "submodule", "add", dep_b.to_str().unwrap(), "vendor/b"]);
+        run_git(&parent, &["commit", "-am", "Add two submodules"]);
+        let parent_string = parent.to_string_lossy().into_owned();
+        (parent_string, parent.join("vendor/a"), parent.join("vendor/b"))
+    }
+
+    #[test]
+    fn stage_files_skips_a_submodule_that_is_only_dirty_inside_head_unchanged() {
+        // Reproduces the confirmed Mac log exactly: a submodule with
+        // uncommitted internal changes (its own working tree dirty) but a
+        // HEAD that still matches what the parent already has recorded.
+        // add_to_index used to write back the exact same SHA that was
+        // already there — a real no-op that git2 doesn't error on — and the
+        // caller counted it as staged anyway. Now it must be reported as
+        // skipped, with nothing added to the index, and the parent's own
+        // "modified" status for that submodule (from its dirty content, not
+        // from a pointer change) must stay exactly as it was.
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-stage-dirty-submodule-{suffix}"));
+        let (parent_string, sub_a, _sub_b) = setup_parent_with_two_submodules(&base);
+
+        // Dirty the submodule's own working tree WITHOUT committing — HEAD stays put.
+        fs::write(sub_a.join("a.txt"), "uncommitted local edit").unwrap();
+        let recorded_before = Repository::open(&parent_string).unwrap().index().unwrap().get_path(Path::new("vendor/a"), 0).unwrap().id;
+
+        let result = stage_files(parent_string.clone(), vec!["vendor/a".into()]).unwrap();
+        assert!(result.staged_paths.is_empty(), "a submodule with an unchanged HEAD must not be reported as staged, got: {result:?}");
+        assert_eq!(result.skipped_dirty_submodules, vec!["vendor/a".to_string()], "must be reported as skipped instead");
+
+        let recorded_after = Repository::open(&parent_string).unwrap().index().unwrap().get_path(Path::new("vendor/a"), 0).unwrap().id;
+        assert_eq!(recorded_before, recorded_after, "the parent's recorded gitlink pointer must not have changed at all");
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn stage_files_stages_a_submodule_whose_head_actually_moved() {
+        // The real, meaningful case: the submodule's HEAD genuinely differs
+        // from what the parent has recorded (a real local commit inside it,
+        // clean working tree) — this IS something to stage, and must be
+        // counted as such.
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-stage-moved-submodule-{suffix}"));
+        let (parent_string, sub_a, _sub_b) = setup_parent_with_two_submodules(&base);
+
+        fs::write(sub_a.join("a.txt"), "v2, committed").unwrap();
+        run_git(&sub_a, &["commit", "-am", "Advance the submodule"]);
+        let new_head = Repository::open(&sub_a).unwrap().head().unwrap().target().unwrap();
+
+        let result = stage_files(parent_string.clone(), vec!["vendor/a".into()]).unwrap();
+        assert_eq!(result.staged_paths, vec!["vendor/a".to_string()], "a submodule whose HEAD genuinely moved must be reported as staged, got: {result:?}");
+        assert!(result.skipped_dirty_submodules.is_empty());
+
+        let recorded = Repository::open(&parent_string).unwrap().index().unwrap().get_path(Path::new("vendor/a"), 0).unwrap().id;
+        assert_eq!(recorded, new_head, "the parent's index must now record the submodule's new HEAD");
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn stage_all_reports_a_real_mixed_count_not_paths_requested() {
+        // Stage All across a mix: one ordinary file, one submodule that
+        // genuinely advanced (real stage), and one submodule that's only
+        // dirty inside with an unchanged HEAD (must be skipped, not staged).
+        // The old behavior reported paths.len() — every path stage_all
+        // *asked about* — regardless of what actually landed in the index;
+        // this must report the real, true count instead.
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-stage-all-mixed-{suffix}"));
+        let (parent_string, sub_a, sub_b) = setup_parent_with_two_submodules(&base);
+        let parent = Path::new(&parent_string);
+
+        fs::write(parent.join("plain.txt"), "new file").unwrap();
+        fs::write(sub_a.join("a.txt"), "v2, committed").unwrap();
+        run_git(&sub_a, &["commit", "-am", "Advance submodule a"]);
+        fs::write(sub_b.join("b.txt"), "uncommitted, HEAD unchanged").unwrap();
+
+        let result = stage_all(parent_string.clone(), String::new()).unwrap();
+        let staged: std::collections::HashSet<_> = result.staged_paths.iter().cloned().collect();
+        assert_eq!(staged, ["plain.txt".to_string(), "vendor/a".to_string()].into_iter().collect(), "exactly the real file and the submodule that actually advanced, got: {result:?}");
+        assert_eq!(result.skipped_dirty_submodules, vec!["vendor/b".to_string()], "the merely-dirty submodule must be reported as skipped, not silently counted as staged");
+
+        fs::remove_dir_all(base).unwrap();
     }
 
     #[test]

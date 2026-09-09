@@ -2590,14 +2590,40 @@ async function stageAllInScope(scope) {
   // by the time this button is pressed — files added or removed from
   // outside the app since the last load wouldn't be in it at all.
   const run = (async () => {
-    try { const count = await invoke('stage_all', { repositoryPath: state.repository.path, scope }); return count; }
+    try { return await invoke('stage_all', { repositoryPath: state.repository.path, scope }); }
     finally { button.textContent = label; }
   })();
   activeStagingOperation = run;
   try {
-    const count = await run;
-    if (!count) return;
-    await loadRepository(state.repository.path, { keepPath: true });
+    // The backend tells apart what genuinely landed in the index
+    // (staged_paths) from a submodule that was only dirty *inside* it, with
+    // no real gitlink change to record (skipped_dirty_submodules) — a
+    // parent-level Stage All can never stage a submodule's own uncommitted
+    // content, only a new commit pointer, so this is never silently folded
+    // into "success" the way a plain count used to.
+    const result = await run;
+    jsPerfLog(`stageAllInScope result (staged=${result.staged_paths.length}, skipped_dirty_submodules=${result.skipped_dirty_submodules.length})`, 0);
+    if (!result.staged_paths.length && !result.skipped_dirty_submodules.length) return;
+    let appliedMsg = null;
+    if (!result.staged_paths.length && result.skipped_dirty_submodules.length) {
+      const names = result.skipped_dirty_submodules.map(p => p.split('/').pop()).join(', ');
+      appliedMsg = `${result.skipped_dirty_submodules.length} submodule${result.skipped_dirty_submodules.length === 1 ? '' : 's'} (${names}) contain${result.skipped_dirty_submodules.length === 1 ? 's' : ''} internal changes. Nothing was staged in the parent project. Open each submodule and use Stage/Commit submodule.`;
+      status(appliedMsg, 'error'); showOperationToast(appliedMsg, 'error');
+      jsPerfLog(`stageAllInScope UI message: ${appliedMsg}`, 0);
+      return;
+    }
+    if (result.skipped_dirty_submodules.length) {
+      const names = result.skipped_dirty_submodules.map(p => p.split('/').pop()).join(', ');
+      appliedMsg = `Staged ${result.staged_paths.length} item${result.staged_paths.length === 1 ? '' : 's'}. ${result.skipped_dirty_submodules.length} submodule${result.skipped_dirty_submodules.length === 1 ? '' : 's'} (${names}) still ${result.skipped_dirty_submodules.length === 1 ? 'has' : 'have'} internal changes only — open ${result.skipped_dirty_submodules.length === 1 ? 'it' : 'them'} and use Stage/Commit submodule.`;
+      status(appliedMsg); showOperationToast(appliedMsg);
+    }
+    if (appliedMsg) jsPerfLog(`stageAllInScope UI message: ${appliedMsg}`, 0);
+    // Stage All only ever changes status — never branches, history, stashes,
+    // or a submodule-gitlink reconciliation pass, so a full loadRepository
+    // was unnecessary work paid on every click.
+    const refreshStarted = performance.now();
+    await refreshStatusAndFolder(state.repository.path, state.currentPath);
+    jsPerfLog('stageAllInScope refreshStatusAndFolder', performance.now() - refreshStarted);
     renderChanges();
   } catch (error) { handleError(error); }
   finally { if (activeStagingOperation === run) activeStagingOperation = null; }
