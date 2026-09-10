@@ -3647,11 +3647,20 @@ function createPrStatusPanel(root, options) {
   let pollTimer = null;
   let lastKey = null;
 
+  // A short "what is this panel showing right now" line — the submodule's
+  // name when the Submodule Branch Map is open, so it's unmistakable the PR
+  // context follows the view and isn't the parent's.
+  function contextHeaderHtml() {
+    const title = options.getContextTitle?.();
+    return title ? `<div class="pr-status-context">${esc(title)}</div>` : '';
+  }
+
   function renderState(result) {
-    if (result.state === 'loading') { root.innerHTML = '<div class="pr-status-loading"><i class="spinner"></i>Checking pull request status…</div>'; return; }
+    const ctx = contextHeaderHtml();
+    if (result.state === 'loading') { root.innerHTML = ctx + '<div class="pr-status-loading"><i class="spinner"></i>Checking pull request status…</div>'; return; }
     if (result.state === 'ok' && result.pull_requests.length) {
       const heading = result.pull_requests.length > 1 ? `<div class="pr-status-count">${result.pull_requests.length} open pull requests for <code>${esc(result.branch || '')}</code></div>` : '';
-      root.innerHTML = heading + result.pull_requests.map(prCardHtml).join('');
+      root.innerHTML = ctx + heading + result.pull_requests.map(prCardHtml).join('');
       return;
     }
     const message = PR_STATE_LABELS[result.state] || result.detail || 'Pull request status unavailable.';
@@ -3662,20 +3671,25 @@ function createPrStatusPanel(root, options) {
     else if (result.state === 'no_upstream') detail = `No open pull request for ${branchCode}${where}. This branch has no upstream set — push it and set an upstream so it can be matched to a PR.`;
     else detail = esc(message);
     const retryable = ['api_error', 'auth_missing'].includes(result.state);
-    root.innerHTML = `<div class="pr-status-empty pr-status-${esc(result.state)}">${detail}${retryable ? '<button class="pr-status-retry" id="prStatusRetry">Retry</button>' : ''}</div>`;
+    root.innerHTML = ctx + `<div class="pr-status-empty pr-status-${esc(result.state)}">${detail}${retryable ? '<button class="pr-status-retry" id="prStatusRetry">Retry</button>' : ''}</div>`;
     if (retryable) root.querySelector('#prStatusRetry')?.addEventListener('click', load);
+  }
+
+  function contextKey() {
+    return `${options.getRepositoryPath() || ''}::${options.getBranch() || ''}::${options.getContextLabel?.() || ''}`;
   }
 
   async function load() {
     const repositoryPath = options.getRepositoryPath();
     const branch = options.getBranch();
-    lastKey = `${repositoryPath || ''}::${branch || ''}`;
+    const context = options.getContextLabel?.() || null;
+    lastKey = contextKey();
     if (!repositoryPath) { renderState({ state: 'no_repository', detail: 'No repository open.', pull_requests: [] }); return; }
     const myGeneration = ++generation;
     renderState({ state: 'loading', pull_requests: [] });
     if (!invoke) { renderState({ state: 'no_open_pr', branch, pull_requests: [] }); return; }
     try {
-      const result = await invoke('pr_status', { repositoryPath, branch: branch || null });
+      const result = await invoke('pr_status', { repositoryPath, branch: branch || null, context });
       if (myGeneration !== generation) return; // a newer load (or context change) superseded this one
       renderState(result);
     } catch (error) {
@@ -3704,7 +3718,7 @@ function createPrStatusPanel(root, options) {
   // panel later always fetches for whatever repository/branch is current
   // then, never a stale one from before it was opened.
   function refreshIfContextChanged() {
-    const key = `${options.getRepositoryPath() || ''}::${options.getBranch() || ''}`;
+    const key = contextKey();
     if (key === lastKey) return;
     if (expanded) load(); else lastKey = key;
   }
@@ -3712,9 +3726,21 @@ function createPrStatusPanel(root, options) {
   return { setExpanded, refreshIfContextChanged, isExpanded: () => expanded };
 }
 
+// The panel follows whatever repository/branch the user is actually looking
+// at: the parent normally, but the *submodule's* own repo and branch while
+// its Submodule Branch Map is open (state.submoduleGraph). The backend
+// re-resolves HEAD/upstream from whichever path it's given, and the
+// generation guard in load() drops a slow parent response that lands after
+// the context already moved to a submodule.
 const mainPrStatusPanel = createPrStatusPanel(refs.prStatusPanel, {
-  getRepositoryPath: () => state.repository?.path || null,
-  getBranch: () => state.repository?.current_branch || null,
+  getRepositoryPath: () => state.submoduleGraph?.repository?.path || state.repository?.path || null,
+  getBranch: () => {
+    const info = state.submoduleGraph ? state.submoduleGraph.repository : state.repository;
+    if (!info || info.head_detached) return null;
+    return info.current_branch || null;
+  },
+  getContextLabel: () => (state.submoduleGraph ? `submodule:${state.submoduleGraph.name}` : 'parent'),
+  getContextTitle: () => (state.submoduleGraph ? `Submodule · ${state.submoduleGraph.name}` : null),
   pollMs: 60000,
 });
 refs.togglePrStatus.addEventListener('click', () => {

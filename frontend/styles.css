@@ -61,6 +61,7 @@ button { cursor: default; }
 .pr-status-retry:hover { border-color: #526273; background: var(--surface-soft); color: white; }
 .pr-status-count { color: #748596; font-size: 10px; font-weight: 700; letter-spacing: .3px; padding: 2px 2px 0; }
 .pr-status-count code { font: 10px ui-monospace, SFMono-Regular, Consolas, monospace; color: #aec0d2; }
+.pr-status-context { color: #6f9bd8; font-size: 10px; font-weight: 700; letter-spacing: .3px; text-transform: uppercase; padding: 0 2px 2px; border-bottom: 1px solid var(--border-soft); margin-bottom: 2px; }
 .pr-card { border: 1px solid var(--border-soft); border-radius: 8px; padding: 9px 10px; background: #131b23; display: flex; flex-direction: column; gap: 6px; }
 .pr-card-top { display: flex; align-items: center; gap: 8px; }
 .pr-number { color: #6f95b8; font: 11px ui-monospace, SFMono-Regular, Consolas, monospace; font-weight: 700; }
