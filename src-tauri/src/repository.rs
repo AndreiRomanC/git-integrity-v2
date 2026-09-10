@@ -1246,6 +1246,9 @@ fn submodule_browser_base(parent_repo_path: &str, submodule_rel_path: &str) -> R
         .find(|item| normalized(item.path()) == wanted)
         .and_then(|item| item.url().map(String::from));
 
+    // Deliberately never fall back to the *parent's* own URL here: that is
+    // exactly the wrong-destination bug this function exists to prevent. If
+    // nothing submodule-specific is known, say so.
     let resolved = if let Some(url) = own_origin.as_deref().filter(|u| !is_relative_git_url(u)) {
         url.to_string()
     } else if let Some(cfg) = configured.filter(|u| !u.trim().is_empty()) {
@@ -1257,11 +1260,14 @@ fn submodule_browser_base(parent_repo_path: &str, submodule_rel_path: &str) -> R
             cfg
         }
     } else if let Some(url) = own_origin {
-        url
-    } else if let Some(url) = parent_remote {
-        url
+        // Only a relative origin and no .gitmodules entry to cross-check —
+        // still resolve it against the parent rather than hand back `../x`.
+        match parent_remote.as_deref() {
+            Some(base) => resolve_relative_git_url(base, &url),
+            None => return Err("This submodule's only remote URL is relative and the parent has no remote to resolve it against".into()),
+        }
     } else {
-        return Err("This submodule has no remote URL to open".into());
+        return Err("This submodule has no remote URL of its own to open".into());
     };
 
     browser_repository_url(resolved.trim()).ok_or_else(|| "This submodule's remote URL cannot be opened in a browser".into())
@@ -6938,6 +6944,15 @@ mod tests {
         let resolved_from_gitmodules = submodule_browser_base(&parent_string, "eng/submodul").unwrap();
         assert_eq!(resolved_from_gitmodules, "https://github.vitesco.io/eng/submodul",
             "a relative URL that was never resolved into .git/config must still resolve against the parent's remote");
+
+        // Even with no `.gitmodules` entry left at all (an orphaned submodule
+        // working dir whose own .git is still valid but carries only a
+        // relative origin), it must resolve against the parent — never fall
+        // back to opening the parent's own URL.
+        run_git(&parent, &["config", "-f", ".gitmodules", "--remove-section", "submodule.eng/submodul"]);
+        let resolved_orphan = submodule_browser_base(&parent_string, "eng/submodul").unwrap();
+        assert_eq!(resolved_orphan, "https://github.vitesco.io/eng/submodul",
+            "a relative-only submodule origin with no .gitmodules entry must still resolve to the sibling, not the parent");
 
         fs::remove_dir_all(&base).unwrap();
     }
