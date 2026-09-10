@@ -11,6 +11,7 @@ pub fn run() {
             repository::clone_repository,
             repository::open_external_url,
             repository::open_repository_item,
+            repository::open_submodule_on_server,
             repository::open_commit_on_server,
             repository::open_repository_fast,
             repository::load_repository,

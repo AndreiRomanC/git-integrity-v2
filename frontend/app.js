@@ -1165,7 +1165,10 @@ async function handleDetailAction(action, entry, button) {
   if (action === 'commit') return openScopeCommit();
   if (action === 'versions') return await openSubmoduleMenu(entry, innerWidth - 480, 110);
   if (action === 'subgraph') return openSubmoduleGraph(entry);
-  if (action === 'server') return openEntryOnServer(entry, false);
+  // A submodule isn't a folder inside the parent — "Open on server" on one
+  // must go to the submodule's own repository (a sibling of the parent when
+  // its .gitmodules URL is relative), never <parent-url>/tree/…/<path>.
+  if (action === 'server') return openEntryOnServer(entry, entry.kind === 'submodule');
   if (action === 'subserver') return openEntryOnServer(entry, true);
   if (action === 'location') return replaceSubmoduleLocation(entry);
   if (action === 'delete') return deleteEntry(entry, button);
@@ -1199,8 +1202,7 @@ async function openEntryOnServer(entry, submodule) {
   if (!invoke) return status(`Preview: open ${entry.name} on server`);
   try {
     if (submodule) {
-      const data = await invoke('submodule_repository', { repositoryPath: state.repository.path, relativePath: entry.relative_path });
-      await invoke('open_repository_item', { repositoryPath: data.repository.path, relativePath: '', kind: 'folder' });
+      await invoke('open_submodule_on_server', { repositoryPath: state.repository.path, relativePath: entry.relative_path });
     } else await invoke('open_repository_item', { repositoryPath: state.repository.path, relativePath: entry.relative_path, kind: entry.kind });
   } catch (error) { handleError(error); }
 }
@@ -1672,7 +1674,7 @@ async function openSubmoduleGraph(entry) {
   const name = entry.name;
   const generation = ++submoduleGraphGeneration;
   jsPerfLog(`openSubmoduleGraph request (parent=${anonymizeForLog(parentRepositoryPath)}, relativePath=${relativePath})`, 0);
-  if (!invoke) { state.submoduleGraph = { name, repository: { path: '', name, current_branch: '' }, branches: [], commits: [], changes: [], stashes: [], primaryBranch: null }; state.view = 'graph'; render(); return; }
+  if (!invoke) { state.submoduleGraph = { name, parentRepositoryPath, relativePath, repository: { path: '', name, current_branch: '' }, branches: [], commits: [], changes: [], stashes: [], primaryBranch: null }; state.view = 'graph'; render(); return; }
   try {
     const data = await invoke('submodule_repository', { repositoryPath: parentRepositoryPath, relativePath });
     if (generation !== submoduleGraphGeneration) { jsPerfLog(`openSubmoduleGraph IGNORED (superseded — generation was ${generation}, now ${submoduleGraphGeneration})`, 0); return; }
@@ -1694,7 +1696,7 @@ async function openSubmoduleGraph(entry) {
     // requests resolving to the same HEAD/commit OIDs here.
     const firstThree = (data.commits || []).slice(0, 3).map(c => `${(c.id || '').slice(0, 8)}:${c.subject}`).join(' | ');
     jsPerfLog(`openSubmoduleGraph APPLIED (generation=${generation}, name=${name}, relativePath=${relativePath}, resolved=${anonymizeForLog(resultPath)}, head=${(data.repository?.head_oid || '').slice(0, 8)}, branches=${(data.branches || []).length}, commits=${(data.commits || []).length}, first_commits=[${firstThree}])`, 0);
-    state.submoduleGraph = { name, repository: data.repository, branches: data.branches, commits: data.commits, changes: data.changes, stashes: data.stashes || [], primaryBranch: null, commits_truncated: !!data.commits_truncated };
+    state.submoduleGraph = { name, parentRepositoryPath, relativePath, repository: data.repository, branches: data.branches, commits: data.commits, changes: data.changes, stashes: data.stashes || [], primaryBranch: null, commits_truncated: !!data.commits_truncated };
     state.view = 'graph';
     jsPerfLog(`openSubmoduleGraph before renderGraph (generation=${generation}, submoduleGraph.name=${state.submoduleGraph.name}, submoduleGraph.repository.path=${anonymizeForLog(state.submoduleGraph.repository.path)}, submoduleGraph.commits.length=${state.submoduleGraph.commits.length})`, 0);
     render();
@@ -2935,15 +2937,19 @@ document.addEventListener('click', event => {
   const link = event.target.closest('.commit-server-link'); if (!link || !state.repository) return; event.preventDefault();
   const commitId = link.dataset.commitId;
   const subPath = link.dataset.submodulePath;
-  // A submodule-file link from the Explorer detail panel is always relative
-  // to the *parent* repository (state.repository); a plain commit link with
-  // no subPath comes from selectCommit in the graph view, which may be
-  // showing the parent's own history or a submodule's — activeGraphData()
-  // resolves to whichever is actually on screen (and is just state.repository
-  // when no submodule graph is active, so this is unchanged outside it).
-  const repositoryPath = subPath ? `${state.repository.path}/${subPath}` : activeGraphData().path;
+  // The backend always resolves against the *parent* repository plus an
+  // optional submodule path — so a submodule commit link goes to the
+  // submodule's own remote (a sibling of the parent for a relative
+  // .gitmodules URL), not <parent-url>/commit/<sha>. subPath comes from the
+  // Explorer submodule detail panel; state.submoduleGraph covers the graph
+  // view while a submodule's own history is on screen; otherwise it's the
+  // parent's own commit.
+  let repositoryPath, submodulePath = null;
+  if (subPath) { repositoryPath = state.repository.path; submodulePath = subPath; }
+  else if (state.submoduleGraph) { repositoryPath = state.submoduleGraph.parentRepositoryPath || state.repository.path; submodulePath = state.submoduleGraph.relativePath || null; }
+  else { repositoryPath = state.repository.path; }
   if (!invoke) return status(`Preview: open commit ${commitId.slice(0, 8)} on server`);
-  invoke('open_commit_on_server', { repositoryPath, commitId }).catch(error => handleError(error));
+  invoke('open_commit_on_server', { repositoryPath, commitId, submodulePath }).catch(error => handleError(error));
 });
 refs.goUp.addEventListener('click', () => { const commander = state.view === 'commander'; const parts = (commander ? state.commanderPath : state.currentPath).split('/').filter(Boolean); parts.pop(); commander ? openCommanderDirectory(parts.join('/')) : openDirectory(parts.join('/')); });
 refs.reloadFolder.addEventListener('click', () => {

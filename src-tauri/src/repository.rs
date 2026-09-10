@@ -1167,6 +1167,106 @@ fn browser_repository_url(remote: &str) -> Option<String> {
     Some(url.trim_end_matches(".git").to_string())
 }
 
+// A submodule URL in `.gitmodules` is very often stored *relative* (`../sibling`
+// so the same file works over SSH and HTTPS). Git resolves it against the
+// parent's own remote URL when it clones/syncs the submodule; a `../` strips
+// one path segment off the parent URL, so `git@host:eng/parent.git` + `../dep`
+// becomes `git@host:eng/dep` — a *sibling* of the parent, never a child.
+fn is_relative_git_url(url: &str) -> bool {
+    let u = url.trim();
+    u.starts_with("./") || u.starts_with("../")
+}
+
+// Mirror git's own `relative_url()` (remote.c): split the base into an
+// authority prefix that must be preserved verbatim (`scheme://host`, or the
+// `git@host:` of an scp-like URL) and a path we can pop segments from, then
+// apply each component of `relative` — `.` is a no-op, `..` pops one segment,
+// anything else is appended. Returns `relative` unchanged when it isn't
+// actually relative.
+fn resolve_relative_git_url(base: &str, relative: &str) -> String {
+    let rel = relative.trim();
+    if !is_relative_git_url(rel) { return rel.to_string(); }
+    let base = base.trim().trim_end_matches('/');
+
+    let (prefix, path): (String, &str) = if let Some(idx) = base.find("://") {
+        let after = &base[idx + 3..];
+        match after.find('/') {
+            Some(slash) => (format!("{}{}", &base[..idx + 3], &after[..slash]), &after[slash..]),
+            None => (base.to_string(), ""),
+        }
+    } else if let Some((host, rest)) = base.split_once(':') {
+        // scp-like `git@host:path` — but not a Windows drive letter (`C:\...`)
+        // or a bare path that merely contains a colon.
+        if host.len() > 1 && !host.contains(['/', '\\']) && !rest.starts_with(['/', '\\']) {
+            (format!("{host}:"), rest)
+        } else {
+            (String::new(), base)
+        }
+    } else {
+        (String::new(), base)
+    };
+
+    let had_leading_slash = path.starts_with('/');
+    let mut segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    for part in rel.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => { segments.pop(); }
+            other => segments.push(other),
+        }
+    }
+    let mut joined = segments.join("/");
+    if had_leading_slash { joined.insert(0, '/'); }
+    format!("{prefix}{joined}")
+}
+
+fn first_remote_url(repo: &Repository) -> Option<String> {
+    repo.find_remote("origin").ok()
+        .or_else(|| repo.remotes().ok().and_then(|names| {
+            names.iter().flatten().next().and_then(|name| repo.find_remote(name).ok())
+        }))
+        .and_then(|remote| remote.url().map(str::to_string))
+}
+
+// The browser base URL for a submodule's *own* repository. Prefers the
+// submodule's resolved `origin` (what `git submodule update` wrote into its
+// `.git/config`) when that is absolute; otherwise resolves the `.gitmodules`
+// URL against the parent repository's remote, exactly as git would — so a
+// relative `../dep` lands on the sibling of the parent, not a child path
+// under it.
+fn submodule_browser_base(parent_repo_path: &str, submodule_rel_path: &str) -> Result<String, String> {
+    let relative = safe_relative_path(submodule_rel_path)?;
+    let wanted = normalized(&relative);
+    let parent = internal_repository(parent_repo_path)?;
+    let parent_remote = first_remote_url(&parent);
+
+    let own_origin = internal_submodule_repository(&Path::new(parent_repo_path).join(&relative)).ok()
+        .and_then(|repo| first_remote_url(&repo));
+    let configured = parent.submodules().ok().into_iter().flatten()
+        .find(|item| normalized(item.path()) == wanted)
+        .and_then(|item| item.url().map(String::from));
+
+    let resolved = if let Some(url) = own_origin.as_deref().filter(|u| !is_relative_git_url(u)) {
+        url.to_string()
+    } else if let Some(cfg) = configured.filter(|u| !u.trim().is_empty()) {
+        if is_relative_git_url(&cfg) {
+            let base = parent_remote.as_deref()
+                .ok_or("The parent repository has no remote to resolve this submodule's relative URL against")?;
+            resolve_relative_git_url(base, &cfg)
+        } else {
+            cfg
+        }
+    } else if let Some(url) = own_origin {
+        url
+    } else if let Some(url) = parent_remote {
+        url
+    } else {
+        return Err("This submodule has no remote URL to open".into());
+    };
+
+    browser_repository_url(resolved.trim()).ok_or_else(|| "This submodule's remote URL cannot be opened in a browser".into())
+}
+
 fn launch_browser(url: &str) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     let status = Command::new("open").arg(url).status();
@@ -1181,7 +1281,8 @@ fn launch_browser(url: &str) -> Result<(), String> {
 pub fn open_repository_item(repository_path: String, relative_path: String, kind: String) -> Result<(), String> {
     validate_path(&repository_path)?;
     let relative = safe_relative_path(&relative_path)?;
-    let repo = internal_repository(&repository_path)?; let remote = repo.find_remote("origin").or_else(|_| { let names = repo.remotes()?; let first = names.iter().flatten().next().ok_or_else(|| git2::Error::from_str("No remote is configured"))?; repo.find_remote(first) }).map_err(|error| error.message().to_string())?; let remote = remote.url().ok_or("The remote has no URL")?.to_string();
+    let repo = internal_repository(&repository_path)?;
+    let remote = first_remote_url(&repo).ok_or("The remote has no URL")?;
     let base = browser_repository_url(remote.trim()).ok_or("This remote URL cannot be opened in a browser")?;
     let branch = repo.head().ok().and_then(|head| head.shorthand().map(String::from)).or_else(|| repo.head().ok().and_then(|head| head.target().map(|id| id.to_string()))).unwrap_or_else(|| "HEAD".into());
     let path = normalized(&relative);
@@ -1192,13 +1293,29 @@ pub fn open_repository_item(repository_path: String, relative_path: String, kind
     launch_browser(&url)
 }
 
+// Open a submodule's *own* repository on the server. A submodule is not a
+// folder inside the parent's repo — going to `<parent-url>/tree/<branch>/<path>`
+// (what `open_repository_item` would do) lands on the parent's gitlink, not the
+// submodule's project. This resolves the submodule's actual remote instead,
+// handling the common relative-`.gitmodules`-URL case (`../dep` -> sibling).
 #[tauri::command]
-pub fn open_commit_on_server(repository_path: String, commit_id: String) -> Result<(), String> {
+pub fn open_submodule_on_server(repository_path: String, relative_path: String) -> Result<(), String> {
     validate_path(&repository_path)?;
-    let repo = internal_repository(&repository_path)?;
-    let remote = repo.find_remote("origin").or_else(|_| { let names = repo.remotes()?; let first = names.iter().flatten().next().ok_or_else(|| git2::Error::from_str("No remote is configured"))?; repo.find_remote(first) }).map_err(|error| error.message().to_string())?;
-    let remote = remote.url().ok_or("The remote has no URL")?.to_string();
-    let base = browser_repository_url(remote.trim()).ok_or("This remote URL cannot be opened in a browser")?;
+    let base = submodule_browser_base(&repository_path, &relative_path)?;
+    launch_browser(&base)
+}
+
+#[tauri::command]
+pub fn open_commit_on_server(repository_path: String, commit_id: String, submodule_path: Option<String>) -> Result<(), String> {
+    validate_path(&repository_path)?;
+    let base = match submodule_path.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(sub) => submodule_browser_base(&repository_path, sub)?,
+        None => {
+            let repo = internal_repository(&repository_path)?;
+            let remote = first_remote_url(&repo).ok_or("The remote has no URL")?;
+            browser_repository_url(remote.trim()).ok_or("This remote URL cannot be opened in a browser")?
+        }
+    };
     launch_browser(&format!("{base}/commit/{}", commit_id.trim()))
 }
 
@@ -6744,6 +6861,110 @@ mod tests {
         let base = browser_repository_url("git@github.vitesco.io:eng/sw-prj-OMBMS_000U0.git").expect("should parse an SSH enterprise GitHub URL");
         assert_eq!(base, "https://github.vitesco.io/eng/sw-prj-OMBMS_000U0");
         assert_eq!(format!("{base}/commit/49032750e188cfb56b0c72834feef071a4d9cc13"), "https://github.vitesco.io/eng/sw-prj-OMBMS_000U0/commit/49032750e188cfb56b0c72834feef071a4d9cc13");
+    }
+
+    #[test]
+    fn resolve_relative_git_url_lands_on_the_sibling_the_way_git_does() {
+        // Every URL shape a `.gitmodules` `url = ../dep` can be resolved
+        // against — a `../` strips one path segment off the *parent's* remote,
+        // so the submodule is a sibling of the parent, never a child under it.
+        // (Each case was cross-checked against `git submodule sync`.)
+        assert_eq!(resolve_relative_git_url("git@github.vitesco.io:eng/parent.git", "../submodul.git"), "git@github.vitesco.io:eng/submodul.git");
+        assert_eq!(resolve_relative_git_url("ssh://git@github.vitesco.io/eng/parent.git", "../submodul.git"), "ssh://git@github.vitesco.io/eng/submodul.git");
+        assert_eq!(resolve_relative_git_url("https://github.vitesco.io/eng/parent.git", "../submodul.git"), "https://github.vitesco.io/eng/submodul.git");
+        assert_eq!(resolve_relative_git_url("git@github.vitesco.io:eng/grp/parent.git", "../submodul.git"), "git@github.vitesco.io:eng/grp/submodul.git");
+        // Two levels up, then back down a different path.
+        assert_eq!(resolve_relative_git_url("https://github.vitesco.io/eng/grp/parent.git", "../../other/dep.git"), "https://github.vitesco.io/eng/other/dep.git");
+        // Only one segment left after the host: git truncates at the ':'.
+        assert_eq!(resolve_relative_git_url("git@github.vitesco.io:parent.git", "../submodul.git"), "git@github.vitesco.io:submodul.git");
+        // A bare filesystem path (local bare-repo remotes, used in tests).
+        assert_eq!(resolve_relative_git_url("/srv/git/eng/parent.git", "../submodul.git"), "/srv/git/eng/submodul.git");
+        // `./` is a no-op; a non-relative URL is returned untouched.
+        assert_eq!(resolve_relative_git_url("https://host/eng/parent.git", "./submodul.git"), "https://host/eng/parent.git/submodul.git");
+        assert_eq!(resolve_relative_git_url("https://host/eng/parent.git", "https://elsewhere/x.git"), "https://elsewhere/x.git");
+    }
+
+    #[test]
+    fn submodule_browser_base_resolves_a_relative_gitmodules_url_to_the_sibling_not_a_child() {
+        // The report: right-clicking a submodule -> "Open on server" opened
+        // `<parent-url>/tree/<branch>/<path>` — the parent's own gitlink page —
+        // instead of the submodule's own project, which for a relative
+        // `url = ../submodul.git` lives *next to* the parent on the server.
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-relurl-{suffix}"));
+        let server = base.join("server/eng");
+        fs::create_dir_all(&server).unwrap();
+        run_git(&base, &["init", "-q", "--bare", "server/eng/parent.git"]);
+        run_git(&base, &["init", "-q", "--bare", "server/eng/submodul.git"]);
+
+        // Seed the submodule's bare "server" repo with one commit.
+        let sub_src = base.join("sub-src");
+        create_libgit2_repository(&sub_src, "lib.txt");
+        run_git(&sub_src, &["branch", "-M", "main"]);
+        run_git(&sub_src, &["push", "-q", server.join("submodul.git").to_str().unwrap(), "main"]);
+
+        // A real parent working copy with a real remote, and the submodule
+        // added by the *relative* URL (`../submodul.git`) exactly as the
+        // real repositories do.
+        let parent = base.join("work/parent");
+        create_libgit2_repository(&parent, "root.txt");
+        run_git(&parent, &["branch", "-M", "main"]);
+        run_git(&parent, &["config", "protocol.file.allow", "always"]);
+        run_git(&parent, &["remote", "add", "origin", server.join("parent.git").to_str().unwrap()]);
+        run_git(&parent, &["-c", "protocol.file.allow=always", "submodule", "add", "../submodul.git", "eng/submodul"]);
+        run_git(&parent, &["commit", "-qm", "add submodule"]);
+        let parent_string = parent.to_string_lossy().into_owned();
+
+        // Sanity: the submodule's own .git is present and valid (so the
+        // "prefer the submodule's absolute origin" path is what runs here).
+        assert!(parent.join("eng/submodul/lib.txt").exists());
+
+        // Now the parent points at an enterprise SSH remote (what a developer
+        // actually has after cloning), and the submodule is synced against it.
+        run_git(&parent, &["remote", "set-url", "origin", "git@github.vitesco.io:eng/parent.git"]);
+        run_git(&parent, &["submodule", "sync", "-q", "--", "eng/submodul"]);
+
+        let resolved = submodule_browser_base(&parent_string, "eng/submodul").unwrap();
+        assert_eq!(resolved, "https://github.vitesco.io/eng/submodul",
+            "must be the sibling of the parent on the server, not github.vitesco.io/eng/parent/... ");
+
+        // And the case where nothing resolved the submodule's own origin —
+        // it's still the raw relative `../submodul.git`, and the parent's
+        // `.git/config` no longer carries a resolved `submodule.<name>.url`
+        // either, so only `.gitmodules` (relative) is left to go on. The
+        // parent's remote must still be used to reach the same sibling.
+        run_git(&parent.join("eng/submodul"), &["config", "remote.origin.url", "../submodul.git"]);
+        run_git(&parent, &["config", "--unset", "submodule.eng/submodul.url"]);
+        let resolved_from_gitmodules = submodule_browser_base(&parent_string, "eng/submodul").unwrap();
+        assert_eq!(resolved_from_gitmodules, "https://github.vitesco.io/eng/submodul",
+            "a relative URL that was never resolved into .git/config must still resolve against the parent's remote");
+
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn submodule_browser_base_uses_an_absolute_submodule_origin_verbatim() {
+        // When the submodule already has a fully-qualified origin of its own
+        // (the common case once it's been cloned/updated), that is
+        // authoritative — no parent-relative resolution, even if the parent's
+        // remote points somewhere unrelated.
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-abs-suburl-{suffix}"));
+        let parent = base.join("parent");
+        let dependency = base.join("dependency");
+        create_libgit2_repository(&parent, "README.md");
+        create_libgit2_repository(&dependency, "module.txt");
+        let parent_string = parent.to_string_lossy().into_owned();
+        let added = add_submodule(parent_string.clone(), "".into(), dependency.to_string_lossy().into_owned(), "dep".into(), String::new(), String::new()).unwrap();
+        create_commit(parent_string.clone(), "Add dep submodule".into()).unwrap();
+
+        run_git(&parent, &["remote", "add", "origin", "git@github.vitesco.io:eng/unrelated-parent.git"]);
+        run_git(&parent.join(&added), &["remote", "set-url", "origin", "git@github.vitesco.io:tools/dependency.git"]);
+
+        let resolved = submodule_browser_base(&parent_string, &added).unwrap();
+        assert_eq!(resolved, "https://github.vitesco.io/tools/dependency");
+
+        fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]
