@@ -2087,38 +2087,77 @@ pub struct PullRequestSummary {
 #[derive(Serialize)]
 pub struct PrStatusResult {
     // "no_remote" | "unsupported_provider" | "auth_missing" | "api_error" |
-    // "no_open_pr" | "ok" (one or more PRs — the frontend distinguishes
-    // "one" vs "multiple" from pull_requests.len() itself)
+    // "no_open_pr" | "no_upstream" | "detached_head" | "no_branch" | "ok"
+    // (one or more PRs — the frontend distinguishes "one" vs "multiple" from
+    // pull_requests.len() itself)
     state: String,
     detail: String,
+    // The branch actually checked against the server (the *remote* branch
+    // name, which can differ from the local one) — for the UI's
+    // "No open PR for <branch> in <repo>" message.
     branch: Option<String>,
+    // The `host/owner/repo` the query ran against — same message.
+    queried_repo: Option<String>,
     pull_requests: Vec<PullRequestSummary>,
 }
 
 impl PrStatusResult {
     fn plain(state: &str, detail: impl Into<String>) -> Self {
-        PrStatusResult { state: state.into(), detail: detail.into(), branch: None, pull_requests: Vec::new() }
+        PrStatusResult { state: state.into(), detail: detail.into(), branch: None, queried_repo: None, pull_requests: Vec::new() }
     }
 }
 
-// Accepts the handful of real-world GitHub remote URL shapes this app's own
-// remotes are likely to be in: `git@github.com:owner/repo.git`,
-// `https://github.com/owner/repo.git`, `https://github.com/owner/repo`, and
-// the `ssh://git@github.com/owner/repo.git` form. Anything else (a self-hosted
-// Git server, GitLab, Bitbucket, Azure DevOps...) is deliberately left
-// unrecognized — reported as "unsupported provider" rather than guessed at.
-fn parse_github_slug(url: &str) -> Option<String> {
-    let trimmed = url.trim().trim_end_matches(".git");
-    let after_host = if let Some(rest) = trimmed.strip_prefix("git@github.com:") { rest }
-        else if let Some(rest) = trimmed.strip_prefix("https://github.com/") { rest }
-        else if let Some(rest) = trimmed.strip_prefix("http://github.com/") { rest }
-        else if let Some(rest) = trimmed.strip_prefix("ssh://git@github.com/") { rest }
-        else { return None };
-    let mut parts = after_host.splitn(2, '/');
+// Every real-world GitHub remote URL shape — github.com *and* GitHub
+// Enterprise (`github.vitesco.io`, `github.<company>.com`, ...) — with the
+// host kept exactly as written, never rewritten to github.com. Non-GitHub
+// hosts (a self-hosted Git server, GitLab, Bitbucket, Azure DevOps...) are
+// deliberately left unrecognized — reported as "unsupported provider"
+// rather than guessed at. A GitHub repo path is exactly `owner/repo`; a
+// deeper path (a GitLab subgroup) is rejected.
+#[derive(Debug, Clone, PartialEq)]
+struct GitHubRepo { host: String, owner: String, repo: String }
+
+impl GitHubRepo {
+    // The `HOST/OWNER/REPO` argument `gh` expects. `gh` accepts the
+    // host-qualified form for github.com too, so always including the host
+    // is safe — and it's the only form that works for Enterprise.
+    fn gh_repo_arg(&self) -> String { format!("{}/{}/{}", self.host, self.owner, self.repo) }
+}
+
+fn is_github_like_host(host: &str) -> bool {
+    let h = host.trim().to_ascii_lowercase();
+    h == "github.com" || h == "github" || h.starts_with("github.")
+}
+
+fn parse_github_repo(url: &str) -> Option<GitHubRepo> {
+    let trimmed = url.trim().trim_end_matches('/');
+    let trimmed = trimmed.strip_suffix(".git").unwrap_or(trimmed);
+
+    let (host, path) = if let Some(rest) = trimmed.strip_prefix("git@") {
+        // scp-like: git@HOST:OWNER/REPO
+        let (host, path) = rest.split_once(':')?;
+        (host.to_string(), path.to_string())
+    } else if let Some(rest) = trimmed.strip_prefix("ssh://") {
+        // ssh://[user@]HOST[:port]/OWNER/REPO
+        let rest = rest.rsplit_once('@').map(|(_, after)| after).unwrap_or(rest);
+        let (host, path) = rest.split_once('/')?;
+        (host.split(':').next().unwrap_or(host).to_string(), path.to_string())
+    } else if let Some(rest) = trimmed.strip_prefix("https://").or_else(|| trimmed.strip_prefix("http://")) {
+        // http(s)://[user@]HOST[:port]/OWNER/REPO
+        let rest = rest.rsplit_once('@').map(|(_, after)| after).unwrap_or(rest);
+        let (host, path) = rest.split_once('/')?;
+        (host.split(':').next().unwrap_or(host).to_string(), path.to_string())
+    } else {
+        return None;
+    };
+
+    if !is_github_like_host(&host) { return None; }
+
+    let mut parts = path.trim_matches('/').splitn(2, '/');
     let owner = parts.next()?.trim();
-    let repo = parts.next()?.trim();
+    let repo = parts.next()?.trim().trim_end_matches('/');
     if owner.is_empty() || repo.is_empty() || repo.contains('/') { return None; }
-    Some(format!("{owner}/{repo}"))
+    Some(GitHubRepo { host: host.to_ascii_lowercase(), owner: owner.to_string(), repo: repo.to_string() })
 }
 
 fn map_pr_state(state: &str, is_draft: bool) -> String {
@@ -2162,69 +2201,194 @@ fn map_checks_status(rollup: &[serde_json::Value]) -> String {
     if any_pending { "pending".into() } else if any_success { "passing".into() } else { "none".into() }
 }
 
+// Everything `pr_status` needs to know *before* it shells out to `gh` —
+// resolved straight from Git, never from what the frontend believes.
+struct PrQueryContext {
+    // `gh --repo` target: the *base* repo PRs are opened against — the
+    // `upstream` remote for a fork checkout, otherwise the branch's own
+    // tracking remote.
+    base: GitHubRepo,
+    // When base != head (a fork), the login a PR's head repo must belong to
+    // for it to count; None when base and head are the same repo.
+    head_owner: Option<String>,
+    // The branch name *on the remote* (`branch.<local>.merge`), which can
+    // differ from the local branch name.
+    head_branch: String,
+    local_branch: String,
+    tracking_remote: String,
+    had_upstream: bool,
+    // Set when the frontend passed a branch that disagrees with real HEAD —
+    // logged, never acted on.
+    frontend_branch_mismatch: Option<String>,
+}
+
+enum PrContext { Ready(PrQueryContext), Terminal(PrStatusResult) }
+
+// Backend is the single source of truth: HEAD/branch/upstream come from Git
+// on every call. `frontend_branch` is advisory only — used to *detect and
+// log* a mismatch (stale frontend state, an external checkout), never to
+// decide what to query.
+fn resolve_pr_query_context(repo: &Repository, frontend_branch: Option<&str>) -> PrContext {
+    use PrContext::Terminal;
+    let frontend_branch = frontend_branch.map(str::trim).filter(|b| !b.is_empty());
+
+    if repo.head_detached().unwrap_or(false) {
+        return Terminal(PrStatusResult::plain("detached_head",
+            "HEAD is detached — not on a branch, so there's no branch to check for a pull request."));
+    }
+    let Some(local_branch) = repo.head().ok().filter(|head| head.is_branch()).and_then(|head| head.shorthand().map(String::from)) else {
+        return Terminal(PrStatusResult::plain("no_branch", "No branch is currently checked out."));
+    };
+
+    let frontend_branch_mismatch = frontend_branch.filter(|fb| *fb != local_branch).map(String::from);
+
+    // Upstream straight from config: branch.<local>.remote / branch.<local>.merge.
+    let cfg = repo.config().ok();
+    let tracking_remote_cfg = cfg.as_ref()
+        .and_then(|c| c.get_string(&format!("branch.{local_branch}.remote")).ok())
+        .filter(|remote| !remote.is_empty() && remote != ".");
+    let remote_branch = cfg.as_ref()
+        .and_then(|c| c.get_string(&format!("branch.{local_branch}.merge")).ok())
+        .map(|merge_ref| merge_ref.strip_prefix("refs/heads/").unwrap_or(&merge_ref).to_string());
+    let had_upstream = tracking_remote_cfg.is_some();
+
+    let existing_remotes: Vec<String> = repo.remotes().ok()
+        .map(|names| names.iter().flatten().map(String::from).collect())
+        .unwrap_or_default();
+    if existing_remotes.is_empty() {
+        return Terminal(PrStatusResult::plain("no_remote", "This repository has no configured remote."));
+    }
+    // The tracking remote if it's set and still exists; else `origin`; else
+    // whatever remote is first.
+    let head_remote_name = tracking_remote_cfg.clone()
+        .filter(|remote| existing_remotes.iter().any(|name| name == remote))
+        .or_else(|| existing_remotes.iter().find(|name| name.as_str() == "origin").cloned())
+        .unwrap_or_else(|| existing_remotes[0].clone());
+
+    let Some(head_remote_url) = repo.find_remote(&head_remote_name).ok().and_then(|remote| remote.url().map(String::from)) else {
+        return Terminal(PrStatusResult::plain("no_remote", format!("The '{head_remote_name}' remote has no URL.")));
+    };
+    let Some(head_repo) = parse_github_repo(&head_remote_url) else {
+        return Terminal(PrStatusResult::plain("unsupported_provider",
+            format!("Pull request status is only available for GitHub remotes so far — '{head_remote_name}' points at {head_remote_url}")));
+    };
+
+    // Fork checkout: a distinct GitHub `upstream` remote is the base repo
+    // PRs are opened against; the tracking remote is the head (fork).
+    let upstream_repo = if head_remote_name != "upstream" {
+        repo.find_remote("upstream").ok()
+            .and_then(|remote| remote.url().map(String::from))
+            .and_then(|url| parse_github_repo(&url))
+    } else { None };
+    let (base, head_owner) = match upstream_repo {
+        Some(upstream) if upstream != head_repo => (upstream, Some(head_repo.owner.clone())),
+        _ => (head_repo.clone(), None),
+    };
+
+    PrContext::Ready(PrQueryContext {
+        base, head_owner,
+        head_branch: remote_branch.unwrap_or_else(|| local_branch.clone()),
+        local_branch,
+        tracking_remote: head_remote_name,
+        had_upstream,
+        frontend_branch_mismatch,
+    })
+}
+
 #[tauri::command]
 pub fn pr_status(repository_path: String, branch: Option<String>) -> Result<PrStatusResult, String> {
     validate_path(&repository_path)?;
     let repo = internal_repository(&repository_path)?;
 
-    let remote_url = repo.find_remote("origin").ok().and_then(|remote| remote.url().map(str::to_string))
-        .or_else(|| repo.remotes().ok().and_then(|names| {
-            names.iter().flatten().next().and_then(|name| repo.find_remote(name).ok()).and_then(|remote| remote.url().map(str::to_string))
-        }));
-    let Some(remote_url) = remote_url else { return Ok(PrStatusResult::plain("no_remote", "This repository has no configured remote.")); };
-
-    let Some(repo_slug) = parse_github_slug(&remote_url) else {
-        return Ok(PrStatusResult::plain("unsupported_provider", format!("Pull request status isn't available for this remote yet — only GitHub is supported so far ({remote_url})")));
+    let ctx = match resolve_pr_query_context(&repo, branch.as_deref()) {
+        PrContext::Ready(ctx) => ctx,
+        PrContext::Terminal(result) => {
+            perf_log(&format!("pr_status: repo={} terminal={} (no gh call)", anonymized_repository_id(&repository_path), result.state), Duration::ZERO);
+            return Ok(result);
+        }
     };
-
-    let current_branch = branch.filter(|b| !b.trim().is_empty())
-        .or_else(|| repo.head().ok().and_then(|head| head.shorthand().map(String::from)));
     drop(repo);
-    let Some(current_branch) = current_branch else {
-        return Ok(PrStatusResult::plain("no_open_pr", "No branch is currently checked out."));
-    };
+
+    let base_arg = ctx.base.gh_repo_arg();
+    let base_id = anonymized_repository_id(&base_arg);
+    let queried_repo = base_arg.clone();
+
+    if let Some(frontend_branch) = &ctx.frontend_branch_mismatch {
+        perf_log(&format!("pr_status: frontend branch '{frontend_branch}' != HEAD '{}' — using HEAD", ctx.local_branch), Duration::ZERO);
+    }
+    perf_log(&format!(
+        "pr_status: repo={} host={} base={} fork={} local_branch={} head_branch={} tracking_remote={} had_upstream={}",
+        anonymized_repository_id(&repository_path), ctx.base.host, base_id, ctx.head_owner.is_some(),
+        ctx.local_branch, ctx.head_branch, ctx.tracking_remote, ctx.had_upstream,
+    ), Duration::ZERO);
 
     let mut command = Command::new("gh");
-    command.args(["pr", "list", "--repo", &repo_slug, "--head", &current_branch, "--state", "open",
-        "--json", "number,title,headRefName,baseRefName,state,isDraft,mergeable,reviewDecision,statusCheckRollup,url"]);
+    command.args(["pr", "list", "--repo", &base_arg, "--head", &ctx.head_branch, "--state", "open",
+        "--json", "number,title,headRefName,headRepositoryOwner,baseRefName,state,isDraft,mergeable,reviewDecision,statusCheckRollup,url"]);
     command.stdin(std::process::Stdio::null());
+    perf_log(&format!("pr_status: exec `gh pr list --repo <{base_id}> --head {} --state open`", ctx.head_branch), Duration::ZERO);
+
     let output = match run_with_timeout_labeled(command, Duration::from_secs(20), "gh", "20 seconds") {
         Ok(output) => output,
         Err(error) => {
             let not_found = error.contains("Cannot start gh") || error.to_lowercase().contains("no such file");
             let message = if not_found { "The GitHub CLI (`gh`) isn't installed — install it and run `gh auth login` to see pull request status.".to_string() } else { error };
-            return Ok(PrStatusResult { state: "auth_missing".into(), detail: message, branch: Some(current_branch), pull_requests: Vec::new() });
+            perf_log(&format!("pr_status: gh unavailable ({})", if not_found { "not installed" } else { "run error" }), Duration::ZERO);
+            return Ok(PrStatusResult { state: "auth_missing".into(), detail: message, branch: Some(ctx.head_branch), queried_repo: Some(queried_repo), pull_requests: Vec::new() });
         }
     };
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
         let lower = stderr.to_lowercase();
-        let state = if lower.contains("auth") || lower.contains("not logged") || lower.contains("credentials") { "auth_missing" } else { "api_error" };
-        let detail = if stderr.trim().is_empty() { "The GitHub API request failed.".to_string() } else { stderr.trim().to_string() };
-        return Ok(PrStatusResult { state: state.into(), detail, branch: Some(current_branch), pull_requests: Vec::new() });
+        let auth = lower.contains("auth") || lower.contains("not logged") || lower.contains("credentials")
+            || lower.contains("no accounts") || lower.contains("gh auth login");
+        let enterprise = ctx.base.host != "github.com";
+        let state = if auth { "auth_missing" } else { "api_error" };
+        let detail = if auth && enterprise {
+            format!("`gh` isn't authenticated for {} — run `gh auth login --hostname {}`.{}", ctx.base.host, ctx.base.host,
+                if stderr.trim().is_empty() { String::new() } else { format!(" ({})", stderr.trim()) })
+        } else if stderr.trim().is_empty() {
+            "The GitHub API request failed.".to_string()
+        } else { stderr.trim().to_string() };
+        perf_log(&format!("pr_status: gh exit=fail state={state} host={}", ctx.base.host), Duration::ZERO);
+        return Ok(PrStatusResult { state: state.into(), detail, branch: Some(ctx.head_branch), queried_repo: Some(queried_repo), pull_requests: Vec::new() });
     }
 
     let raw: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout)
         .map_err(|error| format!("Could not read the GitHub CLI's response: {error}"))?;
 
-    let pull_requests: Vec<PullRequestSummary> = raw.iter().map(|item| {
-        let rollup = item.get("statusCheckRollup").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-        PullRequestSummary {
-            number: item.get("number").and_then(|v| v.as_u64()).unwrap_or(0),
-            title: item.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-            source_branch: item.get("headRefName").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-            target_branch: item.get("baseRefName").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-            state: map_pr_state(item.get("state").and_then(|v| v.as_str()).unwrap_or(""), item.get("isDraft").and_then(|v| v.as_bool()).unwrap_or(false)),
-            mergeable: map_mergeable(item.get("mergeable").and_then(|v| v.as_str()).unwrap_or("")),
-            review_summary: map_review_summary(item.get("reviewDecision").and_then(|v| v.as_str()).unwrap_or("")),
-            checks_status: map_checks_status(&rollup),
-            url: item.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-        }
-    }).collect();
+    let pull_requests: Vec<PullRequestSummary> = raw.iter()
+        // `gh pr list --head` matches by ref name across forks, so keep only
+        // the exact remote branch — and, for a fork checkout, only PRs whose
+        // head repo is actually ours.
+        .filter(|item| item.get("headRefName").and_then(|v| v.as_str()) == Some(ctx.head_branch.as_str()))
+        .filter(|item| match &ctx.head_owner {
+            None => true,
+            Some(owner) => item.get("headRepositoryOwner").and_then(|v| v.get("login")).and_then(|v| v.as_str())
+                .map(|login| login.eq_ignore_ascii_case(owner)).unwrap_or(false),
+        })
+        .map(|item| {
+            let rollup = item.get("statusCheckRollup").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+            PullRequestSummary {
+                number: item.get("number").and_then(|v| v.as_u64()).unwrap_or(0),
+                title: item.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                source_branch: item.get("headRefName").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                target_branch: item.get("baseRefName").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                state: map_pr_state(item.get("state").and_then(|v| v.as_str()).unwrap_or(""), item.get("isDraft").and_then(|v| v.as_bool()).unwrap_or(false)),
+                mergeable: map_mergeable(item.get("mergeable").and_then(|v| v.as_str()).unwrap_or("")),
+                review_summary: map_review_summary(item.get("reviewDecision").and_then(|v| v.as_str()).unwrap_or("")),
+                checks_status: map_checks_status(&rollup),
+                url: item.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            }
+        }).collect();
 
-    let state = if pull_requests.is_empty() { "no_open_pr" } else { "ok" };
-    Ok(PrStatusResult { state: state.into(), detail: String::new(), branch: Some(current_branch), pull_requests })
+    perf_log(&format!("pr_status: gh exit=ok prs_found={}", pull_requests.len()), Duration::ZERO);
+
+    let state = if !pull_requests.is_empty() { "ok" }
+        else if !ctx.had_upstream { "no_upstream" }
+        else { "no_open_pr" };
+    Ok(PrStatusResult { state: state.into(), detail: String::new(), branch: Some(ctx.head_branch), queried_repo: Some(queried_repo), pull_requests })
 }
 
 #[tauri::command]
@@ -5425,14 +5589,27 @@ mod tests {
     }
 
     #[test]
-    fn parse_github_slug_accepts_the_real_world_url_shapes_and_rejects_other_hosts() {
-        assert_eq!(parse_github_slug("git@github.com:AndreiRomanC/git-integrity.git"), Some("AndreiRomanC/git-integrity".into()));
-        assert_eq!(parse_github_slug("https://github.com/AndreiRomanC/git-integrity.git"), Some("AndreiRomanC/git-integrity".into()));
-        assert_eq!(parse_github_slug("https://github.com/AndreiRomanC/git-integrity"), Some("AndreiRomanC/git-integrity".into()));
-        assert_eq!(parse_github_slug("ssh://git@github.com/AndreiRomanC/git-integrity.git"), Some("AndreiRomanC/git-integrity".into()));
-        assert_eq!(parse_github_slug("https://gitlab.com/AndreiRomanC/git-integrity.git"), None, "a non-GitHub host must be reported as unsupported, not guessed at");
-        assert_eq!(parse_github_slug("https://git.internal.example.com/team/repo.git"), None, "a self-hosted server must be reported as unsupported, not guessed at");
-        assert_eq!(parse_github_slug(""), None);
+    fn parse_github_repo_accepts_github_com_and_enterprise_and_rejects_other_hosts() {
+        let gi = GitHubRepo { host: "github.com".into(), owner: "AndreiRomanC".into(), repo: "git-integrity".into() };
+        assert_eq!(parse_github_repo("git@github.com:AndreiRomanC/git-integrity.git"), Some(gi.clone()));
+        assert_eq!(parse_github_repo("https://github.com/AndreiRomanC/git-integrity.git"), Some(gi.clone()));
+        assert_eq!(parse_github_repo("https://github.com/AndreiRomanC/git-integrity"), Some(gi.clone()));
+        assert_eq!(parse_github_repo("ssh://git@github.com/AndreiRomanC/git-integrity.git"), Some(gi));
+
+        // GitHub Enterprise — host kept verbatim, never rewritten to github.com.
+        let ent = GitHubRepo { host: "github.vitesco.io".into(), owner: "eng".into(), repo: "sw-prj-OMBMS_000U0".into() };
+        assert_eq!(parse_github_repo("git@github.vitesco.io:eng/sw-prj-OMBMS_000U0.git"), Some(ent.clone()));
+        assert_eq!(parse_github_repo("https://github.vitesco.io/eng/sw-prj-OMBMS_000U0.git"), Some(ent.clone()));
+        assert_eq!(parse_github_repo("ssh://git@github.vitesco.io/eng/sw-prj-OMBMS_000U0.git"), Some(ent.clone()));
+        assert_eq!(parse_github_repo("ssh://git@github.vitesco.io:22/eng/sw-prj-OMBMS_000U0.git"), Some(ent.clone()));
+        assert_eq!(ent.gh_repo_arg(), "github.vitesco.io/eng/sw-prj-OMBMS_000U0");
+
+        // Non-GitHub hosts and GitLab-style subgroup paths stay unrecognized.
+        assert_eq!(parse_github_repo("https://gitlab.com/AndreiRomanC/git-integrity.git"), None);
+        assert_eq!(parse_github_repo("https://git.internal.example.com/team/repo.git"), None);
+        assert_eq!(parse_github_repo("git@mygithub.com:team/repo.git"), None, "only a real `github.*` host counts, not any host with 'github' in it");
+        assert_eq!(parse_github_repo("https://github.vitesco.io/eng/group/sub/repo.git"), None, "a GitHub repo path is exactly owner/repo");
+        assert_eq!(parse_github_repo(""), None);
     }
 
     #[test]
@@ -5480,6 +5657,158 @@ mod tests {
         let result = pr_status(base.to_string_lossy().into_owned(), None).unwrap();
         assert_eq!(result.state, "unsupported_provider");
         assert!(result.pull_requests.is_empty());
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    // Shared setup: a real repo with one commit, a checked-out branch, and a
+    // GitHub Enterprise `origin`. Returns (base_dir, repo_path_string).
+    fn pr_repo(tag: &str) -> (PathBuf, String) {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-prctx-{tag}-{suffix}"));
+        create_libgit2_repository(&base, "README.md");
+        let path = base.to_string_lossy().into_owned();
+        (base, path)
+    }
+
+    fn ready_ctx(repo: &Repository, frontend_branch: Option<&str>) -> PrQueryContext {
+        match resolve_pr_query_context(repo, frontend_branch) {
+            PrContext::Ready(ctx) => ctx,
+            PrContext::Terminal(result) => panic!("expected a resolvable context, got terminal state {}", result.state),
+        }
+    }
+
+    fn terminal_state(repo: &Repository, frontend_branch: Option<&str>) -> String {
+        match resolve_pr_query_context(repo, frontend_branch) {
+            PrContext::Terminal(result) => result.state,
+            PrContext::Ready(ctx) => panic!("expected a terminal result, got a resolvable context for {}/{}", ctx.base.gh_repo_arg(), ctx.head_branch),
+        }
+    }
+
+    #[test]
+    fn resolve_pr_query_context_reads_head_from_git_not_the_stale_frontend_branch() {
+        let (base, path) = pr_repo("head-truth");
+        run_git(&base, &["remote", "add", "origin", "git@github.vitesco.io:eng/demo.git"]);
+        run_git(&base, &["checkout", "-q", "-b", "really-on-this"]);
+        let repo = internal_repository(&path).unwrap();
+
+        // Frontend still believes an old branch is checked out.
+        let ctx = ready_ctx(&repo, Some("frontend-thinks-this"));
+        assert_eq!(ctx.local_branch, "really-on-this", "must use the branch Git actually has checked out");
+        assert_eq!(ctx.head_branch, "really-on-this");
+        assert_eq!(ctx.frontend_branch_mismatch.as_deref(), Some("frontend-thinks-this"), "the disagreement is recorded (for logging), not acted on");
+        assert_eq!(ctx.base.gh_repo_arg(), "github.vitesco.io/eng/demo");
+        assert!(!ctx.had_upstream);
+
+        // A matching frontend branch is not flagged.
+        assert!(ready_ctx(&repo, Some("really-on-this")).frontend_branch_mismatch.is_none());
+        drop(repo);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn resolve_pr_query_context_queries_the_remote_branch_name_not_the_local_one() {
+        let (base, path) = pr_repo("renamed-upstream");
+        run_git(&base, &["remote", "add", "origin", "https://github.vitesco.io/eng/demo.git"]);
+        run_git(&base, &["checkout", "-q", "-b", "local-name"]);
+        run_git(&base, &["config", "branch.local-name.remote", "origin"]);
+        run_git(&base, &["config", "branch.local-name.merge", "refs/heads/name-on-the-server"]);
+        let repo = internal_repository(&path).unwrap();
+
+        let ctx = ready_ctx(&repo, None);
+        assert_eq!(ctx.local_branch, "local-name");
+        assert_eq!(ctx.head_branch, "name-on-the-server", "gh --head must get the branch's name on the remote, not the local name");
+        assert_eq!(ctx.tracking_remote, "origin");
+        assert!(ctx.had_upstream);
+        assert_eq!(ctx.head_owner, None);
+        drop(repo);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn resolve_pr_query_context_follows_the_upstream_to_a_non_origin_remote() {
+        let (base, path) = pr_repo("non-origin-upstream");
+        run_git(&base, &["remote", "add", "origin", "git@github.com:me/local-fork.git"]);
+        run_git(&base, &["remote", "add", "mirror", "https://github.vitesco.io/eng/canonical.git"]);
+        run_git(&base, &["checkout", "-q", "-b", "work"]);
+        run_git(&base, &["config", "branch.work.remote", "mirror"]);
+        run_git(&base, &["config", "branch.work.merge", "refs/heads/work"]);
+        let repo = internal_repository(&path).unwrap();
+
+        let ctx = ready_ctx(&repo, None);
+        assert_eq!(ctx.tracking_remote, "mirror", "the branch's own upstream remote wins over origin");
+        assert_eq!(ctx.base.host, "github.vitesco.io");
+        assert_eq!(ctx.base.owner, "eng");
+        assert_eq!(ctx.base.repo, "canonical");
+        assert_eq!(ctx.head_owner, None, "no `upstream` remote -> base and head are the same repo");
+        drop(repo);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn resolve_pr_query_context_uses_the_upstream_remote_as_the_base_for_a_fork_checkout() {
+        let (base, path) = pr_repo("fork");
+        run_git(&base, &["remote", "add", "origin", "git@github.com:me/local-fork.git"]);
+        run_git(&base, &["remote", "add", "upstream", "git@github.com:acme/product.git"]);
+        run_git(&base, &["checkout", "-q", "-b", "feature"]);
+        run_git(&base, &["config", "branch.feature.remote", "origin"]);
+        run_git(&base, &["config", "branch.feature.merge", "refs/heads/feature"]);
+        let repo = internal_repository(&path).unwrap();
+
+        let ctx = ready_ctx(&repo, None);
+        assert_eq!(ctx.tracking_remote, "origin");
+        assert_eq!((ctx.base.owner.as_str(), ctx.base.repo.as_str()), ("acme", "product"), "PRs are opened against the upstream/base repo, not the fork");
+        assert_eq!(ctx.head_owner.as_deref(), Some("me"), "results must be filtered to PRs whose head repo is our fork");
+        drop(repo);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn resolve_pr_query_context_reports_detached_head_and_unsupported_remote_as_terminal() {
+        let (base, path) = pr_repo("terminal");
+        run_git(&base, &["remote", "add", "origin", "git@github.vitesco.io:eng/demo.git"]);
+        run_git(&base, &["checkout", "-q", "--detach"]);
+        let repo = internal_repository(&path).unwrap();
+        assert_eq!(terminal_state(&repo, None), "detached_head");
+        drop(repo);
+
+        run_git(&base, &["checkout", "-q", "-b", "back-on-a-branch"]);
+        run_git(&base, &["remote", "set-url", "origin", "https://bitbucket.org/team/demo.git"]);
+        let repo = internal_repository(&path).unwrap();
+        assert_eq!(terminal_state(&repo, None), "unsupported_provider");
+        drop(repo);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn pr_status_on_a_detached_head_returns_a_clear_state_without_calling_gh() {
+        let (base, path) = pr_repo("detached-cmd");
+        run_git(&base, &["remote", "add", "origin", "git@github.vitesco.io:eng/demo.git"]);
+        run_git(&base, &["checkout", "-q", "--detach"]);
+        let result = pr_status(path, None).unwrap();
+        assert_eq!(result.state, "detached_head");
+        assert!(result.queried_repo.is_none());
+        assert!(result.pull_requests.is_empty());
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn pr_status_reports_the_enterprise_repo_and_remote_branch_it_actually_queried() {
+        // gh isn't authenticated for this host in the test environment, so the
+        // state will be auth_missing/api_error — but the context fields the UI
+        // shows ("No open PR for <branch> in <host/owner/repo>") are computed
+        // before gh runs and must be right regardless.
+        let (base, path) = pr_repo("enterprise-context");
+        run_git(&base, &["remote", "add", "origin", "git@github.vitesco.io:eng/sw-prj-OMBMS_000U0.git"]);
+        run_git(&base, &["checkout", "-q", "-b", "feature/local"]);
+        run_git(&base, &["config", "branch.feature/local.remote", "origin"]);
+        run_git(&base, &["config", "branch.feature/local.merge", "refs/heads/feature/on-server"]);
+        let result = pr_status(path, Some("some-stale-branch".into())).unwrap();
+        assert_eq!(result.queried_repo.as_deref(), Some("github.vitesco.io/eng/sw-prj-OMBMS_000U0"),
+            "must query the enterprise host verbatim, not github.com");
+        assert_eq!(result.branch.as_deref(), Some("feature/on-server"),
+            "must report the branch's name on the remote, resolved from Git not from the stale frontend value");
+        assert_ne!(result.state, "unsupported_provider", "a github.vitesco.io remote is supported");
+        assert_ne!(result.state, "no_remote");
         fs::remove_dir_all(base).unwrap();
     }
 

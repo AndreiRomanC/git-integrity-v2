@@ -3614,10 +3614,13 @@ document.addEventListener('keydown', (e) => {
 const PR_STATE_LABELS = {
   loading: 'Checking pull request status…',
   no_remote: 'No remote configured for this repository.',
+  detached_head: 'HEAD is detached — not on a branch, so there is no branch to check for a pull request.',
+  no_branch: 'No branch is currently checked out.',
   unsupported_provider: null, // uses the backend's own detail message verbatim
   auth_missing: null,
   api_error: null,
-  no_open_pr: null,
+  no_open_pr: null, // built from result.branch + result.queried_repo
+  no_upstream: null,
 };
 const PR_LIFECYCLE_LABEL = { draft: 'Draft', open: 'Open', merged: 'Merged', closed: 'Closed' };
 const PR_MERGEABLE_LABEL = { mergeable: 'Mergeable', conflicting: 'Conflicting', calculating: 'Calculating…', unknown: 'Unknown' };
@@ -3652,7 +3655,12 @@ function createPrStatusPanel(root, options) {
       return;
     }
     const message = PR_STATE_LABELS[result.state] || result.detail || 'Pull request status unavailable.';
-    const detail = result.state === 'no_open_pr' ? `No open pull request for <code>${esc(result.branch || 'this branch')}</code>.` : esc(message);
+    const where = result.queried_repo ? ` in <code>${esc(result.queried_repo)}</code>` : '';
+    const branchCode = `<code>${esc(result.branch || 'this branch')}</code>`;
+    let detail;
+    if (result.state === 'no_open_pr') detail = `No open pull request for ${branchCode}${where}.`;
+    else if (result.state === 'no_upstream') detail = `No open pull request for ${branchCode}${where}. This branch has no upstream set — push it and set an upstream so it can be matched to a PR.`;
+    else detail = esc(message);
     const retryable = ['api_error', 'auth_missing'].includes(result.state);
     root.innerHTML = `<div class="pr-status-empty pr-status-${esc(result.state)}">${detail}${retryable ? '<button class="pr-status-retry" id="prStatusRetry">Retry</button>' : ''}</div>`;
     if (retryable) root.querySelector('#prStatusRetry')?.addEventListener('click', load);
