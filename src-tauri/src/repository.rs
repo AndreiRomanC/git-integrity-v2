@@ -428,7 +428,13 @@ fn cached_submodule_has_unpushed(sub_path: &str) -> bool {
 // reliable "where am I" for a detached checkout (extremely common for a
 // submodule right after `git submodule update`/"Reset submodule", both of
 // which intentionally leave it that way).
-pub struct RepositoryInfo { path: String, name: String, current_branch: String, head_oid: String, head_detached: bool }
+// gitdir/submodule_url exist mainly for diagnosing "which repository is
+// this actually talking to" reports (a submodule's history view silently
+// resolving to the parent, or vice versa) — see submodule_repository_inner
+// and openSubmoduleGraph's own logging. gitdir is always real (every
+// repository, submodule or not, has one); submodule_url is only ever
+// populated for a submodule's own RepositoryInfo, never the parent's.
+pub struct RepositoryInfo { path: String, name: String, current_branch: String, head_oid: String, head_detached: bool, gitdir: String, submodule_url: Option<String> }
 
 #[derive(Serialize)]
 pub struct Branch { name: String, current: bool, remote: bool }
@@ -668,6 +674,12 @@ fn git(path: &str, args: &[&str]) -> Result<String, String> {
 #[derive(Serialize)]
 pub struct RawGitResult { stdout: String, stderr: String, success: bool, exit_code: Option<i32>, read_only: bool }
 
+// The Terminal uses the same compact result shape as the older Git-only
+// console. Keeping the type shared also keeps the frontend transition
+// backwards-compatible while run_git_command remains available to older
+// builds/tests.
+pub type TerminalCommandResult = RawGitResult;
+
 // A minimal shell-like tokenizer — single/double-quoted segments (with
 // backslash-escaping *inside* double quotes only, matching common shell
 // behavior closely enough for this) are kept together as one argument, so
@@ -768,6 +780,101 @@ pub fn run_git_command(repository_path: String, args: String) -> Result<RawGitRe
         exit_code: output.status.code(),
         read_only,
     })
+}
+
+// Only skip the post-command repository refresh when the whole command is a
+// single, plainly read-only invocation. Shell operators are rejected from
+// this classification first: `git status && rm file`, `ls > file`, command
+// substitutions, and similar compound commands must all be treated as
+// possibly mutating. A false negative only costs one refresh; a false
+// positive could leave the UI stale after a real disk/repository change.
+fn is_definitely_read_only_terminal_command(input: &str) -> bool {
+    if input.chars().any(|ch| matches!(ch, '\n' | '\r' | ';' | '|' | '&' | '>' | '<' | '`')) || input.contains("$(") { return false; }
+    let Ok(parts) = tokenize_git_args(input) else { return false };
+    let Some(program) = parts.first().map(|part| part.to_ascii_lowercase()) else { return false };
+    if program == "git" {
+        return parts.get(1).map(|part| is_read_only_git_subcommand(&part.to_ascii_lowercase())).unwrap_or(false);
+    }
+    matches!(program.as_str(), "pwd" | "ls" | "dir" | "whoami" | "hostname" | "which" | "where")
+}
+
+fn run_terminal_command_inner(repository_path: String, command_text: String) -> Result<TerminalCommandResult, String> {
+    let started = Instant::now();
+    validate_path(&repository_path)?;
+    let command_text = command_text.trim();
+    if command_text.is_empty() { return Err("Type a command, e.g. \"git status\", \"pwd\", or \"gh pr status\"".into()); }
+
+    // Discover the enclosing repository once and use its real worktree root
+    // for the shared write lock/cache invalidation. The command itself still
+    // runs in the exact folder selected in the UI. Without this, a command
+    // launched from `repo/src` and a Stage launched at `repo` would acquire
+    // different path-keyed locks and could race on the same index.
+    let repository = internal_repository(&repository_path)?;
+    let repository_root = repository.workdir()
+        .ok_or("Bare repositories are not supported by the embedded Terminal")?
+        .to_string_lossy().into_owned();
+    drop(repository);
+
+    let queue_started = Instant::now();
+    let lock_handle = repo_write_lock(&repository_root);
+    let _lock = lock_handle.lock().unwrap();
+    log_repo_write_lock_acquired(&repository_root, "run_terminal_command", queue_started.elapsed());
+
+    let read_only = is_definitely_read_only_terminal_command(command_text);
+    let repo_id = anonymized_repository_id(&repository_root);
+
+    #[cfg(windows)]
+    let mut command = {
+        let shell = std::env::var_os("COMSPEC").unwrap_or_else(|| "cmd.exe".into());
+        let mut command = Command::new(shell);
+        command.args(["/D", "/S", "/C"]).arg(command_text);
+        command
+    };
+    #[cfg(not(windows))]
+    let mut command = {
+        // A login shell restores the user's normal PATH when the macOS app
+        // was launched from Finder, so tools installed by Homebrew (notably
+        // `gh`) resolve the same way they do in the user's Terminal.
+        let shell = std::env::var_os("SHELL").filter(|value| Path::new(value).is_file()).unwrap_or_else(|| "/bin/sh".into());
+        let mut command = Command::new(shell);
+        command.args(["-l", "-c"]).arg(command_text);
+        command
+    };
+
+    command.current_dir(&repository_path)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GH_PROMPT_DISABLED", "1")
+        .env("GIT_PAGER", "cat")
+        .env("PAGER", "cat")
+        .stdin(std::process::Stdio::null());
+
+    let output = run_with_timeout_labeled(command, GIT_COMMAND_TIMEOUT, "Terminal", "10 minutes");
+    let output = match output {
+        Ok(output) => output,
+        Err(error) => {
+            // Never log the command text: it can contain credentials, URLs,
+            // commit messages, or arbitrary private data.
+            perf_log(&format!("run_terminal_command: ({repo_id}, read_only={read_only}) TIMED_OUT"), started.elapsed());
+            return Err(error);
+        }
+    };
+    perf_log(&format!("run_terminal_command: ({repo_id}, read_only={read_only}) exit_code={:?}", output.status.code()), started.elapsed());
+    if !read_only { invalidate_git_metadata(&repository_root); }
+    Ok(RawGitResult {
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        success: output.status.success(),
+        exit_code: output.status.code(),
+        read_only,
+    })
+}
+
+// Arbitrary shell commands are blocking OS processes, so this command must
+// use the same background pool as status/stage/commit/network operations;
+// otherwise a long command would freeze the native WebView event thread.
+#[tauri::command]
+pub async fn run_terminal_command(repository_path: String, command_text: String) -> Result<TerminalCommandResult, String> {
+    off_main_thread(move || run_terminal_command_inner(repository_path, command_text)).await
 }
 
 fn internal_repository(path: &str) -> Result<Repository, String> {
@@ -1589,8 +1696,9 @@ fn open_repository_fast_inner(path: String) -> Result<FastRepositoryData, String
     // submodule_navigation_status, used only when this list disagrees with
     // what the frontend already believes, e.g. a submodule added since).
     let submodule_paths: Vec<String> = cached_index_metadata(&path).1.iter().cloned().collect();
+    let gitdir = repo.path().to_string_lossy().into_owned();
     perf_log("open_repository_fast: TOTAL", started.elapsed());
-    Ok(FastRepositoryData { repository: RepositoryInfo { path, name, current_branch, head_oid, head_detached }, branches, commits, stashes, submodule_paths, commits_truncated })
+    Ok(FastRepositoryData { repository: RepositoryInfo { path, name, current_branch, head_oid, head_detached, gitdir, submodule_url: None }, branches, commits, stashes, submodule_paths, commits_truncated })
 }
 
 #[tauri::command]
@@ -1659,9 +1767,10 @@ fn load_repository_inner(path: String, force: Option<bool>) -> Result<Repository
 
     replace_git_metadata(&path, statuses);
     let submodule_paths: Vec<String> = cached_index_metadata(&path).1.iter().cloned().collect();
+    let gitdir = repo.path().to_string_lossy().into_owned();
 
     perf_log("load_repository: TOTAL", load_started.elapsed());
-    Ok(RepositoryData { repository: RepositoryInfo { path, name, current_branch, head_oid, head_detached }, branches, commits, changes, stashes, submodule_paths, commits_truncated })
+    Ok(RepositoryData { repository: RepositoryInfo { path, name, current_branch, head_oid, head_detached, gitdir, submodule_url: None }, branches, commits, changes, stashes, submodule_paths, commits_truncated })
 }
 
 #[derive(Serialize)]
@@ -3074,22 +3183,28 @@ pub async fn submodule_repository(repository_path: String, relative_path: String
 fn submodule_repository_inner(repository_path: String, relative_path: String) -> Result<RepositoryData, String> {
     perf_log(&format!("submodule_repository: requested (parent={}, relative_path={relative_path})", anonymized_repository_id(&repository_path)), Duration::ZERO);
     let absolute = validate_submodule(&repository_path, &relative_path)?;
-    let result = load_repository_inner(absolute.to_string_lossy().into_owned(), None);
+    // load_repository_inner has no idea it's being asked for a submodule —
+    // it just opens whatever path it was given — so it always leaves
+    // submodule_url as None; only this caller actually knows the parent's
+    // .gitmodules entry this resolved from, so it fills that in here.
+    let (submodule_url, _) = submodule_url_and_branch(&repository_path, &relative_path);
+    let mut result = load_repository_inner(absolute.to_string_lossy().into_owned(), None);
+    if let Ok(data) = &mut result { data.repository.submodule_url = submodule_url; }
     match &result {
         Ok(data) => {
-            // Temporary, deliberately verbose diagnostic for the "does the
-            // Submodule Branch Map ever show the wrong submodule's history"
-            // report — enough to confirm from the log alone, without a
-            // debugger, exactly which repository and commits this call
-            // resolved to: a real cross-contamination bug would show two
-            // different relative_path requests resolving to the same HEAD/
+            // Verbose diagnostic for the "does the Submodule Branch Map
+            // ever show the wrong submodule's history" report — enough to
+            // confirm from the log alone, without a debugger, exactly which
+            // repository/gitdir this call resolved to and what it returned:
+            // a real cross-contamination bug would show two different
+            // relative_path requests resolving to the same gitdir/HEAD/
             // commit OIDs; two genuinely different (if superficially
             // similar-looking) submodules would not.
             let first_three: Vec<String> = data.commits.iter().take(3).map(|c| format!("{}:{}", &c.id[..8.min(c.id.len())], c.subject)).collect();
             perf_log(&format!(
-                "submodule_repository: resolved to {} (branch={}, head={}, branches={}, commits={}, first_commits=[{}])",
-                anonymized_repository_id(&data.repository.path), data.repository.current_branch, &data.repository.head_oid[..8.min(data.repository.head_oid.len())],
-                data.branches.len(), data.commits.len(), first_three.join(" | "),
+                "submodule_repository: resolved to {} (gitdir={}, branch={}, head={}, url={}, branches={}, commits={}, first_commits=[{}])",
+                anonymized_repository_id(&data.repository.path), anonymized_repository_id(&data.repository.gitdir), data.repository.current_branch, &data.repository.head_oid[..8.min(data.repository.head_oid.len())],
+                data.repository.submodule_url.as_deref().unwrap_or("(none)"), data.branches.len(), data.commits.len(), first_three.join(" | "),
             ), Duration::ZERO);
         }
         Err(error) => perf_log(&format!("submodule_repository: ERROR: {error}"), Duration::ZERO),
@@ -7814,6 +7929,51 @@ mod tests {
     }
 
     #[test]
+    fn terminal_command_runs_shell_and_git_commands_in_the_selected_scope() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let repository = std::env::temp_dir().join(format!("git-integrity-terminal-{suffix}"));
+        let nested = repository.join("folder with spaces");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(repository.join("README.md"), "terminal test").unwrap();
+        run_git(&repository, &["init", "-b", "main"]);
+        run_git(&repository, &["config", "user.email", "test@example.com"]);
+        run_git(&repository, &["config", "user.name", "Test User"]);
+        run_git(&repository, &["add", "."]);
+        run_git(&repository, &["commit", "-m", "Initial"]);
+
+        let scoped = run_terminal_command_inner(
+            nested.to_string_lossy().into_owned(),
+            "git rev-parse --show-prefix".into(),
+        ).unwrap();
+        assert!(scoped.success, "stderr={}", scoped.stderr);
+        assert_eq!(scoped.stdout.trim().replace('\\', "/"), "folder with spaces/");
+
+        let arbitrary = run_terminal_command_inner(
+            repository.to_string_lossy().into_owned(),
+            "echo terminal-ok".into(),
+        ).unwrap();
+        assert!(arbitrary.success, "stderr={}", arbitrary.stderr);
+        assert!(arbitrary.stdout.contains("terminal-ok"));
+
+        let add_remote = run_terminal_command_inner(
+            repository.to_string_lossy().into_owned(),
+            "git remote add origin https://github.example.test/team/project.git".into(),
+        ).unwrap();
+        assert!(add_remote.success, "stderr={}", add_remote.stderr);
+        assert!(!add_remote.read_only);
+        assert_eq!(git(&repository.to_string_lossy(), &["remote", "get-url", "origin"]).unwrap().trim(), "https://github.example.test/team/project.git");
+
+        let status = run_terminal_command_inner(
+            repository.to_string_lossy().into_owned(),
+            "git status --short".into(),
+        ).unwrap();
+        assert!(status.success);
+        assert!(status.read_only);
+
+        fs::remove_dir_all(repository).unwrap();
+    }
+
+    #[test]
     fn commander_view_compares_files_inside_a_submodule_against_its_own_remote() {
         // Reproduces the reported issue: after committing and pushing a change
         // *inside* a submodule (to the submodule's own remote), browsing into that
@@ -9055,6 +9215,23 @@ mod tests {
     }
 
     #[test]
+    fn terminal_read_only_classification_rejects_compound_or_redirected_commands() {
+        for allowed in ["git status --short", "git log --oneline -3", "pwd", "ls", "dir"] {
+            assert!(is_definitely_read_only_terminal_command(allowed), "{allowed} should be safely read-only");
+        }
+        for mutating_or_ambiguous in [
+            "git remote add origin somewhere",
+            "git status && touch changed.txt",
+            "ls > listing.txt",
+            "pwd; rm file.txt",
+            "echo $(touch changed.txt)",
+            "gh pr status",
+        ] {
+            assert!(!is_definitely_read_only_terminal_command(mutating_or_ambiguous), "{mutating_or_ambiguous} must trigger a refresh");
+        }
+    }
+
+    #[test]
     fn run_git_command_reports_exit_code_and_read_only_classification() {
         let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let repo_path = std::env::temp_dir().join(format!("git-integrity-console-{suffix}"));
@@ -9474,6 +9651,105 @@ mod tests {
         assert!(annotated.annotated, "a `git tag -a` must be reported as annotated");
         assert_eq!(annotated.commit_id, head, "an annotated tag's commit_id must be the peeled commit, not the tag object's own oid");
         assert_eq!(annotated.message.as_deref(), Some("release notes here"));
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    // ---- Message C: submodule history vs. parent gitlink reference changes ----
+
+    #[test]
+    fn submodule_history_and_parent_reference_changes_never_share_a_commit() {
+        // The exact report: "Submodule History" showing a commit that reads
+        // like "Update submodule X to <sha>" — a parent-repository gitlink
+        // bump, not anything that happened inside the submodule's own
+        // repository. The two questions ("what did the submodule itself
+        // commit" vs. "when did the parent last point at a new version of
+        // it") are answered by two different backend calls on two different
+        // repositories — submodule_repository_inner (the submodule's own
+        // gitdir) and path_history (the parent, filtered to the submodule's
+        // gitlink path) — and their results must never overlap.
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-history-vs-refchanges-{suffix}"));
+        let parent = base.join("parent"); let dependency = base.join("dependency");
+        create_libgit2_repository(&parent, "README.md");
+        create_libgit2_repository(&dependency, "module.txt");
+        run_git(&parent, &["branch", "-M", "main"]);
+        run_git(&dependency, &["branch", "-M", "main"]);
+        let parent_string = parent.to_string_lossy().into_owned();
+        let added = add_submodule_inner(parent_string.clone(), "".into(), dependency.to_string_lossy().into_owned(), "dep".into(), String::new(), String::new()).unwrap();
+        create_commit(parent_string.clone(), "Add dep submodule".into()).unwrap();
+        let sub_path = parent.join(&added);
+
+        // Advance the submodule and record the new version in the parent —
+        // exactly the "Update submodule dep to <sha>" commit the report saw.
+        fs::write(sub_path.join("module.txt"), "v2").unwrap();
+        run_git(&sub_path, &["commit", "-am", "Submodule's own second commit"]);
+        commit_selected_internal(&parent_string, &[normalized(Path::new(&added))], &format!("Update submodule {added} to a new version")).unwrap();
+
+        let submodule_history = submodule_repository_inner(parent_string.clone(), added.clone()).unwrap();
+        let reference_changes = path_history(parent_string, added.clone()).unwrap();
+
+        assert!(submodule_history.commits.iter().any(|c| c.subject == "Submodule's own second commit"), "the submodule's own commit must be in its own history");
+        assert!(!submodule_history.commits.iter().any(|c| c.subject.starts_with("Update submodule")), "a parent gitlink-update commit must never appear in the submodule's own history");
+
+        assert!(reference_changes.iter().any(|c| c.subject.starts_with("Update submodule")), "the parent's gitlink-update commit must appear in Submodule Reference Changes");
+        assert!(reference_changes.iter().any(|c| c.subject == "Add dep submodule"), "the original gitlink-add commit is also a real parent reference change");
+        assert!(!reference_changes.iter().any(|c| c.subject == "Submodule's own second commit"), "a commit that only happened inside the submodule's own repository must never appear in the parent's reference-change history");
+
+        // The two views must be genuinely disjoint, not just individually correct.
+        let submodule_subjects: HashSet<&str> = submodule_history.commits.iter().map(|c| c.subject.as_str()).collect();
+        let reference_subjects: HashSet<&str> = reference_changes.iter().map(|c| c.subject.as_str()).collect();
+        assert!(submodule_subjects.is_disjoint(&reference_subjects), "Submodule History and Submodule Reference Changes must never share a commit");
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn submodule_repository_reports_a_distinct_gitdir_and_url_from_the_parent() {
+        // Message C, point 2: the context this app resolves for a submodule
+        // must include a gitdir and identity genuinely distinct from the
+        // parent's own — the most direct possible check that "Submodule
+        // History" is really talking to a different repository, not the
+        // same one with a path filter.
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-submodule-identity-{suffix}"));
+        let parent = base.join("parent"); let dependency = base.join("dependency");
+        create_libgit2_repository(&parent, "README.md");
+        create_libgit2_repository(&dependency, "module.txt");
+        let parent_string = parent.to_string_lossy().into_owned();
+        let added = add_submodule_inner(parent_string.clone(), "".into(), dependency.to_string_lossy().into_owned(), "dep".into(), String::new(), String::new()).unwrap();
+        create_commit(parent_string.clone(), "Add dep submodule".into()).unwrap();
+
+        let parent_data = load_repository_inner(parent_string.clone(), None).unwrap();
+        let submodule_data = submodule_repository_inner(parent_string, added).unwrap();
+
+        assert_ne!(submodule_data.repository.gitdir, parent_data.repository.gitdir, "the submodule's resolved gitdir must be genuinely distinct from the parent's own");
+        assert_ne!(submodule_data.repository.path, parent_data.repository.path, "sanity check: the workdir paths must differ too");
+        assert!(parent_data.repository.submodule_url.is_none(), "the parent itself is not a submodule — it must never report a submodule_url");
+        assert!(submodule_data.repository.submodule_url.is_some(), "the submodule's own configured URL (from the parent's .gitmodules) must be reported");
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn submodule_repository_reports_detached_head_correctly_not_as_a_fake_branch_name() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-submodule-detached-{suffix}"));
+        let parent = base.join("parent"); let dependency = base.join("dependency");
+        create_libgit2_repository(&parent, "README.md");
+        create_libgit2_repository(&dependency, "module.txt");
+        run_git(&dependency, &["commit", "--allow-empty", "-m", "second"]);
+        let parent_string = parent.to_string_lossy().into_owned();
+        let added = add_submodule_inner(parent_string.clone(), "".into(), dependency.to_string_lossy().into_owned(), "dep".into(), String::new(), String::new()).unwrap();
+        create_commit(parent_string.clone(), "Add dep submodule".into()).unwrap();
+        let sub_path = parent.join(&added);
+        let target = run_git_capture(&sub_path, &["rev-parse", "HEAD~1"]);
+        run_git(&sub_path, &["checkout", "--detach", &target]);
+
+        let data = submodule_repository_inner(parent_string, added).unwrap();
+        assert!(data.repository.head_detached, "a detached submodule checkout must be reported as detached");
+        assert_eq!(data.repository.current_branch, "", "current_branch must be empty, never a synthetic name, on a detached HEAD (see RepositoryInfo's own contract)");
+        assert_eq!(data.repository.head_oid, target, "head_oid must be the exact commit actually checked out");
 
         fs::remove_dir_all(base).unwrap();
     }
