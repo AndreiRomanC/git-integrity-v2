@@ -15,17 +15,18 @@ const MUTATING_COMMANDS = new Set([
   'restore_file', 'restore_remote_file', 'add_submodule', 'switch_submodule_version', 'reset_submodule', 'change_submodule_url',
   'commit_submodule', 'push_submodule', 'pull_submodule', 'force_push_submodule', 'fetch_submodule',
   'create_submodule_branch', 'merge_branch', 'resolve_conflict', 'complete_merge', 'abort_merge',
-  'sync_repository', 'publish_branch', 'fetch_remote', 'fetch_all_remotes', 'write_text_file', 'run_git_command',
+  'sync_repository', 'publish_branch', 'fetch_remote', 'fetch_all_remotes', 'write_text_file', 'run_git_command', 'run_terminal_command',
 ]);
-// While a Git Console command is running, every mutation *and* switching to
+// While an embedded Terminal command is running, every mutation *and* switching to
 // a different repository (which would otherwise let that command's delayed
 // result try to reload/affect a repository the user isn't even looking at
-// anymore) are refused the same centralized way. run_git_command itself is
-// excluded here deliberately — runRawGitFromConsole's own check is what
+// anymore) are refused the same centralized way. The two console commands are
+// excluded here deliberately — runTerminalFromConsole's own check is what
 // actually prevents a second console command from starting, before this
 // wrapper is ever reached; blocking it here too would just refuse the
 // legitimate call that's about to set consoleCommandRunning in the first place.
 const REPO_SWITCH_COMMANDS = new Set(['load_repository', 'open_repository_fast']);
+const EMBEDDED_CONSOLE_COMMANDS = new Set(['run_git_command', 'run_terminal_command']);
 const rawInvoke = window.__TAURI__?.core?.invoke;
 const invoke = rawInvoke && ((command, args) => {
   if (MUTATING_COMMANDS.has(command) && !state.statusReady) {
@@ -34,8 +35,8 @@ const invoke = rawInvoke && ((command, args) => {
     jsPerfLog(`invoke wrapper REFUSED ${command} (statusReady=false)`, 0);
     return Promise.reject(message);
   }
-  if (command !== 'run_git_command' && state.consoleCommandRunning && (MUTATING_COMMANDS.has(command) || REPO_SWITCH_COMMANDS.has(command))) {
-    const message = 'A Git command is still running in the console — please wait for it to finish.';
+  if (!EMBEDDED_CONSOLE_COMMANDS.has(command) && state.consoleCommandRunning && (MUTATING_COMMANDS.has(command) || REPO_SWITCH_COMMANDS.has(command))) {
+    const message = 'A Terminal command is still running — please wait for it to finish.';
     status(message, 'error');
     jsPerfLog(`invoke wrapper REFUSED ${command} (consoleCommandRunning)`, 0);
     return Promise.reject(message);
@@ -81,7 +82,7 @@ const state = { repository: null, branches: [], commits: [], allCommits: [], cha
   // the fields above, never this — see activeGraphData(), openSubmoduleGraph
   // and leaveSubmoduleGraph.
   submoduleGraph: null,
-  consoleMode: 'commands', consoleTranscript: [], consoleCmdHistory: [], consoleScopeOverride: null, graphPrimaryBranch: null, publishUpto: null,
+  consoleMode: 'commands', consoleTranscript: [], consoleCmdHistory: [], consoleDrafts: { commands: '', console: '' }, consoleScopeOverride: null, graphPrimaryBranch: null, publishUpto: null,
   // False only right after openRepositoryFast, until its background
   // refresh_status completes — mutations (stage/unstage, delete, commit,
   // switching branch) are refused while this is false, since they'd act on
@@ -516,12 +517,8 @@ function render() {
   refs.repoName.textContent = loaded ? state.repository.name : 'Open a repository';
   refs.repoPath.textContent = loaded ? state.repository.path : 'Choose an existing Git folder';
   refs.currentBranch.textContent = loaded ? describeBranch(state.repository) : 'No branch';
-  // Includes the short HEAD OID for a submodule's own map, not just its name
-  // — lets the user confirm at a glance exactly which commit this view is
-  // actually showing, the same way the diagnostic log lines added for the
-  // "does this ever show the wrong submodule" report do.
-  refs.viewTitle.textContent = state.view === 'explorer' ? 'Project Explorer' : state.view === 'commander' ? 'Local ↔ Remote' : state.view === 'remotes' ? 'Remotes' : state.submoduleGraph ? `Submodule Branch Map · ${state.submoduleGraph.name} · HEAD ${(state.submoduleGraph.repository?.head_oid || '').slice(0, 8) || '—'}` : state.historyScope ? `History · ${state.historyScope}` : 'Branch Map';
-  refs.graphSubtitle.textContent = !loaded ? 'Navigate folders and inspect every item in your repository.' : state.view === 'explorer' ? `${state.entries.length} items in ${state.currentPath || state.repository.name}` : state.view === 'commander' ? 'Compare the workspace with a cached remote snapshot—no second checkout.' : state.view === 'remotes' ? 'Configured server locations and explicit fetch controls.' : (() => { const g = activeGraphData(); return `${(g.commits || []).length} commits across ${(g.branches || []).length} branches`; })();
+  refs.viewTitle.textContent = state.view === 'explorer' ? 'Project Explorer' : state.view === 'commander' ? 'Local ↔ Remote' : state.view === 'remotes' ? 'Remotes' : state.submoduleGraph ? `Submodule History · ${state.submoduleGraph.name}` : state.historyScope ? `History · ${state.historyScope}` : 'Repository History';
+  refs.graphSubtitle.textContent = !loaded ? 'Navigate folders and inspect every item in your repository.' : state.view === 'explorer' ? `${state.entries.length} items in ${state.currentPath || state.repository.name}` : state.view === 'commander' ? 'Compare the workspace with a cached remote snapshot—no second checkout.' : state.view === 'remotes' ? 'Configured server locations and explicit fetch controls.' : state.historyScope ? `Commits touching ${state.historyScope}` : state.submoduleGraph ? 'Commits, branches and release tags for this submodule' : 'Commits, branches and release tags';
   refs.search.placeholder = state.view === 'explorer' ? 'Filter this folder' : state.view === 'commander' ? 'Filter comparison' : 'Find commit or author';
   refs.search.closest('label').hidden = state.view === 'remotes';
   refs.goUp.hidden = refs.reloadFolder.hidden = !['explorer','commander'].includes(state.view); refs.goUp.disabled = state.view === 'explorer' ? !state.currentPath : !state.commanderPath;
@@ -2035,26 +2032,46 @@ const LANE_WIDTH = 30;
 const GRAPH_COMMIT_WINDOW = 500;
 const laneX = lane => LANE_WIDTH / 2 + lane * LANE_WIDTH;
 
-// Show at most a couple of ref labels inline — the graph's shape is the main
-// signal, refs are a secondary lookup. Anything beyond that collapses into a
-// single "+N" pill instead of filling the row with badges.
-const MAX_INLINE_REFS = 2;
-function refsBadges(refList, color, isHead) {
-  // With only a couple of inline slots, whichever refs happened to come
-  // first in the backend's arbitrary reference-iteration order could easily
-  // bump origin/main out to the "+N" overflow (visible only on hover) —
-  // which looked like it had vanished from the graph entirely. The
-  // currently checked-out branch and the project's main remote-tracking
-  // branch are what answering "where am I relative to origin/main" actually
-  // needs, so they always get first claim on the visible slots.
-  const priority = ref => (ref === activeGraphData().currentBranch ? 0 : /^origin\/(main|master)$/.test(ref) ? 1 : 2);
-  const grouped = refList.filter(ref => ref !== 'HEAD').slice().sort((a, b) => priority(a) - priority(b));
-  const headPill = isHead ? '<b class="head-pill">HEAD</b>' : '';
-  if (!grouped.length && !headPill) return '';
-  const shown = grouped.slice(0, MAX_INLINE_REFS);
-  const rest = grouped.slice(MAX_INLINE_REFS);
-  const restPill = rest.length ? `<b class="ref-pill ref-pill-more" data-tooltip="${esc(rest.join(', '))}">+${rest.length}</b>` : '';
-  return `<span class="ref-pills">${headPill}${shown.map(ref => `<b class="ref-pill" style="--lane-color:${color}">${esc(ref)}</b>`).join('')}${restPill}</span>`;
+// Point 5 of the rework: a subtle, collapsible legend at the base of the
+// graph — <details>/<summary> gives the collapse behavior natively (same
+// pattern the Help panel already uses), no JS needed for it. Built once as
+// a constant, not per-render: it never depends on anything in `state`.
+const GRAPH_LEGEND_HTML = `<details class="graph-legend">
+  <summary>How to read this map</summary>
+  <div class="graph-legend-grid">
+    <span><i class="legend-glyph">●</i>Commit — A saved point in repository history</span>
+    <span><i class="legend-glyph">◎</i>HEAD — The commit currently checked out</span>
+    <span><i class="legend-glyph">⑂</i>Branch point — A common ancestor or lane transition</span>
+    <span><i class="legend-glyph legend-tag">◆</i>TAG — A named release or version</span>
+    <span><i class="legend-swatch kind-local_branch"></i>Branch — A local branch tip</span>
+    <span><i class="legend-swatch kind-remote_branch"></i>Remote branch — The last locally known remote position</span>
+    <span><i class="legend-line"></i>Line — A real parent relationship between commits</span>
+    <span><i class="legend-swatch legend-merge"></i>MERGE — A commit with multiple parents</span>
+    <span><i class="legend-glyph">…</i>Older history is available but not loaded</span>
+  </div>
+  <p class="graph-legend-note">Lane colors are visual guides only; they do not permanently identify a branch.</p>
+</details>`;
+
+// Turns selectRefBadges' pure selection (graph-model.js) into markup. Badge
+// color is by *kind* now, not by lane — lanes/colors are exclusively about
+// the graph's own topology (point 1 of the rework: never inferred as
+// meaning anything about a specific branch), while a badge's color is
+// exactly the opposite: a fixed, stable signal for what *kind* of ref it
+// is, the same on every row it ever appears on. A tag badge also carries
+// its own click handler (see renderGraph) separate from the row's —
+// clicking a tag shows *that tag's* detail (lightweight/annotated, full
+// name), clicking anywhere else on the row selects the commit.
+const REF_BADGE_ICON = { tag: '◆ ' };
+function refsBadges(refList, isHead, currentBranchName) {
+  const { badges, overflowTags, overflowBranches } = selectRefBadges(refList, { isHead, currentBranchName });
+  if (!badges.length && !overflowTags.length && !overflowBranches.length) return '';
+  const badgeHtml = badges.map(badge => {
+    if (badge.kind === 'tag') return `<b class="ref-pill kind-tag" data-tag-name="${esc(badge.name)}" data-tooltip="Click for tag details">${REF_BADGE_ICON.tag}${esc(badge.name)}</b>`;
+    return `<b class="ref-pill kind-${badge.kind}">${esc(badge.name)}</b>`;
+  }).join('');
+  const tagOverflow = overflowTags.length ? `<b class="ref-pill kind-tag ref-pill-more" data-tooltip="${esc(overflowTags.map(t => t.name).join(', '))}">+${overflowTags.length} tags</b>` : '';
+  const branchOverflow = overflowBranches.length ? `<b class="ref-pill ref-pill-more" data-tooltip="${esc(overflowBranches.map(b => b.name).join(', '))}">+${overflowBranches.length}</b>` : '';
+  return `<span class="ref-pills">${badgeHtml}${tagOverflow}${branchOverflow}</span>`;
 }
 
 // The graph view renders one of two entirely separate repositories: the
@@ -2078,6 +2095,14 @@ function activeGraphData() {
 // the parent) keeps its own choice, isolated in state.submoduleGraph.primaryBranch.
 function activeGraphPrimaryBranch() { return state.submoduleGraph ? state.submoduleGraph.primaryBranch : state.graphPrimaryBranch; }
 function setActiveGraphPrimaryBranch(name) { if (state.submoduleGraph) state.submoduleGraph.primaryBranch = name; else state.graphPrimaryBranch = name; }
+
+// The subtle All/Branches/Releases filter — same per-context isolation as
+// the primary-branch picker above, and the same "dim, never remove" rule
+// search already uses: filtering must never make buildGraphModel see a
+// different (smaller) commit list, only change which rows *look* faded, so
+// a filtered-out commit's edges stay exactly as real and unbroken as before.
+function activeGraphRefFilter() { return (state.submoduleGraph ? state.submoduleGraph.refFilter : state.graphRefFilter) || 'all'; }
+function setActiveGraphRefFilter(value) { if (state.submoduleGraph) state.submoduleGraph.refFilter = value; else state.graphRefFilter = value; }
 
 // The one place that decodes activeGraphPrimaryBranch()'s stored value
 // ("detached" / "branch:<name>" / "remote:<name>", or nothing yet — see the
@@ -2117,6 +2142,7 @@ async function loadOlderGraphCommits() {
   // landing after either can never silently append onto the wrong context.
   const targetContext = state.submoduleGraph;
   const targetPath = g.path;
+  const previousCommitCount = g.commits.length;
   loadingOlderCommits = true;
   if (state.view === 'graph') renderGraph();
   try {
@@ -2131,7 +2157,13 @@ async function loadOlderGraphCommits() {
       state.commits_truncated = page.has_more;
     }
   } catch (error) { status(String(error), 'error'); }
-  finally { loadingOlderCommits = false; if (state.view === 'graph') renderGraph(); }
+  finally {
+    loadingOlderCommits = false;
+    // Point 6 of the rework: append only the new page's own rows when it's
+    // safe to (appendOlderGraphRows itself is the one place that decides
+    // that, and falls back to a full renderGraph whenever it isn't sure).
+    if (state.view === 'graph') appendOlderGraphRows(previousCommitCount);
+  }
 }
 
 // Real, backend-computed ahead/behind + merge-base per local branch relative
@@ -2180,7 +2212,87 @@ function ensureBranchDivergence(repositoryPath, primaryBranchName) {
 // however many rows apart they end up being (instead of independent per-row
 // segments that only look connected when every row happens to be the same
 // height).
+
+// The one real per-row template — shared by renderGraph's full build and
+// appendOlderGraphRows' incremental one, so "Load older" can never drift
+// into a second, slightly-different copy of what a commit row looks like.
+// `ctx` bundles everything both need to read: model/lanesWidth/
+// stashesByBase/aheadAnnotations/branchPointRows/query/matchesQuery/
+// currentBranch/refFilter (see renderGraph, which builds the real one).
+function buildCommitRowHtml(commit, index, ctx) {
+  const node = ctx.model[index];
+  const stashPills = (ctx.stashesByBase.get(commit.id) || []).map(stash => `<b class="stash-pill" data-toggle-stash="${stash.index}" data-tooltip="stash@{${stash.index}} — click for details">⇕ stash</b>`).join('');
+  const stashDetails = (ctx.stashesByBase.get(commit.id) || []).map(stash => `<div class="stash-internals" data-stash-detail="${stash.index}" hidden>
+    <div>stash@{${stash.index}}: ${esc(stash.message.replace(/^WIP on [^:]+:\s*[0-9a-f]+\s*/, 'WIP on ') || 'Saved work')} — bundles working-tree changes, staged index${stash.message.includes('untracked') ? ', untracked files' : ''}</div>
+    <div class="stash-file-list" data-stash-file-list="${stash.index}"></div>
+  </div>`).join('');
+  const ahead = ctx.aheadAnnotations.get(index);
+  const isBranchPoint = ctx.branchPointRows.has(index);
+  // A query highlights matches instead of removing anything from the
+  // graph — a non-matching commit stays exactly where it is, still fully
+  // connected, as the real context for whichever matches surround it.
+  const isMatch = ctx.query && ctx.matchesQuery(commit);
+  const isSearchDimmed = ctx.query && !isMatch;
+  // The All/Branches/Releases filter dims exactly the same way search
+  // does — never removes a commit or its edges, only fades rows that
+  // don't carry the kind of ref currently asked for. "Releases" means
+  // "has a tag"; a merge or branch point is never dimmed regardless of
+  // its own refs, since it's structural context for whatever nearby row
+  // *does* match, the same reasoning search already applies.
+  const refKinds = new Set((node.refs || []).map(r => r.kind));
+  const matchesFilter = ctx.refFilter === 'all' || isBranchPoint || (ctx.refFilter === 'branches' ? (refKinds.has('local_branch') || refKinds.has('remote_branch')) : refKinds.has('tag'));
+  const isFilterDimmed = !matchesFilter;
+
+  return `<article class="commit-row ${node.isHead ? 'is-head' : ''} ${isBranchPoint ? 'is-branch-point' : ''} ${isMatch ? 'is-search-match' : ''} ${isSearchDimmed || isFilterDimmed ? 'is-search-dimmed' : ''}" data-id="${esc(commit.id)}" data-lane="${node.lane}">
+    <div class="graph-cell"></div>
+    <div class="commit-body">
+      <div class="commit-card"><div class="commit-main">${isBranchPoint ? '<b class="branch-point-pill" data-tooltip="Common ancestor — where the newer branch above split off">⑂</b>' : ''}<span class="commit-title">${commitSubjectHtml(commit.subject)}</span>${refsBadges(node.refs, node.isHead, ctx.currentBranch)}${stashPills}</div><span class="commit-id">${esc(commit.id.slice(0, 8))}</span>
+      <span class="topology-badges">${commit.parents?.length > 1 ? `<b class="merge-badge">MERGE</b>` : ''}</span><span class="commit-author">${esc(commit.author)}</span></div>
+      ${ahead ? `<div class="ahead-annotation">${esc(ahead)}</div>` : ''}${stashDetails}
+    </div>
+  </article>`;
+}
+
+function graphTruncationStubHtml(truncated) {
+  return truncated ? `<div class="history-truncated-stub"><span>⋯ continues in older history</span><button id="loadOlderCommits" ${loadingOlderCommits ? 'disabled' : ''}>${loadingOlderCommits ? '<i class="spinner"></i> Loading…' : 'Load older'}</button></div>` : '';
+}
+
+// Row click (select), tag-badge click (tag detail), and stash-pill click
+// (expand/collapse) — shared so a fresh batch of rows, whether from a full
+// renderGraph or an incremental appendOlderGraphRows, is wired up
+// identically either way; attaching this twice to the *same* already-wired
+// row (which double-toggling stash-pill state would immediately reveal)
+// is exactly what keeping this to one shared function, called once per
+// row per its own lifetime, avoids.
+function wireGraphRowInteractions(rowElements) {
+  rowElements.forEach(row => row.addEventListener('click', () => selectCommit(row.dataset.id)));
+  rowElements.forEach(row => row.querySelectorAll('[data-tag-name]').forEach(pill => pill.addEventListener('click', event => { event.stopPropagation(); showTagDetails(pill.dataset.tagName); })));
+  rowElements.forEach(row => row.querySelectorAll('[data-toggle-stash]').forEach(pill => pill.addEventListener('click', event => {
+    event.stopPropagation();
+    const index = pill.dataset.toggleStash;
+    const detail = pill.closest('.commit-card').parentElement.querySelector(`[data-stash-detail="${index}"]`);
+    if (!detail) return;
+    detail.toggleAttribute('hidden');
+    const fileList = detail.querySelector(`[data-stash-file-list="${index}"]`);
+    // Load the file list lazily, only the first time this stash is expanded
+    // — "what's actually in there?" answered without needing to pop it first.
+    if (!detail.hidden && fileList && !fileList.dataset.loaded) {
+      fileList.dataset.loaded = '1';
+      fileList.innerHTML = '<i class="spinner"></i>';
+      if (!invoke) { fileList.innerHTML = '<div class="stash-file">preview.txt</div>'; return; }
+      invoke('stash_entry_files', { repositoryPath: activeGraphData().path, stashIndex: Number(index) })
+        .then(files => { fileList.innerHTML = files.length ? files.map(file => `<div class="stash-file">${esc(file)}</div>`).join('') : '<div class="stash-file">(no files — this stash is empty)</div>'; })
+        .catch(error => { fileList.innerHTML = `<div class="stash-file">${esc(String(error))}</div>`; });
+    }
+    // The stash toggle above changes this row's height without a full
+    // renderGraph — the SVG lines/dots were positioned from row.offsetTop
+    // measurements taken before that change, so they'd drift out of
+    // alignment with every row below it otherwise.
+    scheduleGraphOverlayRedraw();
+  })));
+}
 function renderGraph() {
+  const modelStarted = performance.now();
   const query = refs.search.value.trim().toLowerCase();
   const g = activeGraphData();
   // Search never removes a commit from the graph being built — doing that
@@ -2190,7 +2302,10 @@ function renderGraph() {
   // edge, not just a missing one). Every commit stays in the model
   // unconditionally; a query only decides which rows get highlighted.
   const commits = g.commits || [];
-  const matchesQuery = c => !query || `${c.subject} ${c.author} ${c.id} ${(c.refs || []).join(' ')}`.toLowerCase().includes(query);
+  // .refs is now Vec<{name, kind}> from the backend — search must still
+  // find a tag (or branch) by name, exactly as it did with the old flat
+  // string list, just reading the structured shape correctly now.
+  const matchesQuery = c => !query || `${c.subject} ${c.author} ${c.id} ${(c.refs || []).map(r => r.name).join(' ')}`.toLowerCase().includes(query);
   const matchCount = query ? commits.filter(matchesQuery).length : 0;
   const currentBranch = g.currentBranch;
   // "Primary" drives which lane is lane 0 — defaults to whatever is
@@ -2204,13 +2319,18 @@ function renderGraph() {
   const localBranchNames = (g.branches || []).filter(b => !b.remote).map(b => b.name);
   const remoteBranchNames = (g.branches || []).filter(b => b.remote).map(b => b.name);
   const { kind: primaryKind, name: primaryName } = resolvePrimarySelection(g);
-  const primaryTip = primaryKind === 'detached' ? commits.find(c => c.id === g.headOid) : primaryName ? commits.find(c => (c.refs || []).includes(primaryName)) : null;
+  // primaryName can be either a local branch or a remote-tracking ref (the
+  // picker accepts both) — match against whichever structured ref kind it
+  // actually is, by name.
+  const hasRefNamed = (commit, name) => (commit.refs || []).some(r => (r.kind === 'local_branch' || r.kind === 'remote_branch') && r.name === name);
+  const primaryTip = primaryKind === 'detached' ? commits.find(c => c.id === g.headOid) : primaryName ? commits.find(c => hasRefNamed(c, primaryName)) : null;
   const model = buildGraphModel(commits, primaryTip?.id);
   const nodeById = new Map(commits.map((commit, index) => [commit.id, model[index]]));
-  const headEntry = g.headDetached ? commits.find(c => c.id === g.headOid) : currentBranch ? commits.find(commit => (commit.refs || []).includes(currentBranch)) : null;
+  const headEntry = g.headDetached ? commits.find(c => c.id === g.headOid) : currentBranch ? commits.find(commit => hasRefNamed(commit, currentBranch)) : null;
   if (headEntry) { nodeById.get(headEntry.id).isHead = true; }
   const maxLanes = Math.max(1, ...model.map(n => Math.max(n.before.length, n.after.length)));
   const lanesWidth = maxLanes * LANE_WIDTH;
+  jsPerfLog(`renderGraph model build (${commits.length} commits)`, performance.now() - modelStarted);
 
   const pickerOptions = [
     ...(g.headDetached ? [{ value: 'detached', label: `Detached HEAD (${(g.headOid || '').slice(0, 8)})` }] : []),
@@ -2219,13 +2339,23 @@ function renderGraph() {
   ];
   const selectedPickerValue = primaryKind === 'detached' ? 'detached' : `${primaryKind}:${primaryName}`;
 
-  refs.laneLegend.style.setProperty('--lanes-width', `${lanesWidth}px`);
+  // Path/name stays visible here regardless of which repository is active —
+  // the persistent global topbar (#repoPath) always shows the *parent*
+  // project's own path, even while a submodule's Branch Map is open, so it
+  // alone can't answer "which repository am I actually looking at right
+  // now" (point 4 of the rework).
+  const refFilter = activeGraphRefFilter();
+  const filterOptions = [['all', 'All'], ['branches', 'Branches'], ['releases', 'Releases']];
+  refs.graphView.style.setProperty('--lanes-width', `${lanesWidth}px`);
   refs.laneLegend.innerHTML = `<span class="time-direction"><b>NEWEST</b><i>↓</i><b>OLDEST</b></span>
+    <span class="graph-path-badge" data-tooltip="${esc(g.path || '')}">${esc(g.path || '')}</span>
     ${g.headDetached ? `<span class="head-banner">HEAD <i>→</i> <b>Detached at ${esc((g.headOid || '').slice(0, 8))}</b></span>` : currentBranch ? `<span class="head-banner">HEAD <i>→</i> <b>${esc(currentBranch)}</b></span>` : ''}
     ${query ? `<span class="search-match-count">${matchCount} match${matchCount === 1 ? '' : 'es'} — rest shown as context</span>` : ''}
+    <div class="ref-filter-group" role="group" aria-label="Filter by ref kind">${filterOptions.map(([value, label]) => `<button type="button" class="ref-filter-btn ${refFilter === value ? 'active' : ''}" data-ref-filter="${value}">${label}</button>`).join('')}</div>
     ${pickerOptions.length > 1 ? `<label class="primary-branch-picker"><span>Primary</span><select id="graphPrimaryBranch">${pickerOptions.map(opt => `<option value="${esc(opt.value)}" ${opt.value === selectedPickerValue ? 'selected' : ''}>${esc(opt.label)}</option>`).join('')}</select></label>` : ''}
     <span class="lane-header"><span>GRAPH</span><span>COMMIT</span></span>`;
   $('#graphPrimaryBranch')?.addEventListener('change', event => { setActiveGraphPrimaryBranch(event.target.value); renderGraph(); });
+  refs.laneLegend.querySelectorAll('[data-ref-filter]').forEach(button => button.addEventListener('click', () => { setActiveGraphRefFilter(button.dataset.refFilter); renderGraph(); }));
 
   // Stash entries are informational pointers, not real DAG commits. Rendering
   // them as their own row used to insert a break in the middle of the vertical
@@ -2277,65 +2407,40 @@ function renderGraph() {
     if (targetRow != null) branchPointRows.add(targetRow);
   }));
 
-  const rows = commits.map((commit, index) => {
-    const node = model[index]; const color = palette[node.lane % palette.length];
-    const stashPills = (stashesByBase.get(commit.id) || []).map(stash => `<b class="stash-pill" data-toggle-stash="${stash.index}" data-tooltip="stash@{${stash.index}} — click for details">⇕ stash</b>`).join('');
-    const stashDetails = (stashesByBase.get(commit.id) || []).map(stash => `<div class="stash-internals" data-stash-detail="${stash.index}" hidden>
-      <div>stash@{${stash.index}}: ${esc(stash.message.replace(/^WIP on [^:]+:\s*[0-9a-f]+\s*/, 'WIP on ') || 'Saved work')} — bundles working-tree changes, staged index${stash.message.includes('untracked') ? ', untracked files' : ''}</div>
-      <div class="stash-file-list" data-stash-file-list="${stash.index}"></div>
-    </div>`).join('');
-    const ahead = aheadAnnotations.get(index);
-    const isBranchPoint = branchPointRows.has(index);
-    // A query highlights matches instead of removing anything from the
-    // graph — a non-matching commit stays exactly where it is, still fully
-    // connected, as the real context for whichever matches surround it.
-    const isMatch = query && matchesQuery(commit);
-    const isDimmed = query && !isMatch;
-
-    return `<article class="commit-row ${node.isHead ? 'is-head' : ''} ${isBranchPoint ? 'is-branch-point' : ''} ${isMatch ? 'is-search-match' : ''} ${isDimmed ? 'is-search-dimmed' : ''}" data-id="${esc(commit.id)}" data-lane="${node.lane}">
-      <div class="graph-cell" style="width:${lanesWidth}px"></div>
-      <div class="commit-body">
-        <div class="commit-card"><div class="commit-main">${isBranchPoint ? '<b class="branch-point-pill" data-tooltip="Common ancestor — where the newer branch above split off">⑂</b>' : ''}<span class="commit-title">${commitSubjectHtml(commit.subject)}</span>${refsBadges(node.refs, color, node.isHead)}${stashPills}</div><span class="commit-id">${esc(commit.id.slice(0, 8))}</span>
-        <span class="topology-badges">${commit.parents?.length > 1 ? `<b class="merge-badge">MERGE</b>` : ''}</span><span class="commit-author">${esc(commit.author)}</span></div>
-        ${ahead ? `<div class="ahead-annotation">${esc(ahead)}</div>` : ''}${stashDetails}
-      </div>
-    </article>`;
-  }).join('') || '<div class="empty-change">No commits in this history</div>';
+  // The full per-row context, bundled so appendOlderGraphRows (below) can
+  // recompute the exact same inputs for just the newly-arrived rows,
+  // without a second, drifting copy of the actual row markup — both paths
+  // call buildCommitRowHtml for the real template.
+  lastGraphRenderContext = { model, lanesWidth, stashesByBase, aheadAnnotations, branchPointRows, query, matchesQuery, currentBranch, refFilter };
+  const rowsStarted = performance.now();
+  const rows = commits.map((commit, index) => buildCommitRowHtml(commit, index, lastGraphRenderContext)).join('') || '<div class="empty-change">No commits in this history</div>';
 
   // Real, backend-confirmed truncation (never "exactly 500 came back") —
   // never presented as if this were the whole history. Search filtering the
   // *visible* rows doesn't change this: the underlying loaded set is still
   // truncated at the same point regardless of what's currently matched.
-  const truncationStub = g.commitsTruncated ? `<div class="history-truncated-stub"><span>⋯ continues in older history</span><button id="loadOlderCommits" ${loadingOlderCommits ? 'disabled' : ''}>${loadingOlderCommits ? '<i class="spinner"></i> Loading…' : 'Load older'}</button></div>` : '';
+  const truncationStub = graphTruncationStubHtml(g.commitsTruncated);
 
-  refs.graph.innerHTML = `<svg class="graph-overlay"></svg>` + rows + truncationStub;
+  const domStarted = performance.now();
+  jsPerfLog(`renderGraph rows build (${commits.length} rows)`, domStarted - rowsStarted);
+  refs.graph.innerHTML = `<svg class="graph-overlay"></svg>` + rows + truncationStub + GRAPH_LEGEND_HTML;
+  jsPerfLog(`renderGraph DOM render (${commits.length} rows)`, performance.now() - domStarted);
+  wireGraphRowInteractions(refs.graph.querySelectorAll('.commit-row[data-id]'));
   $('#loadOlderCommits')?.addEventListener('click', loadOlderGraphCommits);
-  refs.graph.querySelectorAll('.commit-row[data-id]').forEach(row => row.addEventListener('click', () => selectCommit(row.dataset.id)));
-  refs.graph.querySelectorAll('[data-toggle-stash]').forEach(pill => pill.addEventListener('click', event => {
-    event.stopPropagation();
-    const index = pill.dataset.toggleStash;
-    const detail = pill.closest('.commit-card').parentElement.querySelector(`[data-stash-detail="${index}"]`);
-    if (!detail) return;
-    detail.toggleAttribute('hidden');
-    const fileList = detail.querySelector(`[data-stash-file-list="${index}"]`);
-    // Load the file list lazily, only the first time this stash is expanded
-    // — "what's actually in there?" answered without needing to pop it first.
-    if (!detail.hidden && fileList && !fileList.dataset.loaded) {
-      fileList.dataset.loaded = '1';
-      fileList.innerHTML = '<i class="spinner"></i>';
-      if (!invoke) { fileList.innerHTML = '<div class="stash-file">preview.txt</div>'; return; }
-      invoke('stash_entry_files', { repositoryPath: activeGraphData().path, stashIndex: Number(index) })
-        .then(files => { fileList.innerHTML = files.length ? files.map(file => `<div class="stash-file">${esc(file)}</div>`).join('') : '<div class="stash-file">(no files — this stash is empty)</div>'; })
-        .catch(error => { fileList.innerHTML = `<div class="stash-file">${esc(String(error))}</div>`; });
-    }
-    // The stash toggle above changes this row's height without a full
-    // renderGraph — the SVG lines/dots were positioned from row.offsetTop
-    // measurements taken before that change, so they'd drift out of
-    // alignment with every row below it otherwise.
-    scheduleGraphOverlayRedraw();
-  }));
   lastGraphModel = model; lastGraphLanesWidth = lanesWidth;
-  if (commits.length) drawGraphOverlay(model, lanesWidth);
+  // Deferred to requestAnimationFrame: the overlay reads each row's real
+  // offsetTop, which only reflects this render's *own* new rows once the
+  // browser has actually laid them out — measuring synchronously, right
+  // after the innerHTML assignment above, risks reading stale positions
+  // from before layout on some engines. rAF also keeps this off the
+  // critical path of the render itself, so the rows painting doesn't wait
+  // on the overlay's own DOM reads.
+  if (commits.length) requestAnimationFrame(() => {
+    if (lastGraphModel !== model) return; // superseded by a newer render before this frame ran
+    const overlayStarted = performance.now();
+    drawGraphOverlay(model, lanesWidth);
+    jsPerfLog(`renderGraph SVG overlay (${commits.length} commits)`, performance.now() - overlayStarted);
+  });
 }
 
 // Redraws the SVG overlay against whatever the DOM's *current* row layout
@@ -2347,11 +2452,93 @@ function renderGraph() {
 let graphOverlayRedrawTimer = null;
 let lastGraphModel = null;
 let lastGraphLanesWidth = 0;
+let lastGraphRenderContext = null;
 function scheduleGraphOverlayRedraw() {
   clearTimeout(graphOverlayRedrawTimer);
   graphOverlayRedrawTimer = setTimeout(() => {
     if (state.view === 'graph' && lastGraphModel && lastGraphModel.length) drawGraphOverlay(lastGraphModel, lastGraphLanesWidth);
   }, 80);
+}
+
+// Point 6 of the rework: append only the new page's own rows — the rows
+// already on screen are left completely untouched, since buildGraphModel
+// never looks ahead (a row's lane/before/after is only ever a function of
+// the rows *above* it, so appending more below can never retroactively
+// change one that's already rendered). Falls back to a full renderGraph
+// whenever that isn't obviously true or safe: no previous render context
+// to build on, a search query active (dimming/highlighting could touch
+// old rows too), or a ref filter other than "all" active (same reason).
+function appendOlderGraphRows(previousCommitCount) {
+  const g = activeGraphData();
+  const commits = g.commits || [];
+  const query = refs.search.value.trim().toLowerCase();
+  const refFilter = activeGraphRefFilter();
+  if (commits.length <= previousCommitCount || !lastGraphRenderContext || query || refFilter !== 'all') { renderGraph(); return; }
+
+  const modelStarted = performance.now();
+  const currentBranch = g.currentBranch;
+  const hasRefNamed = (commit, name) => (commit.refs || []).some(r => (r.kind === 'local_branch' || r.kind === 'remote_branch') && r.name === name);
+  const { kind: primaryKind, name: primaryName } = resolvePrimarySelection(g);
+  const primaryTip = primaryKind === 'detached' ? commits.find(c => c.id === g.headOid) : primaryName ? commits.find(c => hasRefNamed(c, primaryName)) : null;
+  const model = buildGraphModel(commits, primaryTip?.id);
+  const nodeById = new Map(commits.map((commit, index) => [commit.id, model[index]]));
+  const headEntry = g.headDetached ? commits.find(c => c.id === g.headOid) : currentBranch ? commits.find(commit => hasRefNamed(commit, currentBranch)) : null;
+  if (headEntry) { nodeById.get(headEntry.id).isHead = true; }
+  const maxLanes = Math.max(1, ...model.map(n => Math.max(n.before.length, n.after.length)));
+  const lanesWidth = maxLanes * LANE_WIDTH;
+
+  const divergence = primaryKind === 'branch' && primaryName ? ensureBranchDivergence(g.path, primaryName) : null;
+  const aheadAnnotations = new Map();
+  const branchPointRows = new Set();
+  if (divergence) {
+    const rowByCommitId = new Map(commits.map((c, i) => [c.id, i]));
+    for (const entry of divergence) {
+      if (entry.name === primaryName) continue;
+      const tipRow = rowByCommitId.get(entry.tip);
+      if (tipRow != null && entry.ahead > 0) aheadAnnotations.set(tipRow, `↳ ${entry.ahead} commit${entry.ahead === 1 ? '' : 's'} ahead of ${primaryName}`);
+      if (entry.merge_base) { const baseRow = rowByCommitId.get(entry.merge_base); if (baseRow != null) branchPointRows.add(baseRow); }
+    }
+  }
+  const commitIdToRow = new Map(commits.map((c, i) => [c.id, i]));
+  model.forEach(node => node.parents.forEach(parent => {
+    if (parent.targetLane === node.lane) return;
+    const targetRow = commitIdToRow.get(parent.commitId);
+    if (targetRow != null) branchPointRows.add(targetRow);
+  }));
+
+  // Stashes are untouched by loading more history — the previous render's
+  // own base-commit map is still exactly correct, including for a stash
+  // based on a commit that only just became loaded.
+  // Older history can easily introduce more simultaneous lanes than the
+  // page already on screen ever needed — the header's own column width
+  // (set once per full renderGraph) must be kept in sync here too, or the
+  // "GRAPH | COMMIT" labels stop lining up with the wider rows below them.
+  refs.graphView.style.setProperty('--lanes-width', `${lanesWidth}px`);
+  const ctx = { model, lanesWidth, stashesByBase: lastGraphRenderContext.stashesByBase, aheadAnnotations, branchPointRows, query: '', matchesQuery: () => false, currentBranch, refFilter };
+  jsPerfLog(`appendOlderGraphRows model build (${commits.length} commits)`, performance.now() - modelStarted);
+
+  const domStarted = performance.now();
+  const rowsBefore = refs.graph.querySelectorAll('.commit-row[data-id]').length;
+  const newRowsHtml = commits.slice(previousCommitCount).map((commit, i) => buildCommitRowHtml(commit, previousCommitCount + i, ctx)).join('');
+  refs.graph.querySelector('.history-truncated-stub')?.remove();
+  // The legend (GRAPH_LEGEND_HTML) is always the very last child — new rows
+  // and the fresh stub go right before it, never after, or the legend
+  // would end up stranded in the middle of the history instead of at the
+  // base of it.
+  const legend = refs.graph.querySelector('.graph-legend');
+  const newTailHtml = newRowsHtml + graphTruncationStubHtml(g.commitsTruncated);
+  if (legend) legend.insertAdjacentHTML('beforebegin', newTailHtml); else refs.graph.insertAdjacentHTML('beforeend', newTailHtml);
+  jsPerfLog(`appendOlderGraphRows DOM append (${commits.length - previousCommitCount} new rows)`, performance.now() - domStarted);
+  $('#loadOlderCommits')?.addEventListener('click', loadOlderGraphCommits);
+  wireGraphRowInteractions(Array.prototype.slice.call(refs.graph.querySelectorAll('.commit-row[data-id]'), rowsBefore));
+
+  lastGraphModel = model; lastGraphLanesWidth = lanesWidth; lastGraphRenderContext = ctx;
+  requestAnimationFrame(() => {
+    if (lastGraphModel !== model) return; // superseded by a newer render before this frame ran
+    const overlayStarted = performance.now();
+    drawGraphOverlay(model, lanesWidth);
+    jsPerfLog(`appendOlderGraphRows SVG overlay (${commits.length} commits)`, performance.now() - overlayStarted);
+  });
 }
 
 function drawGraphOverlay(model, lanesWidth) {
@@ -2408,9 +2595,35 @@ function selectCommit(id) {
   state.selectedCommit = activeGraphData().commits.find(commit => commit.id === id);
   refs.graph.querySelectorAll('.commit-row').forEach(row => row.classList.toggle('selected', row.dataset.id === id));
   const c = state.selectedCommit;
+  // .refs is Vec<{name, kind}> now — shown here as "name (kind)" pairs,
+  // kind spelled out in plain words rather than the raw wire value.
+  const kindLabel = { local_branch: 'local branch', remote_branch: 'remote branch', tag: 'tag' };
+  const refsSummary = (c.refs || []).map(r => `${r.name} (${kindLabel[r.kind] || r.kind})`).join(', ') || '—';
   refs.details.innerHTML = `<div class="commit-details"><div class="large-node"></div><h2>${commitSubjectHtml(c.subject)}</h2><div class="hash"><a href="#" class="commit-server-link" data-commit-id="${esc(c.id)}" title="Open this commit on the server">${esc(c.id)} ↗</a></div>
     <div class="detail-grid"><span>Author</span><strong>${esc(c.author)}</strong><span>Date</span><strong>${esc(c.date)}</strong>
-    <span>Parents</span><strong>${esc(c.parents?.join(', ') || 'First commit')}</strong><span>Refs</span><strong>${esc(c.refs?.join(', ') || '—')}</strong></div></div>`;
+    <span>Parents</span><strong>${esc(c.parents?.join(', ') || 'First commit')}</strong><span>Refs</span><strong>${esc(refsSummary)}</strong></div></div>`;
+}
+
+// Point 3's last bullet: clicking a tag badge shows *that tag's* own
+// detail — full name, the commit it resolves to, and whether it's
+// lightweight or annotated — instead of (or as well as) selecting the
+// commit row it sits on. A separate, on-demand backend call (tag_details)
+// rather than something carried in every commit's own bulk payload; see
+// that command's own doc comment in repository.rs.
+async function showTagDetails(tagName) {
+  const repositoryPath = activeGraphData().path;
+  refs.details.innerHTML = `<div class="commit-details"><div class="large-node"></div><h2>${esc(tagName)}</h2><p><i class="spinner"></i> Loading tag details…</p></div>`;
+  if (!invoke) { refs.details.innerHTML = `<div class="commit-details"><div class="large-node"></div><h2>${esc(tagName)}</h2><div class="detail-grid"><span>Kind</span><strong>Annotated</strong><span>Commit</span><strong>preview-only</strong></div></div>`; return; }
+  try {
+    const tag = await invoke('tag_details', { repositoryPath, tagName });
+    if (activeGraphData().path !== repositoryPath) return; // left this repository/submodule while the call was in flight
+    refs.details.innerHTML = `<div class="commit-details"><div class="large-node"></div><h2>${esc(tag.name)}</h2><div class="hash"><a href="#" class="commit-server-link" data-commit-id="${esc(tag.commit_id)}" title="Open this commit on the server">${esc(tag.commit_id)} ↗</a></div>
+      <div class="detail-grid"><span>Kind</span><strong>${tag.annotated ? 'Annotated tag' : 'Lightweight tag'}</strong>${tag.tagger ? `<span>Tagged by</span><strong>${esc(tag.tagger)}</strong>` : ''}${tag.date ? `<span>Date</span><strong>${esc(tag.date)}</strong>` : ''}</div>
+      ${tag.message ? `<p class="tag-message">${esc(tag.message)}</p>` : ''}</div>`;
+    refs.graph.querySelectorAll('.commit-row').forEach(row => row.classList.toggle('selected', row.dataset.id === tag.commit_id));
+  } catch (error) {
+    refs.details.innerHTML = `<div class="commit-details"><div class="large-node"></div><h2>${esc(tagName)}</h2><p>${esc(String(error))}</p></div>`;
+  }
 }
 
 // The small always-visible sidebar badge/subtitle, split out from the full
@@ -3123,8 +3336,8 @@ refs.commitButton.addEventListener('click', async () => {
 //  - "Commands" is a context-aware palette over the app's own already-tested
 //    actions (no shell access) — suggestions depend on where you are (a
 //    submodule selected, a folder open…), each with a short explanation.
-//  - "Git Console" is a real, persistent terminal-style transcript: every git
-//    command you run (and its actual stdout/stderr) stays visible as a scrolling
+//  - "Terminal" is a persistent shell transcript: every command you run (and
+//    its actual stdout/stderr) stays visible as a scrolling
 //    log, with ↑↓ command history, and an explicit, always-visible, cyclable
 //    scope pill so "runs on the current location" is never a guess.
 function currentConsoleContext() {
@@ -3204,7 +3417,7 @@ function scoreCommand(cmd, query, tags) {
 // A small, plain-language git reference — not exhaustive, but covers what
 // someone unfamiliar with git actually reaches for. Powers both the "run as
 // git command" suggestion and the live "what comes next" flag hints while
-// typing in the Git Console.
+// typing a Git command in the Terminal.
 const GIT_COMMAND_HELP = {
   status: { description: 'Shows what changed in your working folder — modified, staged, untracked files.', flags: [
     { flag: '-s', desc: 'Short format — one compact line per file' },
@@ -3327,16 +3540,26 @@ function renderCommandList(query) {
   </div>`).join('') || (gitHint ? '' : '<div class="command-item" style="text-align:center;color:#6b7f96;">No matching commands</div>'));
 }
 
-// ---- Git Console — persistent terminal-style transcript -------------------
-// Real freedom to run any git command, deliberately kept separate from the
-// app's own tested actions above (which never touch a shell) so the two are
-// never confused with each other.
+// ---- Terminal — persistent shell transcript -------------------------------
+// Deliberately separate from the app's own tested actions above: this is the
+// explicit escape hatch for real shell commands. A known bare Git subcommand
+// ("status") is normalized to "git status" for compatibility with the older
+// Git Console, while an already-complete or non-Git command is left untouched.
 const RAW_GIT_PREFIX = '$';
 function isRawGitQuery(query) { return query.trimStart().startsWith(RAW_GIT_PREFIX); }
 function rawGitArgs(query) { return query.trimStart().slice(1).trim(); }
-const DESTRUCTIVE_GIT_PATTERN = /(^|\s)(reset\s+--hard|clean\s+-[a-z]*f|push\s+.*(--force|-f\b)|branch\s+-D|checkout\s+.*-f\b|rebase|filter-branch|gc\s+--prune|update-ref\s+-d)/i;
+const DESTRUCTIVE_TERMINAL_PATTERN = /(^|[\s;&|])(?:git\s+)?(?:reset\s+--hard|clean\s+-[a-z]*f|push\s+.*(?:--force|-f\b)|branch\s+-D|checkout\s+.*-f\b|rebase|filter-branch|gc\s+--prune|update-ref\s+-d)|(^|[\s;&|])(?:rm\s+-[a-z]*r[a-z]*f|rm\s+-[a-z]*f[a-z]*r|del(?:ete)?\s|rmdir\s|remove-item\s|format\s|diskpart\b)/i;
+function normalizeTerminalCommand(input) {
+  const text = input.trim();
+  const first = text.split(/\s+/, 1)[0]?.toLowerCase();
+  return first && first !== 'git' && KNOWN_GIT_SUBCOMMANDS.includes(first) ? `git ${text}` : text;
+}
+function looksDestructiveTerminalCommand(command) {
+  // Redirection writes to disk even when the program itself sounds read-only.
+  return DESTRUCTIVE_TERMINAL_PATTERN.test(command) || />/.test(command);
+}
 
-// Every place a git command could plausibly run right now — always at least
+// Every working directory a terminal command could plausibly use right now — always at least
 // "repository root"; "current folder" and "selected submodule" are added only
 // when they actually apply. Explicit and cyclable (⇄ scope button) instead of
 // a silent guess, so "does this run where I think it runs" is never in doubt.
@@ -3364,12 +3587,14 @@ function cycleConsoleScope() {
   state.consoleScopeOverride = scopes[(idx + 1) % scopes.length].key;
   updateConsoleScopeLabel();
 }
-function updateConsoleScopeLabel() { $('#commandScope').textContent = state.repository ? `📍 ${consoleGitTarget().label}` : ''; }
+function updateConsoleScopeLabel() {
+  const scope = consoleGitTarget();
+  $('#commandScope').textContent = state.repository ? `📍 ${scope.label}` : '';
+  $('#commandScope').title = state.repository ? scope.path : '';
+}
 
-// Lightly colorizes raw git output so the shape of the answer is clear at a
-// glance — added/removed diff lines, status sections, commit hashes — the
-// same way a real terminal with git's own color output would look, without
-// needing to parse or understand the command itself.
+// Lightly colorizes familiar Git output while leaving arbitrary command
+// output untouched apart from HTML escaping.
 function colorizeGitOutput(text) {
   return text.split('\n').map(line => {
     const escaped = esc(line);
@@ -3389,48 +3614,86 @@ function colorizeGitOutput(text) {
 
 function renderConsoleTranscript() {
   const list = $('#commandList'); list.classList.add('console-transcript');
-  list.innerHTML = state.consoleTranscript.map(entry => {
+  list.innerHTML = state.consoleTranscript.map((entry, index) => {
     const elapsed = entry.status === 'RUNNING' ? ((performance.now() - entry.startedAt) / 1000).toFixed(1) : (entry.elapsedMs / 1000).toFixed(1);
     const badge = { RUNNING: '<i class="spinner"></i> RUNNING', SUCCESS: 'SUCCESS', FAILED: 'FAILED', TIMED_OUT: 'TIMED OUT' }[entry.status];
     const badgeClass = { RUNNING: 'running', SUCCESS: 'ok', FAILED: 'fail', TIMED_OUT: 'fail' }[entry.status];
     const result = entry.result;
     const exitCodeLabel = result && result.exit_code != null ? ` · exit ${result.exit_code}` : '';
     return `<div class="raw-git-output">
-    <div class="raw-git-cmd">$ git ${esc(entry.args)} <span class="raw-git-cwd">(in ${esc(entry.targetLabel)})</span> <b class="raw-git-status ${badgeClass}">${badge}</b><span class="raw-git-elapsed">${elapsed}s${exitCodeLabel}</span></div>
+    <div class="raw-git-cmd"><span class="raw-git-command-text">$ ${esc(entry.command)} <span class="raw-git-cwd">(in ${esc(entry.targetLabel)})</span></span> <b class="raw-git-status ${badgeClass}">${badge}</b><span class="raw-git-elapsed">${elapsed}s${exitCodeLabel}</span><span class="raw-git-actions"><button type="button" class="raw-git-action" data-console-reuse="${index}" title="Put this command back in the input so it can be edited">Use again</button><button type="button" class="raw-git-action" data-console-copy="${index}" title="Copy this command and its output">Copy</button></span></div>
     ${result?.stdout ? `<pre class="raw-git-stdout">${colorizeGitOutput(result.stdout)}</pre>` : ''}
     ${result?.stderr ? `<pre class="raw-git-stderr">${colorizeGitOutput(result.stderr)}</pre>` : ''}
     ${entry.status === 'SUCCESS' && !result?.stdout && !result?.stderr ? '<div class="raw-git-empty">Completed successfully — no output</div>' : ''}
   </div>`;
-  }).join('') || '<div class="console-empty">Type a git command below and press Enter — e.g. "status", "log --oneline -10", "diff HEAD~1".</div>';
+  }).join('') || '<div class="console-empty">Run a command in the selected scope — e.g. "git status", "git remote -v", "pwd", "ls" (macOS) or "dir" (Windows).</div>';
   $('#commandClearTranscript').hidden = state.consoleTranscript.length === 0;
+  $('#commandCopyTranscript').hidden = state.consoleTranscript.length === 0;
   list.scrollTop = list.scrollHeight;
 }
 
+function consoleEntryAsText(entry) {
+  const result = entry.result;
+  const lines = [`$ ${entry.command}`, `# working directory: ${entry.targetLabel}`, `# ${entry.status}${result?.exit_code != null ? ` (exit ${result.exit_code})` : ''}`];
+  if (result?.stdout) lines.push(result.stdout.trimEnd());
+  if (result?.stderr) lines.push(result.stderr.trimEnd());
+  return lines.join('\n');
+}
+
+async function copyText(text, successMessage) {
+  try {
+    if (navigator.clipboard?.writeText) await navigator.clipboard.writeText(text);
+    else {
+      const textarea = document.createElement('textarea'); textarea.value = text; textarea.style.position = 'fixed'; textarea.style.opacity = '0';
+      document.body.appendChild(textarea); textarea.select(); document.execCommand('copy'); textarea.remove();
+    }
+    status(successMessage);
+  } catch (error) { status(`Could not copy: ${String(error)}`, 'error'); }
+}
+
+function setCommandInputValue(value) {
+  const input = $('#commandInput'); input.value = value;
+  state.consoleDrafts[state.consoleMode] = value;
+  input.setSelectionRange(value.length, value.length);
+}
+
 let consoleHistoryPointer = -1;
+let consoleHistoryDraft = '';
 function recallConsoleHistory(direction) {
   const history = state.consoleCmdHistory; if (!history.length) return;
-  if (consoleHistoryPointer === -1) consoleHistoryPointer = history.length;
-  consoleHistoryPointer = Math.max(0, Math.min(history.length - 1, consoleHistoryPointer + direction));
-  const input = $('#commandInput'); input.value = history[consoleHistoryPointer]; input.setSelectionRange(input.value.length, input.value.length);
+  const input = $('#commandInput');
+  if (consoleHistoryPointer === -1) {
+    if (direction > 0) return;
+    consoleHistoryDraft = input.value;
+    consoleHistoryPointer = history.length;
+  }
+  const next = Math.max(0, Math.min(history.length, consoleHistoryPointer + direction));
+  if (next === history.length) { consoleHistoryPointer = -1; setCommandInputValue(consoleHistoryDraft); }
+  else { consoleHistoryPointer = next; setCommandInputValue(history[next]); }
 }
 
 let consoleRunningTicker = null;
 
-async function runRawGitFromConsole(args) {
-  if (!args) return;
+async function runTerminalFromConsole(input) {
+  if (!input) return;
   setConsoleMode('console');
-  if (!state.repository) { state.consoleTranscript.push({ args, targetLabel: '—', status: 'FAILED', elapsedMs: 0, result: { success: false, stdout: '', stderr: 'Open a repository first.' } }); renderConsoleTranscript(); return; }
+  const command = normalizeTerminalCommand(input);
+  setCommandInputValue('');
+  if (/^(clear|cls)$/i.test(command)) { state.consoleTranscript = []; renderConsoleTranscript(); return; }
+  if (!state.repository) { state.consoleTranscript.push({ command, targetLabel: '—', status: 'FAILED', elapsedMs: 0, result: { success: false, stdout: '', stderr: 'Open a repository first.' } }); renderConsoleTranscript(); return; }
   // Repeated Enter while one is already running is a no-op, not a queued-up
   // second command — only one Git command is ever active at a time, and the
   // centralized invoke wrapper enforces this the same way for every other
   // mutation too, not just another console command.
-  if (state.consoleCommandRunning) { status('A Git command is already running — wait for it to finish.', 'error'); return; }
-  if (DESTRUCTIVE_GIT_PATTERN.test(args)) {
+  if (state.consoleCommandRunning) { status('A Terminal command is already running — wait for it to finish.', 'error'); return; }
+  if (looksDestructiveTerminalCommand(command)) {
     const target = consoleGitTarget();
-    const ok = await customConfirm(`This looks like a destructive command: "git ${args}" in ${target.label}. It can permanently discard commits, branches or uncommitted work. Continue?`, { title: 'Destructive git command', danger: true, okLabel: 'Run it anyway' });
+    const ok = await customConfirm(`This command may overwrite or delete data: "${command}" in ${target.label}. Continue?`, { title: 'Potentially destructive command', danger: true, okLabel: 'Run it anyway' });
     if (!ok) return;
   }
-  state.consoleCmdHistory.push(args); consoleHistoryPointer = -1;
+  if (state.consoleCmdHistory[state.consoleCmdHistory.length - 1] !== command) state.consoleCmdHistory.push(command);
+  if (state.consoleCmdHistory.length > 100) state.consoleCmdHistory.splice(0, state.consoleCmdHistory.length - 100);
+  consoleHistoryPointer = -1; consoleHistoryDraft = '';
   // Captured now, before anything async — a delayed result must act on the
   // repository/scope this command actually ran against, never on whatever
   // happens to be open by the time it resolves (though the invoke wrapper
@@ -3438,15 +3701,15 @@ async function runRawGitFromConsole(args) {
   // true, so this is belt-and-suspenders, not the only thing preventing it).
   const target = consoleGitTarget();
   const capturedRepositoryPath = state.repository.path;
-  if (!invoke) { state.consoleTranscript.push({ args, targetLabel: target.label, status: 'SUCCESS', elapsedMs: 0, result: { success: true, stdout: '(preview mode — not actually run)', stderr: '' } }); renderConsoleTranscript(); return; }
+  if (!invoke) { state.consoleTranscript.push({ command, targetLabel: target.label, status: 'SUCCESS', elapsedMs: 0, result: { success: true, stdout: '(preview mode — not actually run)', stderr: '' } }); renderConsoleTranscript(); return; }
 
-  const entry = { args, targetLabel: target.label, status: 'RUNNING', startedAt: performance.now(), elapsedMs: 0, result: null };
+  const entry = { command, targetLabel: target.label, status: 'RUNNING', startedAt: performance.now(), elapsedMs: 0, result: null };
   state.consoleTranscript.push(entry);
   renderConsoleTranscript();
   state.consoleCommandRunning = true;
   consoleRunningTicker = setInterval(renderConsoleTranscript, 200);
   try {
-    const result = await invoke('run_git_command', { repositoryPath: target.path, args });
+    const result = await invoke('run_terminal_command', { repositoryPath: target.path, commandText: command });
     entry.status = result.success ? 'SUCCESS' : 'FAILED';
     entry.result = result;
     entry.elapsedMs = performance.now() - entry.startedAt;
@@ -3458,7 +3721,11 @@ async function runRawGitFromConsole(args) {
     // reload — anything else, including a command this app has never heard
     // of, is treated conservatively as possibly mutating.
     if (!result.read_only && state.repository?.path === capturedRepositoryPath) {
-      directoryCache.clear(); await loadRepository(capturedRepositoryPath, { keepPath: true });
+      // Force bypasses status caches because an arbitrary shell command can
+      // change files or Git metadata without going through any app command's
+      // normal invalidation path (especially when the selected scope is a
+      // submodule but the parent repository must also notice its new state).
+      directoryCache.clear(); await loadRepository(capturedRepositoryPath, { keepPath: true, force: true });
     }
   } catch (error) {
     const message = String(error);
@@ -3471,7 +3738,7 @@ async function runRawGitFromConsole(args) {
   }
 }
 
-// Live "what comes next" helper while typing in the Git Console — shows the
+// Live "what comes next" helper while typing a Git command in the Terminal — shows the
 // recognized subcommand's plain-language description plus its common flags
 // (click to append), or, while still typing the subcommand itself, matching
 // subcommand names to autocomplete. Aimed squarely at someone who doesn't
@@ -3505,27 +3772,31 @@ function renderGitHints() {
   if (state.consoleMode !== 'console') { box.hidden = true; return; }
   const raw = $('#commandInput').value;
   const words = raw.split(/\s+/).filter(Boolean);
-  const sub = words[0]?.toLowerCase();
+  const hasGitPrefix = words[0]?.toLowerCase() === 'git';
+  const sub = words[hasGitPrefix ? 1 : 0]?.toLowerCase();
   if (!sub) { box.hidden = true; return; }
   const entry = GIT_COMMAND_HELP[sub];
   if (!entry) {
-    const matches = words.length === 1 ? Object.keys(GIT_COMMAND_HELP).filter(name => name.startsWith(sub)) : [];
+    // Arbitrary shell commands should not receive irrelevant Git typo hints.
+    // Only a literal `git ...` or a prefix of a known bare Git subcommand
+    // participates in the Git helper.
+    const matches = words.length === (hasGitPrefix ? 2 : 1) ? Object.keys(GIT_COMMAND_HELP).filter(name => name.startsWith(sub)) : [];
     if (matches.length) {
       box.hidden = false;
-      box.innerHTML = `<div class="hint-subcommands">${matches.map(name => `<button type="button" class="hint-sub" data-fill-sub="${esc(name)}">${esc(name)}</button>`).join('')}</div>`;
+      box.innerHTML = `<div class="hint-subcommands">${matches.map(name => `<button type="button" class="hint-sub" data-fill-sub="${esc(`git ${name}`)}">git ${esc(name)}</button>`).join('')}</div>`;
       return;
     }
     // Not a known subcommand, and not a prefix of one either — check for a typo.
-    const suggestion = !KNOWN_GIT_SUBCOMMANDS.includes(sub) ? closestGitSubcommand(sub) : null;
+    const suggestion = hasGitPrefix && !KNOWN_GIT_SUBCOMMANDS.includes(sub) ? closestGitSubcommand(sub) : null;
     if (suggestion) {
-      const corrected = [suggestion, ...words.slice(1)].join(' ');
+      const corrected = ['git', suggestion, ...words.slice(2)].join(' ');
       box.hidden = false;
-      box.innerHTML = `<div class="hint-typo">Did you mean <button type="button" class="hint-sub" data-fill-sub="${esc(corrected)}">git ${esc(corrected)}</button>?</div>`;
+      box.innerHTML = `<div class="hint-typo">Did you mean <button type="button" class="hint-sub" data-fill-sub="${esc(corrected)}">${esc(corrected)}</button>?</div>`;
       return;
     }
     box.hidden = true; return;
   }
-  const already = new Set(words.slice(1).map(w => w.split('=')[0]));
+  const already = new Set(words.slice(hasGitPrefix ? 2 : 1).map(w => w.split('=')[0]));
   const flags = entry.flags.filter(f => !already.has(f.flag.split(/[\s=]/)[0]));
   box.hidden = false;
   box.innerHTML = `<p class="hint-desc"><b>git ${esc(sub)}</b> — ${esc(entry.description)}</p>${flags.length ? `<div class="hint-flags">${flags.map(f => `<button type="button" class="hint-flag" data-append-flag="${esc(f.flag)}"><b>${esc(f.flag)}</b><span>${esc(f.desc)}</span></button>`).join('')}</div>` : ''}`;
@@ -3543,17 +3814,24 @@ $('#commandGitHints').addEventListener('click', (e) => {
 });
 
 function setConsoleMode(mode) {
-  state.consoleMode = mode;
-  document.querySelectorAll('.command-tab').forEach(tab => tab.classList.toggle('active', tab.dataset.mode === mode));
   const input = $('#commandInput');
+  const previousMode = state.consoleMode;
+  if (previousMode !== mode) {
+    state.consoleDrafts[previousMode] = input.value;
+    state.consoleMode = mode;
+    input.value = state.consoleDrafts[mode] || '';
+  }
+  document.querySelectorAll('.command-tab').forEach(tab => tab.classList.toggle('active', tab.dataset.mode === mode));
+  $('#terminalQuickCommands').hidden = mode !== 'console';
+  $('#commandScopeCycle').hidden = mode !== 'console';
   if (mode === 'console') {
-    input.placeholder = 'Type a git command… (no "$" needed here)'; input.value = '';
-    $('#commandHelp').textContent = '↑↓ command history · Enter to run · "⇄ scope" to change where it runs · Esc to close';
+    input.placeholder = 'Type a command… e.g. git status, pwd, gh pr status';
+    $('#commandHelp').textContent = '↑↓ history · Enter to run · ⇄ scope changes working directory · non-interactive commands only';
     updateConsoleScopeLabel(); renderConsoleTranscript(); renderGitHints();
   } else {
     input.placeholder = 'Type a command… (Cmd/Ctrl+K)';
     $('#commandHelp').textContent = '↑↓ to navigate · Enter to run · Esc to close';
-    $('#commandScope').textContent = ''; $('#commandList').classList.remove('console-transcript'); $('#commandGitHints').hidden = true; renderCommandList('');
+    $('#commandScope').textContent = ''; $('#commandScope').title = ''; $('#commandList').classList.remove('console-transcript'); $('#commandGitHints').hidden = true; $('#commandClearTranscript').hidden = true; $('#commandCopyTranscript').hidden = true; renderCommandList(input.value);
   }
 }
 
@@ -3561,19 +3839,24 @@ function openCommandPalette() {
   const input = $('#commandInput');
   commandPaletteOpen = true;
   activeCommands = buildCommands();
-  input.value = '';
   setConsoleMode('commands');
+  setCommandInputValue('');
+  renderCommandList('');
   $('#commandPalette').showModal();
   input.focus();
 }
 function filterCommands(query) {
-  if (isRawGitQuery(query)) { setConsoleMode('console'); $('#commandInput').value = rawGitArgs(query); renderGitHints(); return; }
+  if (isRawGitQuery(query)) { const terminalText = rawGitArgs(query); setConsoleMode('console'); setCommandInputValue(terminalText); renderGitHints(); return; }
   renderCommandList(query);
 }
-$('#commandInput').addEventListener('input', (e) => { if (state.consoleMode === 'console') { consoleHistoryPointer = -1; renderGitHints(); return; } filterCommands(e.target.value); });
+$('#commandInput').addEventListener('input', (e) => {
+  state.consoleDrafts[state.consoleMode] = e.target.value;
+  if (state.consoleMode === 'console') { consoleHistoryPointer = -1; consoleHistoryDraft = e.target.value; renderGitHints(); return; }
+  filterCommands(e.target.value);
+});
 $('#commandInput').addEventListener('keydown', (e) => {
   if (state.consoleMode === 'console') {
-    if (e.key === 'Enter') { e.preventDefault(); const args = $('#commandInput').value.trim(); if (args) { $('#commandInput').value = ''; renderGitHints(); runRawGitFromConsole(args); } }
+    if (e.key === 'Enter') { e.preventDefault(); const command = $('#commandInput').value.trim(); if (command) { $('#commandInput').value = ''; renderGitHints(); runTerminalFromConsole(command); } }
     else if (e.key === 'ArrowUp') { e.preventDefault(); recallConsoleHistory(-1); renderGitHints(); }
     else if (e.key === 'ArrowDown') { e.preventDefault(); recallConsoleHistory(1); renderGitHints(); }
     return;
@@ -3584,13 +3867,17 @@ $('#commandInput').addEventListener('keydown', (e) => {
   else if (e.key === 'ArrowUp') { e.preventDefault(); const prev = selected?.previousElementSibling || items[items.length - 1]; items.forEach(i => i.classList.remove('selected')); prev?.classList.add('selected'); prev?.scrollIntoView({ block: 'nearest' }); }
   else if (e.key === 'Enter') {
     e.preventDefault();
-    if (selected?.dataset.rawGitSuggest !== undefined) { runRawGitFromConsole(selected.dataset.rawGitSuggest); return; }
+    if (selected?.dataset.rawGitSuggest !== undefined) { runTerminalFromConsole(selected.dataset.rawGitSuggest); return; }
     const cmd = activeCommands.find(c => c.id === selected?.dataset.cmdId); if (cmd) { $('#commandPalette').close(); cmd.fn(); commandPaletteOpen = false; }
   }
 });
 $('#commandList').addEventListener('click', (e) => {
+  const reuse = e.target.closest('[data-console-reuse]');
+  if (reuse) { const entry = state.consoleTranscript[Number(reuse.dataset.consoleReuse)]; if (entry) { setCommandInputValue(entry.command); $('#commandInput').focus(); renderGitHints(); } return; }
+  const copy = e.target.closest('[data-console-copy]');
+  if (copy) { const entry = state.consoleTranscript[Number(copy.dataset.consoleCopy)]; if (entry) copyText(consoleEntryAsText(entry), 'Command output copied.'); return; }
   const suggest = e.target.closest('[data-raw-git-suggest]');
-  if (suggest) { runRawGitFromConsole(suggest.dataset.rawGitSuggest); return; }
+  if (suggest) { runTerminalFromConsole(suggest.dataset.rawGitSuggest); return; }
   const item = e.target.closest('.command-item');
   if (item && item.dataset.cmdId) {
     const cmd = activeCommands.find(c => c.id === item.dataset.cmdId);
@@ -3598,8 +3885,10 @@ $('#commandList').addEventListener('click', (e) => {
   }
 });
 document.querySelectorAll('.command-tab').forEach(tab => tab.addEventListener('click', () => { setConsoleMode(tab.dataset.mode); $('#commandInput').focus(); }));
+$('#terminalQuickCommands').addEventListener('click', (e) => { const quick = e.target.closest('[data-terminal-fill]'); if (quick) { setCommandInputValue(quick.dataset.terminalFill); $('#commandInput').focus(); renderGitHints(); } });
 $('#commandScopeCycle').addEventListener('click', () => { cycleConsoleScope(); if (state.consoleMode === 'console') renderConsoleTranscript(); });
 $('#commandClearTranscript').addEventListener('click', () => { state.consoleTranscript = []; renderConsoleTranscript(); });
+$('#commandCopyTranscript').addEventListener('click', () => copyText(state.consoleTranscript.map(consoleEntryAsText).join('\n\n'), 'Terminal transcript copied.'));
 $('#commandPalette').addEventListener('close', () => { commandPaletteOpen = false; });
 $('#openConsole').addEventListener('click', () => openCommandPalette());
 $('#openHelp').addEventListener('click', () => $('#helpDialog').showModal());

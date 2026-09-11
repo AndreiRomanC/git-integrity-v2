@@ -8,7 +8,7 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { reachableFrom, buildGraphModel } = require('../frontend/graph-model.js');
+const { reachableFrom, buildGraphModel, selectRefBadges } = require('../frontend/graph-model.js');
 
 // Minimal fixture builder — buildGraphModel only ever reads id/parents/refs
 // off a commit, so tests only set those, matching how sparse real fixtures
@@ -280,4 +280,73 @@ test('targetLane always points at the lane the parent genuinely occupies in "aft
       assert.equal(node.after[parent.targetLane], parent.commitId, `${node.commitId}'s edge to ${parent.commitId} must point at the lane that commit actually lands in`);
     }
   }
+});
+
+// ---- selectRefBadges -------------------------------------------------------
+
+function ref(name, kind) { return { name, kind }; }
+
+test('selectRefBadges shows nothing for a plain commit with no refs and no HEAD', () => {
+  assert.deepEqual(selectRefBadges([], {}), { badges: [], overflowTags: [], overflowBranches: [], overflowTagCount: 0, overflowBranchCount: 0 });
+});
+
+test('selectRefBadges puts HEAD first, ahead of every real ref', () => {
+  const result = selectRefBadges([ref('main', 'local_branch'), ref('v1.0', 'tag')], { isHead: true });
+  assert.equal(result.badges[0].kind, 'head');
+});
+
+test('selectRefBadges order is fixed: HEAD, tag, local branch, remote branch — regardless of input order', () => {
+  const refs = [ref('origin/main', 'remote_branch'), ref('main', 'local_branch'), ref('v2.0', 'tag')];
+  const result = selectRefBadges(refs, { isHead: true, maxBranches: 5 });
+  assert.deepEqual(result.badges.map(b => b.kind), ['head', 'tag', 'local_branch', 'remote_branch']);
+});
+
+test('selectRefBadges shows only the first tag plus a count, never a generic +N for multiple tags', () => {
+  const refs = [ref('v1.0.0', 'tag'), ref('v1.0.1-rc1', 'tag'), ref('release/2024-01', 'tag')];
+  const result = selectRefBadges(refs, {});
+  const tagBadges = result.badges.filter(b => b.kind === 'tag');
+  assert.equal(tagBadges.length, 1, 'only one tag badge is ever shown directly');
+  assert.equal(tagBadges[0].name, 'v1.0.0', 'the first tag, specifically, not an arbitrary one');
+  assert.equal(result.overflowTagCount, 2, 'the other two must still be accounted for, just not shown as individual badges');
+  assert.deepEqual(result.overflowTags.map(t => t.name), ['v1.0.1-rc1', 'release/2024-01'], 'the excluded tags must be precisely identifiable (e.g. for a tooltip), not just counted');
+});
+
+test('selectRefBadges reports zero tag overflow for a commit with exactly one tag', () => {
+  const result = selectRefBadges([ref('v1.0', 'tag')], {});
+  assert.equal(result.overflowTagCount, 0);
+});
+
+test('selectRefBadges caps branches at maxBranches and reports the real overflow count', () => {
+  const refs = [ref('a', 'local_branch'), ref('b', 'local_branch'), ref('c', 'local_branch'), ref('origin/d', 'remote_branch')];
+  const result = selectRefBadges(refs, { maxBranches: 2 });
+  const branchBadges = result.badges.filter(b => b.kind === 'local_branch' || b.kind === 'remote_branch');
+  assert.equal(branchBadges.length, 2);
+  assert.equal(result.overflowBranchCount, 2);
+});
+
+test('selectRefBadges never drops the currently checked-out branch behind the branch overflow', () => {
+  // "z" would normally be pushed past a maxBranches:2 cap by a, b, c coming
+  // first — the exact failure mode the old flat-list version had for
+  // origin/main specifically. The currently checked-out branch must always
+  // survive, regardless of where it happens to sit in the backend's own
+  // (arbitrary) ref order.
+  const refs = [ref('a', 'local_branch'), ref('b', 'local_branch'), ref('c', 'local_branch'), ref('z', 'local_branch')];
+  const result = selectRefBadges(refs, { maxBranches: 2, currentBranchName: 'z' });
+  const shownNames = result.badges.filter(b => b.kind === 'local_branch').map(b => b.name);
+  assert.ok(shownNames.includes('z'), `the current branch must always be shown, got ${JSON.stringify(shownNames)}`);
+  // z (current) plus a (next in original order) fill the two slots; b and c overflow.
+  assert.deepEqual(result.overflowBranches.map(b => b.name).sort(), ['b', 'c'], 'the true overflow set must exclude the current branch, not just be "whatever was left after slicing in original order"');
+});
+
+test('selectRefBadges keeps local-before-remote display order even when the current branch is a remote one', () => {
+  const refs = [ref('feature', 'local_branch'), ref('origin/main', 'remote_branch')];
+  const result = selectRefBadges(refs, { maxBranches: 5, currentBranchName: 'origin/main' });
+  const branchBadges = result.badges.filter(b => b.kind === 'local_branch' || b.kind === 'remote_branch');
+  assert.deepEqual(branchBadges.map(b => b.kind), ['local_branch', 'remote_branch'], 'display order is fixed by kind, independent of which one is "current"');
+});
+
+test('selectRefBadges: a local branch and its remote-tracking branch on the same commit both show, within the cap', () => {
+  const refs = [ref('main', 'local_branch'), ref('origin/main', 'remote_branch')];
+  const result = selectRefBadges(refs, { maxBranches: 2 });
+  assert.deepEqual(result.badges, [{ kind: 'local_branch', name: 'main' }, { kind: 'remote_branch', name: 'origin/main' }]);
 });

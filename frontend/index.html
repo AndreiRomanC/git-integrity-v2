@@ -174,14 +174,23 @@
     <form method="dialog">
       <div class="command-tabs">
         <button type="button" class="command-tab active" data-mode="commands">Commands</button>
-        <button type="button" class="command-tab" data-mode="console">Git Console</button>
+        <button type="button" class="command-tab" data-mode="console">Terminal</button>
         <span id="commandScope" class="command-scope"></span>
-        <button type="button" id="commandScopeCycle" class="command-scope-cycle" title="Change where git commands run">⇄ scope</button>
+        <button type="button" id="commandScopeCycle" class="command-scope-cycle" title="Change the working directory for terminal commands" hidden>⇄ scope</button>
+        <button type="button" id="commandCopyTranscript" class="command-clear" title="Copy the complete terminal transcript" hidden>Copy all</button>
         <button type="button" id="commandClearTranscript" class="command-clear" title="Clear console history" hidden>Clear</button>
       </div>
       <input id="commandInput" type="text" placeholder="Type a command… (Cmd/Ctrl+K)" autocomplete="off" spellcheck="false">
+      <div id="terminalQuickCommands" class="terminal-quick-commands" hidden>
+        <span>Quick:</span>
+        <button type="button" data-terminal-fill="git status --short --branch">Status</button>
+        <button type="button" data-terminal-fill="git branch -vv">Branches</button>
+        <button type="button" data-terminal-fill="git remote -v">Remotes</button>
+        <button type="button" data-terminal-fill="git log --oneline --decorate -10">Recent commits</button>
+        <button type="button" data-terminal-fill="gh pr status">Pull requests</button>
+      </div>
       <div id="commandGitHints" class="command-git-hints" hidden></div>
-      <div id="commandList" class="command-list"></div>
+      <div id="commandList" class="command-list" aria-live="polite"></div>
       <div class="command-help" id="commandHelp">↑↓ to navigate · Enter to run · Esc to close</div>
     </form>
   </dialog>
@@ -368,7 +377,7 @@
         <details>
           <summary>Command Console (⌘ or Ctrl/Cmd+K)</summary>
           <p><b>Commands tab</b> — a searchable list of everything this app can do. Type what you want ("commit", "merge", "push submodule"); commands relevant to what's currently selected are boosted to the top.</p>
-          <p><b>Git Console tab</b> — run any real git command (with or without typing "git" first) and see its actual output, scoped to wherever you currently are (shown at the top, changeable with "⇄ scope"). As-you-type hints show common flags in plain language, and typos get a "did you mean" suggestion. Commands that look destructive (force push, hard reset, etc.) ask for confirmation first.</p>
+          <p><b>Terminal tab</b> — run shell commands such as <code>git status</code>, <code>git remote -v</code>, <code>gh pr status</code>, <code>pwd</code>, <code>ls</code> (macOS) or <code>dir</code> (Windows), and see their real output. Commands run in the location shown at the top, changeable with “⇄ scope”. Use the Quick buttons to prepare common commands, “Use again” to edit an earlier command, and Copy/Copy all to share diagnostic output. Bare Git subcommands such as <code>status</code> still work. Potentially destructive commands ask for confirmation. Interactive prompts are disabled so a command cannot leave the application frozen waiting for invisible input.</p>
         </details>
         <details>
           <summary>Remotes</summary>

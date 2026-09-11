@@ -125,10 +125,65 @@ function buildGraphModel(commits, primaryTipId) {
   });
 }
 
+// Decides *which* ref badges a commit row actually shows and in what
+// order — pure data selection, no DOM, so the badge-ordering/limiting
+// rules (History & Branch Map rework, point 3) are checkable the same way
+// buildGraphModel's lane assignment is, instead of only by eyeballing the
+// rendered graph. refsBadges (app.js) does nothing but turn this
+// function's output into markup.
+//
+// Fixed badge order: HEAD, then the release tag(s), then branches (local
+// before remote). Only ever one tag badge is shown directly — a commit
+// with several tags shows the first plus an aggregate overflowTagCount,
+// never a generic "+N" that hides *which* tag actually matters (release
+// tags are the whole reason this project cares about tags in the first
+// place). Branches share a separate, small cap (maxBranches) with their
+// own overflowBranchCount; if the currently checked-out branch happens to
+// be one of this commit's own refs, it always claims one of those slots
+// rather than risking getting bumped out by an arbitrary earlier ref —
+// losing *that specific* answer ("am I on this branch right now") to a
+// generic overflow pill was a real, reported problem with the flat-list
+// version this replaced.
+function selectRefBadges(refs, options) {
+  const opts = options || {};
+  const isHead = !!opts.isHead;
+  const currentBranchName = opts.currentBranchName || null;
+  const maxBranches = opts.maxBranches == null ? 2 : opts.maxBranches;
+
+  const tags = (refs || []).filter(ref => ref.kind === 'tag');
+  const branches = (refs || []).filter(ref => ref.kind === 'local_branch' || ref.kind === 'remote_branch');
+
+  const badges = [];
+  if (isHead) badges.push({ kind: 'head', name: 'HEAD' });
+
+  // The overflow lists are the *actual* excluded refs (not just a count) —
+  // precise enough for a caller to build a real tooltip ("which tags?"),
+  // rather than reconstructing a guess from the original ref order.
+  if (tags.length) badges.push({ kind: 'tag', name: tags[0].name });
+  const overflowTags = tags.slice(1);
+
+  const isCurrent = branch => branch.name === currentBranchName;
+  // Current branch first (so it survives the slice below regardless of
+  // where it happened to sit in the backend's own ref order), then
+  // restored to local-before-remote display order via the stable sort
+  // right after — priority decides *survival*, kind decides *order*.
+  const prioritized = [...branches.filter(isCurrent), ...branches.filter(branch => !isCurrent(branch))];
+  const shown = prioritized.slice(0, maxBranches).sort((a, b) => (a.kind === b.kind ? 0 : a.kind === 'local_branch' ? -1 : 1));
+  const shownNames = new Set(shown.map(branch => branch.name));
+  for (const branch of shown) badges.push({ kind: branch.kind, name: branch.name });
+  const overflowBranches = branches.filter(branch => !shownNames.has(branch.name));
+
+  return {
+    badges,
+    overflowTags, overflowBranches,
+    overflowTagCount: overflowTags.length, overflowBranchCount: overflowBranches.length,
+  };
+}
+
 // Node (the test runner only — see the file banner above) sees `module`;
 // the webview, loading this as a plain <script>, does not, so the two
 // functions above stay ordinary globals there, exactly as if this code was
 // still inline in app.js. No bundler, no import/export syntax, either way.
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { reachableFrom, buildGraphModel };
+  module.exports = { reachableFrom, buildGraphModel, selectRefBadges };
 }

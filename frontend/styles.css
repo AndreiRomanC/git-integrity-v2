@@ -239,13 +239,32 @@ button { cursor: default; }
 .lane-legend { position: sticky; z-index: 3; top: 0; min-height: 40px; display: flex; align-items: center; gap: 15px; padding: 0 22px; background: #111820; border-bottom: 1px solid var(--border); }
 .time-direction { flex: none; display: grid; grid-template-columns: auto auto auto; align-items: center; gap: 7px; padding-right: 15px; border-right: 1px solid #34414c; color: #c0d0dd; font-size: 9px; }.time-direction i { color: var(--blue); font-style: normal; }
 .head-banner { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border: 1px solid #3d5368; border-radius: 999px; background: #182432; color: #cfe3f5; font-size: 11px; font-weight: 600; }.head-banner i { color: #6f8daa; font-style: normal; }.head-banner b { color: #7fc1ff; }
+/* Always visible, whether the parent repository or a submodule's own
+   history is on screen (point 4 of the rework) — the persistent global
+   topbar's own path/name is the *parent's*, even inside a submodule's map,
+   so this is the one place in the graph view itself that never leaves that
+   ambiguous. */
+.graph-path-badge { min-width: 0; max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #5a6c7d; font-size: 10px; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
 .primary-branch-picker { display: flex; align-items: center; gap: 6px; color: #7f92a4; font-size: 10px; }
 .primary-branch-picker select { height: 26px; padding: 0 8px; border: 1px solid #354356; border-radius: 6px; background: #182430; color: #cfe0ee; font-size: 11px; }
+.ref-filter-group { display: flex; align-items: center; gap: 2px; padding: 2px; border: 1px solid #2d3a47; border-radius: 6px; background: #10171f; }
+.ref-filter-btn { height: 22px; padding: 0 9px; border: 0; border-radius: 4px; background: transparent; color: #7f92a4; font-size: 10px; font-weight: 600; }
+.ref-filter-btn:hover { color: #cfe0ee; }
+.ref-filter-btn.active { background: #23364a; color: #bfe0ff; }
 .lane-header { margin-left: auto; display: grid; grid-template-columns: var(--lanes-width, 90px) 1fr; gap: 8px; color: #5a6c7d; font-size: 9px; font-weight: 700; letter-spacing: .8px; }
 .back-context { margin: 12px 20px 0; height: 32px; padding: 0 12px; border: 1px solid #3c5368; border-radius: 6px; background: #172737; color: #bcd8ef; }
 .graph { position: relative; padding: 14px 20px 30px; }
 .graph-overlay { position: absolute; top: 0; left: 0; pointer-events: none; overflow: visible; }
-.commit-row { min-height: 44px; display: grid; grid-template-columns: auto minmax(280px, 1fr); align-items: center; border-radius: 9px; cursor: default; gap: 6px; }
+/* 48px — the middle of the ~46-52px target (point 2 of the rework),
+   deliberately, not an emergent side effect of nested padding: .commit-card's
+   own 40px min-height plus .commit-body's 4px+4px padding around it add up
+   to exactly this. Kept as stable as the row's actual content allows — a
+   row without an ahead-annotation or an expanded stash never grows past
+   it — but never enforced as a hard cap; drawGraphOverlay always measures
+   each row's *real* rendered position rather than assuming this number,
+   so a row that does need to grow taller (either of those two cases) never
+   throws the SVG lines/dots off. */
+.commit-row { min-height: 48px; display: grid; grid-template-columns: auto minmax(280px, 1fr); align-items: center; border-radius: 9px; cursor: default; gap: 6px; }
 .commit-row:hover { background: #121c26; }
 .commit-row.selected { background: #17283a; box-shadow: inset 0 0 0 1px #315b82; }
 .commit-row.is-head .commit-card { border-color: #4f8fc8; box-shadow: 0 0 0 1px #4f8fc855, 0 3px 10px #0004; }
@@ -253,11 +272,26 @@ button { cursor: default; }
 .commit-row.is-search-dimmed .commit-card { opacity: .38; }
 .commit-row.is-search-dimmed:hover .commit-card { opacity: .7; }
 .search-match-count { color: #d9a25c; font-size: 10px; font-weight: 700; }
-.graph-cell { flex-shrink: 0; }
+/* Driven by the same --lanes-width custom property the header's own
+   .lane-header column reads (set on #graphView, an ancestor of both) —
+   never each row's own inline style. This is what keeps every row's graph
+   column the same width automatically, including rows appendOlderGraphRows
+   never touches: updating the one shared variable re-cascades to all of
+   them live, with no need to touch their own DOM nodes at all. */
+.graph-cell { width: var(--lanes-width, 90px); flex-shrink: 0; }
 .ref-pills { display: flex; flex-wrap: nowrap; gap: 4px; flex-shrink: 0; }
-.ref-pill { max-width: 130px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 2px 7px; border-left: 3px solid var(--lane-color); border-radius: 3px; background: #1b2a36; color: #d6e5f0; font-size: 10px; font-weight: 700; }
-.head-pill { flex-shrink: 0; padding: 2px 6px; border-radius: 3px; background: #2c4a67; color: #bfe0ff; font-size: 9px; font-weight: 800; letter-spacing: .4px; }
-.commit-card { min-width: 0; display: grid; grid-template-columns: 1fr auto auto auto; align-items: center; gap: 14px; min-height: 44px; padding: 7px 12px; border: 1px solid var(--border-soft); border-radius: 8px; background: #141c24; box-shadow: 0 2px 8px #0002; }
+/* Color is by ref *kind* now, not by lane (History & Branch Map rework,
+   point 1/3) — a lane's color is exclusively about that commit's position
+   in the graph and must never be read as meaning anything about a
+   specific branch; a badge's color is the opposite: a fixed, stable
+   signal for what kind of ref it is, unrelated to which lane it's on. */
+.ref-pill { max-width: 130px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 2px 7px; border-radius: 3px; background: #1b2a36; color: #d6e5f0; font-size: 10px; font-weight: 700; }
+.ref-pill.kind-local_branch { border-left: 3px solid #39c5cf; background: #12262a; color: #bdf0f5; }
+.ref-pill.kind-remote_branch { border-left: 3px solid #6f84a3; background: #1c2430; color: #c7d2e2; }
+.ref-pill.kind-tag { border: 1px solid #a4842e; background: #3a2c12; color: #ffe3a3; font-weight: 800; cursor: pointer; }
+.ref-pill.kind-tag:hover { border-color: var(--amber); background: #4a3818; }
+.ref-pill.kind-head { border: 1px solid #e8eef5; background: transparent; color: #e8eef5; font-weight: 800; letter-spacing: .4px; }
+.commit-card { min-width: 0; display: grid; grid-template-columns: 1fr auto auto auto; align-items: center; gap: 14px; min-height: 40px; padding: 6px 12px; border: 1px solid var(--border-soft); border-radius: 8px; background: #141c24; box-shadow: 0 2px 8px #0002; }
 .commit-row:hover .commit-card, .commit-row.selected .commit-card { border-color: #3d5368; background: #18232e; }
 .commit-main { min-width: 0; display: flex; align-items: center; gap: 7px; }
 .commit-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; font-size: 13px; flex-shrink: 1; }
@@ -279,6 +313,23 @@ button { cursor: default; }
 .branch-point-pill { flex-shrink: 0; display: grid; place-items: center; width: 16px; height: 16px; border-radius: 50%; border: 1px dashed #6f8daa; color: #9db3c8; font-size: 9px; }
 .commit-row.is-branch-point .commit-card { border-style: dashed; }
 
+/* Point 5 of the rework: a subtle, collapsible legend at the base of the
+   graph. <details>/<summary> for the collapse — no JS needed for it, same
+   pattern the Help panel already uses. */
+.graph-legend { margin: 10px 0 0; }
+.graph-legend summary { padding: 6px 4px; color: #5a6c7d; font-size: 10px; font-weight: 600; cursor: pointer; }
+.graph-legend summary:hover { color: #8296a8; }
+.graph-legend-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 6px 18px; padding: 6px 4px 2px; }
+.graph-legend-grid span { display: flex; align-items: center; gap: 7px; color: #6b7f96; font-size: 10.5px; }
+.legend-glyph { flex: none; width: 14px; text-align: center; color: #8296a8; font-style: normal; }
+.legend-glyph.legend-tag { color: var(--amber); }
+.legend-swatch { flex: none; width: 10px; height: 10px; border-radius: 2px; }
+.legend-swatch.kind-local_branch { background: #39c5cf; }
+.legend-swatch.kind-remote_branch { background: #6f84a3; }
+.legend-swatch.legend-merge { background: #6f5aad; }
+.legend-line { flex: none; width: 14px; height: 2px; background: #58a6ff; border-radius: 1px; }
+.graph-legend-note { margin: 4px 4px 0; color: #4c5c6c; font-size: 10px; font-style: italic; }
+
 .details-panel-wrap { min-width: 0; min-height: 0; display: flex; }
 .details-panel { min-width: 0; min-height: 0; flex: 1; background: #111820; border-left: 1px solid var(--border); overflow-y: auto; overscroll-behavior: contain; }
 .details-toggle { flex-shrink: 0; align-self: stretch; width: 18px; margin: 0; border: 0; border-left: 1px solid var(--border); border-radius: 0; background: #141c24; color: #8395a6; font-size: 11px; line-height: 1; display: grid; place-items: center; }
@@ -296,6 +347,7 @@ button { cursor: default; }
 .detail-grid { display: grid; grid-template-columns: 60px 1fr; gap: 7px 8px; margin-top: 0; padding-top: 0; border-top: 0; color: var(--muted); font-size: 11px; }
 .commit-details .detail-grid { margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--border); }
 .detail-grid strong { color: #c6d2dc; font-weight: 500; overflow-wrap: anywhere; }
+.tag-message { margin: 14px 0 0; padding: 10px 12px; border-left: 2px solid #a4842e; color: #d9c99a; font-size: 12px; line-height: 1.5; white-space: pre-wrap; }
 .entry-details { height: 100%; overflow: auto; padding: 16px 18px; }
 .entry-preview { width: 44px; height: 40px; display: grid; place-items: center; margin-bottom: 12px; border-radius: 8px; background: #264d71; color: #dceeff; font-size: 21px; }
 .entry-preview.submodule { border: 2px solid var(--purple); background: #292341; color: #d8caff; }
@@ -414,18 +466,23 @@ dialog form { padding: 28px; text-align: center; }dialog h2 { margin: 0 0 10px; 
 .polarion-link { color: #79c4ff; text-decoration: none; border-bottom: 1px solid #4e8fbd; }.polarion-link:hover { color: #c5e8ff; border-bottom-color: #9bd4ff; }
 .commit-server-link { color: #79c4ff; text-decoration: none; border-bottom: 1px solid #4e8fbd; font: 11px ui-monospace, SFMono-Regular, Consolas, monospace; }.commit-server-link:hover { color: #c5e8ff; border-bottom-color: #9bd4ff; }
 
-.command-palette { width: min(640px, 90vw); max-width: 640px; padding: 0; }.command-palette form { padding: 0; }
+.command-palette { width: min(820px, 92vw); max-width: 820px; height: min(640px, 84vh); max-height: 640px; padding: 0; overflow: hidden; }.command-palette form { display: flex; flex-direction: column; height: 100%; min-height: 0; padding: 0; }
 .command-context { padding: 8px 16px; border-bottom: 1px solid var(--border-soft); background: #141c24; color: #7ea9d6; font-size: 10px; letter-spacing: .3px; }
 .command-tabs { display: flex; align-items: center; gap: 6px; padding: 8px 10px; border-bottom: 1px solid var(--border-soft); background: #141c24; }
 .command-tab { height: 26px; padding: 0 12px; border: 1px solid transparent; border-radius: 6px; background: transparent; color: #8296a8; font-size: 11px; font-weight: 600; }
 .command-tab:hover { background: #1c2733; color: #cfe0ee; }
 .command-tab.active { background: #23364a; border-color: #3d5470; color: #bfe0ff; }
-.command-scope { margin-left: auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 260px; color: #6f8daa; font-size: 10px; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+.command-scope { min-width: 0; margin-left: auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 300px; color: #6f8daa; font-size: 10px; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
 .command-scope-cycle, .command-clear { height: 24px; padding: 0 9px; border: 1px solid #354356; border-radius: 5px; background: #182430; color: #9db3c8; font-size: 10px; }
 .command-scope-cycle:hover, .command-clear:hover { border-color: #5794c7; color: white; }
-#commandInput { width: 100%; height: 50px; border: 0; outline: 0; padding: 14px 16px; background: #1a2532; color: #e8eef5; font-size: 14px; border-bottom: 1px solid var(--border); }
+#commandInput { flex: 0 0 50px; width: 100%; height: 50px; border: 0; outline: 0; padding: 14px 16px; background: #1a2532; color: #e8eef5; font: 14px ui-monospace, SFMono-Regular, Consolas, monospace; border-bottom: 1px solid var(--border); }
 #commandInput::placeholder { color: #6b7f96; }
-.command-list { max-height: 420px; overflow: auto; }
+.terminal-quick-commands { flex: 0 0 37px; display: flex; align-items: center; gap: 6px; min-width: 0; padding: 5px 12px; overflow-x: auto; border-bottom: 1px solid var(--border-soft); background: #121b24; scrollbar-width: thin; }
+.terminal-quick-commands[hidden] { display: none; }
+.terminal-quick-commands > span { flex: 0 0 auto; color: #63798c; font-size: 9px; font-weight: 700; letter-spacing: .6px; text-transform: uppercase; }
+.terminal-quick-commands button { flex: 0 0 auto; width: auto; height: 25px; margin: 0; padding: 0 9px; border: 1px solid #304458; border-radius: 5px; background: #172432; color: #a9bfd2; font: 10px ui-monospace, SFMono-Regular, Consolas, monospace; }
+.terminal-quick-commands button:hover { border-color: #5794c7; color: #e2f1ff; }
+.command-list { flex: 1 1 auto; min-height: 0; max-height: none; overflow: auto; }
 .command-item { padding: 10px 16px; border-bottom: 1px solid var(--border-soft); cursor: default; }
 .command-item:hover { background: #202b36; }
 .command-item.selected { background: #243d56; }
@@ -434,10 +491,11 @@ dialog form { padding: 28px; text-align: center; }dialog h2 { margin: 0 0 10px; 
 .command-item.relevant .command-name::before { content: "●"; margin-right: 6px; color: #58a6ff; font-size: 8px; vertical-align: 1px; }
 .command-desc { display: block; margin-top: 2px; color: #7f92a4; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .command-keys { flex-shrink: 0; color: #6b7f96; font-size: 11px; font-family: ui-monospace; }
-.command-help { padding: 9px 14px; background: #141c24; color: #6b7f96; font-size: 10px; text-align: center; border-top: 1px solid var(--border-soft); }
+.command-help { flex: 0 0 auto; min-height: 33px; padding: 9px 14px; background: #141c24; color: #6b7f96; font-size: 10px; text-align: center; border-top: 1px solid var(--border-soft); }
 .raw-git-item .command-name { color: #7ee787; font: 12px ui-monospace, SFMono-Regular, Consolas, monospace; }
 .raw-git-output { padding: 12px 16px; }
-.raw-git-cmd { margin-bottom: 8px; color: #9db3c8; font: 12px ui-monospace, SFMono-Regular, Consolas, monospace; }
+.raw-git-cmd { display: flex; align-items: center; gap: 6px; min-width: 0; margin-bottom: 8px; color: #9db3c8; font: 12px ui-monospace, SFMono-Regular, Consolas, monospace; }
+.raw-git-command-text { min-width: 0; overflow-wrap: anywhere; }
 .raw-git-cwd { color: #5a6c7d; }
 .raw-git-status { margin-left: 8px; padding: 2px 7px; border-radius: 4px; font-size: 9px; font-weight: 800; letter-spacing: .5px; display: inline-flex; align-items: center; gap: 4px; }
 .raw-git-status.ok { background: #12271b; color: #8fe8b7; border: 1px solid #2f8f5b; }
@@ -445,6 +503,9 @@ dialog form { padding: 28px; text-align: center; }dialog h2 { margin: 0 0 10px; 
 .raw-git-status.running { background: #16202b; color: #8fc4ff; border: 1px solid #34617f; }
 .raw-git-status.running .spinner { width: 9px; height: 9px; border-width: 1.5px; }
 .raw-git-elapsed { margin-left: 6px; color: #5a6c7d; font-size: 10px; }
+.raw-git-actions { display: inline-flex; flex: 0 0 auto; gap: 4px; margin-left: auto; }
+.raw-git-action { width: auto; height: 23px; margin: 0; padding: 0 7px; border: 1px solid #304458; border-radius: 4px; background: #141f2a; color: #7890a5; font-size: 9px; }
+.raw-git-action:hover { border-color: #5794c7; color: #d8ebfb; }
 .raw-git-stdout, .raw-git-stderr { max-height: 280px; overflow: auto; margin: 0 0 8px; padding: 10px 12px; border-radius: 6px; background: #0b1116; color: #c5d1db; font: 11px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace; white-space: pre-wrap; word-break: break-word; }
 .raw-git-stderr { color: #ffb0b8; background: #1a0f11; }
 .git-out-add { color: var(--green); }.git-out-del { color: #ff8a8a; }.git-out-hunk { color: var(--purple); font-weight: 700; }.git-out-meta { color: #64798c; }.git-out-changed { color: var(--amber); font-weight: 600; }.git-out-hint { color: #56697a; font-style: italic; }.git-out-branch { color: var(--blue); font-weight: 700; }.git-out-section { color: #d9e4ee; font-weight: 700; }.git-out-hash { color: var(--amber); font-weight: 700; }
@@ -452,7 +513,7 @@ dialog form { padding: 28px; text-align: center; }dialog h2 { margin: 0 0 10px; 
 .console-transcript { display: flex; flex-direction: column; gap: 2px; }
 .console-transcript .raw-git-output { border-bottom: 1px solid var(--border-soft); }
 .console-empty { padding: 30px 16px; color: #6b7f96; font-size: 12px; text-align: center; }
-.command-git-hints { padding: 9px 16px; border-bottom: 1px solid var(--border-soft); background: #101923; }
+.command-git-hints { flex: 0 0 auto; max-height: 128px; overflow-y: auto; padding: 9px 16px; border-bottom: 1px solid var(--border-soft); background: #101923; }
 .command-git-hints .hint-desc { margin: 0 0 7px; color: #9db3c8; font-size: 11px; }
 .command-git-hints .hint-desc b { color: #7ee787; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
 .hint-flags { display: flex; flex-wrap: wrap; gap: 6px; }
