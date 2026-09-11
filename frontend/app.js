@@ -765,33 +765,70 @@ function renderBreadcrumbs() {
   refs.breadcrumbs.querySelectorAll('[data-path]').forEach(crumb => crumb.addEventListener('click', () => openDirectory(crumb.dataset.path)));
 }
 
-let explorerRenderState = { path: null, query: null, entries: null };
+// A folder with many thousands of entries used to build one real DOM node
+// per entry unconditionally — fine up to a few hundred, but a genuinely
+// enormous single folder (an unusual layout, but real ones exist: a flat
+// asset dump, a generated-output directory) made this innerHTML assignment
+// itself the dominant cost, freezing the window for it. True scroll
+// virtualization (recycling a small pool of DOM rows as the user scrolls)
+// would need a reliable fixed row height to do the scroll-offset math
+// against, but .file-row is only min-height in CSS — close enough visually,
+// not something worth trusting pixel-for-pixel. This caps how many rows
+// this function ever hands to the DOM in one shot instead, the same
+// explicit-continuation shape already used for a huge commit graph
+// (GRAPH_COMMIT_WINDOW/"Load older", above) rather than an automatic
+// infinite scroll: nothing here is silently hidden, it just isn't built
+// into the DOM until asked for. Ordinary folders (the overwhelming common
+// case) never come close to this and never notice it exists.
+const EXPLORER_DOM_ROW_CAP = 500;
+
+let explorerRenderState = { path: null, query: null, entries: null, showAll: false, pendingShowAll: false };
 let lastExplorerClick = { path: null, time: 0 };
 function renderExplorer() {
   if (!state.repository) return;
   renderBreadcrumbs();
   const query = refs.search.value.trim().toLowerCase();
-  // If nothing but the selection changed (a plain click, no folder reload and
-  // no new search), update just the "selected" class in place instead of
-  // rebuilding every row's DOM node. Rebuilding on every click replaces the
-  // very button the user just clicked — on Windows/WebView2 that resets the
-  // browser's double-click sequence (it requires both clicks to land on the
-  // same element), so a folder needed two double-clicks to open. macOS's
-  // WebKit is more lenient about this, which is why it only showed up there.
-  if (explorerRenderState.path === state.currentPath && explorerRenderState.query === query && explorerRenderState.entries === state.entries) {
+  const samePlace = explorerRenderState.path === state.currentPath && explorerRenderState.query === query;
+  // If nothing but the selection changed (a plain click, no folder reload,
+  // no new search, and no "Show all" click either) — update just the
+  // "selected" class in place instead of rebuilding every row's DOM node.
+  // Rebuilding on every click replaces the very button the user just
+  // clicked — on Windows/WebView2 that resets the browser's double-click
+  // sequence (it requires both clicks to land on the same element), so a
+  // folder needed two double-clicks to open. macOS's WebKit is more
+  // lenient about this, which is why it only showed up there.
+  if (samePlace && explorerRenderState.entries === state.entries && !explorerRenderState.pendingShowAll) {
     refs.fileList.querySelectorAll('[data-entry]').forEach(row => row.classList.toggle('selected', state.selectedEntry?.relative_path === row.dataset.entry));
     return;
   }
-  explorerRenderState = { path: state.currentPath, query, entries: state.entries };
-  const entries = state.entries.filter(entry => !query || entry.name.toLowerCase().includes(query));
+  // A background refresh of the very same folder/search (a status scan
+  // landing, a git operation completing) must not silently re-collapse an
+  // already-expanded huge folder back under the cap; leaving this folder
+  // (or starting a new search in it) is the only thing that should.
+  const showAll = samePlace && (explorerRenderState.showAll || explorerRenderState.pendingShowAll);
+  explorerRenderState = { path: state.currentPath, query, entries: state.entries, showAll, pendingShowAll: false };
+  const buildStarted = performance.now();
+  const allEntries = state.entries.filter(entry => !query || entry.name.toLowerCase().includes(query));
+  const capped = !showAll && allEntries.length > EXPLORER_DOM_ROW_CAP;
+  const entries = capped ? allEntries.slice(0, EXPLORER_DOM_ROW_CAP) : allEntries;
   const upRow = state.currentPath ? `<button class="file-row file-grid up-row" data-go-up="1">
     <span class="file-main"><span class="entry-icon folder">▲</span><span class="entry-copy"><span class="entry-name">..</span><span class="entry-hint">Parent folder</span></span></span>
     <span></span><span></span><span></span>
   </button>` : '';
-  refs.fileList.innerHTML = upRow + entries.map(entry => `<button class="file-row file-grid ${entry.status || !entry.tracked ? 'has-change' : ''} ${state.selectedEntry?.relative_path === entry.relative_path ? 'selected' : ''}" data-entry="${esc(entry.relative_path)}">
+  const rowsHtml = entries.map(entry => `<button class="file-row file-grid ${entry.status || !entry.tracked ? 'has-change' : ''} ${state.selectedEntry?.relative_path === entry.relative_path ? 'selected' : ''}" data-entry="${esc(entry.relative_path)}">
     <span class="file-main">${iconFor(entry)}<span class="entry-copy"><span class="entry-name">${esc(entry.name)}${entry.kind === 'submodule' ? '<b class="inline-submodule-badge">SUBMODULE</b>' : ''}</span><span class="entry-hint">${entry.kind === 'submodule' ? 'Independent Git repository' : entry.kind}</span></span>${['folder','submodule'].includes(entry.kind) ? '<span class="folder-arrow">›</span>' : ''}</span>
     ${gitState(entry)}<span class="file-size">${entry.kind === 'file' ? formatSize(entry.size) : '—'}</span><span class="file-modified">${formatModified(entry.modified)}</span>
   </button>`).join('') || (state.currentPath ? '' : '<div class="empty-change">This folder is empty</div>');
+  const showAllStub = capped ? `<div class="history-truncated-stub"><span>Showing ${EXPLORER_DOM_ROW_CAP} of ${allEntries.length} items</span><button id="explorerShowAll">Show all ${allEntries.length}</button></div>` : '';
+  jsPerfLog(`renderExplorer build HTML (${state.currentPath || '/'}, ${entries.length}${capped ? `/${allEntries.length}` : ''} rows)`, performance.now() - buildStarted);
+  // Isolated from the string-building above and attachFileListDelegation
+  // below, so a slow render can be attributed to whichever of the three it
+  // actually is instead of one lump "renderExplorer" number (the caller,
+  // fetchAndRenderDirectory, separately times the backend/IPC round trip
+  // this runs after — see its own jsPerfLog calls).
+  const domStarted = performance.now();
+  refs.fileList.innerHTML = upRow + rowsHtml + showAllStub;
+  jsPerfLog(`renderExplorer DOM write (${state.currentPath || '/'}, ${entries.length} nodes)`, performance.now() - domStarted);
   // Single delegated listener on the container instead of one click +
   // one contextmenu listener per row: attaching thousands of individual
   // listeners (one pair per entry) was itself a real, measurable cost on
@@ -799,6 +836,7 @@ function renderExplorer() {
   // instead of O(entries), same behavior either way since we only ever
   // care which row the event happened inside.
   attachFileListDelegation();
+  if (capped) { $('#explorerShowAll')?.addEventListener('click', () => { explorerRenderState.pendingShowAll = true; renderExplorer(); }); }
 }
 
 let fileListDelegationAttached = false;
@@ -1983,121 +2021,12 @@ async function dropStashEntry(index) {
 function updateStashUI() { $('#stashWork').hidden = state.hasStash; $('#popStash').hidden = !state.hasStash; }
 
 // ---- Git DAG / topology model -------------------------------------------
-// Assigns each commit a stable vertical lane. Lanes are never renumbered or
-// shifted for unrelated commits — a lane slot is only ever (a) kept as-is,
-// (b) reused in place by the first still-unseen parent of the commit that
-// currently occupies it, or (c) freed and later reused (first-fit) by a
-// later, unrelated fork. This is what keeps a linear branch pinned to one
-// lane for its entire visible history instead of drifting row to row.
-// Every commit reachable from `primaryTipId` (the selected branch's tip) —
-// walking ALL parents, not just first-parent, so a merge into the selected
-// branch still counts its merged-in history as "belongs to this branch".
-function reachableFrom(tipId, commits) {
-  const set = new Set(); if (!tipId) return set;
-  const byId = new Map(commits.map(c => [c.id, c]));
-  const stack = [tipId];
-  while (stack.length) {
-    const id = stack.pop(); if (set.has(id)) continue; set.add(id);
-    const commit = byId.get(id); if (commit) (commit.parents || []).forEach(p => stack.push(p));
-  }
-  return set;
-}
-
-// Lane 0 is reserved for the selected branch's own ancestry. A commit that
-// isn't reachable from it — e.g. another branch's commit made after the two
-// diverged — is never placed there, even if it's chronologically newer and
-// would otherwise be first in line; it gets its own lane instead, and that
-// lane only exists for as long as it actually needs to (freed again right
-// after its edge reconnects to the primary chain).
-//
-// DAG-correctness contract (this project has no JS test runner, so this is
-// hand-verified and documented here instead — see the commit that added
-// this comment for the exact bug it fixes): for every commit and every one
-// of its parents that also appears in `commits`, buildGraphModel's output
-// must contain exactly one edge for that child→parent pair — lanes are pure
-// presentation and must never cause one to be silently dropped. Verified by
-// hand-tracing the exact case this used to fail:
-//   main:    M → Q → P → A
-//   feature: F → P
-//   row order: M, F, Q, P, A     (primary = main; F is not on it)
-// F's only parent, P, IS on the primary chain (reachable from M) — the
-// previous version special-cased "a primary-reachable parent always tries
-// lane 0", found lane 0 already held by Q (main's own pending next commit)
-// at F's row, and — having been excluded from the *secondary*-parent
-// placement path specifically because it WAS the primary parent — was
-// placed nowhere at all, so the real F→P edge silently vanished. The
-// current version places every parent somewhere unconditionally (lane 0 is
-// only ever a *preference*, taken solely when actually free); tracing the
-// same case now: F→P lands in lane 1 (F's own row's freed lane), and Q's own
-// edge to P — processed next — finds P already sitting in lane 1 and simply
-// draws into it, the two lanes correctly converging on the one shared commit
-// instead of one of them losing its edge.
-function buildGraphModel(commits, primaryTipId) {
-  const primarySet = reachableFrom(primaryTipId, commits);
-  const lanes = []; // lanes[i] = commitId currently occupying that lane, or null
-  if (primarySet.size && commits.some(c => c.id === primaryTipId)) lanes[0] = primaryTipId;
-  const dedupe = list => (list || []).filter((id, index, all) => id && all.indexOf(id) === index);
-
-  return commits.map((commit, row) => {
-    const isPrimary = primarySet.has(commit.id);
-    let lane = lanes.indexOf(commit.id);
-    if (lane < 0) {
-      if (isPrimary) { lane = lanes[0] == null ? 0 : lanes.indexOf(null); if (lane < 0) lane = lanes.length; }
-      else { lane = lanes.length > 1 ? lanes.indexOf(null, 1) : -1; if (lane < 0) lane = Math.max(lanes.length, 1); }
-    }
-    const before = lanes.slice();
-    lanes[lane] = null;
-
-    const parentIds = dedupe(commit.parents);
-    const newParents = parentIds.filter(id => !lanes.includes(id));
-    // Every entry in `newParents` gets a real lane before this row finishes —
-    // no branch below is allowed to fall through without placing one, unlike
-    // the previous version, where a primary-reachable parent that lost the
-    // race for lane 0 (already occupied by another chain still pending, e.g.
-    // main's own next commit) was dropped on the floor entirely: it wasn't
-    // in lane 0, and having been claimed as "the primary parent" it was also
-    // excluded from the secondary-parent placement loop — so it never made
-    // it into `lanes` at all, and the real child→parent edge to it silently
-    // vanished from the rendered graph (reproduced with main: M→Q→P→A and
-    // feature: F→P, rendered in row order M,F,Q,P,A — F's parent P couldn't
-    // claim lane 0 since Q was still waiting there, so F→P used to disappear
-    // even though it's a completely real, unbroken Git relationship).
-    const remaining = newParents.slice();
-    // Preferred, cosmetic-only: a parent reachable from the primary branch
-    // claims lane 0, but *only* if lane 0 is actually free right now — this
-    // never evicts whatever's already pending there, which would just move
-    // the exact same bug onto that commit's edge instead of fixing it.
-    if (lanes[0] == null) {
-      const primaryIndex = remaining.findIndex(id => primarySet.has(id));
-      if (primaryIndex >= 0) { lanes[0] = remaining[primaryIndex]; remaining.splice(primaryIndex, 1); }
-    }
-    // Also cosmetic-only: this row's own just-vacated lane (when it isn't
-    // lane 0) is offered to the next parent so a single-parent continuation
-    // draws straight down instead of an unnecessary diagonal.
-    if (lane !== 0 && lanes[lane] == null && remaining.length) { lanes[lane] = remaining.shift(); }
-    // Everything still unplaced — additional merge parents, or a
-    // primary-reachable parent that couldn't claim lane 0 above — gets a
-    // real lane unconditionally: reuse a freed one if there is any (never
-    // lane 0 here, which stays reserved for whichever chain is already
-    // pending in it), otherwise the lane set grows. This is what guarantees
-    // two lanes can later converge on the very same commit (e.g. Q's edge to
-    // P finding P already placed by F's edge above it) instead of one of
-    // them being silently lost.
-    for (const id of remaining) {
-      let slot = lanes.length > 1 ? lanes.indexOf(null, 1) : -1; if (slot < 0) slot = Math.max(lanes.length, 1);
-      lanes[slot] = id;
-    }
-    while (lanes.length && lanes[lanes.length - 1] == null) lanes.pop();
-    const after = lanes.slice();
-
-    return {
-      commitId: commit.id, row, lane, before, after, isPrimary,
-      parents: parentIds.map(id => ({ commitId: id, targetRow: row + 1, targetLane: after.indexOf(id) })).filter(p => p.targetLane >= 0),
-      refs: commit.refs || [],
-      type: 'commit',
-    };
-  });
-}
+// reachableFrom/buildGraphModel used to live here; they moved to their own
+// file, graph-model.js (loaded by index.html right before this script), so
+// they can be exercised by a real, automated test suite (tests/graph-model.
+// test.js, run with `node --test`) instead of relying on hand-tracing
+// documented in a comment. Nothing else changed: both are still ordinary
+// globals by the time this file runs, called exactly as before.
 
 const LANE_WIDTH = 30;
 // Mirrors the backend's own GRAPH_COMMIT_WINDOW — used only as the page size

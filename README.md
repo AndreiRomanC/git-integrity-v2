@@ -12,6 +12,10 @@ A cross-platform visual Git client inspired by the information density and struc
 
 The source project is under 1 MB. Build artifacts are written to the operating system's temporary directory by the launchers and removed when the application closes, so the project does not grow by gigabytes.
 
+## Testing
+
+The Rust backend's own tests (`cargo test`, from `src-tauri`) are the primary suite. A handful of pure-logic frontend modules — currently `frontend/graph-model.js`, the commit-graph lane layout — have their own automated tests in `tests/`, runnable with `node --test` from the repository root. This uses only Node's own built-in test runner and assert module (Node 18+) — no npm install, no `node_modules`, no `package.json` — so it does not change the "no Node.js/npm runtime or build step" above: nothing here is invoked by the build or by the shipped app, only by a maintainer choosing to run it.
+
 ## Browser preview
 
 Open `frontend/index.html` directly or serve the folder with any static server. Browser mode uses representative demo data because a normal web page cannot access local repositories.
