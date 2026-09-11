@@ -180,10 +180,35 @@ function selectRefBadges(refs, options) {
   };
 }
 
+// Decides which branch rows the sidebar (renderBranches, app.js) shows and
+// which one (if any) is HEAD — pure, so the repository-context bug this
+// exists to fix (the sidebar always rendering the *parent's* branches,
+// even while a submodule's own Branch Map is active — see
+// activeRepositoryContext in app.js, which builds `context` here from
+// either state.submoduleGraph or state.repository) is checkable the same
+// way the rest of this module already is. context is {branches,
+// headDetached, headOid} — deliberately shaped so both the parent and a
+// submodule's own resolved repository data fit it identically.
+//
+// The backend already computes each Branch's own `current` flag correctly
+// per-repository (repository.rs: `branch_type == Local && branch_name ==
+// current_branch`, and current_branch is always "" on a detached HEAD —
+// see RepositoryInfo's own contract) — `!detached` here is deliberate
+// belt-and-suspenders on top of that, not a workaround for it: a detached
+// checkout must never show a branch marked HEAD even if that guarantee
+// ever regressed upstream.
+function selectBranchRows(context) {
+  const detached = !!(context && context.headDetached);
+  const rows = ((context && context.branches) || []).map(branch => ({
+    name: branch.name, remote: !!branch.remote, isHead: !detached && !!branch.current,
+  }));
+  return { rows, detached, detachedAt: (context && context.headOid) || '' };
+}
+
 // Node (the test runner only — see the file banner above) sees `module`;
 // the webview, loading this as a plain <script>, does not, so the two
 // functions above stay ordinary globals there, exactly as if this code was
 // still inline in app.js. No bundler, no import/export syntax, either way.
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { reachableFrom, buildGraphModel, selectRefBadges };
+  module.exports = { reachableFrom, buildGraphModel, selectRefBadges, selectBranchRows };
 }

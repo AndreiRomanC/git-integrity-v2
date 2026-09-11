@@ -8,7 +8,7 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { reachableFrom, buildGraphModel, selectRefBadges } = require('../frontend/graph-model.js');
+const { reachableFrom, buildGraphModel, selectRefBadges, selectBranchRows } = require('../frontend/graph-model.js');
 
 // Minimal fixture builder — buildGraphModel only ever reads id/parents/refs
 // off a commit, so tests only set those, matching how sparse real fixtures
@@ -349,4 +349,63 @@ test('selectRefBadges: a local branch and its remote-tracking branch on the same
   const refs = [ref('main', 'local_branch'), ref('origin/main', 'remote_branch')];
   const result = selectRefBadges(refs, { maxBranches: 2 });
   assert.deepEqual(result.badges, [{ kind: 'local_branch', name: 'main' }, { kind: 'remote_branch', name: 'origin/main' }]);
+});
+
+// ---- selectBranchRows -------------------------------------------------------
+// Regression coverage for the sidebar repository-context bug: the Branches
+// sidebar (renderBranches, app.js) must show exactly the *active* context's
+// own branches — the parent's, normally, or the selected submodule's own
+// while its Branch Map is active — and never the wrong repository's list,
+// and never mark a branch HEAD on a detached checkout.
+
+function branch(name, current, remote = false) { return { name, current, remote }; }
+
+test('selectBranchRows: a parent repository on a named branch marks exactly that branch HEAD', () => {
+  const context = { branches: [branch('main', true), branch('feature', false), branch('origin/main', false, true)], headDetached: false, headOid: 'deadbeef' };
+  const result = selectBranchRows(context);
+  assert.equal(result.detached, false);
+  assert.deepEqual(result.rows.filter(r => r.isHead).map(r => r.name), ['main']);
+});
+
+test('selectBranchRows: a submodule in detached HEAD marks no branch as HEAD and reports the exact commit', () => {
+  // Even if the backend's own per-branch `current` flag were ever wrong
+  // (it already shouldn't be — see this function's own comment), this
+  // must never show a branch as HEAD on a detached checkout.
+  const context = { branches: [branch('main', false), branch('release', false)], headDetached: true, headOid: 'e00bbe2cfeed' };
+  const result = selectBranchRows(context);
+  assert.equal(result.detached, true);
+  assert.equal(result.detachedAt, 'e00bbe2cfeed');
+  assert.equal(result.rows.some(r => r.isHead), false, 'no branch may ever be marked HEAD on a detached checkout');
+});
+
+test('selectBranchRows: never marks HEAD even if a branch\'s own `current` flag is stale on a detached checkout', () => {
+  // Defends the belt-and-suspenders guarantee itself: a malformed/stale
+  // upstream `current: true` on a detached checkout must still never
+  // surface as a HEAD row.
+  const context = { branches: [branch('main', true)], headDetached: true, headOid: 'abc123' };
+  const result = selectBranchRows(context);
+  assert.equal(result.rows[0].isHead, false);
+});
+
+test('selectBranchRows: the parent and a submodule with genuinely different branch lists never mix', () => {
+  const parentContext = { branches: [branch('main', true), branch('develop', false)], headDetached: false, headOid: 'p1' };
+  const submoduleContext = { branches: [branch('release/2.0', true), branch('hotfix', false)], headDetached: false, headOid: 's1' };
+  const parentRows = selectBranchRows(parentContext).rows.map(r => r.name);
+  const submoduleRows = selectBranchRows(submoduleContext).rows.map(r => r.name);
+  assert.deepEqual(parentRows, ['main', 'develop']);
+  assert.deepEqual(submoduleRows, ['release/2.0', 'hotfix']);
+  assert.equal(parentRows.some(name => submoduleRows.includes(name)), false, 'sanity check: the two fixtures must not accidentally share a name');
+});
+
+test('selectBranchRows: remote-tracking branches are carried through and never marked HEAD', () => {
+  const context = { branches: [branch('main', true), branch('origin/main', false, true), branch('origin/release', false, true)], headDetached: false, headOid: 'x' };
+  const result = selectBranchRows(context);
+  const remotes = result.rows.filter(r => r.remote);
+  assert.equal(remotes.length, 2);
+  assert.ok(remotes.every(r => !r.isHead), 'a remote-tracking ref is never "current" and must never be marked HEAD');
+});
+
+test('selectBranchRows tolerates a missing/undefined context without throwing', () => {
+  assert.deepEqual(selectBranchRows(undefined), { rows: [], detached: false, detachedAt: '' });
+  assert.deepEqual(selectBranchRows({}), { rows: [], detached: false, detachedAt: '' });
 });

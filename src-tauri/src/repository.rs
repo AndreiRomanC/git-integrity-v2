@@ -9753,4 +9753,54 @@ mod tests {
 
         fs::remove_dir_all(base).unwrap();
     }
+
+    // ---- Message D: branch actions must operate on the repository they're actually given ----
+
+    #[test]
+    fn switch_rename_and_delete_branch_operate_on_a_submodules_own_path_never_the_parent() {
+        // The frontend half of this report was the sidebar/branch actions
+        // defaulting to state.repository.path (the parent) regardless of
+        // which repository's Branch Map was actually on screen. The backend
+        // side of the fix is this: switch_branch/rename_branch/delete_branch
+        // must already be — and stay — fully generic on whatever
+        // repository_path they're given, submodule or parent, with no
+        // assumption baked in that it's always the parent. This is the
+        // exact scenario the sidebar fix now relies on: call these three
+        // directly against a submodule's own absolute path, and confirm the
+        // parent's own branches are never touched or required to exist.
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-submodule-branch-actions-{suffix}"));
+        let parent = base.join("parent"); let dependency = base.join("dependency");
+        create_libgit2_repository(&parent, "README.md");
+        create_libgit2_repository(&dependency, "module.txt");
+        run_git(&parent, &["branch", "-M", "main"]);
+        run_git(&dependency, &["branch", "-M", "main"]);
+        let parent_string = parent.to_string_lossy().into_owned();
+        let added = add_submodule_inner(parent_string.clone(), "".into(), dependency.to_string_lossy().into_owned(), "dep".into(), String::new(), String::new()).unwrap();
+        create_commit(parent_string.clone(), "Add dep submodule".into()).unwrap();
+        let sub_path = parent.join(&added);
+        let sub_path_string = sub_path.to_string_lossy().into_owned();
+
+        // A branch that exists ONLY inside the submodule, never the parent —
+        // proves switch/rename/delete below are genuinely operating on the
+        // submodule's own refs, not coincidentally succeeding against the
+        // parent's (which uses the conventional "main" only).
+        run_git(&sub_path, &["branch", "feature-in-submodule"]);
+        assert!(Repository::open(&parent).unwrap().find_branch("feature-in-submodule", BranchType::Local).is_err(), "sanity check: this branch must not exist in the parent");
+
+        switch_branch(sub_path_string.clone(), "feature-in-submodule".into()).unwrap();
+        assert_eq!(Repository::open(&sub_path).unwrap().head().unwrap().shorthand(), Some("feature-in-submodule"), "the submodule's own HEAD must have moved");
+        assert_eq!(Repository::open(&parent).unwrap().head().unwrap().shorthand(), Some("main"), "the parent's own HEAD must be completely unaffected");
+
+        rename_branch(sub_path_string.clone(), "feature-in-submodule".into(), "renamed-in-submodule".into()).unwrap();
+        assert!(Repository::open(&sub_path).unwrap().find_branch("renamed-in-submodule", BranchType::Local).is_ok(), "the rename must have landed inside the submodule");
+
+        // Switch off it first — delete_branch refuses to delete the current branch.
+        switch_branch(sub_path_string.clone(), "main".into()).unwrap();
+        delete_branch(sub_path_string, "renamed-in-submodule".into()).unwrap();
+        assert!(Repository::open(&sub_path).unwrap().find_branch("renamed-in-submodule", BranchType::Local).is_err(), "the delete must have landed inside the submodule");
+        assert!(Repository::open(&parent).unwrap().find_branch("main", BranchType::Local).is_ok(), "the parent's own main branch must still be completely untouched throughout");
+
+        fs::remove_dir_all(base).unwrap();
+    }
 }

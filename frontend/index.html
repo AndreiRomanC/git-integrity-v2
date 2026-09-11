@@ -53,8 +53,15 @@
         <button class="workspace-status" id="stashWork" data-tooltip="Moves ALL uncommitted changes to a temporary holding area — the stash — so they're set aside and not part of any commit until you bring them back" title="Set all uncommitted changes aside temporarily"><span class="workspace-dot" style="background:#b294ff;"></span><span><strong>Stash work</strong><small>Set changes aside temporarily</small></span></button>
         <button class="workspace-status" id="popStash" data-tooltip="Brings back everything you set aside in the stash" title="Bring the stash back" hidden><span class="workspace-dot" style="background:#48cc7e;"></span><span><strong>Pop stash</strong><small>Bring saved changes back</small></span></button>
 
-        <div class="side-heading pr-status-heading" id="togglePrStatus" title="Pull request status for the currently checked-out branch — collapsed by default, doesn't check until opened"><span class="branch-heading-arrow" id="prStatusArrow">▸</span><span>PULL REQUEST</span></div>
+        <div class="side-heading pr-status-heading" id="togglePrStatus" title="Pull request status for the PARENT project's currently checked-out branch — always the parent, never a submodule, even while a Submodule Branch Map is open. Collapsed by default, doesn't check until opened"><span class="branch-heading-arrow" id="prStatusArrow">▸</span><span>PROJECT PULL REQUEST</span></div>
         <div id="prStatusPanel" class="pr-status-panel collapsed"></div>
+
+        <!-- Only ever shown while a submodule's own Branch Map is open (see
+             renderSubmodulePrHeading in app.js) — a separate section on
+             purpose, so opening a submodule graph never silently replaces
+             what "PROJECT PULL REQUEST" above is reporting on. -->
+        <div class="side-heading pr-status-heading" id="toggleSubmodulePrStatus" title="Pull request status for this submodule's own currently checked-out branch" hidden><span class="branch-heading-arrow" id="submodulePrStatusArrow">▸</span><span id="submodulePrStatusLabel">SUBMODULE PULL REQUEST</span></div>
+        <div id="submodulePrStatusPanel" class="pr-status-panel collapsed" hidden></div>
       </aside>
 
       <section class="content">

@@ -149,6 +149,7 @@ const refs = {
   mergeBranchDialog: $('#mergeBranchDialog'), mergeBranchSubtitle: $('#mergeBranchSubtitle'), mergeBranchCurrent: $('#mergeBranchCurrent'), mergeBranchSource: $('#mergeBranchSource'), mergeBranchStatus: $('#mergeBranchStatus'), confirmMergeBranch: $('#confirmMergeBranch'),
   stashesDialog: $('#stashesDialog'), stashesList: $('#stashesList'),
   togglePrStatus: $('#togglePrStatus'), prStatusArrow: $('#prStatusArrow'), prStatusPanel: $('#prStatusPanel'),
+  toggleSubmodulePrStatus: $('#toggleSubmodulePrStatus'), submodulePrStatusArrow: $('#submodulePrStatusArrow'), submodulePrStatusPanel: $('#submodulePrStatusPanel'), submodulePrStatusLabel: $('#submodulePrStatusLabel'),
   newBranchDialog: $('#newBranchDialog'), newBranchFrom: $('#newBranchFrom'), newBranchOriginStatus: $('#newBranchOriginStatus'), newBranchName: $('#newBranchName'), newBranchStatus: $('#newBranchStatus'), confirmNewBranch: $('#confirmNewBranch'),
   conflictsDialog: $('#conflictsDialog'), conflictsTitle: $('#conflictsTitle'), conflictsSubtitle: $('#conflictsSubtitle'), conflictsList: $('#conflictsList'), conflictsCommitMessage: $('#conflictsCommitMessage'), conflictsCommitMessageLabel: $('#conflictsCommitMessageLabel'), conflictsLocalNote: $('#conflictsLocalNote'), conflictsStatus: $('#conflictsStatus'), confirmCompleteMerge: $('#confirmCompleteMerge'), abortMergeButton: $('#abortMerge'),
   mergeConflictsBanner: $('#mergeConflictsBanner'), mergeConflictsSubtitle: $('#mergeConflictsSubtitle')
@@ -563,6 +564,8 @@ function render() {
   // changed since its last check, and only when the panel is expanded (see
   // createPrStatusPanel's own doc comment for why).
   mainPrStatusPanel?.refreshIfContextChanged();
+  renderSubmodulePrHeading();
+  submodulePrStatusPanel?.refreshIfContextChanged();
 }
 
 function renderCommanderBreadcrumbs() {
@@ -1884,17 +1887,63 @@ function leaveSubmoduleGraph() { if (!state.submoduleGraph) return; state.submod
 // picked for a submodule bleeding into the parent's own Branch Map).
 function closeSubmoduleGraph() { state.submoduleGraph = null; submoduleGraphGeneration++; }
 
+// The one explicit source of truth for every repository-sensitive UI
+// surface outside the graph view itself — the Branches sidebar and every
+// branch action (switch/create/rename/delete/menu) — mirroring
+// activeGraphData()'s own resolution exactly (same state.submoduleGraph
+// check), so the sidebar and the graph header can never disagree about
+// which repository is active. Fixes the reported bug directly: the
+// sidebar used to always render state.branches (the parent's) and every
+// branch action used to always target state.repository.path, regardless
+// of whether a submodule's own Branch Map was open.
+function activeRepositoryContext() {
+  if (state.submoduleGraph) {
+    const g = state.submoduleGraph;
+    return {
+      isSubmodule: true, path: g.repository.path, parentPath: g.parentRepositoryPath, relativePath: g.relativePath,
+      name: g.repository.name, branches: g.branches || [], currentBranch: g.repository.current_branch,
+      headDetached: !!g.repository.head_detached, headOid: g.repository.head_oid,
+    };
+  }
+  return {
+    isSubmodule: false, path: state.repository?.path, parentPath: null, relativePath: null,
+    name: state.repository?.name, branches: state.branches || [], currentBranch: state.repository?.current_branch,
+    headDetached: !!state.repository?.head_detached, headOid: state.repository?.head_oid,
+  };
+}
+
 function renderBranches() {
-  refs.branches.innerHTML = state.branches.map((branch, index) => `<div class="branch-row ${branch.current ? 'active' : ''}" data-branch="${esc(branch.name)}" data-is-remote="${branch.remote ? 'true' : 'false'}">
+  const context = activeRepositoryContext();
+  const { rows, detached, detachedAt } = selectBranchRows(context);
+  // Point 2 of the report: a detached submodule (or parent) must show its
+  // own explicit "Detached HEAD at <sha>" row/status — never leave the
+  // sidebar merely *not* highlighting anything, which reads as "nothing is
+  // checked out" rather than the real, different state "on a specific
+  // commit, no branch".
+  const detachedRow = detached ? `<div class="branch-row detached-head-row active"><span class="branch-bullet detached"></span><span class="branch-name">Detached HEAD at ${esc((detachedAt || '').slice(0, 8))}</span></div>` : '';
+  refs.branches.innerHTML = detachedRow + rows.map((branch, index) => `<div class="branch-row ${branch.isHead ? 'active' : ''}" data-branch="${esc(branch.name)}" data-is-remote="${branch.remote ? 'true' : 'false'}">
     <span class="branch-bullet" style="border-color:${palette[index % palette.length]}"></span>
     <span class="branch-name">${esc(branch.name)}</span>
     <div style="display:flex;gap:6px;margin-left:auto;">
-      ${branch.current ? '<small>HEAD</small>' : branch.remote ? '<small>remote</small>' : `<button class="switch-branch" data-branch="${esc(branch.name)}" title="Switch to ${esc(branch.name)}">↔</button>`}
-      ${!branch.remote && !branch.current ? `<button class="branch-menu" data-branch="${esc(branch.name)}" title="Branch actions" style="width:20px;height:20px;padding:0;font-size:14px;border-radius:3px;">⋮</button>` : ''}
+      ${branch.isHead ? '<small>HEAD</small>' : branch.remote ? '<small>remote</small>' : `<button class="switch-branch" data-branch="${esc(branch.name)}" title="Switch to ${esc(branch.name)}">↔</button>`}
+      ${!branch.remote && !branch.isHead ? `<button class="branch-menu" data-branch="${esc(branch.name)}" title="Branch actions" style="width:20px;height:20px;padding:0;font-size:14px;border-radius:3px;">⋮</button>` : ''}
     </div>
-  </div>`).join('') || '<div class="empty-change">No branches</div>';
+  </div>`).join('') || (detached ? '' : '<div class="empty-change">No branches</div>');
   refs.branches.querySelectorAll('.switch-branch').forEach(button => button.addEventListener('click', event => { event.stopPropagation(); switchBranch(button.dataset.branch); }));
   refs.branches.querySelectorAll('.branch-menu').forEach(button => button.addEventListener('click', event => { event.stopPropagation(); showBranchMenu(button.dataset.branch, event); }));
+}
+
+// Message D, point 5: the "SUBMODULE PULL REQUEST" section exists at all
+// only while a submodule's own Branch Map is actually open — never shown,
+// never polled, the rest of the time, and always plainly labeled with
+// *which* submodule so it can never be mistaken for the project's own PR
+// section right above it.
+function renderSubmodulePrHeading() {
+  const active = !!state.submoduleGraph;
+  refs.toggleSubmodulePrStatus.hidden = !active;
+  refs.submodulePrStatusPanel.hidden = !active;
+  if (active) { refs.submodulePrStatusLabel.textContent = `SUBMODULE PULL REQUEST · ${state.submoduleGraph.name}`; }
+  else { submodulePrStatusPanel?.setExpanded(false); refs.submodulePrStatusArrow.textContent = '▸'; }
 }
 
 function showBranchMenu(branchName, event) {
@@ -1917,17 +1966,35 @@ function showBranchMenu(branchName, event) {
   document.addEventListener('click', (e) => { if (!menuContainer.contains(e.target)) document.body.removeChild(menuContainer); }, { once: true });
 }
 
+// rename_branch/delete_branch are already fully generic on the backend —
+// whatever repository_path they're given, parent or submodule's own — so
+// the fix here is entirely about which path/refresh path this sends,
+// never a backend change. Never state.repository.path unconditionally.
 async function renameBranch(oldName, newName) {
-  if (!state.repository) return;
+  const context = activeRepositoryContext();
+  if (!context.path) return;
   if (!invoke) { status(`Preview: renamed ${oldName} to ${newName}`); return; }
-  try { status('Renaming branch…', 'busy'); await invoke('rename_branch', { repositoryPath: state.repository.path, oldName, newName }); await loadRepository(state.repository.path, { keepPath: true }); status(`Branch renamed to ${newName}`); }
+  try {
+    status('Renaming branch…', 'busy');
+    await invoke('rename_branch', { repositoryPath: context.path, oldName, newName });
+    if (context.isSubmodule) await openSubmoduleGraph({ relative_path: context.relativePath, name: context.name });
+    else await loadRepository(context.path, { keepPath: true });
+    status(`Branch renamed to ${newName}`);
+  }
   catch (error) { handleError(error); }
 }
 
 async function deleteBranch(branchName) {
-  if (!state.repository) return;
+  const context = activeRepositoryContext();
+  if (!context.path) return;
   if (!invoke) { status(`Preview: deleted ${branchName}`); return; }
-  try { status('Deleting branch…', 'busy'); await invoke('delete_branch', { repositoryPath: state.repository.path, branchName }); await loadRepository(state.repository.path, { keepPath: true }); status(`Branch ${branchName} deleted`); }
+  try {
+    status('Deleting branch…', 'busy');
+    await invoke('delete_branch', { repositoryPath: context.path, branchName });
+    if (context.isSubmodule) await openSubmoduleGraph({ relative_path: context.relativePath, name: context.name });
+    else await loadRepository(context.path, { keepPath: true });
+    status(`Branch ${branchName} deleted`);
+  }
   catch (error) { handleError(error); }
 }
 
@@ -2640,6 +2707,26 @@ function drawGraphOverlay(model, lanesWidth) {
     }
   });
 
+  // Point 8 of the report: a lane still open (unresolved) at the very last
+  // loaded row must never just stop with no explanation — that reads as an
+  // arbitrary colored line, not "this branch's real history continues past
+  // what's loaded". Only drawn when there's real, backend-confirmed history
+  // beyond this page (commitsTruncated) — a lane that simply reached its
+  // own true root commit (the real end of that branch's history) gets no
+  // such mark, since there genuinely is nothing more to continue into.
+  if (activeGraphData().commitsTruncated && model.length) {
+    const lastNode = model[model.length - 1];
+    const lastPos = positions.get(lastNode.commitId);
+    if (lastPos) {
+      lastNode.after.forEach((commitId, lane) => {
+        if (commitId == null) return;
+        const color = palette[lane % palette.length];
+        const x = laneX(lane);
+        parts.push(`<line x1="${x}" y1="${lastPos.y + 12}" x2="${x}" y2="${lastPos.y + 26}" stroke="${color}" stroke-width="3" stroke-linecap="round" stroke-dasharray="1 5" opacity="0.55"/>`);
+      });
+    }
+  }
+
   const svg = container.querySelector('.graph-overlay');
   const height = container.scrollHeight;
   svg.setAttribute('width', lanesWidth); svg.setAttribute('height', height);
@@ -2993,7 +3080,8 @@ async function flushPendingTogglesNow(options = {}, context = 'the previous Stag
 }
 
 async function switchBranch(branch) {
-  if (!invoke || !state.repository) return;
+  const context = activeRepositoryContext();
+  if (!invoke || !context.path) return;
   try {
     // Must land before the checkout itself, not just before the reload after
     // it — a checkout racing a still-pending stage/unstage call is exactly
@@ -3002,7 +3090,22 @@ async function switchBranch(branch) {
     // error, not an unhandled rejection that silently leaves the branch
     // switch never attempted.
     await flushPendingTogglesNow({}, 'the Stage operation');
-    status(`Switching to ${branch}…`, 'busy'); await invoke('switch_branch', { path: state.repository.path, branch }); await loadRepository(state.repository.path);
+    status(`Switching to ${branch}…`, 'busy');
+    if (context.isSubmodule) {
+      // Never the plain switch_branch here: a submodule's own checkout is
+      // only half the operation — switch_submodule_version is what also
+      // records the new commit in the parent's index right after,
+      // otherwise the submodule would immediately show as "modified"
+      // against a pointer the parent never actually asked for. Reusing
+      // openSubmoduleGraph for the refresh keeps this on the exact same,
+      // already-correct path that opening the Branch Map itself uses —
+      // never a hand-rolled partial state update that could drift from it.
+      await invoke('switch_submodule_version', { repositoryPath: context.parentPath, relativePath: context.relativePath, revision: branch, versionKind: 'branch', name: branch });
+      await openSubmoduleGraph({ relative_path: context.relativePath, name: context.name });
+    } else {
+      await invoke('switch_branch', { path: context.path, branch });
+      await loadRepository(context.path);
+    }
   }
   catch (error) { handleError(error); }
 }
@@ -3279,6 +3382,12 @@ $('#initRepo').addEventListener('click', async () => {
 });
 $('#newBranch').addEventListener('click', async () => {
   if (!state.repository) return;
+  // While a submodule's own Branch Map is actually open, this button is
+  // unambiguous — there's no "which repository did you mean" the way
+  // there is for a merely-*selected* submodule row in Explorer (handled
+  // just below): the user is looking straight at the submodule's own
+  // sidebar/graph, so the new branch goes there, not the parent.
+  if (state.submoduleGraph) { return createSubmoduleBranch({ kind: 'submodule', relative_path: state.submoduleGraph.relativePath, name: state.submoduleGraph.name }); }
   // This button is easy to confuse with a per-submodule action when a
   // submodule happens to be selected — it always creates the branch (and
   // switches) on the MAIN project, never the submodule, so make that
@@ -4104,21 +4213,19 @@ function createPrStatusPanel(root, options) {
   return { setExpanded, refreshIfContextChanged, isExpanded: () => expanded };
 }
 
-// The panel follows whatever repository/branch the user is actually looking
-// at: the parent normally, but the *submodule's* own repo and branch while
-// its Submodule Branch Map is open (state.submoduleGraph). The backend
-// re-resolves HEAD/upstream from whichever path it's given, and the
-// generation guard in load() drops a slow parent response that lands after
-// the context already moved to a submodule.
+// Message D, point 5: "Project pull request" always means the PARENT
+// project and its own checked-out branch — never silently replaced by a
+// submodule's just because its Branch Map happens to be open. (It used to
+// follow state.submoduleGraph the same way the sidebar's own branch list
+// incorrectly did — same root cause, same fix: never let a repository-
+// sensitive panel default to "whatever's currently on screen" instead of
+// an explicit, named repository.) The separate submodulePrStatusPanel
+// below is where a submodule's own PR status actually lives now.
 const mainPrStatusPanel = createPrStatusPanel(refs.prStatusPanel, {
-  getRepositoryPath: () => state.submoduleGraph?.repository?.path || state.repository?.path || null,
-  getBranch: () => {
-    const info = state.submoduleGraph ? state.submoduleGraph.repository : state.repository;
-    if (!info || info.head_detached) return null;
-    return info.current_branch || null;
-  },
-  getContextLabel: () => (state.submoduleGraph ? `submodule:${state.submoduleGraph.name}` : 'parent'),
-  getContextTitle: () => (state.submoduleGraph ? `Submodule · ${state.submoduleGraph.name}` : null),
+  getRepositoryPath: () => state.repository?.path || null,
+  getBranch: () => (state.repository && !state.repository.head_detached) ? (state.repository.current_branch || null) : null,
+  getContextLabel: () => 'parent',
+  getContextTitle: () => null,
   pollMs: 60000,
 });
 refs.togglePrStatus.addEventListener('click', () => {
@@ -4127,6 +4234,32 @@ refs.togglePrStatus.addEventListener('click', () => {
   mainPrStatusPanel.setExpanded(next);
 });
 refs.prStatusPanel.addEventListener('click', event => {
+  const link = event.target.closest('[data-open-url]');
+  if (!link || link.disabled) return;
+  const url = link.dataset.openUrl;
+  if (invoke) invoke('open_external_url', { url }).catch(error => status(String(error), 'error'));
+  else window.open(url, '_blank', 'noopener');
+});
+
+// A separate, clearly-labeled section for the currently-open submodule's
+// own PR status — only ever visible while state.submoduleGraph is set (see
+// renderSubmodulePrHeading, called from render()). A detached submodule
+// reports no branch here (getBranch returns null), which the existing
+// panel/backend already render as an explicit "detached HEAD, no PR"
+// state rather than silently showing nothing.
+const submodulePrStatusPanel = createPrStatusPanel(refs.submodulePrStatusPanel, {
+  getRepositoryPath: () => state.submoduleGraph?.repository?.path || null,
+  getBranch: () => (state.submoduleGraph && !state.submoduleGraph.repository.head_detached) ? (state.submoduleGraph.repository.current_branch || null) : null,
+  getContextLabel: () => (state.submoduleGraph ? `submodule:${state.submoduleGraph.name}` : 'none'),
+  getContextTitle: () => null,
+  pollMs: 60000,
+});
+refs.toggleSubmodulePrStatus.addEventListener('click', () => {
+  const next = !submodulePrStatusPanel.isExpanded();
+  refs.submodulePrStatusArrow.textContent = next ? '▾' : '▸';
+  submodulePrStatusPanel.setExpanded(next);
+});
+refs.submodulePrStatusPanel.addEventListener('click', event => {
   const link = event.target.closest('[data-open-url]');
   if (!link || link.disabled) return;
   const url = link.dataset.openUrl;

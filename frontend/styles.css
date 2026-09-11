@@ -95,6 +95,12 @@ button { cursor: default; }
 .branch-row.active { border-color: #2b5e8c; background: #17334e; color: #f0f7ff; }
 .branch-bullet { width: 12px; height: 12px; border: 3px solid var(--blue); border-radius: 50%; }
 .branch-row.active .branch-bullet { background: var(--blue); box-shadow: 0 0 10px #58a6ff99; }
+/* A detached checkout's own explicit sidebar row (point 2 of the report)
+   — visually distinct from a real branch being HEAD, never the same blue
+   solid dot, so "on a specific commit, no branch" reads as its own state
+   rather than looking like an ordinary branch happens to be named that. */
+.branch-bullet.detached { border-color: var(--amber); border-style: dashed; background: transparent; }
+.branch-row.active .branch-bullet.detached { background: transparent; box-shadow: 0 0 8px #f0b65a77; }
 .branch-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .branch-row small { color: #7890a4; font-size: 10px; }
 .switch-branch { height: 25px; padding: 0 8px; border: 1px solid #42617c; border-radius: 5px; background: #1b3042; color: #a9d5f7; font-size: 10px; }.switch-branch:hover { border-color: #65a8df; background: #23425b; }
