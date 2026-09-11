@@ -1921,8 +1921,18 @@ function renderBranches() {
   // checked out" rather than the real, different state "on a specific
   // commit, no branch".
   const detachedRow = detached ? `<div class="branch-row detached-head-row active"><span class="branch-bullet detached"></span><span class="branch-name">Detached HEAD at ${esc((detachedAt || '').slice(0, 8))}</span></div>` : '';
-  refs.branches.innerHTML = detachedRow + rows.map((branch, index) => `<div class="branch-row ${branch.isHead ? 'active' : ''}" data-branch="${esc(branch.name)}" data-is-remote="${branch.remote ? 'true' : 'false'}">
-    <span class="branch-bullet" style="border-color:${palette[index % palette.length]}"></span>
+  // Message E, point 9: this bullet used to be colored by the row's index
+  // into the same `palette` the graph's lanes are colored from
+  // (palette[index % palette.length]) — two entirely unrelated indices
+  // sharing one finite color set, which visually implied a branch-to-lane
+  // correspondence that was never real (a lane is a topology-driven
+  // rendering slot the graph model itself reuses across unrelated commits —
+  // see buildGraphModel's own doc comment in graph-model.js — not a stable
+  // per-branch identity a sidebar row could legitimately mirror). Left
+  // neutral (the bullet's plain CSS default) instead of inventing a mapping
+  // that would just be a different false correspondence.
+  refs.branches.innerHTML = detachedRow + rows.map(branch => `<div class="branch-row ${branch.isHead ? 'active' : ''}" data-branch="${esc(branch.name)}" data-is-remote="${branch.remote ? 'true' : 'false'}">
+    <span class="branch-bullet"></span>
     <span class="branch-name">${esc(branch.name)}</span>
     <div style="display:flex;gap:6px;margin-left:auto;">
       ${branch.isHead ? '<small>HEAD</small>' : branch.remote ? '<small>remote</small>' : `<button class="switch-branch" data-branch="${esc(branch.name)}" title="Switch to ${esc(branch.name)}">↔</button>`}
@@ -4140,13 +4150,27 @@ function createPrStatusPanel(root, options) {
     return title ? `<div class="pr-status-context">${esc(title)}</div>` : '';
   }
 
+  // Point 2 of the report: outgoing ("this branch is the PR's head/source")
+  // and incoming ("this branch is the PR's base/target") are two genuinely
+  // different relationships — shown as two clearly, separately labeled
+  // sections rather than one merged list, which is exactly how a real
+  // incoming PR (this branch as someone else's *target*) went unnoticed
+  // before: there was nowhere for it to be shown as a different kind of
+  // result at all.
+  function prDirectionSectionHtml(label, prs) {
+    if (!prs.length) return '';
+    const heading = `<div class="pr-status-direction-heading">${esc(label)}${prs.length > 1 ? ` (${prs.length})` : ''}</div>`;
+    return heading + prs.map(prCardHtml).join('');
+  }
+
   function renderState(result) {
     const ctx = contextHeaderHtml();
     if (result.state === 'loading' || result.state === 'superseded') { root.innerHTML = ctx + '<div class="pr-status-loading"><i class="spinner"></i>Checking pull request status…</div>'; return; }
-    if (result.state === 'ok' && result.pull_requests.length) {
+    const outgoing = result.outgoing_pull_requests || [];
+    const incoming = result.incoming_pull_requests || [];
+    if (result.state === 'ok' && (outgoing.length || incoming.length)) {
       const partialNote = result.partial ? '<div class="pr-status-partial">Not every related repository could be checked — there may be more.</div>' : '';
-      const heading = result.pull_requests.length > 1 ? `<div class="pr-status-count">${result.pull_requests.length} open pull requests for <code>${esc(result.branch || '')}</code></div>` : '';
-      root.innerHTML = ctx + partialNote + heading + result.pull_requests.map(prCardHtml).join('');
+      root.innerHTML = ctx + partialNote + prDirectionSectionHtml('Pull requests from this branch', outgoing) + prDirectionSectionHtml('Pull requests into this branch', incoming);
       return;
     }
     const message = PR_STATE_LABELS[result.state] || result.detail || 'Pull request status unavailable.';
@@ -4171,10 +4195,10 @@ function createPrStatusPanel(root, options) {
     const branch = options.getBranch();
     const context = options.getContextLabel?.() || null;
     lastKey = contextKey();
-    if (!repositoryPath) { renderState({ state: 'no_repository', detail: 'No repository open.', pull_requests: [] }); return; }
+    if (!repositoryPath) { renderState({ state: 'no_repository', detail: 'No repository open.', outgoing_pull_requests: [], incoming_pull_requests: [] }); return; }
     const myGeneration = ++generation;
-    renderState({ state: 'loading', pull_requests: [] });
-    if (!invoke) { renderState({ state: 'no_open_pr', branch, pull_requests: [] }); return; }
+    renderState({ state: 'loading', outgoing_pull_requests: [], incoming_pull_requests: [] });
+    if (!invoke) { renderState({ state: 'no_open_pr', branch, outgoing_pull_requests: [], incoming_pull_requests: [] }); return; }
     try {
       const result = await invoke('pr_status', { repositoryPath, branch: branch || null, context });
       if (myGeneration !== generation) return; // a newer load (or context change) superseded this one

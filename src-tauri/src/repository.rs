@@ -2313,8 +2313,9 @@ pub struct PullRequestSummary {
 pub struct PrStatusResult {
     // "no_remote" | "unsupported_provider" | "auth_missing" | "api_error" |
     // "no_open_pr" | "no_upstream" | "partial_result" | "detached_head" |
-    // "no_branch" | "superseded" | "ok" (one or more PRs — the frontend
-    // distinguishes "one" vs "multiple" from pull_requests.len() itself)
+    // "no_branch" | "superseded" | "ok" (one or more PRs in either list —
+    // the frontend distinguishes "one" vs "multiple" from each list's own
+    // .len())
     state: String,
     detail: String,
     // The branch actually checked against the server (the *remote* branch
@@ -2323,17 +2324,31 @@ pub struct PrStatusResult {
     branch: Option<String>,
     // The `host/owner/repo` the query ran against — same message.
     queried_repo: Option<String>,
-    // True when the search could not check every relevant candidate
-    // repository (one errored, or the candidate list was longer than the
-    // cap) — an empty result under this must never be presented as a
-    // confident "no PR" (see state "partial_result").
+    // True when the search could not check every relevant query (a
+    // candidate repo errored, the candidate list was longer than the cap,
+    // or the incoming-PR query itself failed) — an empty result under this
+    // must never be presented as a confident "no PR" (see state
+    // "partial_result").
     partial: bool,
-    pull_requests: Vec<PullRequestSummary>,
+    // Current branch is the PR's head/source — "Pull requests from this
+    // branch". Still named pull_requests-shaped (PullRequestSummary), kept
+    // as its own explicit field rather than a single ambiguous list: this
+    // whole change exists because collapsing "from" and "into" together is
+    // exactly how a real incoming PR (this branch as someone else's
+    // *target*) went undetected before.
+    outgoing_pull_requests: Vec<PullRequestSummary>,
+    // Current branch is the PR's base/target — "Pull requests into this
+    // branch". Never filtered by head owner/repo (point 4): an incoming PR
+    // is expected to come from any other branch, fork, or owner — `--repo
+    // --base` already scopes it to PRs that genuinely target this branch
+    // in this repository, which is the only check that's actually correct
+    // for this direction.
+    incoming_pull_requests: Vec<PullRequestSummary>,
 }
 
 impl PrStatusResult {
     fn plain(state: &str, detail: impl Into<String>) -> Self {
-        PrStatusResult { state: state.into(), detail: detail.into(), branch: None, queried_repo: None, partial: false, pull_requests: Vec::new() }
+        PrStatusResult { state: state.into(), detail: detail.into(), branch: None, queried_repo: None, partial: false, outgoing_pull_requests: Vec::new(), incoming_pull_requests: Vec::new() }
     }
 }
 
@@ -2554,9 +2569,17 @@ fn resolve_pr_query_context(repo: &Repository, frontend_branch: Option<&str>) ->
     })
 }
 
-// The two variables of a `gh pr list` call — everything else is constant.
+// Which side of the PR `branch` is being matched against — Head for the
+// existing "PRs from this branch" query, Base for "PRs into this branch"
+// (the direction the original report showed was never queried at all).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum PrQueryDirection { Head, Base }
+
+// The variables of one `gh pr list` call — everything else is constant.
+// `branch` is deliberately generic (not `head`): the same resolved remote
+// branch name is correct as either side, depending on `direction`.
 #[derive(Debug, Clone, PartialEq)]
-struct PrGhQuery { repo: String, head: String }
+struct PrGhQuery { repo: String, branch: String, direction: PrQueryDirection }
 
 // The outcome of one `gh pr list` call, in a shape a test can fabricate
 // without constructing a real `std::process::Output`.
@@ -2576,8 +2599,9 @@ fn gh_stderr_looks_like_auth(stderr: &str) -> bool {
 }
 
 fn run_gh_pr_list(query: &PrGhQuery) -> GhOutcome {
+    let side_flag = match query.direction { PrQueryDirection::Head => "--head", PrQueryDirection::Base => "--base" };
     let mut command = Command::new("gh");
-    command.args(["pr", "list", "--repo", &query.repo, "--head", &query.head, "--state", "open", "--json", PR_GH_JSON_FIELDS]);
+    command.args(["pr", "list", "--repo", &query.repo, side_flag, &query.branch, "--state", "open", "--json", PR_GH_JSON_FIELDS]);
     command.stdin(std::process::Stdio::null());
     match run_with_timeout_labeled(command, Duration::from_secs(20), "gh", "20 seconds") {
         Err(error) => {
@@ -2628,11 +2652,29 @@ fn select_matching_prs(raw: &[serde_json::Value], head_branch: &str, head_owner:
         .collect()
 }
 
-// One candidate base's outcome, tagged with whether it was the head repo
-// (index 0) — collected from the concurrent dispatch in pr_status_impl below
-// and reduced into a PrStatusResult afterward, all on the calling thread, so
-// the reduction logic itself stays single-threaded and easy to follow.
-struct PrCandidateOutcome { is_head_repo: bool, base_id: String, outcome: GhOutcome }
+// `gh pr list --repo X --base Y` has no cross-fork ambiguity the way
+// `--head` does: a PR's base branch always lives in the repo the PR was
+// opened against, which is exactly `--repo` — there is no second repo a
+// same-named base branch could belong to. So, deliberately, no
+// owner/repo-name filter here at all (point 4 of the report): an incoming
+// PR is expected to come from any other branch, fork, or owner, and
+// filtering it the same way outgoing PRs are would silently drop
+// legitimate incoming PRs from anyone but ourselves.
+fn select_incoming_prs(raw: &[serde_json::Value]) -> Vec<PullRequestSummary> {
+    raw.iter().map(pr_summary_from_json).collect()
+}
+
+// One query's outcome, tagged with which role it played — collected from
+// the concurrent dispatch in pr_status_impl below and reduced into a
+// PrStatusResult afterward, all on the calling thread, so the reduction
+// logic itself stays single-threaded and easy to follow. Outgoing (current
+// branch as head/source) still fans out across every candidate base, as
+// before; Incoming (current branch as base/target) is always exactly one
+// query, against the repo the branch actually lives in — the two have
+// different validation rules (point 4) and are tracked for completeness
+// completely separately (point 6).
+enum PrCandidateRole { Outgoing { is_head_repo: bool }, Incoming }
+struct PrCandidateOutcome { role: PrCandidateRole, base_id: String, outcome: GhOutcome }
 
 fn pr_status_impl(
     ctx: PrQueryContext,
@@ -2654,75 +2696,113 @@ fn pr_status_impl(
         ctx.tracking_remote, ctx.had_upstream, ctx.candidate_bases.len(), ctx.candidates_truncated,
     ), Duration::ZERO);
 
-    // Every candidate base is queried *concurrently* — one OS thread each,
-    // bounded by PR_MAX_CANDIDATE_BASES — instead of one after another
-    // (which meant a worst case of N sequential 20s timeouts). Since they
-    // all start together, the wall-clock bound for the whole round is just
-    // the slowest single candidate's own existing 20s timeout, not their
-    // sum — this is what actually keeps a "reasonable total timeout" true
-    // without a second, redundant deadline layered on top. `run` must be
-    // `Sync` — shared, read-only, across every spawned thread.
+    // Every outgoing candidate base, *and* the one incoming query, are
+    // dispatched together in the same concurrent batch — one OS thread
+    // each — instead of one after another (which meant a worst case of N
+    // sequential 20s timeouts). Since they all start together, the
+    // wall-clock bound for the whole round is just the slowest single
+    // query's own existing 20s timeout, not their sum. `run` must be
+    // `Sync` — shared, read-only, across every spawned thread. The
+    // incoming query is never fanned out across candidate_bases the way
+    // outgoing is: a PR that targets this branch can only ever be opened
+    // in the repo the branch actually lives in, never a different remote.
     let dispatch_started = Instant::now();
     let outcomes: Vec<PrCandidateOutcome> = std::thread::scope(|scope| {
-        let handles: Vec<_> = ctx.candidate_bases.iter().enumerate().map(|(index, base)| {
-            let query = PrGhQuery { repo: base.gh_repo_arg(), head: ctx.head_branch.clone() };
-            scope.spawn(move || {
+        let mut handles = Vec::with_capacity(ctx.candidate_bases.len() + 1);
+        for (index, base) in ctx.candidate_bases.iter().enumerate() {
+            let query = PrGhQuery { repo: base.gh_repo_arg(), branch: ctx.head_branch.clone(), direction: PrQueryDirection::Head };
+            handles.push(scope.spawn(move || {
                 let base_id = anonymized_repository_id(&query.repo);
-                PrCandidateOutcome { is_head_repo: index == 0, base_id, outcome: run(&query) }
-            })
-        }).collect();
+                PrCandidateOutcome { role: PrCandidateRole::Outgoing { is_head_repo: index == 0 }, base_id, outcome: run(&query) }
+            }));
+        }
+        let incoming_query = PrGhQuery { repo: ctx.head_repo.gh_repo_arg(), branch: ctx.head_branch.clone(), direction: PrQueryDirection::Base };
+        handles.push(scope.spawn(move || {
+            let base_id = anonymized_repository_id(&incoming_query.repo);
+            PrCandidateOutcome { role: PrCandidateRole::Incoming, base_id, outcome: run(&incoming_query) }
+        }));
         handles.into_iter().map(|handle| handle.join().unwrap_or(PrCandidateOutcome {
-            is_head_repo: false, base_id: "unknown".into(),
+            role: PrCandidateRole::Outgoing { is_head_repo: false }, base_id: "unknown".into(),
             outcome: GhOutcome::Failure { stderr: "gh query thread panicked".into() },
         })).collect()
     });
-    perf_log(&format!("pr_status: [{context_label}] {} candidate queries dispatched concurrently", ctx.candidate_bases.len()), dispatch_started.elapsed());
+    perf_log(&format!("pr_status: [{context_label}] {} outgoing + 1 incoming query dispatched concurrently", ctx.candidate_bases.len()), dispatch_started.elapsed());
 
-    let mut found: Vec<PullRequestSummary> = Vec::new();
+    let mut outgoing_found: Vec<PullRequestSummary> = Vec::new();
+    let mut incoming_found: Vec<PullRequestSummary> = Vec::new();
     let mut raw_total = 0usize;
     let mut head_repo_query_ok = false;
     let mut head_repo_error: Option<(bool, String)> = None; // (auth-ish, detail)
     let mut head_repo_unavailable: Option<(bool, String)> = None; // gh missing / unrunnable
-    // A *non*-head candidate that failed or couldn't run — the search wasn't
-    // complete, so an otherwise-empty result must not read as confident.
+    // A *non*-head outgoing candidate that failed or couldn't run — the
+    // search wasn't complete, so an otherwise-empty result must not read
+    // as confident.
     let mut secondary_candidate_failed = false;
+    // The incoming query's own completeness — deliberately never promoted
+    // to a hard top-level error the way the head repo's own failure is
+    // (point 6 asks for "a partial result", not for an outgoing success to
+    // be overridden by an incoming-side auth/API error): it only ever
+    // widens `incomplete`, same bucket as secondary_candidate_failed.
+    let mut incoming_incomplete = false;
 
-    for PrCandidateOutcome { is_head_repo, base_id, outcome } in outcomes {
-        match outcome {
-            GhOutcome::Prs(items) => {
-                if is_head_repo { head_repo_query_ok = true; }
-                raw_total += items.len();
-                found.extend(select_matching_prs(&items, &ctx.head_branch, &head_owner, &head_name));
-            }
-            GhOutcome::Failure { stderr } => {
-                let auth = gh_stderr_looks_like_auth(&stderr);
-                perf_log(&format!("pr_status: [{context_label}] base=<{base_id}> query failed (auth={auth})"), Duration::ZERO);
-                if is_head_repo { head_repo_error = Some((auth, stderr)); } else { secondary_candidate_failed = true; }
-            }
-            GhOutcome::Unavailable { not_installed, detail } => {
-                perf_log(&format!("pr_status: [{context_label}] base=<{base_id}> gh unavailable (not_installed={not_installed})"), Duration::ZERO);
-                if is_head_repo { head_repo_unavailable = Some((not_installed, detail)); } else { secondary_candidate_failed = true; }
-            }
+    for PrCandidateOutcome { role, base_id, outcome } in outcomes {
+        match role {
+            PrCandidateRole::Outgoing { is_head_repo } => match outcome {
+                GhOutcome::Prs(items) => {
+                    if is_head_repo { head_repo_query_ok = true; }
+                    raw_total += items.len();
+                    outgoing_found.extend(select_matching_prs(&items, &ctx.head_branch, &head_owner, &head_name));
+                }
+                GhOutcome::Failure { stderr } => {
+                    let auth = gh_stderr_looks_like_auth(&stderr);
+                    perf_log(&format!("pr_status: [{context_label}] outgoing base=<{base_id}> query failed (auth={auth})"), Duration::ZERO);
+                    if is_head_repo { head_repo_error = Some((auth, stderr)); } else { secondary_candidate_failed = true; }
+                }
+                GhOutcome::Unavailable { not_installed, detail } => {
+                    perf_log(&format!("pr_status: [{context_label}] outgoing base=<{base_id}> gh unavailable (not_installed={not_installed})"), Duration::ZERO);
+                    if is_head_repo { head_repo_unavailable = Some((not_installed, detail)); } else { secondary_candidate_failed = true; }
+                }
+            },
+            PrCandidateRole::Incoming => match outcome {
+                GhOutcome::Prs(items) => {
+                    raw_total += items.len();
+                    incoming_found.extend(select_incoming_prs(&items));
+                }
+                GhOutcome::Failure { stderr } => {
+                    perf_log(&format!("pr_status: [{context_label}] incoming base=<{base_id}> query failed: {stderr}"), Duration::ZERO);
+                    incoming_incomplete = true;
+                }
+                GhOutcome::Unavailable { not_installed, detail } => {
+                    perf_log(&format!("pr_status: [{context_label}] incoming base=<{base_id}> gh unavailable (not_installed={not_installed}): {detail}"), Duration::ZERO);
+                    incoming_incomplete = true;
+                }
+            },
         }
     }
 
-    // The same PR reached through two different `--repo` targets is one PR.
-    found.sort_by(|a, b| a.url.cmp(&b.url));
-    found.dedup_by(|a, b| !a.url.is_empty() && a.url == b.url);
+    // The same PR reached through two different `--repo` targets is one PR
+    // — within each direction; outgoing and incoming are two genuinely
+    // different relationships and are never deduplicated against each
+    // other (a branch can, in principle, be both some PR's head and a
+    // different PR's base at the same time).
+    outgoing_found.sort_by(|a, b| a.url.cmp(&b.url));
+    outgoing_found.dedup_by(|a, b| !a.url.is_empty() && a.url == b.url);
+    incoming_found.sort_by(|a, b| a.url.cmp(&b.url));
+    incoming_found.dedup_by(|a, b| !a.url.is_empty() && a.url == b.url);
 
-    let incomplete = ctx.candidates_truncated || secondary_candidate_failed;
-    perf_log(&format!("pr_status: [{context_label}] raw_results={raw_total} after_filter={} incomplete={incomplete}", found.len()), Duration::ZERO);
+    let incomplete = ctx.candidates_truncated || secondary_candidate_failed || incoming_incomplete;
+    perf_log(&format!("pr_status: [{context_label}] raw_results={raw_total} outgoing={} incoming={} incomplete={incomplete}", outgoing_found.len(), incoming_found.len()), Duration::ZERO);
 
-    if !found.is_empty() {
-        // Real PRs found — worth reporting regardless of whether every
-        // candidate could be checked; `partial` still says so.
-        return PrStatusResult { state: "ok".into(), detail: String::new(), branch: Some(ctx.head_branch), queried_repo: Some(queried_repo), partial: incomplete, pull_requests: found };
+    if !outgoing_found.is_empty() || !incoming_found.is_empty() {
+        // Real PRs found in either direction — worth reporting regardless
+        // of whether every query could be checked; `partial` still says so.
+        return PrStatusResult { state: "ok".into(), detail: String::new(), branch: Some(ctx.head_branch), queried_repo: Some(queried_repo), partial: incomplete, outgoing_pull_requests: outgoing_found, incoming_pull_requests: incoming_found };
     }
     if let Some((not_installed, detail)) = head_repo_unavailable {
         let message = if not_installed {
             "The GitHub CLI (`gh`) isn't installed — install it and run `gh auth login` to see pull request status.".to_string()
         } else { detail };
-        return PrStatusResult { state: "auth_missing".into(), detail: message, branch: Some(ctx.head_branch), queried_repo: Some(queried_repo), partial: true, pull_requests: Vec::new() };
+        return PrStatusResult { state: "auth_missing".into(), detail: message, branch: Some(ctx.head_branch), queried_repo: Some(queried_repo), partial: true, outgoing_pull_requests: Vec::new(), incoming_pull_requests: Vec::new() };
     }
     if let Some((auth, stderr)) = head_repo_error {
         let enterprise = ctx.head_repo.host != "github.com";
@@ -2733,28 +2813,30 @@ fn pr_status_impl(
         } else if stderr.trim().is_empty() {
             "The GitHub API request failed.".to_string()
         } else { stderr.trim().to_string() };
-        return PrStatusResult { state: state.into(), detail, branch: Some(ctx.head_branch), queried_repo: Some(queried_repo), partial: true, pull_requests: Vec::new() };
+        return PrStatusResult { state: state.into(), detail, branch: Some(ctx.head_branch), queried_repo: Some(queried_repo), partial: true, outgoing_pull_requests: Vec::new(), incoming_pull_requests: Vec::new() };
     }
     if !head_repo_query_ok {
         // Neither a result, an error, nor "unavailable" from the head repo —
         // shouldn't happen, but never report a confident "no PR" off it.
-        return PrStatusResult { state: "api_error".into(), detail: "Could not determine pull request status.".into(), branch: Some(ctx.head_branch), queried_repo: Some(queried_repo), partial: true, pull_requests: Vec::new() };
+        return PrStatusResult { state: "api_error".into(), detail: "Could not determine pull request status.".into(), branch: Some(ctx.head_branch), queried_repo: Some(queried_repo), partial: true, outgoing_pull_requests: Vec::new(), incoming_pull_requests: Vec::new() };
     }
     if incomplete {
-        // The head repo itself came back clean, but at least one other
-        // relevant candidate could not be checked (or there were more
-        // candidates than the cap allowed) — this must never look like a
-        // confident "no open PR".
+        // Point 6: an empty result is only ever confident once *both*
+        // relevant queries (every outgoing candidate, and the one incoming
+        // query) actually completed. If either couldn't be checked, this
+        // must never look like a confident "no open PR" — including when
+        // the incoming query specifically is what failed, even though the
+        // outgoing side came back clean.
         return PrStatusResult {
             state: "partial_result".into(),
             detail: "Some candidate repositories could not be checked, so this result may be incomplete.".into(),
-            branch: Some(ctx.head_branch), queried_repo: Some(queried_repo), partial: true, pull_requests: Vec::new(),
+            branch: Some(ctx.head_branch), queried_repo: Some(queried_repo), partial: true, outgoing_pull_requests: Vec::new(), incoming_pull_requests: Vec::new(),
         };
     }
-    // Genuine empty: every candidate that was supposed to be checked was,
-    // and none had a match.
+    // Genuine empty: every relevant query — outgoing and incoming alike —
+    // completed, and none had a match.
     let state = if ctx.had_upstream { "no_open_pr" } else { "no_upstream" };
-    PrStatusResult { state: state.into(), detail: String::new(), branch: Some(ctx.head_branch), queried_repo: Some(queried_repo), partial: false, pull_requests: Vec::new() }
+    PrStatusResult { state: state.into(), detail: String::new(), branch: Some(ctx.head_branch), queried_repo: Some(queried_repo), partial: false, outgoing_pull_requests: Vec::new(), incoming_pull_requests: Vec::new() }
 }
 
 // A newer pr_status call for the same repository path tells an older,
@@ -3709,11 +3791,10 @@ fn switch_submodule_version_inner(repository_path: String, relative_path: String
     validate_path(&repository_path)?;
     let absolute = validate_submodule(&repository_path, &relative_path)?;
     let absolute_string = absolute.to_string_lossy().into_owned();
-    // The submodule's own lock, held only for this first phase (its own
-    // HEAD/checkout) — released before the parent's own lock is taken below
-    // for the gitlink update, so this thread never holds both repositories'
-    // write locks at once (see stage_files_inner's own comment for why that
-    // invariant matters).
+    // The submodule's own lock, held only for the checkout below. This
+    // function never touches the parent's index (see the comment after the
+    // checkout for why), so there is no second, parent-side lock to worry
+    // about ordering against.
     let queue_started = Instant::now();
     let sub_lock_handle = repo_write_lock(&absolute_string);
     let sub_lock = sub_lock_handle.lock().unwrap();
@@ -3765,14 +3846,20 @@ fn switch_submodule_version_inner(repository_path: String, relative_path: String
     let mut checkout = git2::build::CheckoutBuilder::new(); checkout.safe(); repo.checkout_head(Some(&mut checkout)).map_err(|error| error.message().to_string())?;
     let selected = repo.head().ok().and_then(|head| head.target()).map(|id| id.to_string()).unwrap_or_default();
     drop(repo);
-    drop(sub_lock); // fully released before the parent's own lock, never nested
-    let queue_started = Instant::now();
-    let lock_handle = repo_write_lock(&repository_path);
-    let _lock = lock_handle.lock().unwrap();
-    log_repo_write_lock_acquired(&repository_path, "switch_submodule_version(parent)", queue_started.elapsed());
-    let parent = internal_repository(&repository_path)?;
-    let mut submodule = parent.find_submodule(&relative_path).map_err(|error| error.message().to_string())?;
-    submodule.add_to_index(true).map_err(|error| format!("Version changed, but the parent index could not be updated: {}", error.message()))?;
+    drop(sub_lock);
+    // Deliberately does NOT touch the parent's index or gitlink. Switching a
+    // submodule's checked-out branch/remote-branch/tag/commit is a checkout,
+    // not a commit action — from the parent's point of view it must show up
+    // as an ordinary *unstaged* modification (the index-recorded submodule
+    // OID now differs from the submodule's live HEAD), exactly like editing
+    // any other tracked file, and staging it is the user's own explicit
+    // Stage action afterward, same as any other change. This used to call
+    // submodule.add_to_index(true) unconditionally right here, which
+    // silently promoted a mere checkout into a staged parent change the
+    // user never asked for. stage_files_inner already has dedicated
+    // submodule-HEAD-vs-index detection (see its own comment there) that
+    // correctly stages exactly this kind of change once the user asks for
+    // it, so nothing else needs to change to keep that path working.
     invalidate_git_metadata(&repository_path);
     invalidate_submodule_sync(&repository_path); // this app just changed a submodule's registration/version
     Ok(selected)
@@ -6274,7 +6361,8 @@ mod tests {
         create_libgit2_repository(&base, "README.md");
         let result = pr_status_inner(base.to_string_lossy().into_owned(), None, None).unwrap();
         assert_eq!(result.state, "no_remote");
-        assert!(result.pull_requests.is_empty());
+        assert!(result.outgoing_pull_requests.is_empty());
+        assert!(result.incoming_pull_requests.is_empty());
         fs::remove_dir_all(base).unwrap();
     }
 
@@ -6286,7 +6374,8 @@ mod tests {
         run_git(&base, &["remote", "add", "origin", "https://gitlab.com/team/repo.git"]);
         let result = pr_status_inner(base.to_string_lossy().into_owned(), None, None).unwrap();
         assert_eq!(result.state, "unsupported_provider");
-        assert!(result.pull_requests.is_empty());
+        assert!(result.outgoing_pull_requests.is_empty());
+        assert!(result.incoming_pull_requests.is_empty());
         fs::remove_dir_all(base).unwrap();
     }
 
@@ -6447,7 +6536,8 @@ mod tests {
         let result = pr_status_inner(path, None, None).unwrap();
         assert_eq!(result.state, "detached_head");
         assert!(result.queried_repo.is_none());
-        assert!(result.pull_requests.is_empty());
+        assert!(result.outgoing_pull_requests.is_empty());
+        assert!(result.incoming_pull_requests.is_empty());
         fs::remove_dir_all(base).unwrap();
     }
 
@@ -6515,29 +6605,41 @@ mod tests {
         let ctx = ctx_for(&repo);
 
         // Mutex, not RefCell: pr_status_impl now dispatches candidates
-        // concurrently, so `run` must be Sync.
+        // concurrently, so `run` must be Sync. Discriminates by direction —
+        // real `gh pr list --head` and `--base` are different, real calls;
+        // a fake here that answered every query identically would make an
+        // outgoing PR show up as incoming too, which is exactly the
+        // muddling this whole mechanism exists to keep apart.
         let seen = Mutex::new(Vec::<PrGhQuery>::new());
         let run = |q: &PrGhQuery| {
             seen.lock().unwrap().push(q.clone());
-            GhOutcome::Prs(vec![pr_json(42, "feature/on-server", "eng", "sw-prj-OMBMS_000U0")])
+            match q.direction {
+                PrQueryDirection::Head => GhOutcome::Prs(vec![pr_json(42, "feature/on-server", "eng", "sw-prj-OMBMS_000U0")]),
+                PrQueryDirection::Base => GhOutcome::Prs(Vec::new()),
+            }
         };
         let result = pr_status_impl(ctx, &path, "parent", &run);
 
         {
             let queries = seen.lock().unwrap();
-            assert_eq!(queries.len(), 1, "exactly one query — the enterprise head repo");
-            assert_eq!(queries[0], PrGhQuery {
+            assert_eq!(queries.len(), 2, "the enterprise head repo, outgoing and incoming");
+            assert!(queries.contains(&PrGhQuery {
                 repo: "github.vitesco.io/eng/sw-prj-OMBMS_000U0".into(),
-                head: "feature/on-server".into(),
-            }, "against the enterprise head repo, for the remote branch name");
+                branch: "feature/on-server".into(), direction: PrQueryDirection::Head,
+            }), "outgoing query against the enterprise head repo, for the remote branch name");
+            assert!(queries.contains(&PrGhQuery {
+                repo: "github.vitesco.io/eng/sw-prj-OMBMS_000U0".into(),
+                branch: "feature/on-server".into(), direction: PrQueryDirection::Base,
+            }), "incoming query against the same repo and branch");
         }
         assert_eq!(result.state, "ok");
         assert_eq!(result.queried_repo.as_deref(), Some("github.vitesco.io/eng/sw-prj-OMBMS_000U0"));
         assert_eq!(result.branch.as_deref(), Some("feature/on-server"));
-        assert_eq!(result.pull_requests.len(), 1);
-        assert_eq!(result.pull_requests[0].number, 42);
-        assert_eq!(result.pull_requests[0].review_summary, "approved");
-        assert_eq!(result.pull_requests[0].checks_status, "passing");
+        assert_eq!(result.outgoing_pull_requests.len(), 1);
+        assert_eq!(result.outgoing_pull_requests[0].number, 42);
+        assert_eq!(result.outgoing_pull_requests[0].review_summary, "approved");
+        assert_eq!(result.outgoing_pull_requests[0].checks_status, "passing");
+        assert!(result.incoming_pull_requests.is_empty());
         drop(repo);
         fs::remove_dir_all(base).unwrap();
     }
@@ -6555,7 +6657,8 @@ mod tests {
         let result = pr_status_impl(ctx, &path, "parent", &run);
         assert_eq!(result.state, "no_open_pr");
         assert_eq!(result.branch.as_deref(), Some("feat"));
-        assert!(result.pull_requests.is_empty());
+        assert!(result.outgoing_pull_requests.is_empty());
+        assert!(result.incoming_pull_requests.is_empty());
         drop(repo);
         fs::remove_dir_all(base).unwrap();
     }
@@ -6635,7 +6738,7 @@ mod tests {
         };
         let result = pr_status_impl(ctx, &path, "parent", &run);
         assert_eq!(result.state, "ok");
-        assert_eq!(result.pull_requests.iter().map(|p| p.number).collect::<Vec<_>>(), vec![5]);
+        assert_eq!(result.outgoing_pull_requests.iter().map(|p| p.number).collect::<Vec<_>>(), vec![5]);
         let queried = seen.lock().unwrap().clone();
         assert!(queried.contains(&"github.com/me/fork".to_string()));
         assert!(queried.contains(&"github.com/wrong/place".to_string()));
@@ -6654,11 +6757,18 @@ mod tests {
         run_git(&base, &["config", "branch.feature.merge", "refs/heads/feature"]);
         let repo = internal_repository(&path).unwrap();
         let ctx = ctx_for(&repo);
-        // Both `--repo` targets return the same PR (same canonical url).
-        let run = |_: &PrGhQuery| GhOutcome::Prs(vec![pr_json(88, "feature", "me", "fork")]);
+        // Both `--repo` targets return the same PR (same canonical url) for
+        // the outgoing (--head) direction only — this test is specifically
+        // about deduping *across candidate bases*, not about the incoming
+        // side, which is kept empty so it can't muddy that assertion.
+        let run = |q: &PrGhQuery| match q.direction {
+            PrQueryDirection::Head => GhOutcome::Prs(vec![pr_json(88, "feature", "me", "fork")]),
+            PrQueryDirection::Base => GhOutcome::Prs(Vec::new()),
+        };
         let result = pr_status_impl(ctx, &path, "parent", &run);
         assert_eq!(result.state, "ok");
-        assert_eq!(result.pull_requests.len(), 1, "one PR, not one per candidate base");
+        assert_eq!(result.outgoing_pull_requests.len(), 1, "one PR, not one per candidate base");
+        assert!(result.incoming_pull_requests.is_empty());
         drop(repo);
         fs::remove_dir_all(base).unwrap();
     }
@@ -6684,7 +6794,8 @@ mod tests {
         let result = pr_status_impl(ctx, &path, "parent", &run);
         assert_eq!(result.state, "partial_result", "an empty head repo plus a failed secondary candidate must not read as no_open_pr");
         assert!(result.partial);
-        assert!(result.pull_requests.is_empty());
+        assert!(result.outgoing_pull_requests.is_empty());
+        assert!(result.incoming_pull_requests.is_empty());
         drop(repo);
         fs::remove_dir_all(base).unwrap();
     }
@@ -6823,16 +6934,118 @@ mod tests {
 
         let run = |q: &PrGhQuery| {
             assert_eq!(q.repo, "github.vitesco.io/eng/the-dependency");
-            assert_eq!(q.head, "dep-feature-remote");
-            GhOutcome::Prs(vec![pr_json(3, "dep-feature-remote", "eng", "the-dependency")])
+            assert_eq!(q.branch, "dep-feature-remote");
+            match q.direction {
+                PrQueryDirection::Head => GhOutcome::Prs(vec![pr_json(3, "dep-feature-remote", "eng", "the-dependency")]),
+                PrQueryDirection::Base => GhOutcome::Prs(Vec::new()),
+            }
         };
         let result = pr_status_impl(ctx, &sub_path_str, "submodule:dep", &run);
         assert_eq!(result.state, "ok");
         assert_eq!(result.queried_repo.as_deref(), Some("github.vitesco.io/eng/the-dependency"));
         assert_eq!(result.branch.as_deref(), Some("dep-feature-remote"));
-        assert_eq!(result.pull_requests.len(), 1);
-        assert_eq!(result.pull_requests[0].number, 3);
+        assert_eq!(result.outgoing_pull_requests.len(), 1);
+        assert_eq!(result.outgoing_pull_requests[0].number, 3);
+        assert!(result.incoming_pull_requests.is_empty());
         drop(sub_repo);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    // ---- Incoming PRs (current branch as the PR's base/target) ----
+
+    #[test]
+    fn pr_status_impl_detects_an_incoming_pr_whose_head_is_a_different_branch_than_ours() {
+        // The exact reported case: current branch is feature/status-cache,
+        // and the open PR has head=main, base=feature/status-cache — a PR
+        // proposing to merge main *into* this branch, not out of it.
+        // `gh pr list --head feature/status-cache` (the old, only query)
+        // finds nothing, exactly as reported; it must now be found via the
+        // new --base query and reported as incoming — and specifically
+        // never as outgoing, whose own head-owner validation has no reason
+        // to accept a PR whose real head is a completely different branch.
+        let (base, path) = pr_repo("incoming-repro");
+        run_git(&base, &["remote", "add", "origin", "git@github.com:AndreiRomanC/git-stress-small-demo.git"]);
+        run_git(&base, &["checkout", "-q", "-b", "feature/status-cache"]);
+        run_git(&base, &["config", "branch.feature/status-cache.remote", "origin"]);
+        run_git(&base, &["config", "branch.feature/status-cache.merge", "refs/heads/feature/status-cache"]);
+        let repo = internal_repository(&path).unwrap();
+        let ctx = ctx_for(&repo);
+        assert_eq!(ctx.head_branch, "feature/status-cache");
+
+        let incoming_pr = serde_json::json!({
+            "number": 1, "title": "Merge main into feature/status-cache",
+            "headRefName": "main", "headRepository": { "name": "git-stress-small-demo" }, "headRepositoryOwner": { "login": "AndreiRomanC" },
+            "baseRefName": "feature/status-cache", "state": "OPEN", "isDraft": false, "mergeable": "MERGEABLE",
+            "reviewDecision": "REVIEW_REQUIRED", "statusCheckRollup": [],
+            "url": "https://github.com/AndreiRomanC/git-stress-small-demo/pull/1",
+        });
+        let run = |q: &PrGhQuery| {
+            assert_eq!(q.repo, "github.com/AndreiRomanC/git-stress-small-demo");
+            match q.direction {
+                PrQueryDirection::Head => GhOutcome::Prs(Vec::new()), // reproduces `gh pr list --head ... => []`
+                PrQueryDirection::Base => GhOutcome::Prs(vec![incoming_pr.clone()]), // reproduces `gh pr list --base ... => PR #1`
+            }
+        };
+        let result = pr_status_impl(ctx, &path, "parent", &run);
+        assert_eq!(result.state, "ok");
+        assert!(result.outgoing_pull_requests.is_empty(), "PR #1's real head is main, not this branch — it must never appear as outgoing");
+        assert_eq!(result.incoming_pull_requests.len(), 1, "PR #1 targets this branch as its base — it must appear as incoming");
+        assert_eq!(result.incoming_pull_requests[0].number, 1);
+        assert_eq!(result.incoming_pull_requests[0].source_branch, "main");
+        assert_eq!(result.incoming_pull_requests[0].target_branch, "feature/status-cache");
+        drop(repo);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn pr_status_impl_detects_incoming_prs_even_without_an_upstream_configured() {
+        // Point 5 of the report: a missing upstream must not prevent
+        // incoming-PR detection — head_repo/head_branch already fall back
+        // to the first remote and the local branch name in this case (see
+        // resolve_pr_query_context), and the incoming query must use
+        // exactly that, unconditionally, the same as the outgoing query
+        // already did before this change.
+        let (base, path) = pr_repo("incoming-no-upstream");
+        run_git(&base, &["remote", "add", "origin", "git@github.com:me/demo.git"]);
+        run_git(&base, &["checkout", "-q", "-b", "feature/no-upstream"]); // deliberately no branch.<name>.remote/.merge
+        let repo = internal_repository(&path).unwrap();
+        let ctx = ctx_for(&repo);
+        assert!(!ctx.had_upstream, "sanity check: this branch genuinely has no configured upstream");
+        assert_eq!(ctx.head_branch, "feature/no-upstream", "falls back to the local branch name");
+
+        let run = |q: &PrGhQuery| match q.direction {
+            PrQueryDirection::Head => GhOutcome::Prs(Vec::new()),
+            PrQueryDirection::Base => GhOutcome::Prs(vec![pr_json(9, "someone-elses-branch", "them", "demo")]),
+        };
+        let result = pr_status_impl(ctx, &path, "parent", &run);
+        assert_eq!(result.state, "ok");
+        assert_eq!(result.incoming_pull_requests.len(), 1, "a missing upstream must not prevent incoming PR detection");
+        drop(repo);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn pr_status_impl_reports_partial_when_only_the_incoming_query_fails() {
+        // Point 6 of the report: an empty result is only ever confident
+        // once *both* relevant queries succeeded. Here the outgoing side
+        // comes back genuinely empty and successful, but the incoming
+        // query itself fails — this must never read as a confident "no
+        // open PR" just because the outgoing half happened to be fine.
+        let (base, path) = pr_repo("incoming-failed");
+        run_git(&base, &["remote", "add", "origin", "git@github.com:me/demo.git"]);
+        run_git(&base, &["checkout", "-q", "-b", "feature"]);
+        run_git(&base, &["config", "branch.feature.remote", "origin"]);
+        run_git(&base, &["config", "branch.feature.merge", "refs/heads/feature"]);
+        let repo = internal_repository(&path).unwrap();
+        let ctx = ctx_for(&repo);
+        let run = |q: &PrGhQuery| match q.direction {
+            PrQueryDirection::Head => GhOutcome::Prs(Vec::new()),
+            PrQueryDirection::Base => GhOutcome::Failure { stderr: "HTTP 503".into() },
+        };
+        let result = pr_status_impl(ctx, &path, "parent", &run);
+        assert_eq!(result.state, "partial_result", "an incoming-query failure must not be swallowed into a confident no_open_pr");
+        assert!(result.partial);
+        drop(repo);
         fs::remove_dir_all(base).unwrap();
     }
 
@@ -7311,6 +7524,65 @@ mod tests {
         let sub_repo = Repository::open(&sub_path).unwrap();
         assert!(!sub_repo.head_detached().unwrap());
         assert_eq!(sub_repo.head().unwrap().shorthand(), Some("main"));
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn switching_a_submodules_branch_leaves_the_parent_gitlink_unstaged_until_explicitly_staged() {
+        // Message-E point 8: "Change version" on a submodule used to call
+        // add_to_index(true) on the parent unconditionally, silently staging the
+        // gitlink the instant the submodule's checkout moved — before the user had
+        // asked to stage anything. A mere branch switch must show up as an
+        // ordinary *unstaged* modification, exactly like editing any other file;
+        // staging it is still the user's own explicit action via the normal
+        // Stage flow.
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-switch-unstaged-{suffix}"));
+        let repository = base.join("main");
+        let dependency = base.join("dependency");
+        fs::create_dir_all(&repository).unwrap();
+        fs::create_dir_all(&dependency).unwrap();
+        fs::write(repository.join("README.md"), "root").unwrap();
+        fs::write(dependency.join("module.txt"), "v1").unwrap();
+        for path in [&repository, &dependency] {
+            run_git(path, &["init"]);
+            run_git(path, &["config", "user.email", "test@example.com"]);
+            run_git(path, &["config", "user.name", "Test User"]);
+            run_git(path, &["add", "."]);
+            run_git(path, &["commit", "-m", "Initial"]);
+        }
+        run_git(&repository, &["-c", "protocol.file.allow=always", "submodule", "add", dependency.to_str().unwrap(), "vendor/dep"]);
+        run_git(&repository, &["commit", "-am", "Add dep submodule"]);
+
+        let repo_path = repository.to_string_lossy().into_owned();
+        let sub_path = repository.join("vendor/dep");
+        // A second commit on a new local branch inside the submodule's own
+        // checkout, so switching to it actually moves the submodule's HEAD to a
+        // different commit than what the parent has recorded.
+        run_git(&sub_path, &["switch", "-c", "feature-x"]);
+        fs::write(sub_path.join("module.txt"), "v2").unwrap();
+        run_git(&sub_path, &["commit", "-am", "v2 on feature-x"]);
+        run_git(&sub_path, &["switch", "main"]);
+
+        let versions = submodule_versions(repo_path.clone(), "vendor/dep".into()).unwrap();
+        let feature_branch = versions.versions.iter().find(|v| v.kind == "branch" && v.name == "feature-x").expect("feature-x should be listed");
+
+        switch_submodule_version_inner(repo_path.clone(), "vendor/dep".into(), feature_branch.revision.clone(), feature_branch.kind.clone(), feature_branch.name.clone()).unwrap();
+
+        let after_switch = load_repository_inner(repo_path.clone(), Some(true)).unwrap();
+        let gitlink_change = after_switch.changes.iter().find(|change| change.path == "vendor/dep").expect("the moved submodule must show up as a change");
+        assert!(!gitlink_change.staged, "switching a submodule's branch must never silently stage the parent's gitlink");
+        assert_eq!(gitlink_change.status, "M");
+
+        // Staging is still available as the user's own explicit action, and it
+        // must actually work: the existing submodule-HEAD-vs-index detection in
+        // stage_files_inner (see its own comment there) is what now carries this,
+        // once switch_submodule_version_inner stopped doing it automatically.
+        stage_files(repo_path.clone(), vec!["vendor/dep".into()]).unwrap();
+        let after_stage = load_repository_inner(repo_path.clone(), Some(true)).unwrap();
+        let staged_change = after_stage.changes.iter().find(|change| change.path == "vendor/dep").expect("the submodule change must still be present after staging");
+        assert!(staged_change.staged, "explicit Stage must still be able to stage the moved submodule");
 
         fs::remove_dir_all(base).unwrap();
     }
