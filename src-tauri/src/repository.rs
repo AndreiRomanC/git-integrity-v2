@@ -433,8 +433,19 @@ pub struct RepositoryInfo { path: String, name: String, current_branch: String, 
 #[derive(Serialize)]
 pub struct Branch { name: String, current: bool, remote: bool }
 
+// kind is one of "local_branch" | "remote_branch" | "tag" — deliberately a
+// plain String at this JSON boundary (matching DirectoryEntry.kind's own
+// convention in this file) rather than a wire-serialized enum; the small,
+// closed set of values is still enforced at the one place that actually
+// produces them, collect_ref_seeds_and_badges, not scattered across call
+// sites. "head" is intentionally never emitted here — HEAD is not a real
+// refs/* entry, and is attached client-side instead (see refsBadges in
+// app.js), the same way it already was before this struct existed.
+#[derive(Serialize, Clone)]
+pub struct CommitRef { name: String, kind: String }
+
 #[derive(Serialize)]
-pub struct Commit { id: String, parents: Vec<String>, subject: String, author: String, date: String, refs: Vec<String>, lane: usize }
+pub struct Commit { id: String, parents: Vec<String>, subject: String, author: String, date: String, refs: Vec<CommitRef>, lane: usize }
 
 #[derive(Serialize)]
 pub struct Change { status: String, path: String, staged: bool }
@@ -1467,6 +1478,56 @@ fn invalidate_submodule_sync(repository: &str) {
 // explicit request.
 const GRAPH_COMMIT_WINDOW: usize = 500;
 
+// The single source both the revwalk's seed set and every commit's ref
+// badges come from — previously two *separate* full passes over
+// repo.references() (one building an oid->names map, one re-walking the
+// same refs again just to seed the walker), duplicated near-verbatim across
+// open_repository_fast/load_repository/load_older_commits. One pass now
+// does both, and fixes a real bug the old version had: it used
+// `reference.target()` for every ref's badge, which for an annotated tag
+// is the tag *object's* own OID, not the commit's — so an annotated tag's
+// badge could never be found under any commit's real (peeled) OID, it was
+// keyed under an OID no commit in the walk ever has, and just silently
+// dropped. `.peel(Commit)` resolves both an annotated tag (through its tag
+// object) and a lightweight tag (already a direct commit ref) to the same
+// real commit either way, and is what the seed set is built from too — a
+// tag's badge and its seed OID can now never disagree.
+//
+// Intentionally processes only refs/heads, refs/remotes and refs/tags —
+// refs/stash's synthetic WIP commit, refs/notes, and this app's own
+// transient scratch refs (e.g. push_submodule's partial-publish ref) are
+// never a real branch or release marker and must never be shown as one.
+// "HEAD" is not in this namespace at all — it stays a client-side-only
+// badge (see refsBadges/isHead in app.js), exactly as before this existed.
+fn collect_ref_seeds_and_badges(repo: &Repository) -> (Vec<git2::Oid>, HashMap<String, Vec<CommitRef>>) {
+    let mut seeds = Vec::new();
+    let mut by_commit: HashMap<String, Vec<CommitRef>> = HashMap::new();
+    let Ok(references) = repo.references() else { return (seeds, by_commit) };
+    for reference in references.flatten() {
+        let Some(name) = reference.name() else { continue };
+        let kind = if name.starts_with("refs/heads/") {
+            "local_branch"
+        } else if name.starts_with("refs/remotes/") {
+            // origin/HEAD is a *symbolic* pointer at another remote branch,
+            // not a branch of its own — excluded here for the same reason
+            // the plain `branches` list (built separately, from
+            // repo.branches()) already excludes anything ending in "/HEAD".
+            if name.ends_with("/HEAD") { continue; }
+            "remote_branch"
+        } else if name.starts_with("refs/tags/") {
+            "tag"
+        } else {
+            continue;
+        };
+        let Ok(object) = reference.peel(ObjectType::Commit) else { continue };
+        let oid = object.id();
+        seeds.push(oid);
+        let shorthand = reference.shorthand().unwrap_or(name).to_string();
+        by_commit.entry(oid.to_string()).or_default().push(CommitRef { name: shorthand, kind: kind.to_string() });
+    }
+    (seeds, by_commit)
+}
+
 #[tauri::command]
 pub async fn open_repository_fast(path: String) -> Result<FastRepositoryData, String> {
     off_main_thread(move || open_repository_fast_inner(path)).await
@@ -1501,16 +1562,9 @@ fn open_repository_fast_inner(path: String) -> Result<FastRepositoryData, String
     perf_log("open_repository_fast: branches", step.elapsed());
 
     let step = Instant::now();
-    let mut refs_by_oid: HashMap<String, Vec<String>> = HashMap::new();
-    if let Ok(references) = repo.references() { for reference in references.flatten() {
-        if reference.name() == Some("refs/stash") { continue; }
-        if let (Some(oid), Some(name)) = (reference.target(), reference.shorthand()) { refs_by_oid.entry(oid.to_string()).or_default().push(name.to_string()); }
-    } }
+    let (seed_oids, mut refs_by_oid) = collect_ref_seeds_and_badges(&repo);
     let mut commits = Vec::new(); let mut walk = repo.revwalk().map_err(|error| error.message().to_string())?; walk.set_sorting(Sort::TOPOLOGICAL | Sort::TIME).map_err(|error| error.message().to_string())?;
-    if let Ok(references) = repo.references() { for reference in references.flatten() {
-        if reference.name() == Some("refs/stash") { continue; }
-        if let Ok(object) = reference.peel(ObjectType::Commit) { let _ = walk.push(object.id()); }
-    } }
+    for oid in seed_oids { let _ = walk.push(oid); }
     let mut commits_truncated = false;
     for (index, oid) in walk.flatten().enumerate() {
         if index >= GRAPH_COMMIT_WINDOW { commits_truncated = true; break; }
@@ -1576,16 +1630,9 @@ fn load_repository_inner(path: String, force: Option<bool>) -> Result<Repository
     // to do with real branch history — excluded here and surfaced separately as
     // `stashes` instead, so the graph only ever shows real ancestry.
     let step = Instant::now();
-    let mut refs_by_oid: HashMap<String, Vec<String>> = HashMap::new();
-    if let Ok(references) = repo.references() { for reference in references.flatten() {
-        if reference.name() == Some("refs/stash") { continue; }
-        if let (Some(oid), Some(name)) = (reference.target(), reference.shorthand()) { refs_by_oid.entry(oid.to_string()).or_default().push(name.to_string()); }
-    } }
+    let (seed_oids, mut refs_by_oid) = collect_ref_seeds_and_badges(&repo);
     let mut commits = Vec::new(); let mut walk = repo.revwalk().map_err(|error| error.message().to_string())?; walk.set_sorting(Sort::TOPOLOGICAL | Sort::TIME).map_err(|error| error.message().to_string())?;
-    if let Ok(references) = repo.references() { for reference in references.flatten() {
-        if reference.name() == Some("refs/stash") { continue; }
-        if let Ok(object) = reference.peel(ObjectType::Commit) { let _ = walk.push(object.id()); }
-    } }
+    for oid in seed_oids { let _ = walk.push(oid); }
     let mut commits_truncated = false;
     for (index, oid) in walk.flatten().enumerate() {
         if index >= GRAPH_COMMIT_WINDOW { commits_truncated = true; break; }
@@ -1632,17 +1679,10 @@ pub fn load_older_commits(repository_path: String, after_commit_id: String, limi
     let limit = limit.unwrap_or(GRAPH_COMMIT_WINDOW);
     let after_oid = git2::Oid::from_str(&after_commit_id).map_err(|error| error.message().to_string())?;
 
-    let mut refs_by_oid: HashMap<String, Vec<String>> = HashMap::new();
-    if let Ok(references) = repo.references() { for reference in references.flatten() {
-        if reference.name() == Some("refs/stash") { continue; }
-        if let (Some(oid), Some(name)) = (reference.target(), reference.shorthand()) { refs_by_oid.entry(oid.to_string()).or_default().push(name.to_string()); }
-    } }
+    let (seed_oids, mut refs_by_oid) = collect_ref_seeds_and_badges(&repo);
     let mut walk = repo.revwalk().map_err(|error| error.message().to_string())?;
     walk.set_sorting(Sort::TOPOLOGICAL | Sort::TIME).map_err(|error| error.message().to_string())?;
-    if let Ok(references) = repo.references() { for reference in references.flatten() {
-        if reference.name() == Some("refs/stash") { continue; }
-        if let Ok(object) = reference.peel(ObjectType::Commit) { let _ = walk.push(object.id()); }
-    } }
+    for oid in seed_oids { let _ = walk.push(oid); }
 
     let mut found_marker = false;
     let mut commits = Vec::new();
@@ -1656,6 +1696,47 @@ pub fn load_older_commits(repository_path: String, after_commit_id: String, limi
     }
     if !found_marker { return Err("This history has moved on since it was last loaded — refresh and try again.".into()); }
     Ok(OlderCommitsPage { commits, has_more })
+}
+
+#[derive(Serialize)]
+pub struct TagDetails {
+    name: String,
+    commit_id: String,
+    annotated: bool,
+    // Only present for an annotated tag — a lightweight tag is just a named
+    // pointer at a commit, with no message/tagger/date of its own to show.
+    message: Option<String>,
+    tagger: Option<String>,
+    date: Option<String>,
+}
+
+// Only reached when the user actually clicks a tag badge in the graph — the
+// bulk per-commit payload (Commit.refs) deliberately stays minimal (just
+// name+kind), matching this app's established "compact list, full detail on
+// demand" pattern (the same shape commit selection itself already uses).
+// `repository_path` is whichever repository is actually on screen — the
+// frontend already resolves this to the submodule's own path when the
+// graph is showing a submodule's history, never the parent's.
+#[tauri::command]
+pub fn tag_details(repository_path: String, tag_name: String) -> Result<TagDetails, String> {
+    validate_path(&repository_path)?;
+    let repo = internal_repository(&repository_path)?;
+    let reference = repo.find_reference(&format!("refs/tags/{tag_name}")).map_err(|error| format!("Tag '{tag_name}' not found: {}", error.message()))?;
+    let direct_target = reference.target().ok_or("This tag reference has no direct target")?;
+    let commit_id = reference.peel(ObjectType::Commit).map_err(|error| error.message().to_string())?.id().to_string();
+    // An annotated tag's ref points at a real tag *object* (find_tag
+    // succeeds); a lightweight tag's ref points straight at the commit, so
+    // there is no tag object to find at that oid at all.
+    let result = match repo.find_tag(direct_target) {
+        Ok(tag_object) => TagDetails {
+            name: tag_name, commit_id, annotated: true,
+            message: tag_object.message().map(|message| message.trim().to_string()).filter(|message| !message.is_empty()),
+            tagger: tag_object.tagger().and_then(|signature| signature.name().map(str::to_string)),
+            date: tag_object.tagger().map(|signature| short_date(signature.when().seconds())),
+        },
+        Err(_) => TagDetails { name: tag_name, commit_id, annotated: false, message: None, tagger: None, date: None },
+    };
+    Ok(result)
 }
 
 // A lightweight "what changed" refresh — status only, no branches/commits/
@@ -5344,7 +5425,7 @@ mod tests {
 
         let data = load_repository_inner(path.clone(), Some(true)).unwrap();
         assert!(!data.commits.iter().any(|commit| commit.parents.len() > 1), "the WIP stash commit (with its index/untracked parents) must never appear as a graph commit");
-        assert!(!data.commits.iter().any(|commit| commit.refs.iter().any(|r| r == "stash")), "refs/stash must not be attached as a label on any commit");
+        assert!(!data.commits.iter().any(|commit| commit.refs.iter().any(|r| r.name == "stash")), "refs/stash must not be attached as a label on any commit");
         assert_eq!(data.stashes.len(), 1);
         assert_eq!(data.stashes[0].base_commit, base);
 
@@ -9003,5 +9084,397 @@ mod tests {
         assert!(!bad_result.success);
         assert_ne!(bad_result.exit_code, Some(0));
         assert!(bad_result.read_only, "log must be classified read-only regardless of whether the specific invocation succeeded");
+    }
+
+    // ---- Structured refs / graph correctness (History & Branch Map rework) ----
+
+    #[test]
+    fn lightweight_and_annotated_tags_both_resolve_to_the_commit_they_actually_point_at() {
+        // The exact bug this was rewritten for: reference.target() on an
+        // annotated tag's ref returns the tag *object's* own oid, not the
+        // commit's — collect_ref_seeds_and_badges must use .peel(Commit)
+        // instead, so both tag kinds land on the real commit's row.
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-tag-peel-{suffix}"));
+        create_libgit2_repository(&base, "README.md");
+        run_git(&base, &["commit", "--allow-empty", "-m", "second"]);
+        let head = run_git_capture(&base, &["rev-parse", "HEAD"]);
+        run_git(&base, &["tag", "v1-lightweight"]);
+        run_git(&base, &["tag", "-a", "v1-annotated", "-m", "release notes"]);
+        let path = base.to_string_lossy().into_owned();
+
+        let data = load_repository_inner(path, None).unwrap();
+        let head_commit = data.commits.iter().find(|commit| commit.id == head).expect("HEAD's own commit must be in the loaded page");
+        let tag_names: Vec<&str> = head_commit.refs.iter().filter(|r| r.kind == "tag").map(|r| r.name.as_str()).collect();
+        assert!(tag_names.contains(&"v1-lightweight"), "lightweight tag missing from its own commit, got {tag_names:?}");
+        assert!(tag_names.contains(&"v1-annotated"), "annotated tag missing from its own commit (likely still keyed under the tag object's own oid, not the commit's) — got {tag_names:?}");
+        assert!(!data.commits.iter().any(|commit| commit.id != head && commit.refs.iter().any(|r| r.kind == "tag")), "neither tag must appear on any other commit");
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn several_tags_on_the_same_commit_all_appear_together() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-multi-tag-{suffix}"));
+        create_libgit2_repository(&base, "README.md");
+        let head = run_git_capture(&base, &["rev-parse", "HEAD"]);
+        for name in ["v1.0.0", "v1.0.1-rc1", "release/2024-01"] { run_git(&base, &["tag", "-a", name, "-m", "note"]); }
+        let path = base.to_string_lossy().into_owned();
+
+        let data = load_repository_inner(path, None).unwrap();
+        let head_commit = data.commits.iter().find(|commit| commit.id == head).unwrap();
+        let tag_names: HashSet<&str> = head_commit.refs.iter().filter(|r| r.kind == "tag").map(|r| r.name.as_str()).collect();
+        assert_eq!(tag_names, HashSet::from(["v1.0.0", "v1.0.1-rc1", "release/2024-01"]), "all three tags on the same commit must all be attached, none dropped");
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn a_tag_on_a_commit_outside_the_first_page_still_attaches_once_that_page_loads() {
+        // Same real-truncation technique as load_repository_truncates_at_the_
+        // graph_commit_window_and_load_older_continues_past_it: a genuine
+        // chain longer than GRAPH_COMMIT_WINDOW, tagging the very oldest
+        // (definitely-not-on-the-first-page) commit.
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-tag-older-page-{suffix}"));
+        fs::create_dir_all(&base).unwrap();
+        let repo = Repository::init(&base).unwrap();
+        let signature = git2::Signature::now("Test User", "test@example.com").unwrap();
+        let total = GRAPH_COMMIT_WINDOW + 5;
+        let mut last_commit: Option<git2::Oid> = None;
+        let mut root_oid = None;
+        for i in 0..total {
+            fs::write(base.join("file.txt"), format!("{i}")).unwrap();
+            let mut index = repo.index().unwrap();
+            index.add_path(Path::new("file.txt")).unwrap();
+            index.write().unwrap();
+            let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+            let parents: Vec<git2::Commit> = last_commit.map(|oid| repo.find_commit(oid).unwrap()).into_iter().collect();
+            let parent_refs: Vec<&git2::Commit> = parents.iter().collect();
+            let oid = repo.commit(Some("HEAD"), &signature, &signature, &format!("commit {i}"), &tree, &parent_refs).unwrap();
+            if i == 0 { root_oid = Some(oid); }
+            last_commit = Some(oid);
+        }
+        let root_oid = root_oid.unwrap();
+        repo.tag_lightweight("root-tag", &repo.find_object(root_oid, None).unwrap(), false).unwrap();
+        drop(repo);
+        let repo_path = base.to_string_lossy().into_owned();
+
+        let first_page = load_repository_inner(repo_path.clone(), None).unwrap();
+        assert!(!first_page.commits.iter().any(|commit| commit.id == root_oid.to_string()), "sanity check: the tagged root must genuinely be outside the first page");
+        assert!(!first_page.commits.iter().any(|commit| commit.refs.iter().any(|r| r.name == "root-tag")), "the tag must not appear anywhere on the first page — it isn't loaded yet");
+
+        let oldest_in_window = first_page.commits.last().unwrap().id.clone();
+        let older = load_older_commits(repo_path, oldest_in_window, Some(500)).unwrap();
+        let root_row = older.commits.iter().find(|commit| commit.id == root_oid.to_string()).expect("the root commit must be on the older page");
+        assert!(root_row.refs.iter().any(|r| r.name == "root-tag" && r.kind == "tag"), "the tag must attach correctly once its own page actually loads");
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn a_local_branch_and_its_remote_tracking_branch_on_the_same_commit_both_appear() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let repository = std::env::temp_dir().join(format!("git-integrity-local-remote-samecommit-{suffix}"));
+        let remote = std::env::temp_dir().join(format!("git-integrity-local-remote-samecommit-remote-{suffix}.git"));
+        fs::create_dir_all(&repository).unwrap();
+        fs::create_dir_all(&remote).unwrap();
+        run_git(&remote, &["init", "--bare"]);
+        run_git(&repository, &["init", "-b", "main"]);
+        run_git(&repository, &["config", "user.email", "test@example.com"]);
+        run_git(&repository, &["config", "user.name", "Test User"]);
+        fs::write(repository.join("a.txt"), "one").unwrap();
+        run_git(&repository, &["add", "."]);
+        run_git(&repository, &["commit", "-m", "Commit 1"]);
+        run_git(&repository, &["remote", "add", "origin", remote.to_str().unwrap()]);
+        run_git(&repository, &["-c", "protocol.file.allow=always", "push", "origin", "HEAD:main"]);
+        run_git(&repository, &["-c", "protocol.file.allow=always", "fetch", "origin"]);
+        let head = run_git_capture(&repository, &["rev-parse", "HEAD"]);
+        let path = repository.to_string_lossy().into_owned();
+
+        let data = load_repository_inner(path, None).unwrap();
+        let head_commit = data.commits.iter().find(|commit| commit.id == head).unwrap();
+        let labels: Vec<(&str, &str)> = head_commit.refs.iter().map(|r| (r.name.as_str(), r.kind.as_str())).collect();
+        assert!(head_commit.refs.iter().any(|r| r.kind == "local_branch" && r.name == "main"), "local branch missing, got {labels:?}");
+        assert!(head_commit.refs.iter().any(|r| r.kind == "remote_branch" && r.name == "origin/main"), "remote-tracking branch missing, got {labels:?}");
+
+        fs::remove_dir_all(&repository).unwrap();
+        fs::remove_dir_all(&remote).unwrap();
+    }
+
+    #[test]
+    fn a_merge_commits_parents_are_exactly_gits_own_recorded_list_in_order() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-merge-parents-{suffix}"));
+        create_libgit2_repository(&base, "README.md");
+        run_git(&base, &["branch", "-M", "main"]);
+        run_git(&base, &["checkout", "-b", "feature"]);
+        fs::write(base.join("feature.txt"), "x").unwrap();
+        run_git(&base, &["add", "feature.txt"]);
+        run_git(&base, &["commit", "-m", "feature work"]);
+        run_git(&base, &["checkout", "main"]);
+        run_git(&base, &["merge", "--no-ff", "-m", "Merge feature", "feature"]);
+        let merge_oid = run_git_capture(&base, &["rev-parse", "HEAD"]);
+        let expected_parents: Vec<String> = run_git_capture(&base, &["log", "-1", "--format=%P", "HEAD"]).split_whitespace().map(str::to_string).collect();
+        assert_eq!(expected_parents.len(), 2, "sanity check on the fixture itself — this must really be a two-parent merge");
+        let path = base.to_string_lossy().into_owned();
+
+        let data = load_repository_inner(path, None).unwrap();
+        let merge_commit = data.commits.iter().find(|commit| commit.id == merge_oid).unwrap();
+        assert_eq!(&merge_commit.parents, &expected_parents, "a merge's parents must be exactly git's own recorded list, in the same (first-parent-first) order");
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn independent_orphan_histories_appear_with_no_fabricated_relationship_between_them() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-orphan-roots-{suffix}"));
+        create_libgit2_repository(&base, "README.md");
+        run_git(&base, &["branch", "-M", "main"]);
+        let first_root = run_git_capture(&base, &["rev-parse", "HEAD"]);
+        run_git(&base, &["checkout", "--orphan", "second-root"]);
+        run_git(&base, &["rm", "-rf", "--cached", "."]);
+        fs::remove_file(base.join("README.md")).ok();
+        fs::write(base.join("other.txt"), "x").unwrap();
+        run_git(&base, &["add", "other.txt"]);
+        run_git(&base, &["commit", "-m", "second root"]);
+        let second_root = run_git_capture(&base, &["rev-parse", "HEAD"]);
+        assert_ne!(first_root, second_root, "sanity check on the fixture itself");
+        let path = base.to_string_lossy().into_owned();
+
+        let data = load_repository_inner(path, None).unwrap();
+        let a = data.commits.iter().find(|commit| commit.id == first_root).expect("first root must be loaded (still reachable via the 'main' branch ref)");
+        let b = data.commits.iter().find(|commit| commit.id == second_root).expect("second, unrelated root must be loaded too (reachable via 'second-root')");
+        assert!(a.parents.is_empty(), "the first root truly has no parent");
+        assert!(b.parents.is_empty(), "the second, independent root truly has no parent either");
+        assert!(!b.parents.contains(&a.id) && !a.parents.contains(&b.id), "two unrelated histories must never be linked to each other");
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn a_commits_real_parent_id_is_preserved_even_when_that_parent_lands_on_the_next_page() {
+        // The backend must never rewrite or drop a parent id just because
+        // that parent hasn't been paginated into view yet — showing a
+        // "continues in older history" stub for it is the *frontend's* job
+        // (buildGraphModel/graph-model.js), never something the backend
+        // should pre-empt by lying about parentage.
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-parent-next-page-{suffix}"));
+        fs::create_dir_all(&base).unwrap();
+        let repo = Repository::init(&base).unwrap();
+        let signature = git2::Signature::now("Test User", "test@example.com").unwrap();
+        let total = GRAPH_COMMIT_WINDOW + 5;
+        let mut last_commit: Option<git2::Oid> = None;
+        for i in 0..total {
+            fs::write(base.join("file.txt"), format!("{i}")).unwrap();
+            let mut index = repo.index().unwrap();
+            index.add_path(Path::new("file.txt")).unwrap();
+            index.write().unwrap();
+            let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+            let parents: Vec<git2::Commit> = last_commit.map(|oid| repo.find_commit(oid).unwrap()).into_iter().collect();
+            let parent_refs: Vec<&git2::Commit> = parents.iter().collect();
+            let oid = repo.commit(Some("HEAD"), &signature, &signature, &format!("commit {i}"), &tree, &parent_refs).unwrap();
+            last_commit = Some(oid);
+        }
+        drop(repo);
+        let repo_path = base.to_string_lossy().into_owned();
+
+        let first_page = load_repository_inner(repo_path.clone(), None).unwrap();
+        let oldest = first_page.commits.last().unwrap();
+        assert_eq!(oldest.parents.len(), 1, "sanity check on the fixture — this is a plain linear chain");
+        let missing_parent = oldest.parents[0].clone();
+        assert!(!first_page.commits.iter().any(|commit| commit.id == missing_parent), "sanity check: the parent really is outside this page");
+        let real_parent = run_git_capture(&base, &["log", "-1", "--format=%P", &oldest.id]);
+        assert_eq!(missing_parent, real_parent, "the parent id must be git's own real parent, unchanged, even though it is not loaded yet");
+
+        let older = load_older_commits(repo_path, oldest.id.clone(), Some(500)).unwrap();
+        assert!(older.commits.iter().any(|commit| commit.id == missing_parent), "the referenced parent must actually exist once its own page loads");
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn two_submodules_with_identically_named_branches_and_tags_never_mix_their_ref_data() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-submodule-ref-collision-{suffix}"));
+        let parent = base.join("parent"); let dep_a = base.join("dep_a"); let dep_b = base.join("dep_b");
+        create_libgit2_repository(&parent, "README.md");
+        // Different filenames, not just "two separate directories" — same
+        // filename + same content + signatures minted in the same wall-clock
+        // second (very likely, two calls apart) would hash to the exact
+        // same root commit oid, which would make dep_b's *own real* root
+        // commit collide with dep_a's, defeating the "never mix" assertions
+        // below for a reason that has nothing to do with the mechanism
+        // actually under test.
+        create_libgit2_repository(&dep_a, "module_a.txt");
+        create_libgit2_repository(&dep_b, "module_b.txt");
+        for dep in [&dep_a, &dep_b] { run_git(dep, &["branch", "-M", "main"]); }
+
+        // Same branch name ("release") and same tag name ("v1.0") in both
+        // submodules — deliberately pointing at *different* commits.
+        run_git(&dep_a, &["checkout", "-b", "release"]);
+        run_git(&dep_a, &["tag", "-a", "v1.0", "-m", "a's release"]);
+        let dep_a_release_commit = run_git_capture(&dep_a, &["rev-parse", "release"]);
+        run_git(&dep_a, &["checkout", "main"]);
+
+        fs::write(dep_b.join("module_b.txt"), "second").unwrap();
+        run_git(&dep_b, &["commit", "-am", "second commit"]);
+        run_git(&dep_b, &["checkout", "-b", "release"]);
+        run_git(&dep_b, &["tag", "-a", "v1.0", "-m", "b's release"]);
+        let dep_b_release_commit = run_git_capture(&dep_b, &["rev-parse", "release"]);
+        run_git(&dep_b, &["checkout", "main"]);
+        assert_ne!(dep_a_release_commit, dep_b_release_commit, "sanity check: the two same-named tags/branches must genuinely point at different commits");
+
+        let parent_string = parent.to_string_lossy().into_owned();
+        let added_a = add_submodule_inner(parent_string.clone(), "".into(), dep_a.to_string_lossy().into_owned(), "dep-a".into(), String::new(), String::new()).unwrap();
+        let added_b = add_submodule_inner(parent_string.clone(), "".into(), dep_b.to_string_lossy().into_owned(), "dep-b".into(), String::new(), String::new()).unwrap();
+        create_commit(parent_string.clone(), "Add both sibling submodules".into()).unwrap();
+
+        let data_a = submodule_repository_inner(parent_string.clone(), added_a).unwrap();
+        let data_b = submodule_repository_inner(parent_string, added_b).unwrap();
+
+        // add_submodule clones the dependency the same way a plain `git
+        // submodule add` does — the branch checked out at clone time
+        // ("main") becomes a local branch, but any *other* branch (like
+        // "release") only survives as that clone's own remote-tracking ref
+        // ("origin/release"), never as a same-named local branch. Tags
+        // always survive as plain local tags either way, which is the
+        // actual point of this fixture — that same-named branch/tag pair
+        // still never gets mixed up between the two sibling submodules.
+        let a_release = data_a.commits.iter().find(|commit| commit.id == dep_a_release_commit).expect("dep-a's own release commit must be present");
+        assert!(a_release.refs.iter().any(|r| r.name == "origin/release" && r.kind == "remote_branch"), "got {:?}", a_release.refs.iter().map(|r| (&r.name, &r.kind)).collect::<Vec<_>>());
+        assert!(a_release.refs.iter().any(|r| r.name == "v1.0" && r.kind == "tag"));
+        assert!(!data_a.commits.iter().any(|commit| commit.id == dep_b_release_commit), "dep-a's own commit list must never contain dep-b's commit at all");
+
+        let b_release = data_b.commits.iter().find(|commit| commit.id == dep_b_release_commit).expect("dep-b's own release commit must be present");
+        assert!(b_release.refs.iter().any(|r| r.name == "origin/release" && r.kind == "remote_branch"), "got {:?}", b_release.refs.iter().map(|r| (&r.name, &r.kind)).collect::<Vec<_>>());
+        assert!(b_release.refs.iter().any(|r| r.name == "v1.0" && r.kind == "tag"));
+        assert!(!data_b.commits.iter().any(|commit| commit.id == dep_a_release_commit), "dep-b's own commit list must never contain dep-a's commit at all");
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn every_returned_commits_parents_are_exactly_its_real_git2_parent_ids_no_more_no_fewer() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-edge-fidelity-{suffix}"));
+        create_libgit2_repository(&base, "README.md");
+        run_git(&base, &["branch", "-M", "main"]);
+        run_git(&base, &["checkout", "-b", "feature-1"]);
+        fs::write(base.join("f1.txt"), "x").unwrap(); run_git(&base, &["add", "f1.txt"]); run_git(&base, &["commit", "-m", "f1"]);
+        run_git(&base, &["checkout", "main"]);
+        run_git(&base, &["checkout", "-b", "feature-2"]);
+        fs::write(base.join("f2.txt"), "x").unwrap(); run_git(&base, &["add", "f2.txt"]); run_git(&base, &["commit", "-m", "f2"]);
+        run_git(&base, &["checkout", "main"]);
+        run_git(&base, &["merge", "--no-ff", "-m", "merge f1", "feature-1"]);
+        run_git(&base, &["merge", "--no-ff", "-m", "merge f2", "feature-2"]);
+        let path = base.to_string_lossy().into_owned();
+        let ground_truth_repo = Repository::open(&base).unwrap();
+
+        let data = load_repository_inner(path, None).unwrap();
+        assert!(data.commits.len() >= 5, "sanity check: the fixture must actually be this dense");
+        for commit in &data.commits {
+            let oid = git2::Oid::from_str(&commit.id).unwrap();
+            let real_parents: Vec<String> = ground_truth_repo.find_commit(oid).unwrap().parent_ids().map(|id| id.to_string()).collect();
+            assert_eq!(&commit.parents, &real_parents, "commit {}: parents must be exactly git2's own parent_ids, in the same order — no invented edge, no dropped edge", commit.id);
+        }
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn load_repository_matches_real_git_rev_list_and_show_ref_exactly() {
+        // Ground truth from the real `git` binary itself, independent of
+        // this app's own git2 usage: `git rev-list --parents --topo-order
+        // --all` for the complete, real parent graph, and `git show-ref
+        // --dereference` for every ref, peeled to a real commit (the
+        // "^{}" line it emits specifically for an annotated tag, whose own
+        // line otherwise shows the tag *object's* oid — exactly the
+        // distinction collect_ref_seeds_and_badges exists to get right).
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-cli-ground-truth-{suffix}"));
+        create_libgit2_repository(&base, "README.md");
+        run_git(&base, &["branch", "-M", "main"]);
+        run_git(&base, &["checkout", "-b", "feature"]);
+        fs::write(base.join("feature.txt"), "x").unwrap();
+        run_git(&base, &["add", "feature.txt"]);
+        run_git(&base, &["commit", "-m", "feature work"]);
+        run_git(&base, &["checkout", "main"]);
+        run_git(&base, &["merge", "--no-ff", "-m", "Merge feature", "feature"]);
+        run_git(&base, &["tag", "v1-lightweight"]);
+        run_git(&base, &["tag", "-a", "v1-annotated", "-m", "release notes"]);
+        let path = base.to_string_lossy().into_owned();
+
+        let rev_list_output = run_git_capture(&base, &["rev-list", "--parents", "--topo-order", "--all"]);
+        let mut expected_parents: HashMap<String, Vec<String>> = HashMap::new();
+        for line in rev_list_output.lines() {
+            let mut tokens = line.split_whitespace();
+            let oid = tokens.next().unwrap().to_string();
+            expected_parents.insert(oid, tokens.map(str::to_string).collect());
+        }
+
+        let show_ref_output = run_git_capture(&base, &["show-ref", "--dereference"]);
+        let mut expected_tag_commits: HashMap<String, String> = HashMap::new();
+        for line in show_ref_output.lines() {
+            let Some((oid, name)) = line.split_once(' ') else { continue };
+            let Some(tag_name) = name.strip_prefix("refs/tags/") else { continue };
+            if let Some(base_name) = tag_name.strip_suffix("^{}") {
+                // The dereferenced line for an annotated tag — always the
+                // real commit oid, and always wins over the tag object's
+                // own oid on that tag's other (non-dereferenced) line.
+                expected_tag_commits.insert(base_name.to_string(), oid.to_string());
+            } else {
+                expected_tag_commits.entry(tag_name.to_string()).or_insert_with(|| oid.to_string());
+            }
+        }
+
+        let data = load_repository_inner(path, None).unwrap();
+
+        // Same commit set, exactly. Order is deliberately not asserted here:
+        // topological tiebreaking may legitimately differ between git's own
+        // --topo-order and this app's revwalk(TOPOLOGICAL | TIME) — the
+        // brief only requires topological order with date as a tiebreaker,
+        // never bit-for-bit agreement with git log's own tiebreak.
+        let actual_ids: HashSet<String> = data.commits.iter().map(|commit| commit.id.clone()).collect();
+        let expected_ids: HashSet<String> = expected_parents.keys().cloned().collect();
+        assert_eq!(actual_ids, expected_ids, "the exact same set of commits git itself reports must be loaded — none invented, none missing");
+
+        for commit in &data.commits {
+            let expected = expected_parents.get(&commit.id).expect("already asserted the id sets match above");
+            assert_eq!(&commit.parents, expected, "commit {}: parents must match `git rev-list --parents` exactly, same order", commit.id);
+        }
+
+        for (tag_name, expected_commit) in &expected_tag_commits {
+            let commit = data.commits.iter().find(|commit| &commit.id == expected_commit).unwrap_or_else(|| panic!("git show-ref says {tag_name} points at {expected_commit}, but that commit was not loaded at all"));
+            assert!(commit.refs.iter().any(|r| r.kind == "tag" && &r.name == tag_name), "git show-ref says {tag_name} belongs on {expected_commit}, but this app's own data does not have it there — got {:?}", commit.refs.iter().map(|r| &r.name).collect::<Vec<_>>());
+        }
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn tag_details_reports_lightweight_vs_annotated_correctly() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-tag-details-{suffix}"));
+        create_libgit2_repository(&base, "README.md");
+        run_git(&base, &["tag", "v1-lightweight"]);
+        run_git(&base, &["tag", "-a", "v1-annotated", "-m", "release notes here"]);
+        let head = run_git_capture(&base, &["rev-parse", "HEAD"]);
+        let path = base.to_string_lossy().into_owned();
+
+        let lightweight = tag_details(path.clone(), "v1-lightweight".into()).unwrap();
+        assert!(!lightweight.annotated, "a plain `git tag` must be reported as lightweight");
+        assert_eq!(lightweight.commit_id, head);
+        assert_eq!(lightweight.message, None);
+
+        let annotated = tag_details(path, "v1-annotated".into()).unwrap();
+        assert!(annotated.annotated, "a `git tag -a` must be reported as annotated");
+        assert_eq!(annotated.commit_id, head, "an annotated tag's commit_id must be the peeled commit, not the tag object's own oid");
+        assert_eq!(annotated.message.as_deref(), Some("release notes here"));
+
+        fs::remove_dir_all(base).unwrap();
     }
 }

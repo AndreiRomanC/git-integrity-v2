@@ -16,6 +16,7 @@ pub fn run() {
             repository::open_repository_fast,
             repository::load_repository,
             repository::load_older_commits,
+            repository::tag_details,
             repository::refresh_status,
             repository::stage_files,
             repository::stage_all,
