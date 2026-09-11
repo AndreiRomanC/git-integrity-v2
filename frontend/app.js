@@ -74,7 +74,7 @@ function addRecentRepo(path, name) {
   renderRecentRepos();
 }
 
-const state = { repository: null, branches: [], commits: [], allCommits: [], changes: [], selectedCommit: null, view: 'explorer', currentPath: '', entries: [], selectedEntry: null, historyScope: '', commanderPath: '', commanderRows: [], remoteRef: '', remotes: [], editingPath: '', editorOriginal: '', publish: null, changesScope: 'global', commanderFocus: '', comparingRow: null, hasStash: false, stashes: [], editingConflict: null, mergeTarget: null,
+const state = { repository: null, branches: [], commits: [], allCommits: [], changes: [], selectedCommit: null, view: 'explorer', currentPath: '', entries: [], selectedEntry: null, historyScope: '', historyKind: '', commanderPath: '', commanderRows: [], remoteRef: '', remotes: [], editingPath: '', editorOriginal: '', publish: null, changesScope: 'global', commanderFocus: '', comparingRow: null, hasStash: false, stashes: [], editingConflict: null, mergeTarget: null,
   // Set only while viewing a submodule's Submodule Map — holds *its own*
   // repository/branches/commits/changes/stashes/primaryBranch entirely
   // separately from the fields above, which always stay the parent
@@ -345,7 +345,7 @@ async function loadRepository(path, options = {}) {
     // scoped through a refresh without re-querying that same scope, so it
     // falls back to the full Branch Map instead of showing stale-looking
     // scoped chrome over full data.
-    directoryCache.clear(); Object.assign(state, data); state.allCommits = data.commits; state.historyScope = ''; state.view = keepView; state.commanderPath = options.keepPath ? state.commanderPath : ''; state.commanderRows = options.keepPath ? state.commanderRows : [];
+    directoryCache.clear(); Object.assign(state, data); state.allCommits = data.commits; state.historyScope = ''; state.historyKind = ''; state.view = keepView; state.commanderPath = options.keepPath ? state.commanderPath : ''; state.commanderRows = options.keepPath ? state.commanderRows : [];
     // load_repository always includes real, complete status — whatever
     // openRepositoryFast's still-pending background fetch was doing is moot now.
     state.statusReady = true;
@@ -406,7 +406,7 @@ async function openRepositoryFast(path) {
     Object.assign(state, data);
     state.changes = []; state.statusReady = false; state.activeSubmodule = null;
     state.graphPrimaryBranch = null; // a different repository's branches share nothing with the last one's picker choice
-    state.allCommits = data.commits; state.historyScope = ''; state.view = 'explorer'; state.commanderPath = ''; state.commanderRows = [];
+    state.allCommits = data.commits; state.historyScope = ''; state.historyKind = ''; state.view = 'explorer'; state.commanderPath = ''; state.commanderRows = [];
     state.remoteRef = data.branches.find(branch => branch.remote)?.name || '';
     state.hasStash = state.stashes.length > 0; updateStashUI();
     // Filesystem-only, no Git calls at all — see list_directory_fast's own
@@ -517,8 +517,14 @@ function render() {
   refs.repoName.textContent = loaded ? state.repository.name : 'Open a repository';
   refs.repoPath.textContent = loaded ? state.repository.path : 'Choose an existing Git folder';
   refs.currentBranch.textContent = loaded ? describeBranch(state.repository) : 'No branch';
-  refs.viewTitle.textContent = state.view === 'explorer' ? 'Project Explorer' : state.view === 'commander' ? 'Local ↔ Remote' : state.view === 'remotes' ? 'Remotes' : state.submoduleGraph ? `Submodule History · ${state.submoduleGraph.name}` : state.historyScope ? `History · ${state.historyScope}` : 'Repository History';
-  refs.graphSubtitle.textContent = !loaded ? 'Navigate folders and inspect every item in your repository.' : state.view === 'explorer' ? `${state.entries.length} items in ${state.currentPath || state.repository.name}` : state.view === 'commander' ? 'Compare the workspace with a cached remote snapshot—no second checkout.' : state.view === 'remotes' ? 'Configured server locations and explicit fetch controls.' : state.historyScope ? `Commits touching ${state.historyScope}` : state.submoduleGraph ? 'Commits, branches and release tags for this submodule' : 'Commits, branches and release tags';
+  // "Submodule Reference Changes" (state.historyKind === 'submodule-refs')
+  // gets its own explicit title, deliberately distinct from both "History
+  // · <path>" (a plain folder/file's own path_history) and "Submodule
+  // History · <name>" (the submodule's own Branch Map) — the whole point
+  // of Message C's point 1 is that a user must never be unsure which of
+  // these three they're looking at.
+  refs.viewTitle.textContent = state.view === 'explorer' ? 'Project Explorer' : state.view === 'commander' ? 'Local ↔ Remote' : state.view === 'remotes' ? 'Remotes' : state.submoduleGraph ? `Submodule History · ${state.submoduleGraph.relativePath}` : state.historyKind === 'submodule-refs' ? `Submodule Reference Changes · ${state.historyScope}` : state.historyScope ? `History · ${state.historyScope}` : 'Repository History';
+  refs.graphSubtitle.textContent = !loaded ? 'Navigate folders and inspect every item in your repository.' : state.view === 'explorer' ? `${state.entries.length} items in ${state.currentPath || state.repository.name}` : state.view === 'commander' ? 'Compare the workspace with a cached remote snapshot—no second checkout.' : state.view === 'remotes' ? 'Configured server locations and explicit fetch controls.' : state.historyKind === 'submodule-refs' ? `Parent-repository commits that changed this submodule's recorded version — not ${state.historyScope}'s own history` : state.historyScope ? `Commits touching ${state.historyScope}` : state.submoduleGraph ? 'Commits, branches and release tags for this submodule' : 'Commits, branches and release tags';
   refs.search.placeholder = state.view === 'explorer' ? 'Filter this folder' : state.view === 'commander' ? 'Filter comparison' : 'Find commit or author';
   refs.search.closest('label').hidden = state.view === 'remotes';
   refs.goUp.hidden = refs.reloadFolder.hidden = !['explorer','commander'].includes(state.view); refs.goUp.disabled = state.view === 'explorer' ? !state.currentPath : !state.commanderPath;
@@ -1217,13 +1223,53 @@ async function commitSelectedScope(event) {
 const showSelectedHistoryGuard = createRequestGuard();
 async function showSelectedHistory() {
   const scope = selectedScope();
+  // path_history walks the *parent* repository, filtered to commits whose
+  // diff touched this path — for a path that is (or is inside) a submodule,
+  // that only ever finds the parent's own gitlink-update commits, never a
+  // single commit that actually happened inside the submodule's own
+  // repository. This used to be exactly the "View history" bug already
+  // fixed for the detail-action button (see handleDetailAction's own
+  // comment) — this is the *other* way to reach the same call
+  // (#showPathHistory, wired unconditionally below) that bug fix never
+  // covered. submoduleBoundaryFor resolves both "a submodule row is
+  // directly selected" and "currently browsing inside one" to the same
+  // real submodule root.
+  const submoduleRoot = submoduleBoundaryFor(scope.path);
+  if (submoduleRoot) { return openSubmoduleGraph({ relative_path: submoduleRoot, name: submoduleRoot.split('/').pop() }); }
   const stillCurrent = showSelectedHistoryGuard();
-  if (!invoke) { state.historyScope = scope.name; state.view = 'graph'; render(); return; }
+  if (!invoke) { state.historyScope = scope.name; state.historyKind = 'path'; state.view = 'graph'; render(); return; }
   try {
     status(`Loading history for ${scope.name}…`, 'busy');
     const commits = await invoke('path_history', { repositoryPath: state.repository.path, relativePath: scope.path });
     if (!stillCurrent()) return; // repository/folder/branch changed, or a newer history request superseded this one
-    state.commits = commits; state.historyScope = scope.name; state.view = 'graph'; refs.search.value = ''; render(); status(`${state.commits.length} commits for ${scope.name}`);
+    state.commits = commits; state.historyScope = scope.name; state.historyKind = 'path'; state.view = 'graph'; refs.search.value = ''; render(); status(`${state.commits.length} commits for ${scope.name}`);
+  } catch (error) { if (stillCurrent()) handleError(error); }
+}
+
+// Message C's second, deliberately separate concept: "which commits in the
+// *parent* project changed this submodule's recorded version" — a real,
+// legitimate, but genuinely different question from "Submodule Branch
+// Map" (the submodule's own history, resolved in its own repository).
+// Reuses path_history exactly as it already worked (it's the parent
+// scoped to this one gitlink path — correct for *this* question, unlike
+// showSelectedHistory's now-fixed submodule guard which routes *away* from
+// it), but through its own explicit action and its own explicit title
+// (render()'s own viewTitle/graphSubtitle logic reads state.historyKind),
+// so a user only ever lands here on purpose, never by accident while
+// asking for the submodule's own history.
+const showSubmoduleReferenceChangesGuard = createRequestGuard();
+async function showSubmoduleReferenceChanges(entry) {
+  const stillCurrent = showSubmoduleReferenceChangesGuard();
+  const parentRepositoryPath = state.repository?.path;
+  const relativePath = entry.relative_path;
+  const name = entry.name;
+  if (!invoke) { state.historyScope = name; state.historyKind = 'submodule-refs'; state.view = 'graph'; render(); return; }
+  try {
+    status(`Loading parent-repository reference changes for ${name}…`, 'busy');
+    const commits = await invoke('path_history', { repositoryPath: parentRepositoryPath, relativePath });
+    if (!stillCurrent()) return;
+    state.commits = commits; state.historyScope = name; state.historyKind = 'submodule-refs'; state.view = 'graph'; refs.search.value = ''; render();
+    status(`${state.commits.length} parent-repository commit${state.commits.length === 1 ? '' : 's'} changed ${name}'s recorded version`);
   } catch (error) { if (stillCurrent()) handleError(error); }
 }
 
@@ -1244,7 +1290,7 @@ function renderEntryDetails(entry) {
   refs.details.innerHTML = `<div class="entry-details"><div class="entry-preview ${esc(entry.kind)}">${entry.kind === 'submodule' ? '◇' : entry.kind === 'folder' ? '▰' : '▤'}</div>
     <h2>${esc(entry.name)}</h2><div class="entry-path">${esc(entry.relative_path)}</div>${entry.kind === 'submodule' ? '<span class="submodule-badge">◇ Git submodule</span>' : ''}
     ${entry.status || !entry.tracked ? `<div class="local-change-banner"><i></i><div><strong>${entry.kind === 'submodule' && entry.submodule_push_status ? 'New version locally (not pushed yet)' : entry.tracked ? 'Modified locally' : 'New local file'}</strong><span>${entry.kind === 'submodule' && entry.submodule_push_status ? 'Committed here, on this machine — not sent to the submodule\'s server yet.' : 'This item differs from the committed repository state.'}</span></div></div>` : ''}
-    <div class="context-actions">${entry.kind === 'file' ? '<button data-detail-action="edit">Edit local file</button>' : '<button data-detail-action="open">Open folder</button>'}<button data-detail-action="server">Open on server ↗</button><button data-detail-action="history">View history</button>${entry.status ? '<button data-detail-action="commit">Commit this item</button>' : ''}${entry.kind === 'folder' && entry.name === 'r' ? '<button data-detail-action="utrud" data-tooltip="Launches the UTRUD tool for this folder, the same as Windows Explorer\'s Send to → UTRUD. Windows only.">▶ Run UTRUD</button>' : ''}${entry.kind === 'file' && (entry.status || !entry.tracked) ? `<button data-detail-action="stage" data-tooltip="git add — add this file's current content to staging">＋ Stage this file</button><button data-detail-action="unstage" data-tooltip="Unstage — git restore --staged. Removes only the staging entry; your edits on disk are kept exactly as they are.">− Unstage</button><button data-detail-action="stashfile" data-tooltip="Sets this file aside in a temporary holding area (the stash) — it's left out of any commit, and out of your working folder, until you bring it back with Pop stash">⇕ Stash this file</button><button data-detail-action="head" class="danger-action-soft" data-tooltip="Restore from your last local commit (HEAD) — git checkout HEAD -- file. Permanently discards ALL edits; the file on disk becomes identical to what you last committed. Cannot be undone.">↶ Restore from last commit (HEAD)</button><button data-detail-action="compare" data-tooltip="Open side-by-side compare with restore options">⇄ Compare with remote</button>` : ''}${entry.kind === 'submodule' ? `<button data-detail-action="subserver">Open submodule repository ↗</button><button data-detail-action="subgraph" data-tooltip="Open this submodule's own branch/commit history — never the parent project's">Submodule Branch Map</button><button data-detail-action="subnewbranch" data-tooltip="Create a new local branch in this submodule, starting from its current commit, and switch to it">＋ New branch…</button><button data-detail-action="versions">Change version</button><button data-detail-action="subcommit" ${entry.status ? '' : 'disabled'} data-tooltip="${entry.status ? 'Commit uncommitted changes inside the submodule' : 'Nothing to commit — no uncommitted changes inside this submodule'}">Commit submodule</button><button data-detail-action="subreset" class="danger-action-soft" ${entry.status ? '' : 'disabled'} data-tooltip="${entry.status ? 'Discard everything local in this submodule — dirty edits, local commits, an uncommitted version switch — and force it back to exactly what the project currently has recorded. Cannot be undone.' : 'Nothing to reset — the submodule already matches what the project has recorded'}">↺ Reset submodule…</button><button data-detail-action="subpull" data-tooltip="Fast-forward pull — brings in new commits from the submodule's remote. Refuses if it would require a manual merge.">Pull submodule</button><button data-detail-action="submerge" data-tooltip="Merge a branch into this submodule's current branch, with conflict resolution if needed">Merge branch…</button><button data-detail-action="subpush">Push submodule</button><button data-detail-action="subforcepush" class="danger-action-soft" data-tooltip="⚠️ Overwrites the remote branch with your local history, discarding any commits there aren't in yours. Only safe if nobody else uses that remote.">Force push submodule…</button><button data-detail-action="subfetch">Fetch submodule</button><button data-detail-action="location">Replace repository URL</button>` : ''}<button class="danger-action" data-detail-action="delete">Delete…</button></div>
+    <div class="context-actions">${entry.kind === 'file' ? '<button data-detail-action="edit">Edit local file</button>' : '<button data-detail-action="open">Open folder</button>'}<button data-detail-action="server">Open on server ↗</button><button data-detail-action="history">View history</button>${entry.status ? '<button data-detail-action="commit">Commit this item</button>' : ''}${entry.kind === 'folder' && entry.name === 'r' ? '<button data-detail-action="utrud" data-tooltip="Launches the UTRUD tool for this folder, the same as Windows Explorer\'s Send to → UTRUD. Windows only.">▶ Run UTRUD</button>' : ''}${entry.kind === 'file' && (entry.status || !entry.tracked) ? `<button data-detail-action="stage" data-tooltip="git add — add this file's current content to staging">＋ Stage this file</button><button data-detail-action="unstage" data-tooltip="Unstage — git restore --staged. Removes only the staging entry; your edits on disk are kept exactly as they are.">− Unstage</button><button data-detail-action="stashfile" data-tooltip="Sets this file aside in a temporary holding area (the stash) — it's left out of any commit, and out of your working folder, until you bring it back with Pop stash">⇕ Stash this file</button><button data-detail-action="head" class="danger-action-soft" data-tooltip="Restore from your last local commit (HEAD) — git checkout HEAD -- file. Permanently discards ALL edits; the file on disk becomes identical to what you last committed. Cannot be undone.">↶ Restore from last commit (HEAD)</button><button data-detail-action="compare" data-tooltip="Open side-by-side compare with restore options">⇄ Compare with remote</button>` : ''}${entry.kind === 'submodule' ? `<button data-detail-action="subserver">Open submodule repository ↗</button><button data-detail-action="subgraph" data-tooltip="Open this submodule's own branch/commit history — never the parent project's">Submodule Branch Map</button><button data-detail-action="subrefchanges" data-tooltip="A different, narrower question: which commits in the PARENT project changed this submodule's recorded version. Not the submodule's own history.">Submodule Reference Changes</button><button data-detail-action="subnewbranch" data-tooltip="Create a new local branch in this submodule, starting from its current commit, and switch to it">＋ New branch…</button><button data-detail-action="versions">Change version</button><button data-detail-action="subcommit" ${entry.status ? '' : 'disabled'} data-tooltip="${entry.status ? 'Commit uncommitted changes inside the submodule' : 'Nothing to commit — no uncommitted changes inside this submodule'}">Commit submodule</button><button data-detail-action="subreset" class="danger-action-soft" ${entry.status ? '' : 'disabled'} data-tooltip="${entry.status ? 'Discard everything local in this submodule — dirty edits, local commits, an uncommitted version switch — and force it back to exactly what the project currently has recorded. Cannot be undone.' : 'Nothing to reset — the submodule already matches what the project has recorded'}">↺ Reset submodule…</button><button data-detail-action="subpull" data-tooltip="Fast-forward pull — brings in new commits from the submodule's remote. Refuses if it would require a manual merge.">Pull submodule</button><button data-detail-action="submerge" data-tooltip="Merge a branch into this submodule's current branch, with conflict resolution if needed">Merge branch…</button><button data-detail-action="subpush">Push submodule</button><button data-detail-action="subforcepush" class="danger-action-soft" data-tooltip="⚠️ Overwrites the remote branch with your local history, discarding any commits there aren't in yours. Only safe if nobody else uses that remote.">Force push submodule…</button><button data-detail-action="subfetch">Fetch submodule</button><button data-detail-action="location">Replace repository URL</button>` : ''}<button class="danger-action" data-detail-action="delete">Delete…</button></div>
     <div class="detail-section"><h3>GENERAL</h3><div class="detail-grid"><span>Type</span><strong>${kindLabel}</strong><span>Git</span><strong>${entry.tracked ? (entry.status || (entry.unpushed ? (entry.kind === 'folder' ? 'Clean — contains unpushed commits' : 'Committed, not pushed yet') : 'Tracked, clean')) : 'Untracked'}</strong>
     ${entry.item_count != null ? `<span>Items</span><strong>${entry.item_count}</strong>` : `<span>Size</span><strong>${formatSize(entry.size)}</strong>`}<span>Modified</span><strong>${formatModified(entry.modified)}</strong></div></div>
     ${entry.kind === 'submodule' ? `<div class="detail-section"><h3>SUBMODULE</h3><div class="detail-grid"><span>Remote</span><strong>${esc(entry.submodule_url || 'Not configured')}</strong><span>Branch</span><strong>${esc(entry.submodule_branch || 'Default')}</strong><span>Status</span><strong>${entry.status ? (entry.status === 'M' ? 'Has local changes' : 'Modified') : 'Clean'}</strong></div>
@@ -1270,6 +1316,7 @@ async function handleDetailAction(action, entry, button) {
   if (action === 'commit') return openScopeCommit();
   if (action === 'versions') return await openSubmoduleMenu(entry, innerWidth - 480, 110);
   if (action === 'subgraph') return openSubmoduleGraph(entry);
+  if (action === 'subrefchanges') return showSubmoduleReferenceChanges(entry);
   // A submodule isn't a folder inside the parent — "Open on server" on one
   // must go to the submodule's own repository (a sibling of the parent when
   // its .gitmodules URL is relative), never <parent-url>/tree/…/<path>.
@@ -1804,7 +1851,15 @@ async function openSubmoduleGraph(entry) {
     // cross-contamination bug would show two different relativePath
     // requests resolving to the same HEAD/commit OIDs here.
     const firstThree = (data.commits || []).slice(0, 3).map(c => `${(c.id || '').slice(0, 8)}:${c.subject}`).join(' | ');
-    jsPerfLog(`openSubmoduleGraph APPLIED (generation=${generation}, name=${name}, relativePath=${relativePath}, resolved=${anonymizeForLog(resultPath)}, head=${(data.repository?.head_oid || '').slice(0, 8)}, branches=${(data.branches || []).length}, commits=${(data.commits || []).length}, first_commits=[${firstThree}])`, 0);
+    // Message C, point 9: requested path, resolved workdir+gitdir,
+    // repository identity, current ref, and the semantic shape of the
+    // history walk that produced this — a genuine cross-contamination bug
+    // (this resolving to the parent, or to a sibling submodule) would show
+    // up here as a gitdir/head mismatch against what the backend's own
+    // matching log line (submodule_repository, repository.rs) reports for
+    // the same request.
+    const refDescription = data.repository?.head_detached ? `detached at ${(data.repository.head_oid || '').slice(0, 8)}` : (data.repository?.current_branch || '(none)');
+    jsPerfLog(`openSubmoduleGraph APPLIED (generation=${generation}, requested_relative_path=${relativePath}, name=${name}, resolved_workdir=${anonymizeForLog(resultPath)}, resolved_gitdir=${anonymizeForLog(data.repository?.gitdir)}, url=${data.repository?.submodule_url || '(none)'}, ref=${refDescription}, head=${(data.repository?.head_oid || '').slice(0, 8)}, history_walk=revwalk(seed=heads+remotes+tags, sort=topological+time, window=${GRAPH_COMMIT_WINDOW}), branches=${(data.branches || []).length}, commits=${(data.commits || []).length}, first_commits=[${firstThree}])`, 0);
     state.submoduleGraph = { name, parentRepositoryPath, relativePath, repository: data.repository, branches: data.branches, commits: data.commits, changes: data.changes, stashes: data.stashes || [], primaryBranch: null, commits_truncated: !!data.commits_truncated };
     state.view = 'graph';
     jsPerfLog(`openSubmoduleGraph before renderGraph (generation=${generation}, submoduleGraph.name=${state.submoduleGraph.name}, submoduleGraph.repository.path=${anonymizeForLog(state.submoduleGraph.repository.path)}, submoduleGraph.commits.length=${state.submoduleGraph.commits.length})`, 0);
@@ -2086,9 +2141,9 @@ function refsBadges(refList, isHead, currentBranchName) {
 function activeGraphData() {
   if (state.submoduleGraph) {
     const g = state.submoduleGraph;
-    return { path: g.repository.path, currentBranch: g.repository.current_branch, headOid: g.repository.head_oid, headDetached: !!g.repository.head_detached, branches: g.branches, commits: g.commits, stashes: g.stashes || [], commitsTruncated: !!g.commits_truncated };
+    return { path: g.repository.path, name: g.repository.name, gitdir: g.repository.gitdir, submoduleUrl: g.repository.submodule_url, currentBranch: g.repository.current_branch, headOid: g.repository.head_oid, headDetached: !!g.repository.head_detached, branches: g.branches, commits: g.commits, stashes: g.stashes || [], commitsTruncated: !!g.commits_truncated };
   }
-  return { path: state.repository?.path, currentBranch: state.repository?.current_branch, headOid: state.repository?.head_oid, headDetached: !!state.repository?.head_detached, branches: state.branches, commits: state.commits, stashes: state.stashes, commitsTruncated: !!state.commits_truncated };
+  return { path: state.repository?.path, name: state.repository?.name, gitdir: state.repository?.gitdir, submoduleUrl: undefined, currentBranch: state.repository?.current_branch, headOid: state.repository?.head_oid, headDetached: !!state.repository?.head_detached, branches: state.branches, commits: state.commits, stashes: state.stashes, commitsTruncated: !!state.commits_truncated };
 }
 // state.graphPrimaryBranch (the parent's own "Primary" picker choice) must
 // never leak into a submodule's graph, or vice versa — each submodule (and
@@ -2347,8 +2402,16 @@ function renderGraph() {
   const refFilter = activeGraphRefFilter();
   const filterOptions = [['all', 'All'], ['branches', 'Branches'], ['releases', 'Releases']];
   refs.graphView.style.setProperty('--lanes-width', `${lanesWidth}px`);
+  // Message C, point 3's own literal example format ("Repository: X" /
+  // "Branch: Y" or "Detached at Z" / "Parent: repo") — explicit, labeled
+  // lines, not just the identity folded into the title/path badge above,
+  // so there's no ambiguity even at a glance. Only submodule context ever
+  // shows a "Parent" line — the parent repository's own graph has none by
+  // definition.
+  const identityBadges = `<span class="graph-identity-badge" data-tooltip="Repository name"><i>Repository:</i> ${esc(g.name || '')}</span>${state.submoduleGraph ? `<span class="graph-identity-badge" data-tooltip="Parent repository"><i>Parent:</i> ${esc(state.repository?.name || '')}</span>` : ''}`;
   refs.laneLegend.innerHTML = `<span class="time-direction"><b>NEWEST</b><i>↓</i><b>OLDEST</b></span>
     <span class="graph-path-badge" data-tooltip="${esc(g.path || '')}">${esc(g.path || '')}</span>
+    ${identityBadges}
     ${g.headDetached ? `<span class="head-banner">HEAD <i>→</i> <b>Detached at ${esc((g.headOid || '').slice(0, 8))}</b></span>` : currentBranch ? `<span class="head-banner">HEAD <i>→</i> <b>${esc(currentBranch)}</b></span>` : ''}
     ${query ? `<span class="search-match-count">${matchCount} match${matchCount === 1 ? '' : 'es'} — rest shown as context</span>` : ''}
     <div class="ref-filter-group" role="group" aria-label="Filter by ref kind">${filterOptions.map(([value, label]) => `<button type="button" class="ref-filter-btn ${refFilter === value ? 'active' : ''}" data-ref-filter="${value}">${label}</button>`).join('')}</div>
@@ -3119,7 +3182,7 @@ let searchTimeout; refs.search.addEventListener('input', () => { clearTimeout(se
 function returnToProjectNavigator() { closeSubmoduleGraph(); const selectedPath = state.selectedEntry?.relative_path; state.view = 'explorer'; state.selectedCommit = null; refs.search.value = ''; render(); if (selectedPath) selectEntry(selectedPath); else clearDetails('Select a file or folder'); }
 $('#navExplorer').addEventListener('click', returnToProjectNavigator);
 $('#navCommander').addEventListener('click', () => { closeSubmoduleGraph(); const selected = state.selectedEntry; state.commanderFocus = selected?.kind === 'file' ? selected.relative_path : ''; state.commanderPath = selected?.kind === 'file' ? selected.relative_path.split('/').slice(0, -1).join('/') : selected?.kind === 'folder' ? selected.relative_path : state.currentPath; state.commanderRows = []; state.view = 'commander'; refs.search.value = ''; render(); openCommanderDirectory(state.commanderPath); });
-$('#navGraph').addEventListener('click', () => { closeSubmoduleGraph(); state.commits = state.allCommits.length ? state.allCommits : state.commits; state.historyScope = ''; state.selectedEntry = null; state.selectedCommit = null; state.view = 'graph'; refs.search.value = ''; clearDetails('Select a commit'); render(); });
+$('#navGraph').addEventListener('click', () => { closeSubmoduleGraph(); state.commits = state.allCommits.length ? state.allCommits : state.commits; state.historyScope = ''; state.historyKind = ''; state.selectedEntry = null; state.selectedCommit = null; state.view = 'graph'; refs.search.value = ''; clearDetails('Select a commit'); render(); });
 $('#navRemotes').addEventListener('click', () => { closeSubmoduleGraph(); loadRemotes(); });
 refs.leaveSubmoduleGraph.addEventListener('click', leaveSubmoduleGraph);
 // Covers window/pane resizes (a narrower details panel, dragging the app

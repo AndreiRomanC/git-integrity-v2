@@ -245,6 +245,11 @@ button { cursor: default; }
    so this is the one place in the graph view itself that never leaves that
    ambiguous. */
 .graph-path-badge { min-width: 0; max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #5a6c7d; font-size: 10px; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+/* Explicit "Repository: X" / "Parent: Y" labels (Message C, point 3) —
+   deliberately spelled out, not folded silently into the path badge, so a
+   glance at the header alone answers "which repository, whose parent". */
+.graph-identity-badge { flex-shrink: 0; color: #7f92a4; font-size: 10px; }
+.graph-identity-badge i { color: #5a6c7d; font-style: normal; margin-right: 3px; }
 .primary-branch-picker { display: flex; align-items: center; gap: 6px; color: #7f92a4; font-size: 10px; }
 .primary-branch-picker select { height: 26px; padding: 0 8px; border: 1px solid #354356; border-radius: 6px; background: #182430; color: #cfe0ee; font-size: 11px; }
 .ref-filter-group { display: flex; align-items: center; gap: 2px; padding: 2px; border: 1px solid #2d3a47; border-radius: 6px; background: #10171f; }
