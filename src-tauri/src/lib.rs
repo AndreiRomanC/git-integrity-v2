@@ -81,6 +81,7 @@ pub fn run() {
             repository::abort_merge,
             repository::create_submodule_branch,
             repository::run_git_command,
+            repository::run_terminal_command,
             repository::run_utrud,
         ])
         .run(tauri::generate_context!())
