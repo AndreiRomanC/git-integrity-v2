@@ -163,9 +163,38 @@ fn unpushed_paths_cache() -> &'static Mutex<HashMap<String, (Instant, Arc<HashSe
 // of racing.
 static REPO_WRITE_LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
 
+// Folds every way the *same* repository path can be spelled down to one key:
+// `\` vs `/` separators (a path pasted from Windows Explorer's address bar),
+// and — Windows only — letter case (NTFS is case-insensitive, so `C:\Repo`
+// and `c:\repo` are the same repository; a real Unix filesystem is normally
+// case-*sensitive*, where lowercasing here would wrongly merge two genuinely
+// different repositories, e.g. `/Users/x/Foo` and `/Users/x/foo`, so that
+// fold is deliberately platform-gated, not universal). Canonicalizing
+// (resolving `..`/symlinks to the real absolute path) catches the rest —
+// two different-looking paths that are actually the same directory. Falls
+// back to the normalized-but-uncanonicalized form when the path doesn't
+// exist (canonicalize needs a real path) rather than erroring; still folds
+// separators/case even then.
+fn repo_lock_key(path: &str) -> String {
+    let normalized_path = path.replace('\\', "/");
+    let resolved = fs::canonicalize(&normalized_path).map(|p| p.to_string_lossy().replace('\\', "/")).unwrap_or(normalized_path);
+    if cfg!(windows) { resolved.to_lowercase() } else { resolved }
+}
+
 fn repo_write_lock(repository: &str) -> Arc<Mutex<()>> {
+    let key = repo_lock_key(repository);
     let mut locks = REPO_WRITE_LOCKS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
-    locks.entry(repository.to_string()).or_insert_with(|| Arc::new(Mutex::new(()))).clone()
+    locks.entry(key).or_insert_with(|| Arc::new(Mutex::new(()))).clone()
+}
+
+// Call right after acquiring a repo_write_lock guard — logs how long this
+// operation waited behind another one already running on the *same*
+// repository (0 when nothing was contending), tagged with a non-secret
+// label identifying which command/context this is, so a backed-up queue is
+// visible in the perf log without ever including a commit message, file
+// path, or credential.
+fn log_repo_write_lock_acquired(repository_path: &str, label: &str, queue_wait: Duration) {
+    perf_log(&format!("repo_write_lock: [{label}] acquired (repo={}, queue_wait={:.1}ms)", anonymized_repository_id(repository_path), queue_wait.as_secs_f64() * 1000.0), Duration::ZERO);
 }
 
 // `load_repository` runs a full, unscoped status scan (every file in the
@@ -253,6 +282,30 @@ fn recent_full_statuses(repository: &Repository, repository_path: &str) -> Resul
     Ok(statuses)
 }
 
+// The branch's real configured upstream — branch.<local>.remote +
+// branch.<local>.merge, via git2's own Branch::upstream() — not a hardcoded
+// assumption that the remote is named `origin` and that the remote-tracking
+// branch shares the local branch's name. A repository with no `origin` at
+// all, or a branch tracking a differently-named branch on a differently-named
+// remote (a "release"/mirror remote, say), resolves correctly either way.
+// None when there's no configured upstream, the remote no longer exists, or
+// the remote-tracking ref hasn't been fetched yet — callers treat that as
+// "can't tell what's unpushed", not as an error.
+fn upstream_oid(repo: &Repository, local_branch_name: &str) -> Option<git2::Oid> {
+    upstream_ref(repo, local_branch_name).map(|(oid, _)| oid)
+}
+
+// Same, but also returns the upstream's display shorthand (`<remote>/<branch>`,
+// exactly as git/git2 would show it) for user-facing messages — reads
+// correctly even when the remote isn't named `origin` or the remote branch
+// has a different name than the local one.
+fn upstream_ref(repo: &Repository, local_branch_name: &str) -> Option<(git2::Oid, String)> {
+    let upstream = repo.find_branch(local_branch_name, BranchType::Local).ok()?.upstream().ok()?;
+    let target = upstream.get().target()?;
+    let shorthand = upstream.get().shorthand()?.to_string();
+    Some((target, shorthand))
+}
+
 fn unpushed_paths(repository: &str) -> HashSet<String> {
     (|| -> Option<HashSet<String>> {
         let repo = internal_repository(repository).ok()?;
@@ -261,7 +314,7 @@ fn unpushed_paths(repository: &str) -> HashSet<String> {
         let local_oid = head.target()?;
         let branch = head.shorthand()?.to_string();
         drop(head);
-        let upstream_oid = repo.refname_to_id(&format!("refs/remotes/origin/{branch}")).ok()?;
+        let Some(upstream_oid) = upstream_oid(&repo, &branch) else { return Some(HashSet::new()); };
         if upstream_oid == local_oid { return Some(HashSet::new()); }
         let mut walk = repo.revwalk().ok()?; walk.push(local_oid).ok()?; let _ = walk.hide(upstream_oid);
         let mut paths = HashSet::new();
@@ -640,8 +693,10 @@ pub fn run_git_command(repository_path: String, args: String) -> Result<RawGitRe
     // *other* mutation too (Stage/Commit/Delete/checkout/stash), not just
     // against another console command, the same as every other
     // index/HEAD-mutating command in this file.
+    let queue_started = Instant::now();
     let lock_handle = repo_write_lock(&repository_path);
     let _lock = lock_handle.lock().unwrap();
+    log_repo_write_lock_acquired(&repository_path, "run_git_command", queue_started.elapsed());
     let mut parts = tokenize_git_args(&args)?;
     // Typing the full, natural command ("git status") is just as valid as the
     // short form ("status") — strip a leading "git" token instead of
@@ -732,9 +787,8 @@ fn internal_statuses(repository: &Repository, scope: Option<&str>) -> Result<Vec
     // on-disk index's cached file stat info *during the scan* (the same
     // trick plain `git status` uses) — which means it writes to .git/index.
     // A status scan is called from many places that never take
-    // repo_write_lock (navigation, refresh_status, the submodule dirty-check
-    // inside sync_submodule_gitlinks) — a scan racing an actual stage/commit
-    // (which does hold that lock, but only around its *own* write, not
+    // repo_write_lock (navigation, refresh_status) — a scan racing an actual
+    // stage/commit (which does hold that lock, but only around its *own* write, not
     // around every concurrent status scan elsewhere) could interleave writes
     // to the same index file. A function documented and relied on as
     // read-only must not write at all, regardless of the perf upside.
@@ -984,15 +1038,14 @@ fn invalidate_git_metadata(repository: &str) {
     unpushed_paths_cache().lock().unwrap().remove(repository);
     full_status_cache().lock().unwrap().remove(repository);
     sorted_lookups_cache().lock().unwrap().remove(repository);
-    // submodule_sync_cache and submodule_unpushed_cache are deliberately NOT
-    // cleared here: invalidate_git_metadata runs after essentially every
-    // mutation, including an ordinary file stage/commit that has nothing to
-    // do with any submodule's own state — clearing either here would force
-    // the next fold/load to redo real, expensive submodule I/O (up to 18.5s
-    // for submodule_sync_cache on a repository with many submodules)
-    // regardless, defeating their TTLs entirely on the most common action in
-    // the app. Both are invalidated explicitly instead, wherever it's
-    // actually relevant: see invalidate_submodule_sync below.
+    // submodule_unpushed_cache is deliberately NOT cleared here:
+    // invalidate_git_metadata runs after essentially every mutation,
+    // including an ordinary file stage/commit that has nothing to do with
+    // any submodule's own state — clearing it here would force the next
+    // fold/load to redo real, expensive submodule I/O regardless, defeating
+    // its TTL entirely on the most common action in the app. It's
+    // invalidated explicitly instead, wherever it's actually relevant: see
+    // invalidate_submodule_sync below.
 }
 
 fn remove_submodule_section(path: &Path, name: &str) -> Result<(), String> {
@@ -1325,140 +1378,46 @@ pub fn open_commit_on_server(repository_path: String, commit_id: String, submodu
     launch_browser(&format!("{base}/commit/{}", commit_id.trim()))
 }
 
-// For every submodule whose own checked-out commit is clean (no uncommitted
-// changes of its own) and differs from what the parent's index currently
-// records, auto-record that new commit into the parent — the same
-// reconciliation `commit_submodule`/push already do explicitly, applied
-// generally here so it doesn't matter *how* the submodule ended up on a new
-// commit (its dedicated "Commit submodule" button, a raw git command typed
-// in the console, or committing one of its files directly): the parent
-// catches up the moment anything reloads it, instead of silently staying
-// unaware and making "Unpublished commits" look wrong by comparison.
-// A real Windows perf log caught this taking 18.5 SECONDS on one
-// load_repository call. This opens every submodule (a Repository::discover
-// each) and reads its HEAD on *every single* load_repository call — which
-// runs after almost every action in this app — purely to notice a submodule
-// commit made *outside* the app (a raw git command, or committing directly
-// inside the submodule's own folder) that this app wasn't told about any
-// other way. On a repository with many submodules that's real, repeated
-// cost paid on essentially every click. Not removed outright: an existing
-// test (load_repository_reconciles_a_submodule_commit_made_outside_the_app_too)
-// deliberately relies on load_repository catching this, and losing that
-// guarantee entirely would be a real regression, not just a perf tweak.
-// Instead, same long TTL already used for index_metadata for the same
-// reasoning: correctness here doesn't depend on doing this on literally
-// every call, just periodically (and immediately after any submodule action
-// this app itself performs, which already calls invalidate_git_metadata).
-static SUBMODULE_SYNC_CACHE: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+// A submodule whose own checked-out commit differs from what the parent's
+// index currently records — however that happened (its dedicated "Commit
+// submodule" button, a raw git command typed in the console, `git pull` run
+// directly inside it, another tool entirely) — is not "reconciled" by
+// anything passive. It just shows as modified, exactly like any other
+// uncommitted change, the moment the regular status scan sees it (git2's
+// own status walk already compares a submodule's HEAD against the parent's
+// recorded gitlink — no extra scan needed for that). Recording a new gitlink
+// into the parent's history is a real commit, and only ever happens as the
+// direct, explicit result of the user's own action: committing/pushing the
+// submodule itself (record_pushed_submodule_in_parent, called only from
+// commit_submodule/push_submodule/force_push_submodule — never from a
+// Refresh, navigation, or any other passive reload). This used to also run
+// speculatively from every load_repository call (even non-forced ones, at
+// one point) specifically to catch an *externally*-made submodule commit —
+// which is exactly the safety issue this removes: opening or refreshing a
+// repository must never silently create a commit in it that nobody asked
+// for, no matter how that submodule got to its new commit. It cost real
+// time for it too (18.5 seconds on one load_repository call, on a real
+// Windows repository with many submodules) for a guarantee this app no
+// longer makes.
 
-fn submodule_sync_cache() -> &'static Mutex<HashMap<String, Instant>> {
-    SUBMODULE_SYNC_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-// Called explicitly wherever it's actually relevant — a forced Refresh, or a
-// command that specifically changes a submodule's own commit/registration —
-// rather than from the general invalidate_git_metadata (which also fires on
-// every ordinary file stage/commit that has nothing to do with submodules).
+// Called explicitly wherever it's actually relevant — a command that
+// specifically changes a submodule's own commit/registration — rather than
+// from the general invalidate_git_metadata (which also fires on every
+// ordinary file stage/commit that has nothing to do with submodules).
 fn invalidate_submodule_sync(repository: &str) {
-    submodule_sync_cache().lock().unwrap().remove(repository);
     // Prefix match, not a single exact key: submodule_unpushed_cache is keyed
     // by each submodule's own absolute path (repository/relative/...), not
-    // by the parent's path. Only called from genuine submodule-state-changing
-    // actions (commit/push/pull/switch version, or an explicit forced
-    // reconcile) — never from the general invalidate_git_metadata an
-    // ordinary file stage/commit already goes through — so this stays rare,
-    // unlike the bug this whole cache exists to fix.
+    // by the parent's path.
     let prefix = format!("{repository}/");
     submodule_unpushed_cache().lock().unwrap().retain(|key, _| key != repository && !key.starts_with(&prefix));
-}
-
-// `write` controls whether this is allowed to actually record anything into
-// the parent's index/history (via record_pushed_submodule_in_parent) or only
-// scan and report — load_repository passes this through from its own
-// `force` parameter, so an auto-commit in the parent can only ever happen on
-// an *explicit* Refresh, never as a side effect of ordinary navigation or of
-// reloading after some unrelated stage/commit elsewhere in the parent (which
-// used to call this too, since load_repository runs after nearly every
-// action — silently creating a real commit in the user's history from
-// actions that were never "commit this submodule", every time it happened
-// to notice one had moved). Right after a successful Push/Pull, the
-// dedicated push_submodule/force_push_submodule/pull_submodule commands
-// already call record_pushed_submodule_in_parent directly themselves — that
-// path is untouched, it's tied to the specific push that just happened, not
-// to this general periodic reconciliation scan.
-fn sync_submodule_gitlinks(repository_path: &str, write: bool) {
-    let scan_started = Instant::now();
-    if let Some(last_run) = submodule_sync_cache().lock().unwrap().get(repository_path) {
-        if last_run.elapsed() < INDEX_METADATA_TTL {
-            perf_log(&format!("sync_submodule_gitlinks: cache HIT (skipped, {:.1}s old)", last_run.elapsed().as_secs_f64()), scan_started.elapsed());
-            return;
-        }
-    }
-    perf_log("sync_submodule_gitlinks: cache MISS, scanning", Duration::ZERO);
-    // Every exit path below logs either completion or ERROR — a MISS line
-    // with nothing after it (what an early `return` used to produce, on
-    // e.g. the parent repository failing to open) left no way to tell a
-    // real failure apart from the process just never having gotten there.
-    match sync_submodule_gitlinks_inner(repository_path, write) {
-        Ok(submodule_count) => {
-            // Marked done only now, after the scan actually completed —
-            // marking it up front (before doing the work) would let a run
-            // that errored out partway through still count as a fresh scan
-            // for the next TTL window, silently skipping the real one.
-            submodule_sync_cache().lock().unwrap().insert(repository_path.to_string(), Instant::now());
-            perf_log(&format!("sync_submodule_gitlinks: scan complete ({submodule_count} submodules, write={write})"), scan_started.elapsed());
-        }
-        Err(reason) => perf_log(&format!("sync_submodule_gitlinks: ERROR ({reason})"), scan_started.elapsed()),
-    }
-}
-
-fn sync_submodule_gitlinks_inner(repository_path: &str, write: bool) -> Result<usize, &'static str> {
-    let parent = internal_repository(repository_path).map_err(|_| "could not open parent repository")?;
-    let index = parent.index().map_err(|_| "could not open parent index")?;
-    let gitlinks: Vec<(String, git2::Oid)> = index.iter().filter(|entry| entry.mode == 0o160000).map(|entry| (String::from_utf8_lossy(&entry.path).into_owned(), entry.id)).collect();
-    drop(index);
-    drop(parent);
-    let submodule_count = gitlinks.len();
-    if submodule_count == 0 { return Ok(0); }
-    // Each submodule's check is largely independent I/O (open its repository,
-    // read HEAD, and — only for the ones that actually moved — a status
-    // scan) — a real Windows perf log showed this taking 10+ seconds
-    // strictly sequential on a repository with 510 submodules, mostly spent
-    // waiting on that I/O one submodule at a time. Splitting the list across
-    // a small worker pool lets it overlap instead. Each worker opens its own
-    // Repository instances (git2's Repository isn't shared across threads
-    // here, ever — only owned Strings/Oids are); any submodule that actually
-    // needs its parent gitlink bumped still goes through
-    // record_pushed_submodule_in_parent, which acquires repo_write_lock, so
-    // concurrent writes from different workers still serialize safely.
-    let worker_count = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(1, 16);
-    let chunk_size = submodule_count.div_ceil(worker_count).max(1);
-    std::thread::scope(|scope| {
-        for chunk in gitlinks.chunks(chunk_size) {
-            scope.spawn(move || {
-                for (relative, recorded_oid) in chunk {
-                    let absolute = Path::new(repository_path).join(relative);
-                    let Ok(sub_repo) = internal_submodule_repository(&absolute) else { continue };
-                    let Some(head_oid) = sub_repo.head().ok().and_then(|head| head.target()) else { continue };
-                    if head_oid == *recorded_oid { continue; }
-                    let Ok(dirty) = internal_statuses(&sub_repo, None) else { continue };
-                    if !dirty.is_empty() { continue; } // has uncommitted changes of its own — leave it for the user to commit first
-                    drop(sub_repo);
-                    if write { let _ = record_pushed_submodule_in_parent(repository_path, relative, Some(head_oid)); }
-                }
-            });
-        }
-    });
-    Ok(submodule_count)
 }
 
 // A fast, read-only, additive first phase for *opening a repository specifically*
 // — validates and canonicalizes it (via internal_repository/Repository::discover,
 // same as everywhere else), reads its name/current branch, and returns
-// branches/commits/stashes, but does none of the two genuinely expensive parts
-// (a real Windows perf log measured 10-18s in sync_submodule_gitlinks and
-// 15-23s in the full status scan, on repositories with many submodules or many
-// files): no sync_submodule_gitlinks, no status scan. The frontend shows this
+// branches/commits/stashes, but does none of the genuinely expensive part (a
+// real Windows perf log measured 15-23s in the full status scan on
+// repositories with many files): no status scan. The frontend shows this
 // immediately (folders/files navigable, tracked/status shown as "Loading
 // status…", Stage/Delete/Commit/checkout disabled) then calls refresh_status
 // in the background to complete it.
@@ -1560,15 +1519,6 @@ pub fn load_repository(path: String, force: Option<bool>) -> Result<RepositoryDa
     // scan from moments earlier just because nothing *this app* did
     // triggered an invalidation.
     if force.unwrap_or(false) { invalidate_git_metadata(&path); invalidate_submodule_sync(&path); }
-    let step = Instant::now();
-    // Only an explicit Refresh (force: true) is allowed to record anything
-    // into the parent's history here — see sync_submodule_gitlinks' own doc
-    // comment. Every other call (after an ordinary stage/unstage/commit
-    // elsewhere in the parent, or just navigating) still runs the scan
-    // (cheap after the first, TTL-cached) so status stays accurate, but
-    // never writes a commit on its own.
-    sync_submodule_gitlinks(&path, force.unwrap_or(false));
-    perf_log("load_repository: sync_submodule_gitlinks", step.elapsed());
     let mut repo = internal_repository(&path)?;
     let name = Path::new(&path).file_name().and_then(|n| n.to_str()).unwrap_or("repository").to_string();
     let head_detached = repo.head_detached().unwrap_or(false);
@@ -1670,10 +1620,8 @@ pub fn load_older_commits(repository_path: String, after_commit_id: String, limi
 }
 
 // A lightweight "what changed" refresh — status only, no branches/commits/
-// stashes and no sync_submodule_gitlinks (which alone was 10-18s on a
-// repository with many submodules, per earlier perf logs). For "files copied
-// in from outside the app should just show up" — the app can't watch the
-// filesystem itself, but it can cheaply re-check status at the moments that
+// stashes. For "files copied in from outside the app should just show up" —
+// the app can't watch the filesystem itself, but it can cheaply re-check status at the moments that
 // actually matter (regaining window focus, opening the Working tree drawer)
 // instead of only on a full manual Refresh or the next unrelated action.
 // Always a fresh scan, deliberately bypassing the status cache — the whole
@@ -1813,21 +1761,35 @@ pub fn stage_files(path: String, files: Vec<String>) -> Result<StageResult, Stri
 // not staged, not silently reported as if it were.
 fn stage_files_inner(path: &str, files: Vec<String>) -> Result<StageResult, String> {
     validate_path(path)?;
-    // Real evidence this was needed, not theoretical: see repo_write_lock's
-    // doc comment. Held for the rest of this function, so a burst of rapid
-    // checkbox clicks queues up instead of racing on the same index.
-    let lock_handle = repo_write_lock(path);
-    let _lock = lock_handle.lock().unwrap();
     let step = Instant::now();
     let (files, submodule_groups) = partition_by_submodule(path, files);
     perf_log(&format!("stage_files: partition_by_submodule ({} files)", files.len()), step.elapsed());
     let mut result = StageResult::default();
+    // Staging files *inside* a submodule is entirely that submodule's own
+    // repository — it never touches the parent's index at all. Done before
+    // the parent's own lock is even acquired below (each recursive call
+    // acquires and releases only *that* submodule's own lock in turn) so
+    // this thread is never holding two different repositories' write locks
+    // at once. That single-lock-at-a-time invariant is what makes the
+    // parent-vs-submodule lock ordering here provably deadlock-free against
+    // every other command that touches both (e.g. commit_submodule, which
+    // takes the submodule's lock first and, only after releasing it,
+    // separately takes the parent's — see its own comment) — two locks
+    // taken one at a time, never nested, can't form a cycle with anything
+    // else that follows the same rule.
     for (sub_path, inner_files) in submodule_groups {
         let inner = stage_files(sub_path, inner_files)?;
         result.staged_paths.extend(inner.staged_paths);
         result.skipped_dirty_submodules.extend(inner.skipped_dirty_submodules);
     }
     if files.is_empty() { return Ok(result); }
+    // Real evidence this was needed, not theoretical: see repo_write_lock's
+    // doc comment. Held for the rest of this function, so a burst of rapid
+    // checkbox clicks queues up instead of racing on the same index.
+    let queue_started = Instant::now();
+    let lock_handle = repo_write_lock(path);
+    let _lock = lock_handle.lock().unwrap();
+    log_repo_write_lock_acquired(path, "stage_files", queue_started.elapsed());
     let repo = internal_repository(path)?;
     let safe_files = files.into_iter().map(|file| safe_relative_path(file.trim_end_matches(|character| character == '/' || character == '\\'))).collect::<Result<Vec<_>, _>>()?;
     let step = Instant::now();
@@ -1911,13 +1873,19 @@ fn stage_files_inner(path: &str, files: Vec<String>) -> Result<StageResult, Stri
 #[tauri::command]
 pub fn unstage_files(path: String, files: Vec<String>) -> Result<(), String> {
     validate_path(&path)?;
-    // See repo_write_lock's doc comment — same concurrent-index race as
-    // stage_files, from the exact same rapid-checkbox-click pattern.
-    let lock_handle = repo_write_lock(&path);
-    let _lock = lock_handle.lock().unwrap();
     let (files, submodule_groups) = partition_by_submodule(&path, files);
+    // Same single-lock-at-a-time reasoning as stage_files_inner: unstaging
+    // files *inside* a submodule is entirely that submodule's own
+    // repository, done before the parent's own lock is acquired below, one
+    // submodule lock at a time, never nested with the parent's.
     for (sub_path, inner_files) in submodule_groups { unstage_files(sub_path, inner_files)?; }
     if files.is_empty() { return Ok(()); }
+    // See repo_write_lock's doc comment — same concurrent-index race as
+    // stage_files, from the exact same rapid-checkbox-click pattern.
+    let queue_started = Instant::now();
+    let lock_handle = repo_write_lock(&path);
+    let _lock = lock_handle.lock().unwrap();
+    log_repo_write_lock_acquired(&path, "unstage_files", queue_started.elapsed());
     let repo = internal_repository(&path)?; let head = repo.head().and_then(|head| head.peel(ObjectType::Commit)).map_err(|error| error.message().to_string())?;
     let safe = files.iter().map(|file| safe_relative_path(file)).collect::<Result<Vec<_>, _>>()?; repo.reset_default(Some(&head), safe.iter()).map_err(|error| error.message().to_string())?; invalidate_git_metadata(&path); Ok(())
 }
@@ -1925,6 +1893,10 @@ pub fn unstage_files(path: String, files: Vec<String>) -> Result<(), String> {
 #[tauri::command]
 pub fn create_commit(path: String, message: String) -> Result<(), String> {
     if message.trim().is_empty() { return Err("Commit message cannot be empty".into()); }
+    let queue_started = Instant::now();
+    let lock_handle = repo_write_lock(&path);
+    let _lock = lock_handle.lock().unwrap();
+    log_repo_write_lock_acquired(&path, "create_commit", queue_started.elapsed());
     let repo = internal_repository(&path)?; let mut index = repo.index().map_err(|error| error.message().to_string())?; let tree_id = index.write_tree().map_err(|error| error.message().to_string())?; let tree = repo.find_tree(tree_id).map_err(|error| error.message().to_string())?; let signature = repo.signature().map_err(|_| "Configure user.name and user.email for this repository".to_string())?;
     let parent = repo.head().ok().and_then(|head| head.peel_to_commit().ok()); let parents: Vec<&git2::Commit<'_>> = parent.iter().collect(); repo.commit(Some("HEAD"), &signature, &signature, message.trim(), &tree, &parents).map_err(|error| error.message().to_string())?; invalidate_git_metadata(&path); Ok(())
 }
@@ -2010,7 +1982,15 @@ pub fn branch_creation_context(repository_path: String, target_path: String) -> 
 #[tauri::command]
 pub fn create_branch(path: String, branch: String) -> Result<(), String> {
     if branch.trim().is_empty() { return Err("Branch name cannot be empty".into()); }
-    let repo = internal_repository(&path)?; let head = repo.head().and_then(|head| head.peel_to_commit()).map_err(|error| error.message().to_string())?; repo.branch(branch.trim(), &head, false).map_err(|error| error.message().to_string())?; drop(head); switch_branch(path, branch)
+    let queue_started = Instant::now();
+    let lock_handle = repo_write_lock(&path);
+    let _lock = lock_handle.lock().unwrap();
+    log_repo_write_lock_acquired(&path, "create_branch", queue_started.elapsed());
+    let repo = internal_repository(&path)?; let head = repo.head().and_then(|head| head.peel_to_commit()).map_err(|error| error.message().to_string())?; repo.branch(branch.trim(), &head, false).map_err(|error| error.message().to_string())?; drop(head);
+    drop(_lock);
+    // switch_branch takes its own lock on the same repository — released
+    // above first, so this is two sequential acquisitions, never nested.
+    switch_branch(path, branch)
 }
 
 // Creates and switches to a new branch inside a submodule's own repository —
@@ -2024,6 +2004,12 @@ pub fn create_submodule_branch(repository_path: String, relative_path: String, b
     validate_path(&repository_path)?;
     let absolute = validate_submodule(&repository_path, &relative_path)?;
     create_branch(absolute.to_string_lossy().into_owned(), branch)?;
+    // create_branch's own submodule-scoped lock is already released by now —
+    // this acquires only the *parent's*, never nested with it.
+    let queue_started = Instant::now();
+    let lock_handle = repo_write_lock(&repository_path);
+    let _lock = lock_handle.lock().unwrap();
+    log_repo_write_lock_acquired(&repository_path, "create_submodule_branch", queue_started.elapsed());
     let parent = internal_repository(&repository_path)?;
     let mut submodule = parent.find_submodule(&relative_path).map_err(|error| error.message().to_string())?;
     submodule.add_to_index(true).map_err(|error| format!("Branch created, but the parent index could not be updated: {}", error.message()))?;
@@ -2034,6 +2020,10 @@ pub fn create_submodule_branch(repository_path: String, relative_path: String, b
 
 #[tauri::command]
 pub fn switch_branch(path: String, branch: String) -> Result<(), String> {
+    let queue_started = Instant::now();
+    let lock_handle = repo_write_lock(&path);
+    let _lock = lock_handle.lock().unwrap();
+    log_repo_write_lock_acquired(&path, "switch_branch", queue_started.elapsed());
     let repo = internal_repository(&path)?; let reference = format!("refs/heads/{}", branch.trim()); repo.find_reference(&reference).map_err(|error| error.message().to_string())?; repo.set_head(&reference).map_err(|error| error.message().to_string())?; let mut checkout = git2::build::CheckoutBuilder::new(); checkout.safe(); repo.checkout_head(Some(&mut checkout)).map_err(|error| error.message().to_string())?; invalidate_git_metadata(&path); Ok(())
 }
 
@@ -2517,6 +2507,10 @@ pub fn fetch_all_remotes(repository_path: String) -> Result<(), String> {
 #[tauri::command]
 pub fn sync_repository(repository_path: String, action: String) -> Result<(), String> {
     validate_path(&repository_path)?;
+    let queue_started = Instant::now();
+    let lock_handle = repo_write_lock(&repository_path);
+    let _lock = lock_handle.lock().unwrap();
+    log_repo_write_lock_acquired(&repository_path, "sync_repository", queue_started.elapsed());
     let repo = internal_repository(&repository_path)?; let head = repo.head().map_err(|error| error.message().to_string())?; let branch = head.shorthand().ok_or("Detached HEAD cannot be synchronized")?.to_string(); let upstream = repo.find_branch(&branch, BranchType::Local).and_then(|branch| branch.upstream()).map_err(|_| "The current branch has no upstream".to_string())?; let upstream_name = upstream.name().ok().flatten().ok_or("Invalid upstream")?.to_string(); let (remote_name, remote_branch) = upstream_name.split_once('/').ok_or("Invalid upstream branch")?; drop(upstream); drop(head);
     match action.as_str() {
         "pull" => { fetch_remote(repository_path.clone(), remote_name.into())?; let remote_ref = repo.find_reference(&format!("refs/remotes/{remote_name}/{remote_branch}")).map_err(|error| error.message().to_string())?; let target = remote_ref.target().ok_or("Remote branch has no target")?; let annotated = repo.find_annotated_commit(target).map_err(|error| error.message().to_string())?; let (analysis, _) = repo.merge_analysis(&[&annotated]).map_err(|error| error.message().to_string())?; if !analysis.is_fast_forward() && !analysis.is_up_to_date() { return Err("Pull requires a merge; only fast-forward pull is allowed".into()); } if analysis.is_fast_forward() { let mut local = repo.find_reference(&format!("refs/heads/{branch}")).map_err(|error| error.message().to_string())?; local.set_target(target, "fast-forward pull").map_err(|error| error.message().to_string())?; repo.set_head(&format!("refs/heads/{branch}")).map_err(|error| error.message().to_string())?; let mut checkout = git2::build::CheckoutBuilder::new(); checkout.safe(); repo.checkout_head(Some(&mut checkout)).map_err(|error| error.message().to_string())?; } }
@@ -2574,6 +2568,10 @@ fn resolve_target_repository(repository_path: &str, target_path: &str) -> Result
 pub fn merge_branch(repository_path: String, target_path: String, source_ref: String) -> Result<MergeOutcome, String> {
     let repository_path = resolve_target_repository(&repository_path, &target_path)?;
     validate_path(&repository_path)?;
+    let queue_started = Instant::now();
+    let lock_handle = repo_write_lock(&repository_path);
+    let _lock = lock_handle.lock().unwrap();
+    log_repo_write_lock_acquired(&repository_path, "merge_branch", queue_started.elapsed());
     let mut repo = internal_repository(&repository_path)?;
     if repo.state() != git2::RepositoryState::Clean {
         return Err("A merge (or other operation) is already in progress here. Resolve or abort it first.".into());
@@ -2672,6 +2670,10 @@ pub fn resolve_conflict(repository_path: String, target_path: String, relative_p
     let repository_path = resolve_target_repository(&repository_path, &target_path)?;
     validate_path(&repository_path)?;
     let relative = safe_relative_path(&relative_path)?;
+    let queue_started = Instant::now();
+    let lock_handle = repo_write_lock(&repository_path);
+    let _lock = lock_handle.lock().unwrap();
+    log_repo_write_lock_acquired(&repository_path, "resolve_conflict", queue_started.elapsed());
     let repo = internal_repository(&repository_path)?;
     let absolute = Path::new(&repository_path).join(&relative);
     match resolution.as_str() {
@@ -2724,6 +2726,10 @@ pub fn complete_merge(repository_path: String, target_path: String, message: Str
     let repository_path = resolve_target_repository(&repository_path, &target_path)?;
     validate_path(&repository_path)?;
     if message.trim().is_empty() { return Err("Merge commit message cannot be empty".into()); }
+    let queue_started = Instant::now();
+    let lock_handle = repo_write_lock(&repository_path);
+    let _lock = lock_handle.lock().unwrap();
+    log_repo_write_lock_acquired(&repository_path, "complete_merge", queue_started.elapsed());
     let mut repo = internal_repository(&repository_path)?;
     if repo.state() != git2::RepositoryState::Merge {
         return Err("There is no merge in progress here.".into());
@@ -2735,6 +2741,10 @@ pub fn complete_merge(repository_path: String, target_path: String, message: Str
 pub fn abort_merge(repository_path: String, target_path: String) -> Result<(), String> {
     let repository_path = resolve_target_repository(&repository_path, &target_path)?;
     validate_path(&repository_path)?;
+    let queue_started = Instant::now();
+    let lock_handle = repo_write_lock(&repository_path);
+    let _lock = lock_handle.lock().unwrap();
+    log_repo_write_lock_acquired(&repository_path, "abort_merge", queue_started.elapsed());
     let repo = internal_repository(&repository_path)?;
     if repo.state() != git2::RepositoryState::Merge {
         return Err("There is no merge in progress here.".into());
@@ -2774,6 +2784,12 @@ pub fn publish_status(repository_path: String, branch: String, remote: String) -
 pub fn publish_branch(repository_path: String, branch: String, remote: String, username: String, access_token: String, upto_commit: String) -> Result<(), String> {
     validate_path(&repository_path)?;
     if branch.trim().is_empty() || remote.trim().is_empty() { return Err("Choose a local branch and a remote".into()); }
+    // See repo_write_lock's doc comment. No credentials in this log line —
+    // just like every other one here, only the repo id and durations.
+    let queue_started = Instant::now();
+    let lock_handle = repo_write_lock(&repository_path);
+    let _lock = lock_handle.lock().unwrap();
+    log_repo_write_lock_acquired(&repository_path, "publish_branch", queue_started.elapsed());
     let repo = internal_repository(&repository_path)?; let branch = branch.trim(); let remote_name = remote.trim(); let local_oid = repo.refname_to_id(&format!("refs/heads/{branch}")).map_err(|error| error.message().to_string())?;
     // Git can only push a *contiguous* range of history — there's no way to
     // publish a commit while holding back an older one it depends on. So
@@ -3168,11 +3184,14 @@ fn submodule_push_status_in(repo: &Repository) -> Option<String> {
     if repo.head_detached().unwrap_or(true) { return Some("Detached — not on a branch, so it cannot be pushed as-is. Use \"Change version\" to switch to a branch first.".into()); }
     let branch = head.shorthand()?.to_string();
     drop(head);
-    let remote_target = repo.find_reference(&format!("refs/remotes/origin/{branch}")).ok()?.target()?;
+    // The branch's real upstream (see upstream_ref's own doc comment) — not a
+    // hardcoded assumption that it's origin/<same name>. No configured
+    // upstream at all reads as "can't tell", same as it always has.
+    let (remote_target, upstream_label) = upstream_ref(repo, &branch)?;
     if remote_target == local_target { return None; }
     let mut walk = repo.revwalk().ok()?; walk.push(local_target).ok()?; let _ = walk.hide(remote_target);
     let ahead = walk.take(50).count();
-    Some(if ahead > 0 { format!("{ahead} commit{} not yet pushed to origin/{branch} — needs push", if ahead == 1 { "" } else { "s" }) } else { format!("Diverged from origin/{branch}") })
+    Some(if ahead > 0 { format!("{ahead} commit{} not yet pushed to {upstream_label} — needs push", if ahead == 1 { "" } else { "s" }) } else { format!("Diverged from {upstream_label}") })
 }
 
 // The actual commits behind `submodule_push_status`'s summary line — showing
@@ -3196,7 +3215,7 @@ fn submodule_unpushed_commits_in(repo: &Repository) -> Vec<PublishCommit> {
         if repo.head_detached().unwrap_or(true) { return Some(Vec::new()); }
         let branch = head.shorthand()?.to_string();
         drop(head);
-        let remote_target = repo.find_reference(&format!("refs/remotes/origin/{branch}")).ok()?.target()?;
+        let (remote_target, _) = upstream_ref(repo, &branch)?;
         if remote_target == local_target { return Some(Vec::new()); }
         let mut walk = repo.revwalk().ok()?; walk.push(local_target).ok()?; let _ = walk.hide(remote_target);
         let mut commits: Vec<PublishCommit> = walk.take(50).flatten().filter_map(|oid| repo.find_commit(oid).ok().map(|commit| PublishCommit {
@@ -3270,6 +3289,10 @@ pub fn add_submodule(repository_path: String, parent_path: String, url: String, 
     let url = url.trim();
     if url.is_empty() || url.starts_with('-') { return Err("Enter a valid Git repository URL".into()); }
 
+    let queue_started = Instant::now();
+    let lock_handle = repo_write_lock(&repository_path);
+    let _lock = lock_handle.lock().unwrap();
+    log_repo_write_lock_acquired(&repository_path, "add_submodule", queue_started.elapsed());
     let repo = internal_repository(&repository_path)?;
     let destination = Path::new(&repository_path).join(&relative);
     let indexed = cached_index_metadata(&repository_path).0.contains(&relative_string);
@@ -3320,6 +3343,16 @@ pub fn add_submodule(repository_path: String, parent_path: String, url: String, 
 pub fn switch_submodule_version(repository_path: String, relative_path: String, revision: String, version_kind: String, name: String) -> Result<String, String> {
     validate_path(&repository_path)?;
     let absolute = validate_submodule(&repository_path, &relative_path)?;
+    let absolute_string = absolute.to_string_lossy().into_owned();
+    // The submodule's own lock, held only for this first phase (its own
+    // HEAD/checkout) — released before the parent's own lock is taken below
+    // for the gitlink update, so this thread never holds both repositories'
+    // write locks at once (see stage_files_inner's own comment for why that
+    // invariant matters).
+    let queue_started = Instant::now();
+    let sub_lock_handle = repo_write_lock(&absolute_string);
+    let sub_lock = sub_lock_handle.lock().unwrap();
+    log_repo_write_lock_acquired(&absolute_string, "switch_submodule_version(submodule)", queue_started.elapsed());
     let repo = internal_submodule_repository(&absolute)?;
     if version_kind == "branch" {
         // `name` is the actual branch name (e.g. "main"); `revision` is only the SHA
@@ -3367,6 +3400,11 @@ pub fn switch_submodule_version(repository_path: String, relative_path: String, 
     let mut checkout = git2::build::CheckoutBuilder::new(); checkout.safe(); repo.checkout_head(Some(&mut checkout)).map_err(|error| error.message().to_string())?;
     let selected = repo.head().ok().and_then(|head| head.target()).map(|id| id.to_string()).unwrap_or_default();
     drop(repo);
+    drop(sub_lock); // fully released before the parent's own lock, never nested
+    let queue_started = Instant::now();
+    let lock_handle = repo_write_lock(&repository_path);
+    let _lock = lock_handle.lock().unwrap();
+    log_repo_write_lock_acquired(&repository_path, "switch_submodule_version(parent)", queue_started.elapsed());
     let parent = internal_repository(&repository_path)?;
     let mut submodule = parent.find_submodule(&relative_path).map_err(|error| error.message().to_string())?;
     submodule.add_to_index(true).map_err(|error| format!("Version changed, but the parent index could not be updated: {}", error.message()))?;
@@ -3395,6 +3433,12 @@ pub fn reset_submodule(repository_path: String, relative_path: String) -> Result
     let entry = index.iter().find(|entry| String::from_utf8_lossy(&entry.path) == relative_string)
         .ok_or("This path is not a registered submodule in the parent index")?;
     let target_oid = entry.id;
+    drop(index); drop(parent); // read-only above — only the submodule itself is mutated below
+    let absolute_string = absolute.to_string_lossy().into_owned();
+    let queue_started = Instant::now();
+    let lock_handle = repo_write_lock(&absolute_string);
+    let _lock = lock_handle.lock().unwrap();
+    log_repo_write_lock_acquired(&absolute_string, "reset_submodule", queue_started.elapsed());
     let sub_repo = internal_submodule_repository(&absolute)?;
     sub_repo.set_head_detached(target_oid).map_err(|error| error.message().to_string())?;
     let mut checkout = git2::build::CheckoutBuilder::new();
@@ -3413,7 +3457,17 @@ pub fn change_submodule_url(repository_path: String, relative_path: String, url:
     let relative = normalized(&safe_relative_path(&relative_path)?);
     let url = url.trim();
     if url.is_empty() || url.starts_with('-') { return Err("Enter a valid Git repository URL".into()); }
+    let queue_started = Instant::now();
+    let parent_lock_handle = repo_write_lock(&repository_path);
+    let parent_lock = parent_lock_handle.lock().unwrap();
+    log_repo_write_lock_acquired(&repository_path, "change_submodule_url(parent)", queue_started.elapsed());
     let mut repo = internal_repository(&repository_path)?; let name = repo.submodules().map_err(|error| error.message().to_string())?.into_iter().find(|item| normalized(item.path()) == relative).map(|item| item.name().unwrap_or("").to_string()).ok_or("Submodule configuration was not found")?; repo.submodule_set_url(&name, url).map_err(|error| error.message().to_string())?;
+    drop(repo); drop(parent_lock); // released before the submodule's own lock, never nested
+    let absolute_string = absolute.to_string_lossy().into_owned();
+    let queue_started = Instant::now();
+    let sub_lock_handle = repo_write_lock(&absolute_string);
+    let _sub_lock = sub_lock_handle.lock().unwrap();
+    log_repo_write_lock_acquired(&absolute_string, "change_submodule_url(submodule)", queue_started.elapsed());
     let subrepo = internal_submodule_repository(&absolute)?; subrepo.remote_set_url("origin", url).map_err(|error| error.message().to_string())?; subrepo.find_remote("origin").map_err(|error| error.message().to_string())?; git(absolute.to_str().unwrap_or_default(), &["fetch", "origin"]).map_err(|detail| format!("Fetch failed: {detail}"))?;
     invalidate_git_metadata(&repository_path);
     invalidate_submodule_sync(&repository_path); // this app just changed a submodule's registration/version
@@ -3441,6 +3495,10 @@ fn remove_git_path_inner(repository_path: &str, relative_path: &str) -> Result<(
     if !tracked.contains(&relative) && !tracked.iter().any(|path| path.starts_with(&prefix)) {
         return Err("This item is not tracked by Git. Remove it with the operating system if intended".into());
     }
+    let queue_started = Instant::now();
+    let lock_handle = repo_write_lock(repository_path);
+    let _lock = lock_handle.lock().unwrap();
+    log_repo_write_lock_acquired(repository_path, "remove_git_path", queue_started.elapsed());
     let repo = internal_repository(repository_path)?;
     let step = Instant::now();
     let submodule_name = repo.submodules().ok().and_then(|items| items.into_iter().find(|item| normalized(item.path()) == relative).map(|item| item.name().unwrap_or(&relative).to_string()));
@@ -3494,6 +3552,10 @@ pub fn delete_local_path(repository_path: String, relative_path: String) -> Resu
     if tracked.contains(&relative_string) || tracked.iter().any(|path| path.starts_with(&prefix)) {
         return Err("This item is tracked. Use Remove from Git so the deletion can be committed".into());
     }
+    let queue_started = Instant::now();
+    let lock_handle = repo_write_lock(&repository_path);
+    let _lock = lock_handle.lock().unwrap();
+    log_repo_write_lock_acquired(&repository_path, "delete_local_path", queue_started.elapsed());
     let repo = internal_repository(&repository_path)?;
     let registered_name = repo.submodules().ok().and_then(|items| items.into_iter()
         .find(|item| normalized(item.path()) == relative_string)
@@ -3547,8 +3609,10 @@ pub fn commit_staged(repository_path: String, message: String) -> Result<String,
     if message.trim().is_empty() { return Err("Commit message cannot be empty".into()); }
     // See repo_write_lock's doc comment — a commit right as a staging click
     // is still mid-flight would otherwise race the same index.
+    let queue_started = Instant::now();
     let lock_handle = repo_write_lock(&repository_path);
     let _lock = lock_handle.lock().unwrap();
+    log_repo_write_lock_acquired(&repository_path, "commit_staged", queue_started.elapsed());
     let step = Instant::now();
     let repo = internal_repository(&repository_path)?;
     perf_log("commit_staged: internal_repository (open)", step.elapsed());
@@ -3585,9 +3649,14 @@ pub fn commit_files(repository_path: String, files: Vec<String>, message: String
 fn commit_selected_internal(repository_path: &str, files: &[String], message: &str) -> Result<String, String> {
     let commit_started = Instant::now();
     // See repo_write_lock's doc comment — shared by both commit_files and
-    // commit_path, both of which mutate the index.
+    // commit_path, both of which mutate the index. Also reused by
+    // record_pushed_submodule_in_parent (commit_submodule/push_submodule/
+    // force_push_submodule), which is why those never hold their own
+    // submodule lock while calling in here — see this function's callers.
+    let queue_started = Instant::now();
     let lock_handle = repo_write_lock(repository_path);
     let _lock = lock_handle.lock().unwrap();
+    log_repo_write_lock_acquired(repository_path, "commit_selected_internal", queue_started.elapsed());
     let repo = internal_repository(repository_path)?;
     // A submodule folder can be deleted straight from disk (Finder/terminal, or a
     // failed clone) without going through this app's own removal flow, leaving it
@@ -3688,6 +3757,10 @@ pub fn restore_file(repository_path: String, relative_path: String, source_ref: 
         return restore_file(sub_path, inner_relative, source_ref);
     }
     let relative = safe_relative_path(&relative_path)?; if relative.as_os_str().is_empty() { return Err("Select a file".into()); }
+    let queue_started = Instant::now();
+    let lock_handle = repo_write_lock(&repository_path);
+    let _lock = lock_handle.lock().unwrap();
+    log_repo_write_lock_acquired(&repository_path, "restore_file", queue_started.elapsed());
     let repo = internal_repository(&repository_path)?;
     let object = repo.revparse_single(source_ref.trim()).or_else(|_| repo.revparse_single(&format!("refs/remotes/{}", source_ref.trim()))).map_err(|error| format!("Cannot resolve {source_ref}: {}", error.message()))?;
     let commit = object.peel_to_commit().map_err(|error| error.message().to_string())?; let tree = commit.tree().map_err(|error| error.message().to_string())?;
@@ -3916,6 +3989,10 @@ pub fn compare_file_contents(repository_path: String, relative_path: String, rem
 #[tauri::command]
 pub fn stash_changes(repository_path: String) -> Result<(), String> {
     validate_path(&repository_path)?;
+    let queue_started = Instant::now();
+    let lock_handle = repo_write_lock(&repository_path);
+    let _lock = lock_handle.lock().unwrap();
+    log_repo_write_lock_acquired(&repository_path, "stash_changes", queue_started.elapsed());
     let mut repo = internal_repository(&repository_path)?;
     let signature = repo.signature().map_err(|_| "Configure user.name and user.email for this repository".to_string())?;
     repo.stash_save2(&signature, None, Some(git2::StashFlags::INCLUDE_UNTRACKED)).map_err(|error| format!("Cannot stash changes: {}", error.message()))?;
@@ -3938,6 +4015,10 @@ pub fn stash_file(repository_path: String, relative_path: String) -> Result<(), 
     let relative = safe_relative_path(&relative_path)?;
     let relative_string = normalized(&relative);
     if relative_string.is_empty() { return Err("Select a specific file or folder to stash".into()); }
+    let queue_started = Instant::now();
+    let lock_handle = repo_write_lock(&repository_path);
+    let _lock = lock_handle.lock().unwrap();
+    log_repo_write_lock_acquired(&repository_path, "stash_file", queue_started.elapsed());
     git(&repository_path, &["stash", "push", "--include-untracked", "--", &relative_string])?;
     invalidate_git_metadata(&repository_path);
     Ok(())
@@ -3946,6 +4027,10 @@ pub fn stash_file(repository_path: String, relative_path: String) -> Result<(), 
 #[tauri::command]
 pub fn pop_stash(repository_path: String, stash_index: usize) -> Result<(), String> {
     validate_path(&repository_path)?;
+    let queue_started = Instant::now();
+    let lock_handle = repo_write_lock(&repository_path);
+    let _lock = lock_handle.lock().unwrap();
+    log_repo_write_lock_acquired(&repository_path, "pop_stash", queue_started.elapsed());
     let mut repo = internal_repository(&repository_path)?;
     let mut options = git2::StashApplyOptions::new();
     // `stash_pop` (apply + drop) drops the stash entry unconditionally on a
@@ -3970,6 +4055,10 @@ pub fn pop_stash(repository_path: String, stash_index: usize) -> Result<(), Stri
 #[tauri::command]
 pub fn drop_stash(repository_path: String, stash_index: usize) -> Result<(), String> {
     validate_path(&repository_path)?;
+    let queue_started = Instant::now();
+    let lock_handle = repo_write_lock(&repository_path);
+    let _lock = lock_handle.lock().unwrap();
+    log_repo_write_lock_acquired(&repository_path, "drop_stash", queue_started.elapsed());
     let mut repo = internal_repository(&repository_path)?;
     repo.stash_drop(stash_index).map_err(|error| format!("Cannot drop this stash: {}", error.message()))?;
     invalidate_git_metadata(&repository_path);
@@ -3991,6 +4080,10 @@ pub fn restore_stash_paths(repository_path: String, stash_index: usize, paths: V
     let all_files = stash_entry_files(repository_path.clone(), stash_index)?;
     let remaining: Vec<String> = all_files.into_iter().filter(|file| !selected.contains(file)).collect();
 
+    let queue_started = Instant::now();
+    let lock_handle = repo_write_lock(&repository_path);
+    let _lock = lock_handle.lock().unwrap();
+    log_repo_write_lock_acquired(&repository_path, "restore_stash_paths", queue_started.elapsed());
     // The stash this entry becomes is identified by its own commit id, not
     // its stack position — pushing a fresh stash for the leftover files
     // below shifts every later entry's index up by one, so this entry has
@@ -4051,6 +4144,10 @@ pub fn restore_stash_paths(repository_path: String, stash_index: usize, paths: V
 #[tauri::command]
 pub fn abort_stash_conflict(repository_path: String) -> Result<(), String> {
     validate_path(&repository_path)?;
+    let queue_started = Instant::now();
+    let lock_handle = repo_write_lock(&repository_path);
+    let _lock = lock_handle.lock().unwrap();
+    log_repo_write_lock_acquired(&repository_path, "abort_stash_conflict", queue_started.elapsed());
     let repo = internal_repository(&repository_path)?;
     let head_commit = repo.head().map_err(|error| error.message().to_string())?.peel_to_commit().map_err(|error| error.message().to_string())?;
     let mut checkout = git2::build::CheckoutBuilder::new(); checkout.force();
@@ -4100,6 +4197,10 @@ pub fn stash_entry_files(repository_path: String, stash_index: usize) -> Result<
 pub fn rename_branch(repository_path: String, old_name: String, new_name: String) -> Result<(), String> {
     validate_path(&repository_path)?;
     if new_name.trim().is_empty() { return Err("Branch name cannot be empty".into()); }
+    let queue_started = Instant::now();
+    let lock_handle = repo_write_lock(&repository_path);
+    let _lock = lock_handle.lock().unwrap();
+    log_repo_write_lock_acquired(&repository_path, "rename_branch", queue_started.elapsed());
     let repo = internal_repository(&repository_path)?;
     let mut branch = repo.find_branch(old_name.trim(), BranchType::Local).map_err(|error| error.message().to_string())?;
     branch.rename(new_name.trim(), false).map_err(|error| error.message().to_string())?;
@@ -4110,6 +4211,10 @@ pub fn rename_branch(repository_path: String, old_name: String, new_name: String
 #[tauri::command]
 pub fn delete_branch(repository_path: String, branch_name: String) -> Result<(), String> {
     validate_path(&repository_path)?;
+    let queue_started = Instant::now();
+    let lock_handle = repo_write_lock(&repository_path);
+    let _lock = lock_handle.lock().unwrap();
+    log_repo_write_lock_acquired(&repository_path, "delete_branch", queue_started.elapsed());
     let repo = internal_repository(&repository_path)?;
     let current = repo.head().ok().and_then(|head| head.shorthand().map(String::from));
     if current.as_deref() == Some(branch_name.trim()) { return Err("Cannot delete the currently checked out branch. Switch to another branch first".into()); }
@@ -4125,18 +4230,28 @@ pub fn commit_submodule(repository_path: String, relative_path: String, message:
     if message.trim().is_empty() { return Err("Commit message cannot be empty".into()); }
     let absolute = validate_submodule(&repository_path, &relative_path)?;
     let sub_path = absolute.to_string_lossy().into_owned();
-    let repo = internal_submodule_repository(&absolute)?;
-    let mut index = repo.index().map_err(|error| error.message().to_string())?;
-    index.add_all(["*"], git2::IndexAddOption::DEFAULT, None).map_err(|error| error.message().to_string())?;
-    index.write().map_err(|error| error.message().to_string())?;
-    let parent = repo.head().ok().and_then(|head| head.peel_to_commit().ok());
-    let parent_tree_id = parent.as_ref().and_then(|commit| commit.tree().ok()).map(|tree| tree.id());
-    let tree_id = index.write_tree().map_err(|error| error.message().to_string())?;
-    if parent_tree_id == Some(tree_id) { return Err("There are no changes to commit in this submodule".into()); }
-    let tree = repo.find_tree(tree_id).map_err(|error| error.message().to_string())?;
-    let signature = repo.signature().map_err(|_| "Configure user.name and user.email for this submodule".to_string())?;
-    let parents: Vec<&git2::Commit<'_>> = parent.iter().collect();
-    let oid = repo.commit(Some("HEAD"), &signature, &signature, message.trim(), &tree, &parents).map_err(|error| error.message().to_string())?;
+    // Held only for the submodule's own commit — released (end of this block)
+    // before record_pushed_submodule_in_parent below takes the *parent's*
+    // lock, so this thread never holds both at once (see stage_files_inner's
+    // comment for why that matters).
+    let oid = {
+        let queue_started = Instant::now();
+        let lock_handle = repo_write_lock(&sub_path);
+        let _lock = lock_handle.lock().unwrap();
+        log_repo_write_lock_acquired(&sub_path, "commit_submodule", queue_started.elapsed());
+        let repo = internal_submodule_repository(&absolute)?;
+        let mut index = repo.index().map_err(|error| error.message().to_string())?;
+        index.add_all(["*"], git2::IndexAddOption::DEFAULT, None).map_err(|error| error.message().to_string())?;
+        index.write().map_err(|error| error.message().to_string())?;
+        let parent = repo.head().ok().and_then(|head| head.peel_to_commit().ok());
+        let parent_tree_id = parent.as_ref().and_then(|commit| commit.tree().ok()).map(|tree| tree.id());
+        let tree_id = index.write_tree().map_err(|error| error.message().to_string())?;
+        if parent_tree_id == Some(tree_id) { return Err("There are no changes to commit in this submodule".into()); }
+        let tree = repo.find_tree(tree_id).map_err(|error| error.message().to_string())?;
+        let signature = repo.signature().map_err(|_| "Configure user.name and user.email for this submodule".to_string())?;
+        let parents: Vec<&git2::Commit<'_>> = parent.iter().collect();
+        repo.commit(Some("HEAD"), &signature, &signature, message.trim(), &tree, &parents).map_err(|error| error.message().to_string())?
+    };
     invalidate_git_metadata(&sub_path);
     invalidate_submodule_sync(&repository_path); // this app just changed the submodule's own commit
     // Once the submodule itself has a new commit, its working copy already IS
@@ -4157,6 +4272,14 @@ pub fn push_submodule(repository_path: String, relative_path: String) -> Result<
     validate_path(&repository_path)?;
     let absolute = validate_submodule(&repository_path, &relative_path)?;
     let sub_path = absolute.to_string_lossy().into_owned();
+    // Held for the submodule's own fetch+push (a concurrent local write on
+    // this same submodule — a commit, "Reset submodule" — must queue behind
+    // it, not race it) — released below before record_pushed_submodule_in_parent
+    // takes the *parent's* lock, never nested with it.
+    let queue_started = Instant::now();
+    let lock_handle = repo_write_lock(&sub_path);
+    let _lock = lock_handle.lock().unwrap();
+    log_repo_write_lock_acquired(&sub_path, "push_submodule", queue_started.elapsed());
     let repo = internal_submodule_repository(&absolute)?;
     let local_target = repo.head().ok().and_then(|head| head.target());
 
@@ -4212,6 +4335,7 @@ pub fn push_submodule(repository_path: String, relative_path: String) -> Result<
     // its pre-push status for up to the cache's TTL.
     invalidate_git_metadata(&sub_path);
     invalidate_submodule_sync(&repository_path); // this app just changed the submodule's own commit
+    drop(repo); drop(_lock); // fully released before the parent's own lock, never nested
     record_pushed_submodule_in_parent(&repository_path, &relative_path, local_target)?;
     Ok(PushSubmoduleResult { revision: local_target.map(|oid| oid.to_string()).unwrap_or_default(), branch })
 }
@@ -4249,6 +4373,12 @@ pub fn force_push_submodule(repository_path: String, relative_path: String) -> R
     validate_path(&repository_path)?;
     let absolute = validate_submodule(&repository_path, &relative_path)?;
     let sub_path = absolute.to_string_lossy().into_owned();
+    // See push_submodule's own comment — same submodule-then-parent, never
+    // nested, lock ordering.
+    let queue_started = Instant::now();
+    let lock_handle = repo_write_lock(&sub_path);
+    let _lock = lock_handle.lock().unwrap();
+    log_repo_write_lock_acquired(&sub_path, "force_push_submodule", queue_started.elapsed());
     let repo = internal_submodule_repository(&absolute)?;
     let local_target = repo.head().ok().and_then(|head| head.target());
 
@@ -4272,6 +4402,7 @@ pub fn force_push_submodule(repository_path: String, relative_path: String) -> R
 
     invalidate_git_metadata(&sub_path);
     invalidate_submodule_sync(&repository_path); // this app just changed the submodule's own commit
+    drop(repo); drop(_lock); // fully released before the parent's own lock, never nested
     record_pushed_submodule_in_parent(&repository_path, &relative_path, local_target)?;
     Ok(PushSubmoduleResult { revision: local_target.map(|oid| oid.to_string()).unwrap_or_default(), branch })
 }
@@ -4294,6 +4425,12 @@ pub fn pull_submodule(repository_path: String, relative_path: String) -> Result<
     validate_path(&repository_path)?;
     let absolute = validate_submodule(&repository_path, &relative_path)?;
     let sub_path = absolute.to_string_lossy().into_owned();
+    // Fast-forwards the submodule's local branch ref and checks out the new
+    // tree — a real local write, unlike a plain fetch.
+    let queue_started = Instant::now();
+    let lock_handle = repo_write_lock(&sub_path);
+    let _lock = lock_handle.lock().unwrap();
+    log_repo_write_lock_acquired(&sub_path, "pull_submodule", queue_started.elapsed());
     let repo = internal_submodule_repository(&absolute)?;
 
     let dirty = internal_statuses(&repo, None)?;
@@ -6887,6 +7024,89 @@ mod tests {
     }
 
     #[test]
+    fn repo_lock_key_folds_separators_and_canonicalizes_so_the_same_repo_always_gets_the_same_lock() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-lock-key-{suffix}"));
+        create_libgit2_repository(&base, "a.txt");
+        let canonical = base.to_string_lossy().into_owned();
+        // As if pasted from a Windows Explorer address bar (backslash
+        // separators) with a trailing separator too.
+        let mixed_spelling = format!("{}\\", canonical.replace('/', "\\"));
+
+        assert_eq!(repo_lock_key(&canonical), repo_lock_key(&mixed_spelling), "backslash separators and a trailing separator must resolve to the same lock key");
+        assert!(Arc::ptr_eq(&repo_write_lock(&canonical), &repo_write_lock(&mixed_spelling)), "repo_write_lock must hand out the exact same lock instance for equivalent spellings of the same repository");
+
+        #[cfg(windows)]
+        {
+            // NTFS is case-insensitive — this fold only applies on Windows
+            // (a real Unix filesystem is normally case-*sensitive*, where
+            // folding case would wrongly merge two different repositories).
+            let different_case = canonical.to_uppercase();
+            assert_eq!(repo_lock_key(&canonical), repo_lock_key(&different_case), "on Windows, letter case must not change the lock key");
+        }
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn concurrent_parent_and_submodule_writes_never_deadlock() {
+        // The specific hazard this guards against: one call that touches both
+        // the parent's index and a submodule's own index in a single command
+        // (stage_files spanning both — the parent's lock, then, nested, the
+        // submodule's) racing another that commits *inside* the submodule and
+        // lets that auto-record into the parent (commit_submodule — the
+        // submodule's lock first, then, only after releasing it, the
+        // parent's — never nested). If any code path ever reversed that
+        // ordering while the other still held its own lock, two threads doing
+        // these concurrently would deadlock on unlucky timing. Run many
+        // iterations on two genuinely concurrent threads, under a bounded
+        // wait — a real deadlock hangs past the timeout instead of finishing;
+        // this test failing (rather than hanging forever) is itself the point.
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-deadlock-race-{suffix}"));
+        let parent = base.join("parent"); let dependency = base.join("dependency");
+        create_libgit2_repository(&parent, "root.txt");
+        create_libgit2_repository(&dependency, "module.txt");
+        let parent_string = parent.to_string_lossy().into_owned();
+        let added = add_submodule(parent_string.clone(), "".into(), dependency.to_string_lossy().into_owned(), "dep".into(), String::new(), String::new()).unwrap();
+        create_commit(parent_string.clone(), "Add dep submodule".into()).unwrap();
+        let sub_path = parent.join(&added);
+        run_git(&sub_path, &["config", "user.email", "test@example.com"]);
+        run_git(&sub_path, &["config", "user.name", "Test User"]);
+
+        const ITERATIONS: usize = 25;
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        let (p1, s1, a1) = (parent_string.clone(), sub_path.clone(), added.clone());
+        let tx1 = tx.clone();
+        std::thread::spawn(move || {
+            for i in 0..ITERATIONS {
+                fs::write(Path::new(&p1).join("root.txt"), format!("parent v{i}")).unwrap();
+                fs::write(s1.join("module.txt"), format!("sub v{i}")).unwrap();
+                let _ = stage_files(p1.clone(), vec!["root.txt".into(), format!("{a1}/module.txt")]);
+            }
+            let _ = tx1.send("stage_files racer done");
+        });
+
+        let (p2, s2, a2) = (parent_string.clone(), sub_path.clone(), added.clone());
+        let tx2 = tx.clone();
+        std::thread::spawn(move || {
+            for i in 0..ITERATIONS {
+                fs::write(s2.join("module.txt"), format!("committed v{i}")).unwrap();
+                let _ = commit_submodule(p2.clone(), a2.clone(), format!("iteration {i}"));
+            }
+            let _ = tx2.send("commit_submodule racer done");
+        });
+        drop(tx);
+
+        for _ in 0..2 {
+            rx.recv_timeout(Duration::from_secs(30)).expect("concurrent parent/submodule writes must not deadlock");
+        }
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
     fn commit_submodule_auto_updates_the_parent_even_without_a_push() {
         // "After committing inside a submodule and it's already on the new
         // version, it should show as version-changed, not modified — even
@@ -6916,20 +7136,22 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_non_forced_reload_never_auto_commits_in_the_parent() {
-        // Reproduces and fixes a real safety issue: sync_submodule_gitlinks
-        // ran from *every* load_repository call — which itself runs after
-        // nearly every action in this app, and on ordinary navigation-driven
-        // reloads too — and, whenever it noticed a submodule had moved (by
-        // any means: a raw git command, another tool, `git pull` run
-        // directly inside it), silently created a real commit in the
-        // *parent* repository's history with no user action asking for that
-        // specific commit. A user could open or refresh a repository and
-        // find a new commit had appeared in their history that they never
-        // asked for. Only an explicit Refresh (force: true, covered by the
-        // test right below this one) — or the dedicated push/pull/commit
-        // submodule commands, right after the specific action that
-        // justifies it — may still do this.
+    fn load_repository_never_auto_commits_a_submodule_move_regardless_of_force() {
+        // Reproduces and fixes a real safety issue: load_repository used to
+        // silently create a real commit in the *parent* repository's history
+        // whenever it noticed a submodule had moved (by any means: a raw git
+        // command, another tool, `git pull` run directly inside it) — for an
+        // ordinary reload without hesitation, and even a forced Refresh
+        // still did (see the git history of this test — it used to assert
+        // the opposite for force:true). A user could open or refresh a
+        // repository and find a new commit had appeared in their history
+        // that they never asked for. Refresh, navigation, and opening a
+        // repository must be completely read-only toward the parent's
+        // history — a moved submodule is only ever *reported* as modified
+        // (the ordinary status scan already does that, unrelated to this),
+        // never silently committed. Only the dedicated commit/push submodule
+        // commands may still record it, as the direct, explicit result of
+        // that specific user action (see commit_submodule_auto_updates_the_parent_even_without_a_push).
         let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let base = std::env::temp_dir().join(format!("git-integrity-no-silent-commit-{suffix}"));
         let parent = base.join("parent"); let dependency = base.join("dependency");
@@ -6939,63 +7161,29 @@ mod tests {
         create_commit(parent_string.clone(), "Add test submodule".into()).unwrap();
         let head_before = Repository::open(&parent).unwrap().head().unwrap().target().unwrap();
 
-        // A commit made directly with git inside the submodule — nothing in
-        // this app's own commands touched it.
-        let sub_path = parent.join(&added);
-        run_git(&sub_path, &["commit", "--allow-empty", "-m", "Test update"]);
-
-        // An ordinary, non-forced reload — what every post-mutation reload
-        // and plain navigation in this app actually sends — must leave the
-        // parent's history completely untouched.
-        load_repository(parent_string.clone(), None).unwrap();
-        load_repository(parent_string.clone(), Some(false)).unwrap();
-
-        let repo = Repository::open(&parent).unwrap();
-        assert_eq!(repo.head().unwrap().target().unwrap(), head_before, "a non-forced reload must never create a commit in the parent");
-        let recorded = repo.index().unwrap().get_path(Path::new(&added), 0).unwrap().id;
-        assert_ne!(recorded, Repository::open(&sub_path).unwrap().head().unwrap().target().unwrap(), "and must not even silently stage the updated gitlink — the parent's recorded pointer must stay exactly as it was");
-
-        fs::remove_dir_all(base).unwrap();
-    }
-
-    #[test]
-    fn load_repository_reconciles_a_submodule_commit_made_outside_the_app_too() {
-        // Reproduces the report: a submodule's own "N commits not yet pushed"
-        // list showed real commits, but the sidebar's "Unpublished commits"
-        // (the PARENT project's own count) stayed at 0. Cause: the automatic
-        // parent-bump only ever ran from the dedicated `commit_submodule`
-        // command — a commit made any other way inside the submodule (a raw
-        // git command in the console, or committing one of its files
-        // directly) never told the parent. `load_repository` now reconciles
-        // this generally, regardless of how the submodule got its new commit
-        // — but, per the test right above this one, only when explicitly
-        // asked (force: true — an explicit Refresh).
-        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-        let base = std::env::temp_dir().join(format!("git-integrity-general-reconcile-{suffix}"));
-        let parent = base.join("parent"); let dependency = base.join("dependency");
-        create_libgit2_repository(&parent, "README.md"); create_libgit2_repository(&dependency, "module.txt");
-        let parent_string = parent.to_string_lossy().into_owned();
-        let added = add_submodule(parent_string.clone(), "".into(), dependency.to_string_lossy().into_owned(), "test".into(), String::new(), String::new()).unwrap();
-        create_commit(parent_string.clone(), "Add test submodule".into()).unwrap();
-
         // Two commits made directly with git inside the submodule — nothing
         // in this app's own commands touched it.
         let sub_path = parent.join(&added);
         run_git(&sub_path, &["commit", "--allow-empty", "-m", "Test update"]);
         run_git(&sub_path, &["commit", "--allow-empty", "-m", "Test update"]);
-        let expected_oid = Repository::open(&sub_path).unwrap().head().unwrap().target().unwrap();
+        let sub_head = Repository::open(&sub_path).unwrap().head().unwrap().target().unwrap();
 
-        // A single reload must be enough to catch the parent up.
-        load_repository(parent_string.clone(), Some(true)).unwrap();
+        // Every shape of reload this app actually sends — ordinary,
+        // explicit non-forced, and an explicit forced Refresh — must all
+        // leave the parent's history and index completely untouched.
+        load_repository(parent_string.clone(), None).unwrap();
+        load_repository(parent_string.clone(), Some(false)).unwrap();
+        let changes = load_repository(parent_string.clone(), Some(true)).unwrap().changes;
 
         let repo = Repository::open(&parent).unwrap();
+        assert_eq!(repo.head().unwrap().target().unwrap(), head_before, "no reload, forced or not, may ever create a commit in the parent");
         let recorded = repo.index().unwrap().get_path(Path::new(&added), 0).unwrap().id;
-        assert_eq!(recorded, expected_oid, "load_repository should have auto-recorded the submodule's new commit into the parent");
-        assert_eq!(repo.head().unwrap().peel_to_commit().unwrap().summary().unwrap_or(""), "Update submodule test to ".to_string() + &expected_oid.to_string()[..8], "the auto-bump should itself be a real commit in the parent, not just a staged index change");
-        drop(repo);
+        assert_ne!(recorded, sub_head, "and must not even silently stage the updated gitlink — the parent's recorded pointer must stay exactly as it was");
 
-        // And "Unpublished commits" (the parent's own count) must now see it.
-        assert!(!load_repository(parent_string.clone(), Some(true)).unwrap().changes.iter().any(|c| c.path == added), "the submodule should show clean now that the parent has caught up");
+        // The move must still be visible — just as an ordinary uncommitted
+        // change, for the user to explicitly Stage/Commit, not silently
+        // reconciled away.
+        assert!(changes.iter().any(|c| c.path == added), "the submodule must show as modified so the user can decide to stage/commit it, not disappear as if nothing happened: {:?}", changes.iter().map(|c| (&c.path, &c.status)).collect::<Vec<_>>());
 
         fs::remove_dir_all(base).unwrap();
     }
@@ -7052,6 +7240,92 @@ mod tests {
 
         fs::remove_dir_all(repository).unwrap();
         fs::remove_dir_all(remote).unwrap();
+    }
+
+    #[test]
+    fn unpushed_detection_uses_the_real_upstream_not_a_hardcoded_origin_same_name_branch() {
+        // The "unpushed" flag used to hardcode refs/remotes/origin/<local branch
+        // name> — wrong for a repository with no `origin` at all, and wrong for
+        // a branch tracking a differently-named branch on its remote (a
+        // "release"/mirror remote, say). Both together, here.
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let repository = std::env::temp_dir().join(format!("git-integrity-unpushed-real-upstream-{suffix}"));
+        let remote = std::env::temp_dir().join(format!("git-integrity-unpushed-real-upstream-remote-{suffix}.git"));
+        fs::create_dir_all(&repository).unwrap();
+        fs::create_dir_all(&remote).unwrap();
+        run_git(&remote, &["init", "--bare"]);
+        fs::write(repository.join("a.txt"), "one").unwrap();
+        run_git(&repository, &["init", "-b", "work"]);
+        run_git(&repository, &["config", "user.email", "test@example.com"]);
+        run_git(&repository, &["config", "user.name", "Test User"]);
+        run_git(&repository, &["add", "."]);
+        run_git(&repository, &["commit", "-m", "Initial"]);
+        // No `origin` at all — the only remote is named "release", and the
+        // local branch "work" tracks a remote branch named "main" (a
+        // different name than the local branch).
+        run_git(&repository, &["remote", "add", "release", remote.to_str().unwrap()]);
+        run_git(&repository, &["-c", "protocol.file.allow=always", "push", "-u", "release", "work:main"]);
+        let path = repository.to_string_lossy().into_owned();
+
+        let listing = load_directory(path.clone(), "".into(), None).unwrap();
+        assert!(!listing.iter().find(|e| e.name == "a.txt").unwrap().unpushed, "freshly pushed to release/main — nothing should be flagged");
+
+        fs::write(repository.join("a.txt"), "two").unwrap();
+        commit_path(path.clone(), "a.txt".into(), "Update a.txt".into()).unwrap();
+        let listing = load_directory(path.clone(), "".into(), None).unwrap();
+        assert!(listing.iter().find(|e| e.name == "a.txt").unwrap().unpushed, "a commit not yet on release/main must be flagged unpushed, found via the branch's real upstream");
+
+        fs::remove_dir_all(repository).unwrap();
+        fs::remove_dir_all(remote).unwrap();
+    }
+
+    #[test]
+    fn submodule_unpushed_status_uses_the_real_upstream_not_a_hardcoded_origin() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-sub-unpushed-real-upstream-{suffix}"));
+        let repository = base.join("main");
+        let dep_remote = base.join("dep-remote.git");
+        let dep_seed = base.join("dep-seed");
+        fs::create_dir_all(&repository).unwrap();
+        fs::create_dir_all(&dep_seed).unwrap();
+        fs::create_dir_all(&dep_remote).unwrap();
+        fs::write(repository.join("README.md"), "root").unwrap();
+        fs::write(dep_seed.join("module.txt"), "v1").unwrap();
+
+        run_git(&dep_remote, &["init", "--bare"]);
+        for path in [&repository, &dep_seed] {
+            run_git(path, &["init"]);
+            run_git(path, &["config", "user.email", "test@example.com"]);
+            run_git(path, &["config", "user.name", "Test User"]);
+            run_git(path, &["add", "."]);
+            run_git(path, &["commit", "-m", "Initial"]);
+        }
+        run_git(&dep_seed, &["remote", "add", "origin", dep_remote.to_str().unwrap()]);
+        run_git(&dep_seed, &["-c", "protocol.file.allow=always", "push", "origin", "HEAD:main"]);
+        run_git(&repository, &["-c", "protocol.file.allow=always", "submodule", "add", dep_remote.to_str().unwrap(), "vendor/dep"]);
+        run_git(&repository, &["commit", "-am", "Add dep submodule"]);
+
+        let repo_path = repository.to_string_lossy().into_owned();
+        let sub_path = repository.join("vendor/dep");
+        run_git(&sub_path, &["config", "user.email", "test@example.com"]);
+        run_git(&sub_path, &["config", "user.name", "Test User"]);
+        // The submodule's only remote is "mirror" (not "origin"), tracking a
+        // remote branch named "release" (not "main", the local branch name).
+        run_git(&sub_path, &["remote", "rename", "origin", "mirror"]);
+        run_git(&sub_path, &["branch", "-M", "main"]);
+        run_git(&sub_path, &["-c", "protocol.file.allow=always", "push", "-u", "mirror", "main:release"]);
+
+        assert_eq!(submodule_push_status(&sub_path.to_string_lossy()), None, "freshly synced against mirror/release — nothing to report");
+
+        fs::write(sub_path.join("module.txt"), "v2").unwrap();
+        commit_submodule(repo_path, "vendor/dep".into(), "Local only".into()).unwrap();
+        let status = submodule_push_status(&sub_path.to_string_lossy());
+        assert!(status.as_deref().is_some_and(|message| message.contains("1 commit") && message.contains("mirror/release")), "expected an unpushed-commit message naming the real upstream mirror/release, got: {status:?}");
+        let commits = submodule_unpushed_commits(&sub_path.to_string_lossy());
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0].subject, "Local only");
+
+        fs::remove_dir_all(base).unwrap();
     }
 
     #[test]
@@ -7969,35 +8243,6 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_stage_does_not_invalidate_submodule_sync_cache() {
-        // The submodule scan is expensive (18.5s on a real repository with
-        // many submodules, per a Windows perf log) and is deliberately given
-        // a long TTL for that reason — but invalidate_git_metadata, which
-        // runs after essentially *any* mutation, used to also clear this
-        // cache, defeating the TTL for the common case of staging/committing
-        // a file that has nothing to do with any submodule. This asserts the
-        // cached timestamp survives an ordinary stage+commit untouched.
-        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-        let base = std::env::temp_dir().join(format!("git-integrity-submodule-cache-separation-{suffix}"));
-        let parent = base.join("parent"); let dependency = base.join("dependency");
-        create_libgit2_repository(&parent, "README.md"); create_libgit2_repository(&dependency, "module.txt");
-        let parent_string = parent.to_string_lossy().into_owned();
-        add_submodule(parent_string.clone(), "".into(), dependency.to_string_lossy().into_owned(), "dep".into(), String::new(), String::new()).unwrap();
-        create_commit(parent_string.clone(), "Add submodule".into()).unwrap();
-
-        load_repository(parent_string.clone(), Some(true)).unwrap();
-        let recorded_at = *submodule_sync_cache().lock().unwrap().get(&parent_string).expect("should have cached a sync timestamp after the forced load");
-
-        // An ordinary file stage + commit — nothing to do with the submodule.
-        fs::write(parent.join("plain.txt"), "content").unwrap();
-        stage_files(parent_string.clone(), vec!["plain.txt".into()]).unwrap();
-        commit_staged(parent_string.clone(), "Add plain file".into()).unwrap();
-
-        let still_recorded_at = *submodule_sync_cache().lock().unwrap().get(&parent_string).expect("the cache entry should not have been dropped by an unrelated mutation");
-        assert_eq!(recorded_at, still_recorded_at, "an ordinary stage/commit must not force the next load_repository to rescan every submodule");
-    }
-
-    #[test]
     fn staging_a_folder_with_an_embedded_git_repo_fails_clearly_instead_of_invalid_path() {
         // Reproduces the report exactly: staging a directory that contains
         // its own .git (an unregistered embedded repository — copied in from
@@ -8297,7 +8542,7 @@ mod tests {
         println!("PERF load_repository (force, same repo, no mutation between calls): {full_elapsed:?} ({} branches, {} commits, {} changes)", full.branches.len(), full.commits.len(), full.changes.len());
 
         println!("PERF speedup: open_repository_fast was {:.1}x faster", full_elapsed.as_secs_f64() / fast_elapsed.as_secs_f64().max(0.0001));
-        assert!(fast_elapsed < full_elapsed, "open_repository_fast ({fast_elapsed:?}) should be faster than load_repository ({full_elapsed:?}) by skipping sync_submodule_gitlinks and the full status scan");
+        assert!(fast_elapsed < full_elapsed, "open_repository_fast ({fast_elapsed:?}) should be faster than load_repository ({full_elapsed:?}) by skipping the full status scan");
     }
 
     // Isolated from the test above deliberately (a fresh repository, not
