@@ -1468,7 +1468,11 @@ fn invalidate_submodule_sync(repository: &str) {
 const GRAPH_COMMIT_WINDOW: usize = 500;
 
 #[tauri::command]
-pub fn open_repository_fast(path: String) -> Result<FastRepositoryData, String> {
+pub async fn open_repository_fast(path: String) -> Result<FastRepositoryData, String> {
+    off_main_thread(move || open_repository_fast_inner(path)).await
+}
+
+fn open_repository_fast_inner(path: String) -> Result<FastRepositoryData, String> {
     let started = Instant::now();
     perf_log(&format!("open_repository_fast: START ({})", anonymized_repository_id(&path)), Duration::ZERO);
     validate_path(&path)?;
@@ -1536,7 +1540,15 @@ pub fn open_repository_fast(path: String) -> Result<FastRepositoryData, String> 
 }
 
 #[tauri::command]
-pub fn load_repository(path: String, force: Option<bool>) -> Result<RepositoryData, String> {
+pub async fn load_repository(path: String, force: Option<bool>) -> Result<RepositoryData, String> {
+    off_main_thread(move || load_repository_inner(path, force)).await
+}
+
+// The synchronous core, callable directly (never crossing an `.await`) by
+// anything that already runs off the main thread by virtue of its own
+// #[tauri::command] wrapper — submodule_repository, most notably, which
+// needs this exact same full load for the submodule's own path.
+fn load_repository_inner(path: String, force: Option<bool>) -> Result<RepositoryData, String> {
     let load_started = Instant::now();
     perf_log(&format!("load_repository: START ({}, force={})", anonymized_repository_id(&path), force.unwrap_or(false)), Duration::ZERO);
     validate_path(&path)?;
@@ -1654,7 +1666,11 @@ pub fn load_older_commits(repository_path: String, after_commit_id: String, limi
 // Always a fresh scan, deliberately bypassing the status cache — the whole
 // point is "what's actually on disk right now".
 #[tauri::command]
-pub fn refresh_status(repository_path: String) -> Result<Vec<Change>, String> {
+pub async fn refresh_status(repository_path: String) -> Result<Vec<Change>, String> {
+    off_main_thread(move || refresh_status_inner(repository_path)).await
+}
+
+fn refresh_status_inner(repository_path: String) -> Result<Vec<Change>, String> {
     let started = Instant::now();
     validate_path(&repository_path)?;
     let repo = internal_repository(&repository_path)?;
@@ -1704,7 +1720,8 @@ fn partition_by_submodule(repository_path: &str, files: Vec<String>) -> (Vec<Str
 // check) to apply it, so it inherits that protection automatically instead
 // of needing its own copy of it.
 #[tauri::command]
-pub fn stage_all(repository_path: String, scope: String) -> Result<StageResult, String> {
+pub async fn stage_all(repository_path: String, scope: String) -> Result<StageResult, String> {
+    off_main_thread(move || {
     let started = Instant::now();
     perf_log(&format!("stage_all: START (scope={scope:?})"), Duration::ZERO);
     let result = stage_all_inner(&repository_path, &scope);
@@ -1713,6 +1730,7 @@ pub fn stage_all(repository_path: String, scope: String) -> Result<StageResult, 
         Err(error) => perf_log(&format!("stage_all: ERROR: {error}"), started.elapsed()),
     }
     result
+    }).await
 }
 
 fn stage_all_inner(repository_path: &str, scope: &str) -> Result<StageResult, String> {
@@ -2579,7 +2597,11 @@ fn is_latest_pr_status_generation(repository_path: &str, generation: u64) -> boo
 }
 
 #[tauri::command]
-pub fn pr_status(repository_path: String, branch: Option<String>, context: Option<String>) -> Result<PrStatusResult, String> {
+pub async fn pr_status(repository_path: String, branch: Option<String>, context: Option<String>) -> Result<PrStatusResult, String> {
+    off_main_thread(move || pr_status_inner(repository_path, branch, context)).await
+}
+
+fn pr_status_inner(repository_path: String, branch: Option<String>, context: Option<String>) -> Result<PrStatusResult, String> {
     validate_path(&repository_path)?;
     let generation = claim_pr_status_generation(&repository_path);
     let repo = internal_repository(&repository_path)?;
@@ -2624,7 +2646,11 @@ pub fn fetch_remote(repository_path: String, remote: String) -> Result<(), Strin
 // with more than one remote (a second push mirror, an upstream, etc.) had no
 // single-click way to update from all of them at once.
 #[tauri::command]
-pub fn fetch_all_remotes(repository_path: String) -> Result<(), String> {
+pub async fn fetch_all_remotes(repository_path: String) -> Result<(), String> {
+    off_main_thread(move || fetch_all_remotes_inner(repository_path)).await
+}
+
+fn fetch_all_remotes_inner(repository_path: String) -> Result<(), String> {
     validate_path(&repository_path)?;
     git(&repository_path, &["fetch", "--all"]).map_err(|detail| format!("Fetch failed: {detail}"))?;
     invalidate_git_metadata(&repository_path);
@@ -2632,7 +2658,11 @@ pub fn fetch_all_remotes(repository_path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn sync_repository(repository_path: String, action: String) -> Result<(), String> {
+pub async fn sync_repository(repository_path: String, action: String) -> Result<(), String> {
+    off_main_thread(move || sync_repository_inner(repository_path, action)).await
+}
+
+fn sync_repository_inner(repository_path: String, action: String) -> Result<(), String> {
     validate_path(&repository_path)?;
     let queue_started = Instant::now();
     let lock_handle = repo_write_lock(&repository_path);
@@ -2956,10 +2986,14 @@ pub fn publish_branch(repository_path: String, branch: String, remote: String, u
 }
 
 #[tauri::command]
-pub fn submodule_repository(repository_path: String, relative_path: String) -> Result<RepositoryData, String> {
+pub async fn submodule_repository(repository_path: String, relative_path: String) -> Result<RepositoryData, String> {
+    off_main_thread(move || submodule_repository_inner(repository_path, relative_path)).await
+}
+
+fn submodule_repository_inner(repository_path: String, relative_path: String) -> Result<RepositoryData, String> {
     perf_log(&format!("submodule_repository: requested (parent={}, relative_path={relative_path})", anonymized_repository_id(&repository_path)), Duration::ZERO);
     let absolute = validate_submodule(&repository_path, &relative_path)?;
-    let result = load_repository(absolute.to_string_lossy().into_owned(), None);
+    let result = load_repository_inner(absolute.to_string_lossy().into_owned(), None);
     match &result {
         Ok(data) => {
             // Temporary, deliberately verbose diagnostic for the "does the
@@ -3402,7 +3436,11 @@ pub fn submodule_versions(repository_path: String, relative_path: String) -> Res
 }
 
 #[tauri::command]
-pub fn add_submodule(repository_path: String, parent_path: String, url: String, folder_name: String, username: String, access_token: String) -> Result<String, String> {
+pub async fn add_submodule(repository_path: String, parent_path: String, url: String, folder_name: String, username: String, access_token: String) -> Result<String, String> {
+    off_main_thread(move || add_submodule_inner(repository_path, parent_path, url, folder_name, username, access_token)).await
+}
+
+fn add_submodule_inner(repository_path: String, parent_path: String, url: String, folder_name: String, username: String, access_token: String) -> Result<String, String> {
     validate_path(&repository_path)?;
     let parent = safe_relative_path(parent_path.trim())?;
     let folder_name = folder_name.trim();
@@ -3467,7 +3505,11 @@ pub fn add_submodule(repository_path: String, parent_path: String, url: String, 
 }
 
 #[tauri::command]
-pub fn switch_submodule_version(repository_path: String, relative_path: String, revision: String, version_kind: String, name: String) -> Result<String, String> {
+pub async fn switch_submodule_version(repository_path: String, relative_path: String, revision: String, version_kind: String, name: String) -> Result<String, String> {
+    off_main_thread(move || switch_submodule_version_inner(repository_path, relative_path, revision, version_kind, name)).await
+}
+
+fn switch_submodule_version_inner(repository_path: String, relative_path: String, revision: String, version_kind: String, name: String) -> Result<String, String> {
     validate_path(&repository_path)?;
     let absolute = validate_submodule(&repository_path, &relative_path)?;
     let absolute_string = absolute.to_string_lossy().into_owned();
@@ -3550,7 +3592,11 @@ pub fn switch_submodule_version(repository_path: String, relative_path: String, 
 // why the submodule ends up in detached HEAD afterward — same as ordinary
 // `git submodule update` always does.
 #[tauri::command]
-pub fn reset_submodule(repository_path: String, relative_path: String) -> Result<String, String> {
+pub async fn reset_submodule(repository_path: String, relative_path: String) -> Result<String, String> {
+    off_main_thread(move || reset_submodule_inner(repository_path, relative_path)).await
+}
+
+fn reset_submodule_inner(repository_path: String, relative_path: String) -> Result<String, String> {
     validate_path(&repository_path)?;
     let absolute = validate_submodule(&repository_path, &relative_path)?;
     let relative = safe_relative_path(&relative_path)?;
@@ -3578,7 +3624,11 @@ pub fn reset_submodule(repository_path: String, relative_path: String) -> Result
 }
 
 #[tauri::command]
-pub fn change_submodule_url(repository_path: String, relative_path: String, url: String) -> Result<(), String> {
+pub async fn change_submodule_url(repository_path: String, relative_path: String, url: String) -> Result<(), String> {
+    off_main_thread(move || change_submodule_url_inner(repository_path, relative_path, url)).await
+}
+
+fn change_submodule_url_inner(repository_path: String, relative_path: String, url: String) -> Result<(), String> {
     validate_path(&repository_path)?;
     let absolute = validate_submodule(&repository_path, &relative_path)?;
     let relative = normalized(&safe_relative_path(&relative_path)?);
@@ -3730,7 +3780,11 @@ pub fn commit_path(repository_path: String, relative_path: String, message: Stri
 // already equals the new HEAD's tree, which is what "nothing staged
 // anymore" after a commit means).
 #[tauri::command]
-pub fn commit_staged(repository_path: String, message: String) -> Result<String, String> {
+pub async fn commit_staged(repository_path: String, message: String) -> Result<String, String> {
+    off_main_thread(move || commit_staged_inner(repository_path, message)).await
+}
+
+fn commit_staged_inner(repository_path: String, message: String) -> Result<String, String> {
     let started = Instant::now();
     validate_path(&repository_path)?;
     if message.trim().is_empty() { return Err("Commit message cannot be empty".into()); }
@@ -3765,7 +3819,11 @@ pub fn commit_staged(repository_path: String, message: String) -> Result<String,
 }
 
 #[tauri::command]
-pub fn commit_files(repository_path: String, files: Vec<String>, message: String) -> Result<String, String> {
+pub async fn commit_files(repository_path: String, files: Vec<String>, message: String) -> Result<String, String> {
+    off_main_thread(move || commit_files_inner(repository_path, files, message)).await
+}
+
+fn commit_files_inner(repository_path: String, files: Vec<String>, message: String) -> Result<String, String> {
     validate_path(&repository_path)?;
     if message.trim().is_empty() { return Err("Commit message cannot be empty".into()); }
     if files.is_empty() { return Err("Select at least one file".into()); }
@@ -4352,7 +4410,11 @@ pub fn delete_branch(repository_path: String, branch_name: String) -> Result<(),
 }
 
 #[tauri::command]
-pub fn commit_submodule(repository_path: String, relative_path: String, message: String) -> Result<String, String> {
+pub async fn commit_submodule(repository_path: String, relative_path: String, message: String) -> Result<String, String> {
+    off_main_thread(move || commit_submodule_inner(repository_path, relative_path, message)).await
+}
+
+fn commit_submodule_inner(repository_path: String, relative_path: String, message: String) -> Result<String, String> {
     validate_path(&repository_path)?;
     if message.trim().is_empty() { return Err("Commit message cannot be empty".into()); }
     let absolute = validate_submodule(&repository_path, &relative_path)?;
@@ -4395,7 +4457,11 @@ pub fn commit_submodule(repository_path: String, relative_path: String, message:
 pub struct PushSubmoduleResult { revision: String, branch: String }
 
 #[tauri::command]
-pub fn push_submodule(repository_path: String, relative_path: String) -> Result<PushSubmoduleResult, String> {
+pub async fn push_submodule(repository_path: String, relative_path: String) -> Result<PushSubmoduleResult, String> {
+    off_main_thread(move || push_submodule_inner(repository_path, relative_path)).await
+}
+
+fn push_submodule_inner(repository_path: String, relative_path: String) -> Result<PushSubmoduleResult, String> {
     validate_path(&repository_path)?;
     let absolute = validate_submodule(&repository_path, &relative_path)?;
     let sub_path = absolute.to_string_lossy().into_owned();
@@ -4496,7 +4562,11 @@ fn record_pushed_submodule_in_parent(repository_path: &str, relative_path: &str,
 }
 
 #[tauri::command]
-pub fn force_push_submodule(repository_path: String, relative_path: String) -> Result<PushSubmoduleResult, String> {
+pub async fn force_push_submodule(repository_path: String, relative_path: String) -> Result<PushSubmoduleResult, String> {
+    off_main_thread(move || force_push_submodule_inner(repository_path, relative_path)).await
+}
+
+fn force_push_submodule_inner(repository_path: String, relative_path: String) -> Result<PushSubmoduleResult, String> {
     validate_path(&repository_path)?;
     let absolute = validate_submodule(&repository_path, &relative_path)?;
     let sub_path = absolute.to_string_lossy().into_owned();
@@ -4535,7 +4605,11 @@ pub fn force_push_submodule(repository_path: String, relative_path: String) -> R
 }
 
 #[tauri::command]
-pub fn fetch_submodule(repository_path: String, relative_path: String) -> Result<(), String> {
+pub async fn fetch_submodule(repository_path: String, relative_path: String) -> Result<(), String> {
+    off_main_thread(move || fetch_submodule_inner(repository_path, relative_path)).await
+}
+
+fn fetch_submodule_inner(repository_path: String, relative_path: String) -> Result<(), String> {
     validate_path(&repository_path)?;
     let absolute = validate_submodule(&repository_path, &relative_path)?;
     let sub_path = absolute.to_string_lossy().into_owned();
@@ -4548,7 +4622,11 @@ pub fn fetch_submodule(repository_path: String, relative_path: String) -> Result
 }
 
 #[tauri::command]
-pub fn pull_submodule(repository_path: String, relative_path: String) -> Result<(), String> {
+pub async fn pull_submodule(repository_path: String, relative_path: String) -> Result<(), String> {
+    off_main_thread(move || pull_submodule_inner(repository_path, relative_path)).await
+}
+
+fn pull_submodule_inner(repository_path: String, relative_path: String) -> Result<(), String> {
     validate_path(&repository_path)?;
     let absolute = validate_submodule(&repository_path, &relative_path)?;
     let sub_path = absolute.to_string_lossy().into_owned();
@@ -4666,8 +4744,8 @@ mod tests {
         assert!(!parent.join("failed").exists()); assert!(!parent.join(".git/modules/failed").exists());
         fs::write(parent.join("README.md"), "changed").unwrap(); stage_files(parent_string.clone(), vec!["README.md".into()]).unwrap();
         restore_file(parent_string.clone(), "README.md".into(), "HEAD".into()).unwrap();
-        assert!(!load_repository(parent_string.clone(), Some(true)).unwrap().changes.iter().any(|change| change.path == "README.md"));
-        let added = add_submodule(parent_string.clone(), "components".into(), dependency.to_string_lossy().into_owned(), "engine".into(), String::new(), String::new()).unwrap();
+        assert!(!load_repository_inner(parent_string.clone(), Some(true)).unwrap().changes.iter().any(|change| change.path == "README.md"));
+        let added = add_submodule_inner(parent_string.clone(), "components".into(), dependency.to_string_lossy().into_owned(), "engine".into(), String::new(), String::new()).unwrap();
         assert_eq!(added, "components/engine");
         assert!(parent.join(".gitmodules").exists());
         let repo = Repository::open(&parent).unwrap();
@@ -4680,7 +4758,7 @@ mod tests {
         assert_eq!(engine_details.submodule_commit_subject.as_deref(), Some("Initial commit"), "submodule_commit_* must be the submodule's own HEAD commit, not the parent's");
         assert!(engine_details.submodule_commit_id.is_some());
         let versions = submodule_versions(parent_string.clone(), added.clone()).unwrap();
-        switch_submodule_version(parent_string.clone(), added.clone(), versions.current_revision, "commit".into(), String::new()).unwrap();
+        switch_submodule_version_inner(parent_string.clone(), added.clone(), versions.current_revision, "commit".into(), String::new()).unwrap();
         remove_git_path(parent_string, added).unwrap();
         assert!(!parent.join("components/engine").exists());
         assert!(!parent.join(".gitmodules").exists());
@@ -4729,7 +4807,7 @@ mod tests {
         assert!(details.submodule_url.as_deref().unwrap_or_default().contains("dependency"));
         let versions = submodule_versions(repository.to_string_lossy().into_owned(), "vendor/dependency".into()).unwrap();
         let release = versions.versions.iter().find(|version| version.name.ends_with("release/2.4")).unwrap();
-        let switched = switch_submodule_version(repository.to_string_lossy().into_owned(), "vendor/dependency".into(), release.revision.clone(), release.kind.clone(), release.name.clone()).unwrap();
+        let switched = switch_submodule_version_inner(repository.to_string_lossy().into_owned(), "vendor/dependency".into(), release.revision.clone(), release.kind.clone(), release.name.clone()).unwrap();
         assert_eq!(switched, release.revision);
         assert!(worktree_status(repository.to_str().unwrap(), None).iter().any(|(path, _)| path == "vendor/dependency"));
 
@@ -4760,10 +4838,10 @@ mod tests {
         fs::write(repository.join("src/main.c"), "int main(void) { return 3; }").unwrap();
         restore_remote_file(repository.to_string_lossy().into_owned(), "src/main.c".into(), "origin/main".into()).unwrap();
         assert!(!read_text_file(repository.to_string_lossy().into_owned(), "src/main.c".into()).unwrap().content.contains("return 3"));
-        assert_eq!(submodule_repository(repository.to_string_lossy().into_owned(), "vendor/dependency".into()).unwrap().repository.name, "dependency");
+        assert_eq!(submodule_repository_inner(repository.to_string_lossy().into_owned(), "vendor/dependency".into()).unwrap().repository.name, "dependency");
         assert_eq!(list_remotes(repository.to_string_lossy().into_owned()).unwrap().len(), 1);
         let cloned = clone_repository(dependency.to_string_lossy().into_owned(), base.to_string_lossy().into_owned(), "cloned-dependency".into()).unwrap();
-        assert_eq!(load_repository(cloned.clone(), Some(true)).unwrap().repository.name, "cloned-dependency");
+        assert_eq!(load_repository_inner(cloned.clone(), Some(true)).unwrap().repository.name, "cloned-dependency");
         remove_git_path(cloned.clone(), "README.md".into()).unwrap();
         assert!(!Path::new(&cloned).join("README.md").exists());
         assert!(git(&cloned, &["diff", "--cached", "--name-only"]).unwrap().lines().any(|path| path == "README.md"));
@@ -4860,7 +4938,7 @@ mod tests {
         let repo = Repository::open(&repository).unwrap();
         assert_eq!(repo.state(), git2::RepositoryState::Clean);
         assert_eq!(repo.head().unwrap().peel_to_commit().unwrap().parent_count(), 2);
-        assert!(load_repository(path, Some(true)).unwrap().changes.is_empty());
+        assert!(load_repository_inner(path, Some(true)).unwrap().changes.is_empty());
 
         fs::remove_dir_all(repository).unwrap();
     }
@@ -4884,7 +4962,7 @@ mod tests {
         let repo = Repository::open(&repository).unwrap();
         assert_eq!(repo.state(), git2::RepositoryState::Clean);
         assert_eq!(fs::read_to_string(repository.join("a.txt")).unwrap(), "feature version\n", "aborting must restore the pre-merge working tree");
-        assert!(load_repository(path, Some(true)).unwrap().changes.is_empty());
+        assert!(load_repository_inner(path, Some(true)).unwrap().changes.is_empty());
 
         fs::remove_dir_all(repository).unwrap();
     }
@@ -4896,7 +4974,7 @@ mod tests {
         let parent = base.join("parent"); let dependency = base.join("dependency");
         create_libgit2_repository(&parent, "README.md"); create_libgit2_repository(&dependency, "module.txt");
         let parent_string = parent.to_string_lossy().into_owned();
-        let added = add_submodule(parent_string.clone(), "".into(), dependency.to_string_lossy().into_owned(), "dep".into(), String::new(), String::new()).unwrap();
+        let added = add_submodule_inner(parent_string.clone(), "".into(), dependency.to_string_lossy().into_owned(), "dep".into(), String::new(), String::new()).unwrap();
         create_commit(parent_string.clone(), "Add dep submodule".into()).unwrap();
 
         let sub_path = parent.join(&added);
@@ -4947,7 +5025,7 @@ mod tests {
         let head_files = git(&path, &["show", "--pretty=format:", "--name-only", "HEAD"]).unwrap();
         assert!(head_files.lines().any(|p| p == "a.txt"));
         assert!(head_files.lines().any(|p| p == "new.txt"));
-        assert!(load_repository(path, Some(true)).unwrap().changes.is_empty(), "nothing should be left pending after committing the whole repository");
+        assert!(load_repository_inner(path, Some(true)).unwrap().changes.is_empty(), "nothing should be left pending after committing the whole repository");
 
         fs::remove_dir_all(repository).unwrap();
     }
@@ -4992,7 +5070,7 @@ mod tests {
         run_git(&clone_upstream, &["push", "origin", "main"]);
 
         let path = repository.to_string_lossy().into_owned();
-        fetch_all_remotes(path.clone()).unwrap();
+        fetch_all_remotes_inner(path.clone()).unwrap();
         let origin_head = git(&path, &["rev-parse", "refs/remotes/origin/main"]).unwrap().trim().to_string();
         let upstream_head = git(&path, &["rev-parse", "refs/remotes/upstream/main"]).unwrap().trim().to_string();
         let expected_origin = git(clone_origin.to_str().unwrap(), &["rev-parse", "HEAD"]).unwrap().trim().to_string();
@@ -5126,7 +5204,7 @@ mod tests {
         let parent = base.join("parent"); let dependency = base.join("dependency");
         create_libgit2_repository(&parent, "README.md"); create_libgit2_repository(&dependency, "module.txt");
         let parent_string = parent.to_string_lossy().into_owned();
-        let added = add_submodule(parent_string.clone(), "".into(), dependency.to_string_lossy().into_owned(), "dep".into(), String::new(), String::new()).unwrap();
+        let added = add_submodule_inner(parent_string.clone(), "".into(), dependency.to_string_lossy().into_owned(), "dep".into(), String::new(), String::new()).unwrap();
         create_commit(parent_string.clone(), "Add dep submodule".into()).unwrap();
 
         // Addressed exactly like every other submodule-targeting command in
@@ -5190,7 +5268,7 @@ mod tests {
         let head_files = git(&path, &["show", "--pretty=format:", "--name-only", "HEAD"]).unwrap();
         assert!(head_files.lines().any(|p| p == "admin/a.txt"));
         assert!(head_files.lines().any(|p| p == "admin/new.txt"));
-        assert!(load_repository(path, Some(true)).unwrap().changes.is_empty(), "nothing should be left pending after committing the folder");
+        assert!(load_repository_inner(path, Some(true)).unwrap().changes.is_empty(), "nothing should be left pending after committing the folder");
 
         fs::remove_dir_all(repository).unwrap();
     }
@@ -5202,7 +5280,7 @@ mod tests {
         let parent = base.join("parent"); let dependency = base.join("dependency");
         create_libgit2_repository(&parent, "README.md"); create_libgit2_repository(&dependency, "module.txt");
         let parent_string = parent.to_string_lossy().into_owned();
-        let added = add_submodule(parent_string.clone(), "".into(), dependency.to_string_lossy().into_owned(), "dep".into(), String::new(), String::new()).unwrap();
+        let added = add_submodule_inner(parent_string.clone(), "".into(), dependency.to_string_lossy().into_owned(), "dep".into(), String::new(), String::new()).unwrap();
         create_commit(parent_string.clone(), "Add dep submodule".into()).unwrap();
 
         // Advance the submodule's HEAD the way a user would from a plain terminal
@@ -5229,7 +5307,7 @@ mod tests {
         let parent = base.join("parent"); let dependency = base.join("dependency");
         create_libgit2_repository(&parent, "README.md"); create_libgit2_repository(&dependency, "module.txt");
         let parent_string = parent.to_string_lossy().into_owned();
-        add_submodule(parent_string.clone(), "".into(), dependency.to_string_lossy().into_owned(), "test".into(), String::new(), String::new()).unwrap();
+        add_submodule_inner(parent_string.clone(), "".into(), dependency.to_string_lossy().into_owned(), "test".into(), String::new(), String::new()).unwrap();
         create_commit(parent_string.clone(), "Add test submodule".into()).unwrap();
 
         // Simulate the user deleting the submodule folder outside the app (Finder/
@@ -5238,7 +5316,7 @@ mod tests {
         fs::remove_dir_all(parent.join("test")).unwrap();
         assert!(!parent.join("test").exists());
 
-        let result = commit_files(parent_string.clone(), vec!["test".into()], "Remove deleted submodule".into());
+        let result = commit_files_inner(parent_string.clone(), vec!["test".into()], "Remove deleted submodule".into());
         assert!(result.is_ok(), "expected the deletion to commit cleanly, got: {:?}", result);
         let repo = Repository::open(&parent).unwrap();
         assert!(repo.index().unwrap().get_path(Path::new("test"), 0).is_none(), "the gitlink entry should be gone from the index after committing the deletion");
@@ -5264,7 +5342,7 @@ mod tests {
         let path = repository.to_string_lossy().into_owned();
         stash_changes(path.clone()).unwrap();
 
-        let data = load_repository(path.clone(), Some(true)).unwrap();
+        let data = load_repository_inner(path.clone(), Some(true)).unwrap();
         assert!(!data.commits.iter().any(|commit| commit.parents.len() > 1), "the WIP stash commit (with its index/untracked parents) must never appear as a graph commit");
         assert!(!data.commits.iter().any(|commit| commit.refs.iter().any(|r| r == "stash")), "refs/stash must not be attached as a label on any commit");
         assert_eq!(data.stashes.len(), 1);
@@ -5291,7 +5369,7 @@ mod tests {
         let path = repository.to_string_lossy().into_owned();
         stash_file(path.clone(), "a.txt".into()).unwrap();
 
-        let data = load_repository(path.clone(), Some(true)).unwrap();
+        let data = load_repository_inner(path.clone(), Some(true)).unwrap();
         assert!(!data.changes.iter().any(|change| change.path == "a.txt"), "a.txt should be set aside by the stash, not showing as a pending change");
         assert!(data.changes.iter().any(|change| change.path == "b.txt"), "b.txt was never selected — it must stay modified, untouched by the scoped stash");
         assert_eq!(fs::read_to_string(repository.join("a.txt")).unwrap(), "one", "a.txt on disk should be back to the committed version once stashed");
@@ -5335,7 +5413,7 @@ mod tests {
         let conflicts = list_conflicts(path.clone(), "".into()).unwrap();
         assert_eq!(conflicts.len(), 1, "a.txt should be listed as conflicted");
         assert!(!merge_in_progress(path.clone(), "".into()).unwrap(), "a stash-pop conflict must not be mistaken for a real merge in progress");
-        assert!(load_repository(path.clone(), Some(true)).unwrap().stashes.len() == 1, "the stash entry must survive a conflicted pop, not be silently dropped");
+        assert!(load_repository_inner(path.clone(), Some(true)).unwrap().stashes.len() == 1, "the stash entry must survive a conflicted pop, not be silently dropped");
 
         resolve_conflict(path.clone(), "".into(), "a.txt".into(), "theirs".into()).unwrap();
         assert!(list_conflicts(path.clone(), "".into()).unwrap().is_empty(), "resolving the only conflict should clear the list");
@@ -5366,7 +5444,7 @@ mod tests {
         abort_stash_conflict(path.clone()).unwrap();
         assert!(list_conflicts(path.clone(), "".into()).unwrap().is_empty(), "aborting should clear the conflict");
         assert_eq!(fs::read_to_string(repository.join("a.txt")).unwrap(), "conflicting new version\n", "the working tree should be back to HEAD, not left half-merged");
-        assert_eq!(load_repository(path.clone(), Some(true)).unwrap().stashes.len(), 1, "the stash itself must still be there to try again");
+        assert_eq!(load_repository_inner(path.clone(), Some(true)).unwrap().stashes.len(), 1, "the stash itself must still be there to try again");
 
         fs::remove_dir_all(repository).unwrap();
     }
@@ -5420,12 +5498,12 @@ mod tests {
         assert_eq!(stash_entry_files(path.clone(), 1).unwrap(), vec!["a.txt".to_string()]);
 
         drop_stash(path.clone(), 1).unwrap();
-        assert_eq!(load_repository(path.clone(), Some(true)).unwrap().stashes.len(), 1, "dropping index 1 should leave only the b.txt stash");
+        assert_eq!(load_repository_inner(path.clone(), Some(true)).unwrap().stashes.len(), 1, "dropping index 1 should leave only the b.txt stash");
         assert_eq!(fs::read_to_string(repository.join("a.txt")).unwrap(), "one", "dropping never applies the change — a.txt stays at its committed content");
 
         pop_stash(path.clone(), 0).unwrap();
         assert_eq!(fs::read_to_string(repository.join("b.txt")).unwrap(), "b changed second", "popping should bring the change back");
-        assert!(load_repository(path.clone(), Some(true)).unwrap().stashes.is_empty(), "the only remaining stash should be gone after a clean pop");
+        assert!(load_repository_inner(path.clone(), Some(true)).unwrap().stashes.is_empty(), "the only remaining stash should be gone after a clean pop");
 
         fs::remove_dir_all(repository).unwrap();
     }
@@ -5456,11 +5534,11 @@ mod tests {
         restore_stash_paths(path.clone(), 0, vec!["a.txt".into()]).unwrap();
         assert_eq!(fs::read_to_string(repository.join("a.txt")).unwrap(), "a changed", "a.txt should be restored");
         assert_eq!(fs::read_to_string(repository.join("b.txt")).unwrap(), "one", "b.txt was not selected — it must stay untouched, still only in the stash");
-        assert_eq!(load_repository(path.clone(), Some(true)).unwrap().stashes.len(), 1, "a stash entry must remain for the still-unrestored b.txt");
+        assert_eq!(load_repository_inner(path.clone(), Some(true)).unwrap().stashes.len(), 1, "a stash entry must remain for the still-unrestored b.txt");
 
         restore_stash_paths(path.clone(), 0, vec!["b.txt".into()]).unwrap();
         assert_eq!(fs::read_to_string(repository.join("b.txt")).unwrap(), "b changed", "b.txt should now be restored too");
-        assert!(load_repository(path.clone(), Some(true)).unwrap().stashes.is_empty(), "nothing left stashed once both files are restored");
+        assert!(load_repository_inner(path.clone(), Some(true)).unwrap().stashes.is_empty(), "nothing left stashed once both files are restored");
 
         fs::remove_dir_all(repository).unwrap();
     }
@@ -5536,12 +5614,12 @@ mod tests {
 
         restore_stash_paths(path.clone(), 0, vec!["OrdersFromSite/ordersForm.css".into()]).unwrap();
         assert!(repository.join("OrdersFromSite/ordersForm.css").exists(), "the restored file should be on disk");
-        assert_eq!(load_repository(path.clone(), Some(true)).unwrap().stashes.len(), 1, "README.md is still unrestored — a stash entry should remain for it");
+        assert_eq!(load_repository_inner(path.clone(), Some(true)).unwrap().stashes.len(), 1, "README.md is still unrestored — a stash entry should remain for it");
         assert_eq!(stash_entry_files(path.clone(), 0).unwrap(), vec!["README.md".to_string()], "the restored file must be gone from the stash's own list now — not still shown as if untouched");
 
         restore_stash_paths(path.clone(), 0, vec!["README.md".into()]).unwrap();
         assert_eq!(fs::read_to_string(repository.join("README.md")).unwrap(), "changed");
-        assert!(load_repository(path.clone(), Some(true)).unwrap().stashes.is_empty(), "restoring the last remaining file should drop the now-empty stash entry entirely");
+        assert!(load_repository_inner(path.clone(), Some(true)).unwrap().stashes.is_empty(), "restoring the last remaining file should drop the now-empty stash entry entirely");
 
         fs::remove_dir_all(repository).unwrap();
     }
@@ -5561,10 +5639,10 @@ mod tests {
         fs::write(repository.join("intro.css"), "body{color:red}").unwrap();
         let path = repository.to_string_lossy().into_owned();
         stage_files(path.clone(), vec!["intro.css".into()]).unwrap();
-        assert!(load_repository(path.clone(), Some(true)).unwrap().changes.iter().any(|change| change.path == "intro.css" && change.staged));
+        assert!(load_repository_inner(path.clone(), Some(true)).unwrap().changes.iter().any(|change| change.path == "intro.css" && change.staged));
 
-        commit_files(path.clone(), vec!["intro.css".into()], "Update intro.css".into()).unwrap();
-        assert!(!load_repository(path.clone(), Some(true)).unwrap().changes.iter().any(|change| change.path == "intro.css"), "intro.css should no longer appear as a pending change right after commit");
+        commit_files_inner(path.clone(), vec!["intro.css".into()], "Update intro.css".into()).unwrap();
+        assert!(!load_repository_inner(path.clone(), Some(true)).unwrap().changes.iter().any(|change| change.path == "intro.css"), "intro.css should no longer appear as a pending change right after commit");
 
         fs::remove_dir_all(repository).unwrap();
     }
@@ -5592,12 +5670,12 @@ mod tests {
         let path = base.to_string_lossy().into_owned();
 
         stage_files(path.clone(), vec!["src/main.rs".into()]).unwrap();
-        let staged = load_repository(path.clone(), Some(true)).unwrap();
+        let staged = load_repository_inner(path.clone(), Some(true)).unwrap();
         let change = staged.changes.iter().find(|change| change.path == "src/main.rs").expect("src/main.rs should be a pending change");
         assert!(change.staged, "src/main.rs should be staged after stage_files");
 
         unstage_files(path.clone(), vec!["src/main.rs".into()]).unwrap();
-        let unstaged = load_repository(path.clone(), Some(true)).unwrap();
+        let unstaged = load_repository_inner(path.clone(), Some(true)).unwrap();
         let change = unstaged.changes.iter().find(|change| change.path == "src/main.rs").expect("src/main.rs should still be a pending change (untracked, not staged)");
         assert!(!change.staged, "src/main.rs should no longer be staged after unstage_files");
 
@@ -5681,12 +5759,12 @@ mod tests {
         run_git(&base, &["checkout", "--detach", "HEAD"]);
         let path = base.to_string_lossy().into_owned();
 
-        let fast = open_repository_fast(path.clone()).unwrap();
+        let fast = open_repository_fast_inner(path.clone()).unwrap();
         assert!(fast.repository.head_detached, "open_repository_fast must report a detached checkout as such");
         assert_eq!(fast.repository.current_branch, "", "current_branch must never be the literal string \"HEAD\"");
         assert_eq!(fast.repository.head_oid, head_commit);
 
-        let full = load_repository(path, None).unwrap();
+        let full = load_repository_inner(path, None).unwrap();
         assert!(full.repository.head_detached);
         assert_eq!(full.repository.current_branch, "");
         assert_eq!(full.repository.head_oid, head_commit);
@@ -5717,7 +5795,7 @@ mod tests {
 
         // First page: the 2 newest (c4, c3) — matches what load_repository
         // itself would show first, oldest-last.
-        let first_page = load_repository(repo_path.clone(), None).unwrap();
+        let first_page = load_repository_inner(repo_path.clone(), None).unwrap();
         assert_eq!(first_page.commits.len(), 5, "small repository — nothing should be truncated");
         assert!(!first_page.commits_truncated);
 
@@ -5775,7 +5853,7 @@ mod tests {
         drop(repo);
         let repo_path = base.to_string_lossy().into_owned();
 
-        let data = load_repository(repo_path.clone(), None).unwrap();
+        let data = load_repository_inner(repo_path.clone(), None).unwrap();
         assert_eq!(data.commits.len(), GRAPH_COMMIT_WINDOW, "must stop at exactly the window, not the repository's real total");
         assert!(data.commits_truncated, "a repository with more history than the window must say so");
         // Newest-first: the window's oldest (last) entry is commit total-window.
@@ -5809,7 +5887,7 @@ mod tests {
         let path = base.to_string_lossy().into_owned();
 
         // The one full scan: what "opening the repository" does.
-        load_repository(path.clone(), None).unwrap();
+        load_repository_inner(path.clone(), None).unwrap();
 
         // An external program edits files after that scan — a repaint must
         // not see this, since seeing it would mean it rescanned instead of
@@ -5998,7 +6076,7 @@ mod tests {
         let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let base = std::env::temp_dir().join(format!("git-integrity-pr-status-no-remote-{suffix}"));
         create_libgit2_repository(&base, "README.md");
-        let result = pr_status(base.to_string_lossy().into_owned(), None, None).unwrap();
+        let result = pr_status_inner(base.to_string_lossy().into_owned(), None, None).unwrap();
         assert_eq!(result.state, "no_remote");
         assert!(result.pull_requests.is_empty());
         fs::remove_dir_all(base).unwrap();
@@ -6010,7 +6088,7 @@ mod tests {
         let base = std::env::temp_dir().join(format!("git-integrity-pr-status-unsupported-{suffix}"));
         create_libgit2_repository(&base, "README.md");
         run_git(&base, &["remote", "add", "origin", "https://gitlab.com/team/repo.git"]);
-        let result = pr_status(base.to_string_lossy().into_owned(), None, None).unwrap();
+        let result = pr_status_inner(base.to_string_lossy().into_owned(), None, None).unwrap();
         assert_eq!(result.state, "unsupported_provider");
         assert!(result.pull_requests.is_empty());
         fs::remove_dir_all(base).unwrap();
@@ -6170,7 +6248,7 @@ mod tests {
         let (base, path) = pr_repo("detached-cmd");
         run_git(&base, &["remote", "add", "origin", "git@github.vitesco.io:eng/demo.git"]);
         run_git(&base, &["checkout", "-q", "--detach"]);
-        let result = pr_status(path, None, None).unwrap();
+        let result = pr_status_inner(path, None, None).unwrap();
         assert_eq!(result.state, "detached_head");
         assert!(result.queried_repo.is_none());
         assert!(result.pull_requests.is_empty());
@@ -6297,7 +6375,7 @@ mod tests {
         run_git(&base, &["checkout", "-q", "-b", "feature/local"]);
         run_git(&base, &["config", "branch.feature/local.remote", "origin"]);
         run_git(&base, &["config", "branch.feature/local.merge", "refs/heads/feature/on-server"]);
-        let result = pr_status(path, Some("some-stale-branch".into()), Some("parent".into())).unwrap();
+        let result = pr_status_inner(path, Some("some-stale-branch".into()), Some("parent".into())).unwrap();
         assert_eq!(result.queried_repo.as_deref(), Some("github.vitesco.io/eng/sw-prj-OMBMS_000U0"));
         assert_eq!(result.branch.as_deref(), Some("feature/on-server"));
         assert_ne!(result.state, "unsupported_provider");
@@ -6530,7 +6608,7 @@ mod tests {
         create_libgit2_repository(&dependency, "lib.txt");
         let parent_string = parent.to_string_lossy().into_owned();
         run_git(&parent, &["remote", "add", "origin", "git@github.vitesco.io:eng/the-parent.git"]);
-        let added = add_submodule(parent_string.clone(), "".into(), dependency.to_string_lossy().into_owned(), "dep".into(), String::new(), String::new()).unwrap();
+        let added = add_submodule_inner(parent_string.clone(), "".into(), dependency.to_string_lossy().into_owned(), "dep".into(), String::new(), String::new()).unwrap();
         create_commit(parent_string.clone(), "Add dep submodule".into()).unwrap();
         let sub_path = parent.join(&added);
         let sub_path_str = sub_path.to_string_lossy().into_owned();
@@ -6594,7 +6672,7 @@ mod tests {
         run_git(&sub_path, &["config", "user.name", "Test User"]);
 
         // Pushing before there is anything new to push must fail with a clear message.
-        let push_before_commit = push_submodule(repo_path.clone(), "vendor/dep".into());
+        let push_before_commit = push_submodule_inner(repo_path.clone(), "vendor/dep".into());
         assert!(push_before_commit.is_err(), "expected an error when pushing with nothing new, got Ok");
         let message = push_before_commit.unwrap_err();
         assert!(message.to_lowercase().contains("commit") || message.to_lowercase().contains("nothing") || message.to_lowercase().contains("up to date") || message.to_lowercase().contains("up-to-date"), "message should explain there is nothing to push / not committed yet, got: {message}");
@@ -6603,13 +6681,13 @@ mod tests {
         // specific warning — silently pushing an older commit while leaving fresh
         // edits behind would be worse than doing nothing.
         fs::write(sub_path.join("module.txt"), "v2").unwrap();
-        let push_with_uncommitted = push_submodule(repo_path.clone(), "vendor/dep".into());
+        let push_with_uncommitted = push_submodule_inner(repo_path.clone(), "vendor/dep".into());
         assert!(push_with_uncommitted.is_err(), "expected an error when pushing with uncommitted changes, got Ok");
         let uncommitted_message = push_with_uncommitted.unwrap_err();
         assert!(uncommitted_message.to_lowercase().contains("uncommitted") || uncommitted_message.to_lowercase().contains("commit"), "message should warn about uncommitted changes, got: {uncommitted_message}");
 
         // Commit through our command only, then push must succeed.
-        commit_submodule(repo_path.clone(), "vendor/dep".into(), "Update module".into()).expect("commit_submodule should succeed");
+        commit_submodule_inner(repo_path.clone(), "vendor/dep".into(), "Update module".into()).expect("commit_submodule should succeed");
 
         // Committing inside the submodule now updates the parent's recorded
         // gitlink right away (no push needed) — the submodule's working copy
@@ -6619,17 +6697,17 @@ mod tests {
         let submodule_head_oid = { let repo = Repository::open(&sub_path).unwrap(); let oid = repo.head().unwrap().target().unwrap(); oid };
         assert_eq!(parent_index_oid, submodule_head_oid, "the parent should record the submodule's new commit immediately after committing inside it, push or not");
 
-        let parent_changes = load_repository(repo_path.clone(), Some(true)).unwrap().changes;
+        let parent_changes = load_repository_inner(repo_path.clone(), Some(true)).unwrap().changes;
         assert!(!parent_changes.iter().any(|change| change.path == "vendor/dep"), "the submodule should already show as clean/version-changed, not modified, before any push");
 
         // Now push should succeed, and — since the commit is now safely on the
         // submodule's own server — the parent should be updated automatically so the
         // submodule stops showing as merely "modified locally".
-        push_submodule(repo_path.clone(), "vendor/dep".into()).expect("push_submodule should succeed after a commit");
+        push_submodule_inner(repo_path.clone(), "vendor/dep".into()).expect("push_submodule should succeed after a commit");
         let parent_index_oid_after_push = { let repo = Repository::open(&repository).unwrap(); repo.index().unwrap().get_path(Path::new("vendor/dep"), 0).unwrap().id };
         let submodule_head_oid_after_push = { let repo = Repository::open(&sub_path).unwrap(); let oid = repo.head().unwrap().target().unwrap(); oid };
         assert_eq!(parent_index_oid_after_push, submodule_head_oid_after_push, "after a successful push, the parent should automatically record the new submodule commit");
-        let parent_changes_after_push = load_repository(repo_path.clone(), Some(true)).unwrap().changes;
+        let parent_changes_after_push = load_repository_inner(repo_path.clone(), Some(true)).unwrap().changes;
         assert!(!parent_changes_after_push.iter().any(|change| change.path == "vendor/dep"), "the submodule should no longer show as modified in the parent after push auto-commits the new pointer");
 
         fs::remove_dir_all(base).unwrap();
@@ -6676,10 +6754,10 @@ mod tests {
         assert!(Repository::open(&sub_path).unwrap().head_detached().unwrap(), "test setup should leave the submodule detached");
 
         fs::write(sub_path.join("module.txt"), "v2").unwrap();
-        commit_submodule(repo_path.clone(), "vendor/dep".into(), "Detached commit".into()).expect("commit_submodule should succeed while detached");
+        commit_submodule_inner(repo_path.clone(), "vendor/dep".into(), "Detached commit".into()).expect("commit_submodule should succeed while detached");
         assert!(Repository::open(&sub_path).unwrap().head_detached().unwrap(), "committing must not implicitly attach HEAD to a branch");
 
-        let push_result = push_submodule(repo_path.clone(), "vendor/dep".into());
+        let push_result = push_submodule_inner(repo_path.clone(), "vendor/dep".into());
         assert!(push_result.is_ok(), "push from a detached HEAD should resolve a real branch and succeed, got: {:?}", push_result);
 
         let remote_main = git(&dep_remote.to_string_lossy(), &["log", "-1", "--format=%s", "main"]).unwrap();
@@ -6721,7 +6799,7 @@ mod tests {
         let versions = submodule_versions(repo_path.clone(), "vendor/dep".into()).unwrap();
         let feature_branch = versions.versions.iter().find(|version| version.kind == "branch" && version.name == "feature-x").expect("feature-x should be listed as a local branch");
 
-        let switched = switch_submodule_version(repo_path.clone(), "vendor/dep".into(), feature_branch.revision.clone(), feature_branch.kind.clone(), feature_branch.name.clone());
+        let switched = switch_submodule_version_inner(repo_path.clone(), "vendor/dep".into(), feature_branch.revision.clone(), feature_branch.kind.clone(), feature_branch.name.clone());
         assert!(switched.is_ok(), "switching to a local branch by name should succeed, got: {:?}", switched);
         assert!(!Repository::open(&sub_path).unwrap().head_detached().unwrap(), "switching to a branch must leave HEAD attached to it, not detached");
         assert_eq!(Repository::open(&sub_path).unwrap().head().unwrap().shorthand(), Some("feature-x"));
@@ -6748,7 +6826,7 @@ mod tests {
         create_libgit2_repository(&parent, "README.md");
         create_libgit2_repository(&dependency, "module.txt");
         let parent_string = parent.to_string_lossy().into_owned();
-        let added = add_submodule(parent_string.clone(), "".into(), dependency.to_string_lossy().into_owned(), "dep".into(), String::new(), String::new()).unwrap();
+        let added = add_submodule_inner(parent_string.clone(), "".into(), dependency.to_string_lossy().into_owned(), "dep".into(), String::new(), String::new()).unwrap();
         create_commit(parent_string.clone(), "Add dep submodule".into()).unwrap();
         let sub_path = parent.join(&added);
 
@@ -6767,7 +6845,7 @@ mod tests {
         assert!(sub_path.is_dir(), "sanity check: the submodule's working directory must still exist");
         assert!(!sub_git.exists(), "sanity check: its own .git must genuinely be gone");
 
-        let result = submodule_repository(parent_string, added);
+        let result = submodule_repository_inner(parent_string, added);
         match result {
             Err(message) => assert!(message.contains("not initialized") || message.contains("Git metadata"), "expected a clear 'not initialized' error, got: {message}"),
             Ok(data) => panic!("submodule_repository must never succeed here — it silently returned the PARENT's own repository instead of erroring (head commit: {}, which {} the parent's real HEAD {parent_head})", data.repository.head_oid, if data.repository.head_oid == parent_head { "IS" } else { "is not" }),
@@ -6791,7 +6869,7 @@ mod tests {
         run_git(&parent, &["branch", "-M", "main"]);
         run_git(&dependency, &["branch", "-M", "main"]);
         let parent_string = parent.to_string_lossy().into_owned();
-        let added = add_submodule(parent_string.clone(), "".into(), dependency.to_string_lossy().into_owned(), "dep".into(), String::new(), String::new()).unwrap();
+        let added = add_submodule_inner(parent_string.clone(), "".into(), dependency.to_string_lossy().into_owned(), "dep".into(), String::new(), String::new()).unwrap();
         create_commit(parent_string.clone(), "Add dep submodule".into()).unwrap();
         let sub_path = parent.join(&added);
         // A second commit each, so their histories genuinely diverge, not
@@ -6805,7 +6883,7 @@ mod tests {
         let sub_head = Repository::open(&sub_path).unwrap().head().unwrap().target().unwrap().to_string();
         assert_ne!(parent_head, sub_head, "sanity check: the two must genuinely have different HEADs for this test to mean anything");
 
-        let data = submodule_repository(parent_string, added).unwrap();
+        let data = submodule_repository_inner(parent_string, added).unwrap();
         assert_eq!(data.repository.current_branch, "main");
         assert_eq!(data.repository.head_oid, sub_head, "must be the submodule's own HEAD, never the parent's");
         assert!(data.commits.iter().any(|c| c.subject == "Submodule second commit"), "the submodule's own commit must be present");
@@ -6855,16 +6933,16 @@ mod tests {
         run_git(&dep_b, &["merge", "--no-ff", "-m", "B-only merge commit", "feature"]);
 
         let parent_string = parent.to_string_lossy().into_owned();
-        let added_a = add_submodule(parent_string.clone(), "".into(), dep_a.to_string_lossy().into_owned(), "dep-a".into(), String::new(), String::new()).unwrap();
-        let added_b = add_submodule(parent_string.clone(), "".into(), dep_b.to_string_lossy().into_owned(), "dep-b".into(), String::new(), String::new()).unwrap();
+        let added_a = add_submodule_inner(parent_string.clone(), "".into(), dep_a.to_string_lossy().into_owned(), "dep-a".into(), String::new(), String::new()).unwrap();
+        let added_b = add_submodule_inner(parent_string.clone(), "".into(), dep_b.to_string_lossy().into_owned(), "dep-b".into(), String::new(), String::new()).unwrap();
         create_commit(parent_string.clone(), "Add both sibling submodules".into()).unwrap();
 
         let sub_a_head = Repository::open(parent.join(&added_a)).unwrap().head().unwrap().target().unwrap().to_string();
         let sub_b_head = Repository::open(parent.join(&added_b)).unwrap().head().unwrap().target().unwrap().to_string();
         assert_ne!(sub_a_head, sub_b_head, "sanity check");
 
-        let data_a = submodule_repository(parent_string.clone(), added_a).unwrap();
-        let data_b = submodule_repository(parent_string, added_b).unwrap();
+        let data_a = submodule_repository_inner(parent_string.clone(), added_a).unwrap();
+        let data_b = submodule_repository_inner(parent_string, added_b).unwrap();
 
         // Each resolved to its own, distinct repository and HEAD.
         assert_eq!(data_a.repository.head_oid, sub_a_head);
@@ -6936,7 +7014,7 @@ mod tests {
         assert_eq!(annotated.revision, tip_commit, "an annotated tag must resolve to the commit it points at, not the tag object id");
         assert_eq!(annotated.attached_branch.as_deref(), Some("main"), "the tag sits on the same commit as the 'main' branch tip, so main should be reported as attached");
 
-        let switched = switch_submodule_version(repo_path.clone(), "vendor/dep".into(), annotated.revision.clone(), annotated.kind.clone(), annotated.name.clone());
+        let switched = switch_submodule_version_inner(repo_path.clone(), "vendor/dep".into(), annotated.revision.clone(), annotated.kind.clone(), annotated.name.clone());
         assert!(switched.is_ok(), "switching to an annotated tag should succeed, got: {:?}", switched);
         let sub_repo = Repository::open(&sub_path).unwrap();
         assert!(sub_repo.head_detached().unwrap(), "checking out a tag must detach HEAD, exactly like `git checkout <tag>`");
@@ -6977,7 +7055,7 @@ mod tests {
         fs::write(sub_path.join("module.txt"), "v3 (dirty, uncommitted)").unwrap();
         assert!(!Repository::open(&sub_path).unwrap().statuses(None).unwrap().is_empty(), "sanity check: the submodule should be dirty before reset");
 
-        let reset_to = reset_submodule(repo_path, "vendor/dep".into()).unwrap();
+        let reset_to = reset_submodule_inner(repo_path, "vendor/dep".into()).unwrap();
         assert_eq!(reset_to, recorded_commit, "reset should land on the commit the parent has recorded, not wherever the submodule had drifted to");
 
         let sub_repo = Repository::open(&sub_path).unwrap();
@@ -7023,7 +7101,7 @@ mod tests {
         assert!(Repository::open(&sub_path).unwrap().head_detached().unwrap());
         let versions = submodule_versions(repo_path.clone(), "vendor/dep".into()).unwrap();
         let origin_main = versions.versions.iter().find(|v| v.kind == "remote" && v.name == "origin/main").expect("origin/main should be listed").clone();
-        switch_submodule_version(repo_path.clone(), "vendor/dep".into(), origin_main.revision.clone(), origin_main.kind.clone(), origin_main.name.clone()).unwrap();
+        switch_submodule_version_inner(repo_path.clone(), "vendor/dep".into(), origin_main.revision.clone(), origin_main.kind.clone(), origin_main.name.clone()).unwrap();
         let sub_repo = Repository::open(&sub_path).unwrap();
         assert!(!sub_repo.head_detached().unwrap(), "selecting origin/main with no local main should attach, not detach");
         assert_eq!(sub_repo.head().unwrap().shorthand(), Some("main"));
@@ -7033,7 +7111,7 @@ mod tests {
         // points at that exact commit — selecting the remote entry should just
         // attach to the existing local branch, not error or duplicate it.
         run_git(&sub_path, &["checkout", "--detach", "HEAD"]);
-        switch_submodule_version(repo_path.clone(), "vendor/dep".into(), origin_main.revision.clone(), origin_main.kind.clone(), origin_main.name.clone()).unwrap();
+        switch_submodule_version_inner(repo_path.clone(), "vendor/dep".into(), origin_main.revision.clone(), origin_main.kind.clone(), origin_main.name.clone()).unwrap();
         let sub_repo = Repository::open(&sub_path).unwrap();
         assert!(!sub_repo.head_detached().unwrap());
         assert_eq!(sub_repo.head().unwrap().shorthand(), Some("main"));
@@ -7086,7 +7164,7 @@ mod tests {
         let parent = base.join("parent"); let dependency = base.join("dependency");
         create_libgit2_repository(&parent, "README.md"); create_libgit2_repository(&dependency, "module.txt");
         let parent_string = parent.to_string_lossy().into_owned();
-        let added = add_submodule(parent_string.clone(), "".into(), dependency.to_string_lossy().into_owned(), "dep".into(), String::new(), String::new()).unwrap();
+        let added = add_submodule_inner(parent_string.clone(), "".into(), dependency.to_string_lossy().into_owned(), "dep".into(), String::new(), String::new()).unwrap();
         create_commit(parent_string.clone(), "Add dep submodule".into()).unwrap();
 
         create_submodule_branch(parent_string.clone(), added.clone(), "feature-x".into()).unwrap();
@@ -7097,7 +7175,7 @@ mod tests {
         drop(sub_repo);
 
         // Same commit, so nothing should look "modified" in the parent afterward.
-        assert!(!load_repository(parent_string.clone(), Some(true)).unwrap().changes.iter().any(|change| change.path == added));
+        assert!(!load_repository_inner(parent_string.clone(), Some(true)).unwrap().changes.iter().any(|change| change.path == added));
 
         fs::remove_dir_all(base).unwrap();
     }
@@ -7165,7 +7243,7 @@ mod tests {
         let parent = base.join("parent"); let dependency = base.join("dependency");
         create_libgit2_repository(&parent, "README.md"); create_libgit2_repository(&dependency, "module.txt");
         let parent_string = parent.to_string_lossy().into_owned();
-        let added = add_submodule(parent_string.clone(), "".into(), dependency.to_string_lossy().into_owned(), "dep".into(), String::new(), String::new()).unwrap();
+        let added = add_submodule_inner(parent_string.clone(), "".into(), dependency.to_string_lossy().into_owned(), "dep".into(), String::new(), String::new()).unwrap();
         create_commit(parent_string.clone(), "Add dep submodule".into()).unwrap();
         let file_path = format!("{added}/module.txt");
 
@@ -7207,7 +7285,7 @@ mod tests {
         let parent = base.join("parent"); let dependency = base.join("dependency");
         create_libgit2_repository(&parent, "README.md"); create_libgit2_repository(&dependency, "module.txt");
         let parent_string = parent.to_string_lossy().into_owned();
-        let added = add_submodule(parent_string.clone(), "".into(), dependency.to_string_lossy().into_owned(), "dep".into(), String::new(), String::new()).unwrap();
+        let added = add_submodule_inner(parent_string.clone(), "".into(), dependency.to_string_lossy().into_owned(), "dep".into(), String::new(), String::new()).unwrap();
         create_commit(parent_string.clone(), "Add dep submodule".into()).unwrap();
         let file_path = format!("{added}/nou.py");
 
@@ -7249,7 +7327,7 @@ mod tests {
         let parent = base.join("parent"); let dependency = base.join("dependency");
         create_libgit2_repository(&parent, "README.md"); create_libgit2_repository(&dependency, "module.txt");
         let parent_string = parent.to_string_lossy().into_owned();
-        let added = add_submodule(parent_string.clone(), "".into(), dependency.to_string_lossy().into_owned(), "test".into(), String::new(), String::new()).unwrap();
+        let added = add_submodule_inner(parent_string.clone(), "".into(), dependency.to_string_lossy().into_owned(), "test".into(), String::new(), String::new()).unwrap();
         create_commit(parent_string.clone(), "Add test submodule".into()).unwrap();
 
         // Advance the submodule's HEAD (e.g. from a plain terminal) so it now
@@ -7267,15 +7345,15 @@ mod tests {
         drop(sub_repo);
 
         stage_files(parent_string.clone(), vec![added.clone()]).unwrap();
-        let staged_changes = load_repository(parent_string.clone(), Some(true)).unwrap().changes;
+        let staged_changes = load_repository_inner(parent_string.clone(), Some(true)).unwrap().changes;
         assert!(staged_changes.iter().any(|c| c.path == added && c.staged), "the submodule should be staged after checking it, not silently ignored");
 
-        commit_files(parent_string.clone(), vec![added.clone()], "Bump test submodule".into()).unwrap();
+        commit_files_inner(parent_string.clone(), vec![added.clone()], "Bump test submodule".into()).unwrap();
 
         let repo = Repository::open(&parent).unwrap();
         let recorded_oid = repo.index().unwrap().get_path(Path::new(&added), 0).unwrap().id;
         assert_eq!(recorded_oid, expected_oid, "the parent's index should now record the submodule's new commit");
-        assert!(!load_repository(parent_string, Some(true)).unwrap().changes.iter().any(|c| c.path == added), "the submodule should no longer show as changed after being committed");
+        assert!(!load_repository_inner(parent_string, Some(true)).unwrap().changes.iter().any(|c| c.path == added), "the submodule should no longer show as changed after being committed");
 
         fs::remove_dir_all(base).unwrap();
     }
@@ -7325,7 +7403,7 @@ mod tests {
         create_libgit2_repository(&parent, "root.txt");
         create_libgit2_repository(&dependency, "module.txt");
         let parent_string = parent.to_string_lossy().into_owned();
-        let added = add_submodule(parent_string.clone(), "".into(), dependency.to_string_lossy().into_owned(), "dep".into(), String::new(), String::new()).unwrap();
+        let added = add_submodule_inner(parent_string.clone(), "".into(), dependency.to_string_lossy().into_owned(), "dep".into(), String::new(), String::new()).unwrap();
         create_commit(parent_string.clone(), "Add dep submodule".into()).unwrap();
         let sub_path = parent.join(&added);
         run_git(&sub_path, &["config", "user.email", "test@example.com"]);
@@ -7350,7 +7428,7 @@ mod tests {
         std::thread::spawn(move || {
             for i in 0..ITERATIONS {
                 fs::write(s2.join("module.txt"), format!("committed v{i}")).unwrap();
-                let _ = commit_submodule(p2.clone(), a2.clone(), format!("iteration {i}"));
+                let _ = commit_submodule_inner(p2.clone(), a2.clone(), format!("iteration {i}"));
             }
             let _ = tx2.send("commit_submodule racer done");
         });
@@ -7375,18 +7453,18 @@ mod tests {
         let parent = base.join("parent"); let dependency = base.join("dependency");
         create_libgit2_repository(&parent, "README.md"); create_libgit2_repository(&dependency, "module.txt");
         let parent_string = parent.to_string_lossy().into_owned();
-        let added = add_submodule(parent_string.clone(), "".into(), dependency.to_string_lossy().into_owned(), "dep".into(), String::new(), String::new()).unwrap();
+        let added = add_submodule_inner(parent_string.clone(), "".into(), dependency.to_string_lossy().into_owned(), "dep".into(), String::new(), String::new()).unwrap();
         create_commit(parent_string.clone(), "Add dep submodule".into()).unwrap();
 
         fs::write(parent.join(&added).join("module.txt"), "v2").unwrap();
-        let oid = commit_submodule(parent_string.clone(), added.clone(), "Update module".into()).unwrap();
+        let oid = commit_submodule_inner(parent_string.clone(), added.clone(), "Update module".into()).unwrap();
 
         let repo = Repository::open(&parent).unwrap();
         let recorded = repo.index().unwrap().get_path(Path::new(&added), 0).unwrap().id;
         assert_eq!(recorded.to_string(), oid, "the parent must already record the submodule's new commit, with no push and no separate manual step");
         drop(repo);
 
-        let changes = load_repository(parent_string, Some(true)).unwrap().changes;
+        let changes = load_repository_inner(parent_string, Some(true)).unwrap().changes;
         assert!(!changes.iter().any(|c| c.path == added), "the submodule must show as clean/version-changed, not modified, right after committing inside it: {:?}", changes.iter().map(|c| (&c.path, &c.status)).collect::<Vec<_>>());
 
         fs::remove_dir_all(base).unwrap();
@@ -7414,7 +7492,7 @@ mod tests {
         let parent = base.join("parent"); let dependency = base.join("dependency");
         create_libgit2_repository(&parent, "README.md"); create_libgit2_repository(&dependency, "module.txt");
         let parent_string = parent.to_string_lossy().into_owned();
-        let added = add_submodule(parent_string.clone(), "".into(), dependency.to_string_lossy().into_owned(), "test".into(), String::new(), String::new()).unwrap();
+        let added = add_submodule_inner(parent_string.clone(), "".into(), dependency.to_string_lossy().into_owned(), "test".into(), String::new(), String::new()).unwrap();
         create_commit(parent_string.clone(), "Add test submodule".into()).unwrap();
         let head_before = Repository::open(&parent).unwrap().head().unwrap().target().unwrap();
 
@@ -7428,9 +7506,9 @@ mod tests {
         // Every shape of reload this app actually sends — ordinary,
         // explicit non-forced, and an explicit forced Refresh — must all
         // leave the parent's history and index completely untouched.
-        load_repository(parent_string.clone(), None).unwrap();
-        load_repository(parent_string.clone(), Some(false)).unwrap();
-        let changes = load_repository(parent_string.clone(), Some(true)).unwrap().changes;
+        load_repository_inner(parent_string.clone(), None).unwrap();
+        load_repository_inner(parent_string.clone(), Some(false)).unwrap();
+        let changes = load_repository_inner(parent_string.clone(), Some(true)).unwrap().changes;
 
         let repo = Repository::open(&parent).unwrap();
         assert_eq!(repo.head().unwrap().target().unwrap(), head_before, "no reload, forced or not, may ever create a commit in the parent");
@@ -7491,7 +7569,7 @@ mod tests {
 
         // After pushing (through the app's own command, which invalidates the
         // cache — a plain external `git push` wouldn't know to), it must clear.
-        sync_repository(path.clone(), "push".into()).unwrap();
+        sync_repository_inner(path.clone(), "push".into()).unwrap();
         let after_push = load_directory(path, "src".into(), None).unwrap();
         assert!(!after_push.iter().find(|e| e.name == "a.txt").unwrap().unpushed, "after push, the file must no longer be flagged unpushed");
 
@@ -7575,7 +7653,7 @@ mod tests {
         assert_eq!(submodule_push_status(&sub_path.to_string_lossy()), None, "freshly synced against mirror/release — nothing to report");
 
         fs::write(sub_path.join("module.txt"), "v2").unwrap();
-        commit_submodule(repo_path, "vendor/dep".into(), "Local only".into()).unwrap();
+        commit_submodule_inner(repo_path, "vendor/dep".into(), "Local only".into()).unwrap();
         let status = submodule_push_status(&sub_path.to_string_lossy());
         assert!(status.as_deref().is_some_and(|message| message.contains("1 commit") && message.contains("mirror/release")), "expected an unpushed-commit message naming the real upstream mirror/release, got: {status:?}");
         let commits = submodule_unpushed_commits(&sub_path.to_string_lossy());
@@ -7693,8 +7771,8 @@ mod tests {
         // Modify, commit, and push a file inside the submodule, to its own remote —
         // exactly the workflow being verified.
         fs::write(sub_path.join("module.txt"), "v2").unwrap();
-        commit_submodule(repo_path.clone(), "vendor/dep".into(), "Update module".into()).unwrap();
-        push_submodule(repo_path.clone(), "vendor/dep".into()).unwrap();
+        commit_submodule_inner(repo_path.clone(), "vendor/dep".into(), "Update module".into()).unwrap();
+        push_submodule_inner(repo_path.clone(), "vendor/dep".into()).unwrap();
 
         let comparison = compare_remote_directory(repo_path.clone(), "vendor/dep".into(), "origin/main".into()).unwrap();
         let module_row = comparison.rows.iter().find(|row| row.name == "module.txt").expect("module.txt should be listed when browsing inside the submodule");
@@ -7743,10 +7821,10 @@ mod tests {
         run_git(&sub_path, &["config", "user.name", "Test User"]);
 
         fs::write(sub_path.join("module.txt"), "v2").unwrap();
-        commit_submodule(repo_path.clone(), "vendor/dep".into(), "Update module".into()).unwrap();
-        push_submodule(repo_path.clone(), "vendor/dep".into()).unwrap();
+        commit_submodule_inner(repo_path.clone(), "vendor/dep".into(), "Update module".into()).unwrap();
+        push_submodule_inner(repo_path.clone(), "vendor/dep".into()).unwrap();
 
-        let changes = load_repository(repo_path.clone(), Some(true)).unwrap().changes;
+        let changes = load_repository_inner(repo_path.clone(), Some(true)).unwrap().changes;
         assert!(!changes.iter().any(|change| change.path == "vendor/dep"), "load_repository still lists the submodule as changed: {:?}", changes.iter().map(|c| (&c.path, &c.status)).collect::<Vec<_>>());
 
         let entries = load_directory(repo_path.clone(), "vendor".into(), None).unwrap();
@@ -7805,8 +7883,8 @@ mod tests {
         assert_eq!(before.commits.len(), 0, "parent should have nothing to push before the submodule is touched");
 
         fs::write(sub_path.join("module.txt"), "v2").unwrap();
-        commit_submodule(repo_path.clone(), "vendor/dep".into(), "Update module".into()).unwrap();
-        push_submodule(repo_path.clone(), "vendor/dep".into()).unwrap();
+        commit_submodule_inner(repo_path.clone(), "vendor/dep".into(), "Update module".into()).unwrap();
+        push_submodule_inner(repo_path.clone(), "vendor/dep".into()).unwrap();
 
         // The parent's working copy of the submodule must already be at the new revision.
         assert_eq!(fs::read_to_string(sub_path.join("module.txt")).unwrap(), "v2");
@@ -7856,7 +7934,7 @@ mod tests {
 
         // Commit locally without pushing: should report exactly 1 unpushed commit.
         fs::write(sub_path.join("module.txt"), "v2").unwrap();
-        commit_submodule(repo_path.clone(), "vendor/dep".into(), "Local only".into()).unwrap();
+        commit_submodule_inner(repo_path.clone(), "vendor/dep".into(), "Local only".into()).unwrap();
         let status = submodule_push_status(&sub_path.to_string_lossy());
         assert!(status.as_deref().is_some_and(|message| message.contains("1 commit") && message.contains("needs push")), "expected an unpushed-commit message, got: {status:?}");
 
@@ -7866,7 +7944,7 @@ mod tests {
         assert_eq!(unpushed[0].subject, "Local only");
 
         // After a successful push, the warning must clear.
-        push_submodule(repo_path, "vendor/dep".into()).unwrap();
+        push_submodule_inner(repo_path, "vendor/dep".into()).unwrap();
         assert_eq!(submodule_push_status(&sub_path.to_string_lossy()), None, "after push, the submodule should no longer report anything unpushed");
         assert!(submodule_unpushed_commits(&sub_path.to_string_lossy()).is_empty(), "after push, the unpushed commit list should be empty too");
 
@@ -8034,29 +8112,29 @@ mod tests {
 
         // Our local submodule is still on the old commit and has nothing of its own —
         // this must fast-forward cleanly.
-        pull_submodule(repo_path.clone(), "vendor/dep".into()).expect("a clean fast-forward pull should succeed");
+        pull_submodule_inner(repo_path.clone(), "vendor/dep".into()).expect("a clean fast-forward pull should succeed");
         assert_eq!(fs::read_to_string(sub_path.join("module.txt")).unwrap(), "from someone else", "pull should have brought in the other clone's content");
 
         // Now create a REAL divergence: local commits something new, and the remote
         // (via the other clone) also moves again — neither is an ancestor of the other.
         fs::write(sub_path.join("module.txt"), "local edit").unwrap();
-        commit_submodule(repo_path.clone(), "vendor/dep".into(), "Local divergent commit".into()).unwrap();
+        commit_submodule_inner(repo_path.clone(), "vendor/dep".into(), "Local divergent commit".into()).unwrap();
         fs::write(other_clone.join("module.txt"), "remote diverges too").unwrap();
         run_git(&other_clone, &["commit", "-am", "Remote diverges too"]);
         run_git(&other_clone, &["-c", "protocol.file.allow=always", "push", "origin", "HEAD:main"]);
 
-        let diverged = pull_submodule(repo_path.clone(), "vendor/dep".into());
+        let diverged = pull_submodule_inner(repo_path.clone(), "vendor/dep".into());
         assert!(diverged.is_err(), "a real divergence must not be silently resolved, got Ok");
         let message = diverged.unwrap_err();
         assert!(message.to_lowercase().contains("diverged") || message.to_lowercase().contains("manual"), "expected a message explaining manual resolution is needed, got: {message}");
 
         // force_push_submodule must resolve exactly this stuck situation by
         // overwriting the remote with the local history.
-        let forced = force_push_submodule(repo_path.clone(), "vendor/dep".into());
+        let forced = force_push_submodule_inner(repo_path.clone(), "vendor/dep".into());
         assert!(forced.is_ok(), "force_push_submodule should succeed even when diverged, got: {:?}", forced);
         let remote_content = git(&dep_remote.to_string_lossy(), &["show", "main:module.txt"]).unwrap();
         assert_eq!(remote_content.trim(), "local edit", "the remote should now match the local (forced) content");
-        let parent_changes = load_repository(repo_path, Some(true)).unwrap().changes;
+        let parent_changes = load_repository_inner(repo_path, Some(true)).unwrap().changes;
         assert!(!parent_changes.iter().any(|change| change.path == "vendor/dep"), "the parent should be auto-updated after a force push too");
 
         fs::remove_dir_all(base).unwrap();
@@ -8186,7 +8264,7 @@ mod tests {
         create_libgit2_repository(&parent, "README.md");
         create_libgit2_repository(&dependency, "module.txt");
         let parent_string = parent.to_string_lossy().into_owned();
-        let added = add_submodule(parent_string.clone(), "".into(), dependency.to_string_lossy().into_owned(), "dep".into(), String::new(), String::new()).unwrap();
+        let added = add_submodule_inner(parent_string.clone(), "".into(), dependency.to_string_lossy().into_owned(), "dep".into(), String::new(), String::new()).unwrap();
         create_commit(parent_string.clone(), "Add dep submodule".into()).unwrap();
 
         run_git(&parent, &["remote", "add", "origin", "git@github.vitesco.io:eng/unrelated-parent.git"]);
@@ -8253,13 +8331,13 @@ mod tests {
         let repo_string = repo_path.to_string_lossy().into_owned();
 
         // Nothing staged yet — should refuse, same as commit_files would.
-        assert!(commit_staged(repo_string.clone(), "Empty".into()).is_err());
+        assert!(commit_staged_inner(repo_string.clone(), "Empty".into()).is_err());
 
         let names: Vec<String> = (0..5).map(|i| format!("new_{i}.txt")).collect();
         for name in &names { fs::write(repo_path.join(name), "content").unwrap(); }
         stage_files(repo_string.clone(), names.clone()).unwrap();
 
-        let oid = commit_staged(repo_string.clone(), "Add five files".into()).unwrap();
+        let oid = commit_staged_inner(repo_string.clone(), "Add five files".into()).unwrap();
         let repo = internal_repository(&repo_string).unwrap();
         let commit = repo.find_commit(git2::Oid::from_str(&oid).unwrap()).unwrap();
         for name in &names { assert!(commit.tree().unwrap().get_path(Path::new(name)).is_ok(), "{name} should be in the new commit"); }
@@ -8271,7 +8349,7 @@ mod tests {
         assert_eq!(index.write_tree().unwrap(), head_tree.id(), "index should already match the new HEAD tree with no resync needed");
 
         // Nothing staged again now — a second call should refuse too.
-        assert!(commit_staged(repo_string.clone(), "Nothing to commit".into()).is_err());
+        assert!(commit_staged_inner(repo_string.clone(), "Nothing to commit".into()).is_err());
     }
 
     // Ignored by default (`cargo test` skips it; run explicitly with
@@ -8327,7 +8405,7 @@ mod tests {
         println!("PERF stage_files (resync after 5 deletions): {:?}", restage_started.elapsed());
 
         let commit_started = Instant::now();
-        let oid = commit_staged(repo_string.clone(), "Add 240 incoming files".into()).unwrap();
+        let oid = commit_staged_inner(repo_string.clone(), "Add 240 incoming files".into()).unwrap();
         println!("PERF commit_staged: {:?}", commit_started.elapsed());
 
         let repo = internal_repository(&repo_string).unwrap();
@@ -8587,12 +8665,12 @@ mod tests {
         for name in &names { fs::write(repo_path.join(name), "content").unwrap(); }
         for name in &names[..7] { fs::remove_file(repo_path.join(name)).unwrap(); }
 
-        let statuses = refresh_status(repo_string.clone()).unwrap();
+        let statuses = refresh_status_inner(repo_string.clone()).unwrap();
         let untracked_new: Vec<&Change> = statuses.iter().filter(|c| names[7..].contains(&c.path) && c.status == "??").collect();
         assert_eq!(untracked_new.len(), 238, "the 238 files that still exist on disk should all show up as untracked (??)");
         assert!(statuses.iter().all(|c| !names[..7].contains(&c.path)), "a file that was created and then deleted before ever being staged shouldn't show up as a change at all — git never knew about it");
 
-        let staged_count = stage_all(repo_string.clone(), String::new()).unwrap();
+        let staged_count = stage_all_inner(&repo_string, "").unwrap();
         assert_eq!(staged_count.staged_paths.len(), 238, "stage_all should have processed exactly the 238 real, current files");
         assert!(staged_count.skipped_dirty_submodules.is_empty());
 
@@ -8601,7 +8679,7 @@ mod tests {
         for name in &names[7..] { assert!(index.get_path(Path::new(name), 0).is_some(), "{name} should be staged"); }
         for name in &names[..7] { assert!(index.get_path(Path::new(name), 0).is_none(), "{name} was deleted before ever being staged and must not appear in the index"); }
 
-        let oid = commit_staged(repo_string.clone(), "Add 238 incoming files".into()).unwrap();
+        let oid = commit_staged_inner(repo_string.clone(), "Add 238 incoming files".into()).unwrap();
         let commit = repo.find_commit(git2::Oid::from_str(&oid).unwrap()).unwrap();
         let tree = commit.tree().unwrap();
         for name in &names[7..] { assert!(tree.get_path(Path::new(name)).is_ok(), "{name} should be in the commit"); }
@@ -8624,11 +8702,11 @@ mod tests {
         let fake_marker = "__unmistakably_fake_marker__.txt".to_string();
         full_status_cache().lock().unwrap().insert(repo_string.clone(), (Instant::now(), vec![(fake_marker.clone(), "??".into(), false)]));
 
-        let changes = refresh_status(repo_string.clone()).unwrap();
+        let changes = refresh_status_inner(repo_string.clone()).unwrap();
         assert_eq!(changes.len(), 1, "should have reused the seeded entry, not scanned the (actually empty) real repository");
         assert_eq!(changes[0].path, fake_marker);
 
-        let staged = stage_all(repo_string.clone(), String::new()).unwrap();
+        let staged = stage_all_inner(&repo_string, "").unwrap();
         assert_eq!(staged.staged_paths.len(), 1, "stage_all right after should reuse the same still-fresh scan, not run its own");
 
         // Age the cache entry past the reuse window (without a real sleep) —
@@ -8637,7 +8715,7 @@ mod tests {
         if let Some(entry) = full_status_cache().lock().unwrap().get_mut(&repo_string) {
             entry.0 = Instant::now() - FRESH_STATUS_REUSE_WINDOW - Duration::from_millis(500);
         }
-        let changes_after_expiry = refresh_status(repo_string.clone()).unwrap();
+        let changes_after_expiry = refresh_status_inner(repo_string.clone()).unwrap();
         assert!(changes_after_expiry.is_empty(), "past the reuse window, this must be a real fresh scan of the (clean) repository, not the stale fake entry");
     }
 
@@ -8724,7 +8802,7 @@ mod tests {
         run_git(&sub_a, &["commit", "-am", "Advance submodule a"]);
         fs::write(sub_b.join("b.txt"), "uncommitted, HEAD unchanged").unwrap();
 
-        let result = stage_all(parent_string.clone(), String::new()).unwrap();
+        let result = stage_all_inner(&parent_string, "").unwrap();
         let staged: std::collections::HashSet<_> = result.staged_paths.iter().cloned().collect();
         assert_eq!(staged, ["plain.txt".to_string(), "vendor/a".to_string()].into_iter().collect(), "exactly the real file and the submodule that actually advanced, got: {result:?}");
         assert_eq!(result.skipped_dirty_submodules, vec!["vendor/b".to_string()], "the merely-dirty submodule must be reported as skipped, not silently counted as staged");
@@ -8777,24 +8855,24 @@ mod tests {
             fs::create_dir_all(&dir_path).unwrap();
             for file in 0..100 { fs::write(dir_path.join(format!("f{file}.txt")), b"x").unwrap(); }
         }
-        stage_all(parent_string.clone(), String::new()).unwrap();
-        commit_staged(parent_string.clone(), "Add 5000 tracked files".into()).unwrap();
+        stage_all_inner(&parent_string, "").unwrap();
+        commit_staged_inner(parent_string.clone(), "Add 5000 tracked files".into()).unwrap();
         for i in 0..30 {
             let dependency = base.join(format!("dep_{i}"));
             create_libgit2_repository(&dependency, "module.txt");
-            add_submodule(parent_string.clone(), "".into(), dependency.to_string_lossy().into_owned(), format!("sub_{i}"), String::new(), String::new()).unwrap();
+            add_submodule_inner(parent_string.clone(), "".into(), dependency.to_string_lossy().into_owned(), format!("sub_{i}"), String::new(), String::new()).unwrap();
         }
-        commit_staged(parent_string.clone(), "Add 30 submodules".into()).unwrap();
+        commit_staged_inner(parent_string.clone(), "Add 30 submodules".into()).unwrap();
         println!("PERF combined-stress setup (5000 files, 30 submodules): {:?}", setup_started.elapsed());
 
         // Neither call below mutates the repository — pure reads, back to back.
         let fast_started = Instant::now();
-        let fast = open_repository_fast(parent_string.clone()).unwrap();
+        let fast = open_repository_fast_inner(parent_string.clone()).unwrap();
         let fast_elapsed = fast_started.elapsed();
         println!("PERF open_repository_fast: {fast_elapsed:?} ({} branches, {} commits)", fast.branches.len(), fast.commits.len());
 
         let full_started = Instant::now();
-        let full = load_repository(parent_string.clone(), Some(true)).unwrap();
+        let full = load_repository_inner(parent_string.clone(), Some(true)).unwrap();
         let full_elapsed = full_started.elapsed();
         println!("PERF load_repository (force, same repo, no mutation between calls): {full_elapsed:?} ({} branches, {} commits, {} changes)", full.branches.len(), full.commits.len(), full.changes.len());
 
@@ -8824,18 +8902,18 @@ mod tests {
             fs::create_dir_all(&dir_path).unwrap();
             for file in 0..100 { fs::write(dir_path.join(format!("f{file}.txt")), b"x").unwrap(); }
         }
-        stage_all(parent_string.clone(), String::new()).unwrap();
-        commit_staged(parent_string.clone(), "Add 5000 tracked files".into()).unwrap();
+        stage_all_inner(&parent_string, "").unwrap();
+        commit_staged_inner(parent_string.clone(), "Add 5000 tracked files".into()).unwrap();
         for i in 0..30 {
             let dependency = base.join(format!("dep_{i}"));
             create_libgit2_repository(&dependency, "module.txt");
-            add_submodule(parent_string.clone(), "".into(), dependency.to_string_lossy().into_owned(), format!("sub_{i}"), String::new(), String::new()).unwrap();
+            add_submodule_inner(parent_string.clone(), "".into(), dependency.to_string_lossy().into_owned(), format!("sub_{i}"), String::new(), String::new()).unwrap();
         }
-        commit_staged(parent_string.clone(), "Add 30 submodules".into()).unwrap();
+        commit_staged_inner(parent_string.clone(), "Add 30 submodules".into()).unwrap();
 
         // 1. Root visible near-instantly, zero Git calls.
         let fast_started = Instant::now();
-        let fast = open_repository_fast(parent_string.clone()).unwrap();
+        let fast = open_repository_fast_inner(parent_string.clone()).unwrap();
         let fast_list_started = Instant::now();
         let root_entries = list_directory_fast(fast.repository.path.clone(), String::new()).unwrap();
         let fast_total = fast_started.elapsed();
@@ -8846,7 +8924,7 @@ mod tests {
 
         // 2. The one and only real full status scan.
         let scan_started = Instant::now();
-        let changes = refresh_status(fast.repository.path.clone()).unwrap();
+        let changes = refresh_status_inner(fast.repository.path.clone()).unwrap();
         let scan_elapsed = scan_started.elapsed();
         println!("PERF refresh_status (the one real scan): {scan_elapsed:?} ({} changes)", changes.len());
         assert!(changes.is_empty(), "a freshly committed combined-stress repo should be clean");
