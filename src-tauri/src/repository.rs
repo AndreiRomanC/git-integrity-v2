@@ -197,6 +197,33 @@ fn log_repo_write_lock_acquired(repository_path: &str, label: &str, queue_wait: 
     perf_log(&format!("repo_write_lock: [{label}] acquired (repo={}, queue_wait={:.1}ms)", anonymized_repository_id(repository_path), queue_wait.as_secs_f64() * 1000.0), Duration::ZERO);
 }
 
+// Tauri does *not* automatically move a synchronous `#[tauri::command]`'s
+// work off the thread that delivered the IPC call — confirmed against
+// Tauri's own generated wrapper (tauri-macros' `body_blocking`): it calls
+// straight through, on that same thread, with no dispatch elsewhere. That
+// thread is the platform webview's own IPC callback (the native UI thread
+// on both macOS/WKWebView and Windows/WebView2), so a slow synchronous
+// command freezes the whole window for its duration. Only an `async fn`
+// command gets off it — Tauri's own docs recommend exactly this — and only
+// if that `async fn` actually awaits something that itself runs elsewhere,
+// which is what this does: hands the *entire*, unchanged, still-fully-
+// synchronous body to Tokio's dedicated blocking-thread pool (a pool built
+// for exactly this — long, blocking, non-async work — separate from both
+// the UI thread and Tokio's async worker threads) and awaits it there.
+// Every "heavy" command (pr_status, load/refresh status, stage/commit,
+// fetch/push, submodule operations) routes through this. A repository
+// handle is always opened *inside* `body`, never passed across the
+// boundary, so git2::Repository's own thread-affinity story never enters
+// into whether this compiles — only the plain, owned inputs and the
+// `Result<T, String>` output need to be `Send`, and every command's
+// parameters/return types already are.
+async fn off_main_thread<T: Send + 'static>(body: impl FnOnce() -> Result<T, String> + Send + 'static) -> Result<T, String> {
+    match tauri::async_runtime::spawn_blocking(body).await {
+        Ok(result) => result,
+        Err(join_error) => Err(format!("Internal error: a background task panicked ({join_error})")),
+    }
+}
+
 // `load_repository` runs a full, unscoped status scan (every file in the
 // working tree) on essentially every action — this app calls it again right
 // after almost anything (stage, commit, stash, fetch...). On a large repo
@@ -2077,9 +2104,9 @@ pub struct PullRequestSummary {
 #[derive(Serialize)]
 pub struct PrStatusResult {
     // "no_remote" | "unsupported_provider" | "auth_missing" | "api_error" |
-    // "no_open_pr" | "no_upstream" | "detached_head" | "no_branch" | "ok"
-    // (one or more PRs — the frontend distinguishes "one" vs "multiple" from
-    // pull_requests.len() itself)
+    // "no_open_pr" | "no_upstream" | "partial_result" | "detached_head" |
+    // "no_branch" | "superseded" | "ok" (one or more PRs — the frontend
+    // distinguishes "one" vs "multiple" from pull_requests.len() itself)
     state: String,
     detail: String,
     // The branch actually checked against the server (the *remote* branch
@@ -2088,12 +2115,17 @@ pub struct PrStatusResult {
     branch: Option<String>,
     // The `host/owner/repo` the query ran against — same message.
     queried_repo: Option<String>,
+    // True when the search could not check every relevant candidate
+    // repository (one errored, or the candidate list was longer than the
+    // cap) — an empty result under this must never be presented as a
+    // confident "no PR" (see state "partial_result").
+    partial: bool,
     pull_requests: Vec<PullRequestSummary>,
 }
 
 impl PrStatusResult {
     fn plain(state: &str, detail: impl Into<String>) -> Self {
-        PrStatusResult { state: state.into(), detail: detail.into(), branch: None, queried_repo: None, pull_requests: Vec::new() }
+        PrStatusResult { state: state.into(), detail: detail.into(), branch: None, queried_repo: None, partial: false, pull_requests: Vec::new() }
     }
 }
 
@@ -2198,11 +2230,17 @@ struct PrQueryContext {
     // remote, or `origin`/first remote). A PR "for this branch" is one
     // whose head repo is this and whose head ref is `head_branch`.
     head_repo: GitHubRepo,
-    // Every distinct GitHub repo a PR for this branch could have been
-    // opened *against* — `head_repo` first, then the other GitHub remotes
-    // (so a fork's PR against its upstream is found without *assuming* which
-    // remote is the upstream). Each is queried; results are unioned.
+    // Every distinct, same-host GitHub repo a PR for this branch could have
+    // been opened *against* — `head_repo` first, then every other GitHub
+    // remote's fetch *and* push URL (so a fork's PR against its upstream is
+    // found without *assuming* which remote is the upstream, and a remote
+    // whose push destination differs from its fetch URL is still covered).
+    // Each is queried; results are unioned.
     candidate_bases: Vec<GitHubRepo>,
+    // True when there were more same-host GitHub candidates than
+    // PR_MAX_CANDIDATE_BASES allowed through — an empty result must be
+    // reported as partial/incomplete, never a confident "no PR".
+    candidates_truncated: bool,
     // The branch name *on the remote* (`branch.<local>.merge`), which can
     // differ from the local branch name.
     head_branch: String,
@@ -2217,7 +2255,9 @@ struct PrQueryContext {
 enum PrContext { Ready(PrQueryContext), Terminal(PrStatusResult) }
 
 // At most this many `gh` calls per pr_status (head repo + a few candidate
-// bases) — a guard against a repo with a long list of GitHub remotes.
+// bases) — a guard against a repo with a long list of GitHub remotes. They
+// run concurrently (see pr_status_impl), so this is also the concurrency
+// cap, not just a call-count cap.
 const PR_MAX_CANDIDATE_BASES: usize = 4;
 
 // Backend is the single source of truth: HEAD/branch/upstream come from Git
@@ -2271,25 +2311,33 @@ fn resolve_pr_query_context(repo: &Repository, frontend_branch: Option<&str>) ->
     };
 
     // Candidate base repos = the head repo, then every *other* distinct
-    // GitHub remote. No remote name is treated as special: a fork's PR
-    // against its real upstream is found because that upstream is one of the
-    // repo's remotes and gets queried too — not because it's *named*
-    // "upstream".
+    // GitHub remote on the *same host* — mixing hosts would mean querying a
+    // `gh` auth context that can't possibly own the PR (a fork/upstream pair
+    // is never split across two different GitHub instances). No remote name
+    // is treated as special: a fork's PR against its real upstream is found
+    // because that upstream is one of the repo's remotes and gets queried
+    // too — not because it's *named* "upstream". Both a remote's fetch URL
+    // and its push URL (when explicitly different — remote.pushurl()) are
+    // considered: what a branch's commits were actually pushed *to* is what
+    // decides where its PR could be, and that isn't always the fetch URL.
     let mut candidate_bases = vec![head_repo.clone()];
     for name in &existing_remotes {
-        if *name == head_remote_name { continue; }
-        if let Some(other) = repo.find_remote(name).ok()
-            .and_then(|remote| remote.url().map(String::from))
-            .and_then(|url| parse_github_repo(&url))
-        {
-            if !candidate_bases.contains(&other) { candidate_bases.push(other); }
+        let Ok(remote) = repo.find_remote(name) else { continue };
+        let fetch_url = remote.url().map(str::to_string);
+        let push_url = remote.pushurl().map(str::to_string);
+        for url in [fetch_url, push_url].into_iter().flatten() {
+            let Some(parsed) = parse_github_repo(&url) else { continue };
+            if parsed.host != head_repo.host { continue; }
+            if !candidate_bases.contains(&parsed) { candidate_bases.push(parsed); }
         }
     }
+    let candidates_truncated = candidate_bases.len() > PR_MAX_CANDIDATE_BASES;
     candidate_bases.truncate(PR_MAX_CANDIDATE_BASES);
 
     PrContext::Ready(PrQueryContext {
         head_repo,
         candidate_bases,
+        candidates_truncated,
         head_branch: remote_branch.unwrap_or_else(|| local_branch.clone()),
         local_branch,
         tracking_remote: head_remote_name,
@@ -2372,11 +2420,17 @@ fn select_matching_prs(raw: &[serde_json::Value], head_branch: &str, head_owner:
         .collect()
 }
 
+// One candidate base's outcome, tagged with whether it was the head repo
+// (index 0) — collected from the concurrent dispatch in pr_status_impl below
+// and reduced into a PrStatusResult afterward, all on the calling thread, so
+// the reduction logic itself stays single-threaded and easy to follow.
+struct PrCandidateOutcome { is_head_repo: bool, base_id: String, outcome: GhOutcome }
+
 fn pr_status_impl(
     ctx: PrQueryContext,
     repository_path: &str,
     context_label: &str,
-    run: &dyn Fn(&PrGhQuery) -> GhOutcome,
+    run: &(dyn Fn(&PrGhQuery) -> GhOutcome + Sync),
 ) -> PrStatusResult {
     let head_owner = ctx.head_repo.owner.clone();
     let head_name = ctx.head_repo.repo.clone();
@@ -2386,23 +2440,47 @@ fn pr_status_impl(
         perf_log(&format!("pr_status: [{context_label}] frontend branch '{frontend_branch}' != HEAD '{}' — using HEAD", ctx.local_branch), Duration::ZERO);
     }
     perf_log(&format!(
-        "pr_status: [{}] repo={} host={} head_repo=<{}> local_branch={} remote_branch={} tracking_remote={} had_upstream={} candidate_bases={}",
+        "pr_status: [{}] repo={} host={} head_repo=<{}> local_branch={} remote_branch={} tracking_remote={} had_upstream={} candidate_bases={} truncated={}",
         context_label, anonymized_repository_id(repository_path), ctx.head_repo.host,
         anonymized_repository_id(&ctx.head_repo.gh_repo_arg()), ctx.local_branch, ctx.head_branch,
-        ctx.tracking_remote, ctx.had_upstream, ctx.candidate_bases.len(),
+        ctx.tracking_remote, ctx.had_upstream, ctx.candidate_bases.len(), ctx.candidates_truncated,
     ), Duration::ZERO);
+
+    // Every candidate base is queried *concurrently* — one OS thread each,
+    // bounded by PR_MAX_CANDIDATE_BASES — instead of one after another
+    // (which meant a worst case of N sequential 20s timeouts). Since they
+    // all start together, the wall-clock bound for the whole round is just
+    // the slowest single candidate's own existing 20s timeout, not their
+    // sum — this is what actually keeps a "reasonable total timeout" true
+    // without a second, redundant deadline layered on top. `run` must be
+    // `Sync` — shared, read-only, across every spawned thread.
+    let dispatch_started = Instant::now();
+    let outcomes: Vec<PrCandidateOutcome> = std::thread::scope(|scope| {
+        let handles: Vec<_> = ctx.candidate_bases.iter().enumerate().map(|(index, base)| {
+            let query = PrGhQuery { repo: base.gh_repo_arg(), head: ctx.head_branch.clone() };
+            scope.spawn(move || {
+                let base_id = anonymized_repository_id(&query.repo);
+                PrCandidateOutcome { is_head_repo: index == 0, base_id, outcome: run(&query) }
+            })
+        }).collect();
+        handles.into_iter().map(|handle| handle.join().unwrap_or(PrCandidateOutcome {
+            is_head_repo: false, base_id: "unknown".into(),
+            outcome: GhOutcome::Failure { stderr: "gh query thread panicked".into() },
+        })).collect()
+    });
+    perf_log(&format!("pr_status: [{context_label}] {} candidate queries dispatched concurrently", ctx.candidate_bases.len()), dispatch_started.elapsed());
 
     let mut found: Vec<PullRequestSummary> = Vec::new();
     let mut raw_total = 0usize;
     let mut head_repo_query_ok = false;
     let mut head_repo_error: Option<(bool, String)> = None; // (auth-ish, detail)
     let mut head_repo_unavailable: Option<(bool, String)> = None; // gh missing / unrunnable
+    // A *non*-head candidate that failed or couldn't run — the search wasn't
+    // complete, so an otherwise-empty result must not read as confident.
+    let mut secondary_candidate_failed = false;
 
-    for (index, base) in ctx.candidate_bases.iter().enumerate() {
-        let is_head_repo = index == 0;
-        let query = PrGhQuery { repo: base.gh_repo_arg(), head: ctx.head_branch.clone() };
-        let base_id = anonymized_repository_id(&query.repo);
-        match run(&query) {
+    for PrCandidateOutcome { is_head_repo, base_id, outcome } in outcomes {
+        match outcome {
             GhOutcome::Prs(items) => {
                 if is_head_repo { head_repo_query_ok = true; }
                 raw_total += items.len();
@@ -2411,11 +2489,11 @@ fn pr_status_impl(
             GhOutcome::Failure { stderr } => {
                 let auth = gh_stderr_looks_like_auth(&stderr);
                 perf_log(&format!("pr_status: [{context_label}] base=<{base_id}> query failed (auth={auth})"), Duration::ZERO);
-                if is_head_repo { head_repo_error = Some((auth, stderr)); }
+                if is_head_repo { head_repo_error = Some((auth, stderr)); } else { secondary_candidate_failed = true; }
             }
             GhOutcome::Unavailable { not_installed, detail } => {
                 perf_log(&format!("pr_status: [{context_label}] base=<{base_id}> gh unavailable (not_installed={not_installed})"), Duration::ZERO);
-                if is_head_repo { head_repo_unavailable = Some((not_installed, detail)); }
+                if is_head_repo { head_repo_unavailable = Some((not_installed, detail)); } else { secondary_candidate_failed = true; }
             }
         }
     }
@@ -2424,16 +2502,19 @@ fn pr_status_impl(
     found.sort_by(|a, b| a.url.cmp(&b.url));
     found.dedup_by(|a, b| !a.url.is_empty() && a.url == b.url);
 
-    perf_log(&format!("pr_status: [{context_label}] raw_results={raw_total} after_filter={}", found.len()), Duration::ZERO);
+    let incomplete = ctx.candidates_truncated || secondary_candidate_failed;
+    perf_log(&format!("pr_status: [{context_label}] raw_results={raw_total} after_filter={} incomplete={incomplete}", found.len()), Duration::ZERO);
 
     if !found.is_empty() {
-        return PrStatusResult { state: "ok".into(), detail: String::new(), branch: Some(ctx.head_branch), queried_repo: Some(queried_repo), pull_requests: found };
+        // Real PRs found — worth reporting regardless of whether every
+        // candidate could be checked; `partial` still says so.
+        return PrStatusResult { state: "ok".into(), detail: String::new(), branch: Some(ctx.head_branch), queried_repo: Some(queried_repo), partial: incomplete, pull_requests: found };
     }
     if let Some((not_installed, detail)) = head_repo_unavailable {
         let message = if not_installed {
             "The GitHub CLI (`gh`) isn't installed — install it and run `gh auth login` to see pull request status.".to_string()
         } else { detail };
-        return PrStatusResult { state: "auth_missing".into(), detail: message, branch: Some(ctx.head_branch), queried_repo: Some(queried_repo), pull_requests: Vec::new() };
+        return PrStatusResult { state: "auth_missing".into(), detail: message, branch: Some(ctx.head_branch), queried_repo: Some(queried_repo), partial: true, pull_requests: Vec::new() };
     }
     if let Some((auth, stderr)) = head_repo_error {
         let enterprise = ctx.head_repo.host != "github.com";
@@ -2444,21 +2525,63 @@ fn pr_status_impl(
         } else if stderr.trim().is_empty() {
             "The GitHub API request failed.".to_string()
         } else { stderr.trim().to_string() };
-        return PrStatusResult { state: state.into(), detail, branch: Some(ctx.head_branch), queried_repo: Some(queried_repo), pull_requests: Vec::new() };
+        return PrStatusResult { state: state.into(), detail, branch: Some(ctx.head_branch), queried_repo: Some(queried_repo), partial: true, pull_requests: Vec::new() };
     }
     if !head_repo_query_ok {
         // Neither a result, an error, nor "unavailable" from the head repo —
         // shouldn't happen, but never report a confident "no PR" off it.
-        return PrStatusResult { state: "api_error".into(), detail: "Could not determine pull request status.".into(), branch: Some(ctx.head_branch), queried_repo: Some(queried_repo), pull_requests: Vec::new() };
+        return PrStatusResult { state: "api_error".into(), detail: "Could not determine pull request status.".into(), branch: Some(ctx.head_branch), queried_repo: Some(queried_repo), partial: true, pull_requests: Vec::new() };
     }
-    // Genuine empty: the head repo's own query succeeded and matched nothing.
+    if incomplete {
+        // The head repo itself came back clean, but at least one other
+        // relevant candidate could not be checked (or there were more
+        // candidates than the cap allowed) — this must never look like a
+        // confident "no open PR".
+        return PrStatusResult {
+            state: "partial_result".into(),
+            detail: "Some candidate repositories could not be checked, so this result may be incomplete.".into(),
+            branch: Some(ctx.head_branch), queried_repo: Some(queried_repo), partial: true, pull_requests: Vec::new(),
+        };
+    }
+    // Genuine empty: every candidate that was supposed to be checked was,
+    // and none had a match.
     let state = if ctx.had_upstream { "no_open_pr" } else { "no_upstream" };
-    PrStatusResult { state: state.into(), detail: String::new(), branch: Some(ctx.head_branch), queried_repo: Some(queried_repo), pull_requests: Vec::new() }
+    PrStatusResult { state: state.into(), detail: String::new(), branch: Some(ctx.head_branch), queried_repo: Some(queried_repo), partial: false, pull_requests: Vec::new() }
+}
+
+// A newer pr_status call for the same repository path tells an older,
+// possibly still-in-flight one (rapid submodule/context switching, or the
+// same panel polling again before the previous poll returned) that its
+// answer is no longer wanted — checked right before the expensive gh round,
+// so a burst of superseded calls skips straight past it instead of each
+// spending a full concurrent-gh round on an answer nobody will see. This is
+// a best-effort, pre-dispatch check, not true mid-flight cancellation of an
+// already-running gh process; the frontend's own request-generation guard
+// (see createPrStatusPanel) is what actually keeps a late response from
+// ever being *applied* to the wrong context — this only saves the work.
+// Keyed by the raw repository path: a fast in-memory hint, not a
+// correctness-critical identity like repo_write_lock's canonicalized key.
+static PR_STATUS_GENERATION: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+
+fn pr_status_generation_map() -> &'static Mutex<HashMap<String, u64>> {
+    PR_STATUS_GENERATION.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn claim_pr_status_generation(repository_path: &str) -> u64 {
+    let mut map = pr_status_generation_map().lock().unwrap();
+    let next = map.get(repository_path).copied().unwrap_or(0) + 1;
+    map.insert(repository_path.to_string(), next);
+    next
+}
+
+fn is_latest_pr_status_generation(repository_path: &str, generation: u64) -> bool {
+    pr_status_generation_map().lock().unwrap().get(repository_path).copied() == Some(generation)
 }
 
 #[tauri::command]
 pub fn pr_status(repository_path: String, branch: Option<String>, context: Option<String>) -> Result<PrStatusResult, String> {
     validate_path(&repository_path)?;
+    let generation = claim_pr_status_generation(&repository_path);
     let repo = internal_repository(&repository_path)?;
     let context_label = context.as_deref().map(str::trim).filter(|s| !s.is_empty()).unwrap_or("parent").to_string();
 
@@ -2470,6 +2593,10 @@ pub fn pr_status(repository_path: String, branch: Option<String>, context: Optio
         }
     };
     drop(repo);
+    if !is_latest_pr_status_generation(&repository_path, generation) {
+        perf_log(&format!("pr_status: [{context_label}] repo={} superseded by a newer request — skipping the gh round", anonymized_repository_id(&repository_path)), Duration::ZERO);
+        return Ok(PrStatusResult::plain("superseded", "A newer request for this repository has already superseded this one."));
+    }
     Ok(pr_status_impl(ctx, &repository_path, &context_label, &run_gh_pr_list))
 }
 
@@ -5991,9 +6118,10 @@ mod tests {
         assert_eq!(ctx.head_repo.host, "github.vitesco.io");
         assert_eq!((ctx.head_repo.owner.as_str(), ctx.head_repo.repo.as_str()), ("eng", "canonical"),
             "the branch lives on its tracking remote, not origin");
-        // origin is still queried as a candidate base — no remote is special.
-        assert!(base_slugs(&ctx).contains(&"github.com/me/local-fork".to_string()));
-        assert_eq!(base_slugs(&ctx)[0], "github.vitesco.io/eng/canonical", "the head repo is tried first");
+        // origin is a *different GitHub host* (github.com vs github.vitesco.io)
+        // than the head repo — never a candidate, regardless of remote name;
+        // see resolve_pr_query_context_only_considers_remotes_on_the_same_github_host.
+        assert_eq!(base_slugs(&ctx), vec!["github.vitesco.io/eng/canonical"], "the head repo is tried first, and origin's different host excludes it");
         drop(repo);
         fs::remove_dir_all(base).unwrap();
     }
@@ -6112,15 +6240,17 @@ mod tests {
         let repo = internal_repository(&path).unwrap();
         let ctx = ctx_for(&repo);
 
-        let seen = std::cell::RefCell::new(Vec::<PrGhQuery>::new());
+        // Mutex, not RefCell: pr_status_impl now dispatches candidates
+        // concurrently, so `run` must be Sync.
+        let seen = Mutex::new(Vec::<PrGhQuery>::new());
         let run = |q: &PrGhQuery| {
-            seen.borrow_mut().push(q.clone());
+            seen.lock().unwrap().push(q.clone());
             GhOutcome::Prs(vec![pr_json(42, "feature/on-server", "eng", "sw-prj-OMBMS_000U0")])
         };
         let result = pr_status_impl(ctx, &path, "parent", &run);
 
         {
-            let queries = seen.borrow();
+            let queries = seen.lock().unwrap();
             assert_eq!(queries.len(), 1, "exactly one query — the enterprise head repo");
             assert_eq!(queries[0], PrGhQuery {
                 repo: "github.vitesco.io/eng/sw-prj-OMBMS_000U0".into(),
@@ -6220,9 +6350,9 @@ mod tests {
         let repo = internal_repository(&path).unwrap();
         let ctx = ctx_for(&repo);
 
-        let seen = std::cell::RefCell::new(Vec::<String>::new());
+        let seen = Mutex::new(Vec::<String>::new());
         let run = |q: &PrGhQuery| {
-            seen.borrow_mut().push(q.repo.clone());
+            seen.lock().unwrap().push(q.repo.clone());
             if q.repo == "github.com/acme/product" {
                 GhOutcome::Prs(vec![pr_json(5, "feature", "me", "fork")]) // head repo is our fork
             } else {
@@ -6232,7 +6362,7 @@ mod tests {
         let result = pr_status_impl(ctx, &path, "parent", &run);
         assert_eq!(result.state, "ok");
         assert_eq!(result.pull_requests.iter().map(|p| p.number).collect::<Vec<_>>(), vec![5]);
-        let queried = seen.borrow().clone();
+        let queried = seen.lock().unwrap().clone();
         assert!(queried.contains(&"github.com/me/fork".to_string()));
         assert!(queried.contains(&"github.com/wrong/place".to_string()));
         assert!(queried.contains(&"github.com/acme/product".to_string()));
@@ -6257,6 +6387,133 @@ mod tests {
         assert_eq!(result.pull_requests.len(), 1, "one PR, not one per candidate base");
         drop(repo);
         fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn pr_status_impl_never_reports_no_open_pr_when_a_relevant_candidate_failed() {
+        // The head repo itself comes back genuinely empty, but a second
+        // relevant candidate (the real upstream) could not be checked — this
+        // must read as "the search was incomplete", never as a confident
+        // "no open PR".
+        let (base, path) = pr_repo("impl-partial");
+        run_git(&base, &["remote", "add", "origin", "git@github.com:me/fork.git"]);
+        run_git(&base, &["remote", "add", "upstream", "git@github.com:acme/product.git"]);
+        run_git(&base, &["checkout", "-q", "-b", "feature"]);
+        run_git(&base, &["config", "branch.feature.remote", "origin"]);
+        run_git(&base, &["config", "branch.feature.merge", "refs/heads/feature"]);
+        let repo = internal_repository(&path).unwrap();
+        let ctx = ctx_for(&repo);
+        let run = |q: &PrGhQuery| {
+            if q.repo == "github.com/me/fork" { GhOutcome::Prs(Vec::new()) }
+            else { GhOutcome::Failure { stderr: "HTTP 502".into() } }
+        };
+        let result = pr_status_impl(ctx, &path, "parent", &run);
+        assert_eq!(result.state, "partial_result", "an empty head repo plus a failed secondary candidate must not read as no_open_pr");
+        assert!(result.partial);
+        assert!(result.pull_requests.is_empty());
+        drop(repo);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn resolve_pr_query_context_only_considers_remotes_on_the_same_github_host() {
+        // A remote on a *different* GitHub host (github.com vs an
+        // enterprise instance) can never legitimately hold this branch's PR
+        // — gh's auth context is per-host, and a fork/upstream pair is never
+        // split across two different GitHub instances.
+        let (base, path) = pr_repo("cross-host");
+        run_git(&base, &["remote", "add", "origin", "git@github.vitesco.io:eng/demo.git"]);
+        run_git(&base, &["remote", "add", "mirror", "git@github.com:eng/demo-mirror.git"]);
+        run_git(&base, &["checkout", "-q", "-b", "feature"]);
+        run_git(&base, &["config", "branch.feature.remote", "origin"]);
+        run_git(&base, &["config", "branch.feature.merge", "refs/heads/feature"]);
+        let repo = internal_repository(&path).unwrap();
+        let ctx = ctx_for(&repo);
+        assert_eq!(base_slugs(&ctx), vec!["github.vitesco.io/eng/demo"], "the github.com remote must be excluded — different host than the head repo");
+        drop(repo);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn resolve_pr_query_context_caps_candidates_and_flags_the_result_as_truncated() {
+        let (base, path) = pr_repo("many-remotes");
+        run_git(&base, &["remote", "add", "origin", "git@github.com:me/fork.git"]);
+        for (name, owner) in [("r1", "org1"), ("r2", "org2"), ("r3", "org3"), ("r4", "org4"), ("r5", "org5")] {
+            run_git(&base, &["remote", "add", name, &format!("git@github.com:{owner}/repo.git")]);
+        }
+        run_git(&base, &["checkout", "-q", "-b", "feature"]);
+        run_git(&base, &["config", "branch.feature.remote", "origin"]);
+        run_git(&base, &["config", "branch.feature.merge", "refs/heads/feature"]);
+        let repo = internal_repository(&path).unwrap();
+        let ctx = ctx_for(&repo);
+        assert_eq!(ctx.candidate_bases.len(), PR_MAX_CANDIDATE_BASES, "must cap at the concurrency limit, not query all 6 remotes");
+        assert!(ctx.candidates_truncated, "6 same-host GitHub remotes exceeds the cap of {PR_MAX_CANDIDATE_BASES} — must be flagged truncated");
+
+        // And the truncation alone (even with every *queried* candidate
+        // succeeding empty) must still mark the result partial, not a
+        // confident empty.
+        let run = |_: &PrGhQuery| GhOutcome::Prs(Vec::new());
+        let result = pr_status_impl(ctx, &path, "parent", &run);
+        assert_eq!(result.state, "partial_result");
+        assert!(result.partial);
+        drop(repo);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn resolve_pr_query_context_adds_a_remotes_push_url_as_a_candidate_when_it_differs() {
+        let (base, path) = pr_repo("pushurl");
+        run_git(&base, &["remote", "add", "origin", "git@github.com:me/fetch-side.git"]);
+        run_git(&base, &["remote", "set-url", "--push", "origin", "git@github.com:me/push-side.git"]);
+        run_git(&base, &["checkout", "-q", "-b", "feature"]);
+        run_git(&base, &["config", "branch.feature.remote", "origin"]);
+        run_git(&base, &["config", "branch.feature.merge", "refs/heads/feature"]);
+        let repo = internal_repository(&path).unwrap();
+        let ctx = ctx_for(&repo);
+        assert_eq!(base_slugs(&ctx), vec!["github.com/me/fetch-side", "github.com/me/push-side"], "a distinct push URL must be queried too — where commits actually land can differ from the fetch URL");
+        drop(repo);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn pr_status_impl_queries_candidates_concurrently_not_sequentially() {
+        // Three candidates, each artificially slow — sequential would take
+        // roughly 3x as long as the slowest one; concurrent takes roughly 1x.
+        let (base, path) = pr_repo("concurrency");
+        run_git(&base, &["remote", "add", "origin", "git@github.com:me/fork.git"]);
+        run_git(&base, &["remote", "add", "upstream", "git@github.com:acme/product.git"]);
+        run_git(&base, &["remote", "add", "third", "git@github.com:third/party.git"]);
+        run_git(&base, &["checkout", "-q", "-b", "feature"]);
+        run_git(&base, &["config", "branch.feature.remote", "origin"]);
+        run_git(&base, &["config", "branch.feature.merge", "refs/heads/feature"]);
+        let repo = internal_repository(&path).unwrap();
+        let ctx = ctx_for(&repo);
+        assert_eq!(ctx.candidate_bases.len(), 3, "sanity check: three candidates to race");
+
+        const PER_CALL: Duration = Duration::from_millis(200);
+        let run = |_: &PrGhQuery| { std::thread::sleep(PER_CALL); GhOutcome::Prs(Vec::new()) };
+        let started = Instant::now();
+        let _ = pr_status_impl(ctx, &path, "parent", &run);
+        let elapsed = started.elapsed();
+        assert!(elapsed < PER_CALL * 2, "3 candidates dispatched concurrently should take roughly 1x the per-call delay ({PER_CALL:?}), not the sequential ~3x; took {elapsed:?}");
+        drop(repo);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn pr_status_generation_tracks_the_latest_request_per_repository() {
+        let path = "some/fake/repo/path/for/generation/tracking/only";
+        let first = claim_pr_status_generation(path);
+        let second = claim_pr_status_generation(path);
+        assert_ne!(first, second);
+        assert!(!is_latest_pr_status_generation(path, first), "an older claimed generation must no longer read as latest once a newer one exists");
+        assert!(is_latest_pr_status_generation(path, second));
+
+        // A different repository path has its own, independent counter.
+        let other_path = "some/other/fake/repo/path";
+        let other_first = claim_pr_status_generation(other_path);
+        assert!(is_latest_pr_status_generation(other_path, other_first));
+        assert!(is_latest_pr_status_generation(path, second), "unrelated to another repository's generation counter");
     }
 
     #[test]

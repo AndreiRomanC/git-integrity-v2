@@ -480,9 +480,20 @@ document.addEventListener('drop', (e) => {
   });
 });
 
+const updatePublishIndicatorGuard = createRequestGuard();
 async function updatePublishIndicator() {
   if (!invoke || !state.repository) return;
-  try { state.remotes = await invoke('list_remotes', { repositoryPath: state.repository.path }); const remote = state.remotes[0]?.name, branch = state.repository.current_branch; if (!remote || !branch) { refs.publishBadge.textContent = '—'; refs.publishSubtitle.textContent = 'No remote or detached HEAD'; return; } const info = await invoke('publish_status', { repositoryPath: state.repository.path, branch, remote }); refs.publishBadge.textContent = info.commits.length; refs.publishSubtitle.textContent = info.commits.length ? `${info.commits.length} commit${info.commits.length === 1 ? '' : 's'} not on ${remote}` : 'Everything is on the server'; } catch (_) { refs.publishBadge.textContent = '!'; refs.publishSubtitle.textContent = 'Cannot compare with server branch'; }
+  const stillCurrent = updatePublishIndicatorGuard();
+  try {
+    state.remotes = await invoke('list_remotes', { repositoryPath: state.repository.path });
+    if (!stillCurrent()) return;
+    const remote = state.remotes[0]?.name, branch = state.repository.current_branch;
+    if (!remote || !branch) { refs.publishBadge.textContent = '—'; refs.publishSubtitle.textContent = 'No remote or detached HEAD'; return; }
+    const info = await invoke('publish_status', { repositoryPath: state.repository.path, branch, remote });
+    if (!stillCurrent()) return;
+    refs.publishBadge.textContent = info.commits.length;
+    refs.publishSubtitle.textContent = info.commits.length ? `${info.commits.length} commit${info.commits.length === 1 ? '' : 's'} not on ${remote}` : 'Everything is on the server';
+  } catch (_) { if (stillCurrent()) { refs.publishBadge.textContent = '!'; refs.publishSubtitle.textContent = 'Cannot compare with server branch'; } }
 }
 
 // Never displays the literal string "HEAD" as if it were a branch name —
@@ -537,7 +548,8 @@ function render() {
   // Remotes view, none of which were even on screen. Only the view that's
   // actually active gets rebuilt now; switching to one calls render() again
   // right after anyway, which builds it fresh at that point.
-  renderBranches(); renderExplorer();
+  renderBranches();
+  if (state.view === 'explorer') renderExplorer();
   if (state.view === 'commander') renderCommander();
   if (state.view === 'graph') renderGraph();
   if (state.view === 'remotes') renderRemotes();
@@ -583,20 +595,29 @@ function renderCommander() {
   const focused = refs.commanderRows.querySelector('.commander-row.focused'); if (focused) requestAnimationFrame(() => focused.scrollIntoView({ block: 'center' }));
 }
 
+const openCommanderDirectoryGuard = createRequestGuard();
 async function openCommanderDirectory(path) {
   if (!state.remoteRef) { status('No remote-tracking branch is available. Fetch the repository first.', 'error'); return; }
   state.commanderPath = path; refs.commanderRows.innerHTML = '<div class="loading-row"><i class="spinner"></i>Comparing local and remote…</div>';
+  // Captured *after* commanderPath/view are updated, so the snapshot reflects
+  // the folder this call is actually for.
+  const stillCurrent = openCommanderDirectoryGuard();
   if (!invoke) { state.commanderRows = previewCommanderRows(); render(); return; }
-  try { const result = await invoke('compare_remote_directory', { repositoryPath: state.repository.path, relativePath: path, remoteRef: state.remoteRef }); state.commanderRows = result.rows; render(); status(`Compared with ${state.remoteRef.slice(0, 40)}`); }
-  catch (error) { status(String(error), 'error'); refs.commanderRows.innerHTML = `<div class="loading-row">${esc(String(error))}</div>`; }
+  try {
+    const result = await invoke('compare_remote_directory', { repositoryPath: state.repository.path, relativePath: path, remoteRef: state.remoteRef });
+    if (!stillCurrent()) return;
+    state.commanderRows = result.rows; render(); status(`Compared with ${state.remoteRef.slice(0, 40)}`);
+  } catch (error) { if (stillCurrent()) { status(String(error), 'error'); refs.commanderRows.innerHTML = `<div class="loading-row">${esc(String(error))}</div>`; } }
 }
 
 function previewCommanderRows() {
   return previewData.entries.map((entry, index) => ({ name: entry.name, relative_path: entry.relative_path, local: index === 2 ? null : entry, remote: index === 5 ? null : { ...entry, size: index === 3 ? 1720 : entry.size }, status: index === 5 ? 'local-only' : index === 3 ? 'modified' : index === 2 ? 'remote-only' : 'same' }));
 }
 
+const openFileCompareGuard = createRequestGuard();
 async function openFileCompare(row) {
   state.comparingRow = row;
+  const stillCurrent = openFileCompareGuard();
   const localMissing = !row.local; const remoteMissing = !row.remote;
   refs.compareTitle.textContent = row.name;
   refs.compareSubtitle.textContent = localMissing ? `Only exists on ${state.remoteRef} — not fetched locally yet` : remoteMissing ? `Only exists locally — not on ${state.remoteRef}` : `Local workspace compared with ${state.remoteRef}`;
@@ -606,8 +627,11 @@ async function openFileCompare(row) {
   $('#compareStage').disabled = localMissing; $('#compareUnstage').disabled = localMissing; $('#compareRestoreHead').disabled = localMissing; $('#compareRestoreRemote').disabled = remoteMissing;
   refs.compareDialog.showModal();
   if (!invoke) { renderComparisonContents('version = "0.2.0"\nfeatures = ["local"]', 'version = "0.1.0"\nfeatures = []'); return; }
-  try { const comparison = await invoke('compare_file_contents', { repositoryPath: state.repository.path, relativePath: row.relative_path, remoteRef: state.remoteRef }); renderComparisonContents(comparison.local_content || (localMissing ? '(file does not exist locally)' : ''), comparison.remote_content); }
-  catch (error) { refs.localCompare.textContent = String(error); refs.remoteCompare.textContent = ''; }
+  try {
+    const comparison = await invoke('compare_file_contents', { repositoryPath: state.repository.path, relativePath: row.relative_path, remoteRef: state.remoteRef });
+    if (!stillCurrent() || state.comparingRow !== row) return; // a newer file's compare (same guard) or the dialog moved on
+    renderComparisonContents(comparison.local_content || (localMissing ? '(file does not exist locally)' : ''), comparison.remote_content);
+  } catch (error) { if (stillCurrent() && state.comparingRow === row) { refs.localCompare.textContent = String(error); refs.remoteCompare.textContent = ''; } }
 }
 
 function setCompareActionStatus(message, kind = '') { const node = $('#compareActionStatus'); node.textContent = message; node.className = `compare-status-line ${kind}`.trim(); }
@@ -843,6 +867,41 @@ function jsPerfLog(label, elapsedMs) { if (invoke) invoke('frontend_perf_log', {
 // on disk, use just the last path segment (the folder/repo name) instead.
 function anonymizeForLog(path) { if (!path) return '(none)'; return path.split(/[\\/]/).filter(Boolean).pop() || '(root)'; }
 
+// The same staleness-guard idiom already used for Explorer folder loads
+// (explorerRequestSeq below), generalized for every other async UI load
+// whose result can outlive the context it was requested for. Call the
+// returned begin() synchronously, before the first await — it captures a
+// generation number *and* a snapshot of the identity fields a stale
+// response must never be applied across (repository, submodule, folder,
+// branch); call the function IT returns (stillCurrent()) after every await,
+// before touching state or the DOM. Each caller keeps its own instance (a
+// module-level `const xGuard = createRequestGuard();`) so one loader's
+// requests never interfere with another's, and a *newer* call through the
+// same instance invalidates an older one even if the identity fields
+// happen to still match (a duplicate click, a poll firing again before the
+// previous one returned).
+function createRequestGuard() {
+  let generation = 0;
+  function snapshot() {
+    const graphRepo = state.submoduleGraph ? state.submoduleGraph.repository : state.repository;
+    return {
+      repository: state.repository?.path || null,
+      submodule: state.submoduleGraph?.repository?.path || null,
+      folder: state.view === 'commander' ? state.commanderPath : state.currentPath,
+      branch: graphRepo?.current_branch || null,
+    };
+  }
+  return function begin() {
+    const mine = ++generation;
+    const context = snapshot();
+    return function stillCurrent() {
+      if (mine !== generation) return false;
+      const now = snapshot();
+      return context.repository === now.repository && context.submodule === now.submodule && context.folder === now.folder && context.branch === now.branch;
+    };
+  };
+}
+
 let explorerRequestSeq = 0;
 // Submodules this session has already confirmed have a warm, current status
 // snapshot on the backend — either because openDirectory's own background
@@ -981,8 +1040,10 @@ async function openDirectoryFast(path) {
   await paintDirectoryFast(path, requestId);
 }
 
+const openSubmoduleMenuGuard = createRequestGuard();
 async function openSubmoduleMenu(entry, x, y) {
   submoduleMenuEntry = entry;
+  const stillCurrent = openSubmoduleMenuGuard();
   refs.submoduleMenu.hidden = false;
   refs.submoduleMenu.style.left = `${Math.min(x, innerWidth - 460)}px`;
   refs.submoduleMenu.style.top = `${Math.min(y, innerHeight - 590)}px`;
@@ -1000,8 +1061,11 @@ async function openSubmoduleMenu(entry, x, y) {
       { name: 'bd51e40', revision: 'bd51e40ca112', kind: 'commit', current: false, subject: 'Release configuration', author: 'Maria Ionescu', date: '2026-08-12' }
     ] }; renderSubmoduleVersions(); return;
   }
-  try { submoduleMenuData = await invoke('submodule_versions', { repositoryPath: state.repository.path, relativePath: entry.relative_path }); renderSubmoduleVersions(); }
-  catch (error) { refs.submoduleVersions.innerHTML = `<div class="version-loading">${esc(String(error))}</div>`; }
+  try {
+    const data = await invoke('submodule_versions', { repositoryPath: state.repository.path, relativePath: entry.relative_path });
+    if (!stillCurrent() || submoduleMenuEntry !== entry) return; // a newer submodule's menu (same guard), or this one was closed/reopened elsewhere
+    submoduleMenuData = data; renderSubmoduleVersions();
+  } catch (error) { if (stillCurrent() && submoduleMenuEntry === entry) refs.submoduleVersions.innerHTML = `<div class="version-loading">${esc(String(error))}</div>`; }
 }
 
 function renderSubmoduleVersions() {
@@ -1115,11 +1179,17 @@ async function commitSelectedScope(event) {
   finally { refs.confirmScopeCommit.textContent = 'Commit selection'; refs.confirmScopeCommit.disabled = !refs.scopeCommitMessage.value.trim(); }
 }
 
+const showSelectedHistoryGuard = createRequestGuard();
 async function showSelectedHistory() {
   const scope = selectedScope();
+  const stillCurrent = showSelectedHistoryGuard();
   if (!invoke) { state.historyScope = scope.name; state.view = 'graph'; render(); return; }
-  try { status(`Loading history for ${scope.name}…`, 'busy'); state.commits = await invoke('path_history', { repositoryPath: state.repository.path, relativePath: scope.path }); state.historyScope = scope.name; state.view = 'graph'; refs.search.value = ''; render(); status(`${state.commits.length} commits for ${scope.name}`); }
-  catch (error) { handleError(error); }
+  try {
+    status(`Loading history for ${scope.name}…`, 'busy');
+    const commits = await invoke('path_history', { repositoryPath: state.repository.path, relativePath: scope.path });
+    if (!stillCurrent()) return; // repository/folder/branch changed, or a newer history request superseded this one
+    state.commits = commits; state.historyScope = scope.name; state.view = 'graph'; refs.search.value = ''; render(); status(`${state.commits.length} commits for ${scope.name}`);
+  } catch (error) { if (stillCurrent()) handleError(error); }
 }
 
 // "Last commit touching this path" can be a genuinely heavy history walk on
@@ -1438,10 +1508,13 @@ refs.abortMergeButton.addEventListener('click', async () => {
 
 // Detects a merge left mid-resolution (e.g. the app was closed before finishing)
 // and surfaces it via the sidebar banner so it's never silently stuck.
+const checkForMergeConflictsGuard = createRequestGuard();
 async function checkForMergeConflicts() {
   if (!invoke || !state.repository) { refs.mergeConflictsBanner.hidden = true; return; }
+  const stillCurrent = checkForMergeConflictsGuard();
   try {
     const conflicts = await invoke('list_conflicts', { repositoryPath: state.repository.path, targetPath: '' });
+    if (!stillCurrent()) return;
     refs.mergeConflictsBanner.hidden = conflicts.length === 0;
     if (conflicts.length) {
       // The same conflicted-index state can come from a real merge or from a
@@ -1449,11 +1522,12 @@ async function checkForMergeConflicts() {
       // steps (a merge commit vs. nothing at all), so which one this banner
       // means has to be checked, not assumed.
       const inMerge = await invoke('merge_in_progress', { repositoryPath: state.repository.path, targetPath: '' }).catch(() => true);
+      if (!stillCurrent()) return;
       state.pendingConflictsKind = inMerge ? 'merge' : 'stash';
       refs.mergeConflictsSubtitle.textContent = `${conflicts.length} file${conflicts.length === 1 ? '' : 's'} to resolve${inMerge ? '' : ' (from a stash)'}`;
     }
     state.pendingMainConflicts = conflicts;
-  } catch { refs.mergeConflictsBanner.hidden = true; }
+  } catch { if (stillCurrent()) refs.mergeConflictsBanner.hidden = true; }
 }
 
 refs.mergeConflictsBanner.addEventListener('click', () => openConflictsDialog({ ...mergeTargetForMain(), kind: state.pendingConflictsKind || 'merge' }, state.pendingMainConflicts || []));
@@ -1772,7 +1846,16 @@ function renderRemotes() {
   refs.remoteCards.querySelectorAll('[data-fetch-remote]').forEach(button => button.addEventListener('click', () => fetchRemote(button.dataset.fetchRemote)));
 }
 
-async function loadRemotes() { state.view = 'remotes'; refs.search.value = ''; clearDetails('Remote configuration'); if (invoke) { try { state.remotes = await invoke('list_remotes', { repositoryPath: state.repository.path }); } catch (error) { handleError(error); } } else state.remotes = [{ name: 'origin', fetch_url: 'git@example.com:vehicle-control.git', push_url: 'git@example.com:vehicle-control.git' }]; render(); }
+const loadRemotesGuard = createRequestGuard();
+async function loadRemotes() {
+  state.view = 'remotes'; refs.search.value = ''; clearDetails('Remote configuration');
+  const stillCurrent = loadRemotesGuard();
+  if (invoke) {
+    try { const remotes = await invoke('list_remotes', { repositoryPath: state.repository.path }); if (!stillCurrent()) return; state.remotes = remotes; }
+    catch (error) { if (stillCurrent()) handleError(error); }
+  } else state.remotes = [{ name: 'origin', fetch_url: 'git@example.com:vehicle-control.git', push_url: 'git@example.com:vehicle-control.git' }];
+  if (stillCurrent()) render();
+}
 async function fetchRemote(name) { try { status(`Fetching ${name}…`, 'busy'); await invoke('fetch_remote', { repositoryPath: state.repository.path, remote: name }); await loadRepository(state.repository.path, { keepPath: true }); await loadRemotes(); status(`${name} updated`); } catch (error) { handleError(error); } }
 async function fetchAllRemotes() {
   if (!state.repository) return;
@@ -2496,12 +2579,16 @@ function updatePublishSummary() {
   $('#confirmPublish').disabled = !willPushCount;
 }
 
+const refreshPublishGuard = createRequestGuard();
 async function refreshPublish() {
   const branch = refs.publishBranch.value, remote = refs.publishRemote.value;
   state.publishUpto = null;
   if (!branch || !remote) { refs.publishCommits.innerHTML = '<div class="publish-empty">Configure a remote before publishing.</div>'; refs.publishSummary.textContent = 'Nothing to publish'; $('#confirmPublish').disabled = true; return; }
+  const stillCurrent = refreshPublishGuard();
   refs.publishDestination.textContent = `${branch} → ${remote}/${branch}`; refs.publishCommits.innerHTML = '<div class="loading-row"><i class="spinner"></i>Checking server state…</div>';
-  if (!invoke) state.publish = { branch, remote, commits: previewData.commits.slice(0, 2) }; else state.publish = await invoke('publish_status', { repositoryPath: state.repository.path, branch, remote });
+  const publish = invoke ? await invoke('publish_status', { repositoryPath: state.repository.path, branch, remote }) : { branch, remote, commits: previewData.commits.slice(0, 2) };
+  if (!stillCurrent() || refs.publishBranch.value !== branch || refs.publishRemote.value !== remote) return; // repository changed, or the dialog's own selection moved on
+  state.publish = publish;
   renderPublishCommits();
   refs.publishBadge.textContent = state.publish.commits.length; refs.publishSubtitle.textContent = state.publish.commits.length ? `${state.publish.commits.length} local commits not on ${remote}` : 'Everything is on the server';
   updatePublishSummary();
@@ -2839,11 +2926,17 @@ renderCommitMessageHistory();
 // is already shown with whatever data was already there (never blocks
 // opening it), and fails silently — this is a best-effort background
 // top-up, not a user-initiated action worth its own error toast.
+const refreshChangesLightweightGuard = createRequestGuard();
 async function refreshChangesLightweight() {
   if (!invoke || !state.repository) return;
+  const repositoryPath = state.repository.path;
+  const stillCurrent = refreshChangesLightweightGuard();
   try {
-    const changes = await invoke('refresh_status', { repositoryPath: state.repository.path });
-    if (state.repository) { state.changes = changes; updateChangeBadge(); if (refs.changesDrawer.classList.contains('open')) renderChanges(); }
+    const changes = await invoke('refresh_status', { repositoryPath });
+    // state.repository.path itself (not just stillCurrent()) — a different
+    // repository could have been opened at the very same path a stale
+    // response would otherwise still match on identity alone.
+    if (stillCurrent() && state.repository?.path === repositoryPath) { state.changes = changes; updateChangeBadge(); if (refs.changesDrawer.classList.contains('open')) renderChanges(); }
   } catch { /* best-effort — a manual Refresh remains the explicit fallback */ }
 }
 
@@ -3613,6 +3706,7 @@ document.addEventListener('keydown', (e) => {
 // without a separate visibility flag to keep in sync.
 const PR_STATE_LABELS = {
   loading: 'Checking pull request status…',
+  superseded: 'Checking pull request status…', // a newer check already superseded this one; about to be replaced
   no_remote: 'No remote configured for this repository.',
   detached_head: 'HEAD is detached — not on a branch, so there is no branch to check for a pull request.',
   no_branch: 'No branch is currently checked out.',
@@ -3621,6 +3715,7 @@ const PR_STATE_LABELS = {
   api_error: null,
   no_open_pr: null, // built from result.branch + result.queried_repo
   no_upstream: null,
+  partial_result: null, // built the same way, with an "incomplete" note
 };
 const PR_LIFECYCLE_LABEL = { draft: 'Draft', open: 'Open', merged: 'Merged', closed: 'Closed' };
 const PR_MERGEABLE_LABEL = { mergeable: 'Mergeable', conflicting: 'Conflicting', calculating: 'Calculating…', unknown: 'Unknown' };
@@ -3657,10 +3752,11 @@ function createPrStatusPanel(root, options) {
 
   function renderState(result) {
     const ctx = contextHeaderHtml();
-    if (result.state === 'loading') { root.innerHTML = ctx + '<div class="pr-status-loading"><i class="spinner"></i>Checking pull request status…</div>'; return; }
+    if (result.state === 'loading' || result.state === 'superseded') { root.innerHTML = ctx + '<div class="pr-status-loading"><i class="spinner"></i>Checking pull request status…</div>'; return; }
     if (result.state === 'ok' && result.pull_requests.length) {
+      const partialNote = result.partial ? '<div class="pr-status-partial">Not every related repository could be checked — there may be more.</div>' : '';
       const heading = result.pull_requests.length > 1 ? `<div class="pr-status-count">${result.pull_requests.length} open pull requests for <code>${esc(result.branch || '')}</code></div>` : '';
-      root.innerHTML = ctx + heading + result.pull_requests.map(prCardHtml).join('');
+      root.innerHTML = ctx + partialNote + heading + result.pull_requests.map(prCardHtml).join('');
       return;
     }
     const message = PR_STATE_LABELS[result.state] || result.detail || 'Pull request status unavailable.';
@@ -3669,8 +3765,9 @@ function createPrStatusPanel(root, options) {
     let detail;
     if (result.state === 'no_open_pr') detail = `No open pull request for ${branchCode}${where}.`;
     else if (result.state === 'no_upstream') detail = `No open pull request for ${branchCode}${where}. This branch has no upstream set — push it and set an upstream so it can be matched to a PR.`;
+    else if (result.state === 'partial_result') detail = `No open pull request found for ${branchCode}${where} — but not every related repository could be checked, so this may be incomplete.`;
     else detail = esc(message);
-    const retryable = ['api_error', 'auth_missing'].includes(result.state);
+    const retryable = ['api_error', 'auth_missing', 'partial_result'].includes(result.state);
     root.innerHTML = ctx + `<div class="pr-status-empty pr-status-${esc(result.state)}">${detail}${retryable ? '<button class="pr-status-retry" id="prStatusRetry">Retry</button>' : ''}</div>`;
     if (retryable) root.querySelector('#prStatusRetry')?.addEventListener('click', load);
   }
