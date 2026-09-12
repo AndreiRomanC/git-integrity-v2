@@ -1290,9 +1290,30 @@ fn is_generated_polarion_url(url: &str) -> bool {
     id_project == project && !id_number.is_empty() && id_number.chars().all(|value| value.is_ascii_digit())
 }
 
+// Matches only the exact shape `gh pr list --json url` itself returns for a
+// PullRequestSummary.url (see pr_summary_from_json) — e.g.
+// "https://github.com/owner/repo/pull/42", or the same shape against a GitHub
+// Enterprise host (pr_status already queries whichever host the remote
+// resolved to). Not a fixed-host allowlist like Polarion's, since that host
+// varies — the shape is what's checked instead: this is data that came back
+// from GitHub's own API for a repo this app itself queried, not text a user
+// typed in, but it still reaches a shell command as an argument the same way
+// the Polarion link does, so it gets the same strict, no-shell-metacharacters
+// treatment rather than being waved through as "already trusted".
+fn is_generated_pull_request_url(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("https://") else { return false };
+    let Some((host, path)) = rest.split_once('/') else { return false };
+    if host.is_empty() || !host.chars().all(|value| value.is_ascii_alphanumeric() || value == '.' || value == '-') { return false; }
+    let is_identifier = |value: &str| !value.is_empty() && value.chars().all(|value| value.is_ascii_alphanumeric() || value == '.' || value == '-' || value == '_');
+    match path.split('/').collect::<Vec<_>>().as_slice() {
+        [owner, repo, "pull", number] => is_identifier(owner) && is_identifier(repo) && !number.is_empty() && number.chars().all(|value| value.is_ascii_digit()),
+        _ => false,
+    }
+}
+
 #[tauri::command]
 pub fn open_external_url(url: String) -> Result<(), String> {
-    if !is_generated_polarion_url(&url) { return Err("Only generated Polarion links can be opened".into()); }
+    if !is_generated_polarion_url(&url) && !is_generated_pull_request_url(&url) { return Err("Only generated Polarion or pull request links can be opened".into()); }
     #[cfg(target_os = "macos")]
     let status = Command::new("open").arg(&url).status();
     #[cfg(target_os = "windows")]
@@ -8667,6 +8688,28 @@ mod tests {
         assert!(!is_generated_polarion_url("https://polarion.vitesco.io/polarion/#/project//workitem?id=-21610"));
         assert!(!is_generated_polarion_url("javascript:alert(1)"));
         assert!(!is_generated_polarion_url("https://polarion.vitesco.io/polarion/#/project/OMBMS/workitem?id=OMBMS-21610\" & calc.exe"));
+    }
+
+    #[test]
+    fn pull_request_url_validation_accepts_generated_links_and_rejects_everything_else() {
+        // Reproduces the reported bug directly: clicking "Open pull request" on
+        // a real PR card always failed with "Only generated Polarion links can
+        // be opened" — open_external_url only ever allowlisted Polarion's own
+        // fixed host, never the shape `gh pr list --json url` actually returns.
+        assert!(is_generated_pull_request_url("https://github.com/AndreiRomanC/git-stress-small-demo/pull/1"));
+        assert!(is_generated_pull_request_url("https://github.example/eng/sw-prj-OMBMS_000U0/pull/42"), "an enterprise GitHub host must work too, not just github.com");
+
+        // Wrong scheme, wrong shape, or an attempt to smuggle a different
+        // destination or extra shell arguments must all be rejected — this
+        // reaches a shell command exactly like the Polarion link does.
+        assert!(!is_generated_pull_request_url("http://github.com/owner/repo/pull/1"), "must require https");
+        assert!(!is_generated_pull_request_url("https://github.com/owner/repo/pulls/1"), "must be the singular /pull/ path GitHub actually uses");
+        assert!(!is_generated_pull_request_url("https://github.com/owner/repo/pull/"), "PR number must not be empty");
+        assert!(!is_generated_pull_request_url("https://github.com/owner/repo/pull/1x"), "PR number must be all digits");
+        assert!(!is_generated_pull_request_url("https://github.com/owner/repo/pull/1/files"), "no trailing path beyond the PR number");
+        assert!(!is_generated_pull_request_url("https://github.com/owner/repo"), "a bare repo URL is not a PR link");
+        assert!(!is_generated_pull_request_url("javascript:alert(1)"));
+        assert!(!is_generated_pull_request_url("https://github.com/owner/repo/pull/1\" & calc.exe"));
     }
 
     #[test]
