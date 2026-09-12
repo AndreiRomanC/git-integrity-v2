@@ -28,6 +28,34 @@ function groupSubmoduleBranchVersions(versions) {
   return { local, remoteOnly };
 }
 
+// Pure row renderer: all branch/tag data is supplied by the one existing
+// submodule_versions response. Keeping this helper free of invoke/fetch/Git
+// calls makes the "show the pointed-to commit" feature effectively free per
+// row and lets the exact display contract be covered by the Node tests.
+function escapeSubmoduleVersionHtml(value = '') {
+  return String(value).replace(/[&<>"']/g, char => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[char]));
+}
+
+function submoduleVersionRowHtml(item) {
+  const esc = escapeSubmoduleVersionHtml;
+  const kindLabel = { branch: 'BRANCH', remote: 'REMOTE BRANCH', tag: 'TAG', commit: 'COMMIT (detached)' };
+  const symbol = { commit: '●', tag: '◆' };
+  const revision = String(item.revision || '');
+  const upstreamState = item.kind === 'branch' && item.upstream
+    ? `<span class="version-upstream-state">⇄ ${item.ahead || 0}↑ ${item.behind || 0}↓ · ${esc(item.upstream)}</span>`
+    : item.kind === 'branch' ? '<span class="version-upstream-state version-no-upstream">no upstream</span>' : '';
+  const tagContext = item.kind === 'tag'
+    ? `<span class="version-attached-branch">${item.attached_branch ? `on ⑂ ${esc(item.attached_branch)}` : 'no branch here (detached)'}</span>`
+    : upstreamState;
+  return `<button class="version-row ${item.current ? 'current' : ''}" data-revision="${esc(revision)}" data-version-kind="${esc(item.kind)}" data-name="${esc(item.name)}">
+    <span class="version-symbol">${symbol[item.kind] || '⑂'}</span>
+    <span class="version-sha"><code>${esc(revision.slice(0, 8))}</code><span class="version-copy-sha" role="button" tabindex="0" title="Copy full SHA" data-copy-sha="${esc(revision)}">⧉</span></span>
+    <span class="version-name">${esc(item.name)}<b class="version-kind-badge">${esc(kindLabel[item.kind] || item.kind)}</b>${tagContext}</span>
+    <span class="version-copy"><span class="version-subject">${esc(item.subject)}</span><span class="version-meta">${esc(item.author)} · ${esc(item.date)}</span></span>
+    ${item.current ? '<span class="current-label">CURRENT</span>' : ''}
+  </button>`;
+}
+
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { groupSubmoduleBranchVersions };
+  module.exports = { groupSubmoduleBranchVersions, submoduleVersionRowHtml };
 }

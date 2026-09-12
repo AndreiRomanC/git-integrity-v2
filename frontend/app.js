@@ -1112,35 +1112,14 @@ async function openSubmoduleMenu(entry, x, y) {
   } catch (error) { if (stillCurrent() && submoduleMenuEntry === entry) refs.submoduleVersions.innerHTML = `<div class="version-loading">${esc(String(error))}</div>`; }
 }
 
-// Submodule-branch-selector report, point 3: every row now always shows its
-// own short SHA (in a stable-width column — see the CSS — so the rest of the
-// row stays aligned) plus a Copy SHA action, and a local branch with a
-// configured upstream shows its ahead/behind state inline. `versionRowHtml`
-// is shared by every section below so all of them render identically.
-function versionRowHtml(item, kindLabel, symbol) {
-  const upstreamState = item.kind === 'branch' && item.upstream
-    ? `<span class="version-upstream-state">⇄ ${item.ahead || 0}↑ ${item.behind || 0}↓ · ${esc(item.upstream)}</span>`
-    : item.kind === 'branch' ? '<span class="version-upstream-state version-no-upstream">no upstream</span>' : '';
-  return `<button class="version-row ${item.current ? 'current' : ''}" data-revision="${esc(item.revision)}" data-version-kind="${esc(item.kind)}" data-name="${esc(item.name)}">
-    <span class="version-symbol">${symbol[item.kind] || '⑂'}</span>
-    <span class="version-sha"><code>${esc(item.revision.slice(0, 8))}</code><span class="version-copy-sha" role="button" tabindex="0" title="Copy full SHA" data-copy-sha="${esc(item.revision)}">⧉</span></span>
-    <span class="version-name">${esc(item.name)}<b class="version-kind-badge">${esc(kindLabel[item.kind] || item.kind)}</b>${item.kind === 'tag' ? `<span class="version-attached-branch">${item.attached_branch ? `on ⑂ ${esc(item.attached_branch)}` : 'no branch here (detached)'}</span>` : upstreamState}</span>
-    <span class="version-copy"><span class="version-subject">${esc(item.subject)}</span><span class="version-meta">${esc(item.author)} · ${esc(item.date)}</span></span>
-    ${item.current ? '<span class="current-label">CURRENT</span>' : ''}
-  </button>`;
-}
-
 function renderSubmoduleVersions() {
   if (!submoduleMenuData) return;
-  refs.currentSubmoduleVersion.textContent = `${submoduleMenuData.current_branch || 'detached'} · ${submoduleMenuData.current_revision.slice(0, 8)}`;
+  refs.currentSubmoduleVersion.textContent = `${submoduleMenuData.current_branch || 'detached'} @ ${submoduleMenuData.current_revision.slice(0, 8)}`;
   const newVersionButton = $('#submoduleMenuNewBranch');
   newVersionButton.textContent = versionFilter === 'tag' ? '＋ New tag…' : '＋ New branch…';
   newVersionButton.title = versionFilter === 'tag' ? 'Create a new tag in this submodule, at its current commit' : 'Create a new branch in this submodule, from its current commit';
   const query = refs.submoduleVersionSearch.value.trim().toLowerCase();
   const matches = item => !query || `${item.name} ${item.attached_branch || ''} ${item.upstream || ''}`.toLowerCase().includes(query);
-  const kindLabel = { branch: 'BRANCH', remote: 'REMOTE BRANCH', tag: 'TAG', commit: 'COMMIT (detached)' };
-  const symbol = { commit: '●', tag: '◆' };
-
   let html;
   if (versionFilter === 'branch') {
     // Point 3: a local branch and its own tracking remote are one thing, not
@@ -1149,12 +1128,12 @@ function renderSubmoduleVersions() {
     const { local, remoteOnly } = groupSubmoduleBranchVersions(submoduleMenuData.versions);
     const localRows = local.filter(matches);
     const remoteRows = remoteOnly.filter(matches);
-    html = localRows.map(item => versionRowHtml(item, kindLabel, symbol)).join('')
-      + (remoteRows.length ? `<div class="version-section-heading">REMOTE ONLY</div>${remoteRows.map(item => versionRowHtml(item, kindLabel, symbol)).join('')}` : '')
+    html = localRows.map(submoduleVersionRowHtml).join('')
+      + (remoteRows.length ? `<div class="version-section-heading">REMOTE ONLY</div>${remoteRows.map(submoduleVersionRowHtml).join('')}` : '')
       || `<div class="version-loading">${query ? 'No matches' : 'No branches found'}</div>`;
   } else {
     const versions = submoduleMenuData.versions.filter(item => versionFilter === 'tag' ? item.kind === 'tag' : item.kind === 'commit').filter(matches);
-    html = versions.map(item => versionRowHtml(item, kindLabel, symbol)).join('') || `<div class="version-loading">${query ? 'No matches' : versionFilter === 'tag' ? 'No tags in this submodule' : 'No versions found'}</div>`;
+    html = versions.map(submoduleVersionRowHtml).join('') || `<div class="version-loading">${query ? 'No matches' : versionFilter === 'tag' ? 'No tags in this submodule' : 'No versions found'}</div>`;
   }
   refs.submoduleVersions.innerHTML = html;
   refs.submoduleVersions.querySelectorAll('[data-revision]').forEach(row => row.addEventListener('click', event => {

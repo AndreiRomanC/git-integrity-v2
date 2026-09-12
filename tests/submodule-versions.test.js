@@ -6,7 +6,7 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { groupSubmoduleBranchVersions } = require('../frontend/submodule-versions.js');
+const { groupSubmoduleBranchVersions, submoduleVersionRowHtml } = require('../frontend/submodule-versions.js');
 
 function branch(name, upstream) { return { name, kind: 'branch', upstream: upstream || null }; }
 function remote(name) { return { name, kind: 'remote' }; }
@@ -66,4 +66,35 @@ test('tags and commits are ignored entirely — this only ever groups branch/rem
 test('tolerates a missing/undefined list without throwing', () => {
   assert.deepEqual(groupSubmoduleBranchVersions(undefined), { local: [], remoteOnly: [] });
   assert.deepEqual(groupSubmoduleBranchVersions([]), { local: [], remoteOnly: [] });
+});
+
+test('a branch row shows the exact tip SHA and subject from the existing response', () => {
+  const html = submoduleVersionRowHtml({ name: 'develop', kind: 'branch', revision: 'a5cf438372b9568c', subject: 'test32', author: 'Andrei', date: '2026-09-12', current: true, upstream: 'origin/develop', ahead: 1, behind: 0 });
+  assert.match(html, /<code>a5cf4383<\/code>/);
+  assert.match(html, /test32/);
+  assert.match(html, /origin\/develop/);
+});
+
+test('a tag row shows the target commit SHA and subject', () => {
+  const html = submoduleVersionRowHtml({ name: 'v1.0.0', kind: 'tag', revision: '72a991227b54aaaf', subject: 'Release desktop UI', author: 'Andrei', date: '2026-09-12', current: false, attached_branch: 'main' });
+  assert.match(html, /v1\.0\.0/);
+  assert.match(html, /<code>72a99122<\/code>/);
+  assert.match(html, /Release desktop UI/);
+});
+
+test('identically named refs from different submodules keep their own SHAs', () => {
+  const first = submoduleVersionRowHtml({ name: 'main', kind: 'branch', revision: '11111111aaaaaaaa', subject: 'First module', author: 'A', date: '2026-09-12' });
+  const second = submoduleVersionRowHtml({ name: 'main', kind: 'branch', revision: '22222222bbbbbbbb', subject: 'Second module', author: 'B', date: '2026-09-12' });
+  assert.match(first, /11111111/);
+  assert.doesNotMatch(first, /22222222/);
+  assert.match(second, /22222222/);
+  assert.doesNotMatch(second, /11111111/);
+});
+
+test('row rendering is pure and does not invoke a backend loader', () => {
+  let requests = 0;
+  global.invoke = () => { requests += 1; };
+  submoduleVersionRowHtml({ name: 'main', kind: 'branch', revision: 'abcdef1234567890', subject: 'No I/O', author: 'A', date: '2026-09-12' });
+  delete global.invoke;
+  assert.equal(requests, 0);
 });
