@@ -56,6 +56,24 @@ function submoduleVersionRowHtml(item) {
   </button>`;
 }
 
+// Keep Push-button eligibility independent from the number of displayed
+// commits. Creating a new remote branch can legitimately transfer no new
+// objects, and the backend may still safely allow the ref creation.
+function submodulePushDialogState(preview) {
+  const commits = Array.isArray(preview?.commits) ? preview.commits : [];
+  const willCreate = Boolean(preview?.will_create_remote_branch);
+  const branch = String(preview?.branch || 'branch');
+  const revision = String(preview?.local_sha || '').slice(0, 8);
+  return {
+    commits,
+    canPush: preview?.can_push === true,
+    summary: willCreate ? `Create origin/${branch}` : `${commits.length} commit${commits.length === 1 ? '' : 's'} to push`,
+    emptyMessage: willCreate
+      ? `The remote branch does not exist yet. Push will create origin/${branch} at ${revision}.`
+      : String(preview?.blocked_reason || 'Nothing to push — already up to date.'),
+  };
+}
+
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { groupSubmoduleBranchVersions, submoduleVersionRowHtml };
+  module.exports = { groupSubmoduleBranchVersions, submoduleVersionRowHtml, submodulePushDialogState };
 }

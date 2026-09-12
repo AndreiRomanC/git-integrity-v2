@@ -6,7 +6,7 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { groupSubmoduleBranchVersions, submoduleVersionRowHtml } = require('../frontend/submodule-versions.js');
+const { groupSubmoduleBranchVersions, submoduleVersionRowHtml, submodulePushDialogState } = require('../frontend/submodule-versions.js');
 
 function branch(name, upstream) { return { name, kind: 'branch', upstream: upstream || null }; }
 function remote(name) { return { name, kind: 'remote' }; }
@@ -97,4 +97,29 @@ test('row rendering is pure and does not invoke a backend loader', () => {
   submoduleVersionRowHtml({ name: 'main', kind: 'branch', revision: 'abcdef1234567890', subject: 'No I/O', author: 'A', date: '2026-09-12' });
   delete global.invoke;
   assert.equal(requests, 0);
+});
+
+test('push stays enabled when an existing origin branch is ahead but has no configured upstream', () => {
+  const state = submodulePushDialogState({
+    branch: 'develop', local_sha: '2ab9a609e2b7', will_create_remote_branch: false,
+    ahead: 2, behind: 0, can_push: true, blocked_reason: null,
+    commits: [{ id: 'a5cf4383', subject: 'test32' }, { id: '2ab9a609', subject: 'test 32' }],
+  });
+  assert.equal(state.canPush, true);
+  assert.equal(state.commits.length, 2);
+  assert.equal(state.summary, '2 commits to push');
+});
+
+test('new remote branch creation is enabled even with no comparison commit list', () => {
+  const state = submodulePushDialogState({ branch: 'feature/new', local_sha: '1234567890ab', will_create_remote_branch: true, can_push: true, commits: [] });
+  assert.equal(state.canPush, true);
+  assert.equal(state.summary, 'Create origin/feature/new');
+  assert.match(state.emptyMessage, /create origin\/feature\/new at 12345678/);
+});
+
+test('an up-to-date submodule keeps normal push disabled with the backend reason', () => {
+  const state = submodulePushDialogState({ branch: 'develop', local_sha: '2ab9a609', will_create_remote_branch: false, can_push: false, blocked_reason: 'Already up to date with origin/develop.', commits: [] });
+  assert.equal(state.canPush, false);
+  assert.equal(state.commits.length, 0);
+  assert.equal(state.emptyMessage, 'Already up to date with origin/develop.');
 });

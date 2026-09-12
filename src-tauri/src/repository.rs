@@ -604,7 +604,7 @@ pub struct RemoteInfo { name: String, fetch_url: String, push_url: String }
 #[derive(Serialize)]
 pub struct TextFile { relative_path: String, content: String }
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 pub struct PublishCommit { id: String, subject: String, author: String, date: String }
 
 #[derive(Serialize)]
@@ -5210,6 +5210,17 @@ pub struct SubmodulePushPreview {
     // same-named ref on origin yet — pushing will create a brand new remote
     // branch, not update an existing one.
     will_create_remote_branch: bool,
+    // Built from the same comparison target as `ahead`/`behind`. Keeping the
+    // list in this response prevents the frontend from combining this preview
+    // with entry_details, whose generic "unpushed" calculation intentionally
+    // requires a configured upstream and therefore cannot describe a first
+    // `git push -u` to an already-existing origin/<branch>.
+    commits: Vec<PublishCommit>,
+    // Push eligibility is a backend decision, not `commits.len() > 0`: a new
+    // remote branch can be created even when every object is already present
+    // through another ref, while a diverged branch must not offer normal push.
+    can_push: bool,
+    blocked_reason: Option<String>,
 }
 
 #[tauri::command]
@@ -5240,10 +5251,39 @@ fn push_submodule_preview_inner(repository_path: String, relative_path: String) 
         Some(remote_oid) => repo.graph_ahead_behind(local_target, remote_oid).map_err(|error| error.message().to_string())?,
         None => (0, 0),
     };
+    let commits = match remote_sha {
+        Some(remote_oid) if remote_oid != local_target => {
+            let mut walk = repo.revwalk().map_err(|error| error.message().to_string())?;
+            walk.push(local_target).map_err(|error| error.message().to_string())?;
+            walk.hide(remote_oid).map_err(|error| error.message().to_string())?;
+            let mut commits: Vec<PublishCommit> = walk.take(50).flatten().filter_map(|oid| repo.find_commit(oid).ok().map(|commit| PublishCommit {
+                id: oid.to_string(), subject: commit.summary().unwrap_or("No message").into(), author: commit.author().name().unwrap_or("Unknown").into(), date: short_date(commit.time().seconds()),
+            })).collect();
+            commits.reverse();
+            commits
+        }
+        _ => Vec::new(),
+    };
+    let destination = upstream.clone().unwrap_or_else(|| format!("origin/{branch}"));
+    let will_create_remote_branch = remote_sha.is_none();
+    let (can_push, blocked_reason) = if will_create_remote_branch {
+        (true, None)
+    } else if ahead == 0 && behind == 0 {
+        (false, Some(format!("Already up to date with {destination}.")))
+    } else if behind > 0 {
+        let message = if ahead > 0 {
+            format!("Local {branch} and {destination} have diverged ({ahead} ahead, {behind} behind). Fetch, review and merge before pushing.")
+        } else {
+            format!("Local {branch} is behind {destination} by {behind} commit{}. Pull or merge before pushing.", if behind == 1 { "" } else { "s" })
+        };
+        (false, Some(message))
+    } else {
+        (ahead > 0, None)
+    };
     Ok(SubmodulePushPreview {
         branch, local_sha: local_target.to_string(), remote_url,
-        will_create_remote_branch: remote_sha.is_none(),
-        upstream, remote_sha: remote_sha.map(|oid| oid.to_string()), ahead, behind,
+        will_create_remote_branch, upstream, remote_sha: remote_sha.map(|oid| oid.to_string()), ahead, behind,
+        commits, can_push, blocked_reason,
     })
 }
 
@@ -8078,6 +8118,69 @@ mod tests {
         assert!(!preview.will_create_remote_branch);
         assert!(preview.remote_sha.is_some(), "the upstream's tip must be resolved");
         assert_ne!(preview.remote_sha.as_deref(), Some(local_sha.as_str()), "the remote tip must be the old commit, not the new local-only one");
+        assert!(preview.can_push);
+        assert!(preview.blocked_reason.is_none());
+        assert_eq!(preview.commits.len(), 1);
+        assert_eq!(preview.commits[0].subject, "local ahead");
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn push_submodule_preview_lists_existing_origin_branch_commits_without_configured_upstream() {
+        // Exact regression: the preview used origin/develop as a fallback and
+        // correctly reported "2 ahead", while entry_details required an
+        // upstream, returned no commits, and made the frontend disable Push.
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-push-preview-no-upstream-{suffix}"));
+        let repository = base.join("main");
+        let dep_remote = base.join("dep-remote.git");
+        let dep_seed = base.join("dep-seed");
+        fs::create_dir_all(&repository).unwrap();
+        fs::create_dir_all(&dep_seed).unwrap();
+        fs::create_dir_all(&dep_remote).unwrap();
+        fs::write(repository.join("README.md"), "root").unwrap();
+        fs::write(dep_seed.join("module.txt"), "v1").unwrap();
+
+        run_git(&dep_remote, &["init", "--bare"]);
+        for path in [&repository, &dep_seed] {
+            run_git(path, &["init", "-b", "main"]);
+            run_git(path, &["config", "user.email", "test@example.com"]);
+            run_git(path, &["config", "user.name", "Test User"]);
+            run_git(path, &["add", "."]);
+            run_git(path, &["commit", "-m", "Initial"]);
+        }
+        run_git(&dep_seed, &["remote", "add", "origin", dep_remote.to_str().unwrap()]);
+        run_git(&dep_seed, &["-c", "protocol.file.allow=always", "push", "origin", "HEAD:develop"]);
+        run_git(&repository, &["-c", "protocol.file.allow=always", "submodule", "add", "-b", "develop", dep_remote.to_str().unwrap(), "vendor/dep"]);
+        run_git(&repository, &["commit", "-am", "Add dep submodule"]);
+
+        let repo_path = repository.to_string_lossy().into_owned();
+        let sub_path = repository.join("vendor/dep");
+        run_git(&sub_path, &["config", "user.email", "test@example.com"]);
+        run_git(&sub_path, &["config", "user.name", "Test User"]);
+        run_git(&sub_path, &["branch", "--unset-upstream"]);
+        fs::write(sub_path.join("module.txt"), "v2").unwrap();
+        run_git(&sub_path, &["commit", "-am", "first local commit"]);
+        fs::write(sub_path.join("module.txt"), "v3").unwrap();
+        run_git(&sub_path, &["commit", "-am", "second local commit"]);
+
+        let preview = push_submodule_preview_inner(repo_path.clone(), "vendor/dep".into()).unwrap();
+        assert_eq!(preview.branch, "develop");
+        assert_eq!(preview.upstream, None, "the fixture deliberately has no configured upstream");
+        assert!(preview.remote_sha.is_some(), "origin/develop is still a valid comparison target");
+        assert_eq!((preview.ahead, preview.behind), (2, 0));
+        assert_eq!(preview.commits.iter().map(|commit| commit.subject.as_str()).collect::<Vec<_>>(), vec!["first local commit", "second local commit"]);
+        assert!(preview.can_push, "a fast-forward push must be offered even before -u configures the upstream");
+        assert!(preview.blocked_reason.is_none());
+
+        push_submodule_inner(repo_path.clone(), "vendor/dep".into()).expect("the normal push should publish both commits and set the upstream");
+        let after = push_submodule_preview_inner(repo_path, "vendor/dep".into()).unwrap();
+        assert_eq!(after.upstream.as_deref(), Some("origin/develop"));
+        assert_eq!((after.ahead, after.behind), (0, 0));
+        assert!(after.commits.is_empty());
+        assert!(!after.can_push);
+        assert!(after.blocked_reason.as_deref().is_some_and(|message| message.contains("Already up to date")));
 
         fs::remove_dir_all(base).unwrap();
     }
@@ -8125,6 +8228,9 @@ mod tests {
         assert!(preview.will_create_remote_branch);
         assert_eq!(preview.ahead, 0, "with nothing to compare against, ahead/behind default to 0, not a misleading guess");
         assert_eq!(preview.behind, 0);
+        assert!(preview.commits.is_empty(), "there is no remote tip to compare against; branch creation is still independently allowed");
+        assert!(preview.can_push, "creating a remote branch must not depend on a non-empty comparison list");
+        assert!(preview.blocked_reason.is_none());
 
         // Push-submodule-workflow report, point 1: after a successful push,
         // the upstream must be persisted (equivalent to `git push
@@ -8134,6 +8240,8 @@ mod tests {
         let after = push_submodule_preview_inner(repo_path, "vendor/dep".into()).unwrap();
         assert_eq!(after.upstream.as_deref(), Some("origin/feature/never-pushed"), "the upstream must be persisted after a successful push, equivalent to --set-upstream");
         assert_eq!((after.ahead, after.behind), (0, 0));
+        assert!(!after.can_push);
+        assert!(after.blocked_reason.as_deref().is_some_and(|message| message.contains("Already up to date")));
         let sub_repo = Repository::open(&sub_path).unwrap();
         assert_eq!(upstream_ref(&sub_repo, "feature/never-pushed").map(|(_, label)| label), Some("origin/feature/never-pushed".to_string()), "a successful push must persist the upstream, equivalent to --set-upstream");
 

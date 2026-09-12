@@ -1720,6 +1720,7 @@ function pushPreviewHtml(preview) {
     <div class="push-preview-row"><span>Destination</span><code>${destination}</code></div>
     <div class="push-preview-row"><span>Remote</span><code>${esc(preview.remote_url)}</code></div>
     <div class="push-preview-row"><span>Ahead / behind</span><span>${esc(counts)}</span></div>
+    ${preview.blocked_reason ? `<div class="push-preview-row"><span>Status</span><strong>${esc(preview.blocked_reason)}</strong></div>` : ''}
   </div>`;
 }
 
@@ -1731,19 +1732,16 @@ async function pushSubmodule(entry) {
   $('#submodulePublishSummary').textContent = 'Checking…'; $('#submodulePublishStatus').textContent = '';
   $('#confirmSubmodulePublish').disabled = true;
   $('#submodulePublishDialog').showModal();
-  let commits = []; let previewHtml = '';
+  let commits = []; let preview = null;
   try {
-    const [details, preview] = await Promise.all([
-      invoke('entry_details', { repositoryPath: state.repository.path, relativePath: entry.relative_path }),
-      invoke('push_submodule_preview', { repositoryPath: state.repository.path, relativePath: entry.relative_path }).catch(error => { previewHtml = `<div class="publish-empty">${esc(String(error))}</div>`; return null; }),
-    ]);
-    commits = details.submodule_unpushed_commits || [];
-    if (preview) previewHtml = pushPreviewHtml(preview);
+    preview = await invoke('push_submodule_preview', { repositoryPath: state.repository.path, relativePath: entry.relative_path });
   }
   catch (error) { $('#submodulePublishCommits').innerHTML = `<div class="publish-empty">${esc(String(error))}</div>`; return; }
-  $('#submodulePublishCommits').innerHTML = previewHtml + (commits.map((commit, index) => `<div class="publish-commit"><span>${index + 1}</span><i></i><div><strong>${commitSubjectHtml(commit.subject)}</strong><small>${esc(commit.id.slice(0, 8))} · ${esc(commit.author)} · ${esc(commit.date)}</small></div><b>WILL PUSH</b></div>`).join('') || '<div class="publish-empty">Nothing to push — already up to date, or this submodule has no upstream.</div>');
-  $('#submodulePublishSummary').textContent = `${commits.length} commit${commits.length === 1 ? '' : 's'} to push`;
-  $('#confirmSubmodulePublish').disabled = !commits.length;
+  const pushState = submodulePushDialogState(preview);
+  commits = pushState.commits;
+  $('#submodulePublishCommits').innerHTML = pushPreviewHtml(preview) + (commits.map((commit, index) => `<div class="publish-commit"><span>${index + 1}</span><i></i><div><strong>${commitSubjectHtml(commit.subject)}</strong><small>${esc(commit.id.slice(0, 8))} · ${esc(commit.author)} · ${esc(commit.date)}</small></div><b>WILL PUSH</b></div>`).join('') || `<div class="publish-empty">${esc(pushState.emptyMessage)}</div>`);
+  $('#submodulePublishSummary').textContent = pushState.summary;
+  $('#confirmSubmodulePublish').disabled = !pushState.canPush;
 
   const confirmed = await new Promise(resolve => {
     const dialog = $('#submodulePublishDialog');
