@@ -1378,10 +1378,18 @@ async function commitSubmoduleChanges(entry) {
   if (!invoke) return status(`Preview: committed changes in ${entry.name}`);
   try {
     status(`Committing changes in ${entry.name}…`, 'busy');
-    await invoke('commit_submodule', { repositoryPath: state.repository.path, relativePath: entry.relative_path, message: message.trim() });
+    // Submodule-publish-safety report: this used to also silently create a
+    // parent commit right here, whether or not anything had been pushed
+    // anywhere — exactly how "Publish main project" could end up shipping a
+    // gitlink that pointed at a commit that only ever existed on this
+    // machine. also_push:true keeps the one-click convenience (commit, then
+    // immediately try to push) without ever touching the parent on commit
+    // alone; the parent's gitlink is only ever staged, and only once that
+    // push actually succeeds — never committed automatically either way.
+    const result = await invoke('commit_submodule', { repositoryPath: state.repository.path, relativePath: entry.relative_path, message: message.trim(), alsoPush: true });
     directoryCache.clear(); await loadRepository(state.repository.path, { reopenPath: state.currentPath });
-    const successMsg = `${entry.name}: committed inside the submodule. The project's link to it was updated automatically to this new commit — commit/push the project when you're ready to share that.`;
-    status(successMsg); showOperationToast(successMsg, 'success');
+    const successMsg = `${entry.name}: committed inside the submodule. ${result.push_detail}`;
+    status(successMsg); showOperationToast(successMsg, result.pushed ? 'success' : '');
   }
   catch (error) { const message2 = handleError(error); showOperationToast(`Commit failed: ${message2}`, 'error'); }
 }
@@ -1636,7 +1644,7 @@ async function forcePushSubmodule(entry) {
     const result = await invoke('force_push_submodule', { repositoryPath: state.repository.path, relativePath: entry.relative_path });
     directoryCache.clear(); await loadRepository(state.repository.path, { reopenPath: state.currentPath });
     const shortSha = (result?.revision || '').slice(0, 8);
-    const successMsg = `${entry.name}: force pushed to branch "${result?.branch}" (now at ${shortSha}). This project now has a new local commit recording that — see "Unpublished commits" in the sidebar to push it too.`;
+    const successMsg = `${entry.name}: force pushed to branch "${result?.branch}" (now at ${shortSha}). The project's link to it was staged, not committed — commit the project when you're ready to share that.`;
     status(successMsg); showOperationToast(successMsg, 'success');
   }
   catch (error) { const message = handleError(error); showOperationToast(message, 'error'); }
@@ -1672,7 +1680,7 @@ async function pushSubmodule(entry) {
     const result = await invoke('push_submodule', { repositoryPath: state.repository.path, relativePath: entry.relative_path });
     directoryCache.clear(); await loadRepository(state.repository.path, { reopenPath: state.currentPath });
     const shortSha = (result?.revision || '').slice(0, 8);
-    const successMsg = `${entry.name}: pushed to branch "${result?.branch}" on its remote (now at ${shortSha}). This project now has a new local commit recording that — see "Unpublished commits" in the sidebar to push it too.`;
+    const successMsg = `${entry.name}: pushed to branch "${result?.branch}" on its remote (now at ${shortSha}). The project's link to it was staged, not committed — commit the project when you're ready to share that.`;
     status(successMsg); showOperationToast(successMsg, 'success');
   }
   catch (error) { const message = handleError(error); showOperationToast(message, 'error'); }
@@ -2896,11 +2904,36 @@ async function refreshPublish() {
   updatePublishSummary();
 }
 
-async function confirmPublish(event) {
+// Submodule-publish-safety report, point 3: publish_branch now runs a
+// safety preflight itself (never bypassable by skipping some separate
+// advisory step) that can fail in two different ways — a submodule that DOES
+// have a remote but simply hasn't been pushed yet always hard-blocks (no
+// override exists: push it, there's no other safe option), while a submodule
+// with no remote at all (or one this app couldn't even open to check) is
+// override-eligible, marked with a fixed prefix this function looks for and
+// strips before showing anything.
+const UNPUSHED_SUBMODULE_OVERRIDABLE_PREFIX = 'UNPUSHED_SUBMODULE_OVERRIDABLE::';
+async function confirmPublish(event, overrideUnpushedSubmodules = false) {
   event.preventDefault(); if (!state.publish?.commits.length) return;
   const operation = $('#publishOperationStatus'); operation.textContent = `Publishing ${state.publish.branch}…`; operation.className = 'submodule-operation-status busy';
-  try { $('#confirmPublish').disabled = true; status(`Publishing ${state.publish.branch}…`, 'busy'); await invoke('publish_branch', { repositoryPath: state.repository.path, branch: state.publish.branch, remote: state.publish.remote, username: $('#publishUsername').value.trim(), accessToken: $('#publishToken').value, uptoCommit: state.publishUpto || '' }); $('#publishToken').value = ''; refs.publishDialog.close(); await loadRepository(state.repository.path, { keepPath: true }); const msg = state.publishUpto ? `Published part of ${state.publish.branch} to ${state.publish.remote} (up to your chosen commit).` : `Published ${state.publish.branch} to ${state.publish.remote}`; status(msg); showOperationToast(msg); }
-  catch (error) { const message = String(error); operation.textContent = message; operation.className = 'submodule-operation-status error'; status(message, 'error'); $('#confirmPublish').disabled = false; }
+  try {
+    $('#confirmPublish').disabled = true; status(`Publishing ${state.publish.branch}…`, 'busy');
+    await invoke('publish_branch', { repositoryPath: state.repository.path, branch: state.publish.branch, remote: state.publish.remote, username: $('#publishUsername').value.trim(), accessToken: $('#publishToken').value, uptoCommit: state.publishUpto || '', overrideUnpushedSubmodules });
+    $('#publishToken').value = ''; refs.publishDialog.close(); await loadRepository(state.repository.path, { keepPath: true });
+    const msg = state.publishUpto ? `Published part of ${state.publish.branch} to ${state.publish.remote} (up to your chosen commit).` : `Published ${state.publish.branch} to ${state.publish.remote}`;
+    status(msg); showOperationToast(msg);
+  } catch (error) {
+    const message = String(error);
+    if (message.startsWith(UNPUSHED_SUBMODULE_OVERRIDABLE_PREFIX)) {
+      const detail = message.slice(UNPUSHED_SUBMODULE_OVERRIDABLE_PREFIX.length);
+      $('#confirmPublish').disabled = false;
+      const proceed = await customConfirm(`${detail}\n\nPublish anyway?`, { title: 'Local-only submodule commit', danger: true, okLabel: 'Publish anyway' });
+      if (proceed) return confirmPublish(event, true);
+      operation.textContent = 'Publish cancelled'; operation.className = 'submodule-operation-status'; status('Publish cancelled');
+      return;
+    }
+    operation.textContent = message; operation.className = 'submodule-operation-status error'; status(message, 'error'); $('#confirmPublish').disabled = false;
+  }
 }
 
 // Rapid checkbox clicking (e.g. "Stage all" material, ticked one-by-one, or

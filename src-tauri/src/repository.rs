@@ -1551,12 +1551,16 @@ pub fn open_commit_on_server(repository_path: String, commit_id: String, submodu
 // anything passive. It just shows as modified, exactly like any other
 // uncommitted change, the moment the regular status scan sees it (git2's
 // own status walk already compares a submodule's HEAD against the parent's
-// recorded gitlink — no extra scan needed for that). Recording a new gitlink
-// into the parent's history is a real commit, and only ever happens as the
-// direct, explicit result of the user's own action: committing/pushing the
-// submodule itself (record_pushed_submodule_in_parent, called only from
-// commit_submodule/push_submodule/force_push_submodule — never from a
-// Refresh, navigation, or any other passive reload). This used to also run
+// recorded gitlink — no extra scan needed for that). Staging a new gitlink
+// into the parent's index only ever happens as the direct, explicit result
+// of the user's own action: pushing the submodule (stage_pushed_submodule_in_parent,
+// called only from push_submodule/force_push_submodule, and from
+// commit_submodule when it also pushed — never from a Refresh, navigation,
+// or any other passive reload) — and even then it is only ever staged, never
+// committed into the parent's history on its own (see the
+// submodule-publish-safety report: committing the parent automatically here
+// used to let "Publish main project" push a gitlink that pointed at a
+// submodule commit which existed only locally). This used to also run
 // speculatively from every load_repository call (even non-forced ones, at
 // one point) specifically to catch an *externally*-made submodule commit —
 // which is exactly the safety issue this removes: opening or refreshing a
@@ -3207,31 +3211,155 @@ pub fn abort_merge(repository_path: String, target_path: String) -> Result<(), S
     Ok(())
 }
 
+// Every commit reachable from `branch` but not from any of `remote`'s own
+// branches — shared by publish_status (which just lists/displays them) and
+// unpushed_submodule_references (which must inspect every one of them, not
+// just the tip, to catch a gitlink an *older* outgoing commit already
+// carries — see that function's own doc comment). Hides everything
+// reachable from ANY of the remote's branches, not only the one sharing
+// `branch`'s name — a brand new local branch that descends from, or sits
+// right at, a commit already on the server under a different name doesn't
+// need to re-push that shared history; only what isn't reachable from
+// anything already on this remote is genuinely new. Without this,
+// "Publish" on any new branch showed its *entire* ancestry as pending,
+// even commits from years ago already sitting on origin.
+fn outgoing_commit_ids(repo: &Repository, branch: &str, remote: &str) -> Result<Vec<git2::Oid>, String> {
+    let local_oid = repo.refname_to_id(&format!("refs/heads/{branch}")).map_err(|error| error.message().to_string())?;
+    let mut walk = repo.revwalk().map_err(|error| error.message().to_string())?; walk.push(local_oid).map_err(|error| error.message().to_string())?;
+    if let Ok(references) = repo.references_glob(&format!("refs/remotes/{remote}/*")) {
+        for reference in references.flatten() { if let Some(oid) = reference.target() { let _ = walk.hide(oid); } }
+    }
+    Ok(walk.flatten().collect())
+}
+
 #[tauri::command]
 pub fn publish_status(repository_path: String, branch: String, remote: String) -> Result<PublishStatus, String> {
     validate_path(&repository_path)?;
     let branch = branch.trim(); let remote = remote.trim();
     if branch.is_empty() || remote.is_empty() { return Err("Choose a local branch and a remote".into()); }
-    let repo = internal_repository(&repository_path)?; let local_oid = repo.refname_to_id(&format!("refs/heads/{branch}")).map_err(|error| error.message().to_string())?;
+    let repo = internal_repository(&repository_path)?;
     let remote_branch = format!("{remote}/{branch}");
-    let mut walk = repo.revwalk().map_err(|error| error.message().to_string())?; walk.push(local_oid).map_err(|error| error.message().to_string())?;
-    // Hide everything reachable from ANY of this remote's branches, not only
-    // the one sharing this local branch's name. A brand new local branch
-    // (e.g. just created, no upstream yet) that descends from — or sits right
-    // at — a commit already on the server under a different branch name
-    // doesn't actually need to re-push that shared history; only what isn't
-    // reachable from anything already on this remote is genuinely new.
-    // Without this, "Publish" on any new branch showed its *entire* ancestry
-    // as "WILL PUSH", even commits from years ago already sitting on origin.
-    if let Ok(references) = repo.references_glob(&format!("refs/remotes/{remote}/*")) {
-        for reference in references.flatten() { if let Some(oid) = reference.target() { let _ = walk.hide(oid); } }
-    }
-    let mut commits = walk.flatten().take(100).filter_map(|oid| repo.find_commit(oid).ok().map(|commit| PublishCommit { id: oid.to_string(), subject: commit.summary().unwrap_or("No message").into(), author: commit.author().name().unwrap_or("Unknown").into(), date: short_date(commit.time().seconds()) })).collect::<Vec<_>>(); commits.reverse();
+    let outgoing = outgoing_commit_ids(&repo, branch, remote)?;
+    let mut commits = outgoing.iter().take(100).filter_map(|&oid| repo.find_commit(oid).ok().map(|commit| PublishCommit { id: oid.to_string(), subject: commit.summary().unwrap_or("No message").into(), author: commit.author().name().unwrap_or("Unknown").into(), date: short_date(commit.time().seconds()) })).collect::<Vec<_>>(); commits.reverse();
     Ok(PublishStatus { branch: branch.into(), remote: remote.into(), remote_branch, commits })
 }
 
+// One outgoing parent commit's gitlink that cannot be confirmed safe to
+// publish — either it points at a submodule commit not known to exist on
+// that submodule's own remote yet ("unpushed", the common case: push the
+// submodule first — never overridable, since it's always fixable), the
+// submodule has no remote configured at all ("no_remote" — genuinely
+// local-only, can never be verified this way), or the submodule's own repo
+// couldn't be opened here to check at all ("unverifiable"). See
+// unpushed_submodule_references for how this list is built.
+#[derive(Serialize, Debug, Clone, PartialEq)]
+pub struct UnpushedSubmoduleReference { relative_path: String, submodule_oid: String, commit_id: String, commit_subject: String, risk: String }
+
+// None = this exact submodule commit is already known to be safely
+// available from one of the submodule's own remotes. Best-effort fetches
+// first (mirrors push_submodule_inner's own `let _ = git(... "fetch"
+// ...)` — not a "hidden" network operation in the sense point 6 asks to
+// avoid: it's a disclosed, direct part of the explicit Publish action the
+// user just took, exactly like push_submodule_inner already fetches as
+// part of an explicit push) so a commit pushed moments ago from elsewhere
+// isn't reported as missing just because this app's local remote-tracking
+// refs hadn't caught up yet. A fetch failure (offline, unreachable) only
+// ever leaves the existing local knowledge in place — that can only make
+// this check *more* cautious, never less, which is the right direction to
+// err in for something that decides whether it's safe to publish.
+fn submodule_reference_risk(repository_path: &str, relative_path: &str, oid: git2::Oid) -> Option<&'static str> {
+    let absolute = Path::new(repository_path).join(relative_path);
+    let Ok(repo) = internal_submodule_repository(&absolute) else { return Some("unverifiable") };
+    let remotes: Vec<String> = repo.remotes().map(|names| names.iter().flatten().map(String::from).collect()).unwrap_or_default();
+    if remotes.is_empty() { return Some("no_remote"); }
+    let sub_path = absolute.to_string_lossy().into_owned();
+    for remote in &remotes { let _ = git(&sub_path, &["fetch", remote]); }
+    let reachable = repo.references_glob("refs/remotes/*/*").ok().is_some_and(|references| references.flatten().any(|reference| {
+        reference.target().is_some_and(|tip| tip == oid || repo.graph_descendant_of(tip, oid).unwrap_or(false))
+    }));
+    if reachable { None } else { Some("unpushed") }
+}
+
+// Point 3 of the submodule-publish-safety report: inspects every *outgoing*
+// commit's own tree (diffed against its first parent — same one-parent
+// convention unpushed_paths already uses for merges), not just the current
+// index/HEAD state. An older outgoing commit can carry a gitlink to a
+// submodule commit that was only ever local, even if a *later* outgoing
+// commit already moved the submodule on to a since-pushed one — git can't
+// publish the later commit while holding back the earlier one it depends
+// on, so that older, unsafe gitlink ships right along with it. Distinct
+// (path, submodule oid) pairs are checked once each, no matter how many
+// outgoing commits repeat the same value.
+fn unpushed_submodule_references(repository_path: &str, branch: &str, remote: &str, upto: Option<git2::Oid>) -> Result<Vec<UnpushedSubmoduleReference>, String> {
+    let repo = internal_repository(repository_path)?;
+    let mut outgoing = outgoing_commit_ids(&repo, branch, remote)?;
+    // A partial publish ("stop at an earlier commit", see publish_branch's
+    // own doc comment) only ever actually pushes commits up to and
+    // including that cutoff — a commit *newer* than it, deliberately held
+    // back, must never block this publish over a gitlink that isn't going
+    // anywhere yet either.
+    if let Some(cutoff) = upto {
+        outgoing.retain(|&oid| oid == cutoff || repo.graph_descendant_of(cutoff, oid).unwrap_or(false));
+    }
+    // A safety scan must never silently check only *some* of the outgoing
+    // history — that would defeat the entire point of this function. Bail
+    // out instead of truncating when there's an implausibly large amount to
+    // walk (a huge first publish on a very stale local branch).
+    if outgoing.len() > 5000 {
+        return Err(format!("Too many outgoing commits ({}) to verify submodule safety in one pass. Fetch/pull first, or publish in smaller steps.", outgoing.len()));
+    }
+    let mut seen = HashSet::new();
+    let mut first_reference: Vec<(String, git2::Oid, git2::Oid)> = Vec::new(); // (path, submodule oid, the oldest outgoing commit introducing it)
+    for &oid in outgoing.iter().rev() { // oldest outgoing commit first, so "first" below really means first
+        let Ok(commit) = repo.find_commit(oid) else { continue };
+        let Ok(tree) = commit.tree() else { continue };
+        let parent_tree = commit.parent(0).ok().and_then(|parent| parent.tree().ok());
+        let Ok(diff) = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), None) else { continue };
+        for delta in diff.deltas() {
+            if delta.status() == git2::Delta::Deleted { continue; }
+            let new_file = delta.new_file();
+            if new_file.mode() != git2::FileMode::Commit { continue; }
+            let (Some(path), sub_oid) = (new_file.path(), new_file.id()) else { continue };
+            if sub_oid.is_zero() { continue; }
+            let path = normalized(path);
+            if seen.insert((path.clone(), sub_oid)) { first_reference.push((path, sub_oid, oid)); }
+        }
+    }
+    let mut violations = Vec::new();
+    for (path, sub_oid, commit_oid) in first_reference {
+        let Some(risk) = submodule_reference_risk(repository_path, &path, sub_oid) else { continue };
+        let commit_subject = repo.find_commit(commit_oid).ok().and_then(|commit| commit.summary().map(str::to_string)).unwrap_or_default();
+        violations.push(UnpushedSubmoduleReference { relative_path: path, submodule_oid: sub_oid.to_string(), commit_id: commit_oid.to_string(), commit_subject, risk: risk.into() });
+    }
+    Ok(violations)
+}
+
+// Marks an error as override-eligible (point 4: a submodule with no remote
+// at all, or one this app couldn't even open to check, can never be
+// verified — the only way forward besides never publishing is an explicit,
+// informed override) — never used for risk "unpushed", which is always
+// fixable by pushing and is never overridable. The frontend looks for this
+// exact prefix to offer that override; stripped before it's shown.
+const UNPUSHED_SUBMODULE_OVERRIDABLE_PREFIX: &str = "UNPUSHED_SUBMODULE_OVERRIDABLE::";
+
+fn submodule_publish_safety_check(repository_path: &str, branch: &str, remote: &str, upto: Option<git2::Oid>, override_unpushed_submodules: bool) -> Result<(), String> {
+    let violations = unpushed_submodule_references(repository_path, branch, remote, upto)?;
+    if violations.is_empty() { return Ok(()); }
+    let hard: Vec<&UnpushedSubmoduleReference> = violations.iter().filter(|v| v.risk == "unpushed").collect();
+    if !hard.is_empty() {
+        let lines: Vec<String> = hard.iter().map(|v| format!("Push submodule {} first. The main project references {}, which is only local.", v.relative_path, &v.submodule_oid[..8.min(v.submodule_oid.len())])).collect();
+        return Err(format!("Cannot publish — {} submodule commit{} not yet available on {}'s own remote:\n{}", hard.len(), if hard.len() == 1 { " is" } else { "s are" }, if hard.len() == 1 { "its" } else { "their" }, lines.join("\n")));
+    }
+    if override_unpushed_submodules { return Ok(()); }
+    let lines: Vec<String> = violations.iter().map(|v| {
+        let reason = if v.risk == "no_remote" { "has no configured remote" } else { "could not be checked locally" };
+        format!("Submodule {} {} — its commit {} may exist only on this machine. Other users will not be able to restore it after cloning.", v.relative_path, reason, &v.submodule_oid[..8.min(v.submodule_oid.len())])
+    }).collect();
+    Err(format!("{UNPUSHED_SUBMODULE_OVERRIDABLE_PREFIX}{}", lines.join("\n")))
+}
+
 #[tauri::command]
-pub fn publish_branch(repository_path: String, branch: String, remote: String, username: String, access_token: String, upto_commit: String) -> Result<(), String> {
+pub fn publish_branch(repository_path: String, branch: String, remote: String, username: String, access_token: String, upto_commit: String, override_unpushed_submodules: bool) -> Result<(), String> {
     validate_path(&repository_path)?;
     if branch.trim().is_empty() || remote.trim().is_empty() { return Err("Choose a local branch and a remote".into()); }
     // See repo_write_lock's doc comment. No credentials in this log line —
@@ -3253,6 +3381,12 @@ pub fn publish_branch(repository_path: String, branch: String, remote: String, u
         if !walk.flatten().any(|id| id == oid) { return Err("The selected commit isn't part of this branch's history".into()); }
         oid
     };
+    // Point 3 of the submodule-publish-safety report: never just check the
+    // current working-tree/index state — every outgoing commit up to
+    // push_oid gets inspected (see unpushed_submodule_references's own doc
+    // comment for why an older one matters too), and this runs before any
+    // network push is attempted, whether or not an explicit token was given.
+    submodule_publish_safety_check(&repository_path, branch, remote_name, Some(push_oid), override_unpushed_submodules)?;
     if access_token.trim().is_empty() {
         // No explicit token was entered — prefer the system `git` binary, which
         // transparently reuses the user's already-working SSH agent, credential
@@ -4138,10 +4272,7 @@ fn commit_files_inner(repository_path: String, files: Vec<String>, message: Stri
 fn commit_selected_internal(repository_path: &str, files: &[String], message: &str) -> Result<String, String> {
     let commit_started = Instant::now();
     // See repo_write_lock's doc comment — shared by both commit_files and
-    // commit_path, both of which mutate the index. Also reused by
-    // record_pushed_submodule_in_parent (commit_submodule/push_submodule/
-    // force_push_submodule), which is why those never hold their own
-    // submodule lock while calling in here — see this function's callers.
+    // commit_path, both of which mutate the index.
     let queue_started = Instant::now();
     let lock_handle = repo_write_lock(repository_path);
     let _lock = lock_handle.lock().unwrap();
@@ -4713,20 +4844,50 @@ pub fn delete_branch(repository_path: String, branch_name: String) -> Result<(),
     Ok(())
 }
 
-#[tauri::command]
-pub async fn commit_submodule(repository_path: String, relative_path: String, message: String) -> Result<String, String> {
-    off_main_thread(move || commit_submodule_inner(repository_path, relative_path, message)).await
+// The submodule-publish-safety report's point 1: this used to also call
+// record_pushed_submodule_in_parent right here, unconditionally — an actual
+// commit_selected_internal call into the *parent* — whether or not anything
+// had ever been pushed anywhere. That is exactly how "Publish main project"
+// could end up pushing a parent commit whose gitlink pointed at a submodule
+// commit that existed only on this machine: nothing forced the safe order
+// (submodule commit -> submodule push -> parent commit -> publish), so a
+// habitual "commit, then immediately Publish" click could ship an
+// unrecoverable parent history without ever pushing the submodule at all.
+// Committing here now only ever touches the submodule itself. `also_push`
+// (point 1 asks to keep this off by default; the app wires the "Commit
+// submodule" action to pass true, so the common case still only takes one
+// click) optionally chains an immediate push attempt via push_submodule_inner
+// right after — reusing its already-tested logic rather than duplicating it —
+// and, only on that push's own success, its tail stages (never commits) the
+// parent's gitlink. A commit here always succeeds and returns Ok on its own
+// merits; a failed or skipped push is reported in the result, never as an
+// error that would make the caller think the commit itself failed.
+#[derive(Serialize, Debug)]
+pub struct CommitSubmoduleResult {
+    revision: String,
+    pushed: bool,
+    // Set only when `pushed` is true.
+    branch: Option<String>,
+    // Always set — the human-readable reason `pushed` is what it is, so the
+    // caller never has to guess (see the misleading-success-message point of
+    // the report this fixes).
+    push_detail: String,
 }
 
-fn commit_submodule_inner(repository_path: String, relative_path: String, message: String) -> Result<String, String> {
+#[tauri::command]
+pub async fn commit_submodule(repository_path: String, relative_path: String, message: String, also_push: bool) -> Result<CommitSubmoduleResult, String> {
+    off_main_thread(move || commit_submodule_inner(repository_path, relative_path, message, also_push)).await
+}
+
+fn commit_submodule_inner(repository_path: String, relative_path: String, message: String, also_push: bool) -> Result<CommitSubmoduleResult, String> {
     validate_path(&repository_path)?;
     if message.trim().is_empty() { return Err("Commit message cannot be empty".into()); }
     let absolute = validate_submodule(&repository_path, &relative_path)?;
     let sub_path = absolute.to_string_lossy().into_owned();
-    // Held only for the submodule's own commit — released (end of this block)
-    // before record_pushed_submodule_in_parent below takes the *parent's*
-    // lock, so this thread never holds both at once (see stage_files_inner's
-    // comment for why that matters).
+    // Held only for the submodule's own commit, released at the end of this
+    // block — the parent's own lock, if this reaches push_submodule_inner
+    // below, is only ever taken after that, inside its own tail, never nested
+    // with this one (see stage_files_inner's comment for why that matters).
     let oid = {
         let queue_started = Instant::now();
         let lock_handle = repo_write_lock(&sub_path);
@@ -4747,14 +4908,22 @@ fn commit_submodule_inner(repository_path: String, relative_path: String, messag
     };
     invalidate_git_metadata(&sub_path);
     invalidate_submodule_sync(&repository_path); // this app just changed the submodule's own commit
-    // Once the submodule itself has a new commit, its working copy already IS
-    // the new version — record that in the parent right away instead of
-    // leaving the two in sync only after a manual "Change version"/stage step.
-    // Not having pushed yet doesn't change this: the parent should show "this
-    // submodule is now on version X", not "modified", the moment X actually
-    // exists as a real commit here, pushed or not.
-    record_pushed_submodule_in_parent(&repository_path, &relative_path, Some(oid))?;
-    Ok(oid.to_string())
+    if !also_push {
+        return Ok(CommitSubmoduleResult {
+            revision: oid.to_string(), pushed: false, branch: None,
+            push_detail: "Local submodule commit — push the submodule before publishing the main project.".into(),
+        });
+    }
+    match push_submodule_inner(repository_path, relative_path) {
+        Ok(pushed) => Ok(CommitSubmoduleResult {
+            revision: oid.to_string(), pushed: true, branch: Some(pushed.branch.clone()),
+            push_detail: format!("Pushed to origin/{}. The parent's reference to it was staged — commit the parent when you're ready to share that.", pushed.branch),
+        }),
+        Err(detail) => Ok(CommitSubmoduleResult {
+            revision: oid.to_string(), pushed: false, branch: None,
+            push_detail: format!("Committed locally, but not pushed: {detail}\n\nPush the submodule before publishing the main project."),
+        }),
+    }
 }
 
 #[derive(Serialize, Debug)]
@@ -4771,7 +4940,7 @@ fn push_submodule_inner(repository_path: String, relative_path: String) -> Resul
     let sub_path = absolute.to_string_lossy().into_owned();
     // Held for the submodule's own fetch+push (a concurrent local write on
     // this same submodule — a commit, "Reset submodule" — must queue behind
-    // it, not race it) — released below before record_pushed_submodule_in_parent
+    // it, not race it) — released below before stage_pushed_submodule_in_parent
     // takes the *parent's* lock, never nested with it.
     let queue_started = Instant::now();
     let lock_handle = repo_write_lock(&sub_path);
@@ -4827,42 +4996,32 @@ fn push_submodule_inner(repository_path: String, relative_path: String) -> Resul
 
     // `dirty`/status checks above ran against the submodule's own cached status
     // entries (keyed by `sub_path`), separate from the parent's cache that
-    // `record_pushed_submodule_in_parent` invalidates below — without this, opening
+    // `stage_pushed_submodule_in_parent` invalidates below — without this, opening
     // the submodule as its own repository view right after a push could still show
     // its pre-push status for up to the cache's TTL.
     invalidate_git_metadata(&sub_path);
     invalidate_submodule_sync(&repository_path); // this app just changed the submodule's own commit
     drop(repo); drop(_lock); // fully released before the parent's own lock, never nested
-    record_pushed_submodule_in_parent(&repository_path, &relative_path, local_target)?;
+    stage_pushed_submodule_in_parent(&repository_path, &relative_path)?;
     Ok(PushSubmoduleResult { revision: local_target.map(|oid| oid.to_string()).unwrap_or_default(), branch })
 }
 
-// Once a commit is safely on the submodule's own server, it is no longer "only
-// local" — automatically record that new commit in the parent project too, so the
-// submodule stops showing as modified. This mirrors clicking "Commit this item" on
-// the submodule, done here for you right after a successful push.
-fn record_pushed_submodule_in_parent(repository_path: &str, relative_path: &str, local_target: Option<git2::Oid>) -> Result<(), String> {
-    // No add_to_index here anymore — it used to run *before* (and outside)
-    // the repo_write_lock commit_selected_internal below acquires for its
-    // own index work, an unlocked write to the same .git/index this app's
-    // own repo_write_lock exists specifically to serialize every other
-    // index mutation behind (see its doc comment — a real Windows perf log
-    // caught concurrent, unserialized index writes corrupting/racing). It
-    // was also entirely redundant: commit_selected_internal's own loop
-    // already calls add_to_index for exactly this same submodule path,
-    // safely under its lock, as part of building the commit.
-    let parent = internal_repository(repository_path)?;
-    parent.find_submodule(relative_path).map_err(|error| format!("Pushed, but could not find the submodule to update the parent's reference: {}", error.message()))?;
-    let short_sha = local_target.map(|oid| oid.to_string()[..8.min(oid.to_string().len())].to_string()).unwrap_or_default();
-    match commit_selected_internal(repository_path, &[normalized(Path::new(relative_path))], &format!("Update submodule {relative_path} to {short_sha}")) {
-        Ok(_) => {}
-        // "nothing to commit" happens if the parent's index already matched (e.g. it
-        // was committed by hand right before pushing) — not an error worth surfacing.
-        Err(message) if message.contains("no changes to commit") => {}
-        Err(message) => return Err(format!("Pushed successfully, but could not update the parent project: {message}")),
+// Point 2 of the submodule-publish-safety report: once a commit is safely on
+// the submodule's own server, the parent's gitlink is out of date — stage the
+// new one so the *next* explicit parent commit picks it up, exactly like
+// editing any other tracked file. Never commits the parent itself: silently
+// creating a parent commit here (this used to call commit_selected_internal
+// directly) is exactly what let "Publish main project" push a parent commit
+// whose gitlink referenced a still-local submodule commit before, since
+// nothing forced the two operations into the safe order. Reuses
+// stage_files_inner's own submodule-HEAD-vs-index detection (see its comment)
+// rather than reimplementing it — that mechanism already exists precisely to
+// let a submodule's moved-on HEAD be staged as an explicit action.
+fn stage_pushed_submodule_in_parent(repository_path: &str, relative_path: &str) -> Result<(), String> {
+    match stage_files_inner(repository_path, vec![relative_path.to_string()]) {
+        Ok(_) => Ok(()),
+        Err(message) => Err(format!("Pushed successfully, but could not stage the parent's reference to the new commit: {message}")),
     }
-    invalidate_git_metadata(repository_path);
-    Ok(())
 }
 
 #[tauri::command]
@@ -4904,7 +5063,7 @@ fn force_push_submodule_inner(repository_path: String, relative_path: String) ->
     invalidate_git_metadata(&sub_path);
     invalidate_submodule_sync(&repository_path); // this app just changed the submodule's own commit
     drop(repo); drop(_lock); // fully released before the parent's own lock, never nested
-    record_pushed_submodule_in_parent(&repository_path, &relative_path, local_target)?;
+    stage_pushed_submodule_in_parent(&repository_path, &relative_path)?;
     Ok(PushSubmoduleResult { revision: local_target.map(|oid| oid.to_string()).unwrap_or_default(), branch })
 }
 
@@ -7116,29 +7275,37 @@ mod tests {
         let uncommitted_message = push_with_uncommitted.unwrap_err();
         assert!(uncommitted_message.to_lowercase().contains("uncommitted") || uncommitted_message.to_lowercase().contains("commit"), "message should warn about uncommitted changes, got: {uncommitted_message}");
 
-        // Commit through our command only, then push must succeed.
-        commit_submodule_inner(repo_path.clone(), "vendor/dep".into(), "Update module".into()).expect("commit_submodule should succeed");
+        // Commit through our command only (not pushing yet), then push must succeed.
+        let head_before = Repository::open(&repository).unwrap().head().unwrap().target().unwrap();
+        let committed = commit_submodule_inner(repo_path.clone(), "vendor/dep".into(), "Update module".into(), false).expect("commit_submodule should succeed");
+        assert!(!committed.pushed, "also_push was false — nothing should have been pushed");
 
-        // Committing inside the submodule now updates the parent's recorded
-        // gitlink right away (no push needed) — the submodule's working copy
-        // already IS the new version, so the parent should reflect that
-        // immediately instead of still showing it as "modified".
+        // Submodule-publish-safety report, point 1: committing inside the
+        // submodule must NEVER touch the parent on its own — the parent still
+        // records the OLD commit (an ordinary unstaged modification, exactly
+        // like editing any other tracked file) until the submodule is
+        // actually pushed.
         let parent_index_oid = { let repo = Repository::open(&repository).unwrap(); repo.index().unwrap().get_path(Path::new("vendor/dep"), 0).unwrap().id };
         let submodule_head_oid = { let repo = Repository::open(&sub_path).unwrap(); let oid = repo.head().unwrap().target().unwrap(); oid };
-        assert_eq!(parent_index_oid, submodule_head_oid, "the parent should record the submodule's new commit immediately after committing inside it, push or not");
+        assert_ne!(parent_index_oid, submodule_head_oid, "the parent must NOT record the submodule's new commit merely because it was committed locally — that is exactly the unsafe auto-commit this fixes");
+        assert_eq!(Repository::open(&repository).unwrap().head().unwrap().target().unwrap(), head_before, "committing inside the submodule must never create a new commit in the parent");
 
         let parent_changes = load_repository_inner(repo_path.clone(), Some(true)).unwrap().changes;
-        assert!(!parent_changes.iter().any(|change| change.path == "vendor/dep"), "the submodule should already show as clean/version-changed, not modified, before any push");
+        let dep_change = parent_changes.iter().find(|change| change.path == "vendor/dep").expect("the submodule must show as an ordinary unstaged modification before any push");
+        assert!(!dep_change.staged, "must not be staged either — nothing was pushed yet");
 
         // Now push should succeed, and — since the commit is now safely on the
-        // submodule's own server — the parent should be updated automatically so the
-        // submodule stops showing as merely "modified locally".
+        // submodule's own server — the parent's gitlink should be staged (never
+        // committed on its own) so the submodule stops showing as an ordinary
+        // unstaged modification.
         push_submodule_inner(repo_path.clone(), "vendor/dep".into()).expect("push_submodule should succeed after a commit");
         let parent_index_oid_after_push = { let repo = Repository::open(&repository).unwrap(); repo.index().unwrap().get_path(Path::new("vendor/dep"), 0).unwrap().id };
         let submodule_head_oid_after_push = { let repo = Repository::open(&sub_path).unwrap(); let oid = repo.head().unwrap().target().unwrap(); oid };
-        assert_eq!(parent_index_oid_after_push, submodule_head_oid_after_push, "after a successful push, the parent should automatically record the new submodule commit");
+        assert_eq!(parent_index_oid_after_push, submodule_head_oid_after_push, "after a successful push, the parent's gitlink should be staged to the new submodule commit");
+        assert_eq!(Repository::open(&repository).unwrap().head().unwrap().target().unwrap(), head_before, "pushing the submodule must still never create a commit in the parent on its own — only staging");
         let parent_changes_after_push = load_repository_inner(repo_path.clone(), Some(true)).unwrap().changes;
-        assert!(!parent_changes_after_push.iter().any(|change| change.path == "vendor/dep"), "the submodule should no longer show as modified in the parent after push auto-commits the new pointer");
+        let staged_change = parent_changes_after_push.iter().find(|change| change.path == "vendor/dep").expect("the submodule's gitlink change should still be listed, now staged");
+        assert!(staged_change.staged, "after push, the parent's reference should be staged, ready for the user's own next parent commit");
 
         fs::remove_dir_all(base).unwrap();
     }
@@ -7184,7 +7351,7 @@ mod tests {
         assert!(Repository::open(&sub_path).unwrap().head_detached().unwrap(), "test setup should leave the submodule detached");
 
         fs::write(sub_path.join("module.txt"), "v2").unwrap();
-        commit_submodule_inner(repo_path.clone(), "vendor/dep".into(), "Detached commit".into()).expect("commit_submodule should succeed while detached");
+        commit_submodule_inner(repo_path.clone(), "vendor/dep".into(), "Detached commit".into(), false).expect("commit_submodule should succeed while detached");
         assert!(Repository::open(&sub_path).unwrap().head_detached().unwrap(), "committing must not implicitly attach HEAD to a branch");
 
         let push_result = push_submodule_inner(repo_path.clone(), "vendor/dep".into());
@@ -7877,23 +8044,40 @@ mod tests {
         // The specific hazard this guards against: one call that touches both
         // the parent's index and a submodule's own index in a single command
         // (stage_files spanning both — the parent's lock, then, nested, the
-        // submodule's) racing another that commits *inside* the submodule and
-        // lets that auto-record into the parent (commit_submodule — the
-        // submodule's lock first, then, only after releasing it, the
-        // parent's — never nested). If any code path ever reversed that
-        // ordering while the other still held its own lock, two threads doing
-        // these concurrently would deadlock on unlucky timing. Run many
-        // iterations on two genuinely concurrent threads, under a bounded
-        // wait — a real deadlock hangs past the timeout instead of finishing;
-        // this test failing (rather than hanging forever) is itself the point.
+        // submodule's) racing another that pushes a submodule commit and lets
+        // that stage the parent's gitlink (push_submodule_inner, via
+        // stage_pushed_submodule_in_parent — the submodule's lock first, then,
+        // only after releasing it, the parent's — never nested). If any code
+        // path ever reversed that ordering while the other still held its own
+        // lock, two threads doing these concurrently would deadlock on unlucky
+        // timing. Run many iterations on two genuinely concurrent threads,
+        // under a bounded wait — a real deadlock hangs past the timeout
+        // instead of finishing; this test failing (rather than hanging
+        // forever) is itself the point. Needs a real, pushable remote (not
+        // just create_libgit2_repository's bare local dependency) so the
+        // racer thread's push actually reaches the parent-touching tail on
+        // every iteration, exactly like the pre-fix auto-commit used to.
         let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let base = std::env::temp_dir().join(format!("git-integrity-deadlock-race-{suffix}"));
-        let parent = base.join("parent"); let dependency = base.join("dependency");
+        let parent = base.join("parent");
+        let dep_remote = base.join("dep-remote.git");
+        let dep_seed = base.join("dep-seed");
         create_libgit2_repository(&parent, "root.txt");
-        create_libgit2_repository(&dependency, "module.txt");
+        fs::create_dir_all(&dep_seed).unwrap();
+        fs::create_dir_all(&dep_remote).unwrap();
+        fs::write(dep_seed.join("module.txt"), "v0").unwrap();
+        run_git(&dep_remote, &["init", "--bare"]);
+        run_git(&dep_seed, &["init"]);
+        run_git(&dep_seed, &["config", "user.email", "test@example.com"]);
+        run_git(&dep_seed, &["config", "user.name", "Test User"]);
+        run_git(&dep_seed, &["add", "."]);
+        run_git(&dep_seed, &["commit", "-m", "Initial"]);
+        run_git(&dep_seed, &["remote", "add", "origin", dep_remote.to_str().unwrap()]);
+        run_git(&dep_seed, &["-c", "protocol.file.allow=always", "push", "origin", "HEAD:main"]);
+        run_git(&parent, &["-c", "protocol.file.allow=always", "submodule", "add", dep_remote.to_str().unwrap(), "dep"]);
+        run_git(&parent, &["commit", "-am", "Add dep submodule"]);
         let parent_string = parent.to_string_lossy().into_owned();
-        let added = add_submodule_inner(parent_string.clone(), "".into(), dependency.to_string_lossy().into_owned(), "dep".into(), String::new(), String::new()).unwrap();
-        create_commit(parent_string.clone(), "Add dep submodule".into()).unwrap();
+        let added = "dep".to_string();
         let sub_path = parent.join(&added);
         run_git(&sub_path, &["config", "user.email", "test@example.com"]);
         run_git(&sub_path, &["config", "user.name", "Test User"]);
@@ -7917,7 +8101,9 @@ mod tests {
         std::thread::spawn(move || {
             for i in 0..ITERATIONS {
                 fs::write(s2.join("module.txt"), format!("committed v{i}")).unwrap();
-                let _ = commit_submodule_inner(p2.clone(), a2.clone(), format!("iteration {i}"));
+                if commit_submodule_inner(p2.clone(), a2.clone(), format!("iteration {i}"), false).is_ok() {
+                    let _ = push_submodule_inner(p2.clone(), a2.clone());
+                }
             }
             let _ = tx2.send("commit_submodule racer done");
         });
@@ -7931,12 +8117,17 @@ mod tests {
     }
 
     #[test]
-    fn commit_submodule_auto_updates_the_parent_even_without_a_push() {
-        // "After committing inside a submodule and it's already on the new
-        // version, it should show as version-changed, not modified — even
-        // without having pushed it yet." `commit_submodule` now records the new
-        // commit in the parent right away (the same way a push already does),
-        // instead of requiring a separate manual "Change version"/stage step.
+    fn commit_submodule_never_touches_the_parent_when_there_is_nothing_to_push_to() {
+        // Submodule-publish-safety report, points 1 and 4: a submodule with no
+        // remote at all must remain fully usable locally, and committing inside
+        // it must never touch the parent on its own — regardless of whether a
+        // push was even attempted. The old behavior ("commit_submodule now
+        // records the new commit in the parent right away") is exactly the
+        // unsafe auto-commit this fixes: it let "Publish main project" push a
+        // parent commit whose gitlink referenced a commit that could never
+        // exist anywhere else. The submodule itself must show as an ordinary
+        // unstaged modification instead — exactly like editing any other file
+        // — until the user explicitly stages/commits that in the parent.
         let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let base = std::env::temp_dir().join(format!("git-integrity-commit-submodule-auto-bump-{suffix}"));
         let parent = base.join("parent"); let dependency = base.join("dependency");
@@ -7944,17 +8135,26 @@ mod tests {
         let parent_string = parent.to_string_lossy().into_owned();
         let added = add_submodule_inner(parent_string.clone(), "".into(), dependency.to_string_lossy().into_owned(), "dep".into(), String::new(), String::new()).unwrap();
         create_commit(parent_string.clone(), "Add dep submodule".into()).unwrap();
+        let head_before = Repository::open(&parent).unwrap().head().unwrap().target().unwrap();
+        let recorded_before = { let repo = Repository::open(&parent).unwrap(); repo.index().unwrap().get_path(Path::new(&added), 0).unwrap().id };
 
         fs::write(parent.join(&added).join("module.txt"), "v2").unwrap();
-        let oid = commit_submodule_inner(parent_string.clone(), added.clone(), "Update module".into()).unwrap();
+        let committed = commit_submodule_inner(parent_string.clone(), added.clone(), "Update module".into(), true).unwrap();
+        // also_push was true, but this submodule has no remote configured at
+        // all (create_libgit2_repository never adds one) — never attempting a
+        // push there is the whole point of point 4, so this must report a
+        // clean skip, not an error, and the commit itself must still succeed.
+        assert!(!committed.pushed, "there is no remote to push to, so nothing should have been pushed");
 
         let repo = Repository::open(&parent).unwrap();
         let recorded = repo.index().unwrap().get_path(Path::new(&added), 0).unwrap().id;
-        assert_eq!(recorded.to_string(), oid, "the parent must already record the submodule's new commit, with no push and no separate manual step");
+        assert_eq!(recorded, recorded_before, "the parent's index must NOT change just because the submodule was committed locally");
+        assert_eq!(repo.head().unwrap().target().unwrap(), head_before, "committing inside the submodule must never create a commit in the parent on its own");
         drop(repo);
 
         let changes = load_repository_inner(parent_string, Some(true)).unwrap().changes;
-        assert!(!changes.iter().any(|c| c.path == added), "the submodule must show as clean/version-changed, not modified, right after committing inside it: {:?}", changes.iter().map(|c| (&c.path, &c.status)).collect::<Vec<_>>());
+        let dep_change = changes.iter().find(|c| c.path == added).expect("the submodule must show as an ordinary unstaged modification: {:?}");
+        assert!(!dep_change.staged, "must not be staged either — nothing was pushed, and nothing was staged on its own");
 
         fs::remove_dir_all(base).unwrap();
     }
@@ -8142,7 +8342,7 @@ mod tests {
         assert_eq!(submodule_push_status(&sub_path.to_string_lossy()), None, "freshly synced against mirror/release — nothing to report");
 
         fs::write(sub_path.join("module.txt"), "v2").unwrap();
-        commit_submodule_inner(repo_path, "vendor/dep".into(), "Local only".into()).unwrap();
+        commit_submodule_inner(repo_path, "vendor/dep".into(), "Local only".into(), false).unwrap();
         let status = submodule_push_status(&sub_path.to_string_lossy());
         assert!(status.as_deref().is_some_and(|message| message.contains("1 commit") && message.contains("mirror/release")), "expected an unpushed-commit message naming the real upstream mirror/release, got: {status:?}");
         let commits = submodule_unpushed_commits(&sub_path.to_string_lossy());
@@ -8177,7 +8377,7 @@ mod tests {
         run_git(&repository, &["remote", "add", "origin", remote.to_str().unwrap()]);
         let path = repository.to_string_lossy().into_owned();
 
-        publish_branch(path.clone(), "main".into(), "origin".into(), String::new(), String::new(), commit1.clone()).unwrap();
+        publish_branch(path.clone(), "main".into(), "origin".into(), String::new(), String::new(), commit1.clone(), false).unwrap();
 
         let remote_head = git(&remote.to_string_lossy(), &["rev-parse", "refs/heads/main"]).unwrap().trim().to_string();
         assert_eq!(remote_head, commit1, "the server should be at exactly the chosen commit, not the branch tip");
@@ -8189,7 +8389,7 @@ mod tests {
         assert_eq!(status.commits[1].subject, "Commit 3");
 
         // Publishing the rest afterward (a normal full push) must succeed cleanly.
-        publish_branch(path.clone(), "main".into(), "origin".into(), String::new(), String::new(), String::new()).unwrap();
+        publish_branch(path.clone(), "main".into(), "origin".into(), String::new(), String::new(), String::new(), false).unwrap();
         assert_eq!(publish_status(path, "main".into(), "origin".into()).unwrap().commits.len(), 0);
 
         fs::remove_dir_all(repository).unwrap();
@@ -8305,7 +8505,7 @@ mod tests {
         // Modify, commit, and push a file inside the submodule, to its own remote —
         // exactly the workflow being verified.
         fs::write(sub_path.join("module.txt"), "v2").unwrap();
-        commit_submodule_inner(repo_path.clone(), "vendor/dep".into(), "Update module".into()).unwrap();
+        commit_submodule_inner(repo_path.clone(), "vendor/dep".into(), "Update module".into(), false).unwrap();
         push_submodule_inner(repo_path.clone(), "vendor/dep".into()).unwrap();
 
         let comparison = compare_remote_directory(repo_path.clone(), "vendor/dep".into(), "origin/main".into()).unwrap();
@@ -8320,11 +8520,12 @@ mod tests {
     }
 
     #[test]
-    fn submodule_status_is_clean_everywhere_after_push_including_explorer_and_details() {
+    fn submodule_status_is_staged_everywhere_after_push_including_explorer_and_details() {
         // Checks every status source the UI actually reads (load_repository's change
         // list, load_directory's per-row status, and entry_details), not just one of
-        // them, to catch any inconsistency between them after a push auto-commits the
-        // parent's pointer.
+        // them, to catch any inconsistency between them after a push stages (never
+        // commits on its own — see the submodule-publish-safety report) the parent's
+        // pointer.
         let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let base = std::env::temp_dir().join(format!("git-integrity-status-after-push-{suffix}"));
         let repository = base.join("main");
@@ -8355,28 +8556,34 @@ mod tests {
         run_git(&sub_path, &["config", "user.name", "Test User"]);
 
         fs::write(sub_path.join("module.txt"), "v2").unwrap();
-        commit_submodule_inner(repo_path.clone(), "vendor/dep".into(), "Update module".into()).unwrap();
+        commit_submodule_inner(repo_path.clone(), "vendor/dep".into(), "Update module".into(), false).unwrap();
         push_submodule_inner(repo_path.clone(), "vendor/dep".into()).unwrap();
 
+        // Staged, not committed, and not clean either — a real, visible change
+        // is exactly what must keep showing until the user explicitly commits
+        // the parent themselves.
         let changes = load_repository_inner(repo_path.clone(), Some(true)).unwrap().changes;
-        assert!(!changes.iter().any(|change| change.path == "vendor/dep"), "load_repository still lists the submodule as changed: {:?}", changes.iter().map(|c| (&c.path, &c.status)).collect::<Vec<_>>());
+        let dep_change = changes.iter().find(|change| change.path == "vendor/dep").expect("load_repository must still list the submodule as a pending (now staged) change: {:?}");
+        assert!(dep_change.staged, "the gitlink should be staged after a successful push: {:?}", changes.iter().map(|c| (&c.path, &c.status, c.staged)).collect::<Vec<_>>());
 
         let entries = load_directory(repo_path.clone(), "vendor".into(), None).unwrap();
         let dep_entry = entries.iter().find(|entry| entry.relative_path == "vendor/dep").expect("submodule entry should be listed");
-        assert_eq!(dep_entry.status, "", "load_directory still reports a status for the submodule: {:?}", dep_entry.status);
+        assert_eq!(dep_entry.status, "M", "load_directory should still report a status for the staged-but-uncommitted submodule: {:?}", dep_entry.status);
 
         let details = entry_details(repo_path, "vendor/dep".into()).unwrap();
-        assert_eq!(details.status, "", "entry_details still reports a status for the submodule: {:?}", details.status);
+        assert_eq!(details.status, "M", "entry_details should still report a status for the staged-but-uncommitted submodule: {:?}", details.status);
 
         fs::remove_dir_all(base).unwrap();
     }
 
     #[test]
-    fn parent_shows_the_submodule_bump_as_a_ready_to_push_commit_immediately_after_push() {
-        // The exact flow the user asked about: modify a submodule, commit it, push
-        // it — the parent should already show the new revision (auto-committed),
-        // and the workspace should make it obvious there is now a new commit in
-        // the parent ready to push, without any delay.
+    fn pushing_a_submodule_stages_the_gitlink_and_the_parent_commit_publishes_cleanly() {
+        // The safe end-to-end sequence the submodule-publish-safety report asks
+        // for: modify a submodule, commit it, push it — the parent's gitlink is
+        // staged, but publish_status must show NOTHING new to push yet (there is
+        // no parent commit at all). Only once the user explicitly commits the
+        // parent does it show up as one ready-to-push commit, and only then can
+        // "Publish main project" actually succeed.
         let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let base = std::env::temp_dir().join(format!("git-integrity-parent-ready-to-push-{suffix}"));
         let repository = base.join("main");
@@ -8417,17 +8624,166 @@ mod tests {
         assert_eq!(before.commits.len(), 0, "parent should have nothing to push before the submodule is touched");
 
         fs::write(sub_path.join("module.txt"), "v2").unwrap();
-        commit_submodule_inner(repo_path.clone(), "vendor/dep".into(), "Update module".into()).unwrap();
+        commit_submodule_inner(repo_path.clone(), "vendor/dep".into(), "Update module".into(), false).unwrap();
         push_submodule_inner(repo_path.clone(), "vendor/dep".into()).unwrap();
 
         // The parent's working copy of the submodule must already be at the new revision.
         assert_eq!(fs::read_to_string(sub_path.join("module.txt")).unwrap(), "v2");
 
-        // And the parent itself must already show a locally-ready, unpushed commit
-        // for that bump — immediately, no polling/delay needed.
+        // Staged, not committed — publish_status walks real commits, and there
+        // still isn't one in the parent yet, so it must show nothing new.
+        let staged_only = publish_status(repo_path.clone(), "main".into(), "origin".into()).unwrap();
+        assert_eq!(staged_only.commits.len(), 0, "the parent must show nothing new to push until the user actually commits the staged gitlink themselves: {:?}", staged_only.commits.iter().map(|c| &c.subject).collect::<Vec<_>>());
+
+        // The user's own explicit parent commit — only now does the bump become
+        // a real, ready-to-push commit.
+        commit_selected_internal(&repo_path, &["vendor/dep".to_string()], "Bump vendor/dep").expect("committing the staged gitlink should succeed");
         let after = publish_status(repo_path.clone(), "main".into(), "origin".into()).unwrap();
-        assert_eq!(after.commits.len(), 1, "parent should show exactly one new commit ready to push (the submodule bump): {:?}", after.commits.iter().map(|c| &c.subject).collect::<Vec<_>>());
+        assert_eq!(after.commits.len(), 1, "parent should show exactly one new commit ready to push (the submodule bump), now that it was actually committed: {:?}", after.commits.iter().map(|c| &c.subject).collect::<Vec<_>>());
         assert!(after.commits[0].subject.contains("vendor/dep"), "the ready-to-push commit should be the submodule bump: {:?}", after.commits[0].subject);
+
+        // And publishing it must actually succeed — the submodule commit it
+        // references is already safely on the submodule's own remote.
+        publish_branch(repo_path.clone(), "main".into(), "origin".into(), String::new(), String::new(), String::new(), false).expect("publishing should succeed once the submodule was pushed first");
+        let after_publish = publish_status(repo_path, "main".into(), "origin".into()).unwrap();
+        assert_eq!(after_publish.commits.len(), 0, "nothing should be left to publish after a successful push");
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn publish_branch_blocks_even_when_only_an_older_outgoing_commit_carries_an_unpushed_submodule_gitlink() {
+        // Point 3 of the submodule-publish-safety report: the CURRENT tip's
+        // gitlink can be perfectly fine while an OLDER outgoing commit still
+        // carries one that only ever existed locally — git can't push the
+        // newer commit while holding the older one back, so that bad gitlink
+        // ships right along with it. Built directly (bypassing
+        // commit_submodule/push_submodule) so the parent gets two real commits
+        // whose gitlinks are known precisely: the first references a
+        // submodule commit that is deliberately never reachable from the
+        // remote (a sibling of what's actually pushed, not an ancestor of
+        // it), the second references one that genuinely is.
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-old-outgoing-bad-gitlink-{suffix}"));
+        let parent = base.join("main");
+        let parent_remote = base.join("main-remote.git");
+        let dep_remote = base.join("dep-remote.git");
+        let dep_seed = base.join("dep-seed");
+        fs::create_dir_all(&parent).unwrap();
+        fs::create_dir_all(&dep_seed).unwrap();
+        fs::create_dir_all(&dep_remote).unwrap();
+        fs::create_dir_all(&parent_remote).unwrap();
+        fs::write(parent.join("README.md"), "root").unwrap();
+        fs::write(dep_seed.join("module.txt"), "v0").unwrap();
+
+        run_git(&dep_remote, &["init", "--bare"]);
+        run_git(&parent_remote, &["init", "--bare"]);
+        for path in [&parent, &dep_seed] {
+            run_git(path, &["init"]);
+            run_git(path, &["config", "user.email", "test@example.com"]);
+            run_git(path, &["config", "user.name", "Test User"]);
+            run_git(path, &["add", "."]);
+            run_git(path, &["commit", "-m", "Initial"]);
+        }
+        run_git(&dep_seed, &["remote", "add", "origin", dep_remote.to_str().unwrap()]);
+        run_git(&dep_seed, &["-c", "protocol.file.allow=always", "push", "origin", "HEAD:main"]);
+        run_git(&parent, &["-c", "protocol.file.allow=always", "submodule", "add", dep_remote.to_str().unwrap(), "vendor/dep"]);
+        run_git(&parent, &["commit", "-am", "Add dep submodule"]);
+        run_git(&parent, &["remote", "add", "origin", parent_remote.to_str().unwrap()]);
+
+        let parent_path = parent.to_string_lossy().into_owned();
+        let sub_path = parent.join("vendor/dep");
+        run_git(&sub_path, &["config", "user.email", "test@example.com"]);
+        run_git(&sub_path, &["config", "user.name", "Test User"]);
+        let init_sha = git(&sub_path.to_string_lossy(), &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+
+        // Commit A: bumps the submodule to a commit that will never be pushed.
+        fs::write(sub_path.join("module.txt"), "x1").unwrap();
+        run_git(&sub_path, &["commit", "-am", "X1"]);
+        let x1 = git(&sub_path.to_string_lossy(), &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+        stage_files_inner(&parent_path, vec!["vendor/dep".into()]).unwrap();
+        commit_selected_internal(&parent_path, &["vendor/dep".to_string()], "Bump to X1").unwrap();
+
+        // Discard X1 from the submodule's own checkout (its own remote never
+        // sees it) and commit a genuinely different, sibling commit instead —
+        // X1 stays permanently unreachable from origin, not merely "not yet".
+        run_git(&sub_path, &["reset", "--hard", &init_sha]);
+        fs::write(sub_path.join("module.txt"), "x2").unwrap();
+        run_git(&sub_path, &["commit", "-am", "X2"]);
+        run_git(&sub_path, &["-c", "protocol.file.allow=always", "push", "origin", "HEAD:main"]);
+
+        // Commit B: bumps the submodule again, to the commit that IS pushed.
+        stage_files_inner(&parent_path, vec!["vendor/dep".into()]).unwrap();
+        commit_selected_internal(&parent_path, &["vendor/dep".to_string()], "Bump to X2").unwrap();
+
+        let violations = unpushed_submodule_references(&parent_path, "main", "origin", None).unwrap();
+        assert_eq!(violations.len(), 1, "only X1 (carried by the older, already-superseded commit A) should be flagged, not X2: {violations:?}");
+        assert_eq!(violations[0].risk, "unpushed");
+        assert_eq!(violations[0].submodule_oid, x1, "the flagged reference must be the older, unreachable one");
+        assert_eq!(violations[0].commit_subject, "Bump to X1");
+
+        let blocked = publish_branch(parent_path.clone(), "main".into(), "origin".into(), String::new(), String::new(), String::new(), false);
+        assert!(blocked.is_err(), "publishing must be blocked while an older outgoing commit still carries an unreachable submodule gitlink");
+        let message = blocked.unwrap_err();
+        assert!(message.contains("vendor/dep"), "message should name the affected submodule, got: {message}");
+        assert!(!message.starts_with("UNPUSHED_SUBMODULE_OVERRIDABLE::"), "a submodule that HAS a remote and simply wasn't pushed must never be overridable — push it instead, got: {message}");
+        // Confirm the override can't bypass this either — "unpushed" (has a
+        // remote, just isn't reachable yet) is never overridable, unlike
+        // "no_remote"/"unverifiable".
+        let still_blocked = publish_branch(parent_path, "main".into(), "origin".into(), String::new(), String::new(), String::new(), true);
+        assert!(still_blocked.is_err(), "override_unpushed_submodules must never bypass a risk of 'unpushed' — only push can fix that");
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn publish_branch_requires_an_explicit_override_for_a_submodule_with_no_remote_at_all() {
+        // Point 4 of the submodule-publish-safety report: a submodule that has
+        // no remote configured at all can never be verified as safe to
+        // reference from a published parent commit — default behavior must
+        // still be safe (blocked), but since this genuinely can never be
+        // fixed by pushing, an explicit, informed override must be able to
+        // proceed anyway.
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-no-remote-override-{suffix}"));
+        let parent = base.join("parent"); let dependency = base.join("dependency");
+        let parent_remote = base.join("main-remote.git");
+        create_libgit2_repository(&parent, "README.md"); create_libgit2_repository(&dependency, "module.txt");
+        fs::create_dir_all(&parent_remote).unwrap();
+        run_git(&parent_remote, &["init", "--bare"]);
+        let parent_string = parent.to_string_lossy().into_owned();
+        let added = add_submodule_inner(parent_string.clone(), "".into(), dependency.to_string_lossy().into_owned(), "dep".into(), String::new(), String::new()).unwrap();
+        create_commit(parent_string.clone(), "Add dep submodule".into()).unwrap();
+        run_git(&parent, &["remote", "add", "origin", parent_remote.to_str().unwrap()]);
+        // create_libgit2_repository (git2's own Repository::init) picks its own
+        // default branch name, independent of this machine's `git init`
+        // config — read back whatever it actually is instead of assuming "main".
+        let branch = Repository::open(&parent).unwrap().head().unwrap().shorthand().unwrap().to_string();
+        // Publish "Add dep submodule" now, before touching anything else, so
+        // it's no longer outgoing — only the one commit made below is,
+        // keeping this test's own single (path, oid) reference unambiguous.
+        run_git(&parent, &["-c", "protocol.file.allow=always", "push", "origin", &format!("HEAD:{branch}")]);
+
+        // add_submodule_inner's clone auto-configures "origin" pointing back
+        // at `dependency` itself (ordinary clone behavior) — remove it so the
+        // submodule genuinely has no remote at all, matching the report's
+        // exact scenario, not merely "has one but wasn't pushed to it".
+        run_git(&parent.join(&added), &["remote", "remove", "origin"]);
+        fs::write(parent.join(&added).join("module.txt"), "v2").unwrap();
+        commit_submodule_inner(parent_string.clone(), added.clone(), "Update module".into(), false).unwrap();
+        stage_files_inner(&parent_string, vec![added.clone()]).unwrap();
+        commit_selected_internal(&parent_string, &[added.clone()], "Bump dep").unwrap();
+
+        let violations = unpushed_submodule_references(&parent_string, &branch, "origin", None).unwrap();
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].risk, "no_remote");
+
+        let blocked = publish_branch(parent_string.clone(), branch.clone(), "origin".into(), String::new(), String::new(), String::new(), false);
+        assert!(blocked.is_err(), "must be blocked by default — this can never be verified as safe");
+        assert!(blocked.unwrap_err().starts_with("UNPUSHED_SUBMODULE_OVERRIDABLE::"), "a no-remote submodule must be override-eligible, since pushing it is never an option");
+
+        let overridden = publish_branch(parent_string, branch, "origin".into(), String::new(), String::new(), String::new(), true);
+        assert!(overridden.is_ok(), "an explicit override must be able to proceed: {overridden:?}");
 
         fs::remove_dir_all(base).unwrap();
     }
@@ -8468,7 +8824,7 @@ mod tests {
 
         // Commit locally without pushing: should report exactly 1 unpushed commit.
         fs::write(sub_path.join("module.txt"), "v2").unwrap();
-        commit_submodule_inner(repo_path.clone(), "vendor/dep".into(), "Local only".into()).unwrap();
+        commit_submodule_inner(repo_path.clone(), "vendor/dep".into(), "Local only".into(), false).unwrap();
         let status = submodule_push_status(&sub_path.to_string_lossy());
         assert!(status.as_deref().is_some_and(|message| message.contains("1 commit") && message.contains("needs push")), "expected an unpushed-commit message, got: {status:?}");
 
@@ -8652,7 +9008,7 @@ mod tests {
         // Now create a REAL divergence: local commits something new, and the remote
         // (via the other clone) also moves again — neither is an ancestor of the other.
         fs::write(sub_path.join("module.txt"), "local edit").unwrap();
-        commit_submodule_inner(repo_path.clone(), "vendor/dep".into(), "Local divergent commit".into()).unwrap();
+        commit_submodule_inner(repo_path.clone(), "vendor/dep".into(), "Local divergent commit".into(), false).unwrap();
         fs::write(other_clone.join("module.txt"), "remote diverges too").unwrap();
         run_git(&other_clone, &["commit", "-am", "Remote diverges too"]);
         run_git(&other_clone, &["-c", "protocol.file.allow=always", "push", "origin", "HEAD:main"]);
@@ -8668,8 +9024,11 @@ mod tests {
         assert!(forced.is_ok(), "force_push_submodule should succeed even when diverged, got: {:?}", forced);
         let remote_content = git(&dep_remote.to_string_lossy(), &["show", "main:module.txt"]).unwrap();
         assert_eq!(remote_content.trim(), "local edit", "the remote should now match the local (forced) content");
+        // Staged (not auto-committed — see the submodule-publish-safety
+        // report) after a force push too, exactly like an ordinary push.
         let parent_changes = load_repository_inner(repo_path, Some(true)).unwrap().changes;
-        assert!(!parent_changes.iter().any(|change| change.path == "vendor/dep"), "the parent should be auto-updated after a force push too");
+        let dep_change = parent_changes.iter().find(|change| change.path == "vendor/dep").expect("the submodule's gitlink change should be listed, staged, after a force push");
+        assert!(dep_change.staged, "the parent's reference should be staged after a force push too");
 
         fs::remove_dir_all(base).unwrap();
     }
