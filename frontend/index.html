@@ -413,7 +413,24 @@
       <footer><button value="cancel">Cancel</button><button type="button" value="default" id="confirmNewBranch" class="confirm">Create branch</button></footer>
     </form>
   </dialog>
+
+  <dialog id="newTagDialog" class="publish-dialog">
+    <form method="dialog">
+      <header><div><h2>Create tag</h2><p>Tags the submodule's current commit exactly as it is — never anything uncommitted in its working tree.</p></div><button value="cancel">×</button></header>
+      <div class="publish-explain" style="margin-top:17px;">
+        <b id="newTagSubmoduleName">—</b>
+        <span id="newTagContext">—</span>
+        <span id="newTagDirtyNotice" hidden>This submodule has uncommitted changes — the tag will still point at its last commit, not at those changes.</span>
+      </div>
+      <label class="commit-scope-label" style="margin:0 18px 12px;"><span>TAG NAME</span><input id="newTagName" placeholder="e.g. v1.0" autocomplete="off"></label>
+      <label class="commit-scope-label" style="margin:0 18px 12px;"><span>MESSAGE (OPTIONAL — MAKES IT AN ANNOTATED TAG)</span><textarea id="newTagMessage" placeholder="Leave empty for a lightweight tag"></textarea></label>
+      <label class="commit-scope-label row" style="margin:0 18px 12px;"><input type="checkbox" id="newTagPush"><span>Push this tag to the submodule's remote right after creating it</span></label>
+      <p id="newTagStatus" class="submodule-operation-status" role="status" style="margin:0 18px 12px;"></p>
+      <footer><button value="cancel">Cancel</button><button type="button" value="default" id="confirmNewTag" class="confirm">Create tag</button></footer>
+    </form>
+  </dialog>
   <script src="graph-model.js"></script>
+  <script src="submodule-versions.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

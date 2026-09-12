@@ -1112,18 +1112,59 @@ async function openSubmoduleMenu(entry, x, y) {
   } catch (error) { if (stillCurrent() && submoduleMenuEntry === entry) refs.submoduleVersions.innerHTML = `<div class="version-loading">${esc(String(error))}</div>`; }
 }
 
+// Submodule-branch-selector report, point 3: every row now always shows its
+// own short SHA (in a stable-width column — see the CSS — so the rest of the
+// row stays aligned) plus a Copy SHA action, and a local branch with a
+// configured upstream shows its ahead/behind state inline. `versionRowHtml`
+// is shared by every section below so all of them render identically.
+function versionRowHtml(item, kindLabel, symbol) {
+  const upstreamState = item.kind === 'branch' && item.upstream
+    ? `<span class="version-upstream-state">⇄ ${item.ahead || 0}↑ ${item.behind || 0}↓ · ${esc(item.upstream)}</span>`
+    : item.kind === 'branch' ? '<span class="version-upstream-state version-no-upstream">no upstream</span>' : '';
+  return `<button class="version-row ${item.current ? 'current' : ''}" data-revision="${esc(item.revision)}" data-version-kind="${esc(item.kind)}" data-name="${esc(item.name)}">
+    <span class="version-symbol">${symbol[item.kind] || '⑂'}</span>
+    <span class="version-sha"><code>${esc(item.revision.slice(0, 8))}</code><span class="version-copy-sha" role="button" tabindex="0" title="Copy full SHA" data-copy-sha="${esc(item.revision)}">⧉</span></span>
+    <span class="version-name">${esc(item.name)}<b class="version-kind-badge">${esc(kindLabel[item.kind] || item.kind)}</b>${item.kind === 'tag' ? `<span class="version-attached-branch">${item.attached_branch ? `on ⑂ ${esc(item.attached_branch)}` : 'no branch here (detached)'}</span>` : upstreamState}</span>
+    <span class="version-copy"><span class="version-subject">${esc(item.subject)}</span><span class="version-meta">${esc(item.author)} · ${esc(item.date)}</span></span>
+    ${item.current ? '<span class="current-label">CURRENT</span>' : ''}
+  </button>`;
+}
+
 function renderSubmoduleVersions() {
   if (!submoduleMenuData) return;
   refs.currentSubmoduleVersion.textContent = `${submoduleMenuData.current_branch || 'detached'} · ${submoduleMenuData.current_revision.slice(0, 8)}`;
+  const newVersionButton = $('#submoduleMenuNewBranch');
+  newVersionButton.textContent = versionFilter === 'tag' ? '＋ New tag…' : '＋ New branch…';
+  newVersionButton.title = versionFilter === 'tag' ? 'Create a new tag in this submodule, at its current commit' : 'Create a new branch in this submodule, from its current commit';
   const query = refs.submoduleVersionSearch.value.trim().toLowerCase();
-  const versions = submoduleMenuData.versions
-    .filter(item => versionFilter === 'branch' ? ['branch', 'remote'].includes(item.kind) : versionFilter === 'tag' ? item.kind === 'tag' : item.kind === 'commit')
-    .filter(item => !query || `${item.name} ${item.attached_branch || ''}`.toLowerCase().includes(query));
+  const matches = item => !query || `${item.name} ${item.attached_branch || ''} ${item.upstream || ''}`.toLowerCase().includes(query);
   const kindLabel = { branch: 'BRANCH', remote: 'REMOTE BRANCH', tag: 'TAG', commit: 'COMMIT (detached)' };
   const symbol = { commit: '●', tag: '◆' };
-  refs.submoduleVersions.innerHTML = versions.map(item => `<button class="version-row ${item.current ? 'current' : ''}" data-revision="${esc(item.revision)}" data-version-kind="${esc(item.kind)}" data-name="${esc(item.name)}">
-    <span class="version-symbol">${symbol[item.kind] || '⑂'}</span><span class="version-name">${esc(item.name)}<b class="version-kind-badge">${esc(kindLabel[item.kind] || item.kind)}</b>${item.kind === 'tag' ? `<span class="version-attached-branch">${item.attached_branch ? `on ⑂ ${esc(item.attached_branch)}` : 'no branch here (detached)'}</span>` : ''}</span><span class="version-copy"><span class="version-subject">${esc(item.subject)}</span><span class="version-meta">${esc(item.author)} · ${esc(item.date)}</span></span>${item.current ? '<span class="current-label">CURRENT</span>' : ''}</button>`).join('') || `<div class="version-loading">${query ? 'No matches' : versionFilter === 'tag' ? 'No tags in this submodule' : 'No versions found'}</div>`;
-  refs.submoduleVersions.querySelectorAll('[data-revision]').forEach(row => row.addEventListener('click', () => switchSubmoduleVersion(row.dataset.revision, row.dataset.versionKind, row.dataset.name)));
+
+  let html;
+  if (versionFilter === 'branch') {
+    // Point 3: a local branch and its own tracking remote are one thing, not
+    // two confusing, duplicate-looking rows — only a remote-tracking branch
+    // with no local counterpart gets its own "Remote only" section.
+    const { local, remoteOnly } = groupSubmoduleBranchVersions(submoduleMenuData.versions);
+    const localRows = local.filter(matches);
+    const remoteRows = remoteOnly.filter(matches);
+    html = localRows.map(item => versionRowHtml(item, kindLabel, symbol)).join('')
+      + (remoteRows.length ? `<div class="version-section-heading">REMOTE ONLY</div>${remoteRows.map(item => versionRowHtml(item, kindLabel, symbol)).join('')}` : '')
+      || `<div class="version-loading">${query ? 'No matches' : 'No branches found'}</div>`;
+  } else {
+    const versions = submoduleMenuData.versions.filter(item => versionFilter === 'tag' ? item.kind === 'tag' : item.kind === 'commit').filter(matches);
+    html = versions.map(item => versionRowHtml(item, kindLabel, symbol)).join('') || `<div class="version-loading">${query ? 'No matches' : versionFilter === 'tag' ? 'No tags in this submodule' : 'No versions found'}</div>`;
+  }
+  refs.submoduleVersions.innerHTML = html;
+  refs.submoduleVersions.querySelectorAll('[data-revision]').forEach(row => row.addEventListener('click', event => {
+    if (event.target.closest('[data-copy-sha]')) return; // handled by its own listener below, never switches the version
+    switchSubmoduleVersion(row.dataset.revision, row.dataset.versionKind, row.dataset.name);
+  }));
+  refs.submoduleVersions.querySelectorAll('[data-copy-sha]').forEach(button => button.addEventListener('click', event => {
+    event.stopPropagation();
+    navigator.clipboard?.writeText(button.dataset.copySha).then(() => status('Copied SHA to clipboard')).catch(() => {});
+  }));
 }
 
 async function switchSubmoduleVersion(revision, kind, name) {
@@ -1353,6 +1394,40 @@ async function createSubmoduleBranch(entry) {
   openNewBranchDialog(entry);
 }
 
+// Submodule-tag-creation report, point 4: reads submoduleMenuData (already
+// loaded to open the version-selector popup this is triggered from) for the
+// current branch/detached state and target SHA, instead of a fresh backend
+// call — that data is already exactly current, and this dialog only ever
+// opens right after it was fetched.
+function openCreateSubmoduleTagDialog(entry) {
+  if (entry.kind !== 'submodule' || !submoduleMenuData) return;
+  state.newTagTarget = entry;
+  $('#newTagSubmoduleName').textContent = `${entry.name} (submodule)`;
+  const branchState = submoduleMenuData.current_branch ? `on branch ⑂ ${submoduleMenuData.current_branch}` : 'detached HEAD';
+  $('#newTagContext').textContent = `${branchState} · will tag ${submoduleMenuData.current_revision.slice(0, 8)}`;
+  $('#newTagDirtyNotice').hidden = !entry.status;
+  $('#newTagName').value = ''; $('#newTagMessage').value = ''; $('#newTagPush').checked = false;
+  $('#newTagStatus').textContent = ''; $('#confirmNewTag').disabled = true;
+  $('#newTagDialog').showModal();
+  $('#newTagName').focus();
+}
+$('#newTagName').addEventListener('input', () => { $('#confirmNewTag').disabled = !$('#newTagName').value.trim(); });
+$('#confirmNewTag').addEventListener('click', async () => {
+  const target = state.newTagTarget; if (!target) return;
+  const name = $('#newTagName').value.trim(); if (!name) return;
+  const confirmButton = $('#confirmNewTag');
+  confirmButton.disabled = true; confirmButton.textContent = 'Creating…';
+  try {
+    const result = await invoke('create_submodule_tag', { repositoryPath: state.repository.path, relativePath: target.relative_path, tagName: name, message: $('#newTagMessage').value.trim(), push: $('#newTagPush').checked });
+    $('#newTagDialog').close();
+    directoryCache.clear(); if (state.selectedEntry?.relative_path === target.relative_path) await selectEntry(target.relative_path);
+    const pushNote = !$('#newTagPush').checked ? '' : result.pushed ? ` ${result.push_detail}` : ` Not pushed: ${result.push_detail}`;
+    const msg = `${target.name}: tag "${name}" created at ${result.target.slice(0, 8)} (${result.annotated ? 'annotated' : 'lightweight'}).${pushNote}`;
+    status(msg); showOperationToast(msg, !$('#newTagPush').checked || result.pushed ? 'success' : '');
+  } catch (error) { $('#newTagStatus').textContent = String(error); confirmButton.disabled = false; }
+  finally { confirmButton.textContent = 'Create tag'; }
+});
+
 async function openEntryOnServer(entry, submodule) {
   if (!invoke) return status(`Preview: open ${entry.name} on server`);
   try {
@@ -1378,18 +1453,17 @@ async function commitSubmoduleChanges(entry) {
   if (!invoke) return status(`Preview: committed changes in ${entry.name}`);
   try {
     status(`Committing changes in ${entry.name}…`, 'busy');
-    // Submodule-publish-safety report: this used to also silently create a
-    // parent commit right here, whether or not anything had been pushed
-    // anywhere — exactly how "Publish main project" could end up shipping a
-    // gitlink that pointed at a commit that only ever existed on this
-    // machine. also_push:true keeps the one-click convenience (commit, then
-    // immediately try to push) without ever touching the parent on commit
-    // alone; the parent's gitlink is only ever staged, and only once that
-    // push actually succeeds — never committed automatically either way.
-    const result = await invoke('commit_submodule', { repositoryPath: state.repository.path, relativePath: entry.relative_path, message: message.trim(), alsoPush: true });
+    // Push-submodule-workflow report, point 1: "Commit submodule" creates
+    // only a local commit — it must not automatically push (also_push:
+    // false). This used to also silently create a parent commit right here
+    // regardless, whether or not anything had been pushed anywhere — exactly
+    // how "Publish main project" could end up shipping a gitlink that
+    // pointed at a commit that only ever existed on this machine. Push
+    // remains its own separate, explicit action ("Push submodule").
+    const result = await invoke('commit_submodule', { repositoryPath: state.repository.path, relativePath: entry.relative_path, message: message.trim(), alsoPush: false });
     directoryCache.clear(); await loadRepository(state.repository.path, { reopenPath: state.currentPath });
     const successMsg = `${entry.name}: committed inside the submodule. ${result.push_detail}`;
-    status(successMsg); showOperationToast(successMsg, result.pushed ? 'success' : '');
+    status(successMsg); showOperationToast(successMsg);
   }
   catch (error) { const message2 = handleError(error); showOperationToast(`Commit failed: ${message2}`, 'error'); }
 }
@@ -1653,6 +1727,23 @@ async function forcePushSubmodule(entry) {
 // Shows the actual commits about to be pushed — before, this was a plain
 // "push this submodule?" confirm with no list, which was the whole complaint:
 // you had no way to see what you were about to send anywhere.
+// Push-submodule-workflow report, point 1: show the actual destination
+// before pushing — branch, remote URL, local/remote SHA, ahead/behind — not
+// just the commit list. Always reads the submodule's own currently
+// checked-out branch (push_submodule_preview_inner's own doc comment), so
+// this can never show a stale or wrong destination.
+function pushPreviewHtml(preview) {
+  const shortSha = preview.local_sha.slice(0, 8);
+  const destination = preview.will_create_remote_branch ? `${shortSha} → origin/${esc(preview.branch)} <i>(new branch)</i>` : `${shortSha} → ${esc(preview.upstream || `origin/${preview.branch}`)}`;
+  const counts = preview.will_create_remote_branch ? 'Nothing to compare yet — this branch has never been pushed' : `${preview.ahead} ahead, ${preview.behind} behind`;
+  return `<div class="push-preview">
+    <div class="push-preview-row"><span>Branch</span><code>${esc(preview.branch)}</code></div>
+    <div class="push-preview-row"><span>Destination</span><code>${destination}</code></div>
+    <div class="push-preview-row"><span>Remote</span><code>${esc(preview.remote_url)}</code></div>
+    <div class="push-preview-row"><span>Ahead / behind</span><span>${esc(counts)}</span></div>
+  </div>`;
+}
+
 async function pushSubmodule(entry) {
   if (entry.kind !== 'submodule') return;
   if (!invoke) return status(`Preview: pushed ${entry.name}`);
@@ -1661,10 +1752,17 @@ async function pushSubmodule(entry) {
   $('#submodulePublishSummary').textContent = 'Checking…'; $('#submodulePublishStatus').textContent = '';
   $('#confirmSubmodulePublish').disabled = true;
   $('#submodulePublishDialog').showModal();
-  let commits = [];
-  try { const details = await invoke('entry_details', { repositoryPath: state.repository.path, relativePath: entry.relative_path }); commits = details.submodule_unpushed_commits || []; }
+  let commits = []; let previewHtml = '';
+  try {
+    const [details, preview] = await Promise.all([
+      invoke('entry_details', { repositoryPath: state.repository.path, relativePath: entry.relative_path }),
+      invoke('push_submodule_preview', { repositoryPath: state.repository.path, relativePath: entry.relative_path }).catch(error => { previewHtml = `<div class="publish-empty">${esc(String(error))}</div>`; return null; }),
+    ]);
+    commits = details.submodule_unpushed_commits || [];
+    if (preview) previewHtml = pushPreviewHtml(preview);
+  }
   catch (error) { $('#submodulePublishCommits').innerHTML = `<div class="publish-empty">${esc(String(error))}</div>`; return; }
-  $('#submodulePublishCommits').innerHTML = commits.map((commit, index) => `<div class="publish-commit"><span>${index + 1}</span><i></i><div><strong>${commitSubjectHtml(commit.subject)}</strong><small>${esc(commit.id.slice(0, 8))} · ${esc(commit.author)} · ${esc(commit.date)}</small></div><b>WILL PUSH</b></div>`).join('') || '<div class="publish-empty">Nothing to push — already up to date, or this submodule has no upstream.</div>';
+  $('#submodulePublishCommits').innerHTML = previewHtml + (commits.map((commit, index) => `<div class="publish-commit"><span>${index + 1}</span><i></i><div><strong>${commitSubjectHtml(commit.subject)}</strong><small>${esc(commit.id.slice(0, 8))} · ${esc(commit.author)} · ${esc(commit.date)}</small></div><b>WILL PUSH</b></div>`).join('') || '<div class="publish-empty">Nothing to push — already up to date, or this submodule has no upstream.</div>');
   $('#submodulePublishSummary').textContent = `${commits.length} commit${commits.length === 1 ? '' : 's'} to push`;
   $('#confirmSubmodulePublish').disabled = !commits.length;
 
@@ -2855,17 +2953,32 @@ async function openPublish() {
 // out" can only mean "stop pushing at the commit before it": clicking a
 // commit sets it as the cutoff (included, along with everything older);
 // everything newer than it is left unpublished for now.
+// Submodule-publish-safety report, point 2: fetched once per refreshPublish
+// and re-prepended on every renderPublishCommits call (including the ones
+// triggered later by clicking a cutoff checkbox) — the outgoing commits stay
+// fully visible either way; this only ever adds a warning above them,
+// exactly what "mark them with a warning instead of hiding them" asks for.
+let publishSubmoduleRisksHtml = '';
+function submodulePublishRisksHtml(risks) {
+  if (!risks.length) return '';
+  const reasonText = risk => risk.risk === 'unpushed' ? 'has a commit not yet pushed to its own remote' : risk.risk === 'no_remote' ? 'has no remote configured at all' : risk.risk === 'local_only' ? `is only reachable from a local path or file:// URL (${esc(risk.configured_url || '?')})` : 'could not be checked locally';
+  const items = risks.map(risk => `<li><code>${esc(risk.relative_path)}</code> ${reasonText(risk)} — references <code>${esc(risk.submodule_oid.slice(0, 8))}</code> (${esc(risk.commit_subject)})</li>`).join('');
+  const hardBlocking = risks.some(risk => risk.risk === 'unpushed');
+  const headline = hardBlocking ? 'Publishing is blocked until the submodule below is pushed:' : 'Some submodule references may be local-only — another clone might not be able to restore them:';
+  return `<div class="submodule-publish-safety-warning">⚠️ ${headline}<ul>${items}</ul></div>`;
+}
+
 function renderPublishCommits() {
   const commits = state.publish?.commits || [];
   const uptoIndex = state.publishUpto ? commits.findIndex(commit => commit.id === state.publishUpto) : commits.length - 1;
-  refs.publishCommits.innerHTML = commits.map((commit, index) => {
+  refs.publishCommits.innerHTML = publishSubmoduleRisksHtml + (commits.map((commit, index) => {
     const willPush = index <= uptoIndex;
     return `<div class="publish-commit ${willPush ? '' : 'excluded'}" data-commit-id="${esc(commit.id)}">
       <span>${index + 1}</span><input type="checkbox" class="publish-check" data-index="${index}" ${willPush ? 'checked' : ''}>
       <div><strong>${esc(commit.subject)}</strong><small>${esc(commit.id.slice(0, 8))} · ${esc(commit.author)} · ${esc(commit.date)}</small></div>
       ${willPush ? (index === uptoIndex && index < commits.length - 1 ? '<b class="publish-cutoff-badge" data-tooltip="Everything above stays local for now">WILL PUSH · stop here</b>' : '<b>WILL PUSH</b>') : '<b class="publish-held-back">STAYS LOCAL</b>'}
     </div>`;
-  }).join('') || '<div class="publish-empty">This branch is already up to date on the server.</div>';
+  }).join('') || '<div class="publish-empty">This branch is already up to date on the server.</div>');
   // Git can only push a contiguous range from the oldest pending commit
   // forward — unchecking one always means "and everything newer than it
   // too" (they were built on top of it), checking one always means "and
@@ -2896,9 +3009,15 @@ async function refreshPublish() {
   if (!branch || !remote) { refs.publishCommits.innerHTML = '<div class="publish-empty">Configure a remote before publishing.</div>'; refs.publishSummary.textContent = 'Nothing to publish'; $('#confirmPublish').disabled = true; return; }
   const stillCurrent = refreshPublishGuard();
   refs.publishDestination.textContent = `${branch} → ${remote}/${branch}`; refs.publishCommits.innerHTML = '<div class="loading-row"><i class="spinner"></i>Checking server state…</div>';
-  const publish = invoke ? await invoke('publish_status', { repositoryPath: state.repository.path, branch, remote }) : { branch, remote, commits: previewData.commits.slice(0, 2) };
+  const [publish, risks] = invoke
+    ? await Promise.all([
+        invoke('publish_status', { repositoryPath: state.repository.path, branch, remote }),
+        invoke('submodule_publish_risks', { repositoryPath: state.repository.path, branch, remote, uptoCommit: '' }).catch(() => []),
+      ])
+    : [{ branch, remote, commits: previewData.commits.slice(0, 2) }, []];
   if (!stillCurrent() || refs.publishBranch.value !== branch || refs.publishRemote.value !== remote) return; // repository changed, or the dialog's own selection moved on
   state.publish = publish;
+  publishSubmoduleRisksHtml = submodulePublishRisksHtml(risks);
   renderPublishCommits();
   refs.publishBadge.textContent = state.publish.commits.length; refs.publishSubtitle.textContent = state.publish.commits.length ? `${state.publish.commits.length} local commits not on ${remote}` : 'Everything is on the server';
   updatePublishSummary();
@@ -3408,7 +3527,18 @@ refs.reloadFolder.addEventListener('click', () => {
 document.addEventListener('keydown', event => { if (event.key !== 'Escape' || state.view !== 'commander' || document.querySelector('dialog[open]')) return; event.preventDefault(); returnToProjectNavigator(); });
 refs.remoteRef.addEventListener('change', () => { state.remoteRef = refs.remoteRef.value; openCommanderDirectory(state.commanderPath); });
 $('#closeSubmoduleMenu').addEventListener('click', () => { refs.submoduleMenu.hidden = true; });
-$('#submoduleMenuNewBranch').addEventListener('click', () => { refs.submoduleMenu.hidden = true; if (state.selectedEntry?.kind === 'submodule') createSubmoduleBranch(state.selectedEntry); });
+// Uses submoduleMenuEntry (the entry the popup was actually opened for), not
+// state.selectedEntry — this panel isn't modal, so the selection elsewhere in
+// the app can move on while it's still open; reusing that here would be
+// exactly the "leaks into a previously selected submodule" mistake the
+// submodule-branch-selector report warns against (submoduleOpenGraph, right
+// below, already gets this right).
+$('#submoduleMenuNewBranch').addEventListener('click', () => {
+  if (!submoduleMenuEntry || submoduleMenuEntry.kind !== 'submodule') return;
+  const entry = submoduleMenuEntry;
+  refs.submoduleMenu.hidden = true;
+  if (versionFilter === 'tag') openCreateSubmoduleTagDialog(entry); else createSubmoduleBranch(entry);
+});
 document.querySelectorAll('[data-version-filter]').forEach(button => button.addEventListener('click', () => {
   versionFilter = button.dataset.versionFilter; document.querySelectorAll('[data-version-filter]').forEach(item => item.classList.toggle('active', item === button)); renderSubmoduleVersions();
 }));

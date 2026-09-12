@@ -428,8 +428,21 @@ button { cursor: default; }
 .version-tabs { display: flex; align-items: center; gap: 3px; padding: 9px 11px 7px; border-bottom: 1px solid var(--border-soft); }.version-tabs button { height: 29px; padding: 0 11px; border: 0; border-radius: 6px; background: transparent; color: #8fa0b0; font-size: 11px; }.version-tabs button.active { background: #234566; color: #e7f3ff; }.version-tabs .version-graph-link { margin-left: auto; color: #6f95b8; }.version-tabs .version-graph-link:hover { color: #bcdcff; background: #1d2a36; }
 .version-search { margin: 0 11px 9px; width: calc(100% - 22px); height: 28px; padding: 0 10px; border: 1px solid var(--border-soft); border-radius: 6px; background: #131b23; color: #d6e2ec; font-size: 11px; }.version-search:focus { outline: none; border-color: #3a6ea5; }.version-search::placeholder { color: #5a6c7d; }
 .version-attached-branch { font-family: -apple-system, sans-serif; font-size: 9px; color: #7fb88f; }
-.version-list { min-height: 100px; max-height: 360px; overflow: auto; padding: 5px; }.version-row { width: 100%; min-height: 53px; display: grid; grid-template-columns: 24px minmax(100px, 135px) 1fr auto; align-items: center; gap: 8px; padding: 5px 9px; border: 1px solid transparent; border-radius: 7px; background: transparent; text-align: left; }.version-row:hover { border-color: #35495c; background: #1d2a36; }.version-row.current { background: #18334d; }.version-symbol { color: var(--purple); font-size: 16px; }.version-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 11px ui-monospace, SFMono-Regular, Consolas, monospace; color: #c5d4e2; display: flex; flex-direction: column; gap: 3px; align-items: flex-start; }.version-kind-badge { padding: 1px 5px; border-radius: 4px; background: #2a3a4a; color: #8fb3d9; font-size: 8px; font-family: -apple-system, sans-serif; font-weight: 700; letter-spacing: .3px; }.version-copy { min-width: 0; display: flex; flex-direction: column; gap: 3px; }.version-subject { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }.version-meta { color: #748697; font-size: 10px; }.current-label { padding: 2px 6px; border-radius: 8px; background: #2b6c4a; color: #bff1d1; font-size: 9px; }
+.version-list { min-height: 100px; max-height: 360px; overflow: auto; padding: 5px; }.version-row { width: 100%; min-height: 53px; display: grid; grid-template-columns: 24px 78px minmax(100px, 135px) 1fr auto; align-items: center; gap: 8px; padding: 5px 9px; border: 1px solid transparent; border-radius: 7px; background: transparent; text-align: left; }.version-row:hover { border-color: #35495c; background: #1d2a36; }.version-row.current { background: #18334d; }.version-symbol { color: var(--purple); font-size: 16px; }.version-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 11px ui-monospace, SFMono-Regular, Consolas, monospace; color: #c5d4e2; display: flex; flex-direction: column; gap: 3px; align-items: flex-start; }.version-kind-badge { padding: 1px 5px; border-radius: 4px; background: #2a3a4a; color: #8fb3d9; font-size: 8px; font-family: -apple-system, sans-serif; font-weight: 700; letter-spacing: .3px; }.version-copy { min-width: 0; display: flex; flex-direction: column; gap: 3px; }.version-subject { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }.version-meta { color: #748697; font-size: 10px; }.current-label { padding: 2px 6px; border-radius: 8px; background: #2b6c4a; color: #bff1d1; font-size: 9px; }
 .version-loading { display: flex; align-items: center; justify-content: center; gap: 9px; height: 100px; color: var(--muted); }.version-help { min-height: 34px; padding: 9px 14px; border-top: 1px solid var(--border); background: #131a21; color: #758697; font-size: 10px; }
+/* Submodule-branch-selector report, point 3: a fixed-width SHA column (the
+   78px slot in .version-row's own grid-template-columns above) so every row
+   stays aligned regardless of subject/name length, plus its Copy action, the
+   local-branch ahead/behind line, and the "Remote only" section divider. */
+.version-sha { display: flex; align-items: center; gap: 5px; font: 11px ui-monospace, SFMono-Regular, Consolas, monospace; color: #9fb7cc; }
+.version-copy-sha { cursor: pointer; color: #5f7386; font-size: 11px; }
+.version-copy-sha:hover { color: #bcdcff; }
+.version-upstream-state { font-family: -apple-system, sans-serif; font-size: 9px; color: #7fb88f; }
+.version-upstream-state.version-no-upstream { color: #6b7d8d; }
+.version-section-heading { margin: 8px 4px 3px; padding: 0 5px; color: #5a6c7d; font-size: 9px; font-weight: 700; letter-spacing: .6px; }
+.commit-scope-label textarea { min-height: 52px; padding: 8px 10px; border: 1px solid #405365; border-radius: 6px; background: #0d151c; color: #d4e1eb; font-size: 12px; font-family: inherit; resize: vertical; }
+.commit-scope-label.row { flex-direction: row; align-items: center; gap: 8px; }
+.commit-scope-label.row input[type="checkbox"] { height: auto; width: auto; }
 
 footer { display: flex; align-items: center; gap: 8px; padding: 0 12px; background: #0b1015; border-top: 1px solid var(--border); color: #7f8f9f; font-size: 11px; }
 .footer-spacer { flex: 1; }.status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); }.status-dot.error { background: var(--red); }.status-dot.busy { background: var(--amber); }.branch-footer { padding-left: 14px; border-left: 1px solid var(--border); }.branch-footer b { color: #a8b8c7; }
@@ -461,6 +474,14 @@ dialog form { padding: 28px; text-align: center; }dialog h2 { margin: 0 0 10px; 
 .publish-commit:not(.excluded) { cursor: pointer; }
 .publish-cutoff-badge { color: #ffcd8f !important; }
 .publish-held-back { color: #728595 !important; }
+.push-preview { padding: 11px 13px; border-bottom: 1px solid var(--border-soft); background: #101a23; }
+.push-preview-row { display: flex; align-items: baseline; gap: 8px; padding: 2px 0; font-size: 10.5px; }
+.push-preview-row > span:first-child { flex: none; width: 82px; color: #728595; }
+.push-preview-row code { color: #cce8ff; font: 11px ui-monospace, SFMono-Regular, Consolas, monospace; overflow-wrap: anywhere; }
+.push-preview-row i { color: #8ec9ff; font-style: normal; }
+.submodule-publish-safety-warning { margin: 0 18px 12px; padding: 11px 13px; border-left: 3px solid var(--amber); background: #2a2114; color: #ffd9a0; font-size: 11px; }
+.submodule-publish-safety-warning ul { margin: 6px 0 0; padding-left: 18px; }
+.submodule-publish-safety-warning li { margin: 3px 0; }
 .publish-check { width: 15px; height: 15px; accent-color: var(--blue); cursor: pointer; }
 .commit-scope-label { display: flex; flex-direction: column; gap: 6px; margin: 0 18px 12px; color: #7f92a3; font-size: 9px; letter-spacing: .8px; }.commit-scope-label input { height: 36px; border: 1px solid #405365; border-radius: 6px; padding: 0 10px; background: #0d151c; color: #d4e1eb; font-size: 13px; }
 .conflicts-list { max-height: 330px; overflow: auto; margin: 0 18px 14px; border: 1px solid var(--border); border-radius: 7px; }
