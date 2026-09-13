@@ -2314,6 +2314,18 @@ pub fn write_text_file(repository_path: String, relative_path: String, content: 
     if !target.is_file() { return Err("The selected path is not a file".into()); }
     if content.len() > 2_000_000 { return Err("Only text files up to 2 MB can be edited".into()); }
     fs::write(target, content).map_err(|error| error.to_string())?;
+    // The frontend always calls this with the *parent's* repository_path,
+    // even when relative_path points inside a submodule (its own editor has
+    // no separate notion of "which repo" — see read_text_file's own call
+    // sites) — invalidating only that path left the submodule's own cached
+    // status stale until something else happened to refresh it, so a file
+    // just edited *inside* a submodule kept showing as clean there (the
+    // parent's own row for the submodule still updated correctly, since its
+    // cache was invalidated — only the submodule's own, separately cached
+    // view of itself was missed). Invalidate both.
+    if let Some((sub_path, _inner)) = resolve_submodule_boundary(&repository_path, &relative_path) {
+        invalidate_git_metadata(&sub_path);
+    }
     invalidate_git_metadata(&repository_path);
     Ok(())
 }
@@ -5699,6 +5711,52 @@ mod tests {
         assert!(git(&cloned, &["diff", "--cached", "--name-only"]).unwrap().lines().any(|path| path == "README.md"));
         assert_eq!(browser_repository_url("git@github.com:team/project.git").as_deref(), Some("https://github.com/team/project"));
         assert_eq!(browser_repository_url("https://gitlab.example/team/project.git").as_deref(), Some("https://gitlab.example/team/project"));
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn editing_a_file_inside_a_submodule_through_the_editor_shows_up_as_modified_there() {
+        // Reported bug: editing a file *inside* a submodule via the app's
+        // built-in editor stopped showing that file (and the submodule
+        // itself) as modified. Root cause: the editor's frontend always
+        // calls write_text_file/read_text_file with the *parent's*
+        // repository_path (it has no separate notion of "which repo" —
+        // relative_path alone carries it into the submodule), so
+        // write_text_file only ever invalidated the parent's own cached
+        // status. The parent's own row for the submodule still updated
+        // correctly (its cache was the one invalidated) — but the
+        // submodule's *own*, separately cached view of itself (what the
+        // Explorer shows once you actually navigate inside it) kept
+        // serving the stale, pre-edit "clean" status for up to
+        // GIT_METADATA_TTL.
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-edit-in-submodule-{suffix}"));
+        let parent = base.join("parent"); let dependency = base.join("dependency");
+        create_libgit2_repository(&parent, "README.md"); create_libgit2_repository(&dependency, "module.txt");
+        let parent_string = parent.to_string_lossy().into_owned();
+        let added = add_submodule_inner(parent_string.clone(), "".into(), dependency.to_string_lossy().into_owned(), "dep".into(), String::new(), String::new()).unwrap();
+        create_commit(parent_string.clone(), "Add dep submodule".into()).unwrap();
+        let sub_path = parent.join(&added);
+        let sub_path_string = sub_path.to_string_lossy().into_owned();
+
+        // Warm the submodule's own cache with the pre-edit, clean status —
+        // exactly what browsing into it in the Explorer would have already
+        // done before the edit.
+        let before = load_directory(sub_path_string.clone(), "".into(), Some(true)).unwrap();
+        let file_before = before.iter().find(|entry| entry.relative_path == "module.txt").expect("module.txt should be listed");
+        assert_eq!(file_before.status, "", "should be clean before editing");
+
+        // Edit it the same way the app's own editor does: repositoryPath is
+        // always the *parent's*, relativePath crosses into the submodule.
+        write_text_file(parent_string, format!("{added}/module.txt"), "edited content".into()).unwrap();
+
+        // A fresh (unforced — this must not require the user to know to
+        // force-refresh) listing of the submodule's own directory must now
+        // show it as modified.
+        let after = load_directory(sub_path_string, "".into(), None).unwrap();
+        let file_after = after.iter().find(|entry| entry.relative_path == "module.txt").expect("module.txt should still be listed");
+        assert_eq!(file_after.status, "M", "editing the file must show up as modified when browsing inside the submodule itself, not just in the parent's own row for it");
 
         fs::remove_dir_all(base).unwrap();
     }
