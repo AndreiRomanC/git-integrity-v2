@@ -1,5 +1,5 @@
 use serde::Serialize;
-use git2::{BranchType, ObjectType, Repository, Sort, Status, StatusOptions};
+use git2::{BranchType, ObjectType, Oid, Repository, Sort, Status, StatusOptions};
 use std::{collections::{HashMap, HashSet}, fs, path::{Component, Path, PathBuf}, process::Command, sync::{Arc, Mutex, OnceLock}, time::{Instant, Duration, UNIX_EPOCH}};
 
 // Temporary performance diagnostics: appends "<label>: <ms>ms" lines to a log
@@ -368,28 +368,25 @@ fn cached_unpushed_paths(repository: &str) -> Arc<HashSet<String>> {
     data
 }
 
-// Whether one specific submodule (keyed by its own absolute path — globally
-// unique, unlike a parent-relative path) has local commits not yet pushed to
-// its own origin. Deliberately per-submodule, not "every submodule in the
-// repository at once": load_directory used to answer this by calling
-// submodule_push_status (opens a whole separate Repository, walks up to 50
-// commits) synchronously for every submodule *entry in the repository*, on
-// every single folder listing, regardless of whether that submodule was
-// even in the folder being shown — real, serial cost that only got worse
-// the more submodules the repository had (measured against a real
-// case with hundreds). Each submodule that's actually *visible* in a
-// listing gets its own cached answer, checked and populated independently
-// — opening folder A with 2 submodules never touches the other 498
-// elsewhere in the repository, and a folder revisited later, or a sibling
-// folder sharing one of the same submodules, reuses the cached answer
-// instead of reopening it. Deliberately not cleared by the general
-// invalidate_git_metadata (an ordinary file stage/commit doesn't change any
-// submodule's own push status) — only invalidate_submodule_sync does,
-// alongside the actions that can actually affect it.
-static SUBMODULE_UNPUSHED_CACHE: OnceLock<Mutex<HashMap<String, (Instant, bool)>>> = OnceLock::new();
+// One consolidated snapshot per changed, visible submodule. It answers the
+// dirty/HEAD/origin questions in one repository open and one status scan,
+// instead of separate synchronous scans for each badge. Clean synchronized
+// rows do not enter this cache at all. It is deliberately invalidated only
+// by actions that can affect a submodule, not by unrelated parent file work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SubmoduleRemoteRelation { OnOrigin, PushNeeded, SyncNeeded, DetachedNeedsBranch, NoOrigin, Unknown }
 
-fn submodule_unpushed_cache() -> &'static Mutex<HashMap<String, (Instant, bool)>> {
-    SUBMODULE_UNPUSHED_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+#[derive(Clone, Debug)]
+struct SubmoduleStateSnapshot {
+    dirty: bool,
+    head_oid: Option<Oid>,
+    remote_relation: SubmoduleRemoteRelation,
+}
+
+static SUBMODULE_STATE_CACHE: OnceLock<Mutex<HashMap<String, (Instant, SubmoduleStateSnapshot)>>> = OnceLock::new();
+
+fn submodule_state_cache() -> &'static Mutex<HashMap<String, (Instant, SubmoduleStateSnapshot)>> {
+    SUBMODULE_STATE_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 // Single-flight per submodule path, same shape as status_scan_lock: two
@@ -403,19 +400,56 @@ fn submodule_unpushed_lock(sub_path: &str) -> Arc<Mutex<()>> {
     locks.entry(sub_path.to_string()).or_insert_with(|| Arc::new(Mutex::new(()))).clone()
 }
 
-fn cached_submodule_has_unpushed(sub_path: &str) -> bool {
-    if let Some((cached_at, value)) = submodule_unpushed_cache().lock().unwrap().get(sub_path) {
-        if cached_at.elapsed() < INDEX_METADATA_TTL { return *value; }
+fn remote_relation(repo: &Repository, head_oid: Oid) -> SubmoduleRemoteRelation {
+    if repo.find_remote("origin").is_err() { return SubmoduleRemoteRelation::NoOrigin; }
+    if repo.head_detached().unwrap_or(true) {
+        let on_origin = repo.references_glob("refs/remotes/origin/*").ok().is_some_and(|references| references.flatten().any(|reference| {
+            reference.target().is_some_and(|remote_oid| remote_oid == head_oid || repo.graph_descendant_of(remote_oid, head_oid).unwrap_or(false))
+        }));
+        return if on_origin { SubmoduleRemoteRelation::OnOrigin } else { SubmoduleRemoteRelation::DetachedNeedsBranch };
+    }
+    let branch = match repo.head().ok().and_then(|head| head.shorthand().map(str::to_string)) {
+        Some(branch) => branch,
+        None => return SubmoduleRemoteRelation::Unknown,
+    };
+    let remote_oid = match repo.find_reference(&format!("refs/remotes/origin/{branch}")).ok().and_then(|reference| reference.target()) {
+        Some(oid) => oid,
+        None => return SubmoduleRemoteRelation::PushNeeded,
+    };
+    match repo.graph_ahead_behind(head_oid, remote_oid) {
+        Ok((0, 0)) => SubmoduleRemoteRelation::OnOrigin,
+        Ok((ahead, 0)) if ahead > 0 => SubmoduleRemoteRelation::PushNeeded,
+        Ok(_) => SubmoduleRemoteRelation::SyncNeeded,
+        Err(_) => SubmoduleRemoteRelation::Unknown,
+    }
+}
+
+fn inspect_submodule_state_in(repo: &Repository) -> SubmoduleStateSnapshot {
+    let head_oid = repo.head().ok().and_then(|head| head.target());
+    let dirty = !internal_statuses(repo, None).unwrap_or_default().is_empty();
+    let remote_relation = head_oid.map(|oid| remote_relation(repo, oid)).unwrap_or(SubmoduleRemoteRelation::Unknown);
+    SubmoduleStateSnapshot { dirty, head_oid, remote_relation }
+}
+
+fn inspect_submodule_state(sub_path: &str) -> SubmoduleStateSnapshot {
+    internal_submodule_repository(Path::new(sub_path)).map(|repo| inspect_submodule_state_in(&repo)).unwrap_or(SubmoduleStateSnapshot {
+        dirty: false, head_oid: None, remote_relation: SubmoduleRemoteRelation::Unknown,
+    })
+}
+
+fn cached_submodule_state(sub_path: &str) -> SubmoduleStateSnapshot {
+    if let Some((cached_at, value)) = submodule_state_cache().lock().unwrap().get(sub_path) {
+        if cached_at.elapsed() < INDEX_METADATA_TTL { return value.clone(); }
     }
     let lock_handle = submodule_unpushed_lock(sub_path);
     let _guard = lock_handle.lock().unwrap();
     // Re-check after acquiring the lock — a concurrent caller for this exact
     // submodule may have just finished the real scan while this one waited.
-    if let Some((cached_at, value)) = submodule_unpushed_cache().lock().unwrap().get(sub_path) {
-        if cached_at.elapsed() < INDEX_METADATA_TTL { return *value; }
+    if let Some((cached_at, value)) = submodule_state_cache().lock().unwrap().get(sub_path) {
+        if cached_at.elapsed() < INDEX_METADATA_TTL { return value.clone(); }
     }
-    let value = submodule_push_status(sub_path).is_some();
-    submodule_unpushed_cache().lock().unwrap().insert(sub_path.to_string(), (Instant::now(), value));
+    let value = inspect_submodule_state(sub_path);
+    submodule_state_cache().lock().unwrap().insert(sub_path.to_string(), (Instant::now(), value.clone()));
     value
 }
 
@@ -501,6 +535,11 @@ pub struct DirectoryEntry {
     // regardless of push state; "M" + submodule_is_dirty is genuinely dirty
     // content and should look like any other modification.
     submodule_is_dirty: bool,
+    // A compact, mutually-exclusive workflow state derived from the
+    // submodule HEAD/working tree, origin tracking ref, and the parent
+    // repository's HEAD/index gitlinks. The frontend only translates this
+    // code into copy; it never guesses Git state from a generic "M".
+    submodule_state: String,
     // True when this file is fully committed (no working-tree status at all)
     // but the commit that last touched it isn't on the upstream branch yet —
     // or, for a folder, when something inside it is in that state. Lets the
@@ -533,6 +572,7 @@ pub struct EntryDetails {
     submodule_unpushed_commits: Vec<PublishCommit>,
     // See DirectoryEntry's own doc comment — same signal, same reason.
     submodule_is_dirty: bool,
+    submodule_state: String,
     last_commit_id: Option<String>,
     last_commit_subject: Option<String>,
     last_commit_author: Option<String>,
@@ -1208,7 +1248,7 @@ fn invalidate_git_metadata(repository: &str) {
     unpushed_paths_cache().lock().unwrap().remove(repository);
     full_status_cache().lock().unwrap().remove(repository);
     sorted_lookups_cache().lock().unwrap().remove(repository);
-    // submodule_unpushed_cache is deliberately NOT cleared here:
+    // submodule_state_cache is deliberately NOT cleared here:
     // invalidate_git_metadata runs after essentially every mutation,
     // including an ordinary file stage/commit that has nothing to do with
     // any submodule's own state — clearing it here would force the next
@@ -1259,6 +1299,35 @@ fn status_for(path: &str, statuses: &[(String, String)]) -> String {
     statuses.iter().find(|(changed, _)| changed == path).map(|(_, status)| status.clone())
         .or_else(|| statuses.iter().find(|(changed, _)| changed.starts_with(&prefix)).map(|_| "•".into()))
         .unwrap_or_default()
+}
+
+fn parent_gitlink_oid(repo: &Repository, relative_path: &str, from_index: bool) -> Option<Oid> {
+    if from_index {
+        return repo.index().ok()?.get_path(Path::new(relative_path), 0).map(|entry| entry.id);
+    }
+    repo.head().ok()?.peel_to_commit().ok()?.tree().ok()?.get_path(Path::new(relative_path)).ok().map(|entry| entry.id())
+}
+
+fn submodule_workflow_state(parent: &Repository, relative_path: &str, parent_unpushed: bool, snapshot: &SubmoduleStateSnapshot) -> String {
+    if snapshot.dirty { return "changes_inside".into(); }
+    let submodule_head = match snapshot.head_oid {
+        Some(oid) => oid,
+        None => return "unavailable".into(),
+    };
+    match snapshot.remote_relation {
+        SubmoduleRemoteRelation::PushNeeded => return "local_commit_push_needed".into(),
+        SubmoduleRemoteRelation::SyncNeeded => return "sync_needed".into(),
+        SubmoduleRemoteRelation::DetachedNeedsBranch => return "detached_choose_branch".into(),
+        SubmoduleRemoteRelation::NoOrigin => return "origin_missing".into(),
+        SubmoduleRemoteRelation::Unknown => return "status_unknown".into(),
+        SubmoduleRemoteRelation::OnOrigin => {}
+    }
+    let index_oid = parent_gitlink_oid(parent, relative_path, true);
+    if index_oid != Some(submodule_head) { return "on_origin_stage_project".into(); }
+    let committed_oid = parent_gitlink_oid(parent, relative_path, false);
+    if committed_oid != Some(submodule_head) { return "on_origin_commit_project".into(); }
+    if parent_unpushed { return "project_commit_push_needed".into(); }
+    "synced".into()
 }
 
 // Lets the UI show exactly which commit this binary was built from — set at
@@ -1600,11 +1669,11 @@ pub fn open_commit_on_server(repository_path: String, commit_id: String, submodu
 // from the general invalidate_git_metadata (which also fires on every
 // ordinary file stage/commit that has nothing to do with submodules).
 fn invalidate_submodule_sync(repository: &str) {
-    // Prefix match, not a single exact key: submodule_unpushed_cache is keyed
+    // Prefix match, not a single exact key: submodule_state_cache is keyed
     // by each submodule's own absolute path (repository/relative/...), not
     // by the parent's path.
     let prefix = format!("{repository}/");
-    submodule_unpushed_cache().lock().unwrap().retain(|key, _| key != repository && !key.starts_with(&prefix));
+    submodule_state_cache().lock().unwrap().retain(|key, _| key != repository && !key.starts_with(&prefix));
 }
 
 // A fast, read-only, additive first phase for *opening a repository specifically*
@@ -2340,6 +2409,10 @@ pub fn write_text_file(repository_path: String, relative_path: String, content: 
     // view of itself was missed). Invalidate both.
     if let Some((sub_path, _inner)) = resolve_submodule_boundary(&repository_path, &relative_path) {
         invalidate_git_metadata(&sub_path);
+        // The consolidated Explorer state (dirty / push / parent step) has
+        // its own per-submodule cache. An edit inside the submodule changes
+        // that state even though it does not move HEAD.
+        invalidate_submodule_sync(&repository_path);
     }
     invalidate_git_metadata(&repository_path);
     Ok(())
@@ -3656,7 +3729,7 @@ pub fn list_directory_fast(repository_path: String, relative_path: String) -> Re
         let metadata = item.metadata().map_err(|error| error.to_string())?;
         let kind = if metadata.file_type().is_symlink() { "symlink" } else if metadata.is_dir() { "folder" } else { "file" }.to_string();
         let modified = metadata.modified().ok().and_then(|time| time.duration_since(UNIX_EPOCH).ok()).map(|value| value.as_secs()).unwrap_or(0);
-        entries.push(DirectoryEntry { name, relative_path: relative_string, kind, status: String::new(), tracked: false, size: if metadata.is_file() { metadata.len() } else { 0 }, modified, submodule_has_unpushed_commits: false, submodule_is_dirty: false, unpushed: false, status_known: false });
+        entries.push(DirectoryEntry { name, relative_path: relative_string, kind, status: String::new(), tracked: false, size: if metadata.is_file() { metadata.len() } else { 0 }, modified, submodule_has_unpushed_commits: false, submodule_is_dirty: false, submodule_state: String::new(), unpushed: false, status_known: false });
     }
     entries.sort_by_cached_key(|entry| (!matches!(entry.kind.as_str(), "folder" | "submodule"), entry.name.to_lowercase()));
     perf_log(&format!("list_directory_fast: TOTAL ({} entries, {relative_path})", entries.len()), started.elapsed());
@@ -3693,7 +3766,7 @@ pub fn load_directory(repository_path: String, relative_path: String, force: Opt
     // of silently serving up to 5-minute-old data back at them.
     if force.unwrap_or(false) {
         invalidate_git_metadata(status_repo);
-        // invalidate_git_metadata deliberately leaves submodule_unpushed_cache
+        // invalidate_git_metadata deliberately leaves submodule_state_cache
         // alone (an ordinary stage/commit elsewhere has nothing to do with
         // any submodule's own push status) — but an explicit forced reload
         // is the one signal that *should* also bypass it, same reasoning as
@@ -3702,7 +3775,7 @@ pub fn load_directory(repository_path: String, relative_path: String, force: Opt
         // just the submodules under this folder's own repository, not every
         // submodule cached anywhere.
         let prefix = format!("{status_repo}/");
-        submodule_unpushed_cache().lock().unwrap().retain(|key, _| key != status_repo && !key.starts_with(&prefix));
+        submodule_state_cache().lock().unwrap().retain(|key, _| key != status_repo && !key.starts_with(&prefix));
     }
     let step = Instant::now();
     let git_metadata = cached_git_metadata(status_repo, status_scope);
@@ -3739,6 +3812,10 @@ pub fn load_directory(repository_path: String, relative_path: String, force: Opt
         if statuses_sorted.get(idx).map(|(path, _)| path.starts_with(&prefix)).unwrap_or(false) { "•".to_string() } else { String::new() }
     };
     let mut entries = Vec::new();
+    // Open the owning repository once for all visible submodule rows. Gitlink
+    // comparisons below are cheap index/tree lookups and must not rediscover
+    // the parent repository once per row.
+    let status_repository = internal_repository(status_repo).ok();
     let step = Instant::now();
     let mut submodule_count = 0usize;
 
@@ -3766,15 +3843,21 @@ pub fn load_directory(repository_path: String, relative_path: String, force: Opt
         let modified = metadata.modified().ok().and_then(|time| time.duration_since(UNIX_EPOCH).ok()).map(|value| value.as_secs()).unwrap_or(0);
         if kind == "submodule" { submodule_count += 1; }
         let status = status_for_entry(&status_key);
-        // Only the submodules actually visible in *this* folder, and only
-        // when there's even an "M" to explain, ever get the extra scan —
-        // see cached_submodule_has_unpushed's own doc comment, and
-        // submodule_is_dirty's doc comment on DirectoryEntry for why both
-        // still matter.
-        let submodule_has_unpushed_commits = kind == "submodule" && cached_submodule_has_unpushed(item.path().to_str().unwrap_or_default());
-        let submodule_is_dirty = kind == "submodule" && status == "M" && !cached_git_metadata(item.path().to_str().unwrap_or_default(), "").statuses.is_empty();
         let unpushed = if kind == "folder" { git_metadata.unpushed.contains(&status_key) || has_prefix(unpushed_sorted, &tracked_prefix) } else { git_metadata.unpushed.contains(&status_key) };
-        entries.push(DirectoryEntry { name, relative_path: relative_string, kind, status, tracked, size: if metadata.is_file() { metadata.len() } else { 0 }, modified, submodule_has_unpushed_commits, submodule_is_dirty, unpushed, status_known: true });
+        // A clean, fully synchronized submodule needs no sub-repository scan.
+        // Only a row whose parent status/unpushed information says there is
+        // something to explain gets one cached, consolidated inspection.
+        let submodule_snapshot = (kind == "submodule" && (!status.is_empty() || unpushed))
+            .then(|| cached_submodule_state(item.path().to_str().unwrap_or_default()));
+        let submodule_has_unpushed_commits = submodule_snapshot.as_ref().is_some_and(|snapshot| snapshot.remote_relation == SubmoduleRemoteRelation::PushNeeded);
+        let submodule_is_dirty = submodule_snapshot.as_ref().is_some_and(|snapshot| snapshot.dirty);
+        let submodule_state = match (&status_repository, &submodule_snapshot) {
+            (Some(parent), Some(snapshot)) => submodule_workflow_state(parent, &status_key, unpushed, snapshot),
+            _ if kind == "submodule" && unpushed => "project_commit_push_needed".into(),
+            _ if kind == "submodule" => "synced".into(),
+            _ => String::new(),
+        };
+        entries.push(DirectoryEntry { name, relative_path: relative_string, kind, status, tracked, size: if metadata.is_file() { metadata.len() } else { 0 }, modified, submodule_has_unpushed_commits, submodule_is_dirty, submodule_state, unpushed, status_known: true });
     }
     perf_log(&format!("load_directory: readdir loop ({} entries, {submodule_count} submodules)", entries.len()), step.elapsed());
     let step = Instant::now();
@@ -3842,29 +3925,33 @@ pub fn entry_details(repository_path: String, relative_path: String) -> Result<E
     // "describe this submodule" read. Open the submodule's own repo once
     // here and share it; the parent-side url/branch lookup is now a single
     // scan too (submodule_url_and_branch), not two.
-    let (submodule_url, submodule_branch, submodule_push_status, submodule_unpushed_commits, submodule_commit, submodule_is_dirty) = if kind == "submodule" {
+    let (submodule_url, submodule_branch, submodule_push_status, submodule_unpushed_commits, submodule_commit, submodule_snapshot) = if kind == "submodule" {
         let (url, branch) = submodule_url_and_branch(&repository_path, &relative_string);
         match internal_submodule_repository(&absolute) {
             Ok(sub_repo) => {
+                let snapshot = inspect_submodule_state_in(&sub_repo);
                 let push_status = submodule_push_status_in(&sub_repo);
                 let unpushed_commits = submodule_unpushed_commits_in(&sub_repo);
                 let commit = sub_repo.head().ok().and_then(|head| head.peel_to_commit().ok()).map(|commit| {
                     let author_name = commit.author().name().unwrap_or("Unknown").to_string();
                     (commit.id().to_string(), commit.summary().unwrap_or("No message").to_string(), author_name, short_date(commit.time().seconds()))
                 });
-                // See DirectoryEntry.submodule_is_dirty's own doc comment —
-                // reused directly on this already-open repo instead of
-                // going through cached_git_metadata a second time.
-                let is_dirty = !internal_statuses(&sub_repo, None).unwrap_or_default().is_empty();
-                (url, branch, push_status, unpushed_commits, commit, is_dirty)
+                (url, branch, push_status, unpushed_commits, commit, Some(snapshot))
             }
-            Err(_) => (url, branch, None, Vec::new(), None, false),
+            Err(_) => (url, branch, None, Vec::new(), None, None),
         }
-    } else { (None, None, None, Vec::new(), None, false) };
+    } else { (None, None, None, Vec::new(), None, None) };
+    let submodule_is_dirty = submodule_snapshot.as_ref().is_some_and(|snapshot| snapshot.dirty);
+    let submodule_state = if kind == "submodule" {
+        match (internal_repository(status_repo).ok(), submodule_snapshot.as_ref()) {
+            (Some(parent), Some(snapshot)) => submodule_workflow_state(&parent, status_scope, unpushed, snapshot),
+            _ => "unavailable".into(),
+        }
+    } else { String::new() };
 
     Ok(EntryDetails {
         name: absolute.file_name().and_then(|name| name.to_str()).unwrap_or(&relative_string).to_string(), relative_path: relative_string,
-        kind, status, tracked, unpushed, size: if metadata.is_file() { metadata.len() } else { 0 }, modified, item_count, submodule_url, submodule_branch, submodule_push_status, submodule_unpushed_commits, submodule_is_dirty,
+        kind, status, tracked, unpushed, size: if metadata.is_file() { metadata.len() } else { 0 }, modified, item_count, submodule_url, submodule_branch, submodule_push_status, submodule_unpushed_commits, submodule_is_dirty, submodule_state,
         last_commit_id: last.as_ref().map(|value| value.0.clone()),
         last_commit_subject: last.as_ref().map(|value| value.1.clone()), last_commit_author: last.as_ref().map(|value| value.2.clone()), last_commit_date: last.as_ref().map(|value| value.3.clone()),
         submodule_commit_id: submodule_commit.as_ref().map(|value| value.0.clone()),
@@ -3893,6 +3980,7 @@ pub fn entry_last_commit(repository_path: String, relative_path: String) -> Resu
 // Uses only already-known local refs (no fetch) so it's cheap enough to call every
 // time a submodule is selected. Tells the user, at a glance, whether the commit
 // they're looking at has actually reached the submodule's own remote yet.
+#[cfg(test)]
 fn submodule_push_status(sub_path: &str) -> Option<String> {
     submodule_push_status_in(&internal_submodule_repository(Path::new(sub_path)).ok()?)
 }
@@ -5797,10 +5885,12 @@ mod tests {
         let before = load_directory(sub_path_string.clone(), "".into(), Some(true)).unwrap();
         let file_before = before.iter().find(|entry| entry.relative_path == "module.txt").expect("module.txt should be listed");
         assert_eq!(file_before.status, "", "should be clean before editing");
+        let cached_before_edit = cached_submodule_state(&sub_path_string);
+        assert!(!cached_before_edit.dirty, "seed the Explorer's consolidated submodule-state cache as clean too");
 
         // Edit it the same way the app's own editor does: repositoryPath is
         // always the *parent's*, relativePath crosses into the submodule.
-        write_text_file(parent_string, format!("{added}/module.txt"), "edited content".into()).unwrap();
+        write_text_file(parent_string.clone(), format!("{added}/module.txt"), "edited content".into()).unwrap();
 
         // A fresh (unforced — this must not require the user to know to
         // force-refresh) listing of the submodule's own directory must now
@@ -5808,6 +5898,9 @@ mod tests {
         let after = load_directory(sub_path_string, "".into(), None).unwrap();
         let file_after = after.iter().find(|entry| entry.relative_path == "module.txt").expect("module.txt should still be listed");
         assert_eq!(file_after.status, "M", "editing the file must show up as modified when browsing inside the submodule itself, not just in the parent's own row for it");
+        let parent_listing = load_directory(parent_string, "".into(), None).unwrap();
+        let submodule_after = parent_listing.iter().find(|entry| entry.relative_path == added).expect("submodule should still be listed in its parent");
+        assert_eq!(submodule_after.submodule_state, "changes_inside", "the parent Explorer row must also drop the cached clean snapshot immediately after an in-app edit");
 
         fs::remove_dir_all(base).unwrap();
     }
@@ -9959,6 +10052,7 @@ mod tests {
         let clean = load_directory(repo_path.clone(), "vendor".into(), Some(true)).unwrap();
         let clean_entry = clean.iter().find(|e| e.name == "dep").unwrap();
         assert_eq!(clean_entry.status, "");
+        assert_eq!(clean_entry.submodule_state, "synced");
         assert!(!clean_entry.submodule_is_dirty);
         assert!(!clean_entry.submodule_has_unpushed_commits);
 
@@ -9967,6 +10061,7 @@ mod tests {
         let dirty = load_directory(repo_path.clone(), "vendor".into(), Some(true)).unwrap();
         let dirty_entry = dirty.iter().find(|e| e.name == "dep").unwrap();
         assert_eq!(dirty_entry.status, "M");
+        assert_eq!(dirty_entry.submodule_state, "changes_inside");
         assert!(dirty_entry.submodule_is_dirty, "an uncommitted edit inside the submodule, with its own HEAD unchanged, must be flagged dirty");
         let dirty_details = entry_details(repo_path.clone(), "vendor/dep".into()).unwrap();
         assert!(dirty_details.submodule_is_dirty, "entry_details must agree with load_directory");
@@ -9975,41 +10070,61 @@ mod tests {
         // State 3: a new commit, deliberately NOT pushed yet.
         fs::write(sub_path.join("module.txt"), "v2").unwrap();
         commit_submodule_inner(repo_path.clone(), "vendor/dep".into(), "Update module".into(), false).unwrap();
-        stage_files_inner(&repo_path, vec!["vendor/dep".into()]).unwrap();
         let unpushed = load_directory(repo_path.clone(), "vendor".into(), Some(true)).unwrap();
         let unpushed_entry = unpushed.iter().find(|e| e.name == "dep").unwrap();
         assert_eq!(unpushed_entry.status, "M");
+        assert_eq!(unpushed_entry.submodule_state, "local_commit_push_needed");
         assert!(!unpushed_entry.submodule_is_dirty, "a clean version bump is never 'dirty', pushed or not");
         assert!(unpushed_entry.submodule_has_unpushed_commits);
 
-        // State 4 — the exact reported scenario: that same new commit is now
-        // pushed to origin, but the parent still hasn't committed the staged
-        // gitlink. Must still read as a clean version bump, not "Modified".
-        push_submodule_inner(repo_path.clone(), "vendor/dep".into()).unwrap();
+        // State 4: pushed to origin, but not staged in the project yet.
+        run_git(&sub_path, &["push", "-u", "origin", "HEAD:main"]);
+        invalidate_submodule_sync(&repo_path);
         let pushed = load_directory(repo_path.clone(), "vendor".into(), Some(true)).unwrap();
         let pushed_entry = pushed.iter().find(|e| e.name == "dep").unwrap();
-        assert_eq!(pushed_entry.status, "M", "still only staged in the parent, not committed there");
+        assert_eq!(pushed_entry.status, "M");
+        assert_eq!(pushed_entry.submodule_state, "on_origin_stage_project");
         assert!(!pushed_entry.submodule_is_dirty, "pushing must not make the submodule 'dirty' — it's the safest state a version bump can be in");
         assert!(!pushed_entry.submodule_has_unpushed_commits, "it really was pushed");
-        let pushed_details = entry_details(repo_path, "vendor/dep".into()).unwrap();
+
+        // State 5: the pushed gitlink is staged, but not committed in parent.
+        stage_files_inner(&repo_path, vec!["vendor/dep".into()]).unwrap();
+        let staged = load_directory(repo_path.clone(), "vendor".into(), Some(true)).unwrap();
+        let staged_entry = staged.iter().find(|e| e.name == "dep").unwrap();
+        assert_eq!(staged_entry.submodule_state, "on_origin_commit_project");
+        let pushed_details = entry_details(repo_path.clone(), "vendor/dep".into()).unwrap();
         assert!(!pushed_details.submodule_is_dirty);
+        assert_eq!(pushed_details.submodule_state, "on_origin_commit_project");
         assert!(pushed_details.submodule_push_status.is_none(), "submodule_push_status must be None once pushed — this is exactly what the frontend used to (wrongly) rely on alone to decide 'New version'");
+
+        // State 6: parent committed the gitlink. Whether that parent commit
+        // still needs pushing is a parent-repository fact, not a submodule
+        // working-tree guess.
+        commit_selected_internal(&repo_path, &["vendor/dep".into()], "Record dep v2").unwrap();
+        let parent = internal_repository(&repo_path).unwrap();
+        let snapshot = inspect_submodule_state(sub_path.to_str().unwrap());
+        assert_eq!(submodule_workflow_state(&parent, "vendor/dep", true, &snapshot), "project_commit_push_needed");
+        assert_eq!(submodule_workflow_state(&parent, "vendor/dep", false, &snapshot), "synced");
+        drop(parent);
+
+        // State 7: a clean local-only commit made while detached cannot be
+        // described as a normal branch commit that is ready to push.
+        run_git(&sub_path, &["checkout", "--detach"]);
+        fs::write(sub_path.join("module.txt"), "v3-local-detached").unwrap();
+        run_git(&sub_path, &["commit", "-am", "Detached local work"]);
+        let detached = load_directory(repo_path, "vendor".into(), Some(true)).unwrap();
+        let detached_entry = detached.iter().find(|e| e.name == "dep").unwrap();
+        assert_eq!(detached_entry.submodule_state, "detached_choose_branch");
 
         fs::remove_dir_all(base).unwrap();
     }
 
     #[test]
-    fn load_directory_only_scans_submodules_actually_visible_in_the_listed_folder() {
-        // A real counter check, not a timing threshold: proves load_directory
-        // scans exactly the submodules on screen, never the rest of the
-        // repository's — the exact concern behind cached_submodule_has_unpushed
-        // being keyed per submodule path instead of "every submodule in the
-        // repository" (a real report: a repository with hundreds of
-        // submodules paid for scanning all of them just to show one folder
-        // with two). Uses 5 submodules split across two folders — small
-        // enough to build quickly in a test, but the property being checked
-        // (opening folder A never touches folder B's submodules) is exactly
-        // the same one that matters at 500.
+    fn load_directory_only_scans_visible_submodules_with_state_to_explain() {
+        // A real counter check, not a timing threshold: synchronized rows do
+        // not open/scan their sub-repositories at all. Only a visible row
+        // whose parent status says something changed gets one consolidated,
+        // cached inspection; hidden and clean siblings stay untouched.
         let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let base = std::env::temp_dir().join(format!("git-integrity-submodule-scan-scope-{suffix}"));
         let repository = base.join("main");
@@ -10033,8 +10148,11 @@ mod tests {
         run_git(&repository, &["commit", "-am", "Add 5 submodules across two folders"]);
         let repo_path = repository.to_string_lossy().into_owned();
 
+        // Only subA1 has a state that needs explaining in the Explorer.
+        fs::write(group_a[0].join("module.txt"), "dirty").unwrap();
+
         // Only groupA is ever listed.
-        let listing = load_directory(repo_path, "groupA".into(), None).unwrap();
+        let listing = load_directory(repo_path, "groupA".into(), Some(true)).unwrap();
         assert_eq!(listing.iter().filter(|e| e.kind == "submodule").count(), 2);
 
         // Filtered to this test's own repository prefix — the cache is a
@@ -10043,11 +10161,12 @@ mod tests {
         // flaky by construction; scoping to paths under this repository is
         // what actually proves the property under test.
         let repo_prefix = repository.to_string_lossy().into_owned();
-        let scanned: std::collections::HashSet<String> = submodule_unpushed_cache().lock().unwrap().keys()
+        let scanned: std::collections::HashSet<String> = submodule_state_cache().lock().unwrap().keys()
             .filter(|key| key.starts_with(&repo_prefix)).cloned().collect();
-        for sub in &group_a { assert!(scanned.contains(sub.to_str().unwrap()), "a submodule actually visible in the listed folder must have been scanned: {sub:?}"); }
+        assert!(scanned.contains(group_a[0].to_str().unwrap()), "the changed visible submodule must be scanned");
+        assert!(!scanned.contains(group_a[1].to_str().unwrap()), "a clean visible sibling must not be scanned");
         for sub in &group_b { assert!(!scanned.contains(sub.to_str().unwrap()), "a submodule in a folder that was never listed must NOT have been scanned: {sub:?}"); }
-        assert_eq!(scanned.len(), 2, "exactly the 2 visible submodules, not all 5 in the repository");
+        assert_eq!(scanned.len(), 1, "exactly the one changed visible submodule, not every visible or registered submodule");
 
         fs::remove_dir_all(base).unwrap();
     }
