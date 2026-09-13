@@ -483,11 +483,24 @@ pub struct DirectoryEntry {
     tracked: bool,
     size: u64,
     modified: u64,
-    // Only set for submodules: true when its "M" status is because it has new
-    // local commits not yet pushed (a version bump), not because its own
-    // working tree has genuinely uncommitted edits — the Explorer row can then
-    // say "New version" instead of "Modified locally".
+    // Only set for submodules: true when this submodule itself has commits
+    // not yet pushed to its own remote. Used only for the more detailed
+    // "New version locally (not pushed yet)" wording in Entry Details — see
+    // submodule_is_dirty below for what actually decides "New version" vs
+    // "Modified" in the first place.
     submodule_has_unpushed_commits: bool,
+    // Only set for submodules: false means its "M" status can only be a
+    // gitlink version bump (staged, pushed or not — see the
+    // submodule-status-labels report) rather than genuinely uncommitted
+    // content inside it, because the submodule's own working tree/index is
+    // clean. This used to be conflated with submodule_has_unpushed_commits
+    // above — which meant a submodule whose new commit was already safely
+    // pushed, but not yet committed in the parent, fell back to a plain
+    // "Modified" label indistinguishable from an ordinary dirty file. "M" +
+    // !submodule_is_dirty is the correct, complete signal for "New version"
+    // regardless of push state; "M" + submodule_is_dirty is genuinely dirty
+    // content and should look like any other modification.
+    submodule_is_dirty: bool,
     // True when this file is fully committed (no working-tree status at all)
     // but the commit that last touched it isn't on the upstream branch yet —
     // or, for a folder, when something inside it is in that state. Lets the
@@ -518,6 +531,8 @@ pub struct EntryDetails {
     submodule_branch: Option<String>,
     submodule_push_status: Option<String>,
     submodule_unpushed_commits: Vec<PublishCommit>,
+    // See DirectoryEntry's own doc comment — same signal, same reason.
+    submodule_is_dirty: bool,
     last_commit_id: Option<String>,
     last_commit_subject: Option<String>,
     last_commit_author: Option<String>,
@@ -3641,7 +3656,7 @@ pub fn list_directory_fast(repository_path: String, relative_path: String) -> Re
         let metadata = item.metadata().map_err(|error| error.to_string())?;
         let kind = if metadata.file_type().is_symlink() { "symlink" } else if metadata.is_dir() { "folder" } else { "file" }.to_string();
         let modified = metadata.modified().ok().and_then(|time| time.duration_since(UNIX_EPOCH).ok()).map(|value| value.as_secs()).unwrap_or(0);
-        entries.push(DirectoryEntry { name, relative_path: relative_string, kind, status: String::new(), tracked: false, size: if metadata.is_file() { metadata.len() } else { 0 }, modified, submodule_has_unpushed_commits: false, unpushed: false, status_known: false });
+        entries.push(DirectoryEntry { name, relative_path: relative_string, kind, status: String::new(), tracked: false, size: if metadata.is_file() { metadata.len() } else { 0 }, modified, submodule_has_unpushed_commits: false, submodule_is_dirty: false, unpushed: false, status_known: false });
     }
     entries.sort_by_cached_key(|entry| (!matches!(entry.kind.as_str(), "folder" | "submodule"), entry.name.to_lowercase()));
     perf_log(&format!("list_directory_fast: TOTAL ({} entries, {relative_path})", entries.len()), started.elapsed());
@@ -3750,11 +3765,16 @@ pub fn load_directory(repository_path: String, relative_path: String, force: Opt
         let tracked = git_metadata.submodules.contains(&status_key) || git_metadata.tracked.contains(&status_key) || has_prefix(tracked_sorted, &tracked_prefix);
         let modified = metadata.modified().ok().and_then(|time| time.duration_since(UNIX_EPOCH).ok()).map(|value| value.as_secs()).unwrap_or(0);
         if kind == "submodule" { submodule_count += 1; }
-        // Only the submodules actually visible in *this* folder ever get
-        // scanned — see cached_submodule_has_unpushed's own doc comment.
+        let status = status_for_entry(&status_key);
+        // Only the submodules actually visible in *this* folder, and only
+        // when there's even an "M" to explain, ever get the extra scan —
+        // see cached_submodule_has_unpushed's own doc comment, and
+        // submodule_is_dirty's doc comment on DirectoryEntry for why both
+        // still matter.
         let submodule_has_unpushed_commits = kind == "submodule" && cached_submodule_has_unpushed(item.path().to_str().unwrap_or_default());
+        let submodule_is_dirty = kind == "submodule" && status == "M" && !cached_git_metadata(item.path().to_str().unwrap_or_default(), "").statuses.is_empty();
         let unpushed = if kind == "folder" { git_metadata.unpushed.contains(&status_key) || has_prefix(unpushed_sorted, &tracked_prefix) } else { git_metadata.unpushed.contains(&status_key) };
-        entries.push(DirectoryEntry { name, relative_path: relative_string, kind, status: status_for_entry(&status_key), tracked, size: if metadata.is_file() { metadata.len() } else { 0 }, modified, submodule_has_unpushed_commits, unpushed, status_known: true });
+        entries.push(DirectoryEntry { name, relative_path: relative_string, kind, status, tracked, size: if metadata.is_file() { metadata.len() } else { 0 }, modified, submodule_has_unpushed_commits, submodule_is_dirty, unpushed, status_known: true });
     }
     perf_log(&format!("load_directory: readdir loop ({} entries, {submodule_count} submodules)", entries.len()), step.elapsed());
     let step = Instant::now();
@@ -3822,7 +3842,7 @@ pub fn entry_details(repository_path: String, relative_path: String) -> Result<E
     // "describe this submodule" read. Open the submodule's own repo once
     // here and share it; the parent-side url/branch lookup is now a single
     // scan too (submodule_url_and_branch), not two.
-    let (submodule_url, submodule_branch, submodule_push_status, submodule_unpushed_commits, submodule_commit) = if kind == "submodule" {
+    let (submodule_url, submodule_branch, submodule_push_status, submodule_unpushed_commits, submodule_commit, submodule_is_dirty) = if kind == "submodule" {
         let (url, branch) = submodule_url_and_branch(&repository_path, &relative_string);
         match internal_submodule_repository(&absolute) {
             Ok(sub_repo) => {
@@ -3832,15 +3852,19 @@ pub fn entry_details(repository_path: String, relative_path: String) -> Result<E
                     let author_name = commit.author().name().unwrap_or("Unknown").to_string();
                     (commit.id().to_string(), commit.summary().unwrap_or("No message").to_string(), author_name, short_date(commit.time().seconds()))
                 });
-                (url, branch, push_status, unpushed_commits, commit)
+                // See DirectoryEntry.submodule_is_dirty's own doc comment —
+                // reused directly on this already-open repo instead of
+                // going through cached_git_metadata a second time.
+                let is_dirty = !internal_statuses(&sub_repo, None).unwrap_or_default().is_empty();
+                (url, branch, push_status, unpushed_commits, commit, is_dirty)
             }
-            Err(_) => (url, branch, None, Vec::new(), None),
+            Err(_) => (url, branch, None, Vec::new(), None, false),
         }
-    } else { (None, None, None, Vec::new(), None) };
+    } else { (None, None, None, Vec::new(), None, false) };
 
     Ok(EntryDetails {
         name: absolute.file_name().and_then(|name| name.to_str()).unwrap_or(&relative_string).to_string(), relative_path: relative_string,
-        kind, status, tracked, unpushed, size: if metadata.is_file() { metadata.len() } else { 0 }, modified, item_count, submodule_url, submodule_branch, submodule_push_status, submodule_unpushed_commits,
+        kind, status, tracked, unpushed, size: if metadata.is_file() { metadata.len() } else { 0 }, modified, item_count, submodule_url, submodule_branch, submodule_push_status, submodule_unpushed_commits, submodule_is_dirty,
         last_commit_id: last.as_ref().map(|value| value.0.clone()),
         last_commit_subject: last.as_ref().map(|value| value.1.clone()), last_commit_author: last.as_ref().map(|value| value.2.clone()), last_commit_date: last.as_ref().map(|value| value.3.clone()),
         submodule_commit_id: submodule_commit.as_ref().map(|value| value.0.clone()),
@@ -9889,6 +9913,87 @@ mod tests {
         let forced = load_directory(repo_path, "vendor".into(), Some(true)).unwrap();
         let forced_entry = forced.iter().find(|e| e.name == "dep").unwrap();
         assert!(forced_entry.submodule_has_unpushed_commits, "force:true must invalidate the cache and report the real, current unpushed commit");
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn submodule_is_dirty_distinguishes_a_pushed_version_bump_from_genuinely_dirty_content() {
+        // Reported bug: a submodule that was committed and pushed to origin,
+        // but not yet committed into the parent project, showed the same
+        // plain "Modified" label as an ordinary dirty file — because the
+        // Explorer's "New version" gate checked submodule_has_unpushed_commits
+        // (a hard "no" once it's actually pushed) instead of whether the
+        // submodule itself has any dirty content at all. Walks through every
+        // relevant state and checks both load_directory and entry_details
+        // agree on submodule_is_dirty for each.
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-submodule-is-dirty-{suffix}"));
+        let repository = base.join("main");
+        let dep_remote = base.join("dep-remote.git");
+        let dep_seed = base.join("dep-seed");
+        fs::create_dir_all(&repository).unwrap();
+        fs::create_dir_all(&dep_seed).unwrap();
+        fs::create_dir_all(&dep_remote).unwrap();
+        fs::write(repository.join("README.md"), "root").unwrap();
+        fs::write(dep_seed.join("module.txt"), "v1").unwrap();
+        run_git(&dep_remote, &["init", "--bare"]);
+        for path in [&repository, &dep_seed] {
+            run_git(path, &["init"]);
+            run_git(path, &["config", "user.email", "test@example.com"]);
+            run_git(path, &["config", "user.name", "Test User"]);
+            run_git(path, &["add", "."]);
+            run_git(path, &["commit", "-m", "Initial"]);
+        }
+        run_git(&dep_seed, &["remote", "add", "origin", dep_remote.to_str().unwrap()]);
+        run_git(&dep_seed, &["-c", "protocol.file.allow=always", "push", "origin", "HEAD:main"]);
+        run_git(&repository, &["-c", "protocol.file.allow=always", "submodule", "add", dep_remote.to_str().unwrap(), "vendor/dep"]);
+        run_git(&repository, &["commit", "-am", "Add dep submodule"]);
+
+        let repo_path = repository.to_string_lossy().into_owned();
+        let sub_path = repository.join("vendor/dep");
+        run_git(&sub_path, &["config", "user.email", "test@example.com"]);
+        run_git(&sub_path, &["config", "user.name", "Test User"]);
+
+        // State 1: freshly synced, nothing to report anywhere.
+        let clean = load_directory(repo_path.clone(), "vendor".into(), Some(true)).unwrap();
+        let clean_entry = clean.iter().find(|e| e.name == "dep").unwrap();
+        assert_eq!(clean_entry.status, "");
+        assert!(!clean_entry.submodule_is_dirty);
+        assert!(!clean_entry.submodule_has_unpushed_commits);
+
+        // State 2: genuinely dirty content inside the submodule, HEAD unchanged.
+        fs::write(sub_path.join("module.txt"), "uncommitted edit").unwrap();
+        let dirty = load_directory(repo_path.clone(), "vendor".into(), Some(true)).unwrap();
+        let dirty_entry = dirty.iter().find(|e| e.name == "dep").unwrap();
+        assert_eq!(dirty_entry.status, "M");
+        assert!(dirty_entry.submodule_is_dirty, "an uncommitted edit inside the submodule, with its own HEAD unchanged, must be flagged dirty");
+        let dirty_details = entry_details(repo_path.clone(), "vendor/dep".into()).unwrap();
+        assert!(dirty_details.submodule_is_dirty, "entry_details must agree with load_directory");
+        run_git(&sub_path, &["checkout", "--", "module.txt"]); // back to clean
+
+        // State 3: a new commit, deliberately NOT pushed yet.
+        fs::write(sub_path.join("module.txt"), "v2").unwrap();
+        commit_submodule_inner(repo_path.clone(), "vendor/dep".into(), "Update module".into(), false).unwrap();
+        stage_files_inner(&repo_path, vec!["vendor/dep".into()]).unwrap();
+        let unpushed = load_directory(repo_path.clone(), "vendor".into(), Some(true)).unwrap();
+        let unpushed_entry = unpushed.iter().find(|e| e.name == "dep").unwrap();
+        assert_eq!(unpushed_entry.status, "M");
+        assert!(!unpushed_entry.submodule_is_dirty, "a clean version bump is never 'dirty', pushed or not");
+        assert!(unpushed_entry.submodule_has_unpushed_commits);
+
+        // State 4 — the exact reported scenario: that same new commit is now
+        // pushed to origin, but the parent still hasn't committed the staged
+        // gitlink. Must still read as a clean version bump, not "Modified".
+        push_submodule_inner(repo_path.clone(), "vendor/dep".into()).unwrap();
+        let pushed = load_directory(repo_path.clone(), "vendor".into(), Some(true)).unwrap();
+        let pushed_entry = pushed.iter().find(|e| e.name == "dep").unwrap();
+        assert_eq!(pushed_entry.status, "M", "still only staged in the parent, not committed there");
+        assert!(!pushed_entry.submodule_is_dirty, "pushing must not make the submodule 'dirty' — it's the safest state a version bump can be in");
+        assert!(!pushed_entry.submodule_has_unpushed_commits, "it really was pushed");
+        let pushed_details = entry_details(repo_path, "vendor/dep".into()).unwrap();
+        assert!(!pushed_details.submodule_is_dirty);
+        assert!(pushed_details.submodule_push_status.is_none(), "submodule_push_status must be None once pushed — this is exactly what the frontend used to (wrongly) rely on alone to decide 'New version'");
 
         fs::remove_dir_all(base).unwrap();
     }
