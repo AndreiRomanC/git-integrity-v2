@@ -41,9 +41,23 @@ function submoduleVersionRowHtml(item) {
   const kindLabel = { branch: 'BRANCH', remote: 'REMOTE BRANCH', tag: 'TAG', commit: 'COMMIT (detached)' };
   const symbol = { commit: '●', tag: '◆' };
   const revision = String(item.revision || '');
-  const upstreamState = item.kind === 'branch' && item.upstream
-    ? `<span class="version-upstream-state">⇄ ${item.ahead || 0}↑ ${item.behind || 0}↓ · ${esc(item.upstream)}</span>`
-    : item.kind === 'branch' ? '<span class="version-upstream-state version-no-upstream">no upstream</span>' : '';
+  // Spell the relationship out instead of showing only arrows. In a
+  // detached checkout these rows describe their own branch tips, not HEAD;
+  // wording such as "LOCAL + ORIGIN" / "ORIGIN NEWER" makes that boundary
+  // visible and avoids reading a branch's counts as the current checkout's.
+  let upstreamState = '';
+  if (item.kind === 'branch' && item.upstream) {
+    const ahead = Number(item.ahead) || 0;
+    const behind = Number(item.behind) || 0;
+    let relation;
+    if (ahead === 0 && behind === 0) relation = 'LOCAL + ORIGIN · in sync';
+    else if (ahead > 0 && behind === 0) relation = `LOCAL AHEAD · ${ahead} commit${ahead === 1 ? '' : 's'} to push`;
+    else if (ahead === 0 && behind > 0) relation = `ORIGIN NEWER · ${behind} commit${behind === 1 ? '' : 's'} to pull`;
+    else relation = `DIVERGED · ${ahead} ahead / ${behind} behind`;
+    upstreamState = `<span class="version-upstream-state" title="Branch ${esc(item.name)} compared with ${esc(item.upstream)}">${relation} · ${esc(item.upstream)}</span>`;
+  } else if (item.kind === 'branch') {
+    upstreamState = '<span class="version-upstream-state version-no-upstream">LOCAL · no upstream configured</span>';
+  }
   const tagContext = item.kind === 'tag'
     ? `<span class="version-attached-branch">${item.attached_branch ? `on ⑂ ${esc(item.attached_branch)}` : 'no branch here (detached)'}</span>`
     : upstreamState;

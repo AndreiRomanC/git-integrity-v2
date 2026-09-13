@@ -123,3 +123,21 @@ test('an up-to-date submodule keeps normal push disabled with the backend reason
   assert.equal(state.commits.length, 0);
   assert.equal(state.emptyMessage, 'Already up to date with origin/develop.');
 });
+
+test('branch rows explain ahead and behind in words and name the compared upstream', () => {
+  const ahead = submoduleVersionRowHtml({ name: 'develop', kind: 'branch', revision: 'aaaaaaaa1234', subject: 'Local work', author: 'A', date: '2026-09-13', upstream: 'origin/develop', ahead: 2, behind: 0 });
+  assert.match(ahead, /LOCAL AHEAD · 2 commits to push · origin\/develop/);
+  assert.match(ahead, /Branch develop compared with origin\/develop/);
+
+  const behind = submoduleVersionRowHtml({ name: 'main', kind: 'branch', revision: 'bbbbbbbb1234', subject: 'Old local tip', author: 'A', date: '2026-09-13', upstream: 'origin/main', ahead: 0, behind: 1 });
+  assert.match(behind, /ORIGIN NEWER · 1 commit to pull · origin\/main/);
+
+  const diverged = submoduleVersionRowHtml({ name: 'release', kind: 'branch', revision: 'cccccccc1234', subject: 'Both moved', author: 'A', date: '2026-09-13', upstream: 'origin/release', ahead: 3, behind: 4 });
+  assert.match(diverged, /DIVERGED · 3 ahead \/ 4 behind · origin\/release/);
+});
+
+test('a branch without upstream is explicitly local and does not show invented counts', () => {
+  const row = submoduleVersionRowHtml({ name: 'work', kind: 'branch', revision: 'dddddddd1234', subject: 'Work', author: 'A', date: '2026-09-13', upstream: null, ahead: null, behind: null });
+  assert.match(row, /LOCAL · no upstream configured/);
+  assert.doesNotMatch(row, /0 ahead|0 behind|in sync/);
+});

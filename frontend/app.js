@@ -1114,7 +1114,10 @@ async function openSubmoduleMenu(entry, x, y) {
 
 function renderSubmoduleVersions() {
   if (!submoduleMenuData) return;
-  refs.currentSubmoduleVersion.textContent = `${submoduleMenuData.current_branch || 'detached'} @ ${submoduleMenuData.current_revision.slice(0, 8)}`;
+  const currentShortSha = submoduleMenuData.current_revision.slice(0, 8);
+  refs.currentSubmoduleVersion.textContent = submoduleMenuData.current_branch
+    ? `${submoduleMenuData.current_branch} @ ${currentShortSha}`
+    : `Detached HEAD @ ${currentShortSha} · create or switch to a branch before push`;
   const newVersionButton = $('#submoduleMenuNewBranch');
   newVersionButton.textContent = versionFilter === 'tag' ? '＋ New tag…' : '＋ New branch…';
   newVersionButton.title = versionFilter === 'tag' ? 'Create a new tag in this submodule, at its current commit' : 'Create a new branch in this submodule, from its current commit';
@@ -1714,9 +1717,13 @@ async function forcePushSubmodule(entry) {
 function pushPreviewHtml(preview) {
   const shortSha = preview.local_sha.slice(0, 8);
   const destination = preview.will_create_remote_branch ? `${shortSha} → origin/${esc(preview.branch)} <i>(new branch)</i>` : `${shortSha} → ${esc(preview.upstream || `origin/${preview.branch}`)}`;
-  const counts = preview.will_create_remote_branch ? 'Nothing to compare yet — this branch has never been pushed' : `${preview.ahead} ahead, ${preview.behind} behind`;
+  const counts = preview.will_create_remote_branch
+    ? 'No origin branch yet — push will create it'
+    : preview.ahead === 0 && preview.behind === 0
+      ? `Local ${preview.branch} and ${preview.upstream || `origin/${preview.branch}`} are in sync`
+      : `Local ${preview.branch}: ${preview.ahead} ahead, ${preview.behind} behind ${preview.upstream || `origin/${preview.branch}`}`;
   return `<div class="push-preview">
-    <div class="push-preview-row"><span>Branch</span><code>${esc(preview.branch)}</code></div>
+    <div class="push-preview-row"><span>Current branch</span><code>${esc(preview.branch)}</code></div>
     <div class="push-preview-row"><span>Destination</span><code>${destination}</code></div>
     <div class="push-preview-row"><span>Remote</span><code>${esc(preview.remote_url)}</code></div>
     <div class="push-preview-row"><span>Ahead / behind</span><span>${esc(counts)}</span></div>
@@ -1736,7 +1743,11 @@ async function pushSubmodule(entry) {
   try {
     preview = await invoke('push_submodule_preview', { repositoryPath: state.repository.path, relativePath: entry.relative_path });
   }
-  catch (error) { $('#submodulePublishCommits').innerHTML = `<div class="publish-empty">${esc(String(error))}</div>`; return; }
+  catch (error) {
+    $('#submodulePublishSummary').textContent = 'Push unavailable';
+    $('#submodulePublishCommits').innerHTML = `<div class="publish-empty">${esc(String(error))}</div>`;
+    return;
+  }
   const pushState = submodulePushDialogState(preview);
   commits = pushState.commits;
   $('#submodulePublishCommits').innerHTML = pushPreviewHtml(preview) + (commits.map((commit, index) => `<div class="publish-commit"><span>${index + 1}</span><i></i><div><strong>${commitSubjectHtml(commit.subject)}</strong><small>${esc(commit.id.slice(0, 8))} · ${esc(commit.author)} · ${esc(commit.date)}</small></div><b>WILL PUSH</b></div>`).join('') || `<div class="publish-empty">${esc(pushState.emptyMessage)}</div>`);

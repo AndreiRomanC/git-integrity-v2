@@ -3948,7 +3948,17 @@ pub fn submodule_versions(repository_path: String, relative_path: String) -> Res
     let absolute = validate_submodule(&repository_path, &relative_path)?;
     let repo = internal_submodule_repository(&absolute)?;
     let current_revision = repo.head().ok().and_then(|head| head.target()).map(|id| id.to_string()).unwrap_or_default();
-    let current_branch = repo.head().ok().and_then(|head| head.shorthand().map(String::from)).unwrap_or_default();
+    // `Reference::shorthand()` returns the literal string "HEAD" for a
+    // detached checkout.  That is not a branch name and made the version
+    // dialog look as though the current detached commit belonged to the
+    // branch rows shown below it.  Keep the same contract as RepositoryInfo:
+    // an empty branch means detached, while current_revision is the exact
+    // commit that is checked out.
+    let current_branch = if repo.head_detached().unwrap_or(true) {
+        String::new()
+    } else {
+        repo.head().ok().and_then(|head| head.shorthand().map(String::from)).unwrap_or_default()
+    };
     let mut versions = Vec::new();
     // Local branch tips, indexed by the commit they currently point at — used
     // below to report which branch (if any) is "attached" to a given tag.
@@ -5176,31 +5186,43 @@ fn commit_submodule_inner(repository_path: String, relative_path: String, messag
 #[derive(Serialize, Debug)]
 pub struct PushSubmoduleResult { revision: String, branch: String }
 
-// Push-submodule-workflow report, point 1: "Always determine the destination
-// from the submodule's currently checked-out local branch. Never accidentally
-// reuse the parent branch, .gitmodules default branch, a previously selected
-// submodule, or main." — the one place that decision gets made, shared by the
-// actual push, the force push, and the preview shown before either, so all
-// three can never disagree about where a push would go. Submodules are very
-// commonly checked out in detached HEAD (git's normal state after `git
-// submodule update`/clone) — libgit2's `shorthand()` misleadingly returns the
-// literal string "HEAD" for a detached HEAD instead of `None`, which used to
-// let a bogus "HEAD" branch name slip through and reach `git push` as an
-// unqualified ref, producing "not a full refname". Resolve a real destination
-// branch instead: the checked-out branch if there is one, else the branch
-// recorded in .gitmodules, else the remote's default branch — but only ever
-// this *specific* submodule's own repo (`repo`/`sub_path`), never anything
-// cached from elsewhere.
-fn resolve_submodule_push_branch(repo: &Repository, repository_path: &str, relative_path: &str, sub_path: &str) -> Result<String, String> {
-    let branch = if !repo.head_detached().unwrap_or(true) {
-        repo.head().ok().and_then(|head| head.shorthand().map(String::from))
-    } else { None }
-        .or_else(|| submodule_value(repository_path, relative_path, "branch"))
-        .or_else(|| git(sub_path, &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"]).ok().map(|value| value.trim().trim_start_matches("origin/").to_string()).filter(|value| !value.is_empty()));
-    match branch {
-        Some(value) if !value.trim().is_empty() => Ok(value),
-        _ => Err("This submodule is in detached HEAD (not on a branch) and no default branch could be determined. Use \"Change version\" to switch to a branch first, then push.".into()),
+// A push destination must be the submodule's *currently checked-out local
+// branch*.  A detached HEAD has a commit but no branch: guessing main, a
+// .gitmodules branch, or origin/HEAD combines one ref's name with another
+// ref's SHA and can publish the commit to the wrong branch.  Keep this single
+// resolver shared by preview and push so their destination can never differ.
+fn resolve_submodule_push_branch(repo: &Repository) -> Result<String, String> {
+    let head = repo.head().map_err(|error| error.message().to_string())?;
+    let revision = head.target().map(|oid| oid.to_string()).unwrap_or_default();
+    if repo.head_detached().unwrap_or(true) {
+        let short = &revision[..8.min(revision.len())];
+        return Err(format!("Push unavailable — detached HEAD at {short}. A detached commit is not on a branch. Use \"Change version\" to switch to a branch, or \"New branch\" to create one from this commit, then push."));
     }
+    head.shorthand().map(String::from).filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "Could not determine this submodule's current branch. Switch to a local branch before pushing.".into())
+}
+
+// Local test fixtures sometimes use another working checkout as `origin`.
+// Git intentionally refuses to update a branch that is checked out in a
+// non-bare destination because its index/worktree would no longer match the
+// ref.  Detect that topology before push so the UI explains the setup error
+// rather than suggesting force-push (which cannot safely fix it).  Bare local
+// remotes and ordinary SSH/HTTPS remotes are unaffected.
+fn local_worktree_remote_block(sub_path: &Path, remote_url: &str, branch: &str) -> Option<String> {
+    let remote_path = if let Some(path) = remote_url.strip_prefix("file://") {
+        PathBuf::from(path)
+    } else {
+        // Treat URI/scp-style values as network remotes. On Windows,
+        // Path::is_absolute correctly recognizes drive-letter paths.
+        if remote_url.contains("://") || (remote_url.contains(':') && !Path::new(remote_url).is_absolute()) { return None; }
+        let path = PathBuf::from(remote_url);
+        if path.is_absolute() { path } else { sub_path.join(path) }
+    };
+    let remote_repo = Repository::open(remote_path).ok()?;
+    if remote_repo.is_bare() || remote_repo.head_detached().unwrap_or(true) { return None; }
+    let checked_out = remote_repo.head().ok()?.shorthand()?.to_string();
+    if checked_out != branch { return None; }
+    Some(format!("Push blocked safely: origin is a local working repository with branch \"{branch}\" checked out. Git cannot update that branch without making the destination worktree inconsistent. Use a bare local repository as origin, or configure this submodule's origin to its real Git server URL. Force push will not fix this setup."))
 }
 
 #[derive(Serialize, Debug)]
@@ -5247,7 +5269,7 @@ fn push_submodule_preview_inner(repository_path: String, relative_path: String) 
     let repo = internal_submodule_repository(&absolute)?;
     let local_target = repo.head().ok().and_then(|head| head.target()).ok_or("Could not determine this submodule's current commit")?;
     let remote_url = repo.find_remote("origin").ok().and_then(|remote| remote.url().map(String::from)).ok_or("No 'origin' remote configured for this submodule")?;
-    let branch = resolve_submodule_push_branch(&repo, &repository_path, &relative_path, &sub_path)?;
+    let branch = resolve_submodule_push_branch(&repo)?;
 
     // Best-effort — same as the actual push's own pre-flight fetch — so the
     // comparison reflects what's really on the server right now, not
@@ -5278,7 +5300,10 @@ fn push_submodule_preview_inner(repository_path: String, relative_path: String) 
     };
     let destination = upstream.clone().unwrap_or_else(|| format!("origin/{branch}"));
     let will_create_remote_branch = remote_sha.is_none();
-    let (can_push, blocked_reason) = if will_create_remote_branch {
+    let local_remote_block = local_worktree_remote_block(&absolute, &remote_url, &branch);
+    let (can_push, blocked_reason) = if let Some(message) = local_remote_block {
+        (false, Some(message))
+    } else if will_create_remote_branch {
         (true, None)
     } else if ahead == 0 && behind == 0 {
         (false, Some(format!("Already up to date with {destination}.")))
@@ -5337,7 +5362,9 @@ fn push_submodule_inner(repository_path: String, relative_path: String) -> Resul
     // plain `git push` in a terminal works fine for the same repository.
     let _ = git(&sub_path, &["fetch", "origin"]);
 
-    let branch = resolve_submodule_push_branch(&repo, &repository_path, &relative_path, &sub_path)?;
+    let branch = resolve_submodule_push_branch(&repo)?;
+    let remote_url = repo.find_remote("origin").ok().and_then(|remote| remote.url().map(String::from)).ok_or("No 'origin' remote configured for this submodule")?;
+    if let Some(message) = local_worktree_remote_block(&absolute, &remote_url, &branch) { return Err(message); }
 
     let remote_target = repo.find_reference(&format!("refs/remotes/origin/{branch}")).ok().and_then(|reference| reference.target());
     if remote_target.is_some() && remote_target == local_target {
@@ -7758,11 +7785,10 @@ mod tests {
     }
 
     #[test]
-    fn push_submodule_works_from_a_detached_head() {
-        // Submodules are checked out in detached HEAD by default (git's normal
-        // behavior for `git submodule add`/`update`), not on a branch. This
-        // reproduces that exact state and verifies push resolves a real branch
-        // instead of trying to push the literal ref name "HEAD".
+    fn detached_submodule_commit_must_be_attached_to_a_branch_before_push() {
+        // Submodules are checked out detached by default. A commit made there
+        // must never be silently sent to a guessed default branch: the user
+        // first has to preserve it on an explicitly chosen local branch.
         let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let base = std::env::temp_dir().join(format!("git-integrity-subpush-detached-{suffix}"));
         let repository = base.join("main");
@@ -7801,11 +7827,71 @@ mod tests {
         commit_submodule_inner(repo_path.clone(), "vendor/dep".into(), "Detached commit".into(), false).expect("commit_submodule should succeed while detached");
         assert!(Repository::open(&sub_path).unwrap().head_detached().unwrap(), "committing must not implicitly attach HEAD to a branch");
 
-        let push_result = push_submodule_inner(repo_path.clone(), "vendor/dep".into());
-        assert!(push_result.is_ok(), "push from a detached HEAD should resolve a real branch and succeed, got: {:?}", push_result);
+        let versions = submodule_versions(repo_path.clone(), "vendor/dep".into()).unwrap();
+        assert_eq!(versions.current_branch, "", "the version dialog must not expose Git's synthetic HEAD shorthand as a branch name");
+        assert_eq!(versions.current_revision, git(&sub_path.to_string_lossy(), &["rev-parse", "HEAD"]).unwrap().trim());
+
+        let preview_error = push_submodule_preview_inner(repo_path.clone(), "vendor/dep".into()).unwrap_err();
+        assert!(preview_error.contains("detached HEAD"), "preview must identify the real state: {preview_error}");
+        assert!(preview_error.contains("New branch") && preview_error.contains("switch to a branch"), "preview must explain the safe recovery: {preview_error}");
+
+        let push_error = push_submodule_inner(repo_path.clone(), "vendor/dep".into()).unwrap_err();
+        assert!(push_error.contains("detached HEAD"), "actual push must enforce the same rule as preview: {push_error}");
 
         let remote_main = git(&dep_remote.to_string_lossy(), &["log", "-1", "--format=%s", "main"]).unwrap();
-        assert!(remote_main.contains("Detached commit"), "the pushed commit should have reached the remote's main branch, remote log: {remote_main}");
+        assert!(!remote_main.contains("Detached commit"), "the detached commit must not be published to a guessed main branch");
+
+        // Once the user explicitly names the branch, normal push works.
+        run_git(&sub_path, &["switch", "-c", "feature/detached-work"]);
+        let result = push_submodule_inner(repo_path.clone(), "vendor/dep".into()).expect("an explicitly attached branch should be pushable");
+        assert_eq!(result.branch, "feature/detached-work");
+        let published = git(&dep_remote.to_string_lossy(), &["log", "-1", "--format=%s", "feature/detached-work"]).unwrap();
+        assert!(published.contains("Detached commit"));
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn push_preflight_blocks_a_checked_out_branch_in_a_non_bare_local_origin() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-non-bare-origin-{suffix}"));
+        let repository = base.join("main");
+        let working_origin = base.join("working-origin");
+        fs::create_dir_all(&repository).unwrap();
+        fs::create_dir_all(&working_origin).unwrap();
+        fs::write(repository.join("README.md"), "root").unwrap();
+        fs::write(working_origin.join("module.txt"), "v1").unwrap();
+        for path in [&repository, &working_origin] {
+            run_git(path, &["init", "-b", "main"]);
+            run_git(path, &["config", "user.email", "test@example.com"]);
+            run_git(path, &["config", "user.name", "Test User"]);
+            run_git(path, &["add", "."]);
+            run_git(path, &["commit", "-m", "Initial"]);
+        }
+        run_git(&repository, &["-c", "protocol.file.allow=always", "submodule", "add", working_origin.to_str().unwrap(), "vendor/dep"]);
+        run_git(&repository, &["commit", "-am", "Add dep submodule"]);
+
+        let repo_path = repository.to_string_lossy().into_owned();
+        let sub_path = repository.join("vendor/dep");
+        run_git(&sub_path, &["config", "user.email", "test@example.com"]);
+        run_git(&sub_path, &["config", "user.name", "Test User"]);
+        // Be explicit: the local clone is attached to the same branch that is
+        // currently checked out in the non-bare destination.
+        run_git(&sub_path, &["switch", "main"]);
+        fs::write(sub_path.join("module.txt"), "v2").unwrap();
+        run_git(&sub_path, &["commit", "-am", "Local update"]);
+        let remote_before = git(&working_origin.to_string_lossy(), &["rev-parse", "main"]).unwrap();
+
+        let preview = push_submodule_preview_inner(repo_path.clone(), "vendor/dep".into()).unwrap();
+        assert_eq!((preview.ahead, preview.behind), (1, 0), "comparison itself must remain correct");
+        assert!(!preview.can_push, "preview must disable a push Git will safely refuse");
+        let reason = preview.blocked_reason.as_deref().unwrap_or_default();
+        assert!(reason.contains("local working repository") && reason.contains("main") && reason.contains("bare"), "the setup problem and safe alternatives must be clear: {reason}");
+
+        let error = push_submodule_inner(repo_path, "vendor/dep".into()).unwrap_err();
+        assert!(error.contains("local working repository"), "actual push must enforce the same preflight: {error}");
+        let remote_after = git(&working_origin.to_string_lossy(), &["rev-parse", "main"]).unwrap();
+        assert_eq!(remote_before, remote_after, "blocked push must not move the destination branch");
 
         fs::remove_dir_all(base).unwrap();
     }
@@ -9652,16 +9738,15 @@ mod tests {
         let parent = base.join("parent"); let dependency = base.join("dependency");
         let parent_remote = base.join("main-remote.git");
         create_libgit2_repository(&parent, "README.md"); create_libgit2_repository(&dependency, "module.txt");
-        // `dependency` is a normal (non-bare) checkout, not a --bare remote —
-        // pushing to its own checked-out branch is refused by git by
-        // default; allow it so the push below can actually land, same as
-        // any real "origin is a working checkout, not a bare repo" setup
-        // would need.
-        run_git(&dependency, &["config", "receive.denyCurrentBranch", "ignore"]);
         fs::create_dir_all(&parent_remote).unwrap();
         run_git(&parent_remote, &["init", "--bare"]);
         let parent_string = parent.to_string_lossy().into_owned();
         let added = add_submodule_inner(parent_string.clone(), "".into(), dependency.to_string_lossy().into_owned(), "dep".into(), String::new(), String::new()).unwrap();
+        // Keep the local-path source non-bare, but move its worktree away
+        // from the branch the cloned submodule will push. This is the safe
+        // non-bare case Git itself permits; the separate preflight test
+        // covers and blocks a destination whose target branch is checked out.
+        run_git(&dependency, &["switch", "-c", "fixture-worktree"]);
         create_commit(parent_string.clone(), "Add dep submodule".into()).unwrap();
         run_git(&parent, &["remote", "add", "origin", parent_remote.to_str().unwrap()]);
         let branch = Repository::open(&parent).unwrap().head().unwrap().shorthand().unwrap().to_string();
