@@ -1,3 +1,3 @@
 fn main() {
-    git_integrity_lib::run();
+    git_drilldown_lib::run();
 }

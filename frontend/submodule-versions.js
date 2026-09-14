@@ -36,6 +36,36 @@ function escapeSubmoduleVersionHtml(value = '') {
   return String(value).replace(/[&<>"']/g, char => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[char]));
 }
 
+function submoduleCurrentPresentation(data = {}) {
+  const revision = String(data.current_revision || '');
+  const parentRevision = String(data.parent_revision || '');
+  const short = revision.slice(0, 8) || 'unknown';
+  const parentShort = parentRevision.slice(0, 8);
+  const matchesProject = Boolean(revision && parentRevision && revision === parentRevision);
+  if (!data.current_branch && matchesProject) {
+    return {
+      text: `Project version @ ${short} (detached)`,
+      help: 'Restore succeeded. The branches below are saved pointers, not the active checkout. Use Checkout to switch to one.',
+    };
+  }
+  if (!data.current_branch) {
+    return {
+      text: `Detached HEAD @ ${short}`,
+      help: parentShort
+        ? `This detached commit is active; the project records ${parentShort}. Branches below are inactive until Checkout.`
+        : 'This detached commit is active. Branches below are inactive until Checkout.',
+    };
+  }
+  return {
+    text: `${data.current_branch} @ ${short}`,
+    help: matchesProject
+      ? 'This branch is active and currently matches the version recorded by the parent project.'
+      : parentShort
+        ? `This branch is active; the parent project still records ${parentShort}. Stage the submodule only when you want to update that project reference.`
+        : 'This branch is active. Use explicit actions below to switch or match its remote.',
+  };
+}
+
 function submoduleVersionRowHtml(item) {
   const esc = escapeSubmoduleVersionHtml;
   const kindLabel = { branch: 'BRANCH', remote: 'REMOTE BRANCH', tag: 'TAG', commit: 'COMMIT (detached)' };
@@ -61,13 +91,23 @@ function submoduleVersionRowHtml(item) {
   const tagContext = item.kind === 'tag'
     ? `<span class="version-attached-branch">${item.attached_branch ? `on ⑂ ${esc(item.attached_branch)}` : 'no branch here (detached)'}</span>`
     : upstreamState;
-  return `<button class="version-row ${item.current ? 'current' : ''}" data-revision="${esc(revision)}" data-version-kind="${esc(item.kind)}" data-name="${esc(item.name)}">
+  // Destructive reset is only offered for the active branch. Uncommitted
+  // work belongs to the current working tree, not to an inactive branch row;
+  // making the user Checkout first keeps the target and consequence explicit.
+  // The backend repeats this safety check so stale UI data cannot bypass it.
+  const canResetToUpstream = item.kind === 'branch' && item.current && item.upstream
+    && ((Number(item.ahead) || 0) > 0 || (Number(item.behind) || 0) > 0);
+  const actions = `<span class="version-row-actions">
+    ${canResetToUpstream ? `<button type="button" class="version-reset-upstream" data-reset-upstream data-name="${esc(item.name)}" data-upstream="${esc(item.upstream)}" data-ahead="${Number(item.ahead) || 0}" data-behind="${Number(item.behind) || 0}" title="Destructive recovery for the active branch: discard its local-only commits and current uncommitted work, then replace it with ${esc(item.upstream)}">Discard local work…</button>` : ''}
+    ${item.current ? '<span class="current-label">CURRENT</span>' : `<button type="button" class="version-checkout" data-switch-version>Checkout</button>`}
+  </span>`;
+  return `<div class="version-row ${item.current ? 'current' : ''}" data-revision="${esc(revision)}" data-version-kind="${esc(item.kind)}" data-name="${esc(item.name)}">
     <span class="version-symbol">${symbol[item.kind] || '⑂'}</span>
     <span class="version-sha"><code>${esc(revision.slice(0, 8))}</code><span class="version-copy-sha" role="button" tabindex="0" title="Copy full SHA" data-copy-sha="${esc(revision)}">⧉</span></span>
     <span class="version-name">${esc(item.name)}<b class="version-kind-badge">${esc(kindLabel[item.kind] || item.kind)}</b>${tagContext}</span>
     <span class="version-copy"><span class="version-subject">${esc(item.subject)}</span><span class="version-meta">${esc(item.author)} · ${esc(item.date)}</span></span>
-    ${item.current ? '<span class="current-label">CURRENT</span>' : ''}
-  </button>`;
+    ${actions}
+  </div>`;
 }
 
 // Keep Push-button eligibility independent from the number of displayed
@@ -89,5 +129,5 @@ function submodulePushDialogState(preview) {
 }
 
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { groupSubmoduleBranchVersions, submoduleVersionRowHtml, submodulePushDialogState };
+  module.exports = { groupSubmoduleBranchVersions, submoduleCurrentPresentation, submoduleVersionRowHtml, submodulePushDialogState };
 }

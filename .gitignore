@@ -3,7 +3,7 @@ src-tauri/target/
 dist/*
 !dist/windows/
 dist/windows/*
-!dist/windows/git-integrity.exe
+!dist/windows/GitDrillDown.exe
 .DS_Store
 *.log
 

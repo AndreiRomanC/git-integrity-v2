@@ -27,7 +27,7 @@ static PERF_LOG_SESSION_HEADER_WRITTEN: OnceLock<()> = OnceLock::new();
 fn perf_log_session_header() {
     PERF_LOG_SESSION_HEADER_WRITTEN.get_or_init(|| {
         use std::io::Write;
-        let line = format!("=== session start: build={} ===\n", env!("GIT_INTEGRITY_BUILD_SHA"));
+        let line = format!("=== session start: build={} ===\n", env!("GIT_DRILLDOWN_BUILD_SHA"));
         if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(perf_log_path()) {
             let _ = file.write_all(line.as_bytes());
         }
@@ -493,6 +493,13 @@ pub struct Change { status: String, path: String, staged: bool }
 #[derive(Serialize)]
 pub struct StashEntry { index: usize, message: String, base_commit: String }
 
+// A stash belongs to one exact Git repository. The parent project and every
+// submodule have separate refs/stash values, so the frontend carries this
+// explicit scope with the list instead of accidentally opening/restoring the
+// parent's stash after an operation that actually targeted a submodule.
+#[derive(Serialize)]
+pub struct StashScope { repository_path: String, repository_name: String, current_branch: String, is_submodule: bool, relative_path: Option<String>, stashes: Vec<StashEntry> }
+
 // commits_truncated is true when the DAG actually has more history beyond
 // `commits` — never inferred by the frontend from "exactly 500 came back" (a
 // repository with precisely 500 reachable commits would falsely look
@@ -617,6 +624,10 @@ pub struct SubmoduleVersions {
     path: String,
     current_revision: String,
     current_branch: String,
+    // The gitlink currently recorded in the parent index. Exposed in this
+    // same response so the dialog can distinguish "restored project version"
+    // from an arbitrary detached checkout without another backend request.
+    parent_revision: String,
     versions: Vec<SubmoduleVersion>,
 }
 
@@ -1335,7 +1346,7 @@ fn submodule_workflow_state(parent: &Repository, relative_path: &str, parent_unp
 // by looking at the app itself instead of a file's modified date, which is
 // what caused a stale Windows executable to go untested for hours.
 #[tauri::command]
-pub fn build_info() -> String { env!("GIT_INTEGRITY_BUILD_SHA").to_string() }
+pub fn build_info() -> String { env!("GIT_DRILLDOWN_BUILD_SHA").to_string() }
 
 // Lets the frontend write into the exact same perf log the backend uses (see
 // `perf_log` above) — `elapsed_ms` comes from `performance.now()` on the JS
@@ -2378,7 +2389,27 @@ pub fn switch_branch(path: String, branch: String) -> Result<(), String> {
     let lock_handle = repo_write_lock(&path);
     let _lock = lock_handle.lock().unwrap();
     log_repo_write_lock_acquired(&path, "switch_branch", queue_started.elapsed());
-    let repo = internal_repository(&path)?; let reference = format!("refs/heads/{}", branch.trim()); repo.find_reference(&reference).map_err(|error| error.message().to_string())?; repo.set_head(&reference).map_err(|error| error.message().to_string())?; let mut checkout = git2::build::CheckoutBuilder::new(); checkout.safe(); repo.checkout_head(Some(&mut checkout)).map_err(|error| error.message().to_string())?; invalidate_git_metadata(&path); Ok(())
+    let repo = internal_repository(&path)?;
+    let branch = branch.trim();
+    if branch.is_empty() { return Err("Branch name cannot be empty".into()); }
+    let reference = format!("refs/heads/{branch}");
+    let target_oid = repo.find_reference(&reference)
+        .map_err(|error| error.message().to_string())?
+        .peel_to_commit().map_err(|error| error.message().to_string())?.id();
+
+    // Keep HEAD on the current branch while libgit2 checks whether the target
+    // tree can be installed safely. If checkout is blocked by local work, HEAD,
+    // index and worktree therefore all remain on their original branch instead
+    // of exposing a half-switched repository. This is the same safe ordering as
+    // switch_submodule_version_inner.
+    let target = repo.find_object(target_oid, Some(ObjectType::Commit)).map_err(|error| error.message().to_string())?;
+    let mut checkout = git2::build::CheckoutBuilder::new();
+    checkout.safe();
+    repo.checkout_tree(&target, Some(&mut checkout)).map_err(|error| format!("Cannot switch to '{branch}': {}", error.message()))?;
+    drop(target);
+    repo.set_head(&reference).map_err(|error| error.message().to_string())?;
+    invalidate_git_metadata(&path);
+    Ok(())
 }
 
 #[tauri::command]
@@ -4058,6 +4089,9 @@ fn validate_submodule(repository_path: &str, relative_path: &str) -> Result<Path
 pub fn submodule_versions(repository_path: String, relative_path: String) -> Result<SubmoduleVersions, String> {
     validate_path(&repository_path)?;
     let absolute = validate_submodule(&repository_path, &relative_path)?;
+    let relative = safe_relative_path(&relative_path)?;
+    let parent = internal_repository(&repository_path)?;
+    let parent_revision = parent.index().ok().and_then(|index| index.get_path(&relative, 0)).map(|entry| entry.id.to_string()).unwrap_or_default();
     let repo = internal_submodule_repository(&absolute)?;
     let current_revision = repo.head().ok().and_then(|head| head.target()).map(|id| id.to_string()).unwrap_or_default();
     // `Reference::shorthand()` returns the literal string "HEAD" for a
@@ -4119,7 +4153,7 @@ pub fn submodule_versions(repository_path: String, relative_path: String) -> Res
     }
     let mut walk = repo.revwalk().map_err(|error| error.message().to_string())?; let _ = walk.set_sorting(Sort::TIME); if let Ok(head) = repo.head() { if let Some(oid) = head.target() { let _ = walk.push(oid); } }
     for oid in walk.flatten().take(30) { if let Ok(commit) = repo.find_commit(oid) { versions.push(SubmoduleVersion { name: oid.to_string()[..8].into(), revision: oid.to_string(), kind: "commit".into(), current: oid.to_string() == current_revision, subject: commit.summary().unwrap_or("").into(), author: commit.author().name().unwrap_or("Unknown").into(), date: short_date(commit.time().seconds()), attached_branch: None, upstream: None, ahead: None, behind: None }); } }
-    Ok(SubmoduleVersions { path: relative_path, current_revision, current_branch, versions })
+    Ok(SubmoduleVersions { path: relative_path, current_revision, current_branch, parent_revision, versions })
 }
 
 #[tauri::command]
@@ -4209,12 +4243,22 @@ fn switch_submodule_version_inner(repository_path: String, relative_path: String
     let sub_lock = sub_lock_handle.lock().unwrap();
     log_repo_write_lock_acquired(&absolute_string, "switch_submodule_version(submodule)", queue_started.elapsed());
     let repo = internal_submodule_repository(&absolute)?;
-    if version_kind == "branch" {
+    // Resolve the destination first, but do not move HEAD yet. Moving HEAD
+    // before checkout makes the old index/worktree look like staged reverse
+    // changes against the new branch (most visibly after "Restore parent
+    // version" followed by selecting the old local branch). Git's checkout
+    // order is the opposite: safely update the tree/index while HEAD still
+    // describes their current baseline, then attach/detach HEAD only after
+    // that checkout succeeds.
+    let (target_oid, attach_reference, create_local_branch) = if version_kind == "branch" {
         // `name` is the actual branch name (e.g. "main"); `revision` is only the SHA
         // it currently points at and is NOT a valid ref on its own — using it here
         // produced "reference 'refs/heads/<sha>' not found" for every local branch.
         let branch_name = if name.is_empty() { revision.clone() } else { name.clone() };
-        let reference = format!("refs/heads/{branch_name}"); repo.find_reference(&reference).map_err(|error| format!("Branch '{branch_name}' not found: {}", error.message()))?; repo.set_head(&reference).map_err(|error| error.message().to_string())?;
+        let reference = format!("refs/heads/{branch_name}");
+        let target = repo.find_reference(&reference).map_err(|error| format!("Branch '{branch_name}' not found: {}", error.message()))?
+            .peel_to_commit().map_err(|error| error.message().to_string())?.id();
+        (target, Some(reference), None)
     } else if version_kind == "remote" {
         // Picking a remote branch (e.g. "origin/main") from the list feels like
         // picking "main" — landing on a detached HEAD there is technically correct
@@ -4228,15 +4272,15 @@ fn switch_submodule_version_inner(repository_path: String, relative_path: String
         // else — moving it here could silently strand the user's own commits.
         let object = repo.revparse_single(&revision).map_err(|error| error.message().to_string())?;
         let commit = object.peel_to_commit().map_err(|error| error.message().to_string())?;
+        let target = commit.id();
         let local_name = name.split_once('/').map(|(_, rest)| rest).unwrap_or(&name);
         match repo.find_branch(local_name, BranchType::Local) {
             Ok(existing) if existing.get().target() == Some(commit.id()) => {
-                repo.set_head(&format!("refs/heads/{local_name}")).map_err(|error| error.message().to_string())?;
+                (target, Some(format!("refs/heads/{local_name}")), None)
             }
-            Ok(_) => { repo.set_head_detached(commit.id()).map_err(|error| error.message().to_string())?; }
+            Ok(_) => (target, None, None),
             Err(_) => {
-                repo.branch(local_name, &commit, false).map_err(|error| error.message().to_string())?;
-                repo.set_head(&format!("refs/heads/{local_name}")).map_err(|error| error.message().to_string())?;
+                (target, Some(format!("refs/heads/{local_name}")), Some(local_name.to_string()))
             }
         }
     } else if version_kind == "tag" {
@@ -4248,11 +4292,25 @@ fn switch_submodule_version_inner(repository_path: String, relative_path: String
         let object = repo.find_reference(&format!("refs/tags/{tag_name}")).and_then(|reference| reference.peel(git2::ObjectType::Commit))
             .or_else(|_| repo.revparse_single(&revision).and_then(|object| object.peel(git2::ObjectType::Commit)))
             .map_err(|error| error.message().to_string())?;
-        repo.set_head_detached(object.id()).map_err(|error| error.message().to_string())?;
+        (object.id(), None, None)
     } else {
-        let object = repo.revparse_single(&revision).map_err(|error| error.message().to_string())?; repo.set_head_detached(object.id()).map_err(|error| error.message().to_string())?;
+        let object = repo.revparse_single(&revision).map_err(|error| error.message().to_string())?;
+        let commit = object.peel_to_commit().map_err(|error| error.message().to_string())?;
+        (commit.id(), None, None)
+    };
+    let target = repo.find_object(target_oid, Some(ObjectType::Commit)).map_err(|error| error.message().to_string())?;
+    let mut checkout = git2::build::CheckoutBuilder::new(); checkout.safe();
+    repo.checkout_tree(&target, Some(&mut checkout)).map_err(|error| error.message().to_string())?;
+    drop(target);
+    if let Some(branch_name) = create_local_branch {
+        let commit = repo.find_commit(target_oid).map_err(|error| error.message().to_string())?;
+        repo.branch(&branch_name, &commit, false).map_err(|error| error.message().to_string())?;
     }
-    let mut checkout = git2::build::CheckoutBuilder::new(); checkout.safe(); repo.checkout_head(Some(&mut checkout)).map_err(|error| error.message().to_string())?;
+    if let Some(reference) = attach_reference {
+        repo.set_head(&reference).map_err(|error| error.message().to_string())?;
+    } else {
+        repo.set_head_detached(target_oid).map_err(|error| error.message().to_string())?;
+    }
     let selected = repo.head().ok().and_then(|head| head.target()).map(|id| id.to_string()).unwrap_or_default();
     drop(repo);
     drop(sub_lock);
@@ -4328,7 +4386,7 @@ fn create_submodule_tag_inner(repository_path: String, relative_path: String, ta
             let signature = repo.signature().map_err(|_| "Configure user.name and user.email for this submodule".to_string())?;
             repo.tag(&tag_name, target.as_object(), &signature, message, false).map_err(|error| error.message().to_string())?;
         } else {
-            repo.reference(&format!("refs/tags/{tag_name}"), target_id, false, "created via Git Integrity").map_err(|error| error.message().to_string())?;
+            repo.reference(&format!("refs/tags/{tag_name}"), target_id, false, "created via Git DrillDown").map_err(|error| error.message().to_string())?;
         }
         (target_id, annotated)
     };
@@ -4428,6 +4486,81 @@ fn reset_submodule_inner(repository_path: String, relative_path: String) -> Resu
     invalidate_git_metadata(&repository_path);
     invalidate_submodule_sync(&repository_path); // this app just changed a submodule's registration/version
     Ok(target_oid.to_string())
+}
+
+#[derive(Serialize, Debug)]
+pub struct ResetSubmoduleBranchResult { branch: String, upstream: String, revision: String }
+
+// Explicitly destructive counterpart to the non-destructive fast-forward
+// pull: discard the checked-out branch's local commits and dirty index/tree,
+// then make it exactly match its configured upstream. This is intentionally
+// separate from reset_submodule, whose target is the parent project's pinned
+// gitlink and which correctly leaves a detached HEAD.
+#[tauri::command]
+pub async fn reset_submodule_branch_to_upstream(repository_path: String, relative_path: String, branch_name: String) -> Result<ResetSubmoduleBranchResult, String> {
+    off_main_thread(move || reset_submodule_branch_to_upstream_inner(repository_path, relative_path, branch_name)).await
+}
+
+fn reset_submodule_branch_to_upstream_inner(repository_path: String, relative_path: String, branch_name: String) -> Result<ResetSubmoduleBranchResult, String> {
+    validate_path(&repository_path)?;
+    let absolute = validate_submodule(&repository_path, &relative_path)?;
+    let sub_path = absolute.to_string_lossy().into_owned();
+    let queue_started = Instant::now();
+    let lock_handle = repo_write_lock(&sub_path);
+    let _lock = lock_handle.lock().unwrap();
+    log_repo_write_lock_acquired(&sub_path, "reset_submodule_branch_to_upstream", queue_started.elapsed());
+    let repo = internal_submodule_repository(&absolute)?;
+    let branch = branch_name.trim().to_string();
+    if branch.is_empty() { return Err("Choose a local branch to match to its upstream".into()); }
+    repo.find_branch(&branch, BranchType::Local).map_err(|_| format!("Local branch '{branch}' was not found"))?;
+
+    // A working tree is shared by every branch in this repository. Moving HEAD
+    // to some *other* saved branch and then doing a hard reset would therefore
+    // destroy the edits belonging to the checkout the user was actually using,
+    // not edits somehow owned by the row they clicked. Only permit dirty-work
+    // deletion when the selected branch is already the active checkout. A clean
+    // detached checkout remains supported (the normal state after restoring the
+    // parent project's recorded submodule version).
+    if repo.state() != git2::RepositoryState::Clean {
+        return Err("Cannot discard this branch while another Git operation or conflict resolution is in progress. Finish or abort it first.".into());
+    }
+    let current_branch = if repo.head_detached().unwrap_or(true) {
+        None
+    } else {
+        repo.head().ok().and_then(|head| head.shorthand().map(String::from))
+    };
+    let dirty = internal_statuses(&repo, None)?;
+    if !dirty.is_empty() && current_branch.as_deref() != Some(branch.as_str()) {
+        let checkout = current_branch.as_deref().map(|name| format!("branch '{name}'")).unwrap_or_else(|| "the detached checkout".into());
+        return Err(format!("Cannot replace branch '{branch}' because {checkout} has uncommitted work. A Git working tree is shared between branches, so switching and hard-resetting here would delete that work. Commit or stash it first, or checkout '{branch}' before explicitly discarding its work."));
+    }
+    let remote = repo.config().ok().and_then(|config| config.get_string(&format!("branch.{branch}.remote")).ok())
+        .filter(|name| !name.is_empty() && name != ".")
+        .ok_or_else(|| format!("Branch '{branch}' has no remote upstream. Configure an upstream before matching it."))?;
+    repo.find_remote(&remote).map_err(|_| format!("Configured remote '{remote}' was not found"))?;
+
+    // Refresh the tracking ref first. The hard reset below is based on this
+    // just-fetched exact target, never on a stale cached origin/* value.
+    git(&sub_path, &["fetch", &remote]).map_err(|detail| format!("Fetch failed: {detail}"))?;
+    let (target_oid, upstream) = upstream_ref(&repo, &branch)
+        .ok_or_else(|| format!("Could not resolve the configured upstream for branch '{branch}' after fetch"))?;
+    let target = repo.find_object(target_oid, Some(ObjectType::Commit)).map_err(|error| error.message().to_string())?;
+    // Make the explicitly selected local branch current first; ResetType::Hard
+    // then moves that branch ref and makes both index and worktree exactly
+    // match the fetched upstream. This also supports the natural flow after
+    // "Restore project version", where HEAD is detached but the saved local
+    // branch is visible in the dialog.
+    repo.set_head(&format!("refs/heads/{branch}")).map_err(|error| error.message().to_string())?;
+    repo.reset(&target, git2::ResetType::Hard, None).map_err(|error| format!("Could not reset '{branch}' to {upstream}: {}", error.message()))?;
+    drop(target);
+    if !internal_statuses(&repo, None)?.is_empty() {
+        return Err("The branch moved to its upstream, but the index or working tree is not clean. No further action was performed.".into());
+    }
+    drop(repo);
+    invalidate_git_metadata(&sub_path);
+    invalidate_git_metadata(&repository_path);
+    invalidate_submodule_sync(&repository_path);
+    Ok(ResetSubmoduleBranchResult { branch, upstream, revision: target_oid.to_string() })
 }
 
 #[tauri::command]
@@ -4989,6 +5122,34 @@ pub fn stash_changes(repository_path: String) -> Result<(), String> {
     Ok(())
 }
 
+fn stash_scope_inner(repository_path: String, is_submodule: bool, relative_path: Option<String>) -> Result<StashScope, String> {
+    let mut repo = internal_repository(&repository_path)?;
+    let repository_name = Path::new(&repository_path).file_name().and_then(|name| name.to_str()).unwrap_or("repository").to_string();
+    let current_branch = if repo.head_detached().unwrap_or(false) { String::new() } else { repo.head().ok().and_then(|head| head.shorthand().map(String::from)).unwrap_or_default() };
+    let mut raw = Vec::new();
+    repo.stash_foreach(|index, message, oid| { raw.push((index, message.to_string(), *oid)); true }).map_err(|error| error.message().to_string())?;
+    let stashes = raw.into_iter().map(|(index, message, oid)| {
+        let base_commit = repo.find_commit(oid).ok().and_then(|commit| commit.parent_id(0).ok()).map(|id| id.to_string()).unwrap_or_default();
+        StashEntry { index, message, base_commit }
+    }).collect();
+    Ok(StashScope { repository_path, repository_name, current_branch, is_submodule, relative_path, stashes })
+}
+
+// Lightweight stash-only reads: opening the stash dialog must not pay for a
+// full status scan and 500-commit history walk merely to enumerate refs/stash.
+#[tauri::command]
+pub fn list_stashes(repository_path: String) -> Result<StashScope, String> {
+    validate_path(&repository_path)?;
+    stash_scope_inner(repository_path, false, None)
+}
+
+#[tauri::command]
+pub fn list_submodule_stashes(repository_path: String, relative_path: String) -> Result<StashScope, String> {
+    validate_path(&repository_path)?;
+    let absolute = validate_submodule(&repository_path, &relative_path)?;
+    stash_scope_inner(absolute.to_string_lossy().into_owned(), true, Some(normalized(&safe_relative_path(&relative_path)?)))
+}
+
 // Stashes a single file/folder instead of the whole working tree. libgit2's
 // stash API has no pathspec filter (it always stashes everything), so this
 // shells out to real `git stash push -- <path>` — exactly what the CLI does
@@ -5021,6 +5182,21 @@ pub fn pop_stash(repository_path: String, stash_index: usize) -> Result<(), Stri
     let _lock = lock_handle.lock().unwrap();
     log_repo_write_lock_acquired(&repository_path, "pop_stash", queue_started.elapsed());
     let mut repo = internal_repository(&repository_path)?;
+    if repo.state() != git2::RepositoryState::Clean || repo.index().map(|index| index.has_conflicts()).unwrap_or(true) {
+        return Err("Cannot restore a stash while another Git operation or conflict resolution is in progress. Finish or abort it first.".into());
+    }
+    // A full stash apply is a merge into the current index/worktree. Applying
+    // it over unrelated local edits makes a later Abort unable to distinguish
+    // the user's pre-existing work from the stash result; the hard reset used
+    // to clear conflicts could consequently delete that work. Require a clean
+    // starting point so Abort can safely restore HEAD and the stash remains the
+    // recovery copy. Selected-path restore has its own per-path clean checks.
+    let dirty = internal_statuses(&repo, None)?;
+    if !dirty.is_empty() {
+        let files: Vec<String> = dirty.iter().take(5).map(|(path, status, _)| format!("{status} {path}")).collect();
+        let more = if dirty.len() > 5 { format!(" (+{} more)", dirty.len() - 5) } else { String::new() };
+        return Err(format!("Cannot restore the complete stash because this repository already has uncommitted work:\n{}{more}\n\nCommit or stash the current work first, or restore only selected clean files. Nothing was changed.", files.join("\n")));
+    }
     let mut options = git2::StashApplyOptions::new();
     // `stash_pop` (apply + drop) drops the stash entry unconditionally on a
     // successful *apply* — but libgit2 considers merge-style conflict markers
@@ -5054,73 +5230,76 @@ pub fn drop_stash(repository_path: String, stash_index: usize) -> Result<(), Str
     Ok(())
 }
 
-// Applies only the chosen files from a stash — not the whole entry. Uses
-// git2's own checkout-path filtering (the same mechanism `stash_apply` uses
-// internally to write the merged result to disk) so it's a real, correct
-// git merge of just those paths, not a hand-rolled diff. The stash entry
-// itself is left exactly as it was — nothing is dropped or rewritten —
-// so restoring a few files first and the rest later is always safe; picking
-// the same file again just re-applies the same (already-matching) content.
+// Restores only the explicitly selected paths from a stash, leaving the stash
+// itself untouched as a recovery copy. In particular, never implement this as
+// "apply the whole stash, then stash the unselected files again": that briefly
+// modifies unrelated files and can absorb work created after the stash. A
+// selected path must also be clean before its saved contents may replace it.
 #[tauri::command]
 pub fn restore_stash_paths(repository_path: String, stash_index: usize, paths: Vec<String>) -> Result<(), String> {
     validate_path(&repository_path)?;
     if paths.is_empty() { return Err("Select at least one file to restore".into()); }
     let selected: HashSet<String> = paths.iter().map(|path| safe_relative_path(path).map(|p| normalized(&p))).collect::<Result<_, _>>()?;
-    let all_files = stash_entry_files(repository_path.clone(), stash_index)?;
-    let remaining: Vec<String> = all_files.into_iter().filter(|file| !selected.contains(file)).collect();
+    let all_files: HashSet<String> = stash_entry_files(repository_path.clone(), stash_index)?.into_iter().collect();
+    let missing: Vec<&String> = selected.iter().filter(|path| !all_files.contains(*path)).collect();
+    if !missing.is_empty() {
+        return Err(format!("The selected path is not present in this stash: {}", missing.iter().map(|path| path.as_str()).collect::<Vec<_>>().join(", ")));
+    }
 
     let queue_started = Instant::now();
     let lock_handle = repo_write_lock(&repository_path);
     let _lock = lock_handle.lock().unwrap();
     log_repo_write_lock_acquired(&repository_path, "restore_stash_paths", queue_started.elapsed());
-    // The stash this entry becomes is identified by its own commit id, not
-    // its stack position — pushing a fresh stash for the leftover files
-    // below shifts every later entry's index up by one, so this entry has
-    // to be found again afterward rather than assumed to still be at
-    // `stash_index`.
-    let original_oid = {
-        let mut repo = internal_repository(&repository_path)?;
-        let mut oid = None;
-        repo.stash_foreach(|index, _, found| { if index == stash_index { oid = Some(*found); } true }).map_err(|error| error.message().to_string())?;
-        oid.ok_or("That stash entry no longer exists")?
-    };
-
     let mut repo = internal_repository(&repository_path)?;
-    let mut options = git2::StashApplyOptions::new();
-    // Apply the whole entry, not just the selected paths — a path-filtered
-    // apply left the stash's own tree completely unaffected, so a restored
-    // file still looked "still stashed" the moment the list was refreshed.
-    // Applying everything, then re-stashing just the leftovers below, is
-    // what actually makes a restored file gone from the entry for good.
-    repo.stash_apply(stash_index, Some(&mut options)).map_err(|error| format!("Cannot restore: {}", error.message()))?;
-    invalidate_git_metadata(&repository_path);
-
-    if repo.index().map(|index| index.has_conflicts()).unwrap_or(false) {
-        // Leave the entry exactly as it is — same safety net as a full pop
-        // — the caller's conflict-resolution flow takes over from here.
-        return Ok(());
+    if repo.state() != git2::RepositoryState::Clean || repo.index().map(|index| index.has_conflicts()).unwrap_or(true) {
+        return Err("Cannot restore a stash file while another Git operation or conflict resolution is in progress.".into());
+    }
+    let dirty_paths: HashSet<String> = internal_statuses(&repo, None)?.into_iter().map(|(path, _, _)| path).collect();
+    let dirty_selected: Vec<&String> = selected.iter().filter(|path| dirty_paths.contains(*path)).collect();
+    if !dirty_selected.is_empty() {
+        return Err(format!("Cannot restore because the selected path already has uncommitted work: {}. Commit, stash, or discard that current work first; it will not be overwritten.", dirty_selected.iter().map(|path| path.as_str()).collect::<Vec<_>>().join(", ")));
     }
 
-    if remaining.is_empty() {
-        // Nothing left to keep stashed: this was effectively a full pop.
-        drop(repo);
-        let mut repo = internal_repository(&repository_path)?;
-        repo.stash_drop(stash_index).map_err(|error| format!("Restored, but could not drop the now-empty stash entry: {}", error.message()))?;
-        return Ok(());
-    }
+    let mut stash_oid = None;
+    repo.stash_foreach(|index, _, found| { if index == stash_index { stash_oid = Some(*found); } true }).map_err(|error| error.message().to_string())?;
+    let stash_oid = stash_oid.ok_or("That stash entry no longer exists")?;
+    let stash_commit = repo.find_commit(stash_oid).map_err(|error| error.message().to_string())?;
+    let untracked_commit = stash_commit.parent(2).ok();
+    let untracked_tree = untracked_commit.as_ref().and_then(|commit| commit.tree().ok());
 
-    // Put the untouched files back into a fresh stash entry of their own —
-    // real `git stash push` scoped to just those paths, so the just-restored
-    // files stay exactly as they are: live, ordinary working-tree changes.
+    let mut tracked = Vec::new();
+    let mut untracked = Vec::new();
+    for path in &selected {
+        if untracked_tree.as_ref().is_some_and(|tree| tree.get_path(Path::new(path)).is_ok()) {
+            // An ignored file can exist without appearing in the normal status
+            // result. Never overwrite any existing filesystem object while
+            // restoring a file that was untracked when it was stashed.
+            if Path::new(&repository_path).join(path).exists() {
+                return Err(format!("Cannot restore '{path}' because a file already exists there. The stash was kept unchanged."));
+            }
+            untracked.push(path.as_str());
+        } else {
+            tracked.push(path.as_str());
+        }
+    }
+    drop(untracked_tree);
+    drop(untracked_commit);
+    drop(stash_commit);
     drop(repo);
-    let mut push_args = vec!["stash", "push", "--include-untracked", "--"];
-    push_args.extend(remaining.iter().map(|path| path.as_str()));
-    git(&repository_path, &push_args)?;
 
-    let mut repo = internal_repository(&repository_path)?;
-    let mut old_index = None;
-    repo.stash_foreach(|index, _, found| { if *found == original_oid { old_index = Some(index); } true }).map_err(|error| error.message().to_string())?;
-    if let Some(index) = old_index { repo.stash_drop(index).map_err(|error| format!("Restored, but could not clean up the original stash entry: {}", error.message()))?; }
+    if !tracked.is_empty() {
+        let source = format!("--source={stash_oid}");
+        let mut args = vec!["restore", source.as_str(), "--worktree", "--"];
+        args.extend(tracked);
+        git(&repository_path, &args).map_err(|error| format!("Cannot restore the selected tracked file(s): {error}"))?;
+    }
+    if !untracked.is_empty() {
+        let untracked_oid = internal_repository(&repository_path)?.find_commit(stash_oid).map_err(|error| error.message().to_string())?.parent_id(2).map_err(|_| "This stash has no saved untracked-file snapshot".to_string())?;
+        let source = format!("--source={untracked_oid}");
+        let mut args = vec!["restore", source.as_str(), "--worktree", "--"];
+        args.extend(untracked);
+        git(&repository_path, &args).map_err(|error| format!("Cannot restore the selected untracked file(s): {error}"))?;
+    }
     invalidate_git_metadata(&repository_path);
     Ok(())
 }
@@ -5314,13 +5493,62 @@ fn resolve_submodule_push_branch(repo: &Repository) -> Result<String, String> {
         .ok_or_else(|| "Could not determine this submodule's current branch. Switch to a local branch before pushing.".into())
 }
 
+#[derive(Debug)]
+struct BranchRemoteTarget {
+    remote_name: String,
+    remote_branch: String,
+    tracking_ref: String,
+    display: String,
+    remote_url: String,
+    configured_upstream: bool,
+}
+
+// Resolve one authoritative destination for every submodule operation. A
+// configured upstream may use a remote other than `origin` and a remote branch
+// whose name differs from the local branch; preview, push, force-push and pull
+// must never silently disagree about that destination. Only a branch with no
+// upstream falls back to origin/<local-branch>, which a successful first push
+// then persists with --set-upstream.
+fn resolve_submodule_remote_target(repo: &Repository, local_branch: &str) -> Result<BranchRemoteTarget, String> {
+    let config = repo.config().map_err(|error| error.message().to_string())?;
+    let remote_key = format!("branch.{local_branch}.remote");
+    let merge_key = format!("branch.{local_branch}.merge");
+    let configured_remote = config.get_string(&remote_key).ok().filter(|value| !value.trim().is_empty());
+    let configured_merge = config.get_string(&merge_key).ok().filter(|value| !value.trim().is_empty());
+
+    let (remote_name, remote_branch, configured_upstream) = match (configured_remote, configured_merge) {
+        (Some(remote), Some(merge)) => {
+            if remote == "." {
+                return Err(format!("Branch '{local_branch}' tracks another local branch, not a pushable remote. Configure a real remote upstream first."));
+            }
+            let remote_branch = merge.strip_prefix("refs/heads/")
+                .ok_or_else(|| format!("Branch '{local_branch}' has an unsupported upstream ref '{merge}'"))?;
+            (remote, remote_branch.to_string(), true)
+        }
+        (None, None) => ("origin".to_string(), local_branch.to_string(), false),
+        _ => return Err(format!("Branch '{local_branch}' has an incomplete upstream configuration. Set both its remote and merge branch before synchronizing.")),
+    };
+    let remote_url = repo.find_remote(&remote_name).ok()
+        .and_then(|remote| remote.url().map(String::from))
+        .ok_or_else(|| format!("Remote '{remote_name}' is not configured with a URL for this submodule"))?;
+    let display = format!("{remote_name}/{remote_branch}");
+    Ok(BranchRemoteTarget {
+        tracking_ref: format!("refs/remotes/{remote_name}/{remote_branch}"),
+        remote_name,
+        remote_branch,
+        display,
+        remote_url,
+        configured_upstream,
+    })
+}
+
 // Local test fixtures sometimes use another working checkout as `origin`.
 // Git intentionally refuses to update a branch that is checked out in a
 // non-bare destination because its index/worktree would no longer match the
 // ref.  Detect that topology before push so the UI explains the setup error
 // rather than suggesting force-push (which cannot safely fix it).  Bare local
 // remotes and ordinary SSH/HTTPS remotes are unaffected.
-fn local_worktree_remote_block(sub_path: &Path, remote_url: &str, branch: &str) -> Option<String> {
+fn local_worktree_remote_block(sub_path: &Path, remote_url: &str, remote_name: &str, branch: &str) -> Option<String> {
     let remote_path = if let Some(path) = remote_url.strip_prefix("file://") {
         PathBuf::from(path)
     } else {
@@ -5334,7 +5562,7 @@ fn local_worktree_remote_block(sub_path: &Path, remote_url: &str, branch: &str) 
     if remote_repo.is_bare() || remote_repo.head_detached().unwrap_or(true) { return None; }
     let checked_out = remote_repo.head().ok()?.shorthand()?.to_string();
     if checked_out != branch { return None; }
-    Some(format!("Push blocked safely: origin is a local working repository with branch \"{branch}\" checked out. Git cannot update that branch without making the destination worktree inconsistent. Use a bare local repository as origin, or configure this submodule's origin to its real Git server URL. Force push will not fix this setup."))
+    Some(format!("Push blocked safely: {remote_name} is a local working repository with branch \"{branch}\" checked out. Git cannot update that branch without making the destination worktree inconsistent. Use a bare local repository as the remote, or configure this submodule's remote to its real Git server URL. Force push will not fix this setup."))
 }
 
 #[derive(Serialize, Debug)]
@@ -5380,19 +5608,17 @@ fn push_submodule_preview_inner(repository_path: String, relative_path: String) 
     let sub_path = absolute.to_string_lossy().into_owned();
     let repo = internal_submodule_repository(&absolute)?;
     let local_target = repo.head().ok().and_then(|head| head.target()).ok_or("Could not determine this submodule's current commit")?;
-    let remote_url = repo.find_remote("origin").ok().and_then(|remote| remote.url().map(String::from)).ok_or("No 'origin' remote configured for this submodule")?;
     let branch = resolve_submodule_push_branch(&repo)?;
+    let destination = resolve_submodule_remote_target(&repo, &branch)?;
 
     // Best-effort — same as the actual push's own pre-flight fetch — so the
     // comparison reflects what's really on the server right now, not
     // whatever this app last happened to know. A failure here (offline) just
     // falls back to already-known local refs instead of blocking the preview.
-    let _ = git(&sub_path, &["fetch", "origin"]);
+    let _ = git(&sub_path, &["fetch", &destination.remote_name]);
 
-    let (upstream, remote_sha) = match upstream_ref(&repo, &branch) {
-        Some((oid, label)) => (Some(label), Some(oid)),
-        None => (None, repo.find_reference(&format!("refs/remotes/origin/{branch}")).ok().and_then(|reference| reference.target())),
-    };
+    let upstream = destination.configured_upstream.then(|| destination.display.clone());
+    let remote_sha = repo.find_reference(&destination.tracking_ref).ok().and_then(|reference| reference.target());
     let (ahead, behind) = match remote_sha {
         Some(remote_oid) => repo.graph_ahead_behind(local_target, remote_oid).map_err(|error| error.message().to_string())?,
         None => (0, 0),
@@ -5410,27 +5636,26 @@ fn push_submodule_preview_inner(repository_path: String, relative_path: String) 
         }
         _ => Vec::new(),
     };
-    let destination = upstream.clone().unwrap_or_else(|| format!("origin/{branch}"));
     let will_create_remote_branch = remote_sha.is_none();
-    let local_remote_block = local_worktree_remote_block(&absolute, &remote_url, &branch);
+    let local_remote_block = local_worktree_remote_block(&absolute, &destination.remote_url, &destination.remote_name, &destination.remote_branch);
     let (can_push, blocked_reason) = if let Some(message) = local_remote_block {
         (false, Some(message))
     } else if will_create_remote_branch {
         (true, None)
     } else if ahead == 0 && behind == 0 {
-        (false, Some(format!("Already up to date with {destination}.")))
+        (false, Some(format!("Already up to date with {}.", destination.display)))
     } else if behind > 0 {
         let message = if ahead > 0 {
-            format!("Local {branch} and {destination} have diverged ({ahead} ahead, {behind} behind). Fetch, review and merge before pushing.")
+            format!("Local {branch} and {} have diverged ({ahead} ahead, {behind} behind). Fetch, review and merge before pushing.", destination.display)
         } else {
-            format!("Local {branch} is behind {destination} by {behind} commit{}. Pull or merge before pushing.", if behind == 1 { "" } else { "s" })
+            format!("Local {branch} is behind {} by {behind} commit{}. Pull or merge before pushing.", destination.display, if behind == 1 { "" } else { "s" })
         };
         (false, Some(message))
     } else {
         (ahead > 0, None)
     };
     Ok(SubmodulePushPreview {
-        branch, local_sha: local_target.to_string(), remote_url,
+        branch, local_sha: local_target.to_string(), remote_url: destination.remote_url,
         will_create_remote_branch, upstream, remote_sha: remote_sha.map(|oid| oid.to_string()), ahead, behind,
         commits, can_push, blocked_reason,
     })
@@ -5466,31 +5691,29 @@ fn push_submodule_inner(repository_path: String, relative_path: String) -> Resul
         return Err(format!("This submodule has uncommitted changes that will NOT be pushed:\n{}{more}\n\nCommit them first, then push.", files.join("\n")));
     }
 
-    repo.find_remote("origin").map_err(|_| "No 'origin' remote configured for this submodule".to_string())?;
+    let branch = resolve_submodule_push_branch(&repo)?;
+    let destination = resolve_submodule_remote_target(&repo, &branch)?;
     // Use the system `git` binary (not libgit2) for network operations here: it
     // transparently reuses the user's already-working SSH agent, credential helper,
     // and OS keychain, instead of libgit2's much narrower built-in credential search
     // — which is what produced "failed to acquire username/password" even though a
     // plain `git push` in a terminal works fine for the same repository.
-    let _ = git(&sub_path, &["fetch", "origin"]);
+    let _ = git(&sub_path, &["fetch", &destination.remote_name]);
+    if let Some(message) = local_worktree_remote_block(&absolute, &destination.remote_url, &destination.remote_name, &destination.remote_branch) { return Err(message); }
 
-    let branch = resolve_submodule_push_branch(&repo)?;
-    let remote_url = repo.find_remote("origin").ok().and_then(|remote| remote.url().map(String::from)).ok_or("No 'origin' remote configured for this submodule")?;
-    if let Some(message) = local_worktree_remote_block(&absolute, &remote_url, &branch) { return Err(message); }
-
-    let remote_target = repo.find_reference(&format!("refs/remotes/origin/{branch}")).ok().and_then(|reference| reference.target());
+    let remote_target = repo.find_reference(&destination.tracking_ref).ok().and_then(|reference| reference.target());
     if remote_target.is_some() && remote_target == local_target {
-        return Err(format!("Nothing to push — this submodule has no commits ahead of origin/{branch}. Commit your changes in the submodule first."));
+        return Err(format!("Nothing to push — this submodule has no commits ahead of {}. Commit your changes in the submodule first.", destination.display));
     }
-    // Push-submodule-workflow report, point 1: `-u` unconditionally, not just
-    // when no upstream is configured yet — setting it again when one already
-    // exists is a harmless no-op, and this is the one place a successful push
-    // must always leave the branch correctly tracking where it just went,
-    // exactly what `git push --set-upstream origin HEAD:<branch>` would do by
-    // hand.
-    git(&sub_path, &["push", "-u", "origin", &format!("HEAD:refs/heads/{branch}")]).map_err(|detail| {
+    let push_refspec = format!("HEAD:refs/heads/{}", destination.remote_branch);
+    let push_result = if destination.configured_upstream {
+        git(&sub_path, &["push", &destination.remote_name, &push_refspec])
+    } else {
+        git(&sub_path, &["push", "--set-upstream", &destination.remote_name, &push_refspec])
+    };
+    push_result.map_err(|detail| {
         if detail.contains("non-fast-forward") || detail.contains("[rejected]") || detail.contains("fetch first") {
-            format!("Push rejected — origin/{branch} has commits you don't have locally (someone else pushed there, or it moved since the last fetch). Fetch the submodule, review/merge the new commits, then push again — or, if you're the only one using this remote, use \"Force push submodule\" to overwrite it.\n\nGit's message: {detail}")
+            format!("Push rejected — {} has commits you don't have locally (someone else pushed there, or it moved since the last fetch). Fetch the submodule, review/merge the new commits, then push again — or, if you're the only one using this remote, use \"Force push submodule\" to overwrite it.\n\nGit's message: {detail}", destination.display)
         } else { format!("Push failed: {detail}") }
     })?;
 
@@ -5548,16 +5771,12 @@ fn force_push_submodule_inner(repository_path: String, relative_path: String) ->
         let more = if dirty.len() > 5 { format!(" (+{} more)", dirty.len() - 5) } else { String::new() };
         return Err(format!("This submodule has uncommitted changes that will NOT be pushed:\n{}{more}\n\nCommit them first, then push.", files.join("\n")));
     }
-    if repo.head_detached().unwrap_or(true) {
-        return Err("This submodule is in detached HEAD (not on a branch). Use \"Change version\" to switch to a branch first, then push.".into());
-    }
-    let branch = repo.head().ok().and_then(|head| head.shorthand().map(String::from)).ok_or("Could not determine the current branch")?;
-
-    repo.find_remote("origin").map_err(|_| "No 'origin' remote configured for this submodule".to_string())?;
+    let branch = resolve_submodule_push_branch(&repo)?;
+    let destination = resolve_submodule_remote_target(&repo, &branch)?;
     // Fetch first so the lease below is checked against the freshest known
     // state of origin/<branch>, not whatever this app last happened to see —
     // matches push_submodule_inner's own pre-flight fetch.
-    let _ = git(&sub_path, &["fetch", "origin"]);
+    let _ = git(&sub_path, &["fetch", &destination.remote_name]);
     // Push-submodule-workflow report, point 1: --force-with-lease, never raw
     // --force. Raw --force overwrites origin/<branch> unconditionally, even
     // if it moved again since the last time this app looked — exactly the
@@ -5567,7 +5786,14 @@ fn force_push_submodule_inner(repository_path: String, relative_path: String) ->
     // where this app last observed it (via the fetch just above), while
     // succeeding for the one case this command is actually for: nobody else
     // is using that remote and it's exactly what was just fetched.
-    git(&sub_path, &["push", "--force-with-lease", "origin", &format!("HEAD:refs/heads/{branch}")]).map_err(|detail| format!("Force push failed: {detail}"))?;
+    if let Some(message) = local_worktree_remote_block(&absolute, &destination.remote_url, &destination.remote_name, &destination.remote_branch) { return Err(message); }
+    let push_refspec = format!("HEAD:refs/heads/{}", destination.remote_branch);
+    let force_result = if destination.configured_upstream {
+        git(&sub_path, &["push", "--force-with-lease", &destination.remote_name, &push_refspec])
+    } else {
+        git(&sub_path, &["push", "--force-with-lease", "--set-upstream", &destination.remote_name, &push_refspec])
+    };
+    force_result.map_err(|detail| format!("Force push to {} failed: {detail}", destination.display))?;
 
     invalidate_git_metadata(&sub_path);
     invalidate_submodule_sync(&repository_path); // this app just changed the submodule's own commit
@@ -5618,17 +5844,16 @@ fn pull_submodule_inner(repository_path: String, relative_path: String) -> Resul
         return Err("This submodule is in detached HEAD (not on a branch), so there is nothing to pull into. Use \"Change version\" to switch to a branch first.".into());
     }
     let branch = repo.head().ok().and_then(|head| head.shorthand().map(String::from)).ok_or("Could not determine the current branch")?;
+    let destination = resolve_submodule_remote_target(&repo, &branch)?;
+    git(&sub_path, &["fetch", &destination.remote_name])?;
 
-    repo.find_remote("origin").map_err(|_| "No 'origin' remote configured for this submodule".to_string())?;
-    git(&sub_path, &["fetch", "origin"])?;
-
-    let remote_ref = repo.find_reference(&format!("refs/remotes/origin/{branch}")).map_err(|error| format!("origin/{branch} not found after fetch: {}", error.message()))?;
-    let target = remote_ref.target().ok_or("origin's branch has no commits")?;
+    let remote_ref = repo.find_reference(&destination.tracking_ref).map_err(|error| format!("{} not found after fetch: {}", destination.display, error.message()))?;
+    let target = remote_ref.target().ok_or_else(|| format!("{} has no commits", destination.display))?;
     let annotated = repo.find_annotated_commit(target).map_err(|error| error.message().to_string())?;
     let (analysis, _) = repo.merge_analysis(&[&annotated]).map_err(|error| error.message().to_string())?;
-    if analysis.is_up_to_date() { return Err(format!("Already up to date with origin/{branch}.")); }
+    if analysis.is_up_to_date() { return Err(format!("Already up to date with {}.", destination.display)); }
     if !analysis.is_fast_forward() {
-        return Err(format!("Cannot fast-forward — your local commit(s) and origin/{branch} have diverged (both have commits the other doesn't). This needs a manual merge or rebase in a terminal inside the submodule folder; it can't be done safely from here."));
+        return Err(format!("Cannot fast-forward — your local commit(s) and {} have diverged (both have commits the other doesn't). Keep both histories with the app's \"Merge branch…\" action, or deliberately delete the local-only history with \"Change version\" → \"Discard local work…\".", destination.display));
     }
     let mut local = repo.find_reference(&format!("refs/heads/{branch}")).map_err(|error| error.message().to_string())?;
     local.set_target(target, "fast-forward pull").map_err(|error| error.message().to_string())?;
@@ -5701,6 +5926,28 @@ mod tests {
         let tree_id = index.write_tree().unwrap(); let tree = repo.find_tree(tree_id).unwrap();
         let signature = git2::Signature::now("Test User", "test@example.com").unwrap();
         repo.commit(Some("HEAD"), &signature, &signature, "Initial commit", &tree, &[]).unwrap();
+    }
+
+    #[test]
+    fn blocked_branch_switch_keeps_head_index_and_worktree_on_the_original_branch() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let repository = std::env::temp_dir().join(format!("git-integrity-safe-switch-{suffix}"));
+        create_libgit2_repository(&repository, "shared.txt");
+        let original_branch = run_git_capture(&repository, &["branch", "--show-current"]);
+        run_git(&repository, &["switch", "-c", "other"]);
+        fs::write(repository.join("shared.txt"), "other branch\n").unwrap();
+        run_git(&repository, &["commit", "-am", "Other branch version"]);
+        run_git(&repository, &["switch", &original_branch]);
+
+        fs::write(repository.join("shared.txt"), "important local edit\n").unwrap();
+        let index_before = run_git_capture(&repository, &["write-tree"]);
+        let result = switch_branch(repository.to_string_lossy().into_owned(), "other".into());
+        assert!(result.is_err(), "a conflicting local edit must block the switch");
+        assert_eq!(run_git_capture(&repository, &["branch", "--show-current"]), original_branch, "HEAD must stay attached to the original branch when checkout fails");
+        assert_eq!(run_git_capture(&repository, &["write-tree"]), index_before, "the index must not be rebased against a branch that was never checked out");
+        assert_eq!(fs::read_to_string(repository.join("shared.txt")).unwrap(), "important local edit\n", "the user's worktree content must remain untouched");
+
+        fs::remove_dir_all(repository).unwrap();
     }
 
     // Test-only: rewrites .gitmodules' recorded `url =` line(s) to a fake
@@ -6406,6 +6653,31 @@ mod tests {
     }
 
     #[test]
+    fn parent_and_submodule_stash_lists_are_independent_and_explicitly_scoped() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-stash-scope-{suffix}"));
+        let parent = base.join("parent"); let dependency = base.join("dependency");
+        create_libgit2_repository(&parent, "README.md"); create_libgit2_repository(&dependency, "module.txt");
+        let parent_path = parent.to_string_lossy().into_owned();
+        add_submodule_inner(parent_path.clone(), "".into(), dependency.to_string_lossy().into_owned(), "test".into(), String::new(), String::new()).unwrap();
+        create_commit(parent_path.clone(), "Add test submodule".into()).unwrap();
+
+        fs::write(parent.join("test/module.txt"), "submodule edit").unwrap();
+        stash_changes(parent.join("test").to_string_lossy().into_owned()).unwrap();
+
+        let parent_scope = list_stashes(parent_path.clone()).unwrap();
+        let sub_scope = list_submodule_stashes(parent_path, "test".into()).unwrap();
+        assert!(!parent_scope.is_submodule);
+        assert!(parent_scope.stashes.is_empty(), "a stash created inside a submodule must never appear in the parent repository's list");
+        assert!(sub_scope.is_submodule);
+        assert_eq!(sub_scope.relative_path.as_deref(), Some("test"));
+        assert_eq!(sub_scope.stashes.len(), 1);
+        assert_eq!(sub_scope.repository_path, parent.join("test").to_string_lossy());
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
     fn stash_file_sets_aside_only_the_chosen_file_leaving_others_modified() {
         let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let repository = std::env::temp_dir().join(format!("git-integrity-stash-one-file-{suffix}"));
@@ -6430,6 +6702,13 @@ mod tests {
         assert_eq!(fs::read_to_string(repository.join("b.txt")).unwrap(), "two", "b.txt's edit must be left alone on disk");
         assert_eq!(data.stashes.len(), 1);
 
+        let blocked = pop_stash(path.clone(), 0).expect_err("a full pop over unrelated live work must be blocked");
+        assert!(blocked.contains("already has uncommitted work"), "the error should explain why the operation was refused: {blocked}");
+        assert_eq!(fs::read_to_string(repository.join("a.txt")).unwrap(), "one", "a blocked pop must not apply any stash content");
+        assert_eq!(fs::read_to_string(repository.join("b.txt")).unwrap(), "two", "a blocked pop must preserve unrelated live work");
+        assert_eq!(list_stashes(path.clone()).unwrap().stashes.len(), 1, "a blocked pop must keep the stash unchanged");
+
+        run_git(&repository, &["restore", "b.txt"]);
         pop_stash(path.clone(), 0).unwrap();
         assert_eq!(fs::read_to_string(repository.join("a.txt")).unwrap(), "two", "popping the stash should bring a.txt's edit back");
 
@@ -6563,7 +6842,7 @@ mod tests {
     }
 
     #[test]
-    fn restore_stash_paths_applies_only_the_chosen_files_and_leaves_the_rest_stashed() {
+    fn restore_stash_paths_restores_only_the_chosen_file_and_keeps_the_stash_as_backup() {
         // Reported: expected to pick individual files (or folders) out of a
         // stash one at a time, not always all-or-nothing. (Restoring one
         // file genuinely removing it from the stash's own list afterward is
@@ -6588,11 +6867,12 @@ mod tests {
         restore_stash_paths(path.clone(), 0, vec!["a.txt".into()]).unwrap();
         assert_eq!(fs::read_to_string(repository.join("a.txt")).unwrap(), "a changed", "a.txt should be restored");
         assert_eq!(fs::read_to_string(repository.join("b.txt")).unwrap(), "one", "b.txt was not selected — it must stay untouched, still only in the stash");
-        assert_eq!(load_repository_inner(path.clone(), Some(true)).unwrap().stashes.len(), 1, "a stash entry must remain for the still-unrestored b.txt");
+        assert_eq!(load_repository_inner(path.clone(), Some(true)).unwrap().stashes.len(), 1, "the original stash must remain as a safety backup");
+        assert_eq!(stash_entry_files(path.clone(), 0).unwrap(), vec!["a.txt".to_string(), "b.txt".to_string()], "a partial restore must never rewrite the stash");
 
         restore_stash_paths(path.clone(), 0, vec!["b.txt".into()]).unwrap();
         assert_eq!(fs::read_to_string(repository.join("b.txt")).unwrap(), "b changed", "b.txt should now be restored too");
-        assert!(load_repository_inner(path.clone(), Some(true)).unwrap().stashes.is_empty(), "nothing left stashed once both files are restored");
+        assert_eq!(load_repository_inner(path.clone(), Some(true)).unwrap().stashes.len(), 1, "restoring every file still keeps the backup until Drop is explicit");
 
         fs::remove_dir_all(repository).unwrap();
     }
@@ -6641,14 +6921,7 @@ mod tests {
     }
 
     #[test]
-    fn restoring_a_file_actually_removes_it_from_the_stash_afterward() {
-        // Reported: after restoring a file, it kept showing up in the list
-        // again — because the earlier implementation only checked the
-        // selected files out of the stash without ever touching the stash
-        // entry itself, so the immutable stash commit still "contained" it
-        // regardless. Restoring must leave it genuinely gone from that
-        // stash: remaining files (if any) end up in a fresh stash entry of
-        // their own; if nothing is left, the old entry is dropped outright.
+    fn restoring_a_file_keeps_the_original_stash_immutable_as_a_backup() {
         let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let repository = std::env::temp_dir().join(format!("git-integrity-stash-shrink-{suffix}"));
         fs::create_dir_all(&repository).unwrap();
@@ -6668,12 +6941,90 @@ mod tests {
 
         restore_stash_paths(path.clone(), 0, vec!["OrdersFromSite/ordersForm.css".into()]).unwrap();
         assert!(repository.join("OrdersFromSite/ordersForm.css").exists(), "the restored file should be on disk");
-        assert_eq!(load_repository_inner(path.clone(), Some(true)).unwrap().stashes.len(), 1, "README.md is still unrestored — a stash entry should remain for it");
-        assert_eq!(stash_entry_files(path.clone(), 0).unwrap(), vec!["README.md".to_string()], "the restored file must be gone from the stash's own list now — not still shown as if untouched");
+        assert_eq!(load_repository_inner(path.clone(), Some(true)).unwrap().stashes.len(), 1, "the backup stash should remain");
+        assert_eq!(stash_entry_files(path.clone(), 0).unwrap(), vec!["OrdersFromSite/ordersForm.css".to_string(), "README.md".to_string()], "restoring one file must not rewrite the stash or its other files");
 
         restore_stash_paths(path.clone(), 0, vec!["README.md".into()]).unwrap();
         assert_eq!(fs::read_to_string(repository.join("README.md")).unwrap(), "changed");
-        assert!(load_repository_inner(path.clone(), Some(true)).unwrap().stashes.is_empty(), "restoring the last remaining file should drop the now-empty stash entry entirely");
+        assert_eq!(load_repository_inner(path.clone(), Some(true)).unwrap().stashes.len(), 1, "only an explicit Drop may delete the backup stash");
+
+        fs::remove_dir_all(repository).unwrap();
+    }
+
+    #[test]
+    fn restoring_one_stash_file_never_touches_live_work_in_an_unselected_file() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let repository = std::env::temp_dir().join(format!("git-integrity-stash-unselected-live-{suffix}"));
+        fs::create_dir_all(&repository).unwrap();
+        fs::write(repository.join("a.txt"), "base a").unwrap();
+        fs::write(repository.join("b.txt"), "base b").unwrap();
+        run_git(&repository, &["init"]);
+        run_git(&repository, &["config", "user.email", "test@example.com"]);
+        run_git(&repository, &["config", "user.name", "Test User"]);
+        run_git(&repository, &["add", "."]);
+        run_git(&repository, &["commit", "-m", "Initial commit"]);
+        let path = repository.to_string_lossy().into_owned();
+
+        fs::write(repository.join("a.txt"), "stashed a").unwrap();
+        fs::write(repository.join("b.txt"), "stashed b").unwrap();
+        stash_changes(path.clone()).unwrap();
+        fs::write(repository.join("b.txt"), "new live b — must survive byte for byte").unwrap();
+
+        restore_stash_paths(path.clone(), 0, vec!["a.txt".into()]).unwrap();
+        assert_eq!(fs::read_to_string(repository.join("a.txt")).unwrap(), "stashed a");
+        assert_eq!(fs::read_to_string(repository.join("b.txt")).unwrap(), "new live b — must survive byte for byte");
+        assert_eq!(stash_entry_files(path.clone(), 0).unwrap(), vec!["a.txt".to_string(), "b.txt".to_string()], "the original backup remains immutable");
+
+        fs::remove_dir_all(repository).unwrap();
+    }
+
+    #[test]
+    fn restoring_a_stash_file_refuses_to_overwrite_current_work_on_that_file() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let repository = std::env::temp_dir().join(format!("git-integrity-stash-selected-live-{suffix}"));
+        fs::create_dir_all(&repository).unwrap();
+        fs::write(repository.join("a.txt"), "base").unwrap();
+        run_git(&repository, &["init"]);
+        run_git(&repository, &["config", "user.email", "test@example.com"]);
+        run_git(&repository, &["config", "user.name", "Test User"]);
+        run_git(&repository, &["add", "."]);
+        run_git(&repository, &["commit", "-m", "Initial commit"]);
+        let path = repository.to_string_lossy().into_owned();
+
+        fs::write(repository.join("a.txt"), "stashed version").unwrap();
+        stash_changes(path.clone()).unwrap();
+        fs::write(repository.join("a.txt"), "new live version").unwrap();
+
+        let error = restore_stash_paths(path.clone(), 0, vec!["a.txt".into()]).unwrap_err();
+        assert!(error.contains("already has uncommitted work"));
+        assert_eq!(fs::read_to_string(repository.join("a.txt")).unwrap(), "new live version", "the current edit must never be overwritten");
+        assert_eq!(load_repository_inner(path.clone(), Some(true)).unwrap().stashes.len(), 1, "the stash must remain available after refusal");
+
+        fs::remove_dir_all(repository).unwrap();
+    }
+
+    #[test]
+    fn restoring_a_stashed_deletion_removes_only_that_clean_tracked_file() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let repository = std::env::temp_dir().join(format!("git-integrity-stash-deletion-{suffix}"));
+        fs::create_dir_all(&repository).unwrap();
+        fs::write(repository.join("delete-me.txt"), "tracked").unwrap();
+        fs::write(repository.join("leave-me.txt"), "tracked").unwrap();
+        run_git(&repository, &["init"]);
+        run_git(&repository, &["config", "user.email", "test@example.com"]);
+        run_git(&repository, &["config", "user.name", "Test User"]);
+        run_git(&repository, &["add", "."]);
+        run_git(&repository, &["commit", "-m", "Initial commit"]);
+        let path = repository.to_string_lossy().into_owned();
+
+        fs::remove_file(repository.join("delete-me.txt")).unwrap();
+        fs::write(repository.join("leave-me.txt"), "stashed but not selected").unwrap();
+        stash_changes(path.clone()).unwrap();
+
+        restore_stash_paths(path.clone(), 0, vec!["delete-me.txt".into()]).unwrap();
+        assert!(!repository.join("delete-me.txt").exists(), "the selected stashed deletion should be restored");
+        assert_eq!(fs::read_to_string(repository.join("leave-me.txt")).unwrap(), "tracked", "an unselected path must remain untouched");
+        assert_eq!(stash_entry_files(path.clone(), 0).unwrap(), vec!["delete-me.txt".to_string(), "leave-me.txt".to_string()], "the original backup remains intact");
 
         fs::remove_dir_all(repository).unwrap();
     }
@@ -8510,6 +8861,83 @@ mod tests {
     }
 
     #[test]
+    fn submodule_preview_push_pull_and_force_push_share_a_differently_named_upstream() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-submodule-real-upstream-{suffix}"));
+        let repository = base.join("main");
+        let origin = base.join("origin.git");
+        let mirror = base.join("mirror.git");
+        let seed = base.join("seed");
+        fs::create_dir_all(&repository).unwrap();
+        fs::create_dir_all(&origin).unwrap();
+        fs::create_dir_all(&mirror).unwrap();
+        fs::create_dir_all(&seed).unwrap();
+        fs::write(repository.join("README.md"), "root").unwrap();
+        fs::write(seed.join("module.txt"), "v1").unwrap();
+        run_git(&origin, &["init", "--bare"]);
+        run_git(&mirror, &["init", "--bare"]);
+        for path in [&repository, &seed] {
+            run_git(path, &["init", "-b", "main"]);
+            run_git(path, &["config", "user.email", "test@example.com"]);
+            run_git(path, &["config", "user.name", "Test User"]);
+            run_git(path, &["add", "."]);
+            run_git(path, &["commit", "-m", "Initial"]);
+        }
+        run_git(&seed, &["remote", "add", "origin", origin.to_str().unwrap()]);
+        run_git(&seed, &["push", "origin", "HEAD:main"]);
+        run_git(&repository, &["-c", "protocol.file.allow=always", "submodule", "add", origin.to_str().unwrap(), "vendor/dep"]);
+        run_git(&repository, &["commit", "-am", "Add dep"]);
+
+        let repo_path = repository.to_string_lossy().into_owned();
+        let sub_path = repository.join("vendor/dep");
+        run_git(&sub_path, &["config", "user.email", "test@example.com"]);
+        run_git(&sub_path, &["config", "user.name", "Test User"]);
+        run_git(&sub_path, &["remote", "add", "mirror", mirror.to_str().unwrap()]);
+        run_git(&sub_path, &["push", "mirror", "HEAD:release"]);
+        run_git(&sub_path, &["switch", "-c", "work"]);
+        run_git(&sub_path, &["config", "branch.work.remote", "mirror"]);
+        run_git(&sub_path, &["config", "branch.work.merge", "refs/heads/release"]);
+        fs::write(sub_path.join("module.txt"), "local v2").unwrap();
+        run_git(&sub_path, &["commit", "-am", "Local work for release"]);
+
+        let preview = push_submodule_preview_inner(repo_path.clone(), "vendor/dep".into()).unwrap();
+        assert_eq!(preview.branch, "work");
+        assert_eq!(preview.upstream.as_deref(), Some("mirror/release"));
+        assert_eq!(preview.remote_url, mirror.to_string_lossy());
+        assert_eq!((preview.ahead, preview.behind), (1, 0));
+        push_submodule_inner(repo_path.clone(), "vendor/dep".into()).expect("push must use mirror/release, exactly as preview advertised");
+        assert_eq!(run_git_capture(&mirror, &["log", "-1", "--format=%s", "release"]), "Local work for release");
+        assert!(Repository::open_bare(&origin).unwrap().find_reference("refs/heads/work").is_err(), "push must not silently create origin/work");
+
+        let other = base.join("other");
+        run_git(&base, &["clone", mirror.to_str().unwrap(), "other"]);
+        run_git(&other, &["switch", "release"]);
+        run_git(&other, &["config", "user.email", "other@example.com"]);
+        run_git(&other, &["config", "user.name", "Other User"]);
+        fs::write(other.join("module.txt"), "remote v3").unwrap();
+        run_git(&other, &["commit", "-am", "Remote release work"]);
+        run_git(&other, &["push", "origin", "release"]);
+
+        pull_submodule_inner(repo_path, "vendor/dep".into()).expect("pull must fetch and fast-forward from mirror/release");
+        assert_eq!(fs::read_to_string(sub_path.join("module.txt")).unwrap(), "remote v3");
+        assert_eq!(run_git_capture(&sub_path, &["branch", "--show-current"]), "work", "pull must keep the differently named local branch attached");
+
+        // Deliberately diverge both sides. Force-push must still overwrite the
+        // same configured mirror/release destination, never origin/work.
+        fs::write(sub_path.join("module.txt"), "local force version").unwrap();
+        run_git(&sub_path, &["commit", "-am", "Local force candidate"]);
+        fs::write(other.join("module.txt"), "remote divergent version").unwrap();
+        run_git(&other, &["commit", "-am", "Remote divergent release"]);
+        run_git(&other, &["push", "origin", "release"]);
+        force_push_submodule_inner(repository.to_string_lossy().into_owned(), "vendor/dep".into())
+            .expect("force-push must use mirror/release too");
+        assert_eq!(run_git_capture(&mirror, &["log", "-1", "--format=%s", "release"]), "Local force candidate");
+        assert!(Repository::open_bare(&origin).unwrap().find_reference("refs/heads/work").is_err(), "force-push must not silently create origin/work either");
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
     fn create_submodule_tag_creates_at_the_intended_commit_and_never_touches_the_parent() {
         // Point 4 of the submodule-tag-workflow report: an annotated tag when
         // a message is supplied, a lightweight one otherwise, always at the
@@ -8653,22 +9081,121 @@ mod tests {
         let repo_path = repository.to_string_lossy().into_owned();
         let sub_path = repository.join("vendor/dep");
         let recorded_commit = Repository::open(&sub_path).unwrap().head().unwrap().target().unwrap().to_string();
+        let local_branch = git(&sub_path.to_string_lossy(), &["branch", "--show-current"]).unwrap().trim().to_string();
 
         // Drift the submodule: a local commit ahead of what the parent has
         // recorded (like an uncommitted "switch version"), plus a dirty,
         // uncommitted edit on top of that — both must be discarded by reset.
         fs::write(sub_path.join("module.txt"), "v2 (local commit)").unwrap();
         run_git(&sub_path, &["commit", "-am", "Local-only change, never recorded by the parent"]);
+        let local_commit = git(&sub_path.to_string_lossy(), &["rev-parse", "HEAD"]).unwrap().trim().to_string();
         fs::write(sub_path.join("module.txt"), "v3 (dirty, uncommitted)").unwrap();
         assert!(!Repository::open(&sub_path).unwrap().statuses(None).unwrap().is_empty(), "sanity check: the submodule should be dirty before reset");
 
-        let reset_to = reset_submodule_inner(repo_path, "vendor/dep".into()).unwrap();
+        let reset_to = reset_submodule_inner(repo_path.clone(), "vendor/dep".into()).unwrap();
         assert_eq!(reset_to, recorded_commit, "reset should land on the commit the parent has recorded, not wherever the submodule had drifted to");
 
         let sub_repo = Repository::open(&sub_path).unwrap();
         assert_eq!(sub_repo.head().unwrap().target().unwrap().to_string(), recorded_commit, "HEAD must be back at the parent-recorded commit");
         assert!(sub_repo.statuses(None).unwrap().is_empty(), "the dirty edit must be discarded — reset means overwritten, not merged or preserved");
         assert_eq!(fs::read_to_string(sub_path.join("module.txt")).unwrap(), "v1", "working tree content must match the recorded commit exactly");
+        drop(sub_repo);
+
+        // Exact field regression from the real UI: after restore, merely
+        // selecting the old local branch used to set HEAD before checkout.
+        // That made the restored tree appear as staged reverse changes
+        // against the branch, even though the user had edited nothing.
+        let versions = submodule_versions(repo_path.clone(), "vendor/dep".into()).unwrap();
+        let branch = versions.versions.iter().find(|version| version.kind == "branch" && version.name == local_branch).unwrap();
+        switch_submodule_version_inner(repo_path, "vendor/dep".into(), branch.revision.clone(), branch.kind.clone(), branch.name.clone()).unwrap();
+        let switched = Repository::open(&sub_path).unwrap();
+        assert!(!switched.head_detached().unwrap(), "selecting a local branch must attach HEAD");
+        assert_eq!(switched.head().unwrap().target().unwrap().to_string(), local_commit);
+        assert!(switched.statuses(None).unwrap().is_empty(), "restore then checkout must not manufacture staged reverse changes");
+        assert_eq!(switched.index().unwrap().write_tree().unwrap(), switched.head().unwrap().peel_to_tree().unwrap().id(), "index must exactly match the selected branch tip");
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn reset_submodule_branch_to_upstream_discards_a_divergence_and_leaves_a_clean_attached_branch() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-reset-submodule-upstream-{suffix}"));
+        let repository = base.join("main");
+        let dependency = base.join("dependency");
+        fs::create_dir_all(&repository).unwrap();
+        fs::create_dir_all(&dependency).unwrap();
+        fs::write(repository.join("README.md"), "root").unwrap();
+        fs::write(dependency.join("module.txt"), "v1").unwrap();
+        for path in [&repository, &dependency] {
+            run_git(path, &["init", "-b", "main"]);
+            run_git(path, &["config", "user.email", "test@example.com"]);
+            run_git(path, &["config", "user.name", "Test User"]);
+            run_git(path, &["add", "."]);
+            run_git(path, &["commit", "-m", "Initial"]);
+        }
+        run_git(&repository, &["-c", "protocol.file.allow=always", "submodule", "add", dependency.to_str().unwrap(), "vendor/dep"]);
+        run_git(&repository, &["commit", "-am", "Add dep submodule"]);
+        let sub_path = repository.join("vendor/dep");
+        run_git(&sub_path, &["config", "user.email", "test@example.com"]);
+        run_git(&sub_path, &["config", "user.name", "Test User"]);
+
+        fs::write(dependency.join("remote.txt"), "remote only").unwrap();
+        run_git(&dependency, &["add", "."]);
+        run_git(&dependency, &["commit", "-m", "Remote moves"]);
+        let remote_tip = git(&dependency.to_string_lossy(), &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+        fs::write(sub_path.join("local.txt"), "local only").unwrap();
+        run_git(&sub_path, &["add", "."]);
+        run_git(&sub_path, &["commit", "-m", "Local moves"]);
+        fs::write(sub_path.join("dirty.txt"), "discard me").unwrap();
+        run_git(&sub_path, &["add", "dirty.txt"]);
+
+        let result = reset_submodule_branch_to_upstream_inner(repository.to_string_lossy().into_owned(), "vendor/dep".into(), "main".into()).unwrap();
+        assert_eq!(result.branch, "main");
+        assert_eq!(result.upstream, "origin/main");
+        assert_eq!(result.revision, remote_tip);
+        let sub_repo = Repository::open(&sub_path).unwrap();
+        assert!(!sub_repo.head_detached().unwrap(), "matching upstream must keep the user on the local branch");
+        assert_eq!(sub_repo.head().unwrap().shorthand(), Some("main"));
+        assert_eq!(sub_repo.head().unwrap().target().unwrap().to_string(), remote_tip);
+        assert!(sub_repo.statuses(None).unwrap().is_empty(), "hard match must leave no staged or unstaged leftovers");
+        let upstream = sub_repo.find_branch("main", BranchType::Local).unwrap().upstream().unwrap();
+        assert_eq!(upstream.get().target(), sub_repo.head().unwrap().target());
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn reset_submodule_branch_to_upstream_refuses_to_delete_dirty_work_from_another_checkout() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-reset-submodule-other-branch-{suffix}"));
+        let repository = base.join("main");
+        let dependency = base.join("dependency");
+        fs::create_dir_all(&repository).unwrap();
+        fs::create_dir_all(&dependency).unwrap();
+        fs::write(repository.join("README.md"), "root").unwrap();
+        fs::write(dependency.join("module.txt"), "v1").unwrap();
+        for path in [&repository, &dependency] {
+            run_git(path, &["init", "-b", "main"]);
+            run_git(path, &["config", "user.email", "test@example.com"]);
+            run_git(path, &["config", "user.name", "Test User"]);
+            run_git(path, &["add", "."]);
+            run_git(path, &["commit", "-m", "Initial"]);
+        }
+        run_git(&repository, &["-c", "protocol.file.allow=always", "submodule", "add", dependency.to_str().unwrap(), "vendor/dep"]);
+        run_git(&repository, &["commit", "-am", "Add dep submodule"]);
+        let sub_path = repository.join("vendor/dep");
+        run_git(&sub_path, &["config", "user.email", "test@example.com"]);
+        run_git(&sub_path, &["config", "user.name", "Test User"]);
+        run_git(&sub_path, &["switch", "-c", "develop"]);
+        fs::write(sub_path.join("module.txt"), "develop work that must survive").unwrap();
+        let main_before = git(&sub_path.to_string_lossy(), &["rev-parse", "main"]).unwrap();
+
+        let error = reset_submodule_branch_to_upstream_inner(repository.to_string_lossy().into_owned(), "vendor/dep".into(), "main".into()).unwrap_err();
+        assert!(error.contains("has uncommitted work"));
+        assert_eq!(git(&sub_path.to_string_lossy(), &["branch", "--show-current"]).unwrap().trim(), "develop", "the active checkout must not change");
+        assert_eq!(git(&sub_path.to_string_lossy(), &["rev-parse", "main"]).unwrap(), main_before, "the selected inactive branch must not move");
+        assert_eq!(fs::read_to_string(sub_path.join("module.txt")).unwrap(), "develop work that must survive", "dirty work must survive byte for byte");
 
         fs::remove_dir_all(base).unwrap();
     }
@@ -8707,7 +9234,7 @@ mod tests {
         run_git(&sub_path, &["checkout", "--detach", "HEAD"]);
         assert!(Repository::open(&sub_path).unwrap().head_detached().unwrap());
         let versions = submodule_versions(repo_path.clone(), "vendor/dep".into()).unwrap();
-        let origin_main = versions.versions.iter().find(|v| v.kind == "remote" && v.name == "origin/main").expect("origin/main should be listed").clone();
+        let origin_main = versions.versions.iter().find(|v| v.kind == "remote" && v.name == "origin/main").expect("origin/main should be listed");
         switch_submodule_version_inner(repo_path.clone(), "vendor/dep".into(), origin_main.revision.clone(), origin_main.kind.clone(), origin_main.name.clone()).unwrap();
         let sub_repo = Repository::open(&sub_path).unwrap();
         assert!(!sub_repo.head_detached().unwrap(), "selecting origin/main with no local main should attach, not detach");

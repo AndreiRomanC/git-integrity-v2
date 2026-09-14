@@ -6,7 +6,7 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { groupSubmoduleBranchVersions, submoduleVersionRowHtml, submodulePushDialogState } = require('../frontend/submodule-versions.js');
+const { groupSubmoduleBranchVersions, submoduleCurrentPresentation, submoduleVersionRowHtml, submodulePushDialogState } = require('../frontend/submodule-versions.js');
 
 function branch(name, upstream) { return { name, kind: 'branch', upstream: upstream || null }; }
 function remote(name) { return { name, kind: 'remote' }; }
@@ -68,11 +68,24 @@ test('tolerates a missing/undefined list without throwing', () => {
   assert.deepEqual(groupSubmoduleBranchVersions([]), { local: [], remoteOnly: [] });
 });
 
+test('a restored detached checkout is clearly separated from saved divergent branches', () => {
+  const restored = submoduleCurrentPresentation({ current_revision: '30402ecb1234', current_branch: '', parent_revision: '30402ecb1234' });
+  assert.equal(restored.text, 'Project version @ 30402ecb (detached)');
+  assert.match(restored.help, /Restore succeeded/);
+  assert.match(restored.help, /saved pointers, not the active checkout/);
+
+  const arbitraryDetached = submoduleCurrentPresentation({ current_revision: '111111111234', current_branch: '', parent_revision: '222222221234' });
+  assert.equal(arbitraryDetached.text, 'Detached HEAD @ 11111111');
+  assert.match(arbitraryDetached.help, /project records 22222222/);
+});
+
 test('a branch row shows the exact tip SHA and subject from the existing response', () => {
   const html = submoduleVersionRowHtml({ name: 'develop', kind: 'branch', revision: 'a5cf438372b9568c', subject: 'test32', author: 'Andrei', date: '2026-09-12', current: true, upstream: 'origin/develop', ahead: 1, behind: 0 });
   assert.match(html, /<code>a5cf4383<\/code>/);
   assert.match(html, /test32/);
   assert.match(html, /origin\/develop/);
+  assert.match(html, /CURRENT/);
+  assert.doesNotMatch(html, /data-switch-version/);
 });
 
 test('a tag row shows the target commit SHA and subject', () => {
@@ -134,6 +147,21 @@ test('branch rows explain ahead and behind in words and name the compared upstre
 
   const diverged = submoduleVersionRowHtml({ name: 'release', kind: 'branch', revision: 'cccccccc1234', subject: 'Both moved', author: 'A', date: '2026-09-13', upstream: 'origin/release', ahead: 3, behind: 4 });
   assert.match(diverged, /DIVERGED · 3 ahead \/ 4 behind · origin\/release/);
+});
+
+test('destructive remote matching is offered only for the active branch', () => {
+  const current = submoduleVersionRowHtml({ name: 'main', kind: 'branch', revision: 'aaaaaaaa1234', subject: 'Local', author: 'A', date: '2026-09-13', current: true, upstream: 'origin/main', ahead: 1, behind: 1 });
+  assert.match(current, /data-reset-upstream/);
+  assert.match(current, /Discard local work…/);
+  assert.match(current, /Destructive recovery/);
+  assert.doesNotMatch(current, /data-switch-version/);
+
+  const other = submoduleVersionRowHtml({ name: 'develop', kind: 'branch', revision: 'bbbbbbbb1234', subject: 'Other', author: 'A', date: '2026-09-13', current: false, upstream: 'origin/develop', ahead: 1, behind: 1 });
+  assert.doesNotMatch(other, /data-reset-upstream/);
+  assert.match(other, /data-switch-version/);
+
+  const synced = submoduleVersionRowHtml({ name: 'main', kind: 'branch', revision: 'cccccccc1234', subject: 'Synced', author: 'A', date: '2026-09-13', current: true, upstream: 'origin/main', ahead: 0, behind: 0 });
+  assert.doesNotMatch(synced, /data-reset-upstream/);
 });
 
 test('a branch without upstream is explicitly local and does not show invented counts', () => {

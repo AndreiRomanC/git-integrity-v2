@@ -1,12 +1,12 @@
 [package]
-name = "git-integrity"
+name = "git-drilldown"
 version = "0.1.0"
 description = "A visual Git client inspired by engineering workflows"
-authors = ["Git Integrity contributors"]
+authors = ["Git DrillDown contributors"]
 edition = "2021"
 
 [lib]
-name = "git_integrity_lib"
+name = "git_drilldown_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]

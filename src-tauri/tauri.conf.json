@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Git Integrity",
+  "productName": "Git DrillDown",
   "version": "0.1.0",
   "identifier": "com.gitintegrity.desktop",
   "build": {
@@ -10,7 +10,7 @@
     "withGlobalTauri": true,
     "windows": [
       {
-        "title": "Git Integrity",
+        "title": "Git DrillDown",
         "width": 1440,
         "height": 900,
         "minWidth": 980,

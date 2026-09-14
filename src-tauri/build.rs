@@ -28,7 +28,7 @@ fn main() {
         .map(|output| !output.stdout.is_empty())
         .unwrap_or(false);
     let sha = if dirty { format!("{sha}-dirty") } else { sha };
-    println!("cargo:rustc-env=GIT_INTEGRITY_BUILD_SHA={sha}");
+    println!("cargo:rustc-env=GIT_DRILLDOWN_BUILD_SHA={sha}");
     // Re-run build.rs (and so re-check dirtiness) on every build — without
     // this, cargo only reruns it when build.rs itself or files it explicitly
     // declares change, so editing repository.rs without touching build.rs

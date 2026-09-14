@@ -3,13 +3,14 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Git Integrity</title>
+  <title>Git DrillDown</title>
+  <link rel="icon" type="image/png" href="assets/git-drilldown-mark.png">
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
   <div class="app-shell">
     <header class="topbar">
-      <div class="brand"><span class="brand-mark">G</span><span>Git Integrity</span></div>
+      <div class="brand"><img class="brand-logo" src="assets/git-drilldown-logo.png" alt="Git DrillDown"></div>
       <button class="repo-picker" id="openRepo">
         <span class="folder-icon">▰</span>
         <span class="repo-picker-copy"><strong id="repoName">Open a repository</strong><small id="repoPath">Choose an existing Git folder</small></span>
@@ -27,7 +28,7 @@
         <button id="pullCurrent" title="Pull current branch">⇣</button>
         <button id="pushCurrent" title="Push current branch">↑</button>
         <button id="mergeCurrent" title="Merge a branch into the current one">⑂</button>
-        <button id="openConsole" title="Command console — type what you want to do (Ctrl/Cmd+K)">⌘</button>
+        <button id="openConsole" title="App actions and Terminal (Ctrl/Cmd+K)">⌘</button>
         <button id="openHelp" title="Help — what everything in this app does">?</button>
       </div>
     </header>
@@ -50,8 +51,8 @@
         </button>
         <button class="workspace-status publish-status" id="showPublish"><span class="publish-dot">↑</span><span><strong>Unpublished</strong><small id="publishSubtitle">Choose what goes to server</small></span><b id="publishBadge">?</b></button>
         <button class="workspace-status" id="mergeConflictsBanner" data-tooltip="A merge is waiting for you to resolve conflicts" title="Resolve merge conflicts" hidden><span class="workspace-dot" style="background:#f06d75;"></span><span><strong>Merge conflicts</strong><small id="mergeConflictsSubtitle">0 files to resolve</small></span></button>
-        <button class="workspace-status" id="stashWork" data-tooltip="Moves ALL uncommitted changes to a temporary holding area — the stash — so they're set aside and not part of any commit until you bring them back" title="Set all uncommitted changes aside temporarily"><span class="workspace-dot" style="background:#b294ff;"></span><span><strong>Stash work</strong><small>Set changes aside temporarily</small></span></button>
-        <button class="workspace-status" id="popStash" data-tooltip="Brings back everything you set aside in the stash" title="Bring the stash back" hidden><span class="workspace-dot" style="background:#48cc7e;"></span><span><strong>Pop stash</strong><small>Bring saved changes back</small></span></button>
+        <button class="workspace-status" id="stashWork" data-tooltip="Sets aside uncommitted changes only in the repository you are currently browsing. A parent project and each submodule have separate stashes." title="Stash changes in the current repository"><span class="workspace-dot" style="background:#b294ff;"></span><span><strong id="stashWorkTitle">Stash project work</strong><small id="stashWorkSubtitle">Main project only</small></span></button>
+        <button class="workspace-status" id="popStash" data-tooltip="Opens the stash list for the repository you are currently browsing. A parent project and each submodule have separate stash lists." title="View stashes for the current repository"><span class="workspace-dot" style="background:#48cc7e;"></span><span><strong>Stashes</strong><small id="stashListSubtitle">View saved project work</small></span></button>
 
         <div class="side-heading pr-status-heading" id="togglePrStatus" title="Pull request status for the PARENT project's currently checked-out branch — always the parent, never a submodule, even while a Submodule Branch Map is open. Collapsed by default, doesn't check until opened"><span class="branch-heading-arrow" id="prStatusArrow">▸</span><span>PROJECT PULL REQUEST</span></div>
         <div id="prStatusPanel" class="pr-status-panel collapsed"></div>
@@ -166,7 +167,7 @@
       </div>
       <input id="submoduleVersionSearch" class="version-search" type="text" placeholder="Search branches or tags…" autocomplete="off" spellcheck="false">
       <div id="submoduleVersions" class="version-list"></div>
-      <footer class="version-help">Select a version to update the submodule reference.</footer>
+      <footer id="submoduleVersionHelp" class="version-help">Use Checkout to change version. “Discard local work…” is a destructive recovery action shown only for a branch that differs from origin.</footer>
     </section>
 
     <footer>
@@ -180,20 +181,25 @@
   <dialog id="commandPalette" class="command-palette">
     <form method="dialog">
       <div class="command-tabs">
-        <button type="button" class="command-tab active" data-mode="commands">Commands</button>
+        <button type="button" class="command-tab active" data-mode="commands">App actions</button>
         <button type="button" class="command-tab" data-mode="console">Terminal</button>
-        <span id="commandScope" class="command-scope"></span>
-        <button type="button" id="commandScopeCycle" class="command-scope-cycle" title="Change the working directory for terminal commands" hidden>⇄ scope</button>
+        <span class="command-tabs-spacer"></span>
         <button type="button" id="commandCopyTranscript" class="command-clear" title="Copy the complete terminal transcript" hidden>Copy all</button>
         <button type="button" id="commandClearTranscript" class="command-clear" title="Clear console history" hidden>Clear</button>
+      </div>
+      <div id="terminalScopeBar" class="terminal-scope-bar" hidden>
+        <span class="terminal-scope-caption">RUN IN</span>
+        <span id="commandScope" class="command-scope"></span>
+        <select id="commandScopeSelect" class="command-scope-select" aria-label="Working directory" title="Choose the exact working directory"></select>
       </div>
       <input id="commandInput" type="text" placeholder="Type a command… (Cmd/Ctrl+K)" autocomplete="off" spellcheck="false">
       <div id="terminalQuickCommands" class="terminal-quick-commands" hidden>
         <span>Quick:</span>
-        <button type="button" data-terminal-fill="git status --short --branch">Status</button>
+        <button type="button" data-terminal-fill="git status --short --branch -- ." title="Limit status to the selected working directory">Status here</button>
         <button type="button" data-terminal-fill="git branch -vv">Branches</button>
         <button type="button" data-terminal-fill="git remote -v">Remotes</button>
-        <button type="button" data-terminal-fill="git log --oneline --decorate -10">Recent commits</button>
+        <button type="button" data-terminal-fill="git log --oneline --decorate -10 -- ." title="Limit history to paths below the selected working directory">History here</button>
+        <button type="button" data-terminal-fill="git diff -- ." title="Limit the diff to the selected working directory">Diff here</button>
         <button type="button" data-terminal-fill="gh pr status">Pull requests</button>
       </div>
       <div id="commandGitHints" class="command-git-hints" hidden></div>
@@ -272,7 +278,7 @@
       <div class="publish-controls"><label><span>LOCAL BRANCH</span><select id="publishBranch"></select></label><span class="publish-arrow">→</span><label><span>REMOTE</span><select id="publishRemote"></select></label></div>
       <div class="publish-explain"><b id="publishDestination">—</b><span>All commits listed below will be published in order. Select files before Commit; select the destination here before Push.</span></div>
       <div id="publishCommits" class="publish-commits"></div>
-      <details class="submodule-auth"><summary>Private server credentials</summary><div><label><span>USERNAME</span><input id="publishUsername" autocomplete="username" placeholder="Git username"></label><label><span>PERSONAL ACCESS TOKEN</span><input id="publishToken" type="password" autocomplete="off" placeholder="Token (not account password)"></label></div><small>Used only for this push and never saved by Git Integrity.</small></details>
+      <details class="submodule-auth"><summary>Private server credentials</summary><div><label><span>USERNAME</span><input id="publishUsername" autocomplete="username" placeholder="Git username"></label><label><span>PERSONAL ACCESS TOKEN</span><input id="publishToken" type="password" autocomplete="off" placeholder="Token (not account password)"></label></div><small>Used only for this push and never saved by Git DrillDown.</small></details>
       <p id="publishOperationStatus" class="submodule-operation-status" role="status"></p>
       <footer><span id="publishSummary">Checking…</span><button value="cancel">Cancel</button><button value="default" id="confirmPublish">Publish branch</button></footer>
     </form>
@@ -375,16 +381,17 @@
         </details>
         <details>
           <summary>Stash</summary>
-          <p>The stash is a temporary holding area — changes you put there are set aside and won't be part of any commit until you bring them back. "Stash work" (top toolbar) sets aside <i>everything</i> uncommitted, leaving your working folder clean — useful for switching tasks without committing half-finished work.</p>
-          <p>"Pop stash" opens the full Stashes list — a plain list of every entry and the files it contains. Click "⇈ Restore" next to any file to bring back just that one; it disappears from the list once restored (it's in your working tree now, nothing more to do there). The rest of the stash is untouched, so come back for other files whenever you want. "Drop entire stash" discards everything still left in that entry, for good.</p>
+          <p>The stash is a temporary holding area — changes you put there are set aside and won't be part of any commit until you bring them back. "Stash work" sets aside the uncommitted work in the <i>repository currently being browsed</i>, leaving that working folder clean.</p>
+          <p>The main project and every submodule are independent Git repositories, so they also have independent stash lists. Stashing the main project never hides edits inside a submodule. Enter that submodule (or use its details panel) to stash its work.</p>
+          <p>"Stashes" opens the full list for the current repository — one row for every entry and the files it contains. Click "⇈ Restore" next to any file to bring back only that file. The original stash remains as a safety backup until you explicitly use "Drop"; Drop permanently discards the whole saved entry.</p>
           <p>To set aside just <i>one</i> file instead of everything, use the "⇕ Stash" button next to it in the Working tree drawer, or "⇕ Stash this file" in that file's own details panel (select it in Explorer to see it) — either way, only that file is stashed; every other change stays untouched.</p>
           <p>Stashes show up as small ⇕ markers in the Branch Map on the commit they were based on, not as real history — click one to expand it and see exactly which files it contains, before you decide to bring it back.</p>
-          <p>If "Pop stash" can't apply cleanly (the file changed since you stashed it), it doesn't fail or lose anything — it opens the same conflict-resolution dialog used for merges, and the stash itself is kept until you finish (or explicitly discard and keep it for later).</p>
+          <p>If restoring a stash can't apply cleanly (the file changed since it was stashed), it doesn't lose anything — the app opens the conflict-resolution dialog and keeps the stash until you finish or explicitly discard the conflicted restore.</p>
         </details>
         <details>
-          <summary>Command Console (⌘ or Ctrl/Cmd+K)</summary>
-          <p><b>Commands tab</b> — a searchable list of everything this app can do. Type what you want ("commit", "merge", "push submodule"); commands relevant to what's currently selected are boosted to the top.</p>
-          <p><b>Terminal tab</b> — run shell commands such as <code>git status</code>, <code>git remote -v</code>, <code>gh pr status</code>, <code>pwd</code>, <code>ls</code> (macOS) or <code>dir</code> (Windows), and see their real output. Commands run in the location shown at the top, changeable with “⇄ scope”. Use the Quick buttons to prepare common commands, “Use again” to edit an earlier command, and Copy/Copy all to share diagnostic output. Bare Git subcommands such as <code>status</code> still work. Potentially destructive commands ask for confirmation. Interactive prompts are disabled so a command cannot leave the application frozen waiting for invisible input.</p>
+          <summary>App actions and Terminal (⌘ or Ctrl/Cmd+K)</summary>
+          <p><b>App actions tab</b> — a searchable list of everything this app can do. Type what you want ("commit", "merge", "push submodule"); actions relevant to what's currently selected are boosted to the top.</p>
+          <p><b>Terminal tab</b> — run shell commands such as <code>git status</code>, <code>git remote -v</code>, <code>gh pr status</code>, <code>pwd</code>, <code>ls</code> (macOS) or <code>dir</code> (Windows), and see their real output. “Run in” shows the exact working directory; use its selector to choose another valid location. Git itself treats commands such as <code>git log</code> as repository-wide even when run from a subfolder; use the “Status here”, “History here” and “Diff here” shortcuts when you want a path filter. “Use again” edits an earlier command, and Copy/Copy all shares diagnostic output. Bare Git subcommands such as <code>status</code> still work. Potentially destructive commands ask for confirmation. Interactive prompts are disabled so a command cannot leave the application frozen waiting for invisible input.</p>
         </details>
         <details>
           <summary>Remotes</summary>
@@ -396,7 +403,7 @@
   </dialog>
   <dialog id="stashesDialog" class="publish-dialog">
     <form method="dialog">
-      <header><div><h2>Stashes</h2><p>Changes set aside temporarily — pick one to bring back, or drop it if you don't need it.</p></div><button type="button" id="refreshStashes" title="Re-check with the actual state on disk">↻</button><button value="cancel">×</button></header>
+      <header><div><h2 id="stashesTitle">Stashes</h2><p id="stashesSubtitle">Restore copies only the selected file; the stash stays as a backup until you explicitly drop it.</p></div><button type="button" id="refreshStashes" title="Re-check with the actual state on disk">↻</button><button value="cancel">×</button></header>
       <div id="stashesList" class="conflicts-list"></div>
       <footer><span style="flex:1"></span><button value="cancel">Close</button></footer>
     </form>
@@ -429,6 +436,7 @@
       <footer><button value="cancel">Cancel</button><button type="button" value="default" id="confirmNewTag" class="confirm">Create tag</button></footer>
     </form>
   </dialog>
+  <script src="console-context.js"></script>
   <script src="graph-model.js"></script>
   <script src="submodule-state.js"></script>
   <script src="submodule-versions.js"></script>

@@ -4,7 +4,7 @@ $ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Manifest = Join-Path $ProjectRoot "src-tauri\Cargo.toml"
 $BuildDir = Join-Path $ProjectRoot ".build-windows"
 $OutputDir = Join-Path $ProjectRoot "dist\windows"
-$OutputExe = Join-Path $OutputDir "git-integrity.exe"
+$OutputExe = Join-Path $OutputDir "GitDrillDown.exe"
 
 if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
     throw "Rust/Cargo is required only on the build machine. The final EXE needs neither Rust nor Node.js."
@@ -16,7 +16,7 @@ $env:CARGO_INCREMENTAL = "0"
 
 try {
     cargo build --release --manifest-path $Manifest
-    Copy-Item (Join-Path $BuildDir "release\git-integrity.exe") $OutputExe -Force
+    Copy-Item (Join-Path $BuildDir "release\git-drilldown.exe") $OutputExe -Force
 
     $Size = (Get-Item $OutputExe).Length
     $Limit = 30MB

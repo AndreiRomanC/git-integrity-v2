@@ -36,6 +36,7 @@ pub fn run() {
             repository::add_submodule,
             repository::switch_submodule_version,
             repository::reset_submodule,
+            repository::reset_submodule_branch_to_upstream,
             repository::change_submodule_url,
             repository::remove_git_path,
             repository::delete_local_path,
@@ -60,6 +61,8 @@ pub fn run() {
             repository::submodule_repository,
             repository::stash_changes,
             repository::stash_file,
+            repository::list_stashes,
+            repository::list_submodule_stashes,
             repository::pop_stash,
             repository::drop_stash,
             repository::restore_stash_paths,
@@ -89,5 +92,5 @@ pub fn run() {
             repository::run_utrud,
         ])
         .run(tauri::generate_context!())
-        .expect("error while running Git Integrity");
+        .expect("error while running Git DrillDown");
 }

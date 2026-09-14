@@ -12,7 +12,7 @@ const MUTATING_COMMANDS = new Set([
   'stage_files', 'unstage_files', 'stage_all', 'commit_files', 'commit_staged', 'commit_path',
   'remove_git_path', 'delete_local_path', 'switch_branch', 'create_branch', 'rename_branch', 'delete_branch',
   'stash_changes', 'stash_file', 'pop_stash', 'drop_stash', 'restore_stash_paths', 'abort_stash_conflict',
-  'restore_file', 'restore_remote_file', 'add_submodule', 'switch_submodule_version', 'reset_submodule', 'change_submodule_url',
+  'restore_file', 'restore_remote_file', 'add_submodule', 'switch_submodule_version', 'reset_submodule', 'reset_submodule_branch_to_upstream', 'change_submodule_url',
   'commit_submodule', 'push_submodule', 'pull_submodule', 'force_push_submodule', 'fetch_submodule',
   'create_submodule_branch', 'merge_branch', 'resolve_conflict', 'complete_merge', 'abort_merge',
   'sync_repository', 'publish_branch', 'fetch_remote', 'fetch_all_remotes', 'write_text_file', 'run_git_command', 'run_terminal_command',
@@ -197,7 +197,7 @@ function handleError(error) {
     'no upstream': 'Go to Branch Map (Ctrl+Shift+G) → Right-click branch → Set upstream',
     'not a git': 'Open a valid Git repository with File > Open Repository',
     'merge conflict': 'Resolve conflicts manually in the files, then stage them',
-    'diverged': 'This needs manual resolution: open a terminal in that folder, run `git fetch` then `git merge origin/<branch>` (or `git rebase origin/<branch>`), resolve any conflicts, commit, then Push again from here.',
+    'diverged': 'To keep both histories, use “Merge branch…”. To throw away the local branch history, open “Change version” and use “Discard local work…” on that branch.',
     'non-fast-forward': 'Use "Pull submodule" first. If it also refuses (diverged), resolve manually in a terminal: `git fetch`, `git merge origin/<branch>`, fix conflicts, commit, then push.',
     'authentication': 'Check your Git credentials and SSH keys',
     'permission denied': 'Check file permissions and access rights',
@@ -351,13 +351,9 @@ async function loadRepository(path, options = {}) {
     // openRepositoryFast's still-pending background fetch was doing is moot now.
     state.statusReady = true;
     state.remoteRef = data.branches.find(branch => branch.remote)?.name || '';
-    // The toolbar's "Pop stash" visibility must reflect whether a stash
-    // actually exists on disk, not a separately hand-tracked flag — that
-    // flag never got reconciled with reality, so it stayed false (hiding
-    // "Pop stash") if the app was relaunched with a stash already pending,
-    // and stayed true after popping just one of several stashes even when
-    // more were still left (per-file stash makes having several at once
-    // common). Deriving it fresh from the real list every reload fixes both.
+    // Keep the parent's stash count current. The sidebar exposes Stash and
+    // Stashes as separate actions even when this is zero; submodules have
+    // their own independently loaded lists.
     state.hasStash = state.stashes.length > 0; updateStashUI();
     await openDirectory(reopenPath, { force: true }); status(`${data.commits.length} commits loaded`);
     addRecentRepo(path, data.repository.name);
@@ -558,6 +554,7 @@ function render() {
   if (state.view === 'graph') renderGraph();
   if (state.view === 'remotes') renderRemotes();
   updateChangeBadge();
+  updateStashUI();
   if (refs.changesDrawer.classList.contains('open')) renderChanges();
   // Independent of everything above: never blocks or is blocked by the rest
   // of this render — only refetches if the repository/branch actually
@@ -1090,13 +1087,17 @@ async function openSubmoduleMenu(entry, x, y) {
   submoduleMenuEntry = entry;
   const stillCurrent = openSubmoduleMenuGuard();
   refs.submoduleMenu.hidden = false;
-  refs.submoduleMenu.style.left = `${Math.min(x, innerWidth - 460)}px`;
-  refs.submoduleMenu.style.top = `${Math.min(y, innerHeight - 590)}px`;
+  // Keep the wider, readable selector fully inside the viewport. Its old
+  // 440px positioning clamp was left behind after the contents grew, so the
+  // recovery and Checkout buttons could overlap text or extend off-screen.
+  const menuWidth = Math.min(600, innerWidth - 32);
+  refs.submoduleMenu.style.left = `${Math.max(16, Math.min(x, innerWidth - menuWidth - 16))}px`;
+  refs.submoduleMenu.style.top = `${Math.max(16, Math.min(y, innerHeight - 576))}px`;
   refs.submoduleMenuName.textContent = entry.name; refs.currentSubmoduleVersion.textContent = 'Loading…';
   refs.submoduleVersionSearch.value = '';
   refs.submoduleVersions.innerHTML = '<div class="version-loading"><i class="spinner"></i>Reading branches, tags and commits…</div>';
   if (!invoke) {
-    submoduleMenuData = { path: entry.relative_path, current_revision: 'a39f21d81ce0', current_branch: 'main', versions: [
+    submoduleMenuData = { path: entry.relative_path, current_revision: 'a39f21d81ce0', current_branch: 'main', parent_revision: 'a39f21d81ce0', versions: [
       { name: 'main', revision: 'a39f21d81ce0', kind: 'branch', current: true, subject: 'Stable diagnostics API', author: 'Andrei Pop', date: '2026-08-14' },
       { name: 'release/2.4', revision: 'bd51e40ca112', kind: 'branch', current: false, subject: 'Release configuration', author: 'Maria Ionescu', date: '2026-08-12' },
       { name: 'origin/feature/events', revision: 'de91822aef33', kind: 'remote', current: false, subject: 'Add event mapping', author: 'Victor Ene', date: '2026-08-11' },
@@ -1115,10 +1116,9 @@ async function openSubmoduleMenu(entry, x, y) {
 
 function renderSubmoduleVersions() {
   if (!submoduleMenuData) return;
-  const currentShortSha = submoduleMenuData.current_revision.slice(0, 8);
-  refs.currentSubmoduleVersion.textContent = submoduleMenuData.current_branch
-    ? `${submoduleMenuData.current_branch} @ ${currentShortSha}`
-    : `Detached HEAD @ ${currentShortSha} · create or switch to a branch before push`;
+  const current = submoduleCurrentPresentation(submoduleMenuData);
+  refs.currentSubmoduleVersion.textContent = current.text;
+  $('#submoduleVersionHelp').textContent = current.help;
   const newVersionButton = $('#submoduleMenuNewBranch');
   newVersionButton.textContent = versionFilter === 'tag' ? '＋ New tag…' : '＋ New branch…';
   newVersionButton.title = versionFilter === 'tag' ? 'Create a new tag in this submodule, at its current commit' : 'Create a new branch in this submodule, from its current commit';
@@ -1140,9 +1140,14 @@ function renderSubmoduleVersions() {
     html = versions.map(submoduleVersionRowHtml).join('') || `<div class="version-loading">${query ? 'No matches' : versionFilter === 'tag' ? 'No tags in this submodule' : 'No versions found'}</div>`;
   }
   refs.submoduleVersions.innerHTML = html;
-  refs.submoduleVersions.querySelectorAll('[data-revision]').forEach(row => row.addEventListener('click', event => {
-    if (event.target.closest('[data-copy-sha]')) return; // handled by its own listener below, never switches the version
+  refs.submoduleVersions.querySelectorAll('[data-switch-version]').forEach(button => button.addEventListener('click', event => {
+    event.stopPropagation();
+    const row = button.closest('[data-revision]');
     switchSubmoduleVersion(row.dataset.revision, row.dataset.versionKind, row.dataset.name);
+  }));
+  refs.submoduleVersions.querySelectorAll('[data-reset-upstream]').forEach(button => button.addEventListener('click', event => {
+    event.stopPropagation();
+    discardSubmoduleBranchAndUseUpstream(button.dataset);
   }));
   refs.submoduleVersions.querySelectorAll('[data-copy-sha]').forEach(button => button.addEventListener('click', event => {
     event.stopPropagation();
@@ -1161,6 +1166,27 @@ async function switchSubmoduleVersion(revision, kind, name) {
     const successMsg = `Submodule switched to ${target}. It now shows as "Modified" here — that's expected: the project hasn't recorded the new pointer yet. Select the submodule and use "Commit this item" to save it.`;
     status(successMsg); showOperationToast(successMsg, 'success');
   } catch (error) { const message = handleError(error); showOperationToast(`Could not switch version: ${message}`, 'error'); }
+}
+
+async function discardSubmoduleBranchAndUseUpstream({ name, upstream, ahead, behind }) {
+  if (!submoduleMenuData) return;
+  const counts = `${Number(ahead) || 0} ahead / ${Number(behind) || 0} behind`;
+  const confirmed = await customConfirm(
+    `Replace local branch "${name}" with ${upstream} (${counts})?\n\nThis is not Push, Pull, or the normal way to record a new submodule version. It is destructive recovery: it permanently deletes this branch's local-only commits, staged files, and uncommitted edits, then checks out the remote version.\n\nThe parent project's recorded submodule version is not changed automatically.`,
+    { title: 'Discard local branch work', okLabel: `Discard local work and use ${upstream}`, danger: true }
+  );
+  if (!confirmed) return;
+  if (!invoke) return status(`Preview: discard local ${name} and use ${upstream}`);
+  try {
+    status(`Fetching ${upstream} and replacing local ${name}…`, 'busy');
+    const result = await invoke('reset_submodule_branch_to_upstream', { repositoryPath: state.repository.path, relativePath: submoduleMenuData.path, branchName: name });
+    const folder = state.currentPath;
+    const data = await invoke('load_repository', { path: state.repository.path, force: false });
+    Object.assign(state, data); state.view = 'explorer'; directoryCache.clear(); refs.submoduleMenu.hidden = true;
+    await openDirectory(folder, { force: true });
+    const message = `${submoduleMenuEntry?.name || 'Submodule'}: ${result.branch} now matches ${result.upstream} @ ${result.revision.slice(0, 8)}. Local-only work was discarded.`;
+    status(message); showOperationToast(message, 'success');
+  } catch (error) { const message = handleError(error); showOperationToast(`Could not replace the local branch: ${message}`, 'error'); }
 }
 
 // Cancelable handle for the deferred entry_details fetch below — shared so
@@ -1324,7 +1350,7 @@ function renderEntryDetails(entry) {
   refs.details.innerHTML = `<div class="entry-details"><div class="entry-preview ${esc(entry.kind)}">${entry.kind === 'submodule' ? '◇' : entry.kind === 'folder' ? '▰' : '▤'}</div>
     <h2>${esc(entry.name)}</h2><div class="entry-path">${esc(entry.relative_path)}</div>${entry.kind === 'submodule' ? '<span class="submodule-badge">◇ Git submodule</span>' : ''}
     ${changeBanner}
-    <div class="context-actions">${entry.kind === 'file' ? '<button data-detail-action="edit">Edit local file</button>' : '<button data-detail-action="open">Open folder</button>'}<button data-detail-action="server">Open on server ↗</button><button data-detail-action="history">View history</button>${entry.status ? '<button data-detail-action="commit">Commit this item</button>' : ''}${entry.kind === 'folder' && entry.name === 'r' ? '<button data-detail-action="utrud" data-tooltip="Launches the UTRUD tool for this folder, the same as Windows Explorer\'s Send to → UTRUD. Windows only.">▶ Run UTRUD</button>' : ''}${entry.kind === 'file' && (entry.status || !entry.tracked) ? `<button data-detail-action="stage" data-tooltip="git add — add this file's current content to staging">＋ Stage this file</button><button data-detail-action="unstage" data-tooltip="Unstage — git restore --staged. Removes only the staging entry; your edits on disk are kept exactly as they are.">− Unstage</button><button data-detail-action="stashfile" data-tooltip="Sets this file aside in a temporary holding area (the stash) — it's left out of any commit, and out of your working folder, until you bring it back with Pop stash">⇕ Stash this file</button><button data-detail-action="head" class="danger-action-soft" data-tooltip="Restore from your last local commit (HEAD) — git checkout HEAD -- file. Permanently discards ALL edits; the file on disk becomes identical to what you last committed. Cannot be undone.">↶ Restore from last commit (HEAD)</button><button data-detail-action="compare" data-tooltip="Open side-by-side compare with restore options">⇄ Compare with remote</button>` : ''}${entry.kind === 'submodule' ? `<button data-detail-action="subserver">Open submodule repository ↗</button><button data-detail-action="subgraph" data-tooltip="Open this submodule's own branch/commit history — never the parent project's">Submodule Branch Map</button><button data-detail-action="subrefchanges" data-tooltip="A different, narrower question: which commits in the PARENT project changed this submodule's recorded version. Not the submodule's own history.">Submodule Reference Changes</button><button data-detail-action="subnewbranch" data-tooltip="Create a new local branch in this submodule, starting from its current commit, and switch to it">＋ New branch…</button><button data-detail-action="versions">Change version</button><button data-detail-action="subcommit" ${canCommitInsideSubmodule ? '' : 'disabled'} data-tooltip="${canCommitInsideSubmodule ? 'Commit uncommitted changes inside the submodule' : 'No uncommitted files inside this submodule'}">Commit submodule</button><button data-detail-action="subreset" class="danger-action-soft" ${entry.status ? '' : 'disabled'} data-tooltip="${entry.status ? 'Discard everything local in this submodule — dirty edits, local commits, an uncommitted version switch — and force it back to exactly what the project currently has recorded. Cannot be undone.' : 'Nothing to reset — the submodule already matches what the project has recorded'}">↺ Reset submodule…</button><button data-detail-action="subpull" data-tooltip="Fast-forward pull — brings in new commits from the submodule's remote. Refuses if it would require a manual merge.">Pull submodule</button><button data-detail-action="submerge" data-tooltip="Merge a branch into this submodule's current branch, with conflict resolution if needed">Merge branch…</button><button data-detail-action="subpush">Push submodule</button><button data-detail-action="subforcepush" class="danger-action-soft" data-tooltip="⚠️ Overwrites the remote branch with your local history, discarding any commits there aren't in yours. Only safe if nobody else uses that remote.">Force push submodule…</button><button data-detail-action="subfetch">Fetch submodule</button><button data-detail-action="location">Replace repository URL</button>` : ''}<button class="danger-action" data-detail-action="delete">Delete…</button></div>
+    <div class="context-actions">${entry.kind === 'file' ? '<button data-detail-action="edit">Edit local file</button>' : '<button data-detail-action="open">Open folder</button>'}<button data-detail-action="server">Open on server ↗</button><button data-detail-action="history">View history</button>${entry.status ? '<button data-detail-action="commit">Commit this item</button>' : ''}${entry.kind === 'folder' && entry.name === 'r' ? '<button data-detail-action="utrud" data-tooltip="Launches the UTRUD tool for this folder, the same as Windows Explorer\'s Send to → UTRUD. Windows only.">▶ Run UTRUD</button>' : ''}${entry.kind === 'file' && (entry.status || !entry.tracked) ? `<button data-detail-action="stage" data-tooltip="git add — add this file's current content to staging">＋ Stage this file</button><button data-detail-action="unstage" data-tooltip="Unstage — git restore --staged. Removes only the staging entry; your edits on disk are kept exactly as they are.">− Unstage</button><button data-detail-action="stashfile" data-tooltip="Sets this file aside in this repository's own stash. Parent projects and submodules have separate stash lists.">⇕ Stash this file</button><button data-detail-action="head" class="danger-action-soft" data-tooltip="Restore from your last local commit (HEAD) — git checkout HEAD -- file. Permanently discards ALL edits; the file on disk becomes identical to what you last committed. Cannot be undone.">↶ Restore from last commit (HEAD)</button><button data-detail-action="compare" data-tooltip="Open side-by-side compare with restore options">⇄ Compare with remote</button>` : ''}${entry.kind === 'submodule' ? `<button data-detail-action="subserver">Open submodule repository ↗</button><button data-detail-action="subgraph" data-tooltip="Open this submodule's own branch/commit history — never the parent project's">Submodule Branch Map</button><button data-detail-action="subrefchanges" data-tooltip="A different, narrower question: which commits in the PARENT project changed this submodule's recorded version. Not the submodule's own history.">Submodule Reference Changes</button><button data-detail-action="subnewbranch" data-tooltip="Create a new local branch in this submodule, starting from its current commit, and switch to it">＋ New branch…</button><button data-detail-action="versions">Change version</button><button data-detail-action="substash" data-tooltip="Set aside all uncommitted files inside this submodule only. The parent project's work is untouched.">Stash submodule work</button><button data-detail-action="substashes" data-tooltip="View and restore this submodule's own stashes. The parent project's stash list is separate.">Submodule stashes</button><button data-detail-action="subcommit" ${canCommitInsideSubmodule ? '' : 'disabled'} data-tooltip="${canCommitInsideSubmodule ? 'Commit uncommitted changes inside the submodule' : 'No uncommitted files inside this submodule'}">Commit submodule</button><button data-detail-action="subreset" class="danger-action-soft" ${entry.status ? '' : 'disabled'} data-tooltip="${entry.status ? 'Discard local work and restore the exact submodule commit recorded by the parent project. This leaves detached HEAD, like git submodule update.' : 'The submodule already uses the version recorded by the parent project'}">↺ Restore project version…</button><button data-detail-action="subpull" data-tooltip="Fast-forward pull — brings in new commits from the submodule's remote. Refuses if it would require a manual merge.">Pull submodule</button><button data-detail-action="submerge" data-tooltip="Merge a branch into this submodule's current branch, with conflict resolution if needed">Merge branch…</button><button data-detail-action="subpush">Push submodule</button><button data-detail-action="subforcepush" class="danger-action-soft" data-tooltip="⚠️ Overwrites the remote branch with your local history, discarding any commits there aren't in yours. Only safe if nobody else uses that remote.">Force push submodule…</button><button data-detail-action="subfetch">Fetch submodule</button><button data-detail-action="location">Replace repository URL</button>` : ''}<button class="danger-action" data-detail-action="delete">Delete…</button></div>
     <div class="detail-section"><h3>GENERAL</h3><div class="detail-grid"><span>Type</span><strong>${kindLabel}</strong><span>Git</span><strong>${entry.tracked ? (entry.status || (entry.unpushed ? (entry.kind === 'folder' ? 'Clean — contains unpushed commits' : 'Committed, not pushed yet') : 'Tracked, clean')) : 'Untracked'}</strong>
     ${entry.item_count != null ? `<span>Items</span><strong>${entry.item_count}</strong>` : `<span>Size</span><strong>${formatSize(entry.size)}</strong>`}<span>Modified</span><strong>${formatModified(entry.modified)}</strong></div></div>
     ${entry.kind === 'submodule' ? `<div class="detail-section"><h3>SUBMODULE</h3><div class="detail-grid"><span>Remote</span><strong>${esc(entry.submodule_url || 'Not configured')}</strong><span>Branch</span><strong>${esc(entry.submodule_branch || 'Default')}</strong><span>Status</span><strong>${esc(submoduleState.short)}</strong></div>
@@ -1361,6 +1387,8 @@ async function handleDetailAction(action, entry, button) {
   if (action === 'utrud') return runUtrud(entry);
   if (action === 'compare') return compareEntryWithRemote(entry);
   if (action === 'subcommit') return commitSubmoduleChanges(entry);
+  if (action === 'substash') return stashSubmoduleWork(entry);
+  if (action === 'substashes') return showSubmoduleStashes(entry);
   if (action === 'subreset') return resetSubmodule(entry);
   if (action === 'subpull') return pullSubmodule(entry);
   if (action === 'submerge') return openMergeBranchDialog(mergeTargetForSubmodule(entry));
@@ -1460,14 +1488,14 @@ async function commitSubmoduleChanges(entry) {
 
 async function resetSubmodule(entry) {
   if (entry.kind !== 'submodule') return;
-  const confirmed = await customConfirm(`This discards everything local in "${entry.name}" — dirty edits, local commits, an uncommitted version switch — and forces it back to exactly what this project currently has recorded. This cannot be undone.`, { title: 'Reset submodule', okLabel: 'Reset submodule', danger: true });
+  const confirmed = await customConfirm(`Restore "${entry.name}" to the exact commit recorded by the parent project?\n\nThis discards dirty edits, staged files and local-only commits, and leaves the submodule in detached HEAD. It does NOT make a local branch match origin. This cannot be undone from here.`, { title: 'Restore project version', okLabel: 'Restore project version', danger: true });
   if (!confirmed) return;
   if (!invoke) return status(`Preview: reset ${entry.name}`);
   try {
-    status(`Resetting ${entry.name}…`, 'busy');
+    status(`Restoring the project-recorded version of ${entry.name}…`, 'busy');
     await invoke('reset_submodule', { repositoryPath: state.repository.path, relativePath: entry.relative_path });
     directoryCache.clear(); await loadRepository(state.repository.path, { reopenPath: state.currentPath });
-    const successMsg = `${entry.name}: reset to what this project has recorded. Local changes inside the submodule were discarded.`;
+    const successMsg = `${entry.name}: restored to the commit recorded by the parent project (detached HEAD). Local work was discarded; no branch was matched to origin.`;
     status(successMsg); showOperationToast(successMsg, 'success');
   }
   catch (error) { const message2 = handleError(error); showOperationToast(`Reset failed: ${message2}`, 'error'); }
@@ -1487,7 +1515,7 @@ async function pullSubmodule(entry) {
   catch (error) {
     const message = handleError(error);
     if (String(error).toLowerCase().includes('diverged')) {
-      showOperationToast(`${message}\nTry "Merge branch…" instead — it can resolve the conflicts here.`, 'error');
+      showOperationToast(`${message}\nKeep both histories with “Merge branch…”, or deliberately discard local-only work with “Change version” → “Discard local work…”.`, 'error');
     } else { showOperationToast(message, 'error'); }
   }
 }
@@ -1557,6 +1585,8 @@ function renderConflictsList(target, conflicts) {
   }));
 }
 
+function conflictRepositoryPath(target) { return target?.repositoryPath || state.repository?.path; }
+
 function openConflictsDialog(target, conflicts, introMessage) {
   state.mergeTarget = target;
   const isStash = target.kind === 'stash';
@@ -1579,7 +1609,7 @@ function openConflictsDialog(target, conflicts, introMessage) {
 
 async function refreshConflictsDialog(target) {
   try {
-    const conflicts = await invoke('list_conflicts', { repositoryPath: state.repository.path, targetPath: target.targetPath });
+    const conflicts = await invoke('list_conflicts', { repositoryPath: conflictRepositoryPath(target), targetPath: target.targetPath });
     renderConflictsList(target, conflicts);
     const isStash = target.kind === 'stash';
     refs.conflictsSubtitle.textContent = conflicts.length
@@ -1592,7 +1622,7 @@ async function refreshConflictsDialog(target) {
 async function resolveConflictAction(target, path, kind) {
   try {
     status(`Resolving ${path}…`, 'busy');
-    await invoke('resolve_conflict', { repositoryPath: state.repository.path, targetPath: target.targetPath, relativePath: path, resolution: kind });
+    await invoke('resolve_conflict', { repositoryPath: conflictRepositoryPath(target), targetPath: target.targetPath, relativePath: path, resolution: kind });
     const msg = `${path}: kept ${kind === 'ours' ? 'your' : 'the incoming'} version.`;
     status(msg); showOperationToast(msg, 'success');
     await refreshConflictsDialog(target);
@@ -1607,7 +1637,7 @@ function editConflictFile(target, path) {
   refs.editorContent.value = 'Loading…';
   refs.editorDialog.showModal();
   if (!invoke) { refs.editorContent.value = '<<<<<<< HEAD\n(your version)\n=======\n(their version)\n>>>>>>> branch\n'; return; }
-  invoke('read_text_file', { repositoryPath: state.repository.path, relativePath: joined })
+  invoke('read_text_file', { repositoryPath: conflictRepositoryPath(target), relativePath: joined })
     .then(file => { refs.editorContent.value = file.content; refs.editorContent.focus(); })
     .catch(error => { refs.editorDialog.close(); handleError(error); });
 }
@@ -1618,12 +1648,12 @@ refs.confirmCompleteMerge.addEventListener('click', async () => {
     // No merge commit to make here — just confirm nothing is still
     // conflicted before letting the user walk away with it.
     try {
-      const conflicts = await invoke('list_conflicts', { repositoryPath: state.repository.path, targetPath: target.targetPath });
+      const conflicts = await invoke('list_conflicts', { repositoryPath: conflictRepositoryPath(target), targetPath: target.targetPath });
       if (conflicts.length) { refs.conflictsStatus.textContent = `${conflicts.length} file${conflicts.length === 1 ? '' : 's'} still need resolution first.`; return; }
       refs.conflictsDialog.close();
       const msg = 'Stash conflicts resolved — the changes are in your working tree, ready to commit.';
       status(msg); showOperationToast(msg, 'success');
-      await refreshAfterMerge();
+      if (target.stashContext) await refreshAfterStashContext(target.stashContext); else await refreshAfterMerge();
     } catch (error) { refs.conflictsStatus.textContent = String(error); }
     return;
   }
@@ -1645,11 +1675,12 @@ refs.abortMergeButton.addEventListener('click', async () => {
   if (target.kind === 'stash') {
     if (!await customConfirm('Discard the conflict markers and restore your last commit? The stashed change stays in the stash list — nothing is lost, you can pop it again (or resolve it differently) later.', { title: 'Discard stash conflict', danger: true, okLabel: 'Discard' })) return;
     try {
-      await invoke('abort_stash_conflict', { repositoryPath: state.repository.path });
+      await invoke('abort_stash_conflict', { repositoryPath: conflictRepositoryPath(target) });
       refs.conflictsDialog.close();
       const msg = 'Discarded — your working tree is back to normal, and the stash is still there.';
       status(msg); showOperationToast(msg, 'success');
-      await refreshAfterMerge(); state.hasStash = true; updateStashUI();
+      if (target.stashContext) await refreshAfterStashContext(target.stashContext); else await refreshAfterMerge();
+      state.hasStash = true; updateStashUI();
     } catch (error) { handleError(error); }
     return;
   }
@@ -1893,8 +1924,8 @@ async function saveEditor(event) {
     const joined = target.targetPath ? `${target.targetPath}/${path}` : path;
     try {
       status(`Saving ${path}…`, 'busy');
-      await invoke('write_text_file', { repositoryPath: state.repository.path, relativePath: joined, content: refs.editorContent.value });
-      await invoke('resolve_conflict', { repositoryPath: state.repository.path, targetPath: target.targetPath, relativePath: path, resolution: 'manual' });
+      await invoke('write_text_file', { repositoryPath: conflictRepositoryPath(target), relativePath: joined, content: refs.editorContent.value });
+      await invoke('resolve_conflict', { repositoryPath: conflictRepositoryPath(target), targetPath: target.targetPath, relativePath: path, resolution: 'manual' });
       refs.editorDialog.close(); state.editingConflict = null;
       status(`${path}: marked resolved.`); showOperationToast(`${path}: marked resolved.`, 'success');
       await refreshConflictsDialog(target);
@@ -2133,10 +2164,75 @@ async function fetchAllRemotes() {
   catch (error) { handleError(error); }
 }
 
+let stashDialogContext = null;
+
+function stashBoundaryForCurrentView(path = state.currentPath) {
+  if (state.submoduleGraph) return state.submoduleGraph.relativePath;
+  return submoduleBoundaryFor(path) || state.activeSubmodule?.path || null;
+}
+
+async function resolveStashContext(path = state.currentPath, explicitSubmodulePath = null) {
+  if (!state.repository) return null;
+  const relativePath = explicitSubmodulePath || stashBoundaryForCurrentView(path);
+  if (!invoke) {
+    const name = relativePath ? relativePath.split('/').pop() : state.repository.name;
+    return { repository_path: state.repository.path, repository_name: name, current_branch: state.repository.current_branch, is_submodule: Boolean(relativePath), relative_path: relativePath, stashes: [] };
+  }
+  return relativePath
+    ? invoke('list_submodule_stashes', { repositoryPath: state.repository.path, relativePath })
+    : invoke('list_stashes', { repositoryPath: state.repository.path });
+}
+
+async function refreshAfterStashContext(context) {
+  if (!context || !state.repository) return;
+  directoryCache.clear();
+  if (context.is_submodule && state.submoduleGraph?.repository?.path === context.repository_path) {
+    await openSubmoduleGraph({ relative_path: context.relative_path, name: context.repository_name });
+    return;
+  }
+  await loadRepository(state.repository.path, { reopenPath: state.currentPath });
+}
+
 async function stashWork() {
   if (!state.repository) return;
-  if (!invoke) { state.hasStash = true; updateStashUI(); status('Preview: work stashed'); return; }
-  try { status('Saving work in progress…', 'busy'); await invoke('stash_changes', { repositoryPath: state.repository.path }); state.hasStash = true; updateStashUI(); refs.commitMessage.value = ''; await loadRepository(state.repository.path, { reopenPath: state.currentPath }); status('Work saved to stash'); showOperationToast('Work stashed. Use "Pop stash" to restore it.'); }
+  try {
+    const context = await resolveStashContext(); if (!context) return;
+    if (!invoke) { status(`Preview: work stashed in ${context.repository_name}`); return; }
+    status(`Saving work in ${context.repository_name}…`, 'busy');
+    await invoke('stash_changes', { repositoryPath: context.repository_path });
+    if (!context.is_submodule) refs.commitMessage.value = '';
+    await refreshAfterStashContext(context);
+    const message = `Work in ${context.repository_name} was stashed. Open “Stashes” while browsing this same repository to restore it.`;
+    status(message); showOperationToast(message, 'success'); updateStashUI();
+  } catch (error) { handleError(error); }
+}
+
+async function stashSubmoduleWork(entry) {
+  if (!state.repository || entry.kind !== 'submodule') return;
+  try {
+    const context = await resolveStashContext('', entry.relative_path); if (!context) return;
+    if (!invoke) return status(`Preview: work stashed in ${entry.name}`);
+    status(`Saving work inside ${entry.name}…`, 'busy');
+    await invoke('stash_changes', { repositoryPath: context.repository_path });
+    await refreshAfterStashContext(context);
+    const message = `Uncommitted work inside ${entry.name} was stashed. The parent project was not changed.`;
+    status(message); showOperationToast(message, 'success'); updateStashUI();
+  } catch (error) { handleError(error); }
+}
+
+function openStashesDialogForContext(context) {
+  stashDialogContext = context;
+  $('#stashesTitle').textContent = `Stashes · ${context.repository_name}`;
+  $('#stashesSubtitle').textContent = context.is_submodule
+    ? `Saved work inside this submodule only. Restore copies one file and keeps this stash as a backup.`
+    : `Saved work in the main project only. Restore copies one file and keeps this stash as a backup.`;
+  refs.stashesDialog.showModal();
+  renderStashesList();
+}
+
+async function showSubmoduleStashes(entry) {
+  if (!state.repository || entry.kind !== 'submodule') return;
+  try { const context = await resolveStashContext('', entry.relative_path); if (context) openStashesDialogForContext(context); }
   catch (error) { handleError(error); }
 }
 
@@ -2144,46 +2240,52 @@ async function stashOneFile(path) {
   if (!state.repository) return;
   if (!invoke) { status(`Preview: ${path} stashed`); return; }
   try {
+    const context = await resolveStashContext(path, submoduleBoundaryFor(path)); if (!context) return;
     status(`Setting ${path} aside…`, 'busy');
     await invoke('stash_file', { repositoryPath: state.repository.path, relativePath: path });
-    state.hasStash = true; updateStashUI();
-    const folder = state.currentPath; await loadRepository(state.repository.path, { reopenPath: folder });
+    await refreshAfterStashContext(context); updateStashUI();
     // The stashed file just went back to its committed state, so the details
     // panel (if it's the one showing) needs to drop its now-stale "Modified"
     // banner and action buttons rather than keep them around.
     if (state.selectedEntry?.relative_path === path) await selectEntry(path);
-    status(`${path} set aside — use "Pop stash" to bring it back`); showOperationToast(`${path} moved to the stash. It won't be part of any commit until you Pop it back.`);
+    const message = `${path} was moved to ${context.repository_name}'s stash. Open “Stashes” in that repository to restore it.`;
+    status(message); showOperationToast(message, 'success');
   } catch (error) { handleError(error); }
 }
 
-// "Pop stash" opens the full list rather than blindly restoring whatever
+// "Stashes" opens the full list rather than blindly restoring whatever
 // happens to be most recent — with per-file stash making it common to have
 // several at once, silently guessing which one you meant was the actual
 // complaint ("I can't find the list of stashes anywhere").
-function popStash() {
-  if (!state.repository || !state.hasStash) return;
-  refs.stashesDialog.showModal();
-  refreshStashesList();
+async function popStash() {
+  if (!state.repository) return;
+  try {
+    const context = await resolveStashContext(); if (!context) return;
+    openStashesDialogForContext(context);
+  } catch (error) { handleError(error); }
 }
 
 // Bumped on every render — a file-list fetch launched by an older render
 // that resolves after a newer one has already started is discarded instead
-// of writing (now-stale) data into the dialog. Without this, restoring two
-// files in quick succession, or restoring one right as the dialog was still
-// loading, could let an earlier, now-outdated response land last and make a
-// just-restored file appear to still be there.
+// of writing stale data into the dialog after a restore, drop, or refresh.
 let stashesRenderGeneration = 0;
 
 async function refreshStashesList() {
-  if (!state.repository) return;
-  try { const data = await invoke('load_repository', { path: state.repository.path, force: true }); state.stashes = data.stashes; state.hasStash = data.stashes.length > 0; updateStashUI(); }
+  if (!state.repository || !stashDialogContext) return;
+  try {
+    const data = await invoke('list_stashes', { repositoryPath: stashDialogContext.repository_path });
+    stashDialogContext = { ...stashDialogContext, stashes: data.stashes, current_branch: data.current_branch };
+    if (!stashDialogContext.is_submodule) { state.stashes = data.stashes; state.hasStash = data.stashes.length > 0; }
+    else if (state.submoduleGraph?.repository?.path === stashDialogContext.repository_path) state.submoduleGraph.stashes = data.stashes;
+    updateStashUI();
+  }
   catch (error) { handleError(error); }
   renderStashesList();
 }
 
 function renderStashesList() {
   const generation = ++stashesRenderGeneration;
-  const stashes = state.stashes || [];
+  const stashes = stashDialogContext?.stashes || [];
   refs.stashesList.innerHTML = stashes.map(stash => `<div class="conflict-row stash-entry-row" data-stash-index="${stash.index}">
     <div class="conflict-head"><span class="conflict-path">stash@{${stash.index}}: ${esc(stash.message.replace(/^WIP on [^:]+:\s*[0-9a-f]+\s*/, 'WIP on ') || 'Saved work')}</span><button class="stash-drop-icon" data-drop-stash="${stash.index}" title="Drop this entire stash — discards everything left in it, for good">✕</button></div>
     <div class="stash-file-list" data-stash-file-list="${stash.index}"><i class="spinner"></i></div>
@@ -2192,9 +2294,9 @@ function renderStashesList() {
   refs.stashesList.querySelectorAll('[data-drop-stash]').forEach(button => button.addEventListener('click', () => dropStashEntry(Number(button.dataset.dropStash))));
 }
 
-// A plain list — one row per file, one small icon button that restores just
-// that file immediately. Once restored, it's genuinely gone from this stash
-// (not just hidden), so the row is removed from the list right away.
+// A plain list — one row per file. Restoring copies only that path back to the
+// working tree and deliberately keeps the stash as a safety backup; dropping
+// the backup remains a separate, explicit destructive action.
 function loadStashFileList(stashIndex, generation) {
   const fileList = refs.stashesList.querySelector(`[data-stash-file-list="${stashIndex}"]`);
   if (!fileList) return;
@@ -2202,54 +2304,54 @@ function loadStashFileList(stashIndex, generation) {
     if (generation !== stashesRenderGeneration) return; // a newer render has since started — this response is stale
     fileList.innerHTML = files.length ? files.map(file => `<div class="stash-file-row" data-stash-file-path="${esc(file)}">
       <span class="stash-file">${esc(file)}</span>
-      <button class="stash-restore-icon" data-restore-file="${esc(file)}" data-restore-stash="${stashIndex}" title="Restore just this file">⇈</button>
+      <button class="stash-restore-icon" data-restore-file="${esc(file)}" data-restore-stash="${stashIndex}" title="Restore only this file; keep the stash as a backup">⇈</button>
     </div>`).join('') : '<div class="empty-change">Nothing left in this stash</div>';
     fileList.querySelectorAll('[data-restore-file]').forEach(button => button.addEventListener('click', () => restoreOneStashFile(Number(button.dataset.restoreStash), button.dataset.restoreFile)));
   };
   if (!invoke) { render(['preview.txt']); return; }
-  invoke('stash_entry_files', { repositoryPath: state.repository.path, stashIndex })
+  invoke('stash_entry_files', { repositoryPath: stashDialogContext.repository_path, stashIndex })
     .then(render)
     .catch(error => { if (generation === stashesRenderGeneration) fileList.innerHTML = `<div class="stash-file-row">${esc(String(error))}</div>`; });
 }
 
 async function restoreOneStashFile(index, path) {
-  if (!invoke) { status(`Preview: ${path} restored`); return; }
+  if (!invoke || !stashDialogContext) { status(`Preview: ${path} restored`); return; }
+  const context = { ...stashDialogContext };
   const row = refs.stashesList.querySelector(`[data-stash-index="${index}"] [data-stash-file-path="${CSS.escape(path)}"]`);
   const button = row?.querySelector('[data-restore-file]'); if (button) { button.disabled = true; button.innerHTML = '<i class="spinner"></i>'; }
   try {
-    await invoke('restore_stash_paths', { repositoryPath: state.repository.path, stashIndex: index, paths: [path] });
-    await loadRepository(state.repository.path, { keepPath: true });
-    // A path-filtered restore can still conflict if this one file changed
-    // since it was stashed — same resolution flow as a full pop.
-    const conflicts = await invoke('list_conflicts', { repositoryPath: state.repository.path, targetPath: '' });
-    if (conflicts.length) {
-      const msg = `Restored, but ${path} conflicted — resolve it below.`;
-      status(msg, 'error'); showOperationToast(msg, 'error');
-      refs.stashesDialog.close();
-      openConflictsDialog({ targetPath: '', label: state.repository.current_branch, isSubmodule: false, kind: 'stash' }, conflicts);
-      return;
-    }
-    // Re-render the whole list from what the backend now actually reports —
-    // force a genuinely fresh read rather than trust the short status cache,
-    // so there's no window where a just-restored file could still show up.
+    await invoke('restore_stash_paths', { repositoryPath: context.repository_path, stashIndex: index, paths: [path] });
+    await refreshAfterStashContext(context);
+    // The entry intentionally remains visible: the immutable stash is retained
+    // as a backup until the user explicitly drops it.
     await refreshStashesList();
-    const msg = `${path} restored.`;
+    const msg = `${path} restored; the stash was kept as a backup.`;
     status(msg); showOperationToast(msg, 'success');
   } catch (error) { handleError(error); if (button) { button.disabled = false; button.textContent = '⇈'; } }
 }
 
 async function dropStashEntry(index) {
   if (!await customConfirm('Discard this stash? Its changes are gone for good — this cannot be undone.', { title: 'Drop stash', danger: true, okLabel: 'Drop' })) return;
-  if (!invoke) { status('Preview: stash dropped'); return; }
+  if (!invoke || !stashDialogContext) { status('Preview: stash dropped'); return; }
+  const context = { ...stashDialogContext };
   try {
-    await invoke('drop_stash', { repositoryPath: state.repository.path, stashIndex: index });
-    await loadRepository(state.repository.path, { keepPath: true });
-    renderStashesList();
-    status('Stash dropped');
+    await invoke('drop_stash', { repositoryPath: context.repository_path, stashIndex: index });
+    await refreshAfterStashContext(context);
+    await refreshStashesList();
+    status(`Stash dropped from ${context.repository_name}`);
   } catch (error) { handleError(error); }
 }
 
-function updateStashUI() { $('#stashWork').hidden = state.hasStash; $('#popStash').hidden = !state.hasStash; }
+function updateStashUI() {
+  const relativePath = stashBoundaryForCurrentView();
+  const name = state.submoduleGraph?.repository?.name || relativePath?.split('/').pop() || state.repository?.name || 'project';
+  const isSubmodule = Boolean(relativePath);
+  $('#stashWorkTitle').textContent = isSubmodule ? `Stash ${name} work` : 'Stash project work';
+  $('#stashWorkSubtitle').textContent = isSubmodule ? 'This submodule only' : 'Main project only';
+  $('#stashListSubtitle').textContent = isSubmodule ? `View saved work in ${name}` : 'View saved project work';
+  $('#stashWork').disabled = !state.repository || Boolean(state.activeSubmodule && !state.activeSubmodule.statusReady);
+  $('#popStash').disabled = !state.repository;
+}
 
 // ---- Git DAG / topology model -------------------------------------------
 // reachableFrom/buildGraphModel used to live here; they moved to their own
@@ -2908,7 +3010,7 @@ function renderChanges() {
   $('#unstageAllButton').disabled = !scopedChanges.some(change => change.staged);
   refs.changes.innerHTML = scopedChanges.map(change => `<div class="change-row-wrap"><label class="change-row"><input type="checkbox" data-change-path="${esc(change.path)}" ${change.staged ? 'checked' : ''}>
     <span class="status-code">${esc(change.status)}</span><span class="change-path">${esc(change.path)}</span><span class="change-state">${change.staged ? 'Staged' : 'Modified'}</span></label>
-    <button class="stash-file-btn" data-stash-path="${esc(change.path)}" title="Set aside just this file for now — moves it to a temporary holding area (the stash) so it's left out of any commit until you bring it back with Pop stash">⇕ Stash</button></div>`).join('') || `<div class="empty-change">No changes inside /${esc(scope)}</div>`;
+    <button class="stash-file-btn" data-stash-path="${esc(change.path)}" title="Set aside just this file in its own repository's stash. Parent projects and submodules have separate stash lists.">⇕ Stash</button></div>`).join('') || `<div class="empty-change">No changes inside /${esc(scope)}</div>`;
   refs.changes.querySelectorAll('[data-stash-path]').forEach(button => button.addEventListener('click', () => stashOneFile(button.dataset.stashPath)));
   refs.changes.querySelectorAll('[data-change-path]').forEach(input => {
     // Belt-and-suspenders against a real Chromium/WebView2 quirk: a checkbox
@@ -3673,14 +3775,14 @@ refs.commitButton.addEventListener('click', async () => {
   finally { refs.commitButton.textContent = 'Commit changes'; renderChanges(); }
 });
 
-// Command Console — two tabs sharing one input:
-//  - "Commands" is a context-aware palette over the app's own already-tested
+// Actions and Terminal — two tabs sharing one input:
+//  - "App actions" is a context-aware palette over the app's own already-tested
 //    actions (no shell access) — suggestions depend on where you are (a
 //    submodule selected, a folder open…), each with a short explanation.
 //  - "Terminal" is a persistent shell transcript: every command you run (and
 //    its actual stdout/stderr) stays visible as a scrolling
-//    log, with ↑↓ command history, and an explicit, always-visible, cyclable
-//    scope pill so "runs on the current location" is never a guess.
+//    log, with ↑↓ command history, and an explicit working-directory selector
+//    so "runs on the current location" is never a guess.
 function currentConsoleContext() {
   const entry = state.selectedEntry;
   if (!state.repository) return { label: 'No repository open', tags: ['no-repo'] };
@@ -3708,8 +3810,8 @@ function buildCommands() {
     { id: 'merge', name: 'Merge Branch…', description: 'Bring another branch\'s commits into your current one — stays local, resolves conflicts here if any', keys: '', keywords: 'combine join', tags: ['explorer', 'graph'], fn: () => state.repository && openMergeBranchDialog(mergeTargetForMain()) },
     { id: 'fetch', name: 'Fetch Remote', description: 'Download new commits/refs from the server without changing your branch', keys: 'Ctrl+Shift+F', tags: ['explorer', 'graph'], fn: () => $('#fetchCurrent').click() },
     { id: 'fetchall', name: 'Fetch All Remotes', description: 'Download new commits/refs from every configured remote, not just the first one', keywords: 'multiple upstream mirror', tags: ['explorer', 'graph'], fn: () => fetchAllRemotes() },
-    { id: 'stash', name: 'Stash Work in Progress', description: 'Temporarily set aside uncommitted changes, restore them later', keys: 'Ctrl+Shift+S', tags: ['explorer'], fn: stashWork },
-    { id: 'pop', name: 'Restore Stashed Work', description: 'Bring back the changes you last stashed', keys: '', tags: ['explorer'], fn: popStash },
+    { id: 'stash', name: 'Stash Work in Current Repository', description: 'Set aside changes only in the project or submodule currently being browsed', keys: 'Ctrl+Shift+S', tags: ['explorer'], fn: stashWork },
+    { id: 'pop', name: 'View Stashes in Current Repository', description: 'View or restore saved work for this project or submodule', keys: '', tags: ['explorer'], fn: popStash },
     { id: 'conflicts', name: 'Resolve Merge Conflicts', description: 'Open the conflict resolution dialog for a merge in progress', keys: '', keywords: 'merge conflict resolve', tags: state.pendingMainConflicts?.length ? ['explorer', 'graph', 'relevant'] : [], fn: () => openConflictsDialog(mergeTargetForMain(), state.pendingMainConflicts || []) },
     { id: 'search', name: 'Search Repository', description: 'Filter the current view by name, author or commit id', keys: 'Ctrl+F', tags: ['explorer', 'graph', 'commander'], fn: () => refs.search.focus() },
     { id: 'explorer', name: 'Go to Project Explorer', description: 'Browse files, folders and submodules', keys: '', keywords: 'files browse', tags: [], fn: () => $('#navExplorer').click() },
@@ -3900,38 +4002,41 @@ function looksDestructiveTerminalCommand(command) {
   return DESTRUCTIVE_TERMINAL_PATTERN.test(command) || />/.test(command);
 }
 
-// Every working directory a terminal command could plausibly use right now — always at least
-// "repository root"; "current folder" and "selected submodule" are added only
-// when they actually apply. Explicit and cyclable (⇄ scope button) instead of
-// a silent guess, so "does this run where I think it runs" is never in doubt.
+// Build a context-bound model of every valid working directory. The pure model
+// stores concrete paths (not reusable "folder"/"submodule" tokens), so an
+// explicit choice cannot leak after navigation or into another repository.
 function consoleAvailableScopes() {
-  if (!state.repository) return [];
-  const scopes = [{ key: 'root', path: state.repository.path, label: `${state.repository.name} (repository root)` }];
-  if (state.currentPath) scopes.push({ key: 'folder', path: `${state.repository.path}/${state.currentPath}`, label: `${state.currentPath} (current folder)` });
-  if (state.selectedEntry?.kind === 'submodule') scopes.push({ key: 'submodule', path: `${state.repository.path}/${state.selectedEntry.relative_path}`, label: `${state.selectedEntry.relative_path} (selected submodule)` });
-  return scopes;
-}
-function consoleDefaultScopeKey() {
-  if (state.selectedEntry?.kind === 'submodule') return 'submodule';
-  if (state.currentPath) return 'folder';
-  return 'root';
+  return ConsoleContextModel.buildConsoleScopeModel({
+    repository: state.repository,
+    view: state.view,
+    currentPath: state.currentPath,
+    commanderPath: state.commanderPath,
+    selectedSubmodule: state.selectedEntry?.kind === 'submodule'
+      ? { relativePath: state.selectedEntry.relative_path, name: state.selectedEntry.name }
+      : null,
+    submoduleGraph: state.submoduleGraph
+      ? { path: state.submoduleGraph.repository?.path, relativePath: state.submoduleGraph.relativePath, name: state.submoduleGraph.name }
+      : null,
+  });
 }
 function consoleGitTarget() {
-  const scopes = consoleAvailableScopes();
-  if (!scopes.length) return { key: 'root', path: '', label: 'No repository open' };
-  const key = scopes.some(s => s.key === state.consoleScopeOverride) ? state.consoleScopeOverride : consoleDefaultScopeKey();
-  return scopes.find(s => s.key === key) || scopes[0];
+  return ConsoleContextModel.resolveConsoleScope(consoleAvailableScopes(), state.consoleScopeOverride);
 }
-function cycleConsoleScope() {
-  const scopes = consoleAvailableScopes(); if (scopes.length < 2) return;
-  const idx = scopes.findIndex(s => s.key === consoleGitTarget().key);
-  state.consoleScopeOverride = scopes[(idx + 1) % scopes.length].key;
+function selectConsoleScope(targetKey) {
+  const model = consoleAvailableScopes();
+  state.consoleScopeOverride = ConsoleContextModel.consoleScopeOverrideFor(model, targetKey);
   updateConsoleScopeLabel();
 }
 function updateConsoleScopeLabel() {
+  const model = consoleAvailableScopes();
   const scope = consoleGitTarget();
-  $('#commandScope').textContent = state.repository ? `📍 ${scope.label}` : '';
+  $('#commandScope').innerHTML = state.repository ? `<strong>${esc(scope.label)}</strong><small>${esc(scope.displayPath || scope.path)}</small>` : '<strong>No repository open</strong>';
   $('#commandScope').title = state.repository ? scope.path : '';
+  const selector = $('#commandScopeSelect');
+  selector.innerHTML = model.scopes.map(item => `<option value="${esc(item.key)}">${esc(item.label)} — ${esc(item.displayPath)}</option>`).join('') || '<option value="">No repository open</option>';
+  selector.value = scope.key;
+  selector.disabled = model.scopes.length < 2;
+  selector.title = model.scopes.length > 1 ? 'Choose the exact working directory' : 'No other working directory is available in this context';
 }
 
 // Lightly colorizes familiar Git output while leaving arbitrary command
@@ -3962,12 +4067,12 @@ function renderConsoleTranscript() {
     const result = entry.result;
     const exitCodeLabel = result && result.exit_code != null ? ` · exit ${result.exit_code}` : '';
     return `<div class="raw-git-output">
-    <div class="raw-git-cmd"><span class="raw-git-command-text">$ ${esc(entry.command)} <span class="raw-git-cwd">(in ${esc(entry.targetLabel)})</span></span> <b class="raw-git-status ${badgeClass}">${badge}</b><span class="raw-git-elapsed">${elapsed}s${exitCodeLabel}</span><span class="raw-git-actions"><button type="button" class="raw-git-action" data-console-reuse="${index}" title="Put this command back in the input so it can be edited">Use again</button><button type="button" class="raw-git-action" data-console-copy="${index}" title="Copy this command and its output">Copy</button></span></div>
+    <div class="raw-git-cmd"><span class="raw-git-command-text">$ ${esc(entry.command)} <span class="raw-git-cwd" title="${esc(entry.targetPath || '')}">(in ${esc(entry.targetLabel)}${entry.targetDisplayPath ? ` · ${esc(entry.targetDisplayPath)}` : ''})</span></span> <b class="raw-git-status ${badgeClass}">${badge}</b><span class="raw-git-elapsed">${elapsed}s${exitCodeLabel}</span><span class="raw-git-actions"><button type="button" class="raw-git-action" data-console-reuse="${index}" title="Put this command back in the input so it can be edited">Use again</button><button type="button" class="raw-git-action" data-console-copy="${index}" title="Copy this command and its output">Copy</button></span></div>
     ${result?.stdout ? `<pre class="raw-git-stdout">${colorizeGitOutput(result.stdout)}</pre>` : ''}
     ${result?.stderr ? `<pre class="raw-git-stderr">${colorizeGitOutput(result.stderr)}</pre>` : ''}
     ${entry.status === 'SUCCESS' && !result?.stdout && !result?.stderr ? '<div class="raw-git-empty">Completed successfully — no output</div>' : ''}
   </div>`;
-  }).join('') || '<div class="console-empty">Run a command in the selected scope — e.g. "git status", "git remote -v", "pwd", "ls" (macOS) or "dir" (Windows).</div>';
+  }).join('') || '<div class="console-empty">Run a command in the working directory shown above — e.g. "git status", "git remote -v", "pwd", "ls" (macOS) or "dir" (Windows).</div>';
   $('#commandClearTranscript').hidden = state.consoleTranscript.length === 0;
   $('#commandCopyTranscript').hidden = state.consoleTranscript.length === 0;
   list.scrollTop = list.scrollHeight;
@@ -3975,7 +4080,7 @@ function renderConsoleTranscript() {
 
 function consoleEntryAsText(entry) {
   const result = entry.result;
-  const lines = [`$ ${entry.command}`, `# working directory: ${entry.targetLabel}`, `# ${entry.status}${result?.exit_code != null ? ` (exit ${result.exit_code})` : ''}`];
+  const lines = [`$ ${entry.command}`, `# working directory: ${entry.targetPath || entry.targetLabel}`, `# ${entry.status}${result?.exit_code != null ? ` (exit ${result.exit_code})` : ''}`];
   if (result?.stdout) lines.push(result.stdout.trimEnd());
   if (result?.stderr) lines.push(result.stderr.trimEnd());
   return lines.join('\n');
@@ -4021,7 +4126,7 @@ async function runTerminalFromConsole(input) {
   const command = normalizeTerminalCommand(input);
   setCommandInputValue('');
   if (/^(clear|cls)$/i.test(command)) { state.consoleTranscript = []; renderConsoleTranscript(); return; }
-  if (!state.repository) { state.consoleTranscript.push({ command, targetLabel: '—', status: 'FAILED', elapsedMs: 0, result: { success: false, stdout: '', stderr: 'Open a repository first.' } }); renderConsoleTranscript(); return; }
+  if (!state.repository) { state.consoleTranscript.push({ command, targetLabel: '—', targetPath: '', targetDisplayPath: '', status: 'FAILED', elapsedMs: 0, result: { success: false, stdout: '', stderr: 'Open a repository first.' } }); renderConsoleTranscript(); return; }
   // Repeated Enter while one is already running is a no-op, not a queued-up
   // second command — only one Git command is ever active at a time, and the
   // centralized invoke wrapper enforces this the same way for every other
@@ -4042,9 +4147,9 @@ async function runTerminalFromConsole(input) {
   // true, so this is belt-and-suspenders, not the only thing preventing it).
   const target = consoleGitTarget();
   const capturedRepositoryPath = state.repository.path;
-  if (!invoke) { state.consoleTranscript.push({ command, targetLabel: target.label, status: 'SUCCESS', elapsedMs: 0, result: { success: true, stdout: '(preview mode — not actually run)', stderr: '' } }); renderConsoleTranscript(); return; }
+  if (!invoke) { state.consoleTranscript.push({ command, targetLabel: target.label, targetPath: target.path, targetDisplayPath: target.displayPath, status: 'SUCCESS', elapsedMs: 0, result: { success: true, stdout: '(preview mode — not actually run)', stderr: '' } }); renderConsoleTranscript(); return; }
 
-  const entry = { command, targetLabel: target.label, status: 'RUNNING', startedAt: performance.now(), elapsedMs: 0, result: null };
+  const entry = { command, targetLabel: target.label, targetPath: target.path, targetDisplayPath: target.displayPath, status: 'RUNNING', startedAt: performance.now(), elapsedMs: 0, result: null };
   state.consoleTranscript.push(entry);
   renderConsoleTranscript();
   state.consoleCommandRunning = true;
@@ -4164,10 +4269,10 @@ function setConsoleMode(mode) {
   }
   document.querySelectorAll('.command-tab').forEach(tab => tab.classList.toggle('active', tab.dataset.mode === mode));
   $('#terminalQuickCommands').hidden = mode !== 'console';
-  $('#commandScopeCycle').hidden = mode !== 'console';
+  $('#terminalScopeBar').hidden = mode !== 'console';
   if (mode === 'console') {
     input.placeholder = 'Type a command… e.g. git status, pwd, gh pr status';
-    $('#commandHelp').textContent = '↑↓ history · Enter to run · ⇄ scope changes working directory · non-interactive commands only';
+    $('#commandHelp').textContent = '↑↓ history · Enter to run · “Run in” is the exact working directory · use “… here” shortcuts to path-filter Git';
     updateConsoleScopeLabel(); renderConsoleTranscript(); renderGitHints();
   } else {
     input.placeholder = 'Type a command… (Cmd/Ctrl+K)';
@@ -4227,7 +4332,7 @@ $('#commandList').addEventListener('click', (e) => {
 });
 document.querySelectorAll('.command-tab').forEach(tab => tab.addEventListener('click', () => { setConsoleMode(tab.dataset.mode); $('#commandInput').focus(); }));
 $('#terminalQuickCommands').addEventListener('click', (e) => { const quick = e.target.closest('[data-terminal-fill]'); if (quick) { setCommandInputValue(quick.dataset.terminalFill); $('#commandInput').focus(); renderGitHints(); } });
-$('#commandScopeCycle').addEventListener('click', () => { cycleConsoleScope(); if (state.consoleMode === 'console') renderConsoleTranscript(); });
+$('#commandScopeSelect').addEventListener('change', (event) => { selectConsoleScope(event.target.value); if (state.consoleMode === 'console') renderConsoleTranscript(); });
 $('#commandClearTranscript').addEventListener('click', () => { state.consoleTranscript = []; renderConsoleTranscript(); });
 $('#commandCopyTranscript').addEventListener('click', () => copyText(state.consoleTranscript.map(consoleEntryAsText).join('\n\n'), 'Terminal transcript copied.'));
 $('#commandPalette').addEventListener('close', () => { commandPaletteOpen = false; });
@@ -4239,7 +4344,7 @@ document.addEventListener('keydown', (e) => {
   else if ((e.ctrlKey || e.metaKey) && (e.shiftKey && e.key === 'C')) { e.preventDefault(); state.changesScope = 'global'; applyDefaultCommitMessage(); renderChanges(); refs.changesDrawer.classList.add('open'); refreshChangesLightweight(); refs.commitMessage.focus(); }
   else if ((e.ctrlKey || e.metaKey) && (e.shiftKey && e.key === 'P')) { e.preventDefault(); $('#pushCurrent').click(); }
   else if ((e.ctrlKey || e.metaKey) && (e.shiftKey && e.key === 'F')) { e.preventDefault(); $('#fetchCurrent').click(); }
-  else if ((e.ctrlKey || e.metaKey) && (e.shiftKey && e.key === 'S')) { e.preventDefault(); state.hasStash ? popStash() : stashWork(); }
+  else if ((e.ctrlKey || e.metaKey) && (e.shiftKey && e.key === 'S')) { e.preventDefault(); stashWork(); }
   else if ((e.ctrlKey || e.metaKey) && (e.shiftKey && e.key === 'L')) { e.preventDefault(); $('#navCommander').click(); }
   else if ((e.ctrlKey || e.metaKey) && (e.shiftKey && e.key === 'G')) { e.preventDefault(); $('#navGraph').click(); }
   else if ((e.ctrlKey || e.metaKey) && e.key === 'f' && !['input','textarea'].includes(document.activeElement.tagName.toLowerCase())) { e.preventDefault(); refs.search.focus(); }
