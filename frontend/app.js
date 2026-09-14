@@ -4358,9 +4358,10 @@ document.addEventListener('keydown', (e) => {
 // directly — so a later "Project Status" view can create one instance per
 // repository (the parent, and one per submodule) just by pointing each at a
 // different root element and a different {path, branch} pair, with no
-// changes needed here. `pr_status` never receives or returns a token — the
-// backend shells out to the `gh` CLI, which owns its own credential storage
-// entirely outside this app.
+// changes needed here. `pr_status` never receives or returns a token. The
+// backend prefers the optional `gh` CLI, and on systems without it (notably
+// managed Windows machines) uses GitHub's API with the HTTPS credential held
+// by Git Credential Manager. Credentials remain entirely outside this DOM.
 //
 // Loading is independent of the rest of the repository UI: this never awaits
 // anything the explorer/graph/commander views depend on, and nothing here
@@ -4385,6 +4386,14 @@ const PR_LIFECYCLE_LABEL = { draft: 'Draft', open: 'Open', merged: 'Merged', clo
 const PR_MERGEABLE_LABEL = { mergeable: 'Mergeable', conflicting: 'Conflicting', calculating: 'Calculating…', unknown: 'Unknown' };
 const PR_REVIEW_LABEL = { approved: 'Approved', changes_requested: 'Changes requested', review_required: 'Review required', none: 'No reviews yet' };
 const PR_CHECKS_LABEL = { passing: 'Checks passing', failing: 'Checks failing', pending: 'Checks running…', none: 'No checks' };
+
+function githubPullsBrowserUrl(queriedRepo) {
+  const parts = String(queriedRepo || '').split('/');
+  if (parts.length !== 3 || !parts.every(Boolean)) return '';
+  const [host, owner, repo] = parts;
+  if (!(host === 'github.com' || host === 'github' || host.startsWith('github.'))) return '';
+  return `https://${host}/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls`;
+}
 
 function prCardHtml(pr) {
   return `<div class="pr-card">
@@ -4446,7 +4455,9 @@ function createPrStatusPanel(root, options) {
     else if (result.state === 'partial_result') detail = `No open pull request found for ${branchCode}${where} — but not every related repository could be checked, so this may be incomplete.`;
     else detail = esc(message);
     const retryable = ['api_error', 'auth_missing', 'partial_result'].includes(result.state);
-    root.innerHTML = ctx + `<div class="pr-status-empty pr-status-${esc(result.state)}">${detail}${retryable ? '<button class="pr-status-retry" id="prStatusRetry">Retry</button>' : ''}</div>`;
+    const browserUrl = githubPullsBrowserUrl(result.queried_repo);
+    const browserFallback = browserUrl && retryable ? `<button class="pr-open-link" data-open-url="${esc(browserUrl)}">Open pull requests in browser ↗</button>` : '';
+    root.innerHTML = ctx + `<div class="pr-status-empty pr-status-${esc(result.state)}">${detail}${retryable ? '<button class="pr-status-retry" id="prStatusRetry">Retry</button>' : ''}${browserFallback}</div>`;
     if (retryable) root.querySelector('#prStatusRetry')?.addEventListener('click', load);
   }
 

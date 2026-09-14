@@ -1395,16 +1395,12 @@ fn is_generated_polarion_url(url: &str) -> bool {
     id_project == project && !id_number.is_empty() && id_number.chars().all(|value| value.is_ascii_digit())
 }
 
-// Matches only the exact shape `gh pr list --json url` itself returns for a
-// PullRequestSummary.url (see pr_summary_from_json) — e.g.
-// "https://github.com/owner/repo/pull/42", or the same shape against a GitHub
-// Enterprise host (pr_status already queries whichever host the remote
-// resolved to). Not a fixed-host allowlist like Polarion's, since that host
-// varies — the shape is what's checked instead: this is data that came back
-// from GitHub's own API for a repo this app itself queried, not text a user
-// typed in, but it still reaches a shell command as an argument the same way
-// the Polarion link does, so it gets the same strict, no-shell-metacharacters
-// treatment rather than being waved through as "already trusted".
+// Matches only the exact shape returned for a PullRequestSummary.url — e.g.
+// "https://github.com/owner/repo/pull/42" — plus the exact `/owner/repo/pulls`
+// fallback page Git DrillDown itself constructs when API authentication is
+// unavailable. Not a fixed-host allowlist like Polarion's, since Enterprise
+// hosts vary; the path and every identifier remain strictly validated because
+// the URL reaches an OS browser-launch command.
 fn is_generated_pull_request_url(url: &str) -> bool {
     let Some(rest) = url.strip_prefix("https://") else { return false };
     let Some((host, path)) = rest.split_once('/') else { return false };
@@ -1412,6 +1408,7 @@ fn is_generated_pull_request_url(url: &str) -> bool {
     let is_identifier = |value: &str| !value.is_empty() && value.chars().all(|value| value.is_ascii_alphanumeric() || value == '.' || value == '-' || value == '_');
     match path.split('/').collect::<Vec<_>>().as_slice() {
         [owner, repo, "pull", number] => is_identifier(owner) && is_identifier(repo) && !number.is_empty() && number.chars().all(|value| value.is_ascii_digit()),
+        [owner, repo, "pulls"] => is_identifier(owner) && is_identifier(repo),
         _ => false,
     }
 }
@@ -2451,12 +2448,15 @@ pub fn write_text_file(repository_path: String, relative_path: String, content: 
 
 // ---- Pull request status (read-only, first incremental step) ----
 //
-// The frontend never receives or stores any GitHub token — this shells out
-// to the `gh` CLI (same trust model this app already uses for plain `git`:
-// reuse whatever credentials are already working outside this app — SSH
-// agent, credential helper, OS keychain — instead of asking the user to
-// paste a secret into it). `gh` owns its own token storage entirely; this
-// process only ever sees `gh`'s stdout/stderr, never the token itself.
+// Prefer the `gh` CLI when it is installed: it already owns its credential
+// storage and provides all the rich PR fields in one operation. Corporate
+// Windows images do not always include `gh`, though, so absence of that
+// optional tool must not disable the feature. In that case we query the
+// GitHub / GitHub Enterprise GraphQL API directly and ask the repository's
+// configured Git credential helper (normally Git Credential Manager on
+// Windows) for the HTTPS credential it already uses. The secret remains in
+// the Rust backend's memory for this request only: it is never returned to
+// the frontend, persisted by Git DrillDown, or written to the perf log.
 
 #[derive(Serialize)]
 pub struct PullRequestSummary {
@@ -2756,6 +2756,225 @@ enum GhOutcome {
     Unavailable { not_installed: bool, detail: String },
 }
 
+#[cfg(not(test))]
+static GH_CLI_AVAILABLE: OnceLock<bool> = OnceLock::new();
+
+// Detect once per process. A missing executable fails immediately, but the
+// timeout also protects against a broken corporate installation that starts
+// and then waits forever. Unit tests deliberately keep using the injected gh
+// runner so they never depend on tools or credentials installed on the host.
+#[cfg(not(test))]
+fn gh_cli_available() -> bool {
+    *GH_CLI_AVAILABLE.get_or_init(|| {
+        let mut command = Command::new("gh");
+        command.arg("--version").stdin(std::process::Stdio::null());
+        run_with_timeout_labeled(command, Duration::from_secs(3), "gh", "3 seconds")
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+    })
+}
+
+#[cfg(test)]
+fn gh_cli_available() -> bool { true }
+
+fn github_graphql_endpoint(host: &str) -> String {
+    if host.eq_ignore_ascii_case("github.com") {
+        "https://api.github.com/graphql".into()
+    } else {
+        format!("https://{host}/api/graphql")
+    }
+}
+
+fn github_token_from_environment(host: &str) -> Option<String> {
+    let names: &[&str] = if host.eq_ignore_ascii_case("github.com") {
+        &["GH_TOKEN", "GITHUB_TOKEN"]
+    } else {
+        &["GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"]
+    };
+    names.iter().find_map(|name| std::env::var(name).ok().map(|value| value.trim().to_string()).filter(|value| !value.is_empty()))
+}
+
+fn parse_git_credential_password(output: &[u8]) -> Option<String> {
+    String::from_utf8_lossy(output).lines().find_map(|line| {
+        let (key, value) = line.split_once('=')?;
+        (key == "password" && !value.is_empty()).then(|| value.to_string())
+    })
+}
+
+// Ask the configured credential helper for the HTTPS credential already used
+// by Git. Git Credential Manager returns it through this standard plumbing on
+// Windows; macOS Keychain and other helpers use the same protocol. Interactive
+// prompting is disabled because a GUI subprocess has no usable terminal and
+// must never make the PR panel freeze. stdout contains a secret and therefore
+// must never be included in an error or performance log.
+fn github_token_from_git_credential_helper(repository_path: &str, repo: &GitHubRepo) -> Option<String> {
+    use std::io::Write;
+
+    let mut command = Command::new("git");
+    command.arg("-C").arg(repository_path).args(["credential", "fill"])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GCM_INTERACTIVE", "Never")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = command.spawn().ok()?;
+    let id = child.id();
+    let request = format!("protocol=https\nhost={}\npath={}/{}.git\n\n", repo.host, repo.owner, repo.repo);
+    let mut stdin = child.stdin.take()?;
+    if stdin.write_all(request.as_bytes()).is_err() {
+        let _ = child.kill();
+        return None;
+    }
+    drop(stdin);
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || { let _ = tx.send(child.wait_with_output()); });
+    match rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(Ok(output)) if output.status.success() => parse_git_credential_password(&output.stdout),
+        Ok(_) => None,
+        Err(_) => {
+            #[cfg(unix)] { let _ = Command::new("kill").arg("-9").arg(id.to_string()).status(); }
+            #[cfg(windows)] { let _ = Command::new("taskkill").args(["/F", "/PID"]).arg(id.to_string()).status(); }
+            None
+        }
+    }
+}
+
+#[derive(Clone)]
+struct GitHubGraphqlClient {
+    http: reqwest::blocking::Client,
+    endpoint: String,
+    token: Option<String>,
+}
+
+impl GitHubGraphqlClient {
+    fn discover(repository_path: &str, repo: &GitHubRepo) -> Result<Self, String> {
+        let token = github_token_from_environment(&repo.host)
+            .or_else(|| github_token_from_git_credential_helper(repository_path, repo));
+        // GitHub's GraphQL API requires authentication even for public
+        // repositories. Avoid several guaranteed-to-fail requests and give
+        // one precise setup message instead.
+        if token.is_none() {
+            return Err(format!(
+                "GitHub API authentication is required for {}. Git DrillDown could not obtain an HTTPS credential from Git Credential Manager. Make sure `git fetch` works over HTTPS for this host, or provide a read-only {}. The GitHub CLI is optional.",
+                repo.host,
+                if repo.host.eq_ignore_ascii_case("github.com") { "GH_TOKEN" } else { "GH_ENTERPRISE_TOKEN" },
+            ));
+        }
+        let http = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(20))
+            .user_agent("Git-DrillDown/0.1")
+            .build()
+            .map_err(|error| format!("Could not initialize the GitHub API client: {error}"))?;
+        Ok(Self { http, endpoint: github_graphql_endpoint(&repo.host), token })
+    }
+
+    fn run(&self, query: &PrGhQuery) -> GhOutcome {
+        let Some(repo) = parse_gh_repo_arg(&query.repo) else {
+            return GhOutcome::Failure { stderr: "The GitHub repository identifier is invalid.".into() };
+        };
+        let query_text = match query.direction {
+            PrQueryDirection::Head => GITHUB_PRS_BY_HEAD_QUERY,
+            PrQueryDirection::Base => GITHUB_PRS_BY_BASE_QUERY,
+        };
+        let variables = serde_json::json!({
+            "owner": repo.owner,
+            "name": repo.repo,
+            "branch": &query.branch,
+        });
+        let mut request = self.http.post(&self.endpoint).json(&serde_json::json!({
+            "query": query_text,
+            "variables": variables,
+        }));
+        if let Some(token) = &self.token { request = request.bearer_auth(token); }
+        let response = match request.send() {
+            Ok(response) => response,
+            Err(error) => return GhOutcome::Failure { stderr: format!("GitHub API request failed: {error}") },
+        };
+        let status = response.status();
+        let payload = match response.json::<serde_json::Value>() {
+            Ok(payload) => payload,
+            Err(error) => return GhOutcome::Failure { stderr: format!("GitHub API returned HTTP {status} with an unreadable response: {error}") },
+        };
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+            return GhOutcome::Failure { stderr: format!("GitHub API authentication failed (HTTP {status}). The saved credential may be expired or may not have read access to this repository.") };
+        }
+        if !status.is_success() {
+            return GhOutcome::Failure { stderr: format!("GitHub API request failed with HTTP {status}.") };
+        }
+        if let Some(errors) = payload.get("errors").and_then(|value| value.as_array()).filter(|errors| !errors.is_empty()) {
+            let message = errors.iter().filter_map(|error| error.get("message").and_then(|value| value.as_str())).take(3).collect::<Vec<_>>().join("; ");
+            return GhOutcome::Failure { stderr: if message.is_empty() { "GitHub API returned an error.".into() } else { format!("GitHub API error: {message}") } };
+        }
+        let Some(nodes) = payload.pointer("/data/repository/pullRequests/nodes").and_then(|value| value.as_array()) else {
+            return GhOutcome::Failure { stderr: "GitHub API response did not contain a pull-request list.".into() };
+        };
+        GhOutcome::Prs(nodes.iter().map(normalize_graphql_pr).collect())
+    }
+}
+
+fn parse_gh_repo_arg(value: &str) -> Option<GitHubRepo> {
+    let mut parts = value.split('/');
+    let host = parts.next()?.trim();
+    let owner = parts.next()?.trim();
+    let repo = parts.next()?.trim();
+    if host.is_empty() || owner.is_empty() || repo.is_empty() || parts.next().is_some() || !is_github_like_host(host) { return None; }
+    Some(GitHubRepo { host: host.to_ascii_lowercase(), owner: owner.into(), repo: repo.into() })
+}
+
+// Kept as two small static documents because GraphQL arguments cannot switch
+// between headRefName/baseRefName through a variable. Both return precisely
+// the vocabulary already consumed by the existing gh response mapper.
+const GITHUB_PRS_BY_HEAD_QUERY: &str = r#"
+query PullRequestsByHead($owner: String!, $name: String!, $branch: String!) {
+  repository(owner: $owner, name: $name) {
+    pullRequests(first: 100, states: [OPEN], headRefName: $branch) {
+      nodes {
+        number title headRefName baseRefName state isDraft mergeable reviewDecision url
+        headRepository { name }
+        headRepositoryOwner { login }
+        commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
+      }
+    }
+  }
+}
+"#;
+const GITHUB_PRS_BY_BASE_QUERY: &str = r#"
+query PullRequestsByBase($owner: String!, $name: String!, $branch: String!) {
+  repository(owner: $owner, name: $name) {
+    pullRequests(first: 100, states: [OPEN], baseRefName: $branch) {
+      nodes {
+        number title headRefName baseRefName state isDraft mergeable reviewDecision url
+        headRepository { name }
+        headRepositoryOwner { login }
+        commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
+      }
+    }
+  }
+}
+"#;
+
+fn normalize_graphql_pr(item: &serde_json::Value) -> serde_json::Value {
+    let rollup = item.pointer("/commits/nodes/0/commit/statusCheckRollup/state")
+        .and_then(|value| value.as_str())
+        .map(|state| vec![serde_json::json!({ "state": state })])
+        .unwrap_or_default();
+    serde_json::json!({
+        "number": item.get("number").cloned().unwrap_or(serde_json::Value::Null),
+        "title": item.get("title").cloned().unwrap_or(serde_json::Value::Null),
+        "headRefName": item.get("headRefName").cloned().unwrap_or(serde_json::Value::Null),
+        "headRepository": item.get("headRepository").cloned().unwrap_or(serde_json::Value::Null),
+        "headRepositoryOwner": item.get("headRepositoryOwner").cloned().unwrap_or(serde_json::Value::Null),
+        "baseRefName": item.get("baseRefName").cloned().unwrap_or(serde_json::Value::Null),
+        "state": item.get("state").cloned().unwrap_or(serde_json::Value::Null),
+        "isDraft": item.get("isDraft").cloned().unwrap_or(serde_json::Value::Bool(false)),
+        "mergeable": item.get("mergeable").cloned().unwrap_or(serde_json::Value::Null),
+        "reviewDecision": item.get("reviewDecision").cloned().unwrap_or(serde_json::Value::Null),
+        "statusCheckRollup": rollup,
+        "url": item.get("url").cloned().unwrap_or(serde_json::Value::Null),
+    })
+}
+
 const PR_GH_JSON_FIELDS: &str = "number,title,headRefName,headRepository,headRepositoryOwner,baseRefName,state,isDraft,mergeable,reviewDecision,statusCheckRollup,url";
 
 fn gh_stderr_looks_like_auth(stderr: &str) -> bool {
@@ -2966,7 +3185,7 @@ fn pr_status_impl(
     }
     if let Some((not_installed, detail)) = head_repo_unavailable {
         let message = if not_installed {
-            "The GitHub CLI (`gh`) isn't installed — install it and run `gh auth login` to see pull request status.".to_string()
+            "Pull request status needs GitHub authentication. Git DrillDown could not use GitHub CLI or obtain an HTTPS credential from Git Credential Manager. Make sure `git fetch` works over HTTPS for this host, or provide a read-only GitHub API token. You can still open the repository's pull requests in your signed-in browser.".to_string()
         } else { detail };
         return PrStatusResult { state: "auth_missing".into(), detail: message, branch: Some(ctx.head_branch), queried_repo: Some(queried_repo), partial: true, outgoing_pull_requests: Vec::new(), incoming_pull_requests: Vec::new() };
     }
@@ -2974,7 +3193,7 @@ fn pr_status_impl(
         let enterprise = ctx.head_repo.host != "github.com";
         let state = if auth { "auth_missing" } else { "api_error" };
         let detail = if auth && enterprise {
-            format!("`gh` isn't authenticated for {} — run `gh auth login --hostname {}`.{}", ctx.head_repo.host, ctx.head_repo.host,
+            format!("GitHub authentication failed for {}. Configure an HTTPS credential in Git Credential Manager or authenticate the optional GitHub CLI for this host.{}", ctx.head_repo.host,
                 if stderr.trim().is_empty() { String::new() } else { format!(" ({})", stderr.trim()) })
         } else if stderr.trim().is_empty() {
             "The GitHub API request failed.".to_string()
@@ -3054,10 +3273,32 @@ fn pr_status_inner(repository_path: String, branch: Option<String>, context: Opt
     };
     drop(repo);
     if !is_latest_pr_status_generation(&repository_path, generation) {
-        perf_log(&format!("pr_status: [{context_label}] repo={} superseded by a newer request — skipping the gh round", anonymized_repository_id(&repository_path)), Duration::ZERO);
+        perf_log(&format!("pr_status: [{context_label}] repo={} superseded by a newer request — skipping the provider round", anonymized_repository_id(&repository_path)), Duration::ZERO);
         return Ok(PrStatusResult::plain("superseded", "A newer request for this repository has already superseded this one."));
     }
-    Ok(pr_status_impl(ctx, &repository_path, &context_label, &run_gh_pr_list))
+    if gh_cli_available() {
+        perf_log(&format!("pr_status: [{context_label}] provider=gh"), Duration::ZERO);
+        return Ok(pr_status_impl(ctx, &repository_path, &context_label, &run_gh_pr_list));
+    }
+
+    // No optional gh installation: reuse the HTTPS credential already held
+    // by Git Credential Manager and query the same Enterprise host directly.
+    // Discover once per panel refresh, before the concurrent candidate calls,
+    // so no credential helper is invoked once per repository/row.
+    let api = match GitHubGraphqlClient::discover(&repository_path, &ctx.head_repo) {
+        Ok(api) => api,
+        Err(detail) => return Ok(PrStatusResult {
+            state: "auth_missing".into(),
+            detail,
+            branch: Some(ctx.head_branch),
+            queried_repo: Some(ctx.head_repo.gh_repo_arg()),
+            partial: true,
+            outgoing_pull_requests: Vec::new(),
+            incoming_pull_requests: Vec::new(),
+        }),
+    };
+    perf_log(&format!("pr_status: [{context_label}] provider=github_api credential=git_or_environment"), Duration::ZERO);
+    Ok(pr_status_impl(ctx, &repository_path, &context_label, &|query| api.run(query)))
 }
 
 #[tauri::command]
@@ -3706,7 +3947,11 @@ pub struct SubmoduleNavigationStatus {
 // involved, or already warm) or must show the filesystem-only listing first
 // while a background scan warms this one specific submodule.
 #[tauri::command]
-pub fn submodule_navigation_status(repository_path: String, relative_path: String) -> Result<Option<SubmoduleNavigationStatus>, String> {
+pub async fn submodule_navigation_status(repository_path: String, relative_path: String) -> Result<Option<SubmoduleNavigationStatus>, String> {
+    off_main_thread(move || submodule_navigation_status_inner(repository_path, relative_path)).await
+}
+
+fn submodule_navigation_status_inner(repository_path: String, relative_path: String) -> Result<Option<SubmoduleNavigationStatus>, String> {
     validate_path(&repository_path)?;
     let relative = safe_relative_path(&relative_path)?;
     let relative_string = normalized(&relative);
@@ -3733,7 +3978,11 @@ pub fn submodule_navigation_status(repository_path: String, relative_path: Strin
 // worktree_status/cached_git_metadata reuse path, instead of each running
 // its own scoped scan.
 #[tauri::command]
-pub fn submodule_folder_status(repository_path: String, relative_path: String) -> Result<(), String> {
+pub async fn submodule_folder_status(repository_path: String, relative_path: String) -> Result<(), String> {
+    off_main_thread(move || submodule_folder_status_inner(repository_path, relative_path)).await
+}
+
+fn submodule_folder_status_inner(repository_path: String, relative_path: String) -> Result<(), String> {
     validate_path(&repository_path)?;
     let (sub_path, _inner) = resolve_submodule_boundary(&repository_path, &relative_path)
         .ok_or("This path is not inside a submodule")?;
@@ -3745,7 +3994,11 @@ pub fn submodule_folder_status(repository_path: String, relative_path: String) -
 }
 
 #[tauri::command]
-pub fn list_directory_fast(repository_path: String, relative_path: String) -> Result<Vec<DirectoryEntry>, String> {
+pub async fn list_directory_fast(repository_path: String, relative_path: String) -> Result<Vec<DirectoryEntry>, String> {
+    off_main_thread(move || list_directory_fast_inner(repository_path, relative_path)).await
+}
+
+fn list_directory_fast_inner(repository_path: String, relative_path: String) -> Result<Vec<DirectoryEntry>, String> {
     let started = Instant::now();
     validate_path(&repository_path)?;
     let relative = safe_relative_path(&relative_path)?;
@@ -3768,7 +4021,11 @@ pub fn list_directory_fast(repository_path: String, relative_path: String) -> Re
 }
 
 #[tauri::command]
-pub fn load_directory(repository_path: String, relative_path: String, force: Option<bool>) -> Result<Vec<DirectoryEntry>, String> {
+pub async fn load_directory(repository_path: String, relative_path: String, force: Option<bool>) -> Result<Vec<DirectoryEntry>, String> {
+    off_main_thread(move || load_directory_inner(repository_path, relative_path, force)).await
+}
+
+fn load_directory_inner(repository_path: String, relative_path: String, force: Option<bool>) -> Result<Vec<DirectoryEntry>, String> {
     let load_started = Instant::now();
     validate_path(&repository_path)?;
     let relative = safe_relative_path(&relative_path)?;
@@ -3905,7 +4162,11 @@ pub fn load_directory(repository_path: String, relative_path: String, force: Opt
 }
 
 #[tauri::command]
-pub fn entry_details(repository_path: String, relative_path: String) -> Result<EntryDetails, String> {
+pub async fn entry_details(repository_path: String, relative_path: String) -> Result<EntryDetails, String> {
+    off_main_thread(move || entry_details_inner(repository_path, relative_path)).await
+}
+
+fn entry_details_inner(repository_path: String, relative_path: String) -> Result<EntryDetails, String> {
     validate_path(&repository_path)?;
     let relative = safe_relative_path(&relative_path)?;
     if relative.as_os_str().is_empty() { return Err("Select a file or folder".into()); }
@@ -3996,7 +4257,11 @@ pub fn entry_details(repository_path: String, relative_path: String) -> Result<E
 // item in a large folder doesn't sit blocked on a potentially-heavy history
 // walk on every single click.
 #[tauri::command]
-pub fn entry_last_commit(repository_path: String, relative_path: String) -> Result<Option<PublishCommit>, String> {
+pub async fn entry_last_commit(repository_path: String, relative_path: String) -> Result<Option<PublishCommit>, String> {
+    off_main_thread(move || entry_last_commit_inner(repository_path, relative_path)).await
+}
+
+fn entry_last_commit_inner(repository_path: String, relative_path: String) -> Result<Option<PublishCommit>, String> {
     validate_path(&repository_path)?;
     let relative = safe_relative_path(&relative_path)?;
     let relative_string = normalized(&relative);
@@ -6002,9 +6267,9 @@ mod tests {
         assert_eq!(repo.index().unwrap().get_path(Path::new("components/engine"), 0).unwrap().mode, 0o160000);
         drop(repo);
         create_commit(parent_string.clone(), "P:89312 add engine".into()).unwrap();
-        assert_eq!(entry_last_commit(parent_string.clone(), "README.md".into()).unwrap().map(|c| c.subject), Some("Initial commit".to_string()));
-        let engine_details = entry_details(parent_string.clone(), "components/engine".into()).unwrap();
-        assert_eq!(entry_last_commit(parent_string.clone(), "components/engine".into()).unwrap().map(|c| c.subject), Some("P:89312 add engine".to_string()), "last-commit-touching-path must stay the parent's gitlink-bump commit");
+        assert_eq!(entry_last_commit_inner(parent_string.clone(), "README.md".into()).unwrap().map(|c| c.subject), Some("Initial commit".to_string()));
+        let engine_details = entry_details_inner(parent_string.clone(), "components/engine".into()).unwrap();
+        assert_eq!(entry_last_commit_inner(parent_string.clone(), "components/engine".into()).unwrap().map(|c| c.subject), Some("P:89312 add engine".to_string()), "last-commit-touching-path must stay the parent's gitlink-bump commit");
         assert_eq!(engine_details.submodule_commit_subject.as_deref(), Some("Initial commit"), "submodule_commit_* must be the submodule's own HEAD commit, not the parent's");
         assert!(engine_details.submodule_commit_id.is_some());
         let versions = submodule_versions(parent_string.clone(), added.clone()).unwrap();
@@ -6044,15 +6309,15 @@ mod tests {
         run_git(&repository, &["commit", "-am", "Add dependency"]);
 
         let path = repository.to_string_lossy().into_owned();
-        let entries = load_directory(path.clone(), "".into(), None).unwrap();
+        let entries = load_directory_inner(path.clone(), "".into(), None).unwrap();
         assert!(entries.iter().any(|entry| entry.relative_path == "src" && entry.kind == "folder"));
         assert!(entries.iter().any(|entry| entry.relative_path == "vendor" && entry.kind == "folder"));
         let cached_start = std::time::Instant::now();
-        for _ in 0..100 { assert!(!load_directory(path.clone(), "".into(), None).unwrap().is_empty()); }
+        for _ in 0..100 { assert!(!load_directory_inner(path.clone(), "".into(), None).unwrap().is_empty()); }
         assert!(cached_start.elapsed().as_millis() < 1000, "cached navigation took {:?}", cached_start.elapsed());
-        let nested = load_directory(path.clone(), "vendor".into(), None).unwrap();
+        let nested = load_directory_inner(path.clone(), "vendor".into(), None).unwrap();
         assert!(nested.iter().any(|entry| entry.relative_path == "vendor/dependency" && entry.kind == "submodule"));
-        let details = entry_details(path, "vendor/dependency".into()).unwrap();
+        let details = entry_details_inner(path, "vendor/dependency".into()).unwrap();
         assert_eq!(details.kind, "submodule");
         assert!(details.submodule_url.as_deref().unwrap_or_default().contains("dependency"));
         let versions = submodule_versions(repository.to_string_lossy().into_owned(), "vendor/dependency".into()).unwrap();
@@ -6129,7 +6394,7 @@ mod tests {
         // Warm the submodule's own cache with the pre-edit, clean status —
         // exactly what browsing into it in the Explorer would have already
         // done before the edit.
-        let before = load_directory(sub_path_string.clone(), "".into(), Some(true)).unwrap();
+        let before = load_directory_inner(sub_path_string.clone(), "".into(), Some(true)).unwrap();
         let file_before = before.iter().find(|entry| entry.relative_path == "module.txt").expect("module.txt should be listed");
         assert_eq!(file_before.status, "", "should be clean before editing");
         let cached_before_edit = cached_submodule_state(&sub_path_string);
@@ -6142,10 +6407,10 @@ mod tests {
         // A fresh (unforced — this must not require the user to know to
         // force-refresh) listing of the submodule's own directory must now
         // show it as modified.
-        let after = load_directory(sub_path_string, "".into(), None).unwrap();
+        let after = load_directory_inner(sub_path_string, "".into(), None).unwrap();
         let file_after = after.iter().find(|entry| entry.relative_path == "module.txt").expect("module.txt should still be listed");
         assert_eq!(file_after.status, "M", "editing the file must show up as modified when browsing inside the submodule itself, not just in the parent's own row for it");
-        let parent_listing = load_directory(parent_string, "".into(), None).unwrap();
+        let parent_listing = load_directory_inner(parent_string, "".into(), None).unwrap();
         let submodule_after = parent_listing.iter().find(|entry| entry.relative_path == added).expect("submodule should still be listed in its parent");
         assert_eq!(submodule_after.submodule_state, "changes_inside", "the parent Explorer row must also drop the cached clean snapshot immediately after an in-app edit");
 
@@ -6531,11 +6796,11 @@ mod tests {
         create_libgit2_repository(&repository, "a.txt");
         let path = repository.to_string_lossy().into_owned();
 
-        let details = entry_details(path.clone(), "a.txt".into()).unwrap();
+        let details = entry_details_inner(path.clone(), "a.txt".into()).unwrap();
         assert!(details.last_commit_id.is_none(), "entry_details must not populate last-commit-touching-path fields itself");
         assert!(details.last_commit_subject.is_none());
 
-        let last = entry_last_commit(path.clone(), "a.txt".into()).unwrap();
+        let last = entry_last_commit_inner(path.clone(), "a.txt".into()).unwrap();
         assert_eq!(last.unwrap().subject, "Initial commit", "entry_last_commit must still find it correctly when actually asked");
 
         fs::remove_dir_all(repository).unwrap();
@@ -7101,12 +7366,12 @@ mod tests {
         fs::write(base.join("brand-new-folder/nested/two.txt"), "b").unwrap();
 
         let path = base.to_string_lossy().into_owned();
-        let entries = load_directory(path.clone(), "".into(), None).unwrap();
+        let entries = load_directory_inner(path.clone(), "".into(), None).unwrap();
         let folder_entry = entries.iter().find(|entry| entry.relative_path == "brand-new-folder").expect("the new folder should be listed");
         assert!(!folder_entry.tracked, "a wholly new folder should not be marked as tracked");
         assert!(!folder_entry.status.is_empty(), "load_directory should flag the new folder with a status (e.g. untracked/changed), got empty status");
 
-        let details = entry_details(path, "brand-new-folder".into()).unwrap();
+        let details = entry_details_inner(path, "brand-new-folder".into()).unwrap();
         assert!(!details.tracked, "entry_details should also report the new folder as untracked");
         assert!(!details.status.is_empty(), "entry_details should flag the new folder with a status too, got empty status");
 
@@ -7127,7 +7392,7 @@ mod tests {
         let path = base.to_string_lossy().into_owned();
 
         // Warm the status cache with a clean tree (no `force`, like ordinary navigation).
-        let clean = load_directory(path.clone(), "".into(), None).unwrap();
+        let clean = load_directory_inner(path.clone(), "".into(), None).unwrap();
         let readme = clean.iter().find(|entry| entry.relative_path == "README.md").expect("README.md should be listed");
         assert!(readme.status.is_empty(), "a freshly committed file should start with no status");
 
@@ -7135,12 +7400,12 @@ mod tests {
         fs::write(base.join("README.md"), "edited externally, not through this app").unwrap();
 
         // Without force, the cache is still fresh (TTL is 300s) and unaware of the edit.
-        let stale = load_directory(path.clone(), "".into(), None).unwrap();
+        let stale = load_directory_inner(path.clone(), "".into(), None).unwrap();
         let stale_readme = stale.iter().find(|entry| entry.relative_path == "README.md").unwrap();
         assert!(stale_readme.status.is_empty(), "sanity check: without force, the pre-existing cache should still be serving the stale, clean status");
 
         // A forced reload (what the Refresh button now sends) must reflect the edit immediately.
-        let refreshed = load_directory(path.clone(), "".into(), Some(true)).unwrap();
+        let refreshed = load_directory_inner(path.clone(), "".into(), Some(true)).unwrap();
         let refreshed_readme = refreshed.iter().find(|entry| entry.relative_path == "README.md").unwrap();
         assert!(!refreshed_readme.status.is_empty(), "force:true must bypass the status cache and show the external edit immediately, got status={:?}", refreshed_readme.status);
 
@@ -7300,16 +7565,16 @@ mod tests {
         fs::write(base.join("README.md"), "edited after the scan").unwrap();
         fs::write(base.join("sub/file.txt"), "edited after the scan too").unwrap();
 
-        let root_repaint = load_directory(path.clone(), "".into(), None).unwrap();
+        let root_repaint = load_directory_inner(path.clone(), "".into(), None).unwrap();
         let readme = root_repaint.iter().find(|e| e.relative_path == "README.md").unwrap();
         assert!(readme.status.is_empty(), "a root repaint without force must reuse load_repository's fresh scan, not rescan and see the external edit");
 
-        let child_repaint = load_directory(path.clone(), "sub".into(), None).unwrap();
+        let child_repaint = load_directory_inner(path.clone(), "sub".into(), None).unwrap();
         let child_file = child_repaint.iter().find(|e| e.relative_path == "sub/file.txt").unwrap();
         assert!(child_file.status.is_empty(), "a child-folder repaint without force must also reuse the same fresh scan (via the full-scan reuse path), not run its own scoped rescan");
 
         // Only the explicit "Reload folder" action (force:true) should invalidate and rescan.
-        let forced = load_directory(path, "".into(), Some(true)).unwrap();
+        let forced = load_directory_inner(path, "".into(), Some(true)).unwrap();
         let forced_readme = forced.iter().find(|e| e.relative_path == "README.md").unwrap();
         assert!(!forced_readme.status.is_empty(), "an explicit forced reload must see the external edit");
 
@@ -7328,16 +7593,16 @@ mod tests {
         run_git(&repository, &["commit", "-am", "Add dep submodule"]);
         let repo_path = repository.to_string_lossy().into_owned();
 
-        assert!(submodule_navigation_status(repo_path.clone(), "".into()).unwrap().is_none(), "the repository root is not inside a submodule");
-        assert!(submodule_navigation_status(repo_path.clone(), "README.md".into()).unwrap().is_none(), "an ordinary parent-repo file is not inside a submodule");
+        assert!(submodule_navigation_status_inner(repo_path.clone(), "".into()).unwrap().is_none(), "the repository root is not inside a submodule");
+        assert!(submodule_navigation_status_inner(repo_path.clone(), "README.md".into()).unwrap().is_none(), "an ordinary parent-repo file is not inside a submodule");
 
-        let before = submodule_navigation_status(repo_path.clone(), "vendor/dep".into()).unwrap().expect("vendor/dep should be recognized as a submodule");
+        let before = submodule_navigation_status_inner(repo_path.clone(), "vendor/dep".into()).unwrap().expect("vendor/dep should be recognized as a submodule");
         assert_eq!(before.submodule_path, "vendor/dep");
         assert!(!before.ready, "no scan has happened yet — must not be reported ready");
 
-        submodule_folder_status(repo_path.clone(), "vendor/dep".into()).unwrap();
+        submodule_folder_status_inner(repo_path.clone(), "vendor/dep".into()).unwrap();
 
-        let after = submodule_navigation_status(repo_path, "vendor/dep".into()).unwrap().unwrap();
+        let after = submodule_navigation_status_inner(repo_path, "vendor/dep".into()).unwrap().unwrap();
         assert!(after.ready, "after submodule_folder_status scans it, the submodule must be reported ready");
 
         fs::remove_dir_all(base).unwrap();
@@ -7365,14 +7630,14 @@ mod tests {
         run_git(&repository, &["commit", "-am", "Add both submodules"]);
         let repo_path = repository.to_string_lossy().into_owned();
 
-        submodule_folder_status(repo_path.clone(), "vendor/a".into()).unwrap();
-        assert!(submodule_navigation_status(repo_path.clone(), "vendor/a".into()).unwrap().unwrap().ready, "the requested submodule should now be ready");
-        assert!(!submodule_navigation_status(repo_path.clone(), "vendor/b".into()).unwrap().unwrap().ready, "a sibling submodule that was never entered must not have been scanned too");
+        submodule_folder_status_inner(repo_path.clone(), "vendor/a".into()).unwrap();
+        assert!(submodule_navigation_status_inner(repo_path.clone(), "vendor/a".into()).unwrap().unwrap().ready, "the requested submodule should now be ready");
+        assert!(!submodule_navigation_status_inner(repo_path.clone(), "vendor/b".into()).unwrap().unwrap().ready, "a sibling submodule that was never entered must not have been scanned too");
 
         // b's real, current status must still be answered correctly on demand
         // (just not pre-emptively) — add an untracked file and confirm load_directory sees it.
         fs::write(repository.join("vendor/b/new.txt"), "new").unwrap();
-        let listing = load_directory(repo_path, "vendor/b".into(), None).unwrap();
+        let listing = load_directory_inner(repo_path, "vendor/b".into(), None).unwrap();
         let new_entry = listing.iter().find(|entry| entry.name == "new.txt").expect("the new file in the never-prescanned submodule should still be listed with real status");
         assert!(!new_entry.status.is_empty(), "vendor/b must still get its own correct, current status when actually read, despite never being pre-scanned");
 
@@ -7405,7 +7670,7 @@ mod tests {
         let repo_path = repository.to_string_lossy().into_owned();
 
         // The one full scan for this submodule.
-        submodule_folder_status(repo_path.clone(), "vendor/dep".into()).unwrap();
+        submodule_folder_status_inner(repo_path.clone(), "vendor/dep".into()).unwrap();
 
         // External edits, made right after that one scan, to a file in the
         // submodule's root listing, one in a nested folder, and one that will
@@ -7413,15 +7678,15 @@ mod tests {
         fs::write(repository.join("vendor/dep/top.txt"), "edited after the scan").unwrap();
         fs::write(repository.join("vendor/dep/nested/deep.txt"), "edited after the scan too").unwrap();
 
-        let root_listing = load_directory(repo_path.clone(), "vendor/dep".into(), None).unwrap();
+        let root_listing = load_directory_inner(repo_path.clone(), "vendor/dep".into(), None).unwrap();
         let top = root_listing.iter().find(|e| e.name == "top.txt").unwrap();
         assert!(top.status.is_empty(), "listing the submodule's own root must reuse the one scan, not rescan");
 
-        let nested_listing = load_directory(repo_path.clone(), "vendor/dep/nested".into(), None).unwrap();
+        let nested_listing = load_directory_inner(repo_path.clone(), "vendor/dep/nested".into(), None).unwrap();
         let deep = nested_listing.iter().find(|e| e.name == "deep.txt").unwrap();
         assert!(deep.status.is_empty(), "a nested folder inside the submodule must also reuse the same scan, not run its own scoped scan");
 
-        let details = entry_details(repo_path, "vendor/dep/nested/deep.txt".into()).unwrap();
+        let details = entry_details_inner(repo_path, "vendor/dep/nested/deep.txt".into()).unwrap();
         assert!(details.status.is_empty(), "entry_details for a file inside the submodule must reuse the same snapshot too, not trigger a duplicate scan");
 
         fs::remove_dir_all(base).unwrap();
@@ -7474,6 +7739,50 @@ mod tests {
         let passing = vec![serde_json::json!({"conclusion": "SUCCESS"}), serde_json::json!({"conclusion": "NEUTRAL"})];
         assert_eq!(map_checks_status(&passing), "passing");
         assert_eq!(map_checks_status(&[]), "none", "no checks configured at all must read as none, not as passing");
+    }
+
+    #[test]
+    fn github_api_fallback_uses_the_correct_public_and_enterprise_endpoints() {
+        assert_eq!(github_graphql_endpoint("github.com"), "https://api.github.com/graphql");
+        assert_eq!(github_graphql_endpoint("github.vitesco.io"), "https://github.vitesco.io/api/graphql");
+        assert_eq!(parse_gh_repo_arg("github.vitesco.io/eng/sw-prj-VWAQ4_000U0"), Some(GitHubRepo {
+            host: "github.vitesco.io".into(), owner: "eng".into(), repo: "sw-prj-VWAQ4_000U0".into(),
+        }));
+        assert_eq!(parse_gh_repo_arg("github.vitesco.io/eng/group/repo"), None);
+    }
+
+    #[test]
+    fn git_credential_parser_extracts_only_the_password_field() {
+        let output = b"protocol=https\nhost=github.vitesco.io\nusername=employee\npassword=secret-token\n";
+        assert_eq!(parse_git_credential_password(output).as_deref(), Some("secret-token"));
+        assert_eq!(parse_git_credential_password(b"username=employee\n"), None);
+    }
+
+    #[test]
+    fn graphql_pr_response_normalizes_to_the_existing_rich_pr_card_shape() {
+        let graphql = serde_json::json!({
+            "number": 282,
+            "title": "Implementation of LAH",
+            "headRefName": "feature/lah",
+            "headRepository": { "name": "sw-prj-VWAQ4_000U0" },
+            "headRepositoryOwner": { "login": "eng" },
+            "baseRefName": "main",
+            "state": "OPEN",
+            "isDraft": false,
+            "mergeable": "MERGEABLE",
+            "reviewDecision": "APPROVED",
+            "url": "https://github.vitesco.io/eng/sw-prj-VWAQ4_000U0/pull/282",
+            "commits": { "nodes": [{ "commit": { "statusCheckRollup": { "state": "SUCCESS" } } }] }
+        });
+        let normalized = normalize_graphql_pr(&graphql);
+        let summary = pr_summary_from_json(&normalized);
+        assert_eq!(summary.number, 282);
+        assert_eq!(summary.source_branch, "feature/lah");
+        assert_eq!(summary.target_branch, "main");
+        assert_eq!(summary.mergeable, "mergeable");
+        assert_eq!(summary.review_summary, "approved");
+        assert_eq!(summary.checks_status, "passing");
+        assert_eq!(summary.url, "https://github.vitesco.io/eng/sw-prj-VWAQ4_000U0/pull/282");
     }
 
     #[test]
@@ -7820,7 +8129,7 @@ mod tests {
     }
 
     #[test]
-    fn pr_status_impl_auth_failure_on_enterprise_points_at_gh_auth_login_hostname() {
+    fn pr_status_impl_auth_failure_on_enterprise_explains_both_supported_credentials() {
         let (base, path) = pr_repo("impl-auth");
         run_git(&base, &["remote", "add", "origin", "git@github.vitesco.io:eng/demo.git"]);
         run_git(&base, &["checkout", "-q", "-b", "feat"]);
@@ -7829,7 +8138,9 @@ mod tests {
         let run = |_: &PrGhQuery| GhOutcome::Failure { stderr: "You are not logged into any GitHub hosts. Run gh auth login".into() };
         let result = pr_status_impl(ctx, &path, "parent", &run);
         assert_eq!(result.state, "auth_missing");
-        assert!(result.detail.contains("gh auth login --hostname github.vitesco.io"), "detail was: {}", result.detail);
+        assert!(result.detail.contains("github.vitesco.io"), "detail was: {}", result.detail);
+        assert!(result.detail.contains("Git Credential Manager"), "detail was: {}", result.detail);
+        assert!(result.detail.contains("optional GitHub CLI"), "detail was: {}", result.detail);
         drop(repo);
         fs::remove_dir_all(base).unwrap();
     }
@@ -9444,12 +9755,12 @@ mod tests {
 
         // The file must be correctly reported as modified — sourced from the
         // submodule's own status, not silently invisible to the parent.
-        let listing = load_directory(parent_string.clone(), added.clone(), None).unwrap();
+        let listing = load_directory_inner(parent_string.clone(), added.clone(), None).unwrap();
         let file_entry = listing.iter().find(|entry| entry.relative_path == file_path).expect("module.txt should be listed");
         assert_eq!(file_entry.status, "M", "a modified file inside a submodule must show its real status, not look permanently untracked");
         assert!(file_entry.tracked);
 
-        let details = entry_details(parent_string.clone(), file_path.clone()).unwrap();
+        let details = entry_details_inner(parent_string.clone(), file_path.clone()).unwrap();
         assert_eq!(details.status, "M");
 
         stage_files(parent_string.clone(), vec![file_path.clone()]).unwrap();
@@ -9484,7 +9795,7 @@ mod tests {
 
         fs::write(parent.join(&file_path), "print('hello')\n").unwrap();
 
-        let listing = load_directory(parent_string.clone(), added.clone(), None).unwrap();
+        let listing = load_directory_inner(parent_string.clone(), added.clone(), None).unwrap();
         let file_entry = listing.iter().find(|entry| entry.relative_path == file_path).expect("nou.py should be listed");
         assert_eq!(file_entry.status, "??", "a brand new file inside a submodule must show as untracked/new, not blank");
 
@@ -9498,7 +9809,7 @@ mod tests {
         }
 
         // Confirm it no longer shows as a pending change afterward.
-        let listing_after = load_directory(parent_string, added, None).unwrap();
+        let listing_after = load_directory_inner(parent_string, added, None).unwrap();
         let file_entry_after = listing_after.iter().find(|entry| entry.relative_path == file_path).expect("nou.py should still be listed");
         assert_eq!(file_entry_after.status, "", "nou.py should no longer show as changed right after being committed");
 
@@ -9773,30 +10084,30 @@ mod tests {
         let path = repository.to_string_lossy().into_owned();
 
         // Freshly pushed: nothing should be flagged.
-        let listing = load_directory(path.clone(), "src".into(), None).unwrap();
+        let listing = load_directory_inner(path.clone(), "src".into(), None).unwrap();
         assert!(!listing.iter().find(|e| e.name == "a.txt").unwrap().unpushed);
 
         // Commit a change but don't push it.
         fs::write(repository.join("src/a.txt"), "two").unwrap();
         commit_path(path.clone(), "src/a.txt".into(), "Update a.txt".into()).unwrap();
 
-        let listing = load_directory(path.clone(), "src".into(), None).unwrap();
+        let listing = load_directory_inner(path.clone(), "src".into(), None).unwrap();
         let entry = listing.iter().find(|e| e.name == "a.txt").unwrap();
         assert_eq!(entry.status, "", "the file is fully committed, so it must not show any working-tree status");
         assert!(entry.unpushed, "a committed-but-unpushed file must be flagged unpushed");
 
         // The containing folder should reflect it too.
-        let root_listing = load_directory(path.clone(), "".into(), None).unwrap();
+        let root_listing = load_directory_inner(path.clone(), "".into(), None).unwrap();
         let src_entry = root_listing.iter().find(|e| e.name == "src").unwrap();
         assert!(src_entry.unpushed, "a folder containing an unpushed file should be flagged too");
 
-        let details = entry_details(path.clone(), "src/a.txt".into()).unwrap();
+        let details = entry_details_inner(path.clone(), "src/a.txt".into()).unwrap();
         assert!(details.unpushed);
 
         // After pushing (through the app's own command, which invalidates the
         // cache — a plain external `git push` wouldn't know to), it must clear.
         sync_repository_inner(path.clone(), "push".into()).unwrap();
-        let after_push = load_directory(path, "src".into(), None).unwrap();
+        let after_push = load_directory_inner(path, "src".into(), None).unwrap();
         assert!(!after_push.iter().find(|e| e.name == "a.txt").unwrap().unpushed, "after push, the file must no longer be flagged unpushed");
 
         fs::remove_dir_all(repository).unwrap();
@@ -9828,12 +10139,12 @@ mod tests {
         run_git(&repository, &["-c", "protocol.file.allow=always", "push", "-u", "release", "work:main"]);
         let path = repository.to_string_lossy().into_owned();
 
-        let listing = load_directory(path.clone(), "".into(), None).unwrap();
+        let listing = load_directory_inner(path.clone(), "".into(), None).unwrap();
         assert!(!listing.iter().find(|e| e.name == "a.txt").unwrap().unpushed, "freshly pushed to release/main — nothing should be flagged");
 
         fs::write(repository.join("a.txt"), "two").unwrap();
         commit_path(path.clone(), "a.txt".into(), "Update a.txt".into()).unwrap();
-        let listing = load_directory(path.clone(), "".into(), None).unwrap();
+        let listing = load_directory_inner(path.clone(), "".into(), None).unwrap();
         assert!(listing.iter().find(|e| e.name == "a.txt").unwrap().unpushed, "a commit not yet on release/main must be flagged unpushed, found via the branch's real upstream");
 
         fs::remove_dir_all(repository).unwrap();
@@ -10103,11 +10414,11 @@ mod tests {
         let dep_change = changes.iter().find(|change| change.path == "vendor/dep").expect("load_repository must still list the submodule as a pending (now staged) change: {:?}");
         assert!(dep_change.staged, "the gitlink should be staged after a successful push: {:?}", changes.iter().map(|c| (&c.path, &c.status, c.staged)).collect::<Vec<_>>());
 
-        let entries = load_directory(repo_path.clone(), "vendor".into(), None).unwrap();
+        let entries = load_directory_inner(repo_path.clone(), "vendor".into(), None).unwrap();
         let dep_entry = entries.iter().find(|entry| entry.relative_path == "vendor/dep").expect("submodule entry should be listed");
         assert_eq!(dep_entry.status, "M", "load_directory should still report a status for the staged-but-uncommitted submodule: {:?}", dep_entry.status);
 
-        let details = entry_details(repo_path, "vendor/dep".into()).unwrap();
+        let details = entry_details_inner(repo_path, "vendor/dep".into()).unwrap();
         assert_eq!(details.status, "M", "entry_details should still report a status for the staged-but-uncommitted submodule: {:?}", details.status);
 
         fs::remove_dir_all(base).unwrap();
@@ -10516,7 +10827,7 @@ mod tests {
         run_git(&sub_path, &["config", "user.name", "Test User"]);
 
         // First listing: freshly in sync, nothing unpushed — also seeds the cache.
-        let listing = load_directory(repo_path.clone(), "vendor".into(), None).unwrap();
+        let listing = load_directory_inner(repo_path.clone(), "vendor".into(), None).unwrap();
         let entry = listing.iter().find(|e| e.name == "dep").unwrap();
         assert!(!entry.submodule_has_unpushed_commits, "freshly synced submodule should not be flagged");
 
@@ -10525,12 +10836,12 @@ mod tests {
         run_git(&sub_path, &["commit", "-am", "Local only, not pushed"]);
 
         // Without force, the cache seeded above is still fresh (TTL is 300s) and unaware of it.
-        let stale = load_directory(repo_path.clone(), "vendor".into(), None).unwrap();
+        let stale = load_directory_inner(repo_path.clone(), "vendor".into(), None).unwrap();
         let stale_entry = stale.iter().find(|e| e.name == "dep").unwrap();
         assert!(!stale_entry.submodule_has_unpushed_commits, "sanity check: without force, the cached (clean) submodule-unpushed set must still be reused, proving load_directory didn't rescan on its own");
 
         // A forced reload (Reload folder) must invalidate and see the real, current state.
-        let forced = load_directory(repo_path, "vendor".into(), Some(true)).unwrap();
+        let forced = load_directory_inner(repo_path, "vendor".into(), Some(true)).unwrap();
         let forced_entry = forced.iter().find(|e| e.name == "dep").unwrap();
         assert!(forced_entry.submodule_has_unpushed_commits, "force:true must invalidate the cache and report the real, current unpushed commit");
 
@@ -10576,7 +10887,7 @@ mod tests {
         run_git(&sub_path, &["config", "user.name", "Test User"]);
 
         // State 1: freshly synced, nothing to report anywhere.
-        let clean = load_directory(repo_path.clone(), "vendor".into(), Some(true)).unwrap();
+        let clean = load_directory_inner(repo_path.clone(), "vendor".into(), Some(true)).unwrap();
         let clean_entry = clean.iter().find(|e| e.name == "dep").unwrap();
         assert_eq!(clean_entry.status, "");
         assert_eq!(clean_entry.submodule_state, "synced");
@@ -10585,19 +10896,19 @@ mod tests {
 
         // State 2: genuinely dirty content inside the submodule, HEAD unchanged.
         fs::write(sub_path.join("module.txt"), "uncommitted edit").unwrap();
-        let dirty = load_directory(repo_path.clone(), "vendor".into(), Some(true)).unwrap();
+        let dirty = load_directory_inner(repo_path.clone(), "vendor".into(), Some(true)).unwrap();
         let dirty_entry = dirty.iter().find(|e| e.name == "dep").unwrap();
         assert_eq!(dirty_entry.status, "M");
         assert_eq!(dirty_entry.submodule_state, "changes_inside");
         assert!(dirty_entry.submodule_is_dirty, "an uncommitted edit inside the submodule, with its own HEAD unchanged, must be flagged dirty");
-        let dirty_details = entry_details(repo_path.clone(), "vendor/dep".into()).unwrap();
+        let dirty_details = entry_details_inner(repo_path.clone(), "vendor/dep".into()).unwrap();
         assert!(dirty_details.submodule_is_dirty, "entry_details must agree with load_directory");
         run_git(&sub_path, &["checkout", "--", "module.txt"]); // back to clean
 
         // State 3: a new commit, deliberately NOT pushed yet.
         fs::write(sub_path.join("module.txt"), "v2").unwrap();
         commit_submodule_inner(repo_path.clone(), "vendor/dep".into(), "Update module".into(), false).unwrap();
-        let unpushed = load_directory(repo_path.clone(), "vendor".into(), Some(true)).unwrap();
+        let unpushed = load_directory_inner(repo_path.clone(), "vendor".into(), Some(true)).unwrap();
         let unpushed_entry = unpushed.iter().find(|e| e.name == "dep").unwrap();
         assert_eq!(unpushed_entry.status, "M");
         assert_eq!(unpushed_entry.submodule_state, "local_commit_push_needed");
@@ -10607,7 +10918,7 @@ mod tests {
         // State 4: pushed to origin, but not staged in the project yet.
         run_git(&sub_path, &["push", "-u", "origin", "HEAD:main"]);
         invalidate_submodule_sync(&repo_path);
-        let pushed = load_directory(repo_path.clone(), "vendor".into(), Some(true)).unwrap();
+        let pushed = load_directory_inner(repo_path.clone(), "vendor".into(), Some(true)).unwrap();
         let pushed_entry = pushed.iter().find(|e| e.name == "dep").unwrap();
         assert_eq!(pushed_entry.status, "M");
         assert_eq!(pushed_entry.submodule_state, "on_origin_stage_project");
@@ -10616,10 +10927,10 @@ mod tests {
 
         // State 5: the pushed gitlink is staged, but not committed in parent.
         stage_files_inner(&repo_path, vec!["vendor/dep".into()]).unwrap();
-        let staged = load_directory(repo_path.clone(), "vendor".into(), Some(true)).unwrap();
+        let staged = load_directory_inner(repo_path.clone(), "vendor".into(), Some(true)).unwrap();
         let staged_entry = staged.iter().find(|e| e.name == "dep").unwrap();
         assert_eq!(staged_entry.submodule_state, "on_origin_commit_project");
-        let pushed_details = entry_details(repo_path.clone(), "vendor/dep".into()).unwrap();
+        let pushed_details = entry_details_inner(repo_path.clone(), "vendor/dep".into()).unwrap();
         assert!(!pushed_details.submodule_is_dirty);
         assert_eq!(pushed_details.submodule_state, "on_origin_commit_project");
         assert!(pushed_details.submodule_push_status.is_none(), "submodule_push_status must be None once pushed — this is exactly what the frontend used to (wrongly) rely on alone to decide 'New version'");
@@ -10639,7 +10950,7 @@ mod tests {
         run_git(&sub_path, &["checkout", "--detach"]);
         fs::write(sub_path.join("module.txt"), "v3-local-detached").unwrap();
         run_git(&sub_path, &["commit", "-am", "Detached local work"]);
-        let detached = load_directory(repo_path, "vendor".into(), Some(true)).unwrap();
+        let detached = load_directory_inner(repo_path, "vendor".into(), Some(true)).unwrap();
         let detached_entry = detached.iter().find(|e| e.name == "dep").unwrap();
         assert_eq!(detached_entry.submodule_state, "detached_choose_branch");
 
@@ -10679,7 +10990,7 @@ mod tests {
         fs::write(group_a[0].join("module.txt"), "dirty").unwrap();
 
         // Only groupA is ever listed.
-        let listing = load_directory(repo_path, "groupA".into(), Some(true)).unwrap();
+        let listing = load_directory_inner(repo_path, "groupA".into(), Some(true)).unwrap();
         assert_eq!(listing.iter().filter(|e| e.kind == "submodule").count(), 2);
 
         // Filtered to this test's own repository prefix — the cache is a
@@ -10799,12 +11110,14 @@ mod tests {
         // fixed host, never the shape `gh pr list --json url` actually returns.
         assert!(is_generated_pull_request_url("https://github.com/AndreiRomanC/git-stress-small-demo/pull/1"));
         assert!(is_generated_pull_request_url("https://github.example/eng/sw-prj-OMBMS_000U0/pull/42"), "an enterprise GitHub host must work too, not just github.com");
+        assert!(is_generated_pull_request_url("https://github.vitesco.io/eng/sw-prj-VWAQ4_000U0/pulls"), "the generated signed-in-browser fallback must be accepted too");
 
         // Wrong scheme, wrong shape, or an attempt to smuggle a different
         // destination or extra shell arguments must all be rejected — this
         // reaches a shell command exactly like the Polarion link does.
         assert!(!is_generated_pull_request_url("http://github.com/owner/repo/pull/1"), "must require https");
         assert!(!is_generated_pull_request_url("https://github.com/owner/repo/pulls/1"), "must be the singular /pull/ path GitHub actually uses");
+        assert!(!is_generated_pull_request_url("https://github.com/owner/repo/pulls?q=is%3Aopen"), "the fallback is an exact generated path, never an arbitrary query string");
         assert!(!is_generated_pull_request_url("https://github.com/owner/repo/pull/"), "PR number must not be empty");
         assert!(!is_generated_pull_request_url("https://github.com/owner/repo/pull/1x"), "PR number must be all digits");
         assert!(!is_generated_pull_request_url("https://github.com/owner/repo/pull/1/files"), "no trailing path beyond the PR number");
@@ -11168,7 +11481,7 @@ mod tests {
         let mut total = Duration::ZERO;
         for folder in 0..20 {
             let started = Instant::now();
-            let entries = load_directory(repo_string.clone(), format!("folder_{folder}"), None).unwrap();
+            let entries = load_directory_inner(repo_string.clone(), format!("folder_{folder}"), None).unwrap();
             total += started.elapsed();
             assert_eq!(entries.len(), 10, "folder_{folder} should list exactly the 10 real files created in it");
         }
@@ -11212,13 +11525,13 @@ mod tests {
         let repo_string = repo_path.to_string_lossy().into_owned();
 
         let first = Instant::now();
-        let entries = load_directory(repo_string.clone(), "big_folder".into(), None).unwrap();
+        let entries = load_directory_inner(repo_string.clone(), "big_folder".into(), None).unwrap();
         println!("PERF load_directory first call (cold caches): {:?}", first.elapsed());
         assert_eq!(entries.len(), 20_000);
         assert!(entries.iter().all(|entry| entry.kind == "file" && entry.tracked));
 
         let second = Instant::now();
-        let entries = load_directory(repo_string.clone(), "big_folder".into(), None).unwrap();
+        let entries = load_directory_inner(repo_string.clone(), "big_folder".into(), None).unwrap();
         println!("PERF load_directory second call (warm caches): {:?}", second.elapsed());
         assert_eq!(entries.len(), 20_000);
 
@@ -11229,7 +11542,7 @@ mod tests {
             entry.0 = Instant::now() - GIT_METADATA_TTL - Duration::from_secs(1);
         }
         let third = Instant::now();
-        let entries = load_directory(repo_string.clone(), "big_folder".into(), None).unwrap();
+        let entries = load_directory_inner(repo_string.clone(), "big_folder".into(), None).unwrap();
         println!("PERF load_directory third call (expired status cache, fresh scoped scan): {:?}", third.elapsed());
         assert_eq!(entries.len(), 20_000);
     }
@@ -11486,7 +11799,7 @@ mod tests {
         fs::write(repo_path.join("folder/new_file.txt"), "content").unwrap();
         let repo_string = repo_path.to_string_lossy().into_owned();
 
-        let entries = load_directory(repo_string.clone(), "folder".into(), None).unwrap();
+        let entries = load_directory_inner(repo_string.clone(), "folder".into(), None).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].status, "??", "a brand-new file must show as untracked even though nothing has loaded this repository before");
         assert!(!entries[0].tracked);
@@ -11572,7 +11885,7 @@ mod tests {
         let fast_started = Instant::now();
         let fast = open_repository_fast_inner(parent_string.clone()).unwrap();
         let fast_list_started = Instant::now();
-        let root_entries = list_directory_fast(fast.repository.path.clone(), String::new()).unwrap();
+        let root_entries = list_directory_fast_inner(fast.repository.path.clone(), String::new()).unwrap();
         let fast_total = fast_started.elapsed();
         println!("PERF open_repository_fast + list_directory_fast (root): {fast_total:?} ({} entries)", root_entries.len());
         assert!(root_entries.iter().all(|entry| !entry.status_known), "list_directory_fast entries must be marked status-unknown, never clean/untracked");
@@ -11591,7 +11904,7 @@ mod tests {
         // if it reused the cache, this stays fast; a real second scan on
         // 5000 files/30 submodules would be measurably slower.
         let reload_started = Instant::now();
-        let real_entries = load_directory(fast.repository.path.clone(), String::new(), None).unwrap();
+        let real_entries = load_directory_inner(fast.repository.path.clone(), String::new(), None).unwrap();
         let reload_elapsed = reload_started.elapsed();
         println!("PERF load_directory (root, reusing refresh_status's scan): {reload_elapsed:?} ({} entries)", real_entries.len());
         assert!(real_entries.iter().all(|entry| entry.status_known), "the real load_directory must always report status_known");
