@@ -39,7 +39,7 @@
     <main class="main-layout">
       <aside class="sidebar">
         <button class="nav-item active" id="navExplorer"><span class="nav-icon">▰</span><span>Project Explorer</span></button>
-        <button class="nav-item" id="navCommander"><span class="nav-icon">⇄</span><span>Compare</span></button>
+        <button class="nav-item" id="navCommander"><span class="nav-icon">⇄</span><span>Folder Sync</span></button>
         <button class="nav-item" id="navGraph"><span class="nav-icon">⑂</span><span>Branch Map</span></button>
         <button class="nav-item" id="navRemotes"><span class="nav-icon">◎</span><span>Remotes</span></button>
 
@@ -110,7 +110,7 @@
         </div>
 
         <div id="commanderView" class="commander-view" hidden>
-          <div class="compare-mode-tabs" role="tablist" aria-label="Compare mode">
+          <div class="compare-mode-tabs" role="tablist" aria-label="Folder Sync mode">
             <button id="compareModeGit" class="active" type="button" role="tab">Git Compare</button>
             <button id="compareModeDrive" type="button" role="tab">Local Drive</button>
           </div>
@@ -518,7 +518,7 @@
           <p>Shows local commits not yet on the server, for the main project only (not submodules — use "Push submodule" for those). Every commit listed here is checked by default; unchecking one also unchecks everything newer than it (Git can only push a continuous range, so that's the only valid way to "leave some out"). Click "Publish branch" to send what's checked.</p>
         </details>
         <details>
-          <summary>Compare</summary>
+          <summary>Folder Sync</summary>
           <p><b>Git Compare</b> compares your working copy against a chosen remote snapshot without checking anything out. <b>Local Drive</b> is a separate two-pane local file workspace for safe copying, creating folders, and moving items to Trash/Recycle Bin.</p>
         </details>
         <details>

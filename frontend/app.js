@@ -552,7 +552,7 @@ function render() {
   // History · <name>" (the submodule's own Branch Map) — the whole point
   // of Message C's point 1 is that a user must never be unsure which of
   // these three they're looking at.
-  refs.viewTitle.textContent = state.view === 'explorer' ? 'Project Explorer' : state.view === 'commander' ? 'Compare' : state.view === 'remotes' ? 'Remotes' : state.submoduleGraph ? `Submodule History · ${state.submoduleGraph.relativePath}` : state.historyKind === 'submodule-refs' ? `Submodule Reference Changes · ${state.historyScope}` : state.historyScope ? `History · ${state.historyScope}` : 'Repository History';
+  refs.viewTitle.textContent = state.view === 'explorer' ? 'Project Explorer' : state.view === 'commander' ? 'Folder Sync' : state.view === 'remotes' ? 'Remotes' : state.submoduleGraph ? `Submodule History · ${state.submoduleGraph.relativePath}` : state.historyKind === 'submodule-refs' ? `Submodule Reference Changes · ${state.historyScope}` : state.historyScope ? `History · ${state.historyScope}` : 'Repository History';
   refs.graphSubtitle.textContent = !loaded ? 'Navigate folders and inspect every item in your repository.' : state.view === 'explorer' ? `${state.entries.length} items in ${state.currentPath || state.repository.name}` : state.view === 'commander' ? (state.compareMode === 'local-drive' ? 'Two independent local folders. Copy safely without overwriting; delete through Trash/Recycle Bin.' : 'Compare the workspace with a cached remote snapshot—no second checkout.') : state.view === 'remotes' ? 'Configured server locations and explicit fetch controls.' : state.historyKind === 'submodule-refs' ? `Parent-repository commits that changed this submodule's recorded version — not ${state.historyScope}'s own history` : state.historyScope ? `Commits touching ${state.historyScope}` : state.submoduleGraph ? 'Commits, branches and release tags for this submodule' : 'Commits, branches and release tags';
   refs.search.placeholder = state.view === 'explorer' ? 'Filter this folder' : state.view === 'commander' ? (state.compareMode === 'local-drive' ? 'Filter both local folders' : 'Filter comparison') : 'Find commit or author';
   refs.search.closest('label').hidden = state.view === 'remotes';
@@ -2057,7 +2057,7 @@ async function openSubmoduleGraph(entry) {
 function leaveSubmoduleGraph() { if (!state.submoduleGraph) return; state.submoduleGraph = null; state.view = 'explorer'; render(); openDirectory(state.currentPath, { force: true }); }
 
 // Any navigation away from the graph view that ISN'T the explicit "Back to
-// parent repository" button above — Project Explorer, Compare,
+// parent repository" button above — Project Explorer, Folder Sync,
 // Remotes, or opening a different repository entirely — must still safely
 // close the submodule context so it can never be silently combined with
 // whatever's navigated to next (a stale "Back to parent" later restoring a
@@ -3859,7 +3859,7 @@ function currentConsoleContext() {
   // "Submodule Branch Map" console context, exactly the kind of mix-up this
   // whole area is about not letting happen.
   if (state.view === 'graph') { const g = activeGraphData(); return state.submoduleGraph ? { label: `Submodule Branch Map · ${state.submoduleGraph.name} · ${g.headDetached ? 'detached' : (g.currentBranch || 'detached')}`, tags: ['graph', 'submodule'] } : { label: `Branch Map · ${g.headDetached ? 'detached' : (g.currentBranch || 'detached')}`, tags: ['graph'] }; }
-  if (state.view === 'commander') return { label: state.compareMode === 'local-drive' ? 'Compare · Local Drive' : 'Compare · Git', tags: ['commander'] };
+  if (state.view === 'commander') return { label: state.compareMode === 'local-drive' ? 'Folder Sync · Local Drive' : 'Folder Sync · Git', tags: ['commander'] };
   return { label: `${state.currentPath || state.repository.name} · branch ${state.repository.current_branch || 'detached'}`, tags: ['explorer'] };
 }
 
@@ -3879,7 +3879,7 @@ function buildCommands() {
     { id: 'conflicts', name: 'Resolve Merge Conflicts', description: 'Open the conflict resolution dialog for a merge in progress', keys: '', keywords: 'merge conflict resolve', tags: state.pendingMainConflicts?.length ? ['explorer', 'graph', 'relevant'] : [], fn: () => openConflictsDialog(mergeTargetForMain(), state.pendingMainConflicts || []) },
     { id: 'search', name: 'Search Repository', description: 'Filter the current view by name, author or commit id', keys: 'Ctrl+F', tags: ['explorer', 'graph', 'commander'], fn: () => refs.search.focus() },
     { id: 'explorer', name: 'Go to Project Explorer', description: 'Browse files, folders and submodules', keys: '', keywords: 'files browse', tags: [], fn: () => $('#navExplorer').click() },
-    { id: 'commander', name: 'Go to Compare', description: 'Compare Git snapshots or work between two local folders', keys: 'Ctrl+Shift+L', keywords: 'diff compare local drive remote', tags: [], fn: () => $('#navCommander').click() },
+    { id: 'commander', name: 'Go to Folder Sync', description: 'Compare Git snapshots or work between two local folders', keys: 'Ctrl+Shift+L', keywords: 'diff compare folder sync local drive remote', tags: [], fn: () => $('#navCommander').click() },
     { id: 'graph', name: 'Go to Branch Map', description: 'See commit history and branches as a graph', keys: 'Ctrl+Shift+G', keywords: 'log history commits', tags: [], fn: () => $('#navGraph').click() },
     { id: 'remotes', name: 'Go to Remotes', description: 'View and fetch configured server locations', keys: '', tags: [], fn: () => $('#navRemotes').click() },
     { id: 'refresh', name: 'Refresh Repository', description: 'Re-read branches, commits and status from disk (e.g. after external Git commands)', keys: '', keywords: 'reload', tags: [], fn: () => $('#refresh').click() },
