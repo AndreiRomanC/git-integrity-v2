@@ -33,6 +33,11 @@ const descriptions = {
   'src-tauri/src/lib.rs': ['Tauri composition root', 'Registers the commands that JavaScript is allowed to invoke.'],
   'src-tauri/src/main.rs': ['Native entry point', 'Starts the desktop process and hands control to the Tauri composition root.'],
   'src-tauri/src/repository.rs': ['Repository backend', 'Implements repository reads, mutations, caching, submodules and external Git integrations.'],
+  'src-tauri/src/repository/stash.rs': ['Stash operations', 'Owns repository-scoped stash creation, inspection, restore, pop and drop behavior.'],
+  'src-tauri/src/repository/branches.rs': ['Branch operations', 'Owns branch creation, checkout, rename, deletion and DAG divergence information.'],
+  'src-tauri/src/repository/branches/merge.rs': ['Merge and conflict operations', 'Owns safe merge analysis, conflict resolution, completion and abort behavior.'],
+  'src-tauri/src/repository/command_console.rs': ['Command console adapter', 'Runs Git-only and shell commands in an explicit repository or directory scope.'],
+  'src-tauri/src/repository/remotes.rs': ['Remote synchronization', 'Owns remote discovery, fetch, fast-forward pull and push synchronization.'],
   'src-tauri/build.rs': ['Build identity generator', 'Captures build metadata used to identify the packaged application.'],
   'src-tauri/Cargo.toml': ['Native dependency manifest', 'Defines the Rust package, Tauri features and native dependencies.'],
   'src-tauri/tauri.conf.json': ['Desktop packaging configuration', 'Defines the desktop bundle, window and frontend asset settings.'],
@@ -45,6 +50,14 @@ const descriptions = {
 };
 
 function owningEntity(path, symbol = '', line = 0) {
+  const repositoryModuleOwners = {
+    'src-tauri/src/repository/stash.rs': 'stash',
+    'src-tauri/src/repository/branches.rs': 'branch-merge',
+    'src-tauri/src/repository/branches/merge.rs': 'branch-merge',
+    'src-tauri/src/repository/command_console.rs': 'process-runner',
+    'src-tauri/src/repository/remotes.rs': 'remote-sync'
+  };
+  if (repositoryModuleOwners[path]) return repositoryModuleOwners[path];
   const pathCandidates = model.entities.filter(item => (item.source || []).some(source => {
     const sourcePath = normalize(source.path || '');
     return sourcePath === path || (sourcePath && !sourcePath.includes('.') && path.startsWith(`${sourcePath}/`));
@@ -222,7 +235,7 @@ for (const fn of functionRecords) {
 }
 
 function importance(path) {
-  if (['frontend/app.js', 'src-tauri/src/repository.rs', 'src-tauri/src/lib.rs', 'frontend/graph-model.js'].includes(path)) return 'CORE';
+  if (['frontend/app.js', 'src-tauri/src/repository.rs', 'src-tauri/src/lib.rs', 'frontend/graph-model.js'].includes(path) || path.startsWith('src-tauri/src/repository/')) return 'CORE';
   if (/^(frontend\/(index\.html|styles\.css|console-context\.js)|src-tauri\/(Cargo\.toml|tauri\.conf\.json|build\.rs)|tests\/)/.test(path)) return 'SUPPORTING';
   return 'UTILITY';
 }
@@ -233,6 +246,7 @@ function fileOwner(path) {
   if (path === 'frontend/styles.css') return 'presentation-style';
   if (path === 'frontend/graph-model.js') return 'graph-model';
   if (path === 'src-tauri/src/repository.rs') return 'repository-module';
+  if (path.startsWith('src-tauri/src/repository/')) return owningEntity(path);
   if (path === 'src-tauri/src/lib.rs' || path === 'src-tauri/src/main.rs') return 'tauri-boundary';
   if (path.startsWith('tests/')) return 'tests';
   if (path.startsWith('src-tauri/')) return 'delivery';
@@ -245,6 +259,7 @@ function dependencies(path) {
   if (path === 'frontend/index.html') deps.push('frontend/styles.css', 'frontend/graph-model.js', 'frontend/console-context.js', 'frontend/app.js');
   if (path === 'src-tauri/src/lib.rs') deps.push('src-tauri/src/repository.rs', 'Tauri runtime');
   if (path === 'src-tauri/src/repository.rs') deps.push('git2/libgit2', 'system Git', 'filesystem', 'Tauri runtime');
+  if (path.startsWith('src-tauri/src/repository/')) deps.push('src-tauri/src/repository.rs', 'git2/libgit2', 'Tauri runtime');
   if (path.startsWith('tests/graph-model')) deps.push('frontend/graph-model.js');
   if (path.startsWith('tests/console-context')) deps.push('frontend/console-context.js');
   return deps;

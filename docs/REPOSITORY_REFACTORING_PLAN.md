@@ -1,6 +1,9 @@
 # Repository backend modularization plan
 
-Status: **Deferred until the current functional changes are stabilized**
+Status: **Phase 1 complete on `codex/repository-modularization`**
+
+Stable rollback point: annotated tag `v1-stable` at commit `1854405`.
+The tag is published on `origin`; `origin/main` was not moved by this work.
 
 ## Goal
 
@@ -38,32 +41,41 @@ Do not begin this refactor until all of the following are true:
   extraction.
 - Stop and revert the current extraction if tests or observable behavior change.
 
-## Proposed structure
+## Current structure
 
 ```text
-src-tauri/src/repository/
-  mod.rs          # stable public surface and Tauri command exports
-  core.rs         # repository opening, context resolution and shared helpers
-  cache.rs        # shared caches and invalidation
-  locks.rs        # per-repository operation coordination
-  stash.rs        # stash list/create/apply/pop/drop operations
-  branches.rs     # branch checkout, merge, reset and tracking information
-  remote.rs       # fetch, pull, push and upstream resolution
-  submodules.rs   # submodule status, versions, switch, commit and publish flows
-  status.rs       # working-tree/status discovery and related aggregation
+src-tauri/src/
+  repository.rs                    # shared repository core, status/navigation,
+                                   # submodules, PR and publish flows
+  repository/
+    stash.rs                        # stash list/create/restore/pop/drop
+    branches.rs                     # branch CRUD, checkout and divergence
+    branches/merge.rs               # merge and conflict workflow
+    command_console.rs              # scoped Git and shell execution
+    remotes.rs                      # list/fetch/pull/push synchronization
 ```
 
-The final boundaries may be adjusted if the existing dependencies show that a
-helper belongs in `core`, but feature modules must not build separate copies of
-shared state.
+Shared locks, caches, repository opening, path validation and cache invalidation
+remain deliberately centralized in `repository.rs`. Feature modules import that
+infrastructure instead of creating parallel state or subtly different rules.
+
+Phase 2 may extract `submodules`, Pull Requests/publishing, and status/navigation,
+but only in that order and only with focused tests around every boundary. Moving
+`repository.rs` mechanically to `repository/mod.rs` is intentionally deferred:
+it would add a large rename without improving behavior or ownership.
 
 ## Recommended extraction order
 
-1. `stash.rs` — relatively isolated and already covered by focused safety tests.
-2. `branches.rs` — preserve checkout ordering and rollback guarantees exactly.
-3. `remote.rs` — centralize upstream resolution and use it for preview and action.
-4. `submodules.rs` — only after parent/submodule context tests are comprehensive.
-5. `status.rs` — last, because status data affects much of the UI and performance.
+1. ✅ `stash.rs` — extracted with focused stash tests.
+2. ✅ `branches.rs` and `branches/merge.rs` — extracted with checkout, DAG,
+   merge, conflict and abort tests.
+3. ✅ `command_console.rs` — extracted with explicit folder/submodule scope tests.
+4. ✅ `remotes.rs` — extracted with multi-remote fetch and upstream sync tests.
+5. ⏳ `submodules.rs` — next only after a separate stable checkpoint.
+6. ⏳ Pull Request and publish adapters — separate generic Git transport from
+   GitHub-specific provider behavior.
+7. ⏳ `status.rs` / `navigation.rs` — last because cache behavior is performance
+   critical and externally edited files must still be detected correctly.
 
 Extract `core.rs`, `cache.rs` and `locks.rs` only as their shared responsibilities
 become clear. Do not create speculative abstractions before moving the first
@@ -96,7 +108,8 @@ feature module.
 
 ## Completion criteria
 
-The refactor is complete only when `repository.rs` has become the stable module
-entry point, all existing behavior is preserved, the complete automated suites
-pass, the critical manual scenarios pass, and there is no measurable regression
-in repository loading, navigation, staging or submodule operations.
+Phase 1 is complete when all automated suites and a packaged macOS smoke test
+pass. The complete refactor remains incremental: it is finished only when the
+remaining high-value domains have safe boundaries, critical manual scenarios
+pass, and there is no measurable regression in repository loading, navigation,
+staging or submodule operations.
