@@ -1,5 +1,7 @@
 use super::*;
 
+pub mod merge;
+
 #[derive(Serialize)]
 pub struct BranchCreationContext {
     pub(super) current_branch: String,
