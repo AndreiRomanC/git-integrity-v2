@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="A progressive, source-traceable architecture guide for GitDrillDown.">
+  <title>GitDrillDown Architecture</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <a class="brand" href="#overview/system" aria-label="Return to Architecture Overview">
+        <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
+        <span><strong>GitDrillDown</strong><small>Architecture guide</small></span>
+      </a>
+      <div class="mode-switch" role="group" aria-label="Reading mode">
+        <button id="overviewMode" class="active" type="button">Overview</button>
+        <button id="deepMode" type="button">Deep dive</button>
+      </div>
+      <label class="search-box">
+        <span aria-hidden="true">⌕</span>
+        <input id="globalSearch" type="search" placeholder="Find a component, file or function…" autocomplete="off">
+        <kbd>/</kbd>
+      </label>
+      <span id="analysisMeta" class="analysis-meta">Loading model…</span>
+    </header>
+
+    <aside class="sidebar">
+      <div class="side-group">
+        <span class="side-label">LEARN THE SYSTEM</span>
+        <nav id="learnNav" aria-label="Overview navigation"></nav>
+      </div>
+      <div class="side-group">
+        <span class="side-label">INVESTIGATE</span>
+        <nav id="deepNav" aria-label="Deep dive navigation"></nav>
+      </div>
+      <div class="side-group scope-group">
+        <span class="side-label">CURRENT SCOPE</span>
+        <nav id="scopeTree" class="scope-tree" aria-label="Architecture scope"></nav>
+      </div>
+      <button id="backToOverview" class="overview-return" type="button"><span>◇</span> Architecture Overview</button>
+      <div class="model-note"><i></i><span><strong>Source-backed</strong><small>One canonical JSON model</small></span></div>
+    </aside>
+
+    <main class="workspace">
+      <nav id="breadcrumbs" class="breadcrumbs" aria-label="Breadcrumb"></nav>
+      <section id="pageHeader" class="page-header"></section>
+      <section id="toolbar" class="toolbar"></section>
+      <section id="content" class="content" aria-live="polite"></section>
+    </main>
+
+    <aside id="inspector" class="inspector" aria-label="Selected element details">
+      <div class="inspector-empty">
+        <span>◇</span>
+        <strong>Details appear here</strong>
+        <p>Select a layer, component, file, function or flow step.</p>
+      </div>
+    </aside>
+  </div>
+
+  <dialog id="modelDialog" class="model-dialog">
+    <form method="dialog">
+      <span class="dialog-icon">{ }</span>
+      <h2>Load the architecture model</h2>
+      <p>The browser cannot load neighboring files automatically. Select <code>architecture.json</code>; nothing is uploaded.</p>
+      <label class="file-button">Choose architecture.json<input id="modelFile" type="file" accept="application/json,.json"></label>
+    </form>
+  </dialog>
+
+  <!-- Generated fallback keeps file:// opening useful; architecture.json is canonical. -->
+  <script src="architecture-data.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

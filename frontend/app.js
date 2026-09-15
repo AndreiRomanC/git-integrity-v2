@@ -74,7 +74,7 @@ function addRecentRepo(path, name) {
   renderRecentRepos();
 }
 
-const state = { repository: null, branches: [], commits: [], allCommits: [], changes: [], selectedCommit: null, view: 'explorer', currentPath: '', entries: [], selectedEntry: null, historyScope: '', historyKind: '', commanderPath: '', commanderRows: [], remoteRef: '', remotes: [], editingPath: '', editorOriginal: '', publish: null, changesScope: 'global', commanderFocus: '', comparingRow: null, hasStash: false, stashes: [], editingConflict: null, mergeTarget: null,
+const state = { repository: null, branches: [], commits: [], allCommits: [], changes: [], selectedCommit: null, view: 'explorer', currentPath: '', entries: [], selectedEntry: null, historyScope: '', historyKind: '', commanderPath: '', commanderRows: [], remoteRef: '', compareMode: 'git', remotes: [], editingPath: '', editorOriginal: '', publish: null, changesScope: 'global', commanderFocus: '', comparingRow: null, hasStash: false, stashes: [], editingConflict: null, mergeTarget: null,
   // Set only while viewing a submodule's Submodule Map — holds *its own*
   // repository/branches/commits/changes/stashes/primaryBranch entirely
   // separately from the fields above, which always stay the parent
@@ -101,7 +101,7 @@ const state = { repository: null, branches: [], commits: [], allCommits: [], cha
   // submodule" costs nothing extra on ordinary (non-submodule) folder
   // clicks. See submoduleBoundaryFor.
   submodule_paths: [],
-  statusReady: true, consoleCommandRunning: false, activeSubmodule: null };
+  statusReady: true, consoleCommandRunning: false, activeSubmodule: null, localDriveGitRefreshPending: false };
 const previewData = {
   repository: { name: 'vehicle-control', path: '/projects/vehicle-control', current_branch: 'feature/diagnostics' },
   branches: [
@@ -144,7 +144,7 @@ const refs = {
   breadcrumbs: $('#breadcrumbs'), viewTitle: $('#viewTitle'), goUp: $('#goUp'), reloadFolder: $('#reloadFolder'),
   submoduleMenu: $('#submoduleMenu'), submoduleVersions: $('#submoduleVersions'), submoduleMenuName: $('#submoduleMenuName'), currentSubmoduleVersion: $('#currentSubmoduleVersion'), submoduleVersionSearch: $('#submoduleVersionSearch'), submoduleOpenGraph: $('#submoduleOpenGraph'),
   commitScope: $('#commitScope'), showPathHistory: $('#showPathHistory'), commitScopeDialog: $('#commitScopeDialog'), commitScopeName: $('#commitScopeName'), scopeCommitMessage: $('#scopeCommitMessage'), confirmScopeCommit: $('#confirmScopeCommit'),
-  commanderView: $('#commanderView'), commanderRows: $('#commanderRows'), commanderBreadcrumbs: $('#commanderBreadcrumbs'), remoteRef: $('#remoteRef'), compareDialog: $('#compareDialog'), compareTitle: $('#compareTitle'), compareSubtitle: $('#compareSubtitle'), localCompare: $('#localCompare'), remoteCompare: $('#remoteCompare'),
+  commanderView: $('#commanderView'), commanderRows: $('#commanderRows'), commanderBreadcrumbs: $('#commanderBreadcrumbs'), remoteRef: $('#remoteRef'), gitComparePanel: $('#gitComparePanel'), localDrivePanel: $('#localDrivePanel'), compareModeGit: $('#compareModeGit'), compareModeDrive: $('#compareModeDrive'), compareDialog: $('#compareDialog'), compareTitle: $('#compareTitle'), compareSubtitle: $('#compareSubtitle'), localCompare: $('#localCompare'), remoteCompare: $('#remoteCompare'),
   remotesView: $('#remotesView'), remoteCards: $('#remoteCards'), editorDialog: $('#editorDialog'), editorTitle: $('#editorTitle'), editorPath: $('#editorPath'), editorContent: $('#editorContent'), locationRepository: $('#locationRepository'), locationBranch: $('#locationBranch'), locationPath: $('#locationPath'), leaveSubmoduleGraph: $('#leaveSubmoduleGraph'), publishDialog: $('#publishDialog'), publishBranch: $('#publishBranch'), publishRemote: $('#publishRemote'), publishCommits: $('#publishCommits'), publishSummary: $('#publishSummary'), publishDestination: $('#publishDestination'), publishBadge: $('#publishBadge'), publishSubtitle: $('#publishSubtitle'), cloneDialog: $('#cloneDialog'), cloneUrl: $('#cloneUrl'), cloneParent: $('#cloneParent'), cloneName: $('#cloneName'), confirmClone: $('#confirmClone'), submoduleDialog: $('#submoduleDialog'), submoduleUrl: $('#submoduleUrl'), submoduleParent: $('#submoduleParent'), submoduleName: $('#submoduleName'), submoduleUsername: $('#submoduleUsername'), submoduleToken: $('#submoduleToken'), submoduleAddStatus: $('#submoduleAddStatus'), confirmAddSubmodule: $('#confirmAddSubmodule'), operationToast: $('#operationToast'), drawerScopeTitle: $('#drawerScopeTitle'),
   mergeBranchDialog: $('#mergeBranchDialog'), mergeBranchSubtitle: $('#mergeBranchSubtitle'), mergeBranchCurrent: $('#mergeBranchCurrent'), mergeBranchSource: $('#mergeBranchSource'), mergeBranchStatus: $('#mergeBranchStatus'), confirmMergeBranch: $('#confirmMergeBranch'),
   stashesDialog: $('#stashesDialog'), stashesList: $('#stashesList'),
@@ -176,6 +176,37 @@ function commitSubjectHtml(subject = '') {
 }
 function status(message, kind = '') { refs.statusText.textContent = message; refs.statusDot.className = `status-dot ${kind}`; }
 let toastTimer; function showOperationToast(message, kind = '') { clearTimeout(toastTimer); refs.operationToast.textContent = message; refs.operationToast.className = `operation-toast ${kind}`; refs.operationToast.hidden = false; toastTimer = setTimeout(() => { refs.operationToast.hidden = true; }, 7000); }
+
+function localPathKey(path) {
+  const value = String(path || '').replace(/\\/g, '/').replace(/\/+$/, '');
+  return /^[A-Za-z]:\//.test(value) ? value.toLowerCase() : value;
+}
+
+function localPathIsInside(parent, candidate) {
+  const parentKey = localPathKey(parent);
+  const candidateKey = localPathKey(candidate);
+  return Boolean(parentKey) && (candidateKey === parentKey || candidateKey.startsWith(`${parentKey}/`));
+}
+
+async function refreshGitAfterLocalDriveMutation(paths) {
+  directoryCache.clear();
+  const repositoryPath = state.repository?.path;
+  if (!repositoryPath || !paths.some(path => localPathIsInside(repositoryPath, path))) return;
+  // Do not launch an expensive repository scan while the dual-pane workspace
+  // is being used: it made both panes flash and contend with navigation after
+  // every copy/delete/new-folder command. Project Explorer consumes this flag
+  // once, when the user returns to Git, and performs one consolidated refresh.
+  state.localDriveGitRefreshPending = true;
+}
+
+const localDriveWorkspace = globalThis.LocalDriveWorkspace?.create({
+  root: refs.localDrivePanel,
+  invoke,
+  notify: status,
+  confirm: (message, options) => customConfirm(message, options),
+  prompt: (message, defaultValue, options) => customPrompt(message, defaultValue, options),
+  onMutation: paths => refreshGitAfterLocalDriveMutation(paths).catch(error => handleError(error)),
+});
 
 function handleError(error) {
   const msg = String(error).toLowerCase();
@@ -243,6 +274,7 @@ function customPrompt(message, defaultValue = '', options = {}) {
     $('#appPromptMessage').textContent = message;
     const input = $('#appPromptInput'); input.value = defaultValue;
     const okButton = $('#appPromptOk'); const cancelButton = $('#appPromptCancel');
+    okButton.textContent = options.okLabel || 'OK';
     const cleanup = (result) => { dialog.close(); okButton.removeEventListener('click', onOk); cancelButton.removeEventListener('click', onCancel); input.removeEventListener('keydown', onKeydown); dialog.removeEventListener('cancel', onCancel); resolve(result); };
     const onOk = () => cleanup(input.value);
     const onCancel = () => cleanup(null);
@@ -520,11 +552,13 @@ function render() {
   // History · <name>" (the submodule's own Branch Map) — the whole point
   // of Message C's point 1 is that a user must never be unsure which of
   // these three they're looking at.
-  refs.viewTitle.textContent = state.view === 'explorer' ? 'Project Explorer' : state.view === 'commander' ? 'Local ↔ Remote' : state.view === 'remotes' ? 'Remotes' : state.submoduleGraph ? `Submodule History · ${state.submoduleGraph.relativePath}` : state.historyKind === 'submodule-refs' ? `Submodule Reference Changes · ${state.historyScope}` : state.historyScope ? `History · ${state.historyScope}` : 'Repository History';
-  refs.graphSubtitle.textContent = !loaded ? 'Navigate folders and inspect every item in your repository.' : state.view === 'explorer' ? `${state.entries.length} items in ${state.currentPath || state.repository.name}` : state.view === 'commander' ? 'Compare the workspace with a cached remote snapshot—no second checkout.' : state.view === 'remotes' ? 'Configured server locations and explicit fetch controls.' : state.historyKind === 'submodule-refs' ? `Parent-repository commits that changed this submodule's recorded version — not ${state.historyScope}'s own history` : state.historyScope ? `Commits touching ${state.historyScope}` : state.submoduleGraph ? 'Commits, branches and release tags for this submodule' : 'Commits, branches and release tags';
-  refs.search.placeholder = state.view === 'explorer' ? 'Filter this folder' : state.view === 'commander' ? 'Filter comparison' : 'Find commit or author';
+  refs.viewTitle.textContent = state.view === 'explorer' ? 'Project Explorer' : state.view === 'commander' ? 'Compare' : state.view === 'remotes' ? 'Remotes' : state.submoduleGraph ? `Submodule History · ${state.submoduleGraph.relativePath}` : state.historyKind === 'submodule-refs' ? `Submodule Reference Changes · ${state.historyScope}` : state.historyScope ? `History · ${state.historyScope}` : 'Repository History';
+  refs.graphSubtitle.textContent = !loaded ? 'Navigate folders and inspect every item in your repository.' : state.view === 'explorer' ? `${state.entries.length} items in ${state.currentPath || state.repository.name}` : state.view === 'commander' ? (state.compareMode === 'local-drive' ? 'Two independent local folders. Copy safely without overwriting; delete through Trash/Recycle Bin.' : 'Compare the workspace with a cached remote snapshot—no second checkout.') : state.view === 'remotes' ? 'Configured server locations and explicit fetch controls.' : state.historyKind === 'submodule-refs' ? `Parent-repository commits that changed this submodule's recorded version — not ${state.historyScope}'s own history` : state.historyScope ? `Commits touching ${state.historyScope}` : state.submoduleGraph ? 'Commits, branches and release tags for this submodule' : 'Commits, branches and release tags';
+  refs.search.placeholder = state.view === 'explorer' ? 'Filter this folder' : state.view === 'commander' ? (state.compareMode === 'local-drive' ? 'Filter both local folders' : 'Filter comparison') : 'Find commit or author';
   refs.search.closest('label').hidden = state.view === 'remotes';
-  refs.goUp.hidden = refs.reloadFolder.hidden = !['explorer','commander'].includes(state.view); refs.goUp.disabled = state.view === 'explorer' ? !state.currentPath : !state.commanderPath;
+  const localDriveMode = state.view === 'commander' && state.compareMode === 'local-drive';
+  if (!localDriveMode) localDriveWorkspace?.deactivate();
+  refs.goUp.hidden = refs.reloadFolder.hidden = !['explorer','commander'].includes(state.view) || localDriveMode; refs.goUp.disabled = state.view === 'explorer' ? !state.currentPath : !state.commanderPath;
   refs.commitScope.hidden = refs.showPathHistory.hidden = state.view !== 'explorer' || !loaded;
   $('#showFolderChanges').hidden = state.view !== 'explorer' || !loaded;
   $('#addSubmodule').hidden = state.view !== 'explorer' || !loaded;
@@ -539,7 +573,7 @@ function render() {
   $('#navExplorer').classList.toggle('active', state.view === 'explorer'); $('#navGraph').classList.toggle('active', state.view === 'graph');
   $('#navCommander').classList.toggle('active', state.view === 'commander');
   $('#navRemotes').classList.toggle('active', state.view === 'remotes');
-  refs.locationRepository.textContent = state.submoduleGraph?.name || state.repository?.name || '—'; refs.locationBranch.textContent = describeBranch(state.submoduleGraph ? state.submoduleGraph.repository : state.repository); refs.locationPath.textContent = state.view === 'commander' ? `/${state.commanderPath}` : state.view === 'explorer' ? `/${state.currentPath}` : state.view === 'graph' ? 'commit history' : 'remote configuration';
+  refs.locationRepository.textContent = state.submoduleGraph?.name || state.repository?.name || '—'; refs.locationBranch.textContent = describeBranch(state.submoduleGraph ? state.submoduleGraph.repository : state.repository); refs.locationPath.textContent = state.view === 'commander' ? (state.compareMode === 'local-drive' ? 'Local Drive' : `/${state.commanderPath}`) : state.view === 'explorer' ? `/${state.currentPath}` : state.view === 'graph' ? 'commit history' : 'remote configuration';
   refs.leaveSubmoduleGraph.hidden = !state.submoduleGraph;
   // Every view used to be rebuilt on every render() call regardless of which
   // one was actually visible — navigating folders in Explorer also rebuilt
@@ -556,10 +590,9 @@ function render() {
   updateChangeBadge();
   updateStashUI();
   if (refs.changesDrawer.classList.contains('open')) renderChanges();
-  // Independent of everything above: never blocks or is blocked by the rest
-  // of this render — only refetches if the repository/branch actually
-  // changed since its last check, and only when the panel is expanded (see
-  // createPrStatusPanel's own doc comment for why).
+  // Independent of everything above: this only invalidates a displayed PR
+  // result when its repository/branch changes. It never starts a network
+  // request; Connect/Refresh inside the panel is the sole trigger.
   mainPrStatusPanel?.refreshIfContextChanged();
   renderSubmodulePrHeading();
   submodulePrStatusPanel?.refreshIfContextChanged();
@@ -580,6 +613,18 @@ function commanderSide(entry, side) {
 
 function renderCommander() {
   if (!state.repository) return;
+  const localDrive = state.compareMode === 'local-drive';
+  refs.compareModeGit.classList.toggle('active', !localDrive);
+  refs.compareModeGit.setAttribute('aria-selected', String(!localDrive));
+  refs.compareModeDrive.classList.toggle('active', localDrive);
+  refs.compareModeDrive.setAttribute('aria-selected', String(localDrive));
+  refs.gitComparePanel.hidden = localDrive;
+  refs.localDrivePanel.hidden = !localDrive;
+  if (localDrive) {
+    localDriveWorkspace?.activate(state.repository.path);
+    return;
+  }
+  localDriveWorkspace?.deactivate();
   renderCommanderBreadcrumbs();
   const remoteBranches = state.branches.filter(branch => branch.remote);
   refs.remoteRef.innerHTML = remoteBranches.map(branch => `<option value="${esc(branch.name)}" ${branch.name === state.remoteRef ? 'selected' : ''}>${esc(branch.name)}</option>`).join('') || '<option value="">No remote refs</option>';
@@ -920,8 +965,8 @@ function anonymizeForLog(path) { if (!path) return '(none)'; return path.split(/
 // module-level `const xGuard = createRequestGuard();`) so one loader's
 // requests never interfere with another's, and a *newer* call through the
 // same instance invalidates an older one even if the identity fields
-// happen to still match (a duplicate click, a poll firing again before the
-// previous one returned).
+// happen to still match (for example, a duplicate click before the previous
+// request returned).
 function createRequestGuard() {
   let generation = 0;
   function snapshot() {
@@ -2012,7 +2057,7 @@ async function openSubmoduleGraph(entry) {
 function leaveSubmoduleGraph() { if (!state.submoduleGraph) return; state.submoduleGraph = null; state.view = 'explorer'; render(); openDirectory(state.currentPath, { force: true }); }
 
 // Any navigation away from the graph view that ISN'T the explicit "Back to
-// parent repository" button above — Project Explorer, Local ↔ Remote,
+// parent repository" button above — Project Explorer, Compare,
 // Remotes, or opening a different repository entirely — must still safely
 // close the submodule context so it can never be silently combined with
 // whatever's navigated to next (a stale "Back to parent" later restoring a
@@ -2077,8 +2122,8 @@ function renderBranches() {
 }
 
 // Message D, point 5: the "SUBMODULE PULL REQUEST" section exists at all
-// only while a submodule's own Branch Map is actually open — never shown,
-// never polled, the rest of the time, and always plainly labeled with
+// only while a submodule's own Branch Map is actually open — never shown or
+// queried the rest of the time, and always plainly labeled with
 // *which* submodule so it can never be mistaken for the project's own PR
 // section right above it.
 function renderSubmodulePrHeading() {
@@ -3541,10 +3586,28 @@ $('#stashWork').addEventListener('click', stashWork);
 $('#popStash').addEventListener('click', popStash);
 $('#refreshStashes').addEventListener('click', () => refreshStashesList());
 $('#closeChanges').addEventListener('click', () => refs.changesDrawer.classList.remove('open'));
-let searchTimeout; refs.search.addEventListener('input', () => { clearTimeout(searchTimeout); searchTimeout = setTimeout(() => { state.view === 'explorer' ? renderExplorer() : state.view === 'commander' ? renderCommander() : renderGraph(); }, 200); }); refs.commitMessage.addEventListener('input', renderChanges);
-function returnToProjectNavigator() { closeSubmoduleGraph(); const selectedPath = state.selectedEntry?.relative_path; state.view = 'explorer'; state.selectedCommit = null; refs.search.value = ''; render(); if (selectedPath) selectEntry(selectedPath); else clearDetails('Select a file or folder'); }
+let searchTimeout; refs.search.addEventListener('input', () => { clearTimeout(searchTimeout); searchTimeout = setTimeout(() => { if (state.view === 'explorer') renderExplorer(); else if (state.view === 'commander' && state.compareMode === 'local-drive') localDriveWorkspace?.setFilter(refs.search.value); else if (state.view === 'commander') renderCommander(); else renderGraph(); }, 200); }); refs.commitMessage.addEventListener('input', renderChanges);
+async function returnToProjectNavigator() {
+  closeSubmoduleGraph();
+  const selectedPath = state.selectedEntry?.relative_path;
+  state.view = 'explorer'; state.selectedCommit = null; refs.search.value = ''; render();
+  if (state.localDriveGitRefreshPending && invoke && state.repository) {
+    state.localDriveGitRefreshPending = false;
+    try {
+      status('Refreshing Git after Local Drive changes…', 'busy');
+      state.changes = await invoke('refresh_status', { repositoryPath: state.repository.path });
+      state.statusReady = true;
+      directoryCache.clear();
+      await openDirectory(state.currentPath, { force: true });
+      status('Git status refreshed');
+    } catch (error) { handleError(error); }
+  }
+  if (selectedPath) selectEntry(selectedPath); else clearDetails('Select a file or folder');
+}
 $('#navExplorer').addEventListener('click', returnToProjectNavigator);
-$('#navCommander').addEventListener('click', () => { closeSubmoduleGraph(); const selected = state.selectedEntry; state.commanderFocus = selected?.kind === 'file' ? selected.relative_path : ''; state.commanderPath = selected?.kind === 'file' ? selected.relative_path.split('/').slice(0, -1).join('/') : selected?.kind === 'folder' ? selected.relative_path : state.currentPath; state.commanderRows = []; state.view = 'commander'; refs.search.value = ''; render(); openCommanderDirectory(state.commanderPath); });
+$('#navCommander').addEventListener('click', () => { closeSubmoduleGraph(); const selected = state.selectedEntry; state.commanderFocus = selected?.kind === 'file' ? selected.relative_path : ''; state.commanderPath = selected?.kind === 'file' ? selected.relative_path.split('/').slice(0, -1).join('/') : selected?.kind === 'folder' ? selected.relative_path : state.currentPath; state.commanderRows = []; state.view = 'commander'; refs.search.value = ''; render(); if (state.compareMode === 'git') openCommanderDirectory(state.commanderPath); });
+refs.compareModeGit.addEventListener('click', () => { if (state.compareMode === 'git') return; state.compareMode = 'git'; refs.search.value = ''; render(); openCommanderDirectory(state.commanderPath); });
+refs.compareModeDrive.addEventListener('click', () => { if (state.compareMode === 'local-drive') return; state.compareMode = 'local-drive'; refs.search.value = ''; render(); });
 $('#navGraph').addEventListener('click', () => { closeSubmoduleGraph(); state.commits = state.allCommits.length ? state.allCommits : state.commits; state.historyScope = ''; state.historyKind = ''; state.selectedEntry = null; state.selectedCommit = null; state.view = 'graph'; refs.search.value = ''; clearDetails('Select a commit'); render(); });
 $('#navRemotes').addEventListener('click', () => { closeSubmoduleGraph(); loadRemotes(); });
 refs.leaveSubmoduleGraph.addEventListener('click', leaveSubmoduleGraph);
@@ -3614,6 +3677,7 @@ document.addEventListener('click', event => {
 });
 refs.goUp.addEventListener('click', () => { const commander = state.view === 'commander'; const parts = (commander ? state.commanderPath : state.currentPath).split('/').filter(Boolean); parts.pop(); commander ? openCommanderDirectory(parts.join('/')) : openDirectory(parts.join('/')); });
 refs.reloadFolder.addEventListener('click', () => {
+  if (state.view === 'commander' && state.compareMode === 'local-drive') return localDriveWorkspace?.reload();
   if (state.view === 'commander') return openCommanderDirectory(state.commanderPath);
   // An explicit reload invalidates the submodule's backend snapshot too (see
   // load_directory's `force`/status_repo) — forget it was warm so the next
@@ -3623,7 +3687,7 @@ refs.reloadFolder.addEventListener('click', () => {
   return openDirectory(state.currentPath, { force: true, invalidateGit: true });
 });
 document.addEventListener('keydown', event => { if (event.key !== 'Escape' || state.view !== 'commander' || document.querySelector('dialog[open]')) return; event.preventDefault(); returnToProjectNavigator(); });
-refs.remoteRef.addEventListener('change', () => { state.remoteRef = refs.remoteRef.value; openCommanderDirectory(state.commanderPath); });
+refs.remoteRef.addEventListener('change', () => { state.remoteRef = refs.remoteRef.value; if (state.compareMode === 'git') openCommanderDirectory(state.commanderPath); });
 $('#closeSubmoduleMenu').addEventListener('click', () => { refs.submoduleMenu.hidden = true; });
 // Uses submoduleMenuEntry (the entry the popup was actually opened for), not
 // state.selectedEntry — this panel isn't modal, so the selection elsewhere in
@@ -3795,7 +3859,7 @@ function currentConsoleContext() {
   // "Submodule Branch Map" console context, exactly the kind of mix-up this
   // whole area is about not letting happen.
   if (state.view === 'graph') { const g = activeGraphData(); return state.submoduleGraph ? { label: `Submodule Branch Map · ${state.submoduleGraph.name} · ${g.headDetached ? 'detached' : (g.currentBranch || 'detached')}`, tags: ['graph', 'submodule'] } : { label: `Branch Map · ${g.headDetached ? 'detached' : (g.currentBranch || 'detached')}`, tags: ['graph'] }; }
-  if (state.view === 'commander') return { label: 'Local ↔ Remote', tags: ['commander'] };
+  if (state.view === 'commander') return { label: state.compareMode === 'local-drive' ? 'Compare · Local Drive' : 'Compare · Git', tags: ['commander'] };
   return { label: `${state.currentPath || state.repository.name} · branch ${state.repository.current_branch || 'detached'}`, tags: ['explorer'] };
 }
 
@@ -3815,7 +3879,7 @@ function buildCommands() {
     { id: 'conflicts', name: 'Resolve Merge Conflicts', description: 'Open the conflict resolution dialog for a merge in progress', keys: '', keywords: 'merge conflict resolve', tags: state.pendingMainConflicts?.length ? ['explorer', 'graph', 'relevant'] : [], fn: () => openConflictsDialog(mergeTargetForMain(), state.pendingMainConflicts || []) },
     { id: 'search', name: 'Search Repository', description: 'Filter the current view by name, author or commit id', keys: 'Ctrl+F', tags: ['explorer', 'graph', 'commander'], fn: () => refs.search.focus() },
     { id: 'explorer', name: 'Go to Project Explorer', description: 'Browse files, folders and submodules', keys: '', keywords: 'files browse', tags: [], fn: () => $('#navExplorer').click() },
-    { id: 'commander', name: 'Go to Local ↔ Remote', description: 'Compare your working copy against a remote snapshot, file by file', keys: 'Ctrl+Shift+L', keywords: 'diff compare', tags: [], fn: () => $('#navCommander').click() },
+    { id: 'commander', name: 'Go to Compare', description: 'Compare Git snapshots or work between two local folders', keys: 'Ctrl+Shift+L', keywords: 'diff compare local drive remote', tags: [], fn: () => $('#navCommander').click() },
     { id: 'graph', name: 'Go to Branch Map', description: 'See commit history and branches as a graph', keys: 'Ctrl+Shift+G', keywords: 'log history commits', tags: [], fn: () => $('#navGraph').click() },
     { id: 'remotes', name: 'Go to Remotes', description: 'View and fetch configured server locations', keys: '', tags: [], fn: () => $('#navRemotes').click() },
     { id: 'refresh', name: 'Refresh Repository', description: 'Re-read branches, commits and status from disk (e.g. after external Git commands)', keys: '', keywords: 'reload', tags: [], fn: () => $('#refresh').click() },
@@ -4353,7 +4417,7 @@ document.addEventListener('keydown', (e) => {
 // ---- Pull request status panel (read-only, first incremental step) ----
 //
 // A self-contained factory, not a singleton tied to the sidebar: it owns its
-// own DOM subtree, its own load/poll lifecycle, and takes its repository
+// own DOM subtree, its own manual-connect lifecycle, and takes its repository
 // path and branch through callbacks instead of reading global `state`
 // directly — so a later "Project Status" view can create one instance per
 // repository (the parent, and one per submodule) just by pointing each at a
@@ -4366,9 +4430,9 @@ document.addEventListener('keydown', (e) => {
 // Loading is independent of the rest of the repository UI: this never awaits
 // anything the explorer/graph/commander views depend on, and nothing here
 // blocks them — a slow or failed PR check only ever affects this one panel.
-// Polling only runs while `setExpanded(true)` — collapsed (the default) or
-// hidden, no requests are made at all, satisfies "don't poll while hidden"
-// without a separate visibility flag to keep in sync.
+// Network access is deliberately explicit: opening the section only reveals
+// a Connect button. A request is made only when the user presses Connect,
+// Refresh, or Retry. There is no timer/polling, including while expanded.
 const PR_STATE_LABELS = {
   loading: 'Checking pull request status…',
   superseded: 'Checking pull request status…', // a newer check already superseded this one; about to be replaced
@@ -4412,7 +4476,6 @@ function prCardHtml(pr) {
 function createPrStatusPanel(root, options) {
   let expanded = false;
   let generation = 0;
-  let pollTimer = null;
   let lastKey = null;
 
   // A short "what is this panel showing right now" line — the submodule's
@@ -4436,6 +4499,14 @@ function createPrStatusPanel(root, options) {
     return heading + prs.map(prCardHtml).join('');
   }
 
+  function manualRefreshHtml() {
+    return '<div class="pr-status-manual"><span>Connected on demand · no background checks</span><button class="pr-status-retry" data-pr-status-action="refresh">Refresh</button></div>';
+  }
+
+  function renderConnectPrompt() {
+    root.innerHTML = contextHeaderHtml() + '<div class="pr-status-empty pr-status-disconnected"><span>Connect only when you want to check GitHub. No request runs in the background.</span><button class="pr-status-retry" data-pr-status-action="connect">Connect to GitHub</button></div>';
+  }
+
   function renderState(result) {
     const ctx = contextHeaderHtml();
     if (result.state === 'loading' || result.state === 'superseded') { root.innerHTML = ctx + '<div class="pr-status-loading"><i class="spinner"></i>Checking pull request status…</div>'; return; }
@@ -4443,7 +4514,7 @@ function createPrStatusPanel(root, options) {
     const incoming = result.incoming_pull_requests || [];
     if (result.state === 'ok' && (outgoing.length || incoming.length)) {
       const partialNote = result.partial ? '<div class="pr-status-partial">Not every related repository could be checked — there may be more.</div>' : '';
-      root.innerHTML = ctx + partialNote + prDirectionSectionHtml('Pull requests from this branch', outgoing) + prDirectionSectionHtml('Pull requests into this branch', incoming);
+      root.innerHTML = ctx + manualRefreshHtml() + partialNote + prDirectionSectionHtml('Pull requests from this branch', outgoing) + prDirectionSectionHtml('Pull requests into this branch', incoming);
       return;
     }
     const message = PR_STATE_LABELS[result.state] || result.detail || 'Pull request status unavailable.';
@@ -4457,8 +4528,8 @@ function createPrStatusPanel(root, options) {
     const retryable = ['api_error', 'auth_missing', 'partial_result'].includes(result.state);
     const browserUrl = githubPullsBrowserUrl(result.queried_repo);
     const browserFallback = browserUrl && retryable ? `<button class="pr-open-link" data-open-url="${esc(browserUrl)}">Open pull requests in browser ↗</button>` : '';
-    root.innerHTML = ctx + `<div class="pr-status-empty pr-status-${esc(result.state)}">${detail}${retryable ? '<button class="pr-status-retry" id="prStatusRetry">Retry</button>' : ''}${browserFallback}</div>`;
-    if (retryable) root.querySelector('#prStatusRetry')?.addEventListener('click', load);
+    const actionLabel = retryable ? 'Retry' : 'Refresh';
+    root.innerHTML = ctx + `<div class="pr-status-empty pr-status-${esc(result.state)}">${detail}<button class="pr-status-retry" data-pr-status-action="refresh">${actionLabel}</button>${browserFallback}</div>`;
   }
 
   function contextKey() {
@@ -4484,30 +4555,25 @@ function createPrStatusPanel(root, options) {
     }
   }
 
-  function schedulePoll() {
-    clearTimeout(pollTimer); pollTimer = null;
-    if (!expanded) return;
-    pollTimer = setTimeout(async () => { await load(); schedulePoll(); }, options.pollMs || 60000);
-  }
-
   function setExpanded(next) {
     expanded = next;
     root.classList.toggle('collapsed', !expanded);
-    if (expanded) { load(); schedulePoll(); }
-    else { clearTimeout(pollTimer); pollTimer = null; }
+    if (expanded && lastKey !== contextKey()) renderConnectPrompt();
   }
 
-  // Called from the main render() on every state change — cheap (a string
-  // comparison) when nothing relevant changed, and if the panel is currently
-  // collapsed this only remembers that a refetch is owed, it doesn't do one:
-  // load() itself recomputes and stores lastKey, so simply expanding the
-  // panel later always fetches for whatever repository/branch is current
-  // then, never a stale one from before it was opened.
+  // A context change invalidates the displayed server result, but never starts
+  // a replacement request. The user explicitly connects for the new branch.
   function refreshIfContextChanged() {
     const key = contextKey();
     if (key === lastKey) return;
-    if (expanded) load(); else lastKey = key;
+    generation += 1; // ignore a response still in flight for the old context
+    lastKey = null;
+    if (expanded) renderConnectPrompt();
   }
+
+  root.addEventListener('click', event => {
+    if (event.target.closest('[data-pr-status-action]')) load();
+  });
 
   return { setExpanded, refreshIfContextChanged, isExpanded: () => expanded };
 }
@@ -4525,7 +4591,6 @@ const mainPrStatusPanel = createPrStatusPanel(refs.prStatusPanel, {
   getBranch: () => (state.repository && !state.repository.head_detached) ? (state.repository.current_branch || null) : null,
   getContextLabel: () => 'parent',
   getContextTitle: () => null,
-  pollMs: 60000,
 });
 refs.togglePrStatus.addEventListener('click', () => {
   const next = !mainPrStatusPanel.isExpanded();
@@ -4551,7 +4616,6 @@ const submodulePrStatusPanel = createPrStatusPanel(refs.submodulePrStatusPanel, 
   getBranch: () => (state.submoduleGraph && !state.submoduleGraph.repository.head_detached) ? (state.submoduleGraph.repository.current_branch || null) : null,
   getContextLabel: () => (state.submoduleGraph ? `submodule:${state.submoduleGraph.name}` : 'none'),
   getContextTitle: () => null,
-  pollMs: 60000,
 });
 refs.toggleSubmodulePrStatus.addEventListener('click', () => {
   const next = !submodulePrStatusPanel.isExpanded();

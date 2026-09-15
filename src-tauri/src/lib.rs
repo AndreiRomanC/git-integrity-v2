@@ -1,3 +1,4 @@
+mod local_drive;
 mod repository;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -88,6 +89,13 @@ pub fn run() {
             repository::create_submodule_tag,
             repository::push_submodule_tag,
             repository::run_git_command,
+            local_drive::list_local_directory,
+            local_drive::create_local_directory,
+            local_drive::copy_local_item,
+            local_drive::move_local_item,
+            local_drive::trash_local_item,
+            local_drive::read_local_text_file,
+            local_drive::write_local_text_file,
             repository::run_terminal_command,
             repository::run_utrud,
         ])

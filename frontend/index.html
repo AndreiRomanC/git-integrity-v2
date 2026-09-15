@@ -36,7 +36,7 @@
     <main class="main-layout">
       <aside class="sidebar">
         <button class="nav-item active" id="navExplorer"><span class="nav-icon">▰</span><span>Project Explorer</span></button>
-        <button class="nav-item" id="navCommander"><span class="nav-icon">⇄</span><span>Local ↔ Remote</span></button>
+        <button class="nav-item" id="navCommander"><span class="nav-icon">⇄</span><span>Compare</span></button>
         <button class="nav-item" id="navGraph"><span class="nav-icon">⑂</span><span>Branch Map</span></button>
         <button class="nav-item" id="navRemotes"><span class="nav-icon">◎</span><span>Remotes</span></button>
 
@@ -54,7 +54,7 @@
         <button class="workspace-status" id="stashWork" data-tooltip="Sets aside uncommitted changes only in the repository you are currently browsing. A parent project and each submodule have separate stashes." title="Stash changes in the current repository"><span class="workspace-dot" style="background:#b294ff;"></span><span><strong id="stashWorkTitle">Stash project work</strong><small id="stashWorkSubtitle">Main project only</small></span></button>
         <button class="workspace-status" id="popStash" data-tooltip="Opens the stash list for the repository you are currently browsing. A parent project and each submodule have separate stash lists." title="View stashes for the current repository"><span class="workspace-dot" style="background:#48cc7e;"></span><span><strong>Stashes</strong><small id="stashListSubtitle">View saved project work</small></span></button>
 
-        <div class="side-heading pr-status-heading" id="togglePrStatus" title="Pull request status for the PARENT project's currently checked-out branch — always the parent, never a submodule, even while a Submodule Branch Map is open. Collapsed by default, doesn't check until opened"><span class="branch-heading-arrow" id="prStatusArrow">▸</span><span>PROJECT PULL REQUEST</span></div>
+        <div class="side-heading pr-status-heading" id="togglePrStatus" title="Pull request status for the PARENT project's currently checked-out branch — always the parent, never a submodule. Opens disconnected and checks only when you press Connect or Refresh."><span class="branch-heading-arrow" id="prStatusArrow">▸</span><span>PROJECT PULL REQUEST</span></div>
         <div id="prStatusPanel" class="pr-status-panel collapsed"></div>
 
         <!-- Only ever shown while a submodule's own Branch Map is open (see
@@ -107,13 +107,43 @@
         </div>
 
         <div id="commanderView" class="commander-view" hidden>
-          <div class="commander-toolbar">
-            <nav id="commanderBreadcrumbs" class="commander-breadcrumbs"></nav>
-            <label><span>REMOTE SNAPSHOT</span><select id="remoteRef"></select></label>
+          <div class="compare-mode-tabs" role="tablist" aria-label="Compare mode">
+            <button id="compareModeGit" class="active" type="button" role="tab">Git Compare</button>
+            <button id="compareModeDrive" type="button" role="tab">Local Drive</button>
           </div>
-          <div class="commander-head commander-grid"><span>LOCAL WORKSPACE</span><span>STATE</span><span>REMOTE BRANCH</span></div>
-          <div id="commanderRows" class="commander-rows"></div>
-          <div class="commander-legend"><span><i class="same"></i>Same</span><span><i class="modified"></i>Modified</span><span><i class="local-only"></i>Only local</span><span><i class="remote-only"></i>Only remote</span></div>
+          <div id="gitComparePanel" class="compare-panel">
+            <div class="commander-toolbar">
+              <nav id="commanderBreadcrumbs" class="commander-breadcrumbs"></nav>
+              <label><span>REMOTE SNAPSHOT</span><select id="remoteRef"></select></label>
+            </div>
+            <div class="commander-head commander-grid"><span>LOCAL WORKSPACE</span><span>STATE</span><span>REMOTE BRANCH</span></div>
+            <div id="commanderRows" class="commander-rows"></div>
+            <div class="commander-legend"><span><i class="same"></i>Same</span><span><i class="modified"></i>Modified</span><span><i class="local-only"></i>Only local</span><span><i class="remote-only"></i>Only remote</span></div>
+          </div>
+          <div id="localDrivePanel" class="local-drive-panel" hidden>
+            <div class="local-drive-note"><strong>Dual-pane file manager.</strong> Select a text file on each side and press F2 to compare or merge. Copying never overwrites and deletion uses Trash/Recycle Bin.</div>
+            <div class="local-drive-columns">
+              <section class="local-drive-pane" data-drive-side="left">
+                <header><strong>LEFT</strong><div><button type="button" data-drive-action="choose">Choose…</button><button type="button" data-drive-action="refresh" title="Refresh">↻</button></div></header>
+                <div class="local-drive-path" data-drive-path title="No folder selected">No folder selected</div>
+                <div class="local-drive-list" data-drive-list><div class="local-drive-empty">Choose a folder.</div></div>
+              </section>
+              <section class="local-drive-pane" data-drive-side="right">
+                <header><strong>LOCAL REPOSITORY</strong><div><button type="button" data-drive-action="choose">Choose…</button><button type="button" data-drive-action="refresh" title="Refresh">↻</button></div></header>
+                <div class="local-drive-path" data-drive-path title="No folder selected">No folder selected</div>
+                <div class="local-drive-list" data-drive-list><div class="local-drive-empty">Choose a folder.</div></div>
+              </section>
+            </div>
+            <div class="local-drive-shortcuts" aria-label="File commands">
+              <button type="button" data-drive-shortcut="compare"><kbd>F2</kbd><span>Compare</span></button>
+              <button type="button" data-drive-shortcut="view"><kbd>F3</kbd><span>View</span></button>
+              <button type="button" data-drive-shortcut="edit"><kbd>F4</kbd><span>Edit</span></button>
+              <button type="button" data-drive-shortcut="copy"><kbd>F5</kbd><span>Copy</span></button>
+              <button type="button" data-drive-shortcut="move"><kbd>F6</kbd><span>Move</span></button>
+              <button type="button" data-drive-shortcut="mkdir"><kbd>F7</kbd><span>New folder</span></button>
+              <button type="button" data-drive-shortcut="trash" class="danger-action-soft"><kbd>F8</kbd><span>Delete</span></button>
+            </div>
+          </div>
         </div>
 
         <div id="graphView" class="graph-view" hidden>
@@ -273,6 +303,49 @@
       <footer><span id="editorSaveState">Local file · UTF-8 · maximum 2 MB</span><button type="button" id="cancelEditor">Cancel</button><button type="button" id="saveFile">Save file</button></footer>
     </div>
   </dialog>
+  <dialog id="localDriveEditorDialog" class="editor-dialog local-drive-editor-dialog">
+    <div class="editor-shell"><header><div><h2 id="localDriveEditorTitle">View file</h2><p id="localDriveEditorPath"></p></div><button type="button" id="closeLocalDriveEditor">×</button></header>
+      <div class="editor-hint" id="localDriveEditorHint">Local Drive text viewer · UTF-8 · maximum 2 MB</div>
+      <textarea id="localDriveEditorContent" spellcheck="false"></textarea>
+      <footer><span id="localDriveEditorState">Ready</span><button type="button" id="cancelLocalDriveEditor">Close</button><button type="button" id="saveLocalDriveEditor">Save file</button></footer>
+    </div>
+  </dialog>
+  <dialog id="localDriveCompareDialog" class="local-drive-compare-dialog">
+    <div class="local-drive-compare-shell">
+      <header>
+        <div><h2>Compare local files</h2><p id="localDriveCompareSummary">Select one file in each pane</p></div>
+        <button type="button" id="closeLocalDriveCompare" aria-label="Close">×</button>
+      </header>
+      <div class="local-drive-compare-paths">
+        <div><span>LEFT</span><strong id="localDriveCompareLeftPath">—</strong></div>
+        <div><span>RIGHT</span><strong id="localDriveCompareRightPath">—</strong></div>
+      </div>
+      <div class="local-drive-compare-toolbar">
+        <div class="local-drive-compare-modes" role="tablist" aria-label="Comparison mode">
+          <button type="button" id="showLocalDriveDiff" class="active" role="tab">Differences</button>
+          <button type="button" id="editLocalDriveDiff" role="tab">Edit &amp; merge</button>
+        </div>
+        <div class="local-drive-copy-all">
+          <button type="button" id="copyAllLocalDriveRight" title="Replace the right editor with all content from the left">Use all left →</button>
+          <button type="button" id="copyAllLocalDriveLeft" title="Replace the left editor with all content from the right">← Use all right</button>
+        </div>
+      </div>
+      <div id="localDriveDiffView" class="local-drive-diff-view">
+        <div class="local-drive-diff-head"><span>LEFT FILE</span><span>MERGE CHANGE</span><span>RIGHT FILE</span></div>
+        <div id="localDriveDiffRows" class="local-drive-diff-rows"></div>
+      </div>
+      <div id="localDriveMergeEditors" class="local-drive-merge-editors" hidden>
+        <textarea id="localDriveCompareLeftContent" spellcheck="false" aria-label="Left file content"></textarea>
+        <textarea id="localDriveCompareRightContent" spellcheck="false" aria-label="Right file content"></textarea>
+      </div>
+      <footer>
+        <span id="localDriveCompareState" role="status">Ready</span>
+        <button type="button" id="saveLocalDriveCompareLeft">Save left</button>
+        <button type="button" id="saveLocalDriveCompareRight">Save right</button>
+        <button type="button" id="cancelLocalDriveCompare">Close</button>
+      </footer>
+    </div>
+  </dialog>
   <dialog id="publishDialog" class="publish-dialog">
     <form method="dialog"><header><div><h2>Publish to server</h2><p>A push publishes commits, not uncommitted files.</p></div><button value="cancel">×</button></header>
       <div class="publish-controls"><label><span>LOCAL BRANCH</span><select id="publishBranch"></select></label><span class="publish-arrow">→</span><label><span>REMOTE</span><select id="publishRemote"></select></label></div>
@@ -376,8 +449,8 @@
           <p>Shows local commits not yet on the server, for the main project only (not submodules — use "Push submodule" for those). Every commit listed here is checked by default; unchecking one also unchecks everything newer than it (Git can only push a continuous range, so that's the only valid way to "leave some out"). Click "Publish branch" to send what's checked.</p>
         </details>
         <details>
-          <summary>Local ↔ Remote (Commander)</summary>
-          <p>Compares your working copy against a chosen remote snapshot, file by file, without checking anything out. Useful to see exactly what differs before deciding what to do about it.</p>
+          <summary>Compare</summary>
+          <p><b>Git Compare</b> compares your working copy against a chosen remote snapshot without checking anything out. <b>Local Drive</b> is a separate two-pane local file workspace for safe copying, creating folders, and moving items to Trash/Recycle Bin.</p>
         </details>
         <details>
           <summary>Stash</summary>
@@ -440,6 +513,8 @@
   <script src="graph-model.js"></script>
   <script src="submodule-state.js"></script>
   <script src="submodule-versions.js"></script>
+  <script src="local-diff.js"></script>
+  <script src="local-drive.js"></script>
   <script src="app.js"></script>
 </body>
 </html>
