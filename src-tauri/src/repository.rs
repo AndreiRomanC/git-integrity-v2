@@ -22,13 +22,33 @@ use remotes::{fetch_all_remotes_inner, list_remotes, sync_repository_inner};
 // in — each write is a single cheap append, guarded so a logging failure never
 // breaks the actual operation. Log path is printed once by `perf_log_path()`.
 fn perf_log_path() -> PathBuf {
+    // A macOS `.app` is a signed bundle. Writing beside its executable means
+    // writing inside `Contents/MacOS`, which invalidates the bundle seal after
+    // the first launch and can make Finder refuse later launches. Keep logs in
+    // the standard per-user Logs directory instead. Tests use the temporary
+    // directory so they never touch a developer's real Library.
+    #[cfg(all(target_os = "macos", test))]
+    return std::env::temp_dir().join("git-integrity-perf.log");
+    #[cfg(all(target_os = "macos", not(test)))]
+    {
+        if let Some(user_directory) = std::env::var_os("HOME") {
+            let log_directory = PathBuf::from(user_directory).join("Library/Logs/Git DrillDown");
+            if fs::create_dir_all(&log_directory).is_ok() {
+                return log_directory.join("git-integrity-perf.log");
+            }
+        }
+        return std::env::temp_dir().join("git-integrity-perf.log");
+    }
+
     // Next to the executable, not the OS temp folder — much easier to find in
     // practice than hunting through %TEMP%. Falls back to temp dir only if the
     // exe's own folder isn't writable (e.g. installed under Program Files).
+    #[cfg(not(target_os = "macos"))]
     if let Ok(exe) = std::env::current_exe() { if let Some(dir) = exe.parent() {
         let candidate = dir.join("git-integrity-perf.log");
         if fs::OpenOptions::new().create(true).append(true).open(&candidate).is_ok() { return candidate; }
     } }
+    #[cfg(not(target_os = "macos"))]
     std::env::temp_dir().join("git-integrity-perf.log")
 }
 
