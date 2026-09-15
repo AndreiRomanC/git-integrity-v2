@@ -96,6 +96,10 @@ pub fn run() {
             local_drive::trash_local_item,
             local_drive::read_local_text_file,
             local_drive::write_local_text_file,
+            local_drive::merge::compare_local_directories,
+            local_drive::merge::copy_local_merge_file,
+            local_drive::merge::create_local_merge_directory,
+            local_drive::merge::replace_local_merge_file,
             repository::command_console::run_terminal_command,
             repository::run_utrud,
         ])

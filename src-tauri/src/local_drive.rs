@@ -1,8 +1,11 @@
 use serde::Serialize;
 use std::fs::{self, OpenOptions};
+use std::hash::Hasher;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Component, Path, PathBuf};
-use std::time::UNIX_EPOCH;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+pub(crate) mod merge;
 
 #[derive(Serialize)]
 pub struct LocalDriveEntry {
@@ -34,6 +37,13 @@ pub struct LocalTextFile {
     content: String,
     bytes: u64,
     encoding: String,
+    fingerprint: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LocalTextWriteResult {
+    bytes: u64,
+    fingerprint: String,
 }
 
 const MAX_LOCAL_TEXT_BYTES: u64 = 2 * 1024 * 1024;
@@ -53,14 +63,14 @@ fn require_absolute(path: &str) -> Result<PathBuf, String> {
     Ok(value)
 }
 
-fn existing_directory(path: &str) -> Result<PathBuf, String> {
+pub(super) fn existing_directory(path: &str) -> Result<PathBuf, String> {
     let value = require_absolute(path)?;
     let canonical = fs::canonicalize(&value).map_err(|error| format!("Cannot open '{}': {error}", value.display()))?;
     if !canonical.is_dir() { return Err(format!("'{}' is not a folder", value.display())); }
     Ok(canonical)
 }
 
-fn contains_git_metadata(path: &Path) -> bool {
+pub(super) fn contains_git_metadata(path: &Path) -> bool {
     path.components().any(|component| match component {
         Component::Normal(name) => name.to_string_lossy().eq_ignore_ascii_case(".git"),
         _ => false,
@@ -128,7 +138,7 @@ pub async fn create_local_directory(parent_path: String, name: String) -> Result
     off_main_thread(move || create_local_directory_inner(parent_path, name)).await
 }
 
-fn copy_file_new(source: &Path, destination: &Path) -> Result<u64, String> {
+pub(super) fn copy_file_new(source: &Path, destination: &Path) -> Result<u64, String> {
     let input = fs::File::open(source).map_err(|error| format!("Cannot read '{}': {error}", source.display()))?;
     let output = OpenOptions::new().write(true).create_new(true).open(destination)
         .map_err(|error| if destination.exists() { format!("'{}' already exists — nothing was overwritten", destination.display()) } else { format!("Cannot create '{}': {error}", destination.display()) })?;
@@ -136,7 +146,7 @@ fn copy_file_new(source: &Path, destination: &Path) -> Result<u64, String> {
     let mut output = BufWriter::new(output);
     match std::io::copy(&mut input, &mut output) {
         Ok(bytes) => {
-            if let Err(error) = output.flush() {
+            if let Err(error) = output.flush().and_then(|_| output.get_ref().sync_all()) {
                 drop(output);
                 let _ = fs::remove_file(destination);
                 return Err(format!("Copy failed while finishing '{}': {error}", source.display()));
@@ -300,7 +310,7 @@ fn decode_windows_1252(bytes: &[u8]) -> Result<String, String> {
     }).collect()
 }
 
-fn decode_local_text(bytes: Vec<u8>) -> Result<(String, &'static str), String> {
+pub(super) fn decode_local_text(bytes: Vec<u8>) -> Result<(String, &'static str), String> {
     if bytes.starts_with(&[0xef, 0xbb, 0xbf]) {
         if bytes[3..].contains(&0) || bytes[3..].iter().any(|byte| *byte < 0x09 || (0x0e..=0x1f).contains(byte)) {
             return Err("The selected file appears to be binary and cannot be opened in the built-in text viewer".into());
@@ -329,6 +339,65 @@ fn decode_local_text(bytes: Vec<u8>) -> Result<(String, &'static str), String> {
     }
     if let Ok(content) = String::from_utf8(bytes.clone()) { return Ok((content, "utf-8")); }
     decode_windows_1252(&bytes).map(|content| (content, "windows-1252"))
+}
+
+pub(super) fn fingerprint_bytes(bytes: &[u8]) -> String {
+    // A content fingerprint is used only as an optimistic-concurrency guard,
+    // never as a security hash. Including the length makes accidental reuse
+    // still less likely and keeps the value cheap for ordinary source files.
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    hasher.write(bytes);
+    format!("{:016x}:{}", hasher.finish(), bytes.len())
+}
+
+pub(super) fn fingerprint_file(path: &Path) -> Result<String, String> {
+    let file = fs::File::open(path).map_err(|error| format!("Cannot verify '{}': {error}", path.display()))?;
+    let length = file.metadata().map_err(|error| format!("Cannot inspect '{}': {error}", path.display()))?.len();
+    let mut reader = BufReader::new(file);
+    let mut buffer = [0u8; 64 * 1024];
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    loop {
+        let count = reader.read(&mut buffer).map_err(|error| format!("Cannot verify '{}': {error}", path.display()))?;
+        if count == 0 { break; }
+        hasher.write(&buffer[..count]);
+    }
+    Ok(format!("{:016x}:{length}", hasher.finish()))
+}
+
+pub(super) fn temporary_sibling(path: &Path, label: &str) -> Result<PathBuf, String> {
+    let parent = path.parent().ok_or("A filesystem root cannot be replaced")?;
+    let name = path.file_name().ok_or("A filesystem root cannot be replaced")?.to_string_lossy();
+    for attempt in 0..32u8 {
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
+        let candidate = parent.join(format!(".{name}.git-drilldown-{label}-{}-{nonce}-{attempt}", std::process::id()));
+        if !candidate.exists() { return Ok(candidate); }
+    }
+    Err(format!("Could not reserve a temporary file next to '{}'", path.display()))
+}
+
+pub(super) fn replace_with_staged_file(staged: &Path, destination: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        fs::rename(staged, destination).map_err(|error| format!("Could not atomically replace '{}': {error}", destination.display()))
+    }
+    #[cfg(windows)]
+    {
+        // Windows cannot rename over an existing file. Keep the original as a
+        // sibling until the staged replacement is in place, then remove it.
+        // If installation fails, restoring the original is attempted before
+        // returning the error.
+        let backup = temporary_sibling(destination, "backup")?;
+        fs::rename(destination, &backup).map_err(|error| format!("Could not prepare safe replacement of '{}': {error}", destination.display()))?;
+        if let Err(error) = fs::rename(staged, destination) {
+            let restore = fs::rename(&backup, destination);
+            return Err(if let Err(restore_error) = restore {
+                format!("Could not install or restore '{}': {error}; restore also failed: {restore_error}. Original remains at '{}'", destination.display(), backup.display())
+            } else {
+                format!("Could not install replacement for '{}': {error}; original was restored", destination.display())
+            });
+        }
+        fs::remove_file(&backup).map_err(|error| format!("Saved '{}', but could not remove its temporary backup '{}': {error}", destination.display(), backup.display()))
+    }
 }
 
 fn cp1252_byte(character: char) -> Option<u8> {
@@ -370,8 +439,9 @@ fn read_local_text_file_inner(path: String) -> Result<LocalTextFile, String> {
     fs::File::open(&value)
         .and_then(|mut file| file.read_to_end(&mut bytes))
         .map_err(|error| format!("Cannot read '{}': {error}", value.display()))?;
+    let fingerprint = fingerprint_bytes(&bytes);
     let (content, encoding) = decode_local_text(bytes)?;
-    Ok(LocalTextFile { path: value.to_string_lossy().into_owned(), bytes: metadata.len(), content, encoding: encoding.into() })
+    Ok(LocalTextFile { path: value.to_string_lossy().into_owned(), bytes: metadata.len(), content, encoding: encoding.into(), fingerprint })
 }
 
 #[tauri::command]
@@ -379,19 +449,39 @@ pub async fn read_local_text_file(path: String) -> Result<LocalTextFile, String>
     off_main_thread(move || read_local_text_file_inner(path)).await
 }
 
-fn write_local_text_file_inner(path: String, content: String, encoding: Option<String>) -> Result<(), String> {
-    let (value, _) = existing_editable_file(&path)?;
+fn write_local_text_file_inner(path: String, content: String, encoding: Option<String>, expected_fingerprint: Option<String>) -> Result<LocalTextWriteResult, String> {
+    let (value, metadata) = existing_editable_file(&path)?;
+    if let Some(expected) = expected_fingerprint.as_deref() {
+        let actual = fingerprint_file(&value)?;
+        if actual != expected {
+            return Err(format!("'{}' changed on disk after it was opened. Nothing was overwritten — reopen the comparison and review the newer file.", value.display()));
+        }
+    }
     let bytes = encode_local_text(&content, encoding.as_deref().unwrap_or("utf-8"))?;
     if bytes.len() as u64 > MAX_LOCAL_TEXT_BYTES { return Err("The built-in viewer/editor supports text files up to 2 MB".into()); }
-    let mut file = OpenOptions::new().write(true).truncate(true).open(&value)
-        .map_err(|error| format!("Cannot edit '{}': {error}", value.display()))?;
-    file.write_all(&bytes).and_then(|_| file.flush())
-        .map_err(|error| format!("Could not finish saving '{}': {error}", value.display()))
+    let staged = temporary_sibling(&value, "write")?;
+    let operation = (|| {
+        let mut file = OpenOptions::new().write(true).create_new(true).open(&staged)
+            .map_err(|error| format!("Cannot stage changes for '{}': {error}", value.display()))?;
+        file.write_all(&bytes).and_then(|_| file.flush()).and_then(|_| file.sync_all())
+            .map_err(|error| format!("Could not finish staging '{}': {error}", value.display()))?;
+        fs::set_permissions(&staged, metadata.permissions()).map_err(|error| format!("Could not preserve permissions for '{}': {error}", value.display()))?;
+        if let Some(expected) = expected_fingerprint.as_deref() {
+            let actual = fingerprint_file(&value)?;
+            if actual != expected {
+                return Err(format!("'{}' changed on disk while it was being saved. Nothing was overwritten — reopen the comparison.", value.display()));
+            }
+        }
+        replace_with_staged_file(&staged, &value)
+    })();
+    if operation.is_err() { let _ = fs::remove_file(&staged); }
+    operation?;
+    Ok(LocalTextWriteResult { bytes: bytes.len() as u64, fingerprint: fingerprint_bytes(&bytes) })
 }
 
 #[tauri::command]
-pub async fn write_local_text_file(path: String, content: String, encoding: Option<String>) -> Result<(), String> {
-    off_main_thread(move || write_local_text_file_inner(path, content, encoding)).await
+pub async fn write_local_text_file(path: String, content: String, encoding: Option<String>, expected_fingerprint: Option<String>) -> Result<LocalTextWriteResult, String> {
+    off_main_thread(move || write_local_text_file_inner(path, content, encoding, expected_fingerprint)).await
 }
 
 #[cfg(test)]
@@ -485,7 +575,7 @@ mod tests {
         let opened = read_local_text_file_inner(path.clone()).unwrap();
         assert_eq!(opened.content, "before");
         assert_eq!(opened.encoding, "utf-8");
-        write_local_text_file_inner(path.clone(), "after".into(), Some(opened.encoding)).unwrap();
+        write_local_text_file_inner(path.clone(), "after".into(), Some(opened.encoding), Some(opened.fingerprint)).unwrap();
         assert_eq!(read_local_text_file_inner(path).unwrap().content, "after");
 
         let utf16 = root.join("windows-utf16.txt");
@@ -494,7 +584,7 @@ mod tests {
         let opened = read_local_text_file_inner(utf16_path.clone()).unwrap();
         assert_eq!(opened.content, "AB");
         assert_eq!(opened.encoding, "utf-16le");
-        write_local_text_file_inner(utf16_path, "CD".into(), Some(opened.encoding)).unwrap();
+        write_local_text_file_inner(utf16_path, "CD".into(), Some(opened.encoding), Some(opened.fingerprint)).unwrap();
         assert_eq!(fs::read(&utf16).unwrap(), [0xff, 0xfe, b'C', 0, b'D', 0]);
 
         let ansi = root.join("windows-ansi.txt");
@@ -503,7 +593,7 @@ mod tests {
         let opened = read_local_text_file_inner(ansi_path.clone()).unwrap();
         assert_eq!(opened.content, "café");
         assert_eq!(opened.encoding, "windows-1252");
-        write_local_text_file_inner(ansi_path, "déjà".into(), Some(opened.encoding)).unwrap();
+        write_local_text_file_inner(ansi_path, "déjà".into(), Some(opened.encoding), Some(opened.fingerprint)).unwrap();
         assert_eq!(fs::read(&ansi).unwrap(), [b'd', 0xe9, b'j', 0xe0]);
 
         let binary = root.join("binary.dat");
@@ -528,6 +618,31 @@ mod tests {
         ).unwrap();
         assert!(!source.exists());
         assert_eq!(fs::read_to_string(result.destination).unwrap(), "content");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn text_save_refuses_to_overwrite_a_file_changed_after_opening() {
+        let root = temp_dir("stale-text-save");
+        let file = root.join("shared.txt");
+        fs::write(&file, "opened").unwrap();
+        let path = file.to_string_lossy().into_owned();
+        let opened = read_local_text_file_inner(path.clone()).unwrap();
+        fs::write(&file, "external update").unwrap();
+        let error = write_local_text_file_inner(path, "my edit".into(), Some(opened.encoding), Some(opened.fingerprint)).unwrap_err();
+        assert!(error.contains("changed on disk"));
+        assert_eq!(fs::read_to_string(&file).unwrap(), "external update");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn streamed_fingerprint_matches_the_in_memory_fingerprint_for_large_files() {
+        let root = temp_dir("streamed-fingerprint");
+        let file = root.join("large.bin");
+        let bytes = (0..200_000).map(|index| (index % 251) as u8).collect::<Vec<_>>();
+        fs::write(&file, &bytes).unwrap();
+
+        assert_eq!(fingerprint_file(&file).unwrap(), fingerprint_bytes(&bytes));
         fs::remove_dir_all(root).unwrap();
     }
 }
