@@ -326,6 +326,20 @@
           <button type="button" id="showLocalDriveDiff" class="active" role="tab">Aligned differences</button>
           <button type="button" id="editLocalDriveDiff" role="tab">Aligned editor</button>
         </div>
+        <div class="local-drive-difference-tools">
+          <button type="button" id="previousLocalDriveDifference" title="Go to the previous important difference">↑ Previous</button>
+          <button type="button" id="nextLocalDriveDifference" title="Go to the next important difference">↓ Next</button>
+          <label title="Changes ignored by this rule remain visible but are not treated as merge blocks">Rules
+            <select id="localDriveComparisonRules" aria-label="Text comparison rules">
+              <option value="exact">Exact text</option>
+              <option value="trim-whitespace">Ignore edge spaces</option>
+              <option value="ignore-whitespace">Ignore all whitespace</option>
+              <option value="ignore-case">Ignore letter case</option>
+              <option value="ignore-whitespace-case">Ignore whitespace + case</option>
+            </select>
+          </label>
+          <span class="local-drive-merge-key"><b>→</b> line <b>Block →</b> section</span>
+        </div>
         <div class="local-drive-copy-all">
           <button type="button" id="undoLocalDriveResult" title="Undo the last in-memory change to the right result">Undo result</button>
           <button type="button" id="resetLocalDriveResult" title="Return the right result to the version read from disk">Reset result</button>
@@ -333,7 +347,7 @@
         </div>
       </div>
       <div id="localDriveDiffView" class="local-drive-diff-view">
-        <div class="local-drive-diff-head"><span>SOURCE · LEFT</span><span>APPLY</span><span>RESULT · RIGHT</span></div>
+        <div class="local-drive-diff-head"><span>SOURCE · LEFT</span><span>MERGE →</span><span>RESULT · RIGHT</span></div>
         <div id="localDriveDiffRows" class="local-drive-diff-rows"></div>
       </div>
       <div id="localDriveMergeEditors" class="local-drive-merge-editors" hidden>

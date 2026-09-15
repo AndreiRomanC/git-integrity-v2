@@ -41,6 +41,7 @@ function fakeComparisonDocument() {
     'localDriveDiffView', 'localDriveDiffRows', 'localDriveMergeEditors', 'localDriveCompareLeftContent',
     'localDriveCompareRightContent', 'showLocalDriveDiff', 'editLocalDriveDiff', 'copyAllLocalDriveRight',
     'localDriveAlignedEditors', 'localDriveResultPreview', 'localDriveResultStats', 'undoLocalDriveResult',
+    'previousLocalDriveDifference', 'nextLocalDriveDifference', 'localDriveComparisonRules',
     'resetLocalDriveResult', 'saveLocalDriveCompareLeft', 'saveLocalDriveCompareRight', 'localDriveCompareState',
     'closeLocalDriveCompare', 'cancelLocalDriveCompare',
     'localFolderMergeDialog', 'localFolderMergeSummary', 'localFolderMergeLeftPath', 'localFolderMergeRightPath',
@@ -145,6 +146,50 @@ test('F2 compares the selected file from each pane with two reads and no filesys
   assert.equal(calls.some(call => call.command === 'write_local_text_file'), false);
   assert.match(document.nodes.localDriveCompareSummary.textContent, /^Identical text/);
   assert.equal(document.nodes.localDriveCompareDialog.open, true);
+});
+
+test('the comparison line action preserves unrelated result lines and writes only after Save', async () => {
+  const dom = fakeLocalDriveDom();
+  const document = fakeComparisonDocument();
+  document.nodes.localDriveComparisonRules.value = 'exact';
+  const calls = [];
+  const invoke = async (command, args) => {
+    calls.push({ command, args });
+    if (command === 'list_local_directory' && args.path === '/repo') {
+      return { path: '/repo', parent: '/work', entries: [{ name: 'right.txt', path: '/repo/right.txt', kind: 'file', size: 8, modified: 0 }] };
+    }
+    if (command === 'list_local_directory' && args.path === '/work') {
+      return { path: '/work', parent: '/', entries: [{ name: 'left.bin', path: '/work/left.bin', kind: 'file', size: 8, modified: 0 }] };
+    }
+    if (command === 'read_local_text_file') return args.path === '/work/left.bin'
+      ? { path: args.path, content: 'git-stress seed=', encoding: 'utf-8', fingerprint: 'left-1' }
+      : { path: args.path, content: 'git-stress seed=old\nsynthetic git', encoding: 'utf-8', fingerprint: 'right-1' };
+    if (command === 'write_local_text_file') return { fingerprint: 'right-2' };
+    throw new Error(`Unexpected command ${command}`);
+  };
+  const workspace = create({ root: dom.root, document, invoke, diff: require('../frontend/local-diff.js') });
+  await workspace.activate('/repo');
+
+  const leftButton = { dataset: { driveEntry: '0' }, classList: classList() };
+  dom.panes.left.entryButtons = [leftButton];
+  dom.listeners.click({ target: { closest: selector => selector === '[data-drive-side]' ? dom.panes.left : selector === '[data-drive-entry]' ? leftButton : null } });
+  const rightButton = { dataset: { driveEntry: '0' }, classList: classList() };
+  dom.panes.right.entryButtons = [rightButton];
+  dom.listeners.click({ target: { closest: selector => selector === '[data-drive-side]' ? dom.panes.right : selector === '[data-drive-entry]' ? rightButton : null } });
+  const shortcut = { dataset: { driveShortcut: 'compare' } };
+  dom.listeners.click({ target: { closest: selector => selector === '[data-drive-shortcut]' ? shortcut : null } });
+  await new Promise(resolve => setImmediate(resolve));
+
+  assert.match(document.nodes.localDriveDiffRows.innerHTML, /data-local-diff-row="0"/);
+  const lineButton = { dataset: { localDiffRow: '0' } };
+  document.nodes.localDriveDiffRows.listeners.click({ target: { closest: selector => selector === '[data-local-diff-row]' ? lineButton : null } });
+  assert.equal(calls.some(call => call.command === 'write_local_text_file'), false, 'preparing a line merge must not write');
+
+  await document.nodes.saveLocalDriveCompareRight.listeners.click();
+  const write = calls.find(call => call.command === 'write_local_text_file');
+  assert.equal(write.args.path, '/repo/right.txt');
+  assert.equal(write.args.content, 'git-stress seed=\nsynthetic git');
+  assert.equal(write.args.expectedFingerprint, 'right-1');
 });
 
 test('F9 scans current folders read-only and a new file needs a separate confirmed left-to-right copy', async () => {

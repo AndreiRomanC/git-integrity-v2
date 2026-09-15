@@ -1,7 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const {
-  buildLineDiff, mergeHunk, createMergeRows, rowsToText, setMergeLine,
+  buildLineDiff, mergeHunk, mergeRow, createMergeRows, rowsToText, setMergeLine,
   insertMergeLine, joinMergeLineBackward, copyMergeRow, rowState,
 } = require('../frontend/local-diff.js');
 
@@ -28,6 +28,37 @@ test('a changed block can be accepted in either direction without touching disk'
   const right = 'header\nright value\nfooter';
   assert.equal(mergeHunk(left, right, 0, 'left-to-right').rightText, left);
   assert.equal(mergeHunk(left, right, 0, 'right-to-left').leftText, right);
+});
+
+test('a line merge replaces only the aligned line and preserves the rest of the result', () => {
+  const left = 'git-stress seed=';
+  const right = 'git-stress seed=5eed5eedd15ca1fc revision=00000000\nsynthetic git';
+  const diff = buildLineDiff(left, right);
+  assert.deepEqual(diff.rows.map(row => [row.left, row.right]), [
+    ['git-stress seed=', 'git-stress seed=5eed5eedd15ca1fc revision=00000000'],
+    [null, 'synthetic git'],
+  ]);
+  assert.equal(mergeRow(left, right, 0, 'left-to-right').rightText, 'git-stress seed=\nsynthetic git');
+  assert.equal(mergeHunk(left, right, 0, 'left-to-right').rightText, left);
+});
+
+test('line merge inserts or removes one aligned line without changing neighboring lines', () => {
+  assert.equal(mergeRow('one\ninserted\ntwo', 'one\ntwo', 1, 'left-to-right').rightText, 'one\ninserted\ntwo');
+  assert.equal(mergeRow('one\ntwo', 'one\nextra\ntwo', 1, 'left-to-right').rightText, 'one\ntwo');
+});
+
+test('comparison rules classify unimportant differences without changing original text', () => {
+  const whitespace = buildLineDiff('  Alpha beta  ', 'Alpha   beta', undefined, 'ignore-whitespace');
+  assert.equal(whitespace.equivalent, true);
+  assert.equal(whitespace.identical, false);
+  assert.equal(whitespace.ignoredDifferences, 1);
+  assert.equal(whitespace.rows[0].ignored, true);
+  assert.equal(rowsToText(whitespace.rows, 'left'), '  Alpha beta  ');
+  assert.equal(rowsToText(whitespace.rows, 'right'), 'Alpha   beta');
+
+  const letterCase = buildLineDiff('VALUE', 'value', undefined, 'ignore-case');
+  assert.equal(letterCase.equivalent, true);
+  assert.equal(letterCase.ignoredDifferences, 1);
 });
 
 test('large but similar comparisons keep exact alignment without the LCS matrix', () => {

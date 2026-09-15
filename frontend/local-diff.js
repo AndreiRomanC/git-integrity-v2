@@ -5,10 +5,54 @@
     return String(text ?? '').split('\n');
   }
 
+  function comparisonKey(line, rules = 'exact') {
+    // A trailing CR belongs to the line ending, not the line's text. Like
+    // established compare tools, LF and CRLF are equivalent by default while
+    // the original content remains untouched until a merge is explicitly
+    // prepared and saved.
+    let key = String(line ?? '').replace(/\r$/, '');
+    if (rules === 'trim-whitespace') key = key.trim();
+    else if (rules === 'ignore-whitespace') key = key.replace(/\s+/g, '');
+    else if (rules === 'ignore-case') key = key.toLowerCase();
+    else if (rules === 'ignore-whitespace-case') key = key.replace(/\s+/g, '').toLowerCase();
+    return key;
+  }
+
+  // LCS/Myers naturally emits a replacement as a deletion followed by an
+  // insertion. Pairing those lines by position inside the same changed run is
+  // the conventional side-by-side presentation and, critically, gives a
+  // single-line merge button an unambiguous destination line.
+  function pairChangedRows(rows) {
+    const paired = [];
+    for (let index = 0; index < rows.length;) {
+      if (rows[index].same) {
+        paired.push(rows[index++]);
+        continue;
+      }
+      const left = [];
+      const right = [];
+      while (index < rows.length && !rows[index].same) {
+        if (rows[index].left !== null) left.push(rows[index].left);
+        if (rows[index].right !== null) right.push(rows[index].right);
+        index++;
+      }
+      const count = Math.max(left.length, right.length);
+      for (let offset = 0; offset < count; offset++) {
+        paired.push({
+          left: offset < left.length ? left[offset] : null,
+          right: offset < right.length ? right[offset] : null,
+          same: false,
+          ignored: false,
+        });
+      }
+    }
+    return paired;
+  }
+
   // Myers is substantially cheaper than the full LCS matrix when two large
   // source files are mostly alike (the normal folder-sync case). Work is
   // capped so two completely unrelated generated files cannot freeze the UI.
-  function alignLinesMyers(leftLines, rightLines, workLimit = 500_000) {
+  function alignLinesMyers(leftLines, rightLines, leftKeys, rightKeys, workLimit = 500_000) {
     const n = leftLines.length;
     const m = rightLines.length;
     const maximum = n + m;
@@ -29,7 +73,7 @@
           leftIndex = (right ?? 0) + 1;
         }
         let rightIndex = leftIndex - diagonal;
-        while (leftIndex < n && rightIndex < m && leftLines[leftIndex] === rightLines[rightIndex]) {
+        while (leftIndex < n && rightIndex < m && leftKeys[leftIndex] === rightKeys[rightIndex]) {
           leftIndex++;
           rightIndex++;
           work++;
@@ -48,16 +92,19 @@
             const previousX = previous.get(previousDiagonal) ?? 0;
             const previousY = previousX - previousDiagonal;
             while (x > previousX && y > previousY) {
-              rows.push({ left: leftLines[x - 1], right: rightLines[y - 1], same: true });
+              rows.push({
+                left: leftLines[x - 1], right: rightLines[y - 1], same: true,
+                ignored: leftLines[x - 1] !== rightLines[y - 1],
+              });
               x--;
               y--;
             }
             if (depth === 0) break;
             if (x === previousX) {
-              rows.push({ left: null, right: rightLines[y - 1], same: false });
+              rows.push({ left: null, right: rightLines[y - 1], same: false, ignored: false });
               y--;
             } else {
-              rows.push({ left: leftLines[x - 1], right: null, same: false });
+              rows.push({ left: leftLines[x - 1], right: null, same: false, ignored: false });
               x--;
             }
           }
@@ -68,11 +115,13 @@
     return null;
   }
 
-  function alignLines(leftLines, rightLines, matrixLimit = DEFAULT_MATRIX_LIMIT) {
+  function alignLines(leftLines, rightLines, matrixLimit = DEFAULT_MATRIX_LIMIT, rules = 'exact') {
     const n = leftLines.length;
     const m = rightLines.length;
+    const leftKeys = leftLines.map(line => comparisonKey(line, rules));
+    const rightKeys = rightLines.map(line => comparisonKey(line, rules));
     if (n * m > matrixLimit) {
-      const exactRows = alignLinesMyers(leftLines, rightLines);
+      const exactRows = alignLinesMyers(leftLines, rightLines, leftKeys, rightKeys);
       if (exactRows) return { approximate: false, rows: exactRows };
       const count = Math.max(n, m);
       return {
@@ -80,7 +129,8 @@
         rows: Array.from({ length: count }, (_, index) => ({
           left: index < n ? leftLines[index] : null,
           right: index < m ? rightLines[index] : null,
-          same: index < n && index < m && leftLines[index] === rightLines[index],
+          same: index < n && index < m && leftKeys[index] === rightKeys[index],
+          ignored: index < n && index < m && leftKeys[index] === rightKeys[index] && leftLines[index] !== rightLines[index],
         })),
       };
     }
@@ -88,7 +138,7 @@
     const table = Array.from({ length: n + 1 }, () => new Uint32Array(m + 1));
     for (let left = n - 1; left >= 0; left--) {
       for (let right = m - 1; right >= 0; right--) {
-        table[left][right] = leftLines[left] === rightLines[right]
+        table[left][right] = leftKeys[left] === rightKeys[right]
           ? table[left + 1][right + 1] + 1
           : Math.max(table[left + 1][right], table[left][right + 1]);
       }
@@ -98,23 +148,29 @@
     let left = 0;
     let right = 0;
     while (left < n && right < m) {
-      if (leftLines[left] === rightLines[right]) {
-        rows.push({ left: leftLines[left++], right: rightLines[right++], same: true });
+      if (leftKeys[left] === rightKeys[right]) {
+        rows.push({
+          left: leftLines[left], right: rightLines[right], same: true,
+          ignored: leftLines[left] !== rightLines[right],
+        });
+        left++;
+        right++;
       } else if (table[left + 1][right] >= table[left][right + 1]) {
-        rows.push({ left: leftLines[left++], right: null, same: false });
+        rows.push({ left: leftLines[left++], right: null, same: false, ignored: false });
       } else {
-        rows.push({ left: null, right: rightLines[right++], same: false });
+        rows.push({ left: null, right: rightLines[right++], same: false, ignored: false });
       }
     }
-    while (left < n) rows.push({ left: leftLines[left++], right: null, same: false });
-    while (right < m) rows.push({ left: null, right: rightLines[right++], same: false });
+    while (left < n) rows.push({ left: leftLines[left++], right: null, same: false, ignored: false });
+    while (right < m) rows.push({ left: null, right: rightLines[right++], same: false, ignored: false });
     return { approximate: false, rows };
   }
 
-  function buildLineDiff(leftText, rightText, matrixLimit = DEFAULT_MATRIX_LIMIT) {
+  function buildLineDiff(leftText, rightText, matrixLimit = DEFAULT_MATRIX_LIMIT, rules = 'exact') {
     const leftLines = splitLines(leftText);
     const rightLines = splitLines(rightText);
-    const aligned = alignLines(leftLines, rightLines, matrixLimit);
+    const aligned = alignLines(leftLines, rightLines, matrixLimit, rules);
+    aligned.rows = pairChangedRows(aligned.rows);
     const hunks = [];
     let currentHunk = null;
     let leftCursor = 0;
@@ -131,12 +187,14 @@
           rightStart: rightCursor,
           leftLines: [],
           rightLines: [],
+          rowCount: 0,
         };
         hunks.push(currentHunk);
       }
 
       const hunkIndex = row.same ? -1 : hunks.length - 1;
       const hunkFirst = !row.same && currentHunk.leftLines.length === 0 && currentHunk.rightLines.length === 0;
+      if (currentHunk) currentHunk.rowCount++;
       if (row.left !== null) {
         leftCursor++;
         leftNumber++;
@@ -154,12 +212,14 @@
       rows,
       hunks,
       identical: String(leftText ?? '') === String(rightText ?? ''),
+      equivalent: hunks.length === 0,
+      ignoredDifferences: rows.filter(row => row.ignored).length,
       approximate: aligned.approximate,
     };
   }
 
-  function mergeHunk(leftText, rightText, hunkIndex, direction, matrixLimit = DEFAULT_MATRIX_LIMIT) {
-    const diff = buildLineDiff(leftText, rightText, matrixLimit);
+  function mergeHunk(leftText, rightText, hunkIndex, direction, matrixLimit = DEFAULT_MATRIX_LIMIT, rules = 'exact') {
+    const diff = buildLineDiff(leftText, rightText, matrixLimit, rules);
     const hunk = diff.hunks[hunkIndex];
     if (!hunk) return { leftText, rightText };
     const leftLines = splitLines(leftText);
@@ -172,6 +232,17 @@
       throw new Error(`Unknown merge direction: ${direction}`);
     }
     return { leftText: leftLines.join('\n'), rightText: rightLines.join('\n') };
+  }
+
+  function mergeRow(leftText, rightText, rowIndex, direction, matrixLimit = DEFAULT_MATRIX_LIMIT, rules = 'exact') {
+    const diff = buildLineDiff(leftText, rightText, matrixLimit, rules);
+    if (!diff.rows[rowIndex] || diff.rows[rowIndex].same) return { leftText, rightText };
+    const rows = diff.rows.map((row, index) => ({ id: index + 1, left: row.left, right: row.right }));
+    const merged = copyMergeRow(rows, rowIndex, direction);
+    return {
+      leftText: rowsToText(merged, 'left'),
+      rightText: rowsToText(merged, 'right'),
+    };
   }
 
   // The comparison view and the editor deliberately share the same aligned
@@ -266,7 +337,7 @@
   }
 
   const api = {
-    buildLineDiff, mergeHunk, splitLines,
+    buildLineDiff, mergeHunk, mergeRow, splitLines, comparisonKey,
     createMergeRows, rowsToText, setMergeLine, insertMergeLine,
     joinMergeLineBackward, copyMergeRow, rowState,
   };
