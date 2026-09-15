@@ -1,0 +1,161 @@
+use super::*;
+
+#[derive(Serialize)]
+pub struct BranchCreationContext {
+    pub(super) current_branch: String,
+    pub(super) current_commit: String,
+    pub(super) main_remote_branch: Option<String>,
+    pub(super) ahead: usize,
+    pub(super) behind: usize,
+}
+
+#[derive(Serialize)]
+pub struct BranchDivergence {
+    pub(super) name: String,
+    pub(super) tip: String,
+    // Real DAG divergence relative to the selected primary branch. These
+    // values must never be inferred from the visual lane or row position.
+    pub(super) ahead: usize,
+    pub(super) behind: usize,
+    // The actual common ancestor, or None for disconnected histories.
+    pub(super) merge_base: Option<String>,
+}
+
+// Computes OID-based divergence independently of the graph renderer.
+#[tauri::command]
+pub fn graph_branch_divergence(repository_path: String, primary_branch: String) -> Result<Vec<BranchDivergence>, String> {
+    validate_path(&repository_path)?;
+    let repo = internal_repository(&repository_path)?;
+    let Some(primary_tip) = repo.find_branch(&primary_branch, BranchType::Local).ok().and_then(|b| b.get().target()) else {
+        return Ok(Vec::new());
+    };
+    let mut result = Vec::new();
+    if let Ok(iterator) = repo.branches(Some(BranchType::Local)) {
+        for item in iterator.flatten() {
+            let name = match item.0.name().ok().flatten() { Some(name) => name.to_string(), None => continue };
+            let Some(tip) = item.0.get().target() else { continue };
+            let (ahead, behind) = repo.graph_ahead_behind(tip, primary_tip).unwrap_or((0, 0));
+            let merge_base = repo.merge_base(tip, primary_tip).ok().map(|oid| oid.to_string());
+            result.push(BranchDivergence { name, tip: tip.to_string(), ahead, behind, merge_base });
+        }
+    }
+    Ok(result)
+}
+
+// Describes exactly where a new branch would start and how that position
+// relates to the main remote branch.
+#[tauri::command]
+pub fn branch_creation_context(repository_path: String, target_path: String) -> Result<BranchCreationContext, String> {
+    let repository_path = resolve_target_repository(&repository_path, &target_path)?;
+    validate_path(&repository_path)?;
+    let repo = internal_repository(&repository_path)?;
+    let head = repo.head().map_err(|error| error.message().to_string())?;
+    let current_branch = head.shorthand().unwrap_or("HEAD").to_string();
+    let current_commit = head.peel_to_commit().map_err(|error| error.message().to_string())?.id().to_string();
+    let local_oid = head.target();
+
+    let mut main_remote_branch = None;
+    for candidate in ["origin/main", "origin/master"] {
+        if repo.find_branch(candidate, BranchType::Remote).is_ok() { main_remote_branch = Some(candidate.to_string()); break; }
+    }
+    if main_remote_branch.is_none() { main_remote_branch = default_remote_ref(&repository_path); }
+
+    let (ahead, behind) = local_oid.zip(main_remote_branch.as_deref())
+        .and_then(|(local, remote_name)| repo.find_branch(remote_name, BranchType::Remote).ok()?.get().target().map(|remote_oid| (local, remote_oid)))
+        .and_then(|(local, remote_oid)| repo.graph_ahead_behind(local, remote_oid).ok())
+        .unwrap_or((0, 0));
+
+    Ok(BranchCreationContext { current_branch, current_commit: current_commit[..8.min(current_commit.len())].to_string(), main_remote_branch, ahead, behind })
+}
+
+#[tauri::command]
+pub fn create_branch(path: String, branch: String) -> Result<(), String> {
+    if branch.trim().is_empty() { return Err("Branch name cannot be empty".into()); }
+    let queue_started = Instant::now();
+    let lock_handle = repo_write_lock(&path);
+    let _lock = lock_handle.lock().unwrap();
+    log_repo_write_lock_acquired(&path, "create_branch", queue_started.elapsed());
+    let repo = internal_repository(&path)?;
+    let head = repo.head().and_then(|head| head.peel_to_commit()).map_err(|error| error.message().to_string())?;
+    repo.branch(branch.trim(), &head, false).map_err(|error| error.message().to_string())?;
+    drop(head);
+    drop(_lock);
+    // switch_branch acquires the same lock; release ours before calling it.
+    switch_branch(path, branch)
+}
+
+// Resolves the target to the submodule's own repository, then refreshes only
+// the parent index metadata after the branch was created successfully.
+#[tauri::command]
+pub fn create_submodule_branch(repository_path: String, relative_path: String, branch: String) -> Result<(), String> {
+    if branch.trim().is_empty() { return Err("Branch name cannot be empty".into()); }
+    validate_path(&repository_path)?;
+    let absolute = validate_submodule(&repository_path, &relative_path)?;
+    create_branch(absolute.to_string_lossy().into_owned(), branch)?;
+    let queue_started = Instant::now();
+    let lock_handle = repo_write_lock(&repository_path);
+    let _lock = lock_handle.lock().unwrap();
+    log_repo_write_lock_acquired(&repository_path, "create_submodule_branch", queue_started.elapsed());
+    let parent = internal_repository(&repository_path)?;
+    let mut submodule = parent.find_submodule(&relative_path).map_err(|error| error.message().to_string())?;
+    submodule.add_to_index(true).map_err(|error| format!("Branch created, but the parent index could not be updated: {}", error.message()))?;
+    invalidate_git_metadata(&repository_path);
+    invalidate_submodule_sync(&repository_path);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn switch_branch(path: String, branch: String) -> Result<(), String> {
+    let queue_started = Instant::now();
+    let lock_handle = repo_write_lock(&path);
+    let _lock = lock_handle.lock().unwrap();
+    log_repo_write_lock_acquired(&path, "switch_branch", queue_started.elapsed());
+    let repo = internal_repository(&path)?;
+    let branch = branch.trim();
+    if branch.is_empty() { return Err("Branch name cannot be empty".into()); }
+    let reference = format!("refs/heads/{branch}");
+    let target_oid = repo.find_reference(&reference)
+        .map_err(|error| error.message().to_string())?
+        .peel_to_commit().map_err(|error| error.message().to_string())?.id();
+    // Install the target tree before changing HEAD. If safe checkout refuses,
+    // HEAD, index and worktree all stay on the original branch.
+    let target = repo.find_object(target_oid, Some(ObjectType::Commit)).map_err(|error| error.message().to_string())?;
+    let mut checkout = git2::build::CheckoutBuilder::new();
+    checkout.safe();
+    repo.checkout_tree(&target, Some(&mut checkout)).map_err(|error| format!("Cannot switch to '{branch}': {}", error.message()))?;
+    drop(target);
+    repo.set_head(&reference).map_err(|error| error.message().to_string())?;
+    invalidate_git_metadata(&path);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn rename_branch(repository_path: String, old_name: String, new_name: String) -> Result<(), String> {
+    validate_path(&repository_path)?;
+    if new_name.trim().is_empty() { return Err("Branch name cannot be empty".into()); }
+    let queue_started = Instant::now();
+    let lock_handle = repo_write_lock(&repository_path);
+    let _lock = lock_handle.lock().unwrap();
+    log_repo_write_lock_acquired(&repository_path, "rename_branch", queue_started.elapsed());
+    let repo = internal_repository(&repository_path)?;
+    let mut branch = repo.find_branch(old_name.trim(), BranchType::Local).map_err(|error| error.message().to_string())?;
+    branch.rename(new_name.trim(), false).map_err(|error| error.message().to_string())?;
+    invalidate_git_metadata(&repository_path);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn delete_branch(repository_path: String, branch_name: String) -> Result<(), String> {
+    validate_path(&repository_path)?;
+    let queue_started = Instant::now();
+    let lock_handle = repo_write_lock(&repository_path);
+    let _lock = lock_handle.lock().unwrap();
+    log_repo_write_lock_acquired(&repository_path, "delete_branch", queue_started.elapsed());
+    let repo = internal_repository(&repository_path)?;
+    let current = repo.head().ok().and_then(|head| head.shorthand().map(String::from));
+    if current.as_deref() == Some(branch_name.trim()) { return Err("Cannot delete the currently checked out branch. Switch to another branch first".into()); }
+    let mut branch = repo.find_branch(branch_name.trim(), BranchType::Local).map_err(|error| error.message().to_string())?;
+    branch.delete().map_err(|error| error.message().to_string())?;
+    invalidate_git_metadata(&repository_path);
+    Ok(())
+}
