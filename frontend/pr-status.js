@@ -1,3 +1,4 @@
+(() => {
 'use strict';
 
 // Pure pull-request card rendering. Keeping this free of Tauri/GitHub calls
@@ -58,3 +59,4 @@ function prCardHtml(pr = {}) {
 const api = { prCardHtml, prReviewerHtml, reviewerDisplayName };
 if (typeof window !== 'undefined') window.GitDrillDownPr = api;
 if (typeof module !== 'undefined' && module.exports) module.exports = api;
+})();

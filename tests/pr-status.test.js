@@ -1,6 +1,8 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const vm = require('node:vm');
 const { prCardHtml, prReviewerHtml, reviewerDisplayName } = require('../frontend/pr-status.js');
 
 const pr = {
@@ -45,4 +47,12 @@ test('PR cards remain compatible when GitHub returns no reviewer detail', () => 
   const html = prCardHtml(pr);
   assert.match(html, /Review required/);
   assert.doesNotMatch(html, /Reviewer activity/);
+});
+
+test('the classic browser script exports without leaking names into app.js global scope', () => {
+  const context = vm.createContext({ window: {} });
+  const source = fs.readFileSync(require.resolve('../frontend/pr-status.js'), 'utf8');
+  vm.runInContext(source, context);
+  assert.equal(typeof context.window.GitDrillDownPr.prCardHtml, 'function');
+  assert.doesNotThrow(() => vm.runInContext('const { prCardHtml } = window.GitDrillDownPr;', context));
 });
