@@ -40,8 +40,13 @@ function fakeComparisonDocument() {
     'localDriveCompareDialog', 'localDriveCompareSummary', 'localDriveCompareLeftPath', 'localDriveCompareRightPath',
     'localDriveDiffView', 'localDriveDiffRows', 'localDriveMergeEditors', 'localDriveCompareLeftContent',
     'localDriveCompareRightContent', 'showLocalDriveDiff', 'editLocalDriveDiff', 'copyAllLocalDriveRight',
-    'copyAllLocalDriveLeft', 'saveLocalDriveCompareLeft', 'saveLocalDriveCompareRight', 'localDriveCompareState',
+    'localDriveAlignedEditors', 'localDriveResultPreview', 'localDriveResultStats', 'undoLocalDriveResult',
+    'resetLocalDriveResult', 'saveLocalDriveCompareLeft', 'saveLocalDriveCompareRight', 'localDriveCompareState',
     'closeLocalDriveCompare', 'cancelLocalDriveCompare',
+    'localFolderMergeDialog', 'localFolderMergeSummary', 'localFolderMergeLeftPath', 'localFolderMergeRightPath',
+    'localFolderMergeCounts', 'localFolderMergeRows', 'localFolderPreviewTitle', 'localFolderPreviewStatus',
+    'localFolderPreviewContent', 'localFolderMergeState', 'rescanLocalFolderMerge', 'skipLocalFolderMergeFile',
+    'reviewLocalFolderMergeFile', 'applyLocalFolderMergeFile', 'closeLocalFolderMerge', 'cancelLocalFolderMerge',
   ];
   const nodes = Object.fromEntries(ids.map(id => [id, fakeNode()]));
   return {
@@ -53,7 +58,7 @@ function fakeComparisonDocument() {
 
 function fakeLocalDriveDom() {
   const listeners = {};
-  const shortcuts = Object.fromEntries(['compare', 'view', 'edit', 'copy', 'move', 'mkdir', 'trash'].map(action => [action, { setAttribute() {} }]));
+  const shortcuts = Object.fromEntries(['compare', 'view', 'edit', 'copy', 'move', 'mkdir', 'trash', 'folder-merge'].map(action => [action, { setAttribute() {} }]));
   function pane(side) {
     const path = { textContent: '', title: '' };
     const refresh = { disabled: false };
@@ -140,4 +145,34 @@ test('F2 compares the selected file from each pane with two reads and no filesys
   assert.equal(calls.some(call => call.command === 'write_local_text_file'), false);
   assert.match(document.nodes.localDriveCompareSummary.textContent, /^Identical text/);
   assert.equal(document.nodes.localDriveCompareDialog.open, true);
+});
+
+test('F9 scans current folders read-only and a new file needs a separate confirmed left-to-right copy', async () => {
+  const dom = fakeLocalDriveDom();
+  const document = fakeComparisonDocument();
+  const calls = [];
+  const invoke = async (command, args) => {
+    calls.push({ command, args });
+    if (command === 'list_local_directory' && args.path === '/right') return { path: '/right', parent: '/left', entries: [] };
+    if (command === 'list_local_directory' && args.path === '/left') return { path: '/left', parent: '/', entries: [] };
+    if (command === 'compare_local_directories') return {
+      left_root: '/left', right_root: '/right', counts: { same: 3, modified: 0, left_only: 1, right_only: 0, conflicts: 0 },
+      entries: [{ relative_path: 'new.txt', left_path: '/left/new.txt', right_path: null, status: 'left-only', left_bytes: 4, right_bytes: 0, reviewable: false }],
+    };
+    if (command === 'copy_local_merge_file') return { destination: '/right/new.txt', files: 1, directories: 0, bytes: 4 };
+    throw new Error(`Unexpected command ${command}`);
+  };
+  const workspace = create({ root: dom.root, document, invoke, diff: require('../frontend/local-diff.js'), confirm: async () => true });
+  await workspace.activate('/right');
+
+  const shortcut = { dataset: { driveShortcut: 'folder-merge' } };
+  dom.listeners.click({ target: { closest: selector => selector === '[data-drive-shortcut]' ? shortcut : null } });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(calls.find(call => call.command === 'compare_local_directories').args, { leftPath: '/left', rightPath: '/right' });
+  assert.equal(document.nodes.localFolderMergeDialog.open, true);
+  assert.equal(calls.some(call => call.command === 'copy_local_merge_file'), false, 'a scan must never write');
+
+  await document.nodes.applyLocalFolderMergeFile.listeners.click();
+  const copy = calls.find(call => call.command === 'copy_local_merge_file');
+  assert.deepEqual(copy.args, { leftRoot: '/left', rightRoot: '/right', relativePath: 'new.txt' });
 });

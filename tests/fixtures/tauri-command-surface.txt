@@ -11,10 +11,12 @@ commit_path
 commit_staged
 commit_submodule
 compare_file_contents
+compare_local_directories
 compare_remote_directory
 complete_merge
 conflict_sides
 copy_local_item
+copy_local_merge_file
 create_branch
 create_commit
 create_local_directory
@@ -70,6 +72,7 @@ resolve_conflict
 restore_file
 restore_remote_file
 restore_stash_paths
+replace_local_merge_file
 run_git_command
 run_terminal_command
 run_utrud
