@@ -1,6 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { create, displayEncoding, formatBytes, nativeParentPath } = require('../frontend/local-drive.js');
+const { create, displayEncoding, formatBytes, nativeChildPath, nativeParentPath } = require('../frontend/local-drive.js');
 
 test('Local Drive formats copy summaries without filesystem or backend work', () => {
   assert.equal(formatBytes(0), '0 B');
@@ -18,6 +18,11 @@ test('Local Drive derives a useful left pane from macOS, Linux and Windows repos
   assert.equal(nativeParentPath('D:\\work\\project'), 'D:\\work');
   assert.equal(nativeParentPath('D:\\'), '');
   assert.equal(nativeParentPath('/'), '');
+});
+
+test('Local Drive displays missing comparison paths with the native separator', () => {
+  assert.equal(nativeChildPath('/work/left', 'nested/file.txt'), '/work/left/nested/file.txt');
+  assert.equal(nativeChildPath('D:\\work\\right', 'nested/file.txt'), 'D:\\work\\right\\nested\\file.txt');
 });
 
 function classList() { return { toggle() {} }; }
@@ -44,12 +49,16 @@ function fakeComparisonDocument() {
     'previousLocalDriveDifference', 'nextLocalDriveDifference', 'localDriveComparisonRules',
     'resetLocalDriveResult', 'saveLocalDriveCompareLeft', 'saveLocalDriveCompareRight', 'localDriveCompareState',
     'closeLocalDriveCompare', 'cancelLocalDriveCompare',
-    'localFolderMergeDialog', 'localFolderMergeSummary', 'localFolderMergeLeftPath', 'localFolderMergeRightPath',
+    'localFolderMergeDialog', 'localFolderMergeTitle', 'localFolderMergeSummary', 'localFolderCompareMode', 'localFolderGuidedMode',
+    'localFolderDirectionWrap', 'localFolderMergeDirection', 'ignoreLocalFolderSubmodules',
+    'localFolderMergeLeftPath', 'localFolderMergeRightPath', 'localFolderQueueHint',
     'localFolderMergeCounts', 'localFolderMergeRows', 'localFolderPreviewTitle', 'localFolderPreviewStatus',
     'localFolderPreviewContent', 'localFolderMergeState', 'rescanLocalFolderMerge', 'skipLocalFolderMergeFile',
     'reviewLocalFolderMergeFile', 'applyLocalFolderMergeFile', 'closeLocalFolderMerge', 'cancelLocalFolderMerge',
   ];
   const nodes = Object.fromEntries(ids.map(id => [id, fakeNode()]));
+  nodes.ignoreLocalFolderSubmodules.checked = true;
+  nodes.localFolderMergeDirection.value = 'left-to-right';
   return {
     nodes,
     querySelector(selector) { return nodes[selector.replace(/^#/, '')] || null; },
@@ -59,7 +68,7 @@ function fakeComparisonDocument() {
 
 function fakeLocalDriveDom() {
   const listeners = {};
-  const shortcuts = Object.fromEntries(['compare', 'view', 'edit', 'copy', 'move', 'mkdir', 'trash', 'folder-merge'].map(action => [action, { setAttribute() {} }]));
+  const shortcuts = Object.fromEntries(['compare', 'view', 'edit', 'copy', 'move', 'mkdir', 'trash', 'folder-compare', 'folder-merge'].map(action => [action, { setAttribute() {} }]));
   function pane(side) {
     const path = { textContent: '', title: '' };
     const refresh = { disabled: false };
@@ -192,7 +201,49 @@ test('the comparison line action preserves unrelated result lines and writes onl
   assert.equal(write.args.expectedFingerprint, 'right-1');
 });
 
-test('F9 scans current folders read-only and a new file needs a separate confirmed left-to-right copy', async () => {
+test('F10 scans current folders and a new left file needs a separate confirmed left-to-right copy', async () => {
+  const dom = fakeLocalDriveDom();
+  const document = fakeComparisonDocument();
+  const calls = [];
+  const invoke = async (command, args) => {
+    calls.push({ command, args });
+    if (command === 'list_local_directory' && args.path === '/right') return { path: '/right', parent: '/left', entries: [] };
+    if (command === 'list_local_directory' && args.path === '/left') return {
+      path: '/left', parent: '/', entries: [{ name: 'selected-child', path: '/left/selected-child', kind: 'folder', size: 0, modified: 0 }],
+    };
+    if (command === 'compare_local_directories') return {
+      left_root: '/left', right_root: '/right', counts: { same: 3, modified: 0, left_only: 1, right_only: 0, conflicts: 0 },
+      entries: [{ relative_path: 'new.txt', left_path: '/left/new.txt', right_path: null, item_kind: 'file', status: 'left-only', left_bytes: 4, right_bytes: 0, reviewable: false }],
+    };
+    if (command === 'copy_local_merge_file') return { destination: '/right/new.txt', files: 1, directories: 0, bytes: 4 };
+    throw new Error(`Unexpected command ${command}`);
+  };
+  const workspace = create({ root: dom.root, document, invoke, diff: require('../frontend/local-diff.js'), confirm: async () => true });
+  await workspace.activate('/right');
+
+  const selectedChild = { dataset: { driveEntry: '0' }, classList: classList() };
+  dom.panes.left.entryButtons = [selectedChild];
+  dom.listeners.click({ target: { closest: selector => selector === '[data-drive-side]' ? dom.panes.left : selector === '[data-drive-entry]' ? selectedChild : null } });
+
+  const shortcut = { dataset: { driveShortcut: 'folder-merge' } };
+  dom.listeners.click({ target: { closest: selector => selector === '[data-drive-shortcut]' ? shortcut : null } });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(calls.find(call => call.command === 'compare_local_directories').args, { leftPath: '/left', rightPath: '/right', ignoreSubmodules: true });
+  assert.equal(document.nodes.localFolderMergeDialog.open, true);
+  assert.equal(calls.some(call => call.command === 'copy_local_merge_file'), false, 'a scan must never write');
+
+  document.nodes.ignoreLocalFolderSubmodules.checked = false;
+  await document.nodes.ignoreLocalFolderSubmodules.listeners.change();
+  assert.deepEqual(calls.filter(call => call.command === 'compare_local_directories').at(-1).args, {
+    leftPath: '/left', rightPath: '/right', ignoreSubmodules: false,
+  });
+
+  await document.nodes.applyLocalFolderMergeFile.listeners.click();
+  const copy = calls.find(call => call.command === 'copy_local_merge_file');
+  assert.deepEqual(copy.args, { leftRoot: '/left', rightRoot: '/right', relativePath: 'new.txt' });
+});
+
+test('Guided merge copies a right-only item back to the left with swapped safe roots', async () => {
   const dom = fakeLocalDriveDom();
   const document = fakeComparisonDocument();
   const calls = [];
@@ -201,23 +252,91 @@ test('F9 scans current folders read-only and a new file needs a separate confirm
     if (command === 'list_local_directory' && args.path === '/right') return { path: '/right', parent: '/left', entries: [] };
     if (command === 'list_local_directory' && args.path === '/left') return { path: '/left', parent: '/', entries: [] };
     if (command === 'compare_local_directories') return {
-      left_root: '/left', right_root: '/right', counts: { same: 3, modified: 0, left_only: 1, right_only: 0, conflicts: 0 },
-      entries: [{ relative_path: 'new.txt', left_path: '/left/new.txt', right_path: null, status: 'left-only', left_bytes: 4, right_bytes: 0, reviewable: false }],
+      left_root: '/left', right_root: '/right', counts: { same: 0, modified: 0, left_only: 0, right_only: 1, conflicts: 0, ignored_submodules: 0 },
+      entries: [{ relative_path: 'from-right.txt', left_path: null, right_path: '/right/from-right.txt', item_kind: 'file', status: 'right-only', left_bytes: 0, right_bytes: 5, reviewable: true }],
     };
-    if (command === 'copy_local_merge_file') return { destination: '/right/new.txt', files: 1, directories: 0, bytes: 4 };
+    if (command === 'copy_local_merge_file') return { destination: '/left/from-right.txt', files: 1, directories: 0, bytes: 5 };
     throw new Error(`Unexpected command ${command}`);
   };
   const workspace = create({ root: dom.root, document, invoke, diff: require('../frontend/local-diff.js'), confirm: async () => true });
   await workspace.activate('/right');
-
   const shortcut = { dataset: { driveShortcut: 'folder-merge' } };
   dom.listeners.click({ target: { closest: selector => selector === '[data-drive-shortcut]' ? shortcut : null } });
   await new Promise(resolve => setImmediate(resolve));
-  assert.deepEqual(calls.find(call => call.command === 'compare_local_directories').args, { leftPath: '/left', rightPath: '/right' });
-  assert.equal(document.nodes.localFolderMergeDialog.open, true);
-  assert.equal(calls.some(call => call.command === 'copy_local_merge_file'), false, 'a scan must never write');
 
+  const row = { dataset: { folderMergeEntry: 'from-right.txt' } };
+  document.nodes.localFolderMergeRows.listeners.click({ target: { closest: selector => selector === '[data-folder-merge-entry]' ? row : null } });
+  assert.equal(document.nodes.localFolderMergeDirection.value, 'right-to-left');
   await document.nodes.applyLocalFolderMergeFile.listeners.click();
-  const copy = calls.find(call => call.command === 'copy_local_merge_file');
-  assert.deepEqual(copy.args, { leftRoot: '/left', rightRoot: '/right', relativePath: 'new.txt' });
+  assert.deepEqual(calls.find(call => call.command === 'copy_local_merge_file').args, {
+    leftRoot: '/right', rightRoot: '/left', relativePath: 'from-right.txt',
+  });
+});
+
+test('Folder Compare is read-only and opens a one-sided text difference against an empty side', async () => {
+  const dom = fakeLocalDriveDom();
+  const document = fakeComparisonDocument();
+  const calls = [];
+  const invoke = async (command, args) => {
+    calls.push({ command, args });
+    if (command === 'list_local_directory' && args.path === '/right') return { path: '/right', parent: '/left', entries: [] };
+    if (command === 'list_local_directory' && args.path === '/left') return { path: '/left', parent: '/', entries: [] };
+    if (command === 'compare_local_directories') return {
+      left_root: '/left', right_root: '/right', counts: { same: 12, modified: 0, left_only: 0, right_only: 1, conflicts: 0, ignored_submodules: 0 },
+      entries: [{ relative_path: 'right.txt', left_path: null, right_path: '/right/right.txt', item_kind: 'file', status: 'right-only', left_bytes: 0, right_bytes: 5, reviewable: true }],
+    };
+    if (command === 'read_local_text_file') return { path: args.path, content: 'right only', encoding: 'utf-8', fingerprint: 'right-1' };
+    throw new Error(`Unexpected command ${command}`);
+  };
+  const workspace = create({ root: dom.root, document, invoke, diff: require('../frontend/local-diff.js') });
+  await workspace.activate('/right');
+  const shortcut = { dataset: { driveShortcut: 'folder-compare' } };
+  dom.listeners.click({ target: { closest: selector => selector === '[data-drive-shortcut]' ? shortcut : null } });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(document.nodes.localFolderMergeTitle.textContent, 'Compare folders');
+
+  const row = { dataset: { folderMergeEntry: 'right.txt' } };
+  document.nodes.localFolderMergeRows.listeners.click({ target: { closest: selector => selector === '[data-folder-merge-entry]' ? row : null } });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(document.nodes.localDriveCompareDialog.open, true);
+  assert.equal(calls.filter(call => call.command === 'read_local_text_file').length, 1, 'only the side that exists is read');
+  assert.equal(calls.some(call => call.command === 'write_local_text_file'), false);
+  assert.match(document.nodes.localDriveCompareSummary.textContent, /^Read-only/);
+});
+
+test('closing a folder scan never leaves the dialog stuck in loading state', async () => {
+  const dom = fakeLocalDriveDom();
+  const document = fakeComparisonDocument();
+  const pendingScans = [];
+  let scanCalls = 0;
+  const scanResult = {
+    left_root: '/left', right_root: '/right',
+    counts: { same: 0, modified: 0, left_only: 0, right_only: 0, conflicts: 0, ignored_submodules: 0 },
+    entries: [],
+  };
+  const invoke = async (command, args) => {
+    if (command === 'list_local_directory' && args.path === '/right') return { path: '/right', parent: '/left', entries: [] };
+    if (command === 'list_local_directory' && args.path === '/left') return { path: '/left', parent: '/', entries: [] };
+    if (command === 'compare_local_directories') {
+      scanCalls++;
+      return new Promise(resolve => pendingScans.push(resolve));
+    }
+    throw new Error(`Unexpected command ${command}`);
+  };
+  const workspace = create({ root: dom.root, document, invoke, diff: require('../frontend/local-diff.js') });
+  await workspace.activate('/right');
+  const shortcut = { dataset: { driveShortcut: 'folder-compare' } };
+
+  dom.listeners.click({ target: { closest: selector => selector === '[data-drive-shortcut]' ? shortcut : null } });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(scanCalls, 1);
+  document.nodes.closeLocalFolderMerge.listeners.click();
+  pendingScans.shift()(scanResult);
+  await new Promise(resolve => setImmediate(resolve));
+
+  dom.listeners.click({ target: { closest: selector => selector === '[data-drive-shortcut]' ? shortcut : null } });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(scanCalls, 2, 'the next scan must start after a cancelled scan completes');
+  pendingScans.shift()(scanResult);
+  await new Promise(resolve => setImmediate(resolve));
 });

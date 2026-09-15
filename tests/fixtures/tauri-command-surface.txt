@@ -20,6 +20,7 @@ copy_local_merge_file
 create_branch
 create_commit
 create_local_directory
+create_local_merge_directory
 create_submodule_branch
 create_submodule_tag
 delete_branch

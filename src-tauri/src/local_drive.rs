@@ -1,6 +1,6 @@
 use serde::Serialize;
-use std::hash::Hasher;
 use std::fs::{self, OpenOptions};
+use std::hash::Hasher;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -351,8 +351,17 @@ pub(super) fn fingerprint_bytes(bytes: &[u8]) -> String {
 }
 
 pub(super) fn fingerprint_file(path: &Path) -> Result<String, String> {
-    let bytes = fs::read(path).map_err(|error| format!("Cannot verify '{}': {error}", path.display()))?;
-    Ok(fingerprint_bytes(&bytes))
+    let file = fs::File::open(path).map_err(|error| format!("Cannot verify '{}': {error}", path.display()))?;
+    let length = file.metadata().map_err(|error| format!("Cannot inspect '{}': {error}", path.display()))?.len();
+    let mut reader = BufReader::new(file);
+    let mut buffer = [0u8; 64 * 1024];
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    loop {
+        let count = reader.read(&mut buffer).map_err(|error| format!("Cannot verify '{}': {error}", path.display()))?;
+        if count == 0 { break; }
+        hasher.write(&buffer[..count]);
+    }
+    Ok(format!("{:016x}:{length}", hasher.finish()))
 }
 
 pub(super) fn temporary_sibling(path: &Path, label: &str) -> Result<PathBuf, String> {
@@ -623,6 +632,17 @@ mod tests {
         let error = write_local_text_file_inner(path, "my edit".into(), Some(opened.encoding), Some(opened.fingerprint)).unwrap_err();
         assert!(error.contains("changed on disk"));
         assert_eq!(fs::read_to_string(&file).unwrap(), "external update");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn streamed_fingerprint_matches_the_in_memory_fingerprint_for_large_files() {
+        let root = temp_dir("streamed-fingerprint");
+        let file = root.join("large.bin");
+        let bytes = (0..200_000).map(|index| (index % 251) as u8).collect::<Vec<_>>();
+        fs::write(&file, &bytes).unwrap();
+
+        assert_eq!(fingerprint_file(&file).unwrap(), fingerprint_bytes(&bytes));
         fs::remove_dir_all(root).unwrap();
     }
 }

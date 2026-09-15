@@ -121,15 +121,15 @@
             <div class="commander-legend"><span><i class="same"></i>Same</span><span><i class="modified"></i>Modified</span><span><i class="local-only"></i>Only local</span><span><i class="remote-only"></i>Only remote</span></div>
           </div>
           <div id="localDrivePanel" class="local-drive-panel" hidden>
-            <div class="local-drive-note"><strong>LEFT = SOURCE · RIGHT = RESULT.</strong> Compare files with F2 or review a complete folder merge with F9. Nothing is written until you explicitly confirm it.</div>
+            <div class="local-drive-note"><strong>TWO INDEPENDENT LOCAL SIDES.</strong> F9 compares complete folder structures without writing; F10 opens a guided, confirmed merge in either direction.</div>
             <div class="local-drive-columns">
               <section class="local-drive-pane" data-drive-side="left">
-                <header><strong>SOURCE · LEFT</strong><div><button type="button" data-drive-action="choose">Choose…</button><button type="button" data-drive-action="refresh" title="Refresh">↻</button></div></header>
+                <header><strong>LEFT</strong><div><button type="button" data-drive-action="choose">Choose…</button><button type="button" data-drive-action="refresh" title="Refresh">↻</button></div></header>
                 <div class="local-drive-path" data-drive-path title="No folder selected">No folder selected</div>
                 <div class="local-drive-list" data-drive-list><div class="local-drive-empty">Choose a folder.</div></div>
               </section>
               <section class="local-drive-pane" data-drive-side="right">
-                <header><strong>RESULT · RIGHT</strong><div><button type="button" data-drive-action="choose">Choose…</button><button type="button" data-drive-action="refresh" title="Refresh">↻</button></div></header>
+                <header><strong>RIGHT</strong><div><button type="button" data-drive-action="choose">Choose…</button><button type="button" data-drive-action="refresh" title="Refresh">↻</button></div></header>
                 <div class="local-drive-path" data-drive-path title="No folder selected">No folder selected</div>
                 <div class="local-drive-list" data-drive-list><div class="local-drive-empty">Choose a folder.</div></div>
               </section>
@@ -142,7 +142,8 @@
               <button type="button" data-drive-shortcut="move"><kbd>F6</kbd><span>Move</span></button>
               <button type="button" data-drive-shortcut="mkdir"><kbd>F7</kbd><span>New folder</span></button>
               <button type="button" data-drive-shortcut="trash" class="danger-action-soft"><kbd>F8</kbd><span>Delete</span></button>
-              <button type="button" data-drive-shortcut="folder-merge" class="merge-action"><kbd>F9</kbd><span>Guided merge</span></button>
+              <button type="button" data-drive-shortcut="folder-compare"><kbd>F9</kbd><span>Compare folders</span></button>
+              <button type="button" data-drive-shortcut="folder-merge" class="merge-action"><kbd>F10</kbd><span>Guided merge</span></button>
             </div>
           </div>
         </div>
@@ -369,18 +370,31 @@
   <dialog id="localFolderMergeDialog" class="local-folder-merge-dialog">
     <div class="local-folder-merge-shell">
       <header>
-        <div><h2>Guided folder merge</h2><p id="localFolderMergeSummary">Compare first, then decide file by file</p></div>
+        <div><h2 id="localFolderMergeTitle">Compare folders</h2><p id="localFolderMergeSummary">Read-only scan of both folder structures</p></div>
         <button type="button" id="closeLocalFolderMerge" aria-label="Close">×</button>
       </header>
+      <div class="local-folder-modebar">
+        <div class="local-folder-modes" role="tablist" aria-label="Folder operation mode">
+          <button type="button" id="localFolderCompareMode" class="active" role="tab">Compare only</button>
+          <button type="button" id="localFolderGuidedMode" role="tab">Guided merge</button>
+        </div>
+        <label id="localFolderDirectionWrap" hidden>MERGE DIRECTION
+          <select id="localFolderMergeDirection">
+            <option value="left-to-right">Left → Right</option>
+            <option value="right-to-left">Right → Left</option>
+          </select>
+        </label>
+        <label class="local-folder-ignore"><input type="checkbox" id="ignoreLocalFolderSubmodules" checked> Ignore Git submodules</label>
+      </div>
       <div class="local-folder-direction">
-        <div><span>SOURCE · LEFT</span><strong id="localFolderMergeLeftPath">—</strong></div>
-        <b>→</b>
-        <div><span>RESULT · RIGHT</span><strong id="localFolderMergeRightPath">—</strong></div>
+        <div><span>LEFT FOLDER</span><strong id="localFolderMergeLeftPath">—</strong></div>
+        <b>⇄</b>
+        <div><span>RIGHT FOLDER</span><strong id="localFolderMergeRightPath">—</strong></div>
       </div>
       <div id="localFolderMergeCounts" class="local-folder-merge-counts"></div>
       <div class="local-folder-merge-body">
         <section class="local-folder-queue">
-          <header><strong>REVIEW QUEUE</strong><span>Identical files are skipped automatically</span></header>
+          <header><strong>DIFFERENCES</strong><span id="localFolderQueueHint">Identical items are counted but omitted</span></header>
           <div id="localFolderMergeRows" class="local-folder-merge-rows"></div>
         </section>
         <section class="local-folder-preview">
@@ -391,9 +405,9 @@
       <footer>
         <span id="localFolderMergeState" role="status">No disk changes are made by scanning.</span>
         <button type="button" id="rescanLocalFolderMerge">Rescan</button>
-        <button type="button" id="skipLocalFolderMergeFile">Keep right / skip</button>
-        <button type="button" id="reviewLocalFolderMergeFile">Open aligned merge…</button>
-        <button type="button" id="applyLocalFolderMergeFile" class="confirm">Apply source → right</button>
+        <button type="button" id="skipLocalFolderMergeFile">Leave different</button>
+        <button type="button" id="reviewLocalFolderMergeFile">Open file comparison…</button>
+        <button type="button" id="applyLocalFolderMergeFile" class="confirm">Use left → right</button>
         <button type="button" id="cancelLocalFolderMerge">Close</button>
       </footer>
     </div>

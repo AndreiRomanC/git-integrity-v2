@@ -22,6 +22,13 @@
     return value.slice(0, index).replace(/[\\/]+$/, '') || separator;
   }
 
+  function nativeChildPath(root, relativePath) {
+    const value = String(root || '').replace(/[\\/]+$/, '');
+    const separator = value.includes('\\') ? '\\' : '/';
+    const child = String(relativePath || '').replace(/[\\/]+/g, separator).replace(new RegExp(`^\\${separator}+`), '');
+    return value ? `${value}${separator}${child}` : child;
+  }
+
   function displayDate(seconds) {
     if (!seconds) return '';
     try { return new Date(seconds * 1000).toLocaleDateString(); }
@@ -48,6 +55,7 @@
     const diffEngine = options.diff || global.LocalDriveDiff;
     const maxAlignedEditorRows = 12_000;
     const maxDiffPreviewRows = 5_000;
+    const folderRowPageSize = 1_000;
     const sides = {
       left: { path: '', parent: null, entries: [], selectedPath: '', loading: false, generation: 0 },
       right: { path: '', parent: null, entries: [], selectedPath: '', loading: false, generation: 0 },
@@ -92,15 +100,22 @@
       leftText: '', rightText: '', leftEncoding: 'utf-8', rightEncoding: 'utf-8',
       leftFingerprint: '', rightFingerprint: '', mergeRows: [], resultHistory: [],
       mode: 'diff', generation: 0, loading: false, returnToFolderMerge: false,
-      activeDifferenceRow: -1,
+      activeDifferenceRow: -1, readOnly: false,
     };
     const folderMerge = {
       dialog: documentRef?.querySelector('#localFolderMergeDialog'),
+      title: documentRef?.querySelector('#localFolderMergeTitle'),
       summary: documentRef?.querySelector('#localFolderMergeSummary'),
+      compareMode: documentRef?.querySelector('#localFolderCompareMode'),
+      guidedMode: documentRef?.querySelector('#localFolderGuidedMode'),
+      directionWrap: documentRef?.querySelector('#localFolderDirectionWrap'),
+      direction: documentRef?.querySelector('#localFolderMergeDirection'),
+      ignoreSubmodules: documentRef?.querySelector('#ignoreLocalFolderSubmodules'),
       leftPathNode: documentRef?.querySelector('#localFolderMergeLeftPath'),
       rightPathNode: documentRef?.querySelector('#localFolderMergeRightPath'),
       counts: documentRef?.querySelector('#localFolderMergeCounts'),
       rows: documentRef?.querySelector('#localFolderMergeRows'),
+      queueHint: documentRef?.querySelector('#localFolderQueueHint'),
       previewTitle: documentRef?.querySelector('#localFolderPreviewTitle'),
       previewStatus: documentRef?.querySelector('#localFolderPreviewStatus'),
       previewContent: documentRef?.querySelector('#localFolderPreviewContent'),
@@ -111,7 +126,7 @@
       apply: documentRef?.querySelector('#applyLocalFolderMergeFile'),
       close: documentRef?.querySelector('#closeLocalFolderMerge'),
       cancel: documentRef?.querySelector('#cancelLocalFolderMerge'),
-      leftRoot: '', rightRoot: '', entries: [], selectedPath: '', loading: false,
+      leftRoot: '', rightRoot: '', entries: [], selectedPath: '', loading: false, mode: 'compare', visibleLimit: folderRowPageSize,
       generation: 0, previewGeneration: 0, resolved: new Set(), skipped: new Set(),
     };
     let active = false;
@@ -155,6 +170,7 @@
       setAvailability('move', !selected || !destination.path || sides.left.loading || sides.right.loading);
       setAvailability('mkdir', !sides[activeSide].path || sides[activeSide].loading);
       setAvailability('trash', !selected || sides[activeSide].loading);
+      setAvailability('folder-compare', !sides.left.path || !sides.right.path || sides.left.loading || sides.right.loading);
       setAvailability('folder-merge', !sides.left.path || !sides.right.path || sides.left.loading || sides.right.loading);
     }
 
@@ -459,15 +475,16 @@
     function updateComparisonState(message = '') {
       const leftDirty = comparisonDirty('left');
       const rightDirty = comparisonDirty('right');
-      if (comparison.saveLeft) comparison.saveLeft.disabled = comparison.loading || !leftDirty;
-      if (comparison.saveRight) comparison.saveRight.disabled = comparison.loading || !rightDirty;
-      if (comparison.copyAllRight) comparison.copyAllRight.disabled = comparison.loading;
-      if (comparison.undoResult) comparison.undoResult.disabled = comparison.loading || !comparison.resultHistory.length;
-      if (comparison.resetResult) comparison.resetResult.disabled = comparison.loading || !rightDirty;
+      if (comparison.saveLeft) comparison.saveLeft.disabled = comparison.readOnly || comparison.loading || !leftDirty;
+      if (comparison.saveRight) comparison.saveRight.disabled = comparison.readOnly || comparison.loading || !rightDirty;
+      if (comparison.copyAllRight) comparison.copyAllRight.disabled = comparison.readOnly || comparison.loading;
+      if (comparison.undoResult) comparison.undoResult.disabled = comparison.readOnly || comparison.loading || !comparison.resultHistory.length;
+      if (comparison.resetResult) comparison.resetResult.disabled = comparison.readOnly || comparison.loading || !rightDirty;
       if (comparison.previousDifference) comparison.previousDifference.disabled = comparison.loading;
       if (comparison.nextDifference) comparison.nextDifference.disabled = comparison.loading;
       if (!comparison.stateNode) return;
       if (message) comparison.stateNode.textContent = message;
+      else if (comparison.readOnly) comparison.stateNode.textContent = 'Folder comparison · read-only';
       else if (leftDirty && rightDirty) comparison.stateNode.textContent = 'Unsaved edits on both sides';
       else if (leftDirty) comparison.stateNode.textContent = 'Unsaved edits on the left';
       else if (rightDirty) comparison.stateNode.textContent = 'Unsaved edits on the right';
@@ -495,7 +512,7 @@
           : row.right === null
             ? 'Insert only this source line into the prepared result'
             : 'Replace only this aligned result line with the source line';
-        const mergeButtons = row.same
+        const mergeButtons = row.same || comparison.readOnly
           ? '<div class="local-drive-hunk-actions"><i title="Lines match under the selected rules"></i></div>'
           : `<div class="local-drive-hunk-actions"><button type="button" class="line-merge ${row.left === null ? 'delete-line' : ''}" data-local-diff-row="${rowIndex}" title="${lineTitle}">${row.left === null ? 'Delete' : '→'}</button>${multiRowBlock ? `<button type="button" class="block-merge" data-local-diff-block="${row.hunkIndex}" title="Replace this complete changed section on the right">Block →</button>` : ''}</div>`;
         return `<div class="local-drive-diff-row ${comparison.activeDifferenceRow === rowIndex ? 'active-difference' : ''}" data-diff-row="${rowIndex}">${renderDiffLine(row.left, row.leftNumber, 'left', row.same, row.ignored)}${mergeButtons}${renderDiffLine(row.right, row.rightNumber, 'right', row.same, row.ignored)}</div>`;
@@ -505,17 +522,18 @@
       }
       const qualifier = diff.approximate ? ' · large-file alignment is approximate' : '';
       const encodings = ` · Left ${displayEncoding(comparison.leftEncoding)} / Right ${displayEncoding(comparison.rightEncoding)}`;
-      comparison.summary.textContent = diff.identical
+      const prefix = comparison.readOnly ? 'Read-only · ' : '';
+      comparison.summary.textContent = prefix + (diff.identical
         ? `Identical text · ${diff.rows.length.toLocaleString()} line${diff.rows.length === 1 ? '' : 's'}${encodings}`
         : diff.equivalent
           ? `Equivalent with selected rules · ${diff.ignoredDifferences.toLocaleString()} ignored line difference${diff.ignoredDifferences === 1 ? '' : 's'}${encodings}`
-          : `${diff.hunks.length.toLocaleString()} changed block${diff.hunks.length === 1 ? '' : 's'}${diff.ignoredDifferences ? ` · ${diff.ignoredDifferences.toLocaleString()} ignored` : ''}${qualifier}${encodings}`;
+          : `${diff.hunks.length.toLocaleString()} changed block${diff.hunks.length === 1 ? '' : 's'}${diff.ignoredDifferences ? ` · ${diff.ignoredDifferences.toLocaleString()} ignored` : ''}${qualifier}${encodings}`);
       comparison.summary.classList.toggle('identical', diff.equivalent);
       updateComparisonState();
     }
 
     function setComparisonMode(mode) {
-      if (comparison.loading) return;
+      if (comparison.loading || (comparison.readOnly && mode === 'edit')) return;
       syncComparisonEditors();
       if (mode === 'edit') {
         const rows = diffEngine.createMergeRows(comparison.leftText, comparison.rightText);
@@ -539,7 +557,7 @@
       updateComparisonState();
     }
 
-    async function openComparisonPair(pair, { returnToFolderMerge = false } = {}) {
+    async function openComparisonPair(pair, { returnToFolderMerge = false, readOnly = false } = {}) {
       if (!pair) {
         notify('Select one text file in each pane, or select a file that has the same name in the other pane.', 'error');
         return;
@@ -548,19 +566,26 @@
       const generation = ++comparison.generation;
       operationBusy = true;
       comparison.loading = true;
-      comparison.leftPath = pair.left.path;
-      comparison.rightPath = pair.right.path;
+      comparison.leftPath = pair.left.path || '';
+      comparison.rightPath = pair.right.path || '';
       comparison.leftOriginal = comparison.leftText = '';
       comparison.rightOriginal = comparison.rightText = '';
       comparison.leftFingerprint = comparison.rightFingerprint = '';
       comparison.mergeRows = [];
       comparison.resultHistory = [];
       comparison.activeDifferenceRow = -1;
+      comparison.readOnly = readOnly;
       comparison.returnToFolderMerge = returnToFolderMerge;
-      comparison.leftPathNode.textContent = pair.left.path;
-      comparison.leftPathNode.title = pair.left.path;
-      comparison.rightPathNode.textContent = pair.right.path;
-      comparison.rightPathNode.title = pair.right.path;
+      const leftDisplayPath = pair.left.displayPath || pair.left.path || '(missing on left)';
+      const rightDisplayPath = pair.right.displayPath || pair.right.path || '(missing on right)';
+      comparison.leftPathNode.textContent = leftDisplayPath;
+      comparison.leftPathNode.title = leftDisplayPath;
+      comparison.rightPathNode.textContent = rightDisplayPath;
+      comparison.rightPathNode.title = rightDisplayPath;
+      if (comparison.showEdit) comparison.showEdit.hidden = readOnly;
+      for (const node of [comparison.copyAllRight, comparison.undoResult, comparison.resetResult, comparison.saveLeft, comparison.saveRight]) {
+        if (node) node.hidden = readOnly;
+      }
       comparison.summary.textContent = 'Reading both files…';
       comparison.diffRows.innerHTML = '<div class="local-drive-diff-empty"><i class="spinner"></i> Comparing…</div>';
       comparison.mode = 'diff';
@@ -572,9 +597,10 @@
       comparison.dialog.showModal();
       renderCommandState();
       try {
+        const emptySide = { content: '', bytes: 0, encoding: 'utf-8', fingerprint: '' };
         const [leftFile, rightFile] = await Promise.all([
-          invoke('read_local_text_file', { path: pair.left.path }),
-          invoke('read_local_text_file', { path: pair.right.path }),
+          pair.left.missing ? Promise.resolve(emptySide) : invoke('read_local_text_file', { path: pair.left.path }),
+          pair.right.missing ? Promise.resolve(emptySide) : invoke('read_local_text_file', { path: pair.right.path }),
         ]);
         if (generation !== comparison.generation) return;
         comparison.leftOriginal = comparison.leftText = leftFile.content;
@@ -603,7 +629,7 @@
     }
 
     function mergeComparisonHunk(direction, hunkIndex) {
-      if (comparison.loading) return;
+      if (comparison.loading || comparison.readOnly) return;
       syncComparisonEditors();
       if (direction === 'left-to-right') rememberRightResult();
       const merged = diffEngine.mergeHunk(comparison.leftText, comparison.rightText, hunkIndex, direction, undefined, comparisonRules());
@@ -615,7 +641,7 @@
     }
 
     function mergeComparisonRow(rowIndex) {
-      if (comparison.loading) return;
+      if (comparison.loading || comparison.readOnly) return;
       syncComparisonEditors();
       rememberRightResult();
       const merged = diffEngine.mergeRow(comparison.leftText, comparison.rightText, rowIndex, 'left-to-right', undefined, comparisonRules());
@@ -644,7 +670,7 @@
     }
 
     function copyWholeComparison(direction) {
-      if (comparison.loading) return;
+      if (comparison.loading || comparison.readOnly) return;
       syncComparisonEditors();
       if (direction !== 'left-to-right') return;
       rememberRightResult();
@@ -678,7 +704,7 @@
     }
 
     function applyMergeRow(rowIndex) {
-      if (comparison.loading || !comparison.mergeRows[rowIndex]) return;
+      if (comparison.readOnly || comparison.loading || !comparison.mergeRows[rowIndex]) return;
       syncComparisonEditors();
       rememberRightResult();
       comparison.mergeRows = diffEngine.copyMergeRow(comparison.mergeRows, rowIndex, 'left-to-right');
@@ -689,7 +715,7 @@
 
     async function saveComparisonSide(side) {
       syncComparisonEditors();
-      if (!comparisonDirty(side) || comparison.loading || operationBusy) return;
+      if (comparison.readOnly || !comparisonDirty(side) || comparison.loading || operationBusy) return;
       const path = comparison[`${side}Path`];
       operationBusy = true;
       comparison.loading = true;
@@ -731,12 +757,9 @@
     }
 
     function folderRoots() {
-      const selectedLeft = selectedEntry('left');
-      const selectedRight = selectedEntry('right');
-      return {
-        left: selectedLeft?.kind === 'folder' ? selectedLeft.path : sides.left.path,
-        right: selectedRight?.kind === 'folder' ? selectedRight.path : sides.right.path,
-      };
+      // Folder operations always use the two paths visibly opened in the
+      // panes. A merely selected child must never silently change the scope.
+      return { left: sides.left.path, right: sides.right.path };
     }
 
     function selectedFolderMergeEntry() {
@@ -744,83 +767,120 @@
     }
 
     function folderStatusCopy(entry) {
-      if (folderMerge.resolved.has(entry.relative_path)) return entry.reviewResult || 'Applied to right';
-      if (folderMerge.skipped.has(entry.relative_path)) return 'Kept on right';
+      if (folderMerge.resolved.has(entry.relative_path)) return entry.reviewResult || 'Reconciled';
+      if (folderMerge.skipped.has(entry.relative_path)) return 'Intentionally left different';
       return {
-        modified: entry.reviewable ? 'Text differs · reviewable' : 'Different content',
-        'left-only': 'New on left',
-        'right-only': 'Only on right · kept',
+        modified: entry.reviewable ? 'Text differs · open comparison' : 'Different binary content',
+        'left-only': entry.item_kind === 'folder' ? 'Folder exists only on left' : 'File exists only on left',
+        'right-only': entry.item_kind === 'folder' ? 'Folder exists only on right' : 'File exists only on right',
         'type-conflict': 'File type conflict',
         unsupported: 'Symbolic link · protected',
+        'ignored-submodule': 'Git submodule ignored by scan option',
       }[entry.status] || entry.status;
     }
 
     function nextFolderMergeEntry() {
-      const actionable = folderMerge.entries.filter(entry => entry.status !== 'same' && !folderMerge.resolved.has(entry.relative_path) && !folderMerge.skipped.has(entry.relative_path));
-      return actionable[0] || null;
+      return folderMerge.entries.find(entry => entry.status !== 'ignored-submodule' && !folderMerge.resolved.has(entry.relative_path) && !folderMerge.skipped.has(entry.relative_path)) || null;
+    }
+
+    function folderDirection() {
+      return folderMerge.direction?.value || 'left-to-right';
+    }
+
+    function directionSides(direction = folderDirection()) {
+      return direction === 'right-to-left'
+        ? { source: 'right', result: 'left', sourceRoot: folderMerge.rightRoot, resultRoot: folderMerge.leftRoot }
+        : { source: 'left', result: 'right', sourceRoot: folderMerge.leftRoot, resultRoot: folderMerge.rightRoot };
+    }
+
+    function canApplyFolderEntry(entry, direction = folderDirection()) {
+      if (!entry || ['ignored-submodule', 'type-conflict', 'unsupported'].includes(entry.status)) return false;
+      if (entry.status === 'modified') return entry.item_kind === 'file';
+      return (entry.status === 'left-only' && direction === 'left-to-right')
+        || (entry.status === 'right-only' && direction === 'right-to-left');
     }
 
     function renderFolderMerge() {
       if (!folderMerge.dialog) return;
-      const counts = folderMerge.countsModel || { same: 0, modified: 0, left_only: 0, right_only: 0, conflicts: 0 };
+      const compareOnly = folderMerge.mode === 'compare';
+      const counts = folderMerge.countsModel || { same: 0, modified: 0, left_only: 0, right_only: 0, conflicts: 0, ignored_submodules: 0 };
+      if (folderMerge.title) folderMerge.title.textContent = compareOnly ? 'Compare folders' : 'Guided folder merge';
+      folderMerge.compareMode?.classList.toggle('active', compareOnly);
+      folderMerge.guidedMode?.classList.toggle('active', !compareOnly);
+      if (folderMerge.directionWrap) folderMerge.directionWrap.hidden = compareOnly;
+      if (folderMerge.queueHint) folderMerge.queueHint.textContent = compareOnly ? 'Click a text file to open its full comparison' : 'Choose a direction; every write is confirmed';
       if (folderMerge.counts) folderMerge.counts.innerHTML = [
-        ['same', counts.same, 'Identical'], ['modified', counts.modified, 'Modified'],
-        ['left-only', counts.left_only, 'New from left'], ['right-only', counts.right_only, 'Only on right'],
-        ['conflict', counts.conflicts, 'Need manual care'],
+        ['same', counts.same, 'Identical omitted'], ['modified', counts.modified, 'Modified'],
+        ['left-only', counts.left_only, 'Only on left'], ['right-only', counts.right_only, 'Only on right'],
+        ['conflict', counts.conflicts, 'Need manual care'], ['ignored', counts.ignored_submodules, 'Submodules ignored'],
       ].map(([kind, count, label]) => `<span class="local-folder-count ${kind}"><b>${Number(count || 0).toLocaleString()}</b>${label}</span>`).join('');
-      const queue = folderMerge.entries.filter(entry => entry.status !== 'same');
+      const queue = folderMerge.entries;
       if (!folderMerge.selectedPath || !queue.some(entry => entry.relative_path === folderMerge.selectedPath)) {
         folderMerge.selectedPath = nextFolderMergeEntry()?.relative_path || queue[0]?.relative_path || '';
       }
-      if (folderMerge.rows) folderMerge.rows.innerHTML = queue.map(entry => {
+      const visibleQueue = queue.slice(0, folderMerge.visibleLimit);
+      if (folderMerge.rows) folderMerge.rows.innerHTML = visibleQueue.map(entry => {
         const selected = entry.relative_path === folderMerge.selectedPath;
         const resolved = folderMerge.resolved.has(entry.relative_path) || folderMerge.skipped.has(entry.relative_path);
-        return `<button type="button" class="local-folder-row ${escapeHtml(entry.status)} ${selected ? 'selected' : ''} ${resolved ? 'resolved' : ''}" data-folder-merge-entry="${escapeHtml(entry.relative_path)}" title="${escapeHtml(entry.relative_path)}"><i></i><span class="local-folder-row-copy"><strong>${escapeHtml(entry.relative_path)}</strong><small>${escapeHtml(folderStatusCopy(entry))}</small></span><em>${formatBytes(entry.left_bytes || entry.right_bytes)}</em></button>`;
-      }).join('') || '<div class="local-drive-empty">The folders already contain identical files.</div>';
-      const pending = queue.filter(entry => !folderMerge.resolved.has(entry.relative_path) && !folderMerge.skipped.has(entry.relative_path)).length;
-      if (folderMerge.summary) folderMerge.summary.textContent = folderMerge.loading ? 'Scanning both folders without changing them…' : `${pending.toLocaleString()} file${pending === 1 ? '' : 's'} left to review · identical files skipped`;
+        return `<button type="button" class="local-folder-row ${escapeHtml(entry.status)} ${selected ? 'selected' : ''} ${resolved ? 'resolved' : ''}" data-folder-merge-entry="${escapeHtml(entry.relative_path)}" title="${escapeHtml(entry.relative_path)}"><i></i><span class="local-folder-row-copy"><strong>${escapeHtml(entry.relative_path)}</strong><small><b>${escapeHtml(entry.item_kind || 'file')}</b>${escapeHtml(folderStatusCopy(entry))}</small></span><em>${entry.item_kind === 'file' ? formatBytes(entry.left_bytes || entry.right_bytes) : ''}</em></button>`;
+      }).join('') + (queue.length > visibleQueue.length
+        ? `<button type="button" class="local-folder-load-more" data-folder-load-more="1">Show next ${Math.min(folderRowPageSize, queue.length - visibleQueue.length).toLocaleString()} differences · ${(queue.length - visibleQueue.length).toLocaleString()} remaining</button>`
+        : '') || '<div class="local-drive-empty">The two folder structures are identical.</div>';
+      const pending = queue.filter(entry => entry.status !== 'ignored-submodule' && !folderMerge.resolved.has(entry.relative_path) && !folderMerge.skipped.has(entry.relative_path)).length;
+      if (folderMerge.summary) folderMerge.summary.textContent = folderMerge.loading
+        ? 'Scanning both folder structures without changing them…'
+        : compareOnly
+          ? `${queue.length.toLocaleString()} difference${queue.length === 1 ? '' : 's'} · ${Number(counts.same || 0).toLocaleString()} identical item${counts.same === 1 ? '' : 's'} omitted`
+          : `${pending.toLocaleString()} difference${pending === 1 ? '' : 's'} left to reconcile · no automatic deletion`;
       const selected = selectedFolderMergeEntry();
       const finished = selected && (folderMerge.resolved.has(selected.relative_path) || folderMerge.skipped.has(selected.relative_path));
-      if (folderMerge.review) folderMerge.review.disabled = folderMerge.loading || finished || selected?.status !== 'modified' || !selected?.reviewable;
-      if (folderMerge.skip) folderMerge.skip.disabled = folderMerge.loading || !selected || finished;
+      if (folderMerge.review) {
+        folderMerge.review.hidden = false;
+        folderMerge.review.disabled = folderMerge.loading || finished || selected?.item_kind !== 'file' || !selected?.reviewable;
+        folderMerge.review.textContent = compareOnly ? 'Open file comparison…' : `Open ${folderDirection() === 'left-to-right' ? 'left → right' : 'right → left'} merge…`;
+      }
+      if (folderMerge.skip) {
+        folderMerge.skip.hidden = compareOnly;
+        folderMerge.skip.disabled = folderMerge.loading || !selected || finished || selected?.status === 'ignored-submodule';
+      }
       if (folderMerge.apply) {
-        folderMerge.apply.disabled = folderMerge.loading || finished || !selected || !['modified', 'left-only'].includes(selected.status);
-        folderMerge.apply.textContent = selected?.status === 'left-only' ? 'Copy new file →' : 'Apply source → right';
+        folderMerge.apply.hidden = compareOnly;
+        folderMerge.apply.disabled = folderMerge.loading || finished || !canApplyFolderEntry(selected);
+        const direction = folderDirection();
+        const item = selected?.item_kind === 'folder' ? 'folder' : 'file';
+        folderMerge.apply.textContent = selected?.status === 'modified'
+          ? `Use ${direction === 'left-to-right' ? 'left → right' : 'right → left'}`
+          : `Copy ${item} ${direction === 'left-to-right' ? '→' : '←'}`;
       }
       if (folderMerge.rescan) folderMerge.rescan.disabled = folderMerge.loading;
-      if (folderMerge.stateNode && !folderMerge.loading) folderMerge.stateNode.textContent = pending ? 'Every write requires an explicit file-level confirmation.' : 'Review complete. Rescan to verify both folders.';
+      if (folderMerge.compareMode) folderMerge.compareMode.disabled = folderMerge.loading;
+      if (folderMerge.guidedMode) folderMerge.guidedMode.disabled = folderMerge.loading;
+      if (folderMerge.direction) folderMerge.direction.disabled = folderMerge.loading;
+      if (folderMerge.ignoreSubmodules) folderMerge.ignoreSubmodules.disabled = folderMerge.loading;
+      if (folderMerge.stateNode && !folderMerge.loading) folderMerge.stateNode.textContent = compareOnly
+        ? 'Read-only comparison · selecting a row never changes either folder.'
+        : pending ? 'Every copy or replacement requires an explicit confirmation.' : 'Review complete. Rescan to verify both structures.';
     }
 
-    async function renderFolderPreview() {
+    function renderFolderPreview() {
       const entry = selectedFolderMergeEntry();
-      const generation = ++folderMerge.previewGeneration;
-      if (!entry || !folderMerge.previewContent) return;
-      folderMerge.previewTitle.textContent = entry.relative_path;
-      folderMerge.previewStatus.textContent = folderStatusCopy(entry);
-      if (!entry.reviewable) {
-        folderMerge.previewContent.innerHTML = `<p>${entry.status === 'unsupported' ? 'Symbolic links are intentionally not merged.' : 'This item cannot be shown as text. You can replace the right file with the exact left file only after confirmation.'}</p>`;
+      if (!folderMerge.previewContent) return;
+      if (!entry) {
+        if (folderMerge.previewTitle) folderMerge.previewTitle.textContent = 'No difference selected';
+        if (folderMerge.previewStatus) folderMerge.previewStatus.textContent = 'The scan found no actionable item';
+        folderMerge.previewContent.innerHTML = '<p>The two opened folders are identical for the selected scan options.</p>';
         return;
       }
-      folderMerge.previewContent.innerHTML = '<p><i class="spinner"></i> Reading preview…</p>';
-      try {
-        const reads = [];
-        reads.push(entry.left_path ? invoke('read_local_text_file', { path: entry.left_path }) : Promise.resolve({ content: '' }));
-        reads.push(entry.right_path ? invoke('read_local_text_file', { path: entry.right_path }) : Promise.resolve({ content: '' }));
-        const [leftFile, rightFile] = await Promise.all(reads);
-        if (generation !== folderMerge.previewGeneration) return;
-        const diff = diffEngine.buildLineDiff(leftFile.content, rightFile.content);
-        const rows = diff.rows.slice(0, 500).map(row => {
-          const leftClass = row.left === null ? 'filler' : row.same ? '' : 'changed';
-          const rightClass = row.right === null ? 'filler' : row.same ? '' : 'changed';
-          return `<div class="local-folder-mini-row"><code class="${leftClass}">${row.left === null ? '' : escapeHtml(row.left) || ' '}</code><code class="${rightClass}">${row.right === null ? '' : escapeHtml(row.right) || ' '}</code></div>`;
-        }).join('');
-        const consequence = entry.status === 'left-only'
-          ? 'Applying creates a new file on the right. Existing paths are never overwritten.'
-          : 'Open the aligned merge to copy individual lines/blocks, or apply the complete left source after confirmation.';
-        folderMerge.previewContent.innerHTML = `<div class="local-folder-mini-diff">${rows}</div><div class="local-folder-preview-note">${escapeHtml(consequence)}${diff.rows.length > 500 ? ' Preview limited to 500 aligned rows.' : ''}</div>`;
-      } catch (error) {
-        if (generation === folderMerge.previewGeneration) folderMerge.previewContent.innerHTML = `<p>${escapeHtml(String(error))}</p>`;
-      }
+      folderMerge.previewTitle.textContent = entry.relative_path;
+      folderMerge.previewStatus.textContent = folderStatusCopy(entry);
+      const explanation = entry.status === 'ignored-submodule'
+        ? 'This entire nested Git repository is excluded. Its files are not scanned and no merge action can enter it.'
+        : entry.item_kind === 'folder'
+          ? 'This directory exists on only one side. Guided merge can create the matching directory on the other side; it never deletes a directory automatically.'
+          : entry.reviewable
+            ? folderMerge.mode === 'compare' ? 'Open the full aligned file comparison. It remains read-only in Folder Compare mode.' : 'Open the aligned merge for line-level control, or copy the complete selected source after confirmation.'
+            : 'Content cannot be shown in the text viewer. Guided merge can copy the complete regular file only after confirmation.';
+      folderMerge.previewContent.innerHTML = `<div class="local-folder-item-summary"><div><span>LEFT</span><code>${escapeHtml(entry.left_path || 'Missing')}</code></div><div><span>RIGHT</span><code>${escapeHtml(entry.right_path || 'Missing')}</code></div><p>${escapeHtml(explanation)}</p></div>`;
     }
 
     async function scanFolderMerge() {
@@ -830,7 +890,11 @@
       folderMerge.stateNode.textContent = 'Scanning both folders…';
       renderFolderMerge();
       try {
-        const result = await invoke('compare_local_directories', { leftPath: folderMerge.leftRoot, rightPath: folderMerge.rightRoot });
+        const result = await invoke('compare_local_directories', {
+          leftPath: folderMerge.leftRoot,
+          rightPath: folderMerge.rightRoot,
+          ignoreSubmodules: folderMerge.ignoreSubmodules?.checked !== false,
+        });
         if (generation !== folderMerge.generation) return;
         folderMerge.leftRoot = result.left_root;
         folderMerge.rightRoot = result.right_root;
@@ -838,7 +902,8 @@
         folderMerge.countsModel = result.counts || {};
         folderMerge.resolved.clear();
         folderMerge.skipped.clear();
-        folderMerge.selectedPath = folderMerge.entries.find(entry => entry.status !== 'same')?.relative_path || '';
+        folderMerge.visibleLimit = folderRowPageSize;
+        folderMerge.selectedPath = folderMerge.entries.find(entry => entry.status !== 'ignored-submodule')?.relative_path || folderMerge.entries[0]?.relative_path || '';
         folderMerge.leftPathNode.textContent = folderMerge.leftRoot;
         folderMerge.leftPathNode.title = folderMerge.leftRoot;
         folderMerge.rightPathNode.textContent = folderMerge.rightRoot;
@@ -857,11 +922,12 @@
       }
     }
 
-    async function openFolderMerge() {
+    async function openFolderOperation(mode = 'compare') {
       if (!folderMerge.dialog || operationBusy || sides.left.loading || sides.right.loading) return;
       const roots = folderRoots();
-      if (!roots.left || !roots.right) return notify('Choose a source folder on the left and a result folder on the right.', 'error');
-      if (roots.left === roots.right) return notify('Choose two different folders for a guided merge.', 'error');
+      if (!roots.left || !roots.right) return notify('Choose one folder on the left and one folder on the right.', 'error');
+      if (roots.left === roots.right) return notify('Choose two different folders to compare.', 'error');
+      folderMerge.mode = mode;
       folderMerge.leftRoot = roots.left;
       folderMerge.rightRoot = roots.right;
       folderMerge.entries = [];
@@ -875,44 +941,57 @@
     function advanceFolderMerge() {
       const next = nextFolderMergeEntry();
       folderMerge.selectedPath = next?.relative_path || folderMerge.selectedPath;
+      const nextIndex = next ? folderMerge.entries.indexOf(next) : -1;
+      if (nextIndex >= folderMerge.visibleLimit) folderMerge.visibleLimit = nextIndex + 1;
       renderFolderMerge();
       renderFolderPreview();
     }
 
-    function markFolderMergeReviewed(rightPath, identicalWithLeft) {
-      const entry = folderMerge.entries.find(item => item.right_path === rightPath);
+    function markFolderMergeReviewed(resultPath, identicalWithSource) {
+      const entry = folderMerge.entries.find(item => item.left_path === resultPath || item.right_path === resultPath);
       if (!entry) return;
       folderMerge.resolved.add(entry.relative_path);
-      entry.reviewResult = identicalWithLeft ? 'Matches source' : 'Custom merged result saved';
+      entry.reviewResult = identicalWithSource ? 'Matches selected source' : 'Custom merged result saved';
       advanceFolderMerge();
     }
 
     async function applyFolderMergeEntry() {
       const entry = selectedFolderMergeEntry();
-      if (!entry || folderMerge.loading || operationBusy || !['modified', 'left-only'].includes(entry.status)) return;
-      const action = entry.status === 'left-only' ? 'create this new file' : 'replace the complete right file with the left source';
+      const direction = folderDirection();
+      if (!entry || folderMerge.mode !== 'merge' || folderMerge.loading || operationBusy || !canApplyFolderEntry(entry, direction)) return;
+      const sidesForDirection = directionSides(direction);
+      const sourcePath = entry[`${sidesForDirection.source}_path`];
+      const resultPath = entry[`${sidesForDirection.result}_path`] || nativeChildPath(sidesForDirection.resultRoot, entry.relative_path);
+      const isNew = entry.status !== 'modified';
+      const action = isNew
+        ? `create this ${entry.item_kind} on the ${sidesForDirection.result}`
+        : `replace the complete ${sidesForDirection.result} file with the ${sidesForDirection.source} file`;
       const warning = entry.status === 'modified' ? '\n\nFor line-by-line control, choose “Open aligned merge” instead.' : '';
-      if (!await ask(`SOURCE\n${entry.left_path}\n\nRESULT\n${entry.right_path || `${folderMerge.rightRoot}/${entry.relative_path}`}\n\nThis will ${action}.${warning}`, {
-        title: entry.status === 'left-only' ? 'Copy new file to the right' : 'Apply complete source to the right', okLabel: entry.status === 'left-only' ? 'Copy file' : 'Replace right file',
+      if (!await ask(`SOURCE · ${sidesForDirection.source.toUpperCase()}\n${sourcePath}\n\nRESULT · ${sidesForDirection.result.toUpperCase()}\n${resultPath}\n\nThis will ${action}. Nothing is deleted.${warning}`, {
+        title: isNew ? `Copy ${entry.item_kind} ${direction === 'left-to-right' ? 'left → right' : 'right → left'}` : `Replace ${sidesForDirection.result} file`,
+        okLabel: isNew ? `Copy ${entry.item_kind}` : `Replace ${sidesForDirection.result} file`,
       })) return;
       operationBusy = true;
       folderMerge.loading = true;
       renderFolderMerge();
       try {
-        const command = entry.status === 'left-only' ? 'copy_local_merge_file' : 'replace_local_merge_file';
-        const args = { leftRoot: folderMerge.leftRoot, rightRoot: folderMerge.rightRoot, relativePath: entry.relative_path };
-        if (entry.status === 'modified') args.expectedRightFingerprint = entry.right_fingerprint;
+        const command = entry.item_kind === 'folder'
+          ? 'create_local_merge_directory'
+          : isNew ? 'copy_local_merge_file' : 'replace_local_merge_file';
+        const args = { leftRoot: sidesForDirection.sourceRoot, rightRoot: sidesForDirection.resultRoot, relativePath: entry.relative_path };
+        if (!isNew) args.expectedRightFingerprint = entry[`${sidesForDirection.result}_fingerprint`];
         const result = await invoke(command, args);
-        entry.right_path = result.destination;
+        entry[`${sidesForDirection.result}_path`] = result.destination;
         folderMerge.resolved.add(entry.relative_path);
-        notify(`${entry.status === 'left-only' ? 'Copied' : 'Updated'} ${entry.relative_path} on the right`);
+        entry.reviewResult = `${isNew ? 'Copied' : 'Updated'} ${sidesForDirection.source} → ${sidesForDirection.result}`;
+        notify(`${entry.reviewResult}: ${entry.relative_path}`);
         options.onMutation?.([result.destination]);
       } catch (error) {
         notify(String(error), 'error');
       } finally {
         folderMerge.loading = false;
         advanceFolderMerge();
-        if (sides.right.path) load('right', sides.right.path, { preserveRows: true });
+        if (sides[sidesForDirection.result].path) load(sidesForDirection.result, sides[sidesForDirection.result].path, { preserveRows: true });
       }
     }
 
@@ -925,17 +1004,28 @@
 
     async function reviewFolderMergeEntry() {
       const entry = selectedFolderMergeEntry();
-      if (!entry?.reviewable || !entry.left_path || !entry.right_path || entry.status !== 'modified') return;
+      if (!entry?.reviewable || entry.item_kind !== 'file') return;
+      const compareOnly = folderMerge.mode === 'compare';
+      const direction = compareOnly ? 'left-to-right' : folderDirection();
+      const ordered = directionSides(direction);
+      const sourcePath = entry[`${ordered.source}_path`];
+      const resultPath = entry[`${ordered.result}_path`];
+      if (!compareOnly && (!sourcePath || !resultPath || entry.status !== 'modified')) return;
       folderMerge.dialog.close();
       await openComparisonPair({
-        left: { path: entry.left_path, name: entry.relative_path },
-        right: { path: entry.right_path, name: entry.relative_path },
-      }, { returnToFolderMerge: true });
+        left: sourcePath
+          ? { path: sourcePath, name: entry.relative_path }
+          : { missing: true, displayPath: `Missing · ${nativeChildPath(ordered.sourceRoot, entry.relative_path)}`, name: entry.relative_path },
+        right: resultPath
+          ? { path: resultPath, name: entry.relative_path }
+          : { missing: true, displayPath: `Missing · ${nativeChildPath(ordered.resultRoot, entry.relative_path)}`, name: entry.relative_path },
+      }, { returnToFolderMerge: true, readOnly: compareOnly });
     }
 
     function closeFolderMerge() {
       folderMerge.generation++;
       folderMerge.previewGeneration++;
+      folderMerge.loading = false;
       folderMerge.dialog?.close();
     }
 
@@ -947,7 +1037,8 @@
       else if (action === 'move') moveSelected();
       else if (action === 'mkdir') createFolder();
       else if (action === 'trash') moveSelectedToTrash();
-      else if (action === 'folder-merge') openFolderMerge();
+      else if (action === 'folder-compare') openFolderOperation('compare');
+      else if (action === 'folder-merge') openFolderOperation('merge');
     }
 
     root?.addEventListener('click', event => {
@@ -986,7 +1077,7 @@
 
     documentRef?.addEventListener('keydown', event => {
       if (!active || root?.hidden || editor.dialog?.open || comparison.dialog?.open || folderMerge.dialog?.open || ['INPUT', 'TEXTAREA', 'SELECT'].includes(event.target?.tagName)) return;
-      const shortcuts = { F2: 'compare', F3: 'view', F4: 'edit', F5: 'copy', F6: 'move', F7: 'mkdir', F8: 'trash', F9: 'folder-merge' };
+      const shortcuts = { F2: 'compare', F3: 'view', F4: 'edit', F5: 'copy', F6: 'move', F7: 'mkdir', F8: 'trash', F9: 'folder-compare', F10: 'folder-merge' };
       if (shortcuts[event.key]) {
         event.preventDefault();
         runShortcut(shortcuts[event.key]);
@@ -1035,6 +1126,7 @@
       if (block) mergeComparisonHunk('left-to-right', Number(block.dataset.localDiffBlock));
     });
     comparison.alignedEditors?.addEventListener('click', event => {
+      if (comparison.readOnly) return;
       const copy = event.target.closest('[data-local-row-copy]');
       if (copy) return applyMergeRow(Number(copy.dataset.row));
       const createLine = event.target.closest('[data-local-line-create]');
@@ -1052,6 +1144,7 @@
       field.dataset.resultHistoryCaptured = 'false';
     });
     comparison.alignedEditors?.addEventListener('input', event => {
+      if (comparison.readOnly) return;
       const field = event.target.closest('[data-local-line-side]');
       if (!field) return;
       const side = field.dataset.localLineSide;
@@ -1067,6 +1160,7 @@
       else { renderResultPreview(); updateComparisonState(); }
     });
     comparison.alignedEditors?.addEventListener('keydown', event => {
+      if (comparison.readOnly) return;
       const field = event.target.closest('[data-local-line-side]');
       if (!field) return;
       const side = field.dataset.localLineSide;
@@ -1089,12 +1183,27 @@
       }
     });
     folderMerge.rows?.addEventListener('click', event => {
+      if (event.target.closest('[data-folder-load-more]')) {
+        folderMerge.visibleLimit += folderRowPageSize;
+        renderFolderMerge();
+        return;
+      }
       const row = event.target.closest('[data-folder-merge-entry]');
       if (!row) return;
       folderMerge.selectedPath = row.dataset.folderMergeEntry;
+      const entry = selectedFolderMergeEntry();
+      if (folderMerge.mode === 'merge' && folderMerge.direction) {
+        if (entry?.status === 'left-only') folderMerge.direction.value = 'left-to-right';
+        else if (entry?.status === 'right-only') folderMerge.direction.value = 'right-to-left';
+      }
       renderFolderMerge();
       renderFolderPreview();
+      if (folderMerge.mode === 'compare' && entry?.item_kind === 'file' && entry.reviewable) reviewFolderMergeEntry();
     });
+    folderMerge.compareMode?.addEventListener('click', () => { folderMerge.mode = 'compare'; renderFolderMerge(); renderFolderPreview(); });
+    folderMerge.guidedMode?.addEventListener('click', () => { folderMerge.mode = 'merge'; renderFolderMerge(); renderFolderPreview(); });
+    folderMerge.direction?.addEventListener('change', () => { renderFolderMerge(); renderFolderPreview(); });
+    folderMerge.ignoreSubmodules?.addEventListener('change', scanFolderMerge);
     folderMerge.rescan?.addEventListener('click', scanFolderMerge);
     folderMerge.skip?.addEventListener('click', skipFolderMergeEntry);
     folderMerge.review?.addEventListener('click', reviewFolderMergeEntry);
@@ -1123,7 +1232,7 @@
     };
   }
 
-  const api = { create, displayEncoding, formatBytes, nativeParentPath };
+  const api = { create, displayEncoding, formatBytes, nativeChildPath, nativeParentPath };
   global.LocalDriveWorkspace = api;
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
 })(typeof window !== 'undefined' ? window : globalThis);
