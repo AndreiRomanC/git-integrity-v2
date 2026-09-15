@@ -88,7 +88,7 @@ pub fn run() {
             repository::branches::create_submodule_branch,
             repository::create_submodule_tag,
             repository::push_submodule_tag,
-            repository::run_git_command,
+            repository::command_console::run_git_command,
             local_drive::list_local_directory,
             local_drive::create_local_directory,
             local_drive::copy_local_item,
@@ -96,7 +96,7 @@ pub fn run() {
             local_drive::trash_local_item,
             local_drive::read_local_text_file,
             local_drive::write_local_text_file,
-            repository::run_terminal_command,
+            repository::command_console::run_terminal_command,
             repository::run_utrud,
         ])
         .run(tauri::generate_context!())

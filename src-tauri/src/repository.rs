@@ -4,12 +4,15 @@ use std::{collections::{HashMap, HashSet}, fs, path::{Component, Path, PathBuf},
 
 pub mod stash;
 pub mod branches;
+pub mod command_console;
 #[cfg(test)]
 use stash::{abort_stash_conflict, drop_stash, list_stashes, list_submodule_stashes, pop_stash, restore_stash_paths, stash_changes, stash_entry_files, stash_file};
 #[cfg(test)]
 use branches::{branch_creation_context, create_branch, create_submodule_branch, delete_branch, graph_branch_divergence, rename_branch, switch_branch};
 #[cfg(test)]
 use branches::merge::{abort_merge, complete_merge, conflict_sides, list_conflicts, merge_branch, merge_in_progress, resolve_conflict};
+#[cfg(test)]
+use command_console::{is_definitely_read_only_terminal_command, is_read_only_git_subcommand, run_git_command, run_terminal_command_inner, tokenize_git_args};
 
 // Temporary performance diagnostics: appends "<label>: <ms>ms" lines to a log
 // file so real-world slowness can be diagnosed without guessing. Safe to leave
@@ -754,212 +757,6 @@ fn git(path: &str, args: &[&str]) -> Result<String, String> {
     let output = run_with_timeout(command)?;
     if output.status.success() { Ok(String::from_utf8_lossy(&output.stdout).into_owned()) }
     else { Err(String::from_utf8_lossy(&output.stderr).trim().to_string()) }
-}
-
-#[derive(Serialize)]
-pub struct RawGitResult { stdout: String, stderr: String, success: bool, exit_code: Option<i32>, read_only: bool }
-
-// The Terminal uses the same compact result shape as the older Git-only
-// console. Keeping the type shared also keeps the frontend transition
-// backwards-compatible while run_git_command remains available to older
-// builds/tests.
-pub type TerminalCommandResult = RawGitResult;
-
-// A minimal shell-like tokenizer — single/double-quoted segments (with
-// backslash-escaping *inside* double quotes only, matching common shell
-// behavior closely enough for this) are kept together as one argument, so
-// `commit -m "fix bug in parser"` produces the 3 arguments a real shell
-// would, not `split_whitespace`'s 6. That bug was real, not theoretical: any
-// commit message, path, or branch name containing a space was silently
-// mangled into multiple bogus arguments before this.
-fn tokenize_git_args(input: &str) -> Result<Vec<String>, String> {
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-    let mut has_current = false;
-    let mut chars = input.chars().peekable();
-    let mut quote: Option<char> = None;
-    while let Some(ch) = chars.next() {
-        match quote {
-            Some(q) => {
-                if ch == '\\' && q == '"' { if let Some(&next) = chars.peek() { if next == '"' || next == '\\' { current.push(next); chars.next(); continue; } } current.push(ch); }
-                else if ch == q { quote = None; }
-                else { current.push(ch); }
-            }
-            None => {
-                if ch == '"' || ch == '\'' { quote = Some(ch); has_current = true; }
-                else if ch.is_whitespace() { if has_current { tokens.push(std::mem::take(&mut current)); has_current = false; } }
-                else { current.push(ch); has_current = true; }
-            }
-        }
-    }
-    if quote.is_some() { return Err("Unclosed quote in command".into()); }
-    if has_current { tokens.push(current); }
-    Ok(tokens)
-}
-
-// A command whose *subcommand alone* (ignoring every flag/argument after it)
-// can never mutate the repository, its index, or the working tree — matched
-// against a strict, deliberately short allowlist. Anything not on this list
-// is treated conservatively as possibly mutating, even if it's actually
-// read-only in practice (e.g. `remote -v`) — the cost of a false negative
-// here (an unnecessary reload) is far lower than a false positive (skipping
-// a reload after something that actually changed state).
-fn is_read_only_git_subcommand(subcommand: &str) -> bool {
-    matches!(subcommand, "status" | "log" | "diff" | "show" | "blame" | "ls-files")
-}
-
-// The command console's "run any git command" escape hatch — scoped to whatever
-// folder the caller passes (the folder currently being browsed, or a selected
-// submodule), using `git -C <path>` exactly like the rest of this file's shell
-// calls. `Command::args` passes each token as a literal argument straight to the
-// `git` binary — never through a shell — so there is no shell-injection surface
-// here regardless of what the user types (no `;`, `&&`, backticks etc. have any
-// special meaning). It genuinely can run destructive commands if asked to
-// (that's the point), so the frontend must confirm before anything recognizably
-// destructive; this only enforces that the first token isn't literally "git"
-// again (a common typo: pasting "git status" here instead of just "status").
-#[tauri::command]
-pub fn run_git_command(repository_path: String, args: String) -> Result<RawGitResult, String> {
-    let started = Instant::now();
-    validate_path(&repository_path)?;
-    // Held for the whole command, including a genuinely read-only one — the
-    // frontend already refuses to start a second console command while one
-    // is running, but this is what makes that actually safe against every
-    // *other* mutation too (Stage/Commit/Delete/checkout/stash), not just
-    // against another console command, the same as every other
-    // index/HEAD-mutating command in this file.
-    let queue_started = Instant::now();
-    let lock_handle = repo_write_lock(&repository_path);
-    let _lock = lock_handle.lock().unwrap();
-    log_repo_write_lock_acquired(&repository_path, "run_git_command", queue_started.elapsed());
-    let mut parts = tokenize_git_args(&args)?;
-    // Typing the full, natural command ("git status") is just as valid as the
-    // short form ("status") — strip a leading "git" token instead of
-    // rejecting it, so this behaves like a real terminal either way.
-    if parts.first().map(String::as_str) == Some("git") { parts.remove(0); }
-    if parts.is_empty() { return Err("Type a git subcommand, e.g. \"status\" or \"log --oneline -10\"".into()); }
-    let read_only = is_read_only_git_subcommand(&parts[0]);
-    // Never the full argument list — it can contain commit messages, file
-    // contents, tokens embedded in a URL, or anything else the user typed.
-    // Only the subcommand itself, which repo this ran against, the duration,
-    // and the outcome are safe to write to a log file that might get shared
-    // back for diagnosis.
-    let repo_id = anonymized_repository_id(&repository_path);
-    let mut command = Command::new("git");
-    configure_git_command(&mut command);
-    command.arg("-C").arg(&repository_path).arg("-c").arg("color.ui=false").args(&parts);
-    let output = run_with_timeout(command);
-    let output = match output {
-        Ok(output) => output,
-        Err(error) => {
-            perf_log(&format!("run_git_command: {} ({repo_id}, read_only={read_only}) TIMED_OUT", parts[0]), started.elapsed());
-            return Err(error);
-        }
-    };
-    perf_log(&format!("run_git_command: {} ({repo_id}, read_only={read_only}) exit_code={:?}", parts[0], output.status.code()), started.elapsed());
-    invalidate_git_metadata(&repository_path);
-    Ok(RawGitResult {
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        success: output.status.success(),
-        exit_code: output.status.code(),
-        read_only,
-    })
-}
-
-// Only skip the post-command repository refresh when the whole command is a
-// single, plainly read-only invocation. Shell operators are rejected from
-// this classification first: `git status && rm file`, `ls > file`, command
-// substitutions, and similar compound commands must all be treated as
-// possibly mutating. A false negative only costs one refresh; a false
-// positive could leave the UI stale after a real disk/repository change.
-fn is_definitely_read_only_terminal_command(input: &str) -> bool {
-    if input.chars().any(|ch| matches!(ch, '\n' | '\r' | ';' | '|' | '&' | '>' | '<' | '`')) || input.contains("$(") { return false; }
-    let Ok(parts) = tokenize_git_args(input) else { return false };
-    let Some(program) = parts.first().map(|part| part.to_ascii_lowercase()) else { return false };
-    if program == "git" {
-        return parts.get(1).map(|part| is_read_only_git_subcommand(&part.to_ascii_lowercase())).unwrap_or(false);
-    }
-    matches!(program.as_str(), "pwd" | "ls" | "dir" | "whoami" | "hostname" | "which" | "where")
-}
-
-fn run_terminal_command_inner(repository_path: String, command_text: String) -> Result<TerminalCommandResult, String> {
-    let started = Instant::now();
-    validate_path(&repository_path)?;
-    let command_text = command_text.trim();
-    if command_text.is_empty() { return Err("Type a command, e.g. \"git status\", \"pwd\", or \"gh pr status\"".into()); }
-
-    // Discover the enclosing repository once and use its real worktree root
-    // for the shared write lock/cache invalidation. The command itself still
-    // runs in the exact folder selected in the UI. Without this, a command
-    // launched from `repo/src` and a Stage launched at `repo` would acquire
-    // different path-keyed locks and could race on the same index.
-    let repository = internal_repository(&repository_path)?;
-    let repository_root = repository.workdir()
-        .ok_or("Bare repositories are not supported by the embedded Terminal")?
-        .to_string_lossy().into_owned();
-    drop(repository);
-
-    let queue_started = Instant::now();
-    let lock_handle = repo_write_lock(&repository_root);
-    let _lock = lock_handle.lock().unwrap();
-    log_repo_write_lock_acquired(&repository_root, "run_terminal_command", queue_started.elapsed());
-
-    let read_only = is_definitely_read_only_terminal_command(command_text);
-    let repo_id = anonymized_repository_id(&repository_root);
-
-    #[cfg(windows)]
-    let mut command = {
-        let shell = std::env::var_os("COMSPEC").unwrap_or_else(|| "cmd.exe".into());
-        let mut command = Command::new(shell);
-        command.args(["/D", "/S", "/C"]).arg(command_text);
-        command
-    };
-    #[cfg(not(windows))]
-    let mut command = {
-        // A login shell restores the user's normal PATH when the macOS app
-        // was launched from Finder, so tools installed by Homebrew (notably
-        // `gh`) resolve the same way they do in the user's Terminal.
-        let shell = std::env::var_os("SHELL").filter(|value| Path::new(value).is_file()).unwrap_or_else(|| "/bin/sh".into());
-        let mut command = Command::new(shell);
-        command.args(["-l", "-c"]).arg(command_text);
-        command
-    };
-
-    command.current_dir(&repository_path)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GH_PROMPT_DISABLED", "1")
-        .env("GIT_PAGER", "cat")
-        .env("PAGER", "cat")
-        .stdin(std::process::Stdio::null());
-
-    let output = run_with_timeout_labeled(command, GIT_COMMAND_TIMEOUT, "Terminal", "10 minutes");
-    let output = match output {
-        Ok(output) => output,
-        Err(error) => {
-            // Never log the command text: it can contain credentials, URLs,
-            // commit messages, or arbitrary private data.
-            perf_log(&format!("run_terminal_command: ({repo_id}, read_only={read_only}) TIMED_OUT"), started.elapsed());
-            return Err(error);
-        }
-    };
-    perf_log(&format!("run_terminal_command: ({repo_id}, read_only={read_only}) exit_code={:?}", output.status.code()), started.elapsed());
-    if !read_only { invalidate_git_metadata(&repository_root); }
-    Ok(RawGitResult {
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        success: output.status.success(),
-        exit_code: output.status.code(),
-        read_only,
-    })
-}
-
-// Arbitrary shell commands are blocking OS processes, so this command must
-// use the same background pool as status/stage/commit/network operations;
-// otherwise a long command would freeze the native WebView event thread.
-#[tauri::command]
-pub async fn run_terminal_command(repository_path: String, command_text: String) -> Result<TerminalCommandResult, String> {
-    off_main_thread(move || run_terminal_command_inner(repository_path, command_text)).await
 }
 
 fn internal_repository(path: &str) -> Result<Repository, String> {
