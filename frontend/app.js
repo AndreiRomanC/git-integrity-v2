@@ -4446,10 +4446,7 @@ const PR_STATE_LABELS = {
   no_upstream: null,
   partial_result: null, // built the same way, with an "incomplete" note
 };
-const PR_LIFECYCLE_LABEL = { draft: 'Draft', open: 'Open', merged: 'Merged', closed: 'Closed' };
-const PR_MERGEABLE_LABEL = { mergeable: 'Mergeable', conflicting: 'Conflicting', calculating: 'Calculating…', unknown: 'Unknown' };
-const PR_REVIEW_LABEL = { approved: 'Approved', changes_requested: 'Changes requested', review_required: 'Review required', none: 'No reviews yet' };
-const PR_CHECKS_LABEL = { passing: 'Checks passing', failing: 'Checks failing', pending: 'Checks running…', none: 'No checks' };
+const { prCardHtml } = window.GitDrillDownPr;
 
 function githubPullsBrowserUrl(queriedRepo) {
   const parts = String(queriedRepo || '').split('/');
@@ -4457,20 +4454,6 @@ function githubPullsBrowserUrl(queriedRepo) {
   const [host, owner, repo] = parts;
   if (!(host === 'github.com' || host === 'github' || host.startsWith('github.'))) return '';
   return `https://${host}/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls`;
-}
-
-function prCardHtml(pr) {
-  return `<div class="pr-card">
-    <div class="pr-card-top"><span class="pr-number">#${pr.number}</span><span class="pr-badge pr-lifecycle-${esc(pr.state)}">${esc(PR_LIFECYCLE_LABEL[pr.state] || pr.state)}</span></div>
-    <div class="pr-title">${esc(pr.title || '(no title)')}</div>
-    <div class="pr-branches"><code>${esc(pr.source_branch)}</code><span class="pr-branch-arrow">→</span><code>${esc(pr.target_branch)}</code></div>
-    <div class="pr-badges">
-      <span class="pr-badge pr-mergeable-${esc(pr.mergeable)}">${esc(PR_MERGEABLE_LABEL[pr.mergeable] || pr.mergeable)}</span>
-      <span class="pr-badge pr-review-${esc(pr.review_summary)}">${esc(PR_REVIEW_LABEL[pr.review_summary] || pr.review_summary)}</span>
-      <span class="pr-badge pr-checks-${esc(pr.checks_status)}">${esc(PR_CHECKS_LABEL[pr.checks_status] || pr.checks_status)}</span>
-    </div>
-    <button class="pr-open-link" data-open-url="${esc(pr.url)}" ${pr.url ? '' : 'disabled'}>Open pull request ↗</button>
-  </div>`;
 }
 
 function createPrStatusPanel(root, options) {

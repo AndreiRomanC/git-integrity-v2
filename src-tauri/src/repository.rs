@@ -1209,12 +1209,17 @@ fn is_generated_polarion_url(url: &str) -> bool {
 // the URL reaches an OS browser-launch command.
 fn is_generated_pull_request_url(url: &str) -> bool {
     let Some(rest) = url.strip_prefix("https://") else { return false };
+    let (rest, fragment) = rest.split_once('#').map(|(base, fragment)| (base, Some(fragment))).unwrap_or((rest, None));
     let Some((host, path)) = rest.split_once('/') else { return false };
     if host.is_empty() || !host.chars().all(|value| value.is_ascii_alphanumeric() || value == '.' || value == '-') { return false; }
     let is_identifier = |value: &str| !value.is_empty() && value.chars().all(|value| value.is_ascii_alphanumeric() || value == '.' || value == '-' || value == '_');
     match path.split('/').collect::<Vec<_>>().as_slice() {
-        [owner, repo, "pull", number] => is_identifier(owner) && is_identifier(repo) && !number.is_empty() && number.chars().all(|value| value.is_ascii_digit()),
-        [owner, repo, "pulls"] => is_identifier(owner) && is_identifier(repo),
+        [owner, repo, "pull", number] => {
+            let review_fragment_ok = fragment.map(|value| value.strip_prefix("pullrequestreview-")
+                .map(|id| !id.is_empty() && id.chars().all(|character| character.is_ascii_digit())).unwrap_or(false)).unwrap_or(true);
+            is_identifier(owner) && is_identifier(repo) && !number.is_empty() && number.chars().all(|value| value.is_ascii_digit()) && review_fragment_ok
+        },
+        [owner, repo, "pulls"] => is_identifier(owner) && is_identifier(repo) && fragment.is_none(),
         _ => false,
     }
 }
@@ -2130,9 +2135,26 @@ pub struct PullRequestSummary {
     mergeable: String,
     // "approved" | "changes_requested" | "review_required" | "none"
     review_summary: String,
+    // The latest submitted review per reviewer plus any still-pending review
+    // requests. This is collected in the same GitHub operation as the PR
+    // card: never one request per person. Submitted reviews may carry their
+    // exact GitHub permalink; pending requests deliberately do not pretend a
+    // review exists yet.
+    reviewers: Vec<PullRequestReviewerSummary>,
     // "passing" | "failing" | "pending" | "none"
     checks_status: String,
     url: String,
+}
+
+#[derive(Serialize, Debug, PartialEq)]
+pub struct PullRequestReviewerSummary {
+    login: String,
+    // "requested" | "approved" | "changes_requested" | "commented" |
+    // "dismissed" | "pending"
+    state: String,
+    // Exact PullRequestReview permalink when GitHub supplies one. The normal
+    // PR URL remains available separately on PullRequestSummary.
+    review_url: String,
 }
 
 #[derive(Serialize)]
@@ -2247,6 +2269,56 @@ fn map_review_summary(review_decision: &str) -> String {
         "REVIEW_REQUIRED" => "review_required",
         _ => "none",
     }.into()
+}
+
+fn map_reviewer_state(state: &str) -> String {
+    match state {
+        "APPROVED" => "approved",
+        "CHANGES_REQUESTED" => "changes_requested",
+        "COMMENTED" => "commented",
+        "DISMISSED" => "dismissed",
+        "PENDING" => "pending",
+        _ => "commented",
+    }.into()
+}
+
+fn reviewer_login(value: &serde_json::Value) -> Option<String> {
+    value.get("login").and_then(|field| field.as_str())
+        .or_else(|| value.get("name").and_then(|field| field.as_str()))
+        .or_else(|| value.get("slug").and_then(|field| field.as_str()))
+        .map(str::trim).filter(|login| !login.is_empty()).map(String::from)
+}
+
+fn pr_reviewers_from_json(item: &serde_json::Value) -> Vec<PullRequestReviewerSummary> {
+    let mut reviewers = Vec::new();
+
+    // `gh pr list --json reviewRequests` returns the requested reviewer
+    // objects directly. normalize_graphql_pr deliberately flattens GraphQL's
+    // ReviewRequest nodes to that identical shape.
+    for requested in item.get("reviewRequests").and_then(|value| value.as_array()).into_iter().flatten() {
+        let Some(login) = reviewer_login(requested) else { continue };
+        if !reviewers.iter().any(|existing: &PullRequestReviewerSummary| existing.login.eq_ignore_ascii_case(&login)) {
+            reviewers.push(PullRequestReviewerSummary { login, state: "requested".into(), review_url: String::new() });
+        }
+    }
+
+    // GitHub defines latestReviews as at most the latest non-pending review
+    // from each reviewer. If a request and a submitted review nevertheless
+    // arrive together, the submitted state replaces the pending one.
+    for review in item.get("latestReviews").and_then(|value| value.as_array()).into_iter().flatten() {
+        let Some(login) = review.get("author").and_then(reviewer_login) else { continue };
+        let summary = PullRequestReviewerSummary {
+            login: login.clone(),
+            state: map_reviewer_state(review.get("state").and_then(|value| value.as_str()).unwrap_or("")),
+            review_url: review.get("url").and_then(|value| value.as_str()).unwrap_or("").to_string(),
+        };
+        if let Some(existing) = reviewers.iter_mut().find(|existing| existing.login.eq_ignore_ascii_case(&login)) {
+            *existing = summary;
+        } else {
+            reviewers.push(summary);
+        }
+    }
+    reviewers
 }
 
 // gh's statusCheckRollup is an array of check-run/status-context objects,
@@ -2593,6 +2665,10 @@ query PullRequestsByHead($owner: String!, $name: String!, $branch: String!) {
         number title headRefName baseRefName state isDraft mergeable reviewDecision url
         headRepository { name }
         headRepositoryOwner { login }
+        reviewRequests(first: 20) {
+          nodes { requestedReviewer { ... on User { login } ... on Team { name slug } } }
+        }
+        latestReviews(first: 20) { nodes { author { login } state url } }
         commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
       }
     }
@@ -2607,6 +2683,10 @@ query PullRequestsByBase($owner: String!, $name: String!, $branch: String!) {
         number title headRefName baseRefName state isDraft mergeable reviewDecision url
         headRepository { name }
         headRepositoryOwner { login }
+        reviewRequests(first: 20) {
+          nodes { requestedReviewer { ... on User { login } ... on Team { name slug } } }
+        }
+        latestReviews(first: 20) { nodes { author { login } state url } }
         commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
       }
     }
@@ -2619,6 +2699,10 @@ fn normalize_graphql_pr(item: &serde_json::Value) -> serde_json::Value {
         .and_then(|value| value.as_str())
         .map(|state| vec![serde_json::json!({ "state": state })])
         .unwrap_or_default();
+    let review_requests = item.pointer("/reviewRequests/nodes").and_then(|value| value.as_array())
+        .map(|nodes| nodes.iter().filter_map(|node| node.get("requestedReviewer").cloned()).collect::<Vec<_>>())
+        .unwrap_or_default();
+    let latest_reviews = item.pointer("/latestReviews/nodes").and_then(|value| value.as_array()).cloned().unwrap_or_default();
     serde_json::json!({
         "number": item.get("number").cloned().unwrap_or(serde_json::Value::Null),
         "title": item.get("title").cloned().unwrap_or(serde_json::Value::Null),
@@ -2630,12 +2714,14 @@ fn normalize_graphql_pr(item: &serde_json::Value) -> serde_json::Value {
         "isDraft": item.get("isDraft").cloned().unwrap_or(serde_json::Value::Bool(false)),
         "mergeable": item.get("mergeable").cloned().unwrap_or(serde_json::Value::Null),
         "reviewDecision": item.get("reviewDecision").cloned().unwrap_or(serde_json::Value::Null),
+        "reviewRequests": review_requests,
+        "latestReviews": latest_reviews,
         "statusCheckRollup": rollup,
         "url": item.get("url").cloned().unwrap_or(serde_json::Value::Null),
     })
 }
 
-const PR_GH_JSON_FIELDS: &str = "number,title,headRefName,headRepository,headRepositoryOwner,baseRefName,state,isDraft,mergeable,reviewDecision,statusCheckRollup,url";
+const PR_GH_JSON_FIELDS: &str = "number,title,headRefName,headRepository,headRepositoryOwner,baseRefName,state,isDraft,mergeable,reviewDecision,reviewRequests,latestReviews,statusCheckRollup,url";
 
 fn gh_stderr_looks_like_auth(stderr: &str) -> bool {
     let lower = stderr.to_lowercase();
@@ -2671,6 +2757,7 @@ fn pr_summary_from_json(item: &serde_json::Value) -> PullRequestSummary {
         state: map_pr_state(item.get("state").and_then(|v| v.as_str()).unwrap_or(""), item.get("isDraft").and_then(|v| v.as_bool()).unwrap_or(false)),
         mergeable: map_mergeable(item.get("mergeable").and_then(|v| v.as_str()).unwrap_or("")),
         review_summary: map_review_summary(item.get("reviewDecision").and_then(|v| v.as_str()).unwrap_or("")),
+        reviewers: pr_reviewers_from_json(item),
         checks_status: map_checks_status(&rollup),
         url: item.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string(),
     }
@@ -6830,6 +6917,9 @@ mod tests {
         assert_eq!(map_review_summary("CHANGES_REQUESTED"), "changes_requested");
         assert_eq!(map_review_summary("REVIEW_REQUIRED"), "review_required");
         assert_eq!(map_review_summary(""), "none");
+        assert_eq!(map_reviewer_state("APPROVED"), "approved");
+        assert_eq!(map_reviewer_state("CHANGES_REQUESTED"), "changes_requested");
+        assert_eq!(map_reviewer_state("COMMENTED"), "commented");
 
         let failing = vec![serde_json::json!({"conclusion": "SUCCESS"}), serde_json::json!({"conclusion": "FAILURE"})];
         assert_eq!(map_checks_status(&failing), "failing", "any real failure must win over other passing/pending checks");
@@ -6838,6 +6928,26 @@ mod tests {
         let passing = vec![serde_json::json!({"conclusion": "SUCCESS"}), serde_json::json!({"conclusion": "NEUTRAL"})];
         assert_eq!(map_checks_status(&passing), "passing");
         assert_eq!(map_checks_status(&[]), "none", "no checks configured at all must read as none, not as passing");
+    }
+
+    #[test]
+    fn cli_pr_response_maps_requested_and_latest_reviewers_without_duplicate_people() {
+        let item = serde_json::json!({
+            "reviewRequests": [
+                { "__typename": "User", "login": "alice" },
+                { "__typename": "User", "login": "Alice" },
+                { "__typename": "Team", "name": "Core maintainers", "slug": "core" }
+            ],
+            "latestReviews": [
+                { "author": { "login": "alice" }, "state": "APPROVED" },
+                { "author": { "login": "copilot-pull-request-reviewer" }, "state": "COMMENTED" }
+            ]
+        });
+        assert_eq!(pr_reviewers_from_json(&item), vec![
+            PullRequestReviewerSummary { login: "alice".into(), state: "approved".into(), review_url: String::new() },
+            PullRequestReviewerSummary { login: "Core maintainers".into(), state: "requested".into(), review_url: String::new() },
+            PullRequestReviewerSummary { login: "copilot-pull-request-reviewer".into(), state: "commented".into(), review_url: String::new() },
+        ]);
     }
 
     #[test]
@@ -6870,6 +6980,12 @@ mod tests {
             "isDraft": false,
             "mergeable": "MERGEABLE",
             "reviewDecision": "APPROVED",
+            "reviewRequests": { "nodes": [{ "requestedReviewer": { "login": "waiting-reviewer" } }] },
+            "latestReviews": { "nodes": [{
+                "author": { "login": "approved-reviewer" },
+                "state": "APPROVED",
+                "url": "https://github.vitesco.io/eng/sw-prj-VWAQ4_000U0/pull/282#pullrequestreview-987"
+            }] },
             "url": "https://github.vitesco.io/eng/sw-prj-VWAQ4_000U0/pull/282",
             "commits": { "nodes": [{ "commit": { "statusCheckRollup": { "state": "SUCCESS" } } }] }
         });
@@ -6880,6 +6996,13 @@ mod tests {
         assert_eq!(summary.target_branch, "main");
         assert_eq!(summary.mergeable, "mergeable");
         assert_eq!(summary.review_summary, "approved");
+        assert_eq!(summary.reviewers, vec![
+            PullRequestReviewerSummary { login: "waiting-reviewer".into(), state: "requested".into(), review_url: String::new() },
+            PullRequestReviewerSummary {
+                login: "approved-reviewer".into(), state: "approved".into(),
+                review_url: "https://github.vitesco.io/eng/sw-prj-VWAQ4_000U0/pull/282#pullrequestreview-987".into(),
+            },
+        ]);
         assert_eq!(summary.checks_status, "passing");
         assert_eq!(summary.url, "https://github.vitesco.io/eng/sw-prj-VWAQ4_000U0/pull/282");
     }
@@ -10209,6 +10332,7 @@ mod tests {
         // fixed host, never the shape `gh pr list --json url` actually returns.
         assert!(is_generated_pull_request_url("https://github.com/AndreiRomanC/git-stress-small-demo/pull/1"));
         assert!(is_generated_pull_request_url("https://github.example/eng/sw-prj-OMBMS_000U0/pull/42"), "an enterprise GitHub host must work too, not just github.com");
+        assert!(is_generated_pull_request_url("https://github.example/eng/sw-prj-OMBMS_000U0/pull/42#pullrequestreview-987"), "an exact GitHub review permalink must be accepted");
         assert!(is_generated_pull_request_url("https://github.vitesco.io/eng/sw-prj-VWAQ4_000U0/pulls"), "the generated signed-in-browser fallback must be accepted too");
 
         // Wrong scheme, wrong shape, or an attempt to smuggle a different
@@ -10217,6 +10341,8 @@ mod tests {
         assert!(!is_generated_pull_request_url("http://github.com/owner/repo/pull/1"), "must require https");
         assert!(!is_generated_pull_request_url("https://github.com/owner/repo/pulls/1"), "must be the singular /pull/ path GitHub actually uses");
         assert!(!is_generated_pull_request_url("https://github.com/owner/repo/pulls?q=is%3Aopen"), "the fallback is an exact generated path, never an arbitrary query string");
+        assert!(!is_generated_pull_request_url("https://github.com/owner/repo/pull/1#discussion_r123"), "only exact review permalinks are accepted, not arbitrary fragments");
+        assert!(!is_generated_pull_request_url("https://github.com/owner/repo/pull/1#pullrequestreview-12x"), "review identifiers must be numeric");
         assert!(!is_generated_pull_request_url("https://github.com/owner/repo/pull/"), "PR number must not be empty");
         assert!(!is_generated_pull_request_url("https://github.com/owner/repo/pull/1x"), "PR number must be all digits");
         assert!(!is_generated_pull_request_url("https://github.com/owner/repo/pull/1/files"), "no trailing path beyond the PR number");

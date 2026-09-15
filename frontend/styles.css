@@ -98,6 +98,19 @@ button { cursor: default; }
 .pr-checks-passing { background: #12271b; color: #8fe8b7; }
 .pr-checks-failing { background: #2a1216; color: #ffb0b8; }
 .pr-checks-pending { background: #16202b; color: #8fc4ff; }
+.pr-reviewers { display: flex; flex-direction: column; gap: 4px; padding-top: 1px; }
+.pr-reviewers-label { color: #728595; font-size: 9px; font-weight: 700; letter-spacing: .35px; text-transform: uppercase; }
+.pr-reviewers > div { display: flex; flex-wrap: wrap; gap: 5px; }
+.pr-reviewer { min-width: 0; min-height: 23px; display: inline-flex; align-items: center; gap: 5px; padding: 2px 7px; border: 1px solid #304253; border-radius: 5px; background: #17222c; color: #aebdca; font-size: 9.5px; }
+button.pr-reviewer { cursor: pointer; }
+button.pr-reviewer:hover { border-color: #59758e; background: #1b2b38; color: #eef6fd; }
+.pr-reviewer span { max-width: 150px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pr-reviewer b { color: #8498aa; font-size: 8.5px; font-weight: 700; text-transform: uppercase; }
+.pr-reviewer i { color: #6f95b8; font-style: normal; }
+.pr-reviewer-approved b { color: #8fe8b7; }
+.pr-reviewer-changes_requested b { color: #ffb0b8; }
+.pr-reviewer-requested b, .pr-reviewer-pending b { color: #e8cd8f; }
+.pr-reviewer-copilot { border-color: #594b83; background: #211d31; }
 .pr-open-link { align-self: flex-start; height: 24px; padding: 0 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); color: #aec0d2; font-size: 10px; }
 .pr-open-link:hover { border-color: #526273; background: var(--surface-soft); color: white; }
 .pr-open-link:disabled { opacity: .4; }
