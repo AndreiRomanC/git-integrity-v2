@@ -10,7 +10,10 @@
 <body>
   <div class="app-shell">
     <header class="topbar">
-      <div class="brand"><img class="brand-logo" src="assets/git-drilldown-logo.png" alt="Git DrillDown"></div>
+      <div class="brand" aria-label="Git DrillDown">
+        <span class="brand-mark"><img src="assets/git-drilldown-mark.png" alt=""></span>
+        <span class="brand-copy"><strong>Git DrillDown</strong><small>GIT WORKSPACE</small></span>
+      </div>
       <button class="repo-picker" id="openRepo">
         <span class="folder-icon">▰</span>
         <span class="repo-picker-copy"><strong id="repoName">Open a repository</strong><small id="repoPath">Choose an existing Git folder</small></span>

@@ -24,9 +24,14 @@ button, input, textarea { font: inherit; color: inherit; }
 button { cursor: default; }
 .app-shell { height: 100vh; min-width: 1000px; display: grid; grid-template-rows: 64px 1fr 28px; }
 
-.topbar { display: flex; align-items: center; gap: 22px; padding: 0 18px; background: #10161d; border-bottom: 1px solid var(--border); }
-.brand { display: flex; align-items: center; width: 126px; height: 38px; padding: 5px 8px; overflow: hidden; flex: 0 0 126px; border: 1px solid #ffffff18; border-radius: 9px; background: #f4f7f9; box-shadow: 0 5px 18px #00000035; }
-.brand-logo { display: block; width: 100%; height: 100%; object-fit: cover; object-position: center top; }
+.topbar { display: flex; align-items: center; gap: 16px; padding: 0 18px; background: #10161d; border-bottom: 1px solid var(--border); }
+.brand { position: relative; display: flex; align-items: center; gap: 9px; width: 172px; height: 46px; padding: 3px 11px 3px 8px; overflow: hidden; flex: 0 0 172px; border: 1px solid #3b4856; border-radius: 10px; background: linear-gradient(145deg, #1c2732 0%, #131b23 75%); box-shadow: inset 0 1px 0 #ffffff0b, 0 5px 16px #00000030; }
+.brand::after { content: ''; position: absolute; inset: 7px 0 7px auto; width: 2px; border-radius: 2px 0 0 2px; background: linear-gradient(#ef5523, #8f3021); opacity: .85; }
+.brand-mark { width: 27px; height: 40px; display: grid; place-items: center; overflow: hidden; flex: 0 0 27px; }
+.brand-mark img { display: block; width: 44px; height: 44px; object-fit: contain; filter: drop-shadow(0 2px 4px #00000080); }
+.brand-copy { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.brand-copy strong { color: #f0f4f8; font-size: 17px; font-weight: 750; line-height: 1.05; letter-spacing: -.45px; white-space: nowrap; }
+.brand-copy small { color: #7f94a7; font-size: 7px; font-weight: 750; line-height: 1; letter-spacing: 1.35px; white-space: nowrap; }
 .repo-picker { width: min(520px, 46vw); height: 44px; display: flex; align-items: center; gap: 12px; padding: 0 13px; border: 1px solid #3a4756; border-radius: 8px; background: #171f29; text-align: left; }
 .repo-picker:hover { border-color: var(--blue); background: #1b2632; }
 .folder-icon { color: var(--blue); font-size: 21px; }
