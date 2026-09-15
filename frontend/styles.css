@@ -658,6 +658,15 @@ button.pr-reviewer:hover { border-color: #59758e; background: #1b2b38; color: #e
 .version-upstream-state { font-family: -apple-system, sans-serif; font-size: 9px; color: #7fb88f; }
 .version-upstream-state.version-no-upstream { color: #6b7d8d; }
 .version-section-heading { margin: 8px 4px 3px; padding: 0 5px; color: #5a6c7d; font-size: 9px; font-weight: 700; letter-spacing: .6px; }
+.version-current-context { margin: 3px 3px 8px; padding: 9px 11px; border: 1px solid #365069; border-left: 3px solid var(--blue); border-radius: 6px; background: #122131; }
+.version-current-context > div { display: flex; align-items: center; gap: 8px; }
+.version-current-context > div span { color: #7990a4; font-size: 8px; font-weight: 700; letter-spacing: .7px; }
+.version-current-context > div strong { color: #b7dcff; font: 11px ui-monospace, SFMono-Regular, Consolas, monospace; }
+.version-current-context > div b { margin-left: auto; padding: 2px 6px; border-radius: 4px; background: #26384a; color: #a7bfd4; font-size: 8px; letter-spacing: .4px; }
+.version-current-context p { margin: 5px 0 3px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #d2dee8; font-size: 10px; }
+.version-current-context small { display: block; color: #8095a7; font-size: 9px; line-height: 1.4; }
+.version-inactive-label { color: #738493; font-size: 8px; font-weight: 700; letter-spacing: .4px; }
+.version-history-limit { margin: 3px 5px 7px; color: #718495; font-size: 9px; line-height: 1.35; }
 .commit-scope-label textarea { min-height: 52px; padding: 8px 10px; border: 1px solid #405365; border-radius: 6px; background: #0d151c; color: #d4e1eb; font-size: 12px; font-family: inherit; resize: vertical; }
 .commit-scope-label.row { flex-direction: row; align-items: center; gap: 8px; }
 .commit-scope-label.row input[type="checkbox"] { height: auto; width: auto; }

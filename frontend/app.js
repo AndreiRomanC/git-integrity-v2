@@ -1142,7 +1142,7 @@ async function openSubmoduleMenu(entry, x, y) {
   refs.submoduleVersionSearch.value = '';
   refs.submoduleVersions.innerHTML = '<div class="version-loading"><i class="spinner"></i>Reading branches, tags and commits…</div>';
   if (!invoke) {
-    submoduleMenuData = { path: entry.relative_path, current_revision: 'a39f21d81ce0', current_branch: 'main', parent_revision: 'a39f21d81ce0', versions: [
+    submoduleMenuData = { path: entry.relative_path, current_revision: 'a39f21d81ce0', current_branch: 'main', parent_revision: 'a39f21d81ce0', current_containing_branches: ['main', 'origin/main'], history_context_branch: 'main', history_limit: 100, versions: [
       { name: 'main', revision: 'a39f21d81ce0', kind: 'branch', current: true, subject: 'Stable diagnostics API', author: 'Andrei Pop', date: '2026-08-14' },
       { name: 'release/2.4', revision: 'bd51e40ca112', kind: 'branch', current: false, subject: 'Release configuration', author: 'Maria Ionescu', date: '2026-08-12' },
       { name: 'origin/feature/events', revision: 'de91822aef33', kind: 'remote', current: false, subject: 'Add event mapping', author: 'Victor Ene', date: '2026-08-11' },
@@ -1168,7 +1168,10 @@ function renderSubmoduleVersions() {
   newVersionButton.textContent = versionFilter === 'tag' ? '＋ New tag…' : '＋ New branch…';
   newVersionButton.title = versionFilter === 'tag' ? 'Create a new tag in this submodule, at its current commit' : 'Create a new branch in this submodule, from its current commit';
   const query = refs.submoduleVersionSearch.value.trim().toLowerCase();
-  const matches = item => !query || `${item.name} ${item.attached_branch || ''} ${item.upstream || ''}`.toLowerCase().includes(query);
+  refs.submoduleVersionSearch.placeholder = versionFilter === 'commit' ? 'Search loaded history by SHA, message or author…' : versionFilter === 'tag' ? 'Search tags, SHAs or messages…' : 'Search branches, SHAs or messages…';
+  const matches = item => matchesSubmoduleVersion(item, query);
+  const currentContext = submoduleCurrentContextHtml(submoduleMenuData);
+  const detached = !submoduleMenuData.current_branch;
   let html;
   if (versionFilter === 'branch') {
     // Point 3: a local branch and its own tracking remote are one thing, not
@@ -1177,12 +1180,19 @@ function renderSubmoduleVersions() {
     const { local, remoteOnly } = groupSubmoduleBranchVersions(submoduleMenuData.versions);
     const localRows = local.filter(matches);
     const remoteRows = remoteOnly.filter(matches);
-    html = localRows.map(submoduleVersionRowHtml).join('')
-      + (remoteRows.length ? `<div class="version-section-heading">REMOTE ONLY</div>${remoteRows.map(submoduleVersionRowHtml).join('')}` : '')
-      || `<div class="version-loading">${query ? 'No matches' : 'No branches found'}</div>`;
+    const renderBranch = item => submoduleVersionRowHtml({ ...item, checkout_detached: detached });
+    const rows = localRows.map(renderBranch).join('')
+      + (remoteRows.length ? `<div class="version-section-heading">REMOTE ONLY</div>${remoteRows.map(renderBranch).join('')}` : '');
+    html = currentContext + (rows || `<div class="version-loading">${query ? 'No matches' : 'No branches found'}</div>`);
   } else {
     const versions = submoduleMenuData.versions.filter(item => versionFilter === 'tag' ? item.kind === 'tag' : item.kind === 'commit').filter(matches);
-    html = versions.map(submoduleVersionRowHtml).join('') || `<div class="version-loading">${query ? 'No matches' : versionFilter === 'tag' ? 'No tags in this submodule' : 'No versions found'}</div>`;
+    const rows = versions.map(submoduleVersionRowHtml).join('') || `<div class="version-loading">${query ? 'No matches' : versionFilter === 'tag' ? 'No tags in this submodule' : 'No versions found'}</div>`;
+    const historyContext = submoduleMenuData.history_context_branch
+      ? `History of ${submoduleMenuData.history_context_branch}. The active checkout is marked CURRENT even when it is inside the branch rather than at its tip.`
+      : 'No known branch contains this detached checkout. History starts at the active commit.';
+    html = versionFilter === 'commit'
+      ? `${currentContext}<div class="version-history-limit">${esc(historyContext)} Showing up to ${Number(submoduleMenuData.history_limit) || 100} commits; search covers this loaded history.</div>${rows}`
+      : rows;
   }
   refs.submoduleVersions.innerHTML = html;
   refs.submoduleVersions.querySelectorAll('[data-switch-version]').forEach(button => button.addEventListener('click', event => {

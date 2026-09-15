@@ -142,9 +142,15 @@ const GIT_METADATA_TTL: Duration = Duration::from_secs(300);
 const INDEX_METADATA_TTL: Duration = Duration::from_secs(300);
 
 static GIT_METADATA_CACHE: OnceLock<Mutex<HashMap<String, (Instant, GitMetadata)>>> = OnceLock::new();
+static GIT_METADATA_SCAN_LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
 
 fn metadata_cache() -> &'static Mutex<HashMap<String, (Instant, GitMetadata)>> {
     GIT_METADATA_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn metadata_scan_lock(key: &str) -> Arc<Mutex<()>> {
+    let mut locks = GIT_METADATA_SCAN_LOCKS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
+    locks.entry(key.to_string()).or_insert_with(|| Arc::new(Mutex::new(()))).clone()
 }
 
 // tracked/submodules (from the index) don't depend on which folder is being
@@ -663,6 +669,13 @@ pub struct SubmoduleVersions {
     // same response so the dialog can distinguish "restored project version"
     // from an arbitrary detached checkout without another backend request.
     parent_revision: String,
+    // Known refs whose history contains the active commit. This is context
+    // for a detached checkout, never a claim that HEAD is attached to one.
+    current_containing_branches: Vec<String>,
+    // Known branch whose tip feeds the bounded history list. Empty means no
+    // branch contains detached HEAD, so history starts at HEAD itself.
+    history_context_branch: String,
+    history_limit: usize,
     versions: Vec<SubmoduleVersion>,
 }
 
@@ -840,13 +853,11 @@ fn internal_statuses(repository: &Repository, scope: Option<&str>) -> Result<Vec
     // to the same index file. A function documented and relied on as
     // read-only must not write at all, regardless of the perf upside.
     options.include_untracked(true).recurse_untracked_dirs(true).include_ignored(false);
-    // Rename detection (comparing added/deleted file contents to spot moves) is
-    // the single most expensive part of a status scan on a huge repository with
-    // many pending changes, and it's only cosmetic — a renamed file still shows
-    // up correctly as separate add/delete entries without it. Worth paying for on
-    // a small, scoped folder view; not worth it on the full unscoped repository-wide
-    // scan that `load_repository` runs after almost every action.
-    if scope.is_some() { options.renames_head_to_index(true).renames_index_to_workdir(true); }
+    // Do not enable rename detection here, including for a scoped directory.
+    // It compares added/deleted contents and a Windows trace measured 27-33s
+    // merely opening the large `work` scope. Rename detection is cosmetic for
+    // status: the same operation remains accurately visible as delete + add,
+    // while Stage/Commit still record the exact resulting tree.
     // Scanning the whole working tree on every folder click is what made navigation
     // painfully slow on large repositories (worse still on Windows, where the same
     // filesystem calls are typically slower than on macOS/Linux) — a pathspec limits
@@ -1021,6 +1032,17 @@ fn cached_git_metadata(repository: &str, scope: &str) -> GitMetadata {
     if let Some((cached_at, metadata)) = metadata_cache().lock().unwrap().get(&key) {
         if cached_at.elapsed() < GIT_METADATA_TTL {
             perf_log(&format!("cached_git_metadata: HIT ({scope})"), Duration::ZERO);
+            return metadata.clone();
+        }
+    }
+    // Rapid navigation can ask for the same folder twice before the first
+    // expensive status scan completes. Serialize only that exact
+    // repository+scope key, then reuse the result produced by the winner.
+    let lock_handle = metadata_scan_lock(&key);
+    let _guard = lock_handle.lock().unwrap();
+    if let Some((cached_at, metadata)) = metadata_cache().lock().unwrap().get(&key) {
+        if cached_at.elapsed() < GIT_METADATA_TTL {
+            perf_log(&format!("cached_git_metadata: HIT after concurrent scan ({scope})"), Duration::ZERO);
             return metadata.clone();
         }
     }
@@ -3186,7 +3208,9 @@ fn is_local_only_url(url: &str) -> bool {
 // knowledge in place — that can only make this check *more* cautious, never
 // less, which is the right direction to err in for something that decides
 // whether it's safe to publish.
-fn submodule_reference_risk(repository_path: &str, relative_path: &str, oid: git2::Oid) -> (Option<&'static str>, Option<String>) {
+fn submodule_reference_risks(repository_path: &str, relative_path: &str, oids: &[git2::Oid]) -> (HashMap<git2::Oid, Option<&'static str>>, Option<String>) {
+    let started = Instant::now();
+    let all = |risk| oids.iter().copied().map(|oid| (oid, risk)).collect();
     // The *effective* clone source: what .gitmodules itself records for this
     // path, since that's what any other, fresh clone would actually use —
     // not merely whatever this local checkout's own "origin" happens to be
@@ -3196,23 +3220,35 @@ fn submodule_reference_risk(repository_path: &str, relative_path: &str, oid: git
     let gitmodules_url = submodule_value(repository_path, relative_path, "url").filter(|url| !url.trim().is_empty());
     let absolute = Path::new(repository_path).join(relative_path);
     let Ok(repo) = internal_submodule_repository(&absolute) else {
-        return (Some("unverifiable"), gitmodules_url);
+        return (all(Some("unverifiable")), gitmodules_url);
     };
     let local_origin_url = repo.find_remote("origin").ok().and_then(|remote| remote.url().map(String::from)).filter(|url| !url.trim().is_empty());
     let effective_url = gitmodules_url.clone().or_else(|| local_origin_url.clone());
     match effective_url.as_deref() {
-        None => return (Some("no_remote"), None),
-        Some(url) if is_local_only_url(url) => return (Some("local_only"), effective_url),
+        None => return (all(Some("no_remote")), None),
+        Some(url) if is_local_only_url(url) => return (all(Some("local_only")), effective_url),
         Some(_) => {}
     }
     let remotes: Vec<String> = repo.remotes().map(|names| names.iter().flatten().map(String::from).collect()).unwrap_or_default();
-    if remotes.is_empty() { return (Some("no_remote"), effective_url); }
+    if remotes.is_empty() { return (all(Some("no_remote")), effective_url); }
     let sub_path = absolute.to_string_lossy().into_owned();
-    for remote in &remotes { let _ = git(&sub_path, &["fetch", remote]); }
-    let reachable = repo.references_glob("refs/remotes/*/*").ok().is_some_and(|references| references.flatten().any(|reference| {
-        reference.target().is_some_and(|tip| tip == oid || repo.graph_descendant_of(tip, oid).unwrap_or(false))
-    }));
-    (if reachable { None } else { Some("unpushed") }, effective_url)
+    // One submodule path can occur at several different gitlink revisions in
+    // the outgoing parent history. Fetch each of its remotes once for the
+    // entire batch, never once per revision — the old nested behavior made a
+    // single Publish repeat the same network round trip many times.
+    for remote in &remotes {
+        let fetch_started = Instant::now();
+        let result = git(&sub_path, &["fetch", remote]);
+        perf_log(&format!("publish_safety: submodule={} fetch {} ({})", relative_path, remote, if result.is_ok() { "ok" } else { "failed; using local refs" }), fetch_started.elapsed());
+    }
+    let remote_tips: Vec<git2::Oid> = repo.references_glob("refs/remotes/*/*").ok().into_iter().flat_map(|references| references.flatten())
+        .filter_map(|reference| reference.target()).collect();
+    let risks = oids.iter().copied().map(|oid| {
+        let reachable = remote_tips.iter().copied().any(|tip| tip == oid || repo.graph_descendant_of(tip, oid).unwrap_or(false));
+        (oid, if reachable { None } else { Some("unpushed") })
+    }).collect();
+    perf_log(&format!("publish_safety: submodule={} checked {} revision{} after one fetch round", relative_path, oids.len(), if oids.len() == 1 { "" } else { "s" }), started.elapsed());
+    (risks, effective_url)
 }
 
 // Point 3 of the submodule-publish-safety report: inspects every *outgoing*
@@ -3226,8 +3262,11 @@ fn submodule_reference_risk(repository_path: &str, relative_path: &str, oid: git
 // (path, submodule oid) pairs are checked once each, no matter how many
 // outgoing commits repeat the same value.
 fn unpushed_submodule_references(repository_path: &str, branch: &str, remote: &str, upto: Option<git2::Oid>) -> Result<Vec<UnpushedSubmoduleReference>, String> {
+    let total_started = Instant::now();
     let repo = internal_repository(repository_path)?;
+    let step = Instant::now();
     let mut outgoing = outgoing_commit_ids(&repo, branch, remote)?;
+    perf_log(&format!("publish_safety: outgoing history ({} commits)", outgoing.len()), step.elapsed());
     // A partial publish ("stop at an earlier commit", see publish_branch's
     // own doc comment) only ever actually pushes commits up to and
     // including that cutoff — a commit *newer* than it, deliberately held
@@ -3245,6 +3284,7 @@ fn unpushed_submodule_references(repository_path: &str, branch: &str, remote: &s
     }
     let mut seen = HashSet::new();
     let mut first_reference: Vec<(String, git2::Oid, git2::Oid)> = Vec::new(); // (path, submodule oid, the oldest outgoing commit introducing it)
+    let step = Instant::now();
     for &oid in outgoing.iter().rev() { // oldest outgoing commit first, so "first" below really means first
         let Ok(commit) = repo.find_commit(oid) else { continue };
         let Ok(tree) = commit.tree() else { continue };
@@ -3260,13 +3300,28 @@ fn unpushed_submodule_references(repository_path: &str, branch: &str, remote: &s
             if seen.insert((path.clone(), sub_oid)) { first_reference.push((path, sub_oid, oid)); }
         }
     }
-    let mut violations = Vec::new();
+    perf_log(&format!("publish_safety: tree scan ({} unique gitlinks)", first_reference.len()), step.elapsed());
+
+    // Preserve first-seen path order for stable user-facing output while
+    // grouping all revisions of the same submodule into one network round.
+    let mut path_order = Vec::new();
+    let mut by_path: HashMap<String, Vec<(git2::Oid, git2::Oid)>> = HashMap::new();
     for (path, sub_oid, commit_oid) in first_reference {
-        let (risk, configured_url) = submodule_reference_risk(repository_path, &path, sub_oid);
-        let Some(risk) = risk else { continue };
-        let commit_subject = repo.find_commit(commit_oid).ok().and_then(|commit| commit.summary().map(str::to_string)).unwrap_or_default();
-        violations.push(UnpushedSubmoduleReference { relative_path: path, submodule_oid: sub_oid.to_string(), commit_id: commit_oid.to_string(), commit_subject, risk: risk.into(), configured_url });
+        if !by_path.contains_key(&path) { path_order.push(path.clone()); }
+        by_path.entry(path).or_default().push((sub_oid, commit_oid));
     }
+    let mut violations = Vec::new();
+    for path in path_order {
+        let references = by_path.remove(&path).unwrap_or_default();
+        let revisions: Vec<git2::Oid> = references.iter().map(|(sub_oid, _)| *sub_oid).collect();
+        let (mut risks, configured_url) = submodule_reference_risks(repository_path, &path, &revisions);
+        for (sub_oid, commit_oid) in references {
+            let Some(risk) = risks.remove(&sub_oid).flatten() else { continue };
+            let commit_subject = repo.find_commit(commit_oid).ok().and_then(|commit| commit.summary().map(str::to_string)).unwrap_or_default();
+            violations.push(UnpushedSubmoduleReference { relative_path: path.clone(), submodule_oid: sub_oid.to_string(), commit_id: commit_oid.to_string(), commit_subject, risk: risk.into(), configured_url: configured_url.clone() });
+        }
+    }
+    perf_log(&format!("publish_safety: TOTAL ({} violation{})", violations.len(), if violations.len() == 1 { "" } else { "s" }), total_started.elapsed());
     Ok(violations)
 }
 
@@ -3306,7 +3361,11 @@ fn submodule_publish_safety_check(repository_path: &str, branch: &str, remote: &
 // shown here can never disagree with what publish_branch would actually
 // check for the same call.
 #[tauri::command]
-pub fn submodule_publish_risks(repository_path: String, branch: String, remote: String, upto_commit: String) -> Result<Vec<UnpushedSubmoduleReference>, String> {
+pub async fn submodule_publish_risks(repository_path: String, branch: String, remote: String, upto_commit: String) -> Result<Vec<UnpushedSubmoduleReference>, String> {
+    off_main_thread(move || submodule_publish_risks_inner(repository_path, branch, remote, upto_commit)).await
+}
+
+fn submodule_publish_risks_inner(repository_path: String, branch: String, remote: String, upto_commit: String) -> Result<Vec<UnpushedSubmoduleReference>, String> {
     validate_path(&repository_path)?;
     let branch = branch.trim(); let remote = remote.trim();
     if branch.is_empty() || remote.is_empty() { return Ok(Vec::new()); }
@@ -3320,7 +3379,14 @@ pub fn submodule_publish_risks(repository_path: String, branch: String, remote: 
 }
 
 #[tauri::command]
-pub fn publish_branch(repository_path: String, branch: String, remote: String, username: String, access_token: String, upto_commit: String, override_unpushed_submodules: bool) -> Result<(), String> {
+pub async fn publish_branch(repository_path: String, branch: String, remote: String, username: String, access_token: String, upto_commit: String, override_unpushed_submodules: bool) -> Result<(), String> {
+    off_main_thread(move || publish_branch_inner(repository_path, branch, remote, username, access_token, upto_commit, override_unpushed_submodules)).await
+}
+
+fn publish_branch_inner(repository_path: String, branch: String, remote: String, username: String, access_token: String, upto_commit: String, override_unpushed_submodules: bool) -> Result<(), String> {
+    let total_started = Instant::now();
+    perf_log("publish_branch: START", Duration::ZERO);
+    let result = (|| {
     validate_path(&repository_path)?;
     if branch.trim().is_empty() || remote.trim().is_empty() { return Err("Choose a local branch and a remote".into()); }
     // See repo_write_lock's doc comment. No credentials in this log line —
@@ -3347,7 +3413,10 @@ pub fn publish_branch(repository_path: String, branch: String, remote: String, u
     // push_oid gets inspected (see unpushed_submodule_references's own doc
     // comment for why an older one matters too), and this runs before any
     // network push is attempted, whether or not an explicit token was given.
+    let safety_started = Instant::now();
     submodule_publish_safety_check(&repository_path, branch, remote_name, Some(push_oid), override_unpushed_submodules)?;
+    perf_log("publish_branch: safety preflight", safety_started.elapsed());
+    let push_started = Instant::now();
     if access_token.trim().is_empty() {
         // No explicit token was entered — prefer the system `git` binary, which
         // transparently reuses the user's already-working SSH agent, credential
@@ -3367,10 +3436,19 @@ pub fn publish_branch(repository_path: String, branch: String, remote: String, u
         let _ = repo.find_reference(scratch_ref).and_then(|mut reference| reference.delete());
         push_result.map_err(|error| { let detail = error.message(); if detail.contains("username/password") || detail.contains("authentication") || detail.contains("401") || detail.contains("403") { "Push authentication failed. Check the username and Personal Access Token in Publish credentials (not your account password).".to_string() } else if detail.contains("non-fast-forward") { "Push rejected because the server branch has newer commits. Pull/fetch those commits first, then publish again.".to_string() } else { format!("Push failed: {detail}") } })?; drop(remote);
     }
+    perf_log("publish_branch: network push", push_started.elapsed());
+    let tracking_started = Instant::now();
     repo.reference(&format!("refs/remotes/{remote_name}/{branch}"), push_oid, true, "successful publish").map_err(|error| format!("Push succeeded, but local server tracking could not be updated: {}", error.message()))?;
     let mut config = repo.config().map_err(|error| error.message().to_string())?; config.set_str(&format!("branch.{branch}.remote"), remote_name).map_err(|error| error.message().to_string())?; config.set_str(&format!("branch.{branch}.merge"), &format!("refs/heads/{branch}")).map_err(|error| error.message().to_string())?;
     invalidate_git_metadata(&repository_path);
+    perf_log("publish_branch: tracking + cache invalidation", tracking_started.elapsed());
     Ok(())
+    })();
+    match &result {
+        Ok(()) => perf_log("publish_branch: TOTAL", total_started.elapsed()),
+        Err(error) => perf_log(&format!("publish_branch: ERROR: {error}"), total_started.elapsed()),
+    }
+    result
 }
 
 #[tauri::command]
@@ -3847,7 +3925,13 @@ fn validate_submodule(repository_path: &str, relative_path: &str) -> Result<Path
 }
 
 #[tauri::command]
-pub fn submodule_versions(repository_path: String, relative_path: String) -> Result<SubmoduleVersions, String> {
+pub async fn submodule_versions(repository_path: String, relative_path: String) -> Result<SubmoduleVersions, String> {
+    off_main_thread(move || submodule_versions_inner(repository_path, relative_path)).await
+}
+
+fn submodule_versions_inner(repository_path: String, relative_path: String) -> Result<SubmoduleVersions, String> {
+    const HISTORY_LIMIT: usize = 100;
+    let started = Instant::now();
     validate_path(&repository_path)?;
     let absolute = validate_submodule(&repository_path, &relative_path)?;
     let relative = safe_relative_path(&relative_path)?;
@@ -3870,12 +3954,14 @@ pub fn submodule_versions(repository_path: String, relative_path: String) -> Res
     // Local branch tips, indexed by the commit they currently point at — used
     // below to report which branch (if any) is "attached" to a given tag.
     let mut branch_tip_names: HashMap<String, String> = HashMap::new();
+    let mut known_branch_tips: Vec<(String, git2::Oid)> = Vec::new();
     for branch_type in [BranchType::Local, BranchType::Remote] {
         let Ok(iterator) = repo.branches(Some(branch_type)) else { continue };
         for item in iterator.flatten() {
             let name = item.0.name().ok().flatten().unwrap_or("").to_string();
             if name.ends_with("/HEAD") { continue; }
             let Some(oid) = item.0.get().target() else { continue };
+            known_branch_tips.push((name.clone(), oid));
             if branch_type == BranchType::Local { branch_tip_names.entry(oid.to_string()).or_insert_with(|| name.clone()); }
             let Ok(commit) = repo.find_commit(oid) else { continue };
             let kind = if branch_type == BranchType::Local { "branch" } else { "remote" };
@@ -3912,9 +3998,16 @@ pub fn submodule_versions(repository_path: String, relative_path: String) -> Res
             });
         }
     }
-    let mut walk = repo.revwalk().map_err(|error| error.message().to_string())?; let _ = walk.set_sorting(Sort::TIME); if let Ok(head) = repo.head() { if let Some(oid) = head.target() { let _ = walk.push(oid); } }
-    for oid in walk.flatten().take(30) { if let Ok(commit) = repo.find_commit(oid) { versions.push(SubmoduleVersion { name: oid.to_string()[..8].into(), revision: oid.to_string(), kind: "commit".into(), current: oid.to_string() == current_revision, subject: commit.summary().unwrap_or("").into(), author: commit.author().name().unwrap_or("Unknown").into(), date: short_date(commit.time().seconds()), attached_branch: None, upstream: None, ahead: None, behind: None }); } }
-    Ok(SubmoduleVersions { path: relative_path, current_revision, current_branch, parent_revision, versions })
+    let current_oid = git2::Oid::from_str(&current_revision).ok();
+    let current_containing_branches: Vec<String> = current_oid.map(|current| known_branch_tips.iter()
+        .filter(|(_, tip)| *tip == current || repo.graph_descendant_of(*tip, current).unwrap_or(false))
+        .map(|(name, _)| name.clone()).collect()).unwrap_or_default();
+    let history_context_branch = if current_branch.is_empty() { current_containing_branches.first().cloned().unwrap_or_default() } else { current_branch.clone() };
+    let history_start = known_branch_tips.iter().find(|(name, _)| name == &history_context_branch).map(|(_, oid)| *oid).or(current_oid);
+    let mut walk = repo.revwalk().map_err(|error| error.message().to_string())?; let _ = walk.set_sorting(Sort::TIME); if let Some(oid) = history_start { let _ = walk.push(oid); }
+    for oid in walk.flatten().take(HISTORY_LIMIT) { if let Ok(commit) = repo.find_commit(oid) { versions.push(SubmoduleVersion { name: oid.to_string()[..8].into(), revision: oid.to_string(), kind: "commit".into(), current: oid.to_string() == current_revision, subject: commit.summary().unwrap_or("").into(), author: commit.author().name().unwrap_or("Unknown").into(), date: short_date(commit.time().seconds()), attached_branch: None, upstream: None, ahead: None, behind: None }); } }
+    perf_log(&format!("submodule_versions: TOTAL ({} refs/commits, {} containing branches)", versions.len(), current_containing_branches.len()), started.elapsed());
+    Ok(SubmoduleVersions { path: relative_path, current_revision, current_branch, parent_revision, current_containing_branches, history_context_branch, history_limit: HISTORY_LIMIT, versions })
 }
 
 #[tauri::command]
@@ -4353,15 +4446,17 @@ fn change_submodule_url_inner(repository_path: String, relative_path: String, ur
 }
 
 #[tauri::command]
-pub fn remove_git_path(repository_path: String, relative_path: String) -> Result<(), String> {
-    let started = Instant::now();
-    perf_log(&format!("remove_git_path: START ({relative_path})"), Duration::ZERO);
-    let result = remove_git_path_inner(&repository_path, &relative_path);
-    match &result {
-        Ok(()) => perf_log(&format!("remove_git_path: TOTAL ({relative_path})"), started.elapsed()),
-        Err(error) => perf_log(&format!("remove_git_path: ERROR ({relative_path}): {error}"), started.elapsed()),
-    }
-    result
+pub async fn remove_git_path(repository_path: String, relative_path: String) -> Result<(), String> {
+    off_main_thread(move || {
+        let started = Instant::now();
+        perf_log(&format!("remove_git_path: START ({relative_path})"), Duration::ZERO);
+        let result = remove_git_path_inner(&repository_path, &relative_path);
+        match &result {
+            Ok(()) => perf_log(&format!("remove_git_path: TOTAL ({relative_path})"), started.elapsed()),
+            Err(error) => perf_log(&format!("remove_git_path: ERROR ({relative_path}): {error}"), started.elapsed()),
+        }
+        result
+    }).await
 }
 
 fn remove_git_path_inner(repository_path: &str, relative_path: &str) -> Result<(), String> {
@@ -5484,9 +5579,9 @@ mod tests {
         assert_eq!(entry_last_commit_inner(parent_string.clone(), "components/engine".into()).unwrap().map(|c| c.subject), Some("P:89312 add engine".to_string()), "last-commit-touching-path must stay the parent's gitlink-bump commit");
         assert_eq!(engine_details.submodule_commit_subject.as_deref(), Some("Initial commit"), "submodule_commit_* must be the submodule's own HEAD commit, not the parent's");
         assert!(engine_details.submodule_commit_id.is_some());
-        let versions = submodule_versions(parent_string.clone(), added.clone()).unwrap();
+        let versions = submodule_versions_inner(parent_string.clone(), added.clone()).unwrap();
         switch_submodule_version_inner(parent_string.clone(), added.clone(), versions.current_revision, "commit".into(), String::new()).unwrap();
-        remove_git_path(parent_string, added).unwrap();
+        remove_git_path_inner(&parent_string, &added).unwrap();
         assert!(!parent.join("components/engine").exists());
         assert!(!parent.join(".gitmodules").exists());
         let repo = Repository::open(&parent).unwrap();
@@ -5532,7 +5627,7 @@ mod tests {
         let details = entry_details_inner(path, "vendor/dependency".into()).unwrap();
         assert_eq!(details.kind, "submodule");
         assert!(details.submodule_url.as_deref().unwrap_or_default().contains("dependency"));
-        let versions = submodule_versions(repository.to_string_lossy().into_owned(), "vendor/dependency".into()).unwrap();
+        let versions = submodule_versions_inner(repository.to_string_lossy().into_owned(), "vendor/dependency".into()).unwrap();
         let release = versions.versions.iter().find(|version| version.name.ends_with("release/2.4")).unwrap();
         let switched = switch_submodule_version_inner(repository.to_string_lossy().into_owned(), "vendor/dependency".into(), release.revision.clone(), release.kind.clone(), release.name.clone()).unwrap();
         assert_eq!(switched, release.revision);
@@ -5569,7 +5664,7 @@ mod tests {
         assert_eq!(list_remotes(repository.to_string_lossy().into_owned()).unwrap().len(), 1);
         let cloned = clone_repository(dependency.to_string_lossy().into_owned(), base.to_string_lossy().into_owned(), "cloned-dependency".into()).unwrap();
         assert_eq!(load_repository_inner(cloned.clone(), Some(true)).unwrap().repository.name, "cloned-dependency");
-        remove_git_path(cloned.clone(), "README.md".into()).unwrap();
+        remove_git_path_inner(&cloned, "README.md").unwrap();
         assert!(!Path::new(&cloned).join("README.md").exists());
         assert!(git(&cloned, &["diff", "--cached", "--name-only"]).unwrap().lines().any(|path| path == "README.md"));
         assert_eq!(browser_repository_url("git@github.com:team/project.git").as_deref(), Some("https://github.com/team/project"));
@@ -7862,14 +7957,21 @@ mod tests {
         let current_sha = git(&sub_path.to_string_lossy(), &["rev-parse", "HEAD"]).unwrap().trim().to_string();
         run_git(&sub_path, &["checkout", "--detach", &current_sha]);
         assert!(Repository::open(&sub_path).unwrap().head_detached().unwrap(), "test setup should leave the submodule detached");
+        let detached_at_known_tip = submodule_versions_inner(repo_path.clone(), "vendor/dep".into()).unwrap();
+        assert!(detached_at_known_tip.current_containing_branches.iter().any(|name| name == "main"),
+            "detached HEAD may still be reachable from a known branch, but must remain presented as detached");
+        assert_eq!(detached_at_known_tip.history_context_branch, "main", "a known containing local branch should provide the history context without attaching HEAD");
 
         fs::write(sub_path.join("module.txt"), "v2").unwrap();
         commit_submodule_inner(repo_path.clone(), "vendor/dep".into(), "Detached commit".into(), false).expect("commit_submodule should succeed while detached");
         assert!(Repository::open(&sub_path).unwrap().head_detached().unwrap(), "committing must not implicitly attach HEAD to a branch");
 
-        let versions = submodule_versions(repo_path.clone(), "vendor/dep".into()).unwrap();
+        let versions = submodule_versions_inner(repo_path.clone(), "vendor/dep".into()).unwrap();
         assert_eq!(versions.current_branch, "", "the version dialog must not expose Git's synthetic HEAD shorthand as a branch name");
         assert_eq!(versions.current_revision, git(&sub_path.to_string_lossy(), &["rev-parse", "HEAD"]).unwrap().trim());
+        assert!(versions.current_containing_branches.is_empty(), "a detached commit created beyond every known branch tip must not be presented as belonging to main or origin/main");
+        assert_eq!(versions.history_context_branch, "", "without a containing branch, history must start at detached HEAD instead of guessing main");
+        assert_eq!(versions.history_limit, 100);
 
         let preview_error = push_submodule_preview_inner(repo_path.clone(), "vendor/dep".into()).unwrap_err();
         assert!(preview_error.contains("detached HEAD"), "preview must identify the real state: {preview_error}");
@@ -7966,7 +8068,7 @@ mod tests {
         // matching what a user would see after working directly inside a submodule.
         run_git(&sub_path, &["branch", "feature-x"]);
 
-        let versions = submodule_versions(repo_path.clone(), "vendor/dep".into()).unwrap();
+        let versions = submodule_versions_inner(repo_path.clone(), "vendor/dep".into()).unwrap();
         let feature_branch = versions.versions.iter().find(|version| version.kind == "branch" && version.name == "feature-x").expect("feature-x should be listed as a local branch");
 
         let switched = switch_submodule_version_inner(repo_path.clone(), "vendor/dep".into(), feature_branch.revision.clone(), feature_branch.kind.clone(), feature_branch.name.clone());
@@ -8177,7 +8279,7 @@ mod tests {
         run_git(&sub_path, &["tag", "-a", "v1.0-annotated", "-m", "Release 1.0"]);
         let tip_commit = Repository::open(&sub_path).unwrap().head().unwrap().target().unwrap().to_string();
 
-        let versions = submodule_versions(repo_path.clone(), "vendor/dep".into()).unwrap();
+        let versions = submodule_versions_inner(repo_path.clone(), "vendor/dep".into()).unwrap();
         let light = versions.versions.iter().find(|v| v.kind == "tag" && v.name == "v1.0-light").expect("lightweight tag should be listed");
         let annotated = versions.versions.iter().find(|v| v.kind == "tag" && v.name == "v1.0-annotated").expect("annotated tag should be listed");
         assert_eq!(light.revision, tip_commit, "a lightweight tag should resolve to the commit it points at");
@@ -8235,7 +8337,7 @@ mod tests {
         run_git(&sub_path, &["commit", "-am", "local ahead"]);
         run_git(&sub_path, &["branch", "untracked-branch"]);
 
-        let versions = submodule_versions(repo_path, "vendor/dep".into()).unwrap();
+        let versions = submodule_versions_inner(repo_path, "vendor/dep".into()).unwrap();
         let develop = versions.versions.iter().find(|v| v.kind == "branch" && v.name == "develop").expect("develop should be listed");
         assert_eq!(develop.upstream.as_deref(), Some("origin/develop"));
         assert_eq!(develop.ahead, Some(1));
@@ -8677,7 +8779,7 @@ mod tests {
         // selecting the old local branch used to set HEAD before checkout.
         // That made the restored tree appear as staged reverse changes
         // against the branch, even though the user had edited nothing.
-        let versions = submodule_versions(repo_path.clone(), "vendor/dep".into()).unwrap();
+        let versions = submodule_versions_inner(repo_path.clone(), "vendor/dep".into()).unwrap();
         let branch = versions.versions.iter().find(|version| version.kind == "branch" && version.name == local_branch).unwrap();
         switch_submodule_version_inner(repo_path, "vendor/dep".into(), branch.revision.clone(), branch.kind.clone(), branch.name.clone()).unwrap();
         let switched = Repository::open(&sub_path).unwrap();
@@ -8805,7 +8907,7 @@ mod tests {
         // detached) — selecting "origin/main" should create and attach to one.
         run_git(&sub_path, &["checkout", "--detach", "HEAD"]);
         assert!(Repository::open(&sub_path).unwrap().head_detached().unwrap());
-        let versions = submodule_versions(repo_path.clone(), "vendor/dep".into()).unwrap();
+        let versions = submodule_versions_inner(repo_path.clone(), "vendor/dep".into()).unwrap();
         let origin_main = versions.versions.iter().find(|v| v.kind == "remote" && v.name == "origin/main").expect("origin/main should be listed");
         switch_submodule_version_inner(repo_path.clone(), "vendor/dep".into(), origin_main.revision.clone(), origin_main.kind.clone(), origin_main.name.clone()).unwrap();
         let sub_repo = Repository::open(&sub_path).unwrap();
@@ -8862,7 +8964,7 @@ mod tests {
         run_git(&sub_path, &["commit", "-am", "v2 on feature-x"]);
         run_git(&sub_path, &["switch", "main"]);
 
-        let versions = submodule_versions(repo_path.clone(), "vendor/dep".into()).unwrap();
+        let versions = submodule_versions_inner(repo_path.clone(), "vendor/dep".into()).unwrap();
         let feature_branch = versions.versions.iter().find(|v| v.kind == "branch" && v.name == "feature-x").expect("feature-x should be listed");
 
         switch_submodule_version_inner(repo_path.clone(), "vendor/dep".into(), feature_branch.revision.clone(), feature_branch.kind.clone(), feature_branch.name.clone()).unwrap();
@@ -9486,7 +9588,7 @@ mod tests {
         run_git(&repository, &["remote", "add", "origin", remote.to_str().unwrap()]);
         let path = repository.to_string_lossy().into_owned();
 
-        publish_branch(path.clone(), "main".into(), "origin".into(), String::new(), String::new(), commit1.clone(), false).unwrap();
+        publish_branch_inner(path.clone(), "main".into(), "origin".into(), String::new(), String::new(), commit1.clone(), false).unwrap();
 
         let remote_head = git(&remote.to_string_lossy(), &["rev-parse", "refs/heads/main"]).unwrap().trim().to_string();
         assert_eq!(remote_head, commit1, "the server should be at exactly the chosen commit, not the branch tip");
@@ -9498,7 +9600,7 @@ mod tests {
         assert_eq!(status.commits[1].subject, "Commit 3");
 
         // Publishing the rest afterward (a normal full push) must succeed cleanly.
-        publish_branch(path.clone(), "main".into(), "origin".into(), String::new(), String::new(), String::new(), false).unwrap();
+        publish_branch_inner(path.clone(), "main".into(), "origin".into(), String::new(), String::new(), String::new(), false).unwrap();
         assert_eq!(publish_status(path, "main".into(), "origin".into()).unwrap().commits.len(), 0);
 
         fs::remove_dir_all(repository).unwrap();
@@ -9759,7 +9861,7 @@ mod tests {
 
         // And publishing it must actually succeed — the submodule commit it
         // references is already safely on the submodule's own remote.
-        publish_branch(repo_path.clone(), "main".into(), "origin".into(), String::new(), String::new(), String::new(), false).expect("publishing should succeed once the submodule was pushed first");
+        publish_branch_inner(repo_path.clone(), "main".into(), "origin".into(), String::new(), String::new(), String::new(), false).expect("publishing should succeed once the submodule was pushed first");
         let after_publish = publish_status(repo_path, "main".into(), "origin".into()).unwrap();
         assert_eq!(after_publish.commits.len(), 0, "nothing should be left to publish after a successful push");
 
@@ -9842,7 +9944,7 @@ mod tests {
         assert_eq!(violations[0].submodule_oid, x1, "the flagged reference must be the older, unreachable one");
         assert_eq!(violations[0].commit_subject, "Bump to X1");
 
-        let blocked = publish_branch(parent_path.clone(), "main".into(), "origin".into(), String::new(), String::new(), String::new(), false);
+        let blocked = publish_branch_inner(parent_path.clone(), "main".into(), "origin".into(), String::new(), String::new(), String::new(), false);
         assert!(blocked.is_err(), "publishing must be blocked while an older outgoing commit still carries an unreachable submodule gitlink");
         let message = blocked.unwrap_err();
         assert!(message.contains("vendor/dep"), "message should name the affected submodule, got: {message}");
@@ -9850,7 +9952,7 @@ mod tests {
         // Confirm the override can't bypass this either — "unpushed" (has a
         // remote, just isn't reachable yet) is never overridable, unlike
         // "no_remote"/"unverifiable".
-        let still_blocked = publish_branch(parent_path, "main".into(), "origin".into(), String::new(), String::new(), String::new(), true);
+        let still_blocked = publish_branch_inner(parent_path, "main".into(), "origin".into(), String::new(), String::new(), String::new(), true);
         assert!(still_blocked.is_err(), "override_unpushed_submodules must never bypass a risk of 'unpushed' — only push can fix that");
 
         fs::remove_dir_all(base).unwrap();
@@ -9925,11 +10027,11 @@ mod tests {
         assert_eq!(violations.len(), 1);
         assert_eq!(violations[0].risk, "no_remote");
 
-        let blocked = publish_branch(parent_string.clone(), branch.clone(), "origin".into(), String::new(), String::new(), String::new(), false);
+        let blocked = publish_branch_inner(parent_string.clone(), branch.clone(), "origin".into(), String::new(), String::new(), String::new(), false);
         assert!(blocked.is_err(), "must be blocked by default — this can never be verified as safe");
         assert!(blocked.unwrap_err().starts_with("UNPUSHED_SUBMODULE_OVERRIDABLE::"), "a no-remote submodule must be override-eligible, since pushing it is never an option");
 
-        let overridden = publish_branch(parent_string, branch, "origin".into(), String::new(), String::new(), String::new(), true);
+        let overridden = publish_branch_inner(parent_string, branch, "origin".into(), String::new(), String::new(), String::new(), true);
         assert!(overridden.is_ok(), "an explicit override must be able to proceed: {overridden:?}");
 
         fs::remove_dir_all(base).unwrap();
@@ -9985,11 +10087,11 @@ mod tests {
         assert_eq!(violations[0].submodule_oid, new_sha);
         assert!(violations[0].configured_url.as_deref().is_some_and(|url| url == dependency.to_string_lossy()), "the reported URL should be the actual local path, for display: {:?}", violations[0].configured_url);
 
-        let blocked = publish_branch(parent_string.clone(), branch.clone(), "origin".into(), String::new(), String::new(), String::new(), false);
+        let blocked = publish_branch_inner(parent_string.clone(), branch.clone(), "origin".into(), String::new(), String::new(), String::new(), false);
         assert!(blocked.is_err(), "must be blocked by default even though the commit is genuinely reachable from that path");
         assert!(blocked.unwrap_err().starts_with("UNPUSHED_SUBMODULE_OVERRIDABLE::"), "a local-only submodule must be override-eligible, since pushing it anywhere else isn't this app's decision to make");
 
-        let overridden = publish_branch(parent_string, branch, "origin".into(), String::new(), String::new(), String::new(), true);
+        let overridden = publish_branch_inner(parent_string, branch, "origin".into(), String::new(), String::new(), String::new(), true);
         assert!(overridden.is_ok(), "an explicit override must be able to proceed: {overridden:?}");
 
         fs::remove_dir_all(base).unwrap();
