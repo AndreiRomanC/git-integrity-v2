@@ -6,7 +6,7 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { groupSubmoduleBranchVersions, submoduleCurrentPresentation, submoduleCurrentContextHtml, matchesSubmoduleVersion, submoduleVersionRowHtml, submodulePushDialogState } = require('../frontend/submodule-versions.js');
+const { groupSubmoduleBranchVersions, submoduleCurrentPresentation, submoduleContainingBranchCandidates, submoduleCurrentContextHtml, matchesSubmoduleVersion, submoduleVersionRowHtml, submodulePushDialogState } = require('../frontend/submodule-versions.js');
 
 function branch(name, upstream) { return { name, kind: 'branch', upstream: upstream || null }; }
 function remote(name) { return { name, kind: 'remote' }; }
@@ -103,14 +103,46 @@ test('detached context distinguishes a containing branch from an exact branch ti
       { kind: 'branch', name: 'develop', revision: '33333333cccc' },
     ],
   });
-  assert.match(contained, /inside the history of: develop, origin\/develop/);
-  assert.match(contained, /branch tips are at newer commits/i);
+  assert.match(contained, /Detached inside 1 known branch/);
+  assert.match(contained, /⑂ develop/);
+  assert.match(contained, /Switch to branch tip/);
 
   const exact = submoduleCurrentContextHtml({
     current_revision: '44444444aaaa', current_branch: '', parent_revision: '44444444aaaa',
     current_containing_branches: ['main'], versions: [{ kind: 'branch', name: 'main', revision: '44444444aaaa' }],
   });
   assert.match(exact, /Detached at the tip of: main/);
+});
+
+test('detached context offers explicit switch actions ordered by nearest useful branch', () => {
+  const data = {
+    current_revision: '11111111aaaa', current_branch: '', parent_revision: '11111111aaaa',
+    current_containing_branches: ['IMS.VITESCO.IO_master', 'feature/errm_common_hip', 'origin/feature/errm_common_hip'],
+    versions: [
+      { kind: 'branch', name: 'IMS.VITESCO.IO_master', revision: '99999999aaaa', contains_current: true, commits_after_current: 12 },
+      { kind: 'branch', name: 'feature/errm_common_hip', revision: '22222222aaaa', upstream: 'origin/feature/errm_common_hip', contains_current: true, commits_after_current: 1 },
+      { kind: 'remote', name: 'origin/feature/errm_common_hip', revision: '22222222aaaa', contains_current: true, commits_after_current: 1 },
+      { kind: 'commit', revision: '11111111aaaa', current: true, subject: 'Current detached change' },
+    ],
+  };
+  const candidates = submoduleContainingBranchCandidates(data);
+  assert.deepEqual(candidates.map(item => item.name), ['feature/errm_common_hip', 'IMS.VITESCO.IO_master']);
+  const html = submoduleCurrentContextHtml(data);
+  assert.ok(html.indexOf('feature/errm_common_hip') < html.indexOf('IMS.VITESCO.IO_master'));
+  assert.match(html, /BRANCHES CONTAINING THIS COMMIT/);
+  assert.match(html, /Branch tip is 1 commit newer/);
+  assert.match(html, /Switch to branch tip/);
+  assert.equal((html.match(/data-switch-version/g) || []).length, 2);
+});
+
+test('the active commit row names branches that contain it without claiming attachment', () => {
+  const html = submoduleVersionRowHtml({
+    name: '11111111', kind: 'commit', revision: '11111111aaaa', current: true,
+    subject: 'Detached change', author: 'A', date: '2026-09-15',
+    context_branches: ['feature/errm_common_hip', 'origin/feature/errm_common_hip'],
+  });
+  assert.match(html, /contained in ⑂ feature\/errm_common_hip, origin\/feature\/errm_common_hip/);
+  assert.match(html, /COMMIT \(detached\)/);
 });
 
 test('submodule search includes SHA, subject, author and date from the loaded response', () => {

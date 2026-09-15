@@ -498,6 +498,9 @@ button.pr-reviewer:hover { border-color: #59758e; background: #1b2b38; color: #e
 .commit-row:hover { background: #121c26; }
 .commit-row.selected { background: #17283a; box-shadow: inset 0 0 0 1px #315b82; }
 .commit-row.is-head .commit-card { border-color: #4f8fc8; box-shadow: 0 0 0 1px #4f8fc855, 0 3px 10px #0004; }
+.commit-row.has-local-branch-tip .commit-card { border-left: 4px solid #39c5cf; background: linear-gradient(90deg, #123039 0, #141c24 17%); }
+.commit-row.has-remote-branch-tip .commit-card { border-left: 4px solid #8298b8; background: linear-gradient(90deg, #202b3a 0, #141c24 17%); }
+.commit-row.is-head.has-local-branch-tip .commit-card { border-left-color: #70dce4; box-shadow: 0 0 0 1px #4f8fc888, 0 3px 12px #0006; }
 .commit-row.is-search-match .commit-card { border-color: #d9a25c; box-shadow: 0 0 0 1px #d9a25c55; }
 .commit-row.is-search-dimmed .commit-card { opacity: .38; }
 .commit-row.is-search-dimmed:hover .commit-card { opacity: .7; }
@@ -515,14 +518,17 @@ button.pr-reviewer:hover { border-color: #59758e; background: #1b2b38; color: #e
    in the graph and must never be read as meaning anything about a
    specific branch; a badge's color is the opposite: a fixed, stable
    signal for what kind of ref it is, unrelated to which lane it's on. */
-.ref-pill { max-width: 130px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 2px 7px; border-radius: 3px; background: #1b2a36; color: #d6e5f0; font-size: 10px; font-weight: 700; }
-.ref-pill.kind-local_branch { border-left: 3px solid #39c5cf; background: #12262a; color: #bdf0f5; }
-.ref-pill.kind-remote_branch { border-left: 3px solid #6f84a3; background: #1c2430; color: #c7d2e2; }
+.ref-pill { max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 3px 8px; border-radius: 5px; background: #1b2a36; color: #d6e5f0; font-size: 10px; font-weight: 700; }
+.ref-pill i { margin-right: 5px; font-size: 7px; font-style: normal; letter-spacing: .45px; opacity: .78; }
+.ref-pill.kind-local_branch { border: 1px solid #3299a2; border-left: 4px solid #4bd3dc; background: #123139; color: #d2f8fb; box-shadow: 0 0 0 1px #39c5cf18; }
+.ref-pill.kind-remote_branch { border: 1px solid #536984; border-left: 4px solid #8298b8; background: #202b3a; color: #d7e1ef; }
 .ref-pill.kind-tag { border: 1px solid #a4842e; background: #3a2c12; color: #ffe3a3; font-weight: 800; cursor: pointer; }
 .ref-pill.kind-tag:hover { border-color: var(--amber); background: #4a3818; }
 .ref-pill.kind-head { border: 1px solid #e8eef5; background: transparent; color: #e8eef5; font-weight: 800; letter-spacing: .4px; }
 .commit-card { min-width: 0; display: grid; grid-template-columns: 1fr auto auto auto; align-items: center; gap: 14px; min-height: 40px; padding: 6px 12px; border: 1px solid var(--border-soft); border-radius: 8px; background: #141c24; box-shadow: 0 2px 8px #0002; }
 .commit-row:hover .commit-card, .commit-row.selected .commit-card { border-color: #3d5368; background: #18232e; }
+.commit-row.has-local-branch-tip:hover .commit-card, .commit-row.has-local-branch-tip.selected .commit-card { border-left: 4px solid #4bd3dc; background: linear-gradient(90deg, #173844 0, #18232e 17%); }
+.commit-row.has-remote-branch-tip:hover .commit-card, .commit-row.has-remote-branch-tip.selected .commit-card { border-left: 4px solid #8298b8; background: linear-gradient(90deg, #263448 0, #18232e 17%); }
 .commit-main { min-width: 0; display: flex; align-items: center; gap: 7px; }
 .commit-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; font-size: 13px; flex-shrink: 1; }
 .commit-id { color: #7297b9; font: 12px ui-monospace, SFMono-Regular, Consolas, monospace; letter-spacing: .3px; }
@@ -634,7 +640,7 @@ button.pr-reviewer:hover { border-color: #59758e; background: #1b2b38; color: #e
 .commit-area button { height: 34px; margin-left: auto; padding: 0 15px; border: 1px solid #5ba6ec; border-radius: 6px; background: #286ca8; color: white; }
 .commit-area button:disabled { border-color: #34404b; background: #27313b; color: #71808d; }
 
-.submodule-menu { position: fixed; z-index: 30; width: min(600px, calc(100vw - 32px)); max-height: 560px; display: flex; flex-direction: column; border: 1px solid #526274; border-radius: 10px; background: #18212b; box-shadow: 0 20px 70px #000c; overflow: hidden; }
+.submodule-menu { position: fixed; z-index: 30; width: min(720px, calc(100vw - 32px)); max-height: min(680px, calc(100vh - 32px)); display: flex; flex-direction: column; border: 1px solid #526274; border-radius: 10px; background: #18212b; box-shadow: 0 20px 70px #000c; overflow: hidden; }
 .submodule-menu > header { min-height: 58px; display: flex; align-items: center; padding: 10px 13px 10px 16px; border-bottom: 1px solid var(--border); background: #1c2631; }
 .submodule-menu > header div { min-width: 0; display: flex; flex-direction: column; gap: 3px; }.submodule-menu > header span { color: #7f92a4; font-size: 9px; letter-spacing: .9px; }.submodule-menu > header strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .submodule-menu > header button { width: 30px; height: 30px; margin-left: auto; border: 0; border-radius: 6px; background: transparent; color: #9babb9; font-size: 22px; }.submodule-menu > header button:hover { background: #2a3642; }
@@ -642,7 +648,7 @@ button.pr-reviewer:hover { border-color: #59758e; background: #1b2b38; color: #e
 .version-tabs { display: flex; align-items: center; gap: 3px; padding: 9px 11px 7px; border-bottom: 1px solid var(--border-soft); }.version-tabs button { height: 29px; padding: 0 11px; border: 0; border-radius: 6px; background: transparent; color: #8fa0b0; font-size: 11px; }.version-tabs button.active { background: #234566; color: #e7f3ff; }.version-tabs .version-graph-link { margin-left: auto; color: #6f95b8; }.version-tabs .version-graph-link:hover { color: #bcdcff; background: #1d2a36; }
 .version-search { margin: 0 11px 9px; width: calc(100% - 22px); height: 28px; padding: 0 10px; border: 1px solid var(--border-soft); border-radius: 6px; background: #131b23; color: #d6e2ec; font-size: 11px; }.version-search:focus { outline: none; border-color: #3a6ea5; }.version-search::placeholder { color: #5a6c7d; }
 .version-attached-branch { font-family: -apple-system, sans-serif; font-size: 9px; color: #7fb88f; }
-.version-list { min-height: 100px; max-height: 360px; overflow: auto; padding: 5px; }.version-row { width: 100%; min-height: 53px; display: grid; grid-template-columns: 24px 78px minmax(120px, 155px) minmax(110px, 1fr) auto; align-items: center; gap: 8px; padding: 5px 9px; border: 1px solid transparent; border-radius: 7px; background: transparent; text-align: left; }.version-row:hover { border-color: #35495c; background: #1d2a36; }.version-row.current { background: #18334d; }.version-symbol { color: var(--purple); font-size: 16px; }.version-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 11px ui-monospace, SFMono-Regular, Consolas, monospace; color: #c5d4e2; display: flex; flex-direction: column; gap: 3px; align-items: flex-start; }.version-kind-badge { padding: 1px 5px; border-radius: 4px; background: #2a3a4a; color: #8fb3d9; font-size: 8px; font-family: -apple-system, sans-serif; font-weight: 700; letter-spacing: .3px; }.version-copy { min-width: 0; display: flex; flex-direction: column; gap: 3px; }.version-subject { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }.version-meta { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #748697; font-size: 10px; }.current-label { padding: 2px 6px; border-radius: 8px; background: #2b6c4a; color: #bff1d1; font-size: 9px; }
+.version-list { min-height: 100px; max-height: 440px; overflow: auto; padding: 5px; }.version-row { width: 100%; min-height: 53px; display: grid; grid-template-columns: 24px 78px minmax(135px, 180px) minmax(130px, 1fr) auto; align-items: center; gap: 8px; padding: 5px 9px; border: 1px solid transparent; border-radius: 7px; background: transparent; text-align: left; }.version-row:hover { border-color: #35495c; background: #1d2a36; }.version-row.current { background: #18334d; }.version-symbol { color: var(--purple); font-size: 16px; }.version-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 11px ui-monospace, SFMono-Regular, Consolas, monospace; color: #c5d4e2; display: flex; flex-direction: column; gap: 3px; align-items: flex-start; }.version-kind-badge { padding: 1px 5px; border-radius: 4px; background: #2a3a4a; color: #8fb3d9; font-size: 8px; font-family: -apple-system, sans-serif; font-weight: 700; letter-spacing: .3px; }.version-copy { min-width: 0; display: flex; flex-direction: column; gap: 3px; }.version-subject { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }.version-meta { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #748697; font-size: 10px; }.current-label { padding: 2px 6px; border-radius: 8px; background: #2b6c4a; color: #bff1d1; font-size: 9px; }
 .version-row-actions { display: flex; align-items: center; justify-content: flex-end; gap: 6px; }
 .version-row-actions button { width: auto; min-width: 58px; height: 25px; padding: 0 8px; border: 1px solid #405365; border-radius: 6px; background: #15222d; color: #a9bfd2; font-size: 9px; white-space: nowrap; }
 .version-row-actions button:hover { border-color: #6695bd; background: #203449; color: white; }
@@ -665,6 +671,16 @@ button.pr-reviewer:hover { border-color: #59758e; background: #1b2b38; color: #e
 .version-current-context > div b { margin-left: auto; padding: 2px 6px; border-radius: 4px; background: #26384a; color: #a7bfd4; font-size: 8px; letter-spacing: .4px; }
 .version-current-context p { margin: 5px 0 3px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #d2dee8; font-size: 10px; }
 .version-current-context small { display: block; color: #8095a7; font-size: 9px; line-height: 1.4; }
+.version-containing-branches { margin-top: 9px; padding-top: 8px; border-top: 1px solid #294156; }
+.version-containing-branches h4 { margin: 0 0 5px; color: #7592ab; font-size: 8px; letter-spacing: .75px; }
+.version-containing-branch { min-height: 38px; display: flex; align-items: center; gap: 12px; padding: 5px 7px; border-radius: 6px; background: #162a3b; }
+.version-containing-branch + .version-containing-branch { margin-top: 4px; }
+.version-containing-branch > span { min-width: 0; display: flex; flex: 1; flex-direction: column; gap: 2px; }
+.version-containing-branch strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #c8e9ff; font: 11px ui-monospace, SFMono-Regular, Consolas, monospace; }
+.version-containing-branch small { color: #7f9aae; font-size: 9px; }
+.version-containing-branch button { flex: none; height: 27px; padding: 0 10px; border: 1px solid #4d7ca4; border-radius: 6px; background: #1d4261; color: #d9efff; font-size: 9px; font-weight: 600; }
+.version-containing-branch button:hover { border-color: #79b6e8; background: #285779; }
+.version-more-branches { margin: 6px 2px 0 !important; color: #70879a !important; font-size: 9px !important; white-space: normal !important; }
 .version-inactive-label { color: #738493; font-size: 8px; font-weight: 700; letter-spacing: .4px; }
 .version-history-limit { margin: 3px 5px 7px; color: #718495; font-size: 9px; line-height: 1.35; }
 .commit-scope-label textarea { min-height: 52px; padding: 8px 10px; border: 1px solid #405365; border-radius: 6px; background: #0d151c; color: #d4e1eb; font-size: 12px; font-family: inherit; resize: vertical; }

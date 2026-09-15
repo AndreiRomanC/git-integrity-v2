@@ -1135,9 +1135,10 @@ async function openSubmoduleMenu(entry, x, y) {
   // Keep the wider, readable selector fully inside the viewport. Its old
   // 440px positioning clamp was left behind after the contents grew, so the
   // recovery and Checkout buttons could overlap text or extend off-screen.
-  const menuWidth = Math.min(600, innerWidth - 32);
+  const menuWidth = Math.min(720, innerWidth - 32);
+  const menuHeight = Math.min(680, innerHeight - 32);
   refs.submoduleMenu.style.left = `${Math.max(16, Math.min(x, innerWidth - menuWidth - 16))}px`;
-  refs.submoduleMenu.style.top = `${Math.max(16, Math.min(y, innerHeight - 576))}px`;
+  refs.submoduleMenu.style.top = `${Math.max(16, Math.min(y, innerHeight - menuHeight - 16))}px`;
   refs.submoduleMenuName.textContent = entry.name; refs.currentSubmoduleVersion.textContent = 'Loading…';
   refs.submoduleVersionSearch.value = '';
   refs.submoduleVersions.innerHTML = '<div class="version-loading"><i class="spinner"></i>Reading branches, tags and commits…</div>';
@@ -1185,7 +1186,12 @@ function renderSubmoduleVersions() {
       + (remoteRows.length ? `<div class="version-section-heading">REMOTE ONLY</div>${remoteRows.map(renderBranch).join('')}` : '');
     html = currentContext + (rows || `<div class="version-loading">${query ? 'No matches' : 'No branches found'}</div>`);
   } else {
-    const versions = submoduleMenuData.versions.filter(item => versionFilter === 'tag' ? item.kind === 'tag' : item.kind === 'commit').filter(matches);
+    const versions = submoduleMenuData.versions
+      .filter(item => versionFilter === 'tag' ? item.kind === 'tag' : item.kind === 'commit')
+      .filter(matches)
+      .map(item => item.kind === 'commit' && item.current
+        ? { ...item, context_branches: submoduleContainingBranchCandidates(submoduleMenuData).map(branch => branch.name) }
+        : item);
     const rows = versions.map(submoduleVersionRowHtml).join('') || `<div class="version-loading">${query ? 'No matches' : versionFilter === 'tag' ? 'No tags in this submodule' : 'No versions found'}</div>`;
     const historyContext = submoduleMenuData.history_context_branch
       ? `History of ${submoduleMenuData.history_context_branch}. The active checkout is marked CURRENT even when it is inside the branch rather than at its tip.`
@@ -2434,8 +2440,8 @@ const GRAPH_LEGEND_HTML = `<details class="graph-legend">
     <span><i class="legend-glyph">◎</i>HEAD — The commit currently checked out</span>
     <span><i class="legend-glyph">⑂</i>Branch point — A common ancestor or lane transition</span>
     <span><i class="legend-glyph legend-tag">◆</i>TAG — A named release or version</span>
-    <span><i class="legend-swatch kind-local_branch"></i>Branch — A local branch tip</span>
-    <span><i class="legend-swatch kind-remote_branch"></i>Remote branch — The last locally known remote position</span>
+    <span><i class="legend-swatch kind-local_branch"></i>Branch — Strong cyan label and outlined tip dot</span>
+    <span><i class="legend-swatch kind-remote_branch"></i>Remote branch — Slate label and outlined last-known tip</span>
     <span><i class="legend-line"></i>Line — A real parent relationship between commits</span>
     <span><i class="legend-swatch legend-merge"></i>MERGE — A commit with multiple parents</span>
     <span><i class="legend-glyph">…</i>Older history is available but not loaded</span>
@@ -2458,6 +2464,8 @@ function refsBadges(refList, isHead, currentBranchName) {
   if (!badges.length && !overflowTags.length && !overflowBranches.length) return '';
   const badgeHtml = badges.map(badge => {
     if (badge.kind === 'tag') return `<b class="ref-pill kind-tag" data-tag-name="${esc(badge.name)}" data-tooltip="Click for tag details">${REF_BADGE_ICON.tag}${esc(badge.name)}</b>`;
+    if (badge.kind === 'local_branch') return `<b class="ref-pill kind-local_branch" data-tooltip="Local branch tip"><i>⑂ BRANCH</i>${esc(badge.name)}</b>`;
+    if (badge.kind === 'remote_branch') return `<b class="ref-pill kind-remote_branch" data-tooltip="Remote-tracking branch tip"><i>REMOTE</i>${esc(badge.name)}</b>`;
     return `<b class="ref-pill kind-${badge.kind}">${esc(badge.name)}</b>`;
   }).join('');
   const tagOverflow = overflowTags.length ? `<b class="ref-pill kind-tag ref-pill-more" data-tooltip="${esc(overflowTags.map(t => t.name).join(', '))}">+${overflowTags.length} tags</b>` : '';
@@ -2631,10 +2639,12 @@ function buildCommitRowHtml(commit, index, ctx) {
   // its own refs, since it's structural context for whatever nearby row
   // *does* match, the same reasoning search already applies.
   const refKinds = new Set((node.refs || []).map(r => r.kind));
+  const hasLocalBranchRef = refKinds.has('local_branch');
+  const hasRemoteBranchRef = refKinds.has('remote_branch');
   const matchesFilter = ctx.refFilter === 'all' || isBranchPoint || (ctx.refFilter === 'branches' ? (refKinds.has('local_branch') || refKinds.has('remote_branch')) : refKinds.has('tag'));
   const isFilterDimmed = !matchesFilter;
 
-  return `<article class="commit-row ${node.isHead ? 'is-head' : ''} ${isBranchPoint ? 'is-branch-point' : ''} ${isMatch ? 'is-search-match' : ''} ${isSearchDimmed || isFilterDimmed ? 'is-search-dimmed' : ''}" data-id="${esc(commit.id)}" data-lane="${node.lane}">
+  return `<article class="commit-row ${node.isHead ? 'is-head' : ''} ${hasLocalBranchRef ? 'has-local-branch-tip' : ''} ${!hasLocalBranchRef && hasRemoteBranchRef ? 'has-remote-branch-tip' : ''} ${isBranchPoint ? 'is-branch-point' : ''} ${isMatch ? 'is-search-match' : ''} ${isSearchDimmed || isFilterDimmed ? 'is-search-dimmed' : ''}" data-id="${esc(commit.id)}" data-lane="${node.lane}">
     <div class="graph-cell"></div>
     <div class="commit-body">
       <div class="commit-card"><div class="commit-main">${isBranchPoint ? '<b class="branch-point-pill" data-tooltip="Common ancestor — where the newer branch above split off">⑂</b>' : ''}<span class="commit-title">${commitSubjectHtml(commit.subject)}</span>${refsBadges(node.refs, node.isHead, ctx.currentBranch)}${stashPills}</div><span class="commit-id">${esc(commit.id.slice(0, 8))}</span>
@@ -2964,6 +2974,8 @@ function drawGraphOverlay(model, lanesWidth) {
   model.forEach(node => {
     const pos = positions.get(node.commitId); if (!pos) return;
     const color = palette[node.lane % palette.length];
+    const refKinds = new Set((node.refs || []).map(ref => ref.kind));
+    const branchTipStroke = refKinds.has('local_branch') ? '#4bd3dc' : refKinds.has('remote_branch') ? '#8298b8' : '';
     if (node.isHead) {
       parts.push(`<circle cx="${pos.x}" cy="${pos.y}" r="8" fill="${color}" stroke="#0d1117" stroke-width="2.5"/><circle cx="${pos.x}" cy="${pos.y}" r="8" fill="none" stroke="#e8eef5" stroke-width="1.6"/>`);
     } else if (branchPointIds.has(node.commitId)) {
@@ -2974,6 +2986,7 @@ function drawGraphOverlay(model, lanesWidth) {
     } else {
       parts.push(`<circle cx="${pos.x}" cy="${pos.y}" r="6" fill="${color}" stroke="#0d1117" stroke-width="2.5"/>`);
     }
+    if (branchTipStroke) parts.push(`<circle cx="${pos.x}" cy="${pos.y}" r="11" fill="none" stroke="${branchTipStroke}" stroke-width="2" opacity="0.92"/>`);
   });
 
   // Point 8 of the report: a lane still open (unresolved) at the very last

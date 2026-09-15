@@ -658,6 +658,11 @@ pub struct SubmoduleVersion {
     upstream: Option<String>,
     ahead: Option<usize>,
     behind: Option<usize>,
+    // For branch/remote rows only: whether the active checkout is reachable
+    // from this branch tip, and how many commits newer that tip is. This is
+    // ancestry context for detached HEAD, not a claim that HEAD is attached.
+    contains_current: bool,
+    commits_after_current: Option<usize>,
 }
 
 #[derive(Serialize)]
@@ -3229,19 +3234,27 @@ fn submodule_reference_risks(repository_path: &str, relative_path: &str, oids: &
         Some(url) if is_local_only_url(url) => return (all(Some("local_only")), effective_url),
         Some(_) => {}
     }
-    let remotes: Vec<String> = repo.remotes().map(|names| names.iter().flatten().map(String::from).collect()).unwrap_or_default();
-    if remotes.is_empty() { return (all(Some("no_remote")), effective_url); }
+    // Verify only against origin. Fetching every configured remote was both
+    // slow and subtly unsafe: a commit available only from an unrelated
+    // personal/backup remote does not make it restorable by a normal clone.
+    // Do not require literal URL equality here: Git commonly stores an
+    // equivalent rewritten/credentialed URL in the local clone, while
+    // .gitmodules keeps the portable public form.
+    if repo.find_remote("origin").is_err() { return (all(Some("no_remote")), effective_url); }
+    let remote = "origin";
     let sub_path = absolute.to_string_lossy().into_owned();
     // One submodule path can occur at several different gitlink revisions in
-    // the outgoing parent history. Fetch each of its remotes once for the
-    // entire batch, never once per revision — the old nested behavior made a
-    // single Publish repeat the same network round trip many times.
-    for remote in &remotes {
-        let fetch_started = Instant::now();
-        let result = git(&sub_path, &["fetch", remote]);
-        perf_log(&format!("publish_safety: submodule={} fetch {} ({})", relative_path, remote, if result.is_ok() { "ok" } else { "failed; using local refs" }), fetch_started.elapsed());
-    }
-    let remote_tips: Vec<git2::Oid> = repo.references_glob("refs/remotes/*/*").ok().into_iter().flat_map(|references| references.flatten())
+    // the outgoing parent history. Fetch origin once for the entire batch,
+    // never once per revision — the old nested behavior made a single
+    // Publish repeat the same network round trip many times.
+    let fetch_started = Instant::now();
+    // Tags and nested-submodule recursion are irrelevant to the question
+    // being answered here (is the gitlink commit reachable from a branch on
+    // this source?) and can add substantial network work on large projects.
+    let result = git(&sub_path, &["fetch", "--no-tags", "--no-recurse-submodules", remote]);
+    perf_log(&format!("publish_safety: submodule={} fetch {} ({})", relative_path, remote, if result.is_ok() { "ok" } else { "failed; using local refs" }), fetch_started.elapsed());
+    let remote_pattern = format!("refs/remotes/{remote}/*");
+    let remote_tips: Vec<git2::Oid> = repo.references_glob(&remote_pattern).ok().into_iter().flat_map(|references| references.flatten())
         .filter_map(|reference| reference.target()).collect();
     let risks = oids.iter().copied().map(|oid| {
         let reachable = remote_tips.iter().copied().any(|tip| tip == oid || repo.graph_descendant_of(tip, oid).unwrap_or(false));
@@ -3950,18 +3963,26 @@ fn submodule_versions_inner(repository_path: String, relative_path: String) -> R
     } else {
         repo.head().ok().and_then(|head| head.shorthand().map(String::from)).unwrap_or_default()
     };
+    let current_oid = git2::Oid::from_str(&current_revision).ok();
     let mut versions = Vec::new();
     // Local branch tips, indexed by the commit they currently point at — used
     // below to report which branch (if any) is "attached" to a given tag.
     let mut branch_tip_names: HashMap<String, String> = HashMap::new();
-    let mut known_branch_tips: Vec<(String, git2::Oid)> = Vec::new();
+    // name, tip, is-local, number of commits from current checkout to tip.
+    // The last value is None when this branch does not contain current HEAD.
+    let mut known_branch_tips: Vec<(String, git2::Oid, bool, Option<usize>)> = Vec::new();
     for branch_type in [BranchType::Local, BranchType::Remote] {
         let Ok(iterator) = repo.branches(Some(branch_type)) else { continue };
         for item in iterator.flatten() {
             let name = item.0.name().ok().flatten().unwrap_or("").to_string();
             if name.ends_with("/HEAD") { continue; }
             let Some(oid) = item.0.get().target() else { continue };
-            known_branch_tips.push((name.clone(), oid));
+            let commits_after_current = current_oid.and_then(|current| {
+                let (ahead, behind) = repo.graph_ahead_behind(oid, current).ok()?;
+                (behind == 0).then_some(ahead)
+            });
+            let contains_current = commits_after_current.is_some();
+            known_branch_tips.push((name.clone(), oid, branch_type == BranchType::Local, commits_after_current));
             if branch_type == BranchType::Local { branch_tip_names.entry(oid.to_string()).or_insert_with(|| name.clone()); }
             let Ok(commit) = repo.find_commit(oid) else { continue };
             let kind = if branch_type == BranchType::Local { "branch" } else { "remote" };
@@ -3979,7 +4000,7 @@ fn submodule_versions_inner(repository_path: String, relative_path: String) -> R
             versions.push(SubmoduleVersion {
                 name: name.clone(), revision: oid.to_string(), kind: kind.into(), current: kind == "branch" && name == current_branch,
                 subject: commit.summary().unwrap_or("").into(), author: commit.author().name().unwrap_or("Unknown").into(), date: short_date(commit.time().seconds()),
-                attached_branch: None, upstream, ahead, behind,
+                attached_branch: None, upstream, ahead, behind, contains_current, commits_after_current,
             });
         }
     }
@@ -3994,18 +4015,26 @@ fn submodule_versions_inner(repository_path: String, relative_path: String) -> R
                 current: commit.id().to_string() == current_revision,
                 subject: commit.summary().unwrap_or("").into(), author: commit.author().name().unwrap_or("Unknown").into(),
                 date: short_date(commit.time().seconds()), attached_branch: branch_tip_names.get(&commit.id().to_string()).cloned(),
-                upstream: None, ahead: None, behind: None,
+                upstream: None, ahead: None, behind: None, contains_current: false, commits_after_current: None,
             });
         }
     }
-    let current_oid = git2::Oid::from_str(&current_revision).ok();
-    let current_containing_branches: Vec<String> = current_oid.map(|current| known_branch_tips.iter()
-        .filter(|(_, tip)| *tip == current || repo.graph_descendant_of(*tip, current).unwrap_or(false))
-        .map(|(name, _)| name.clone()).collect()).unwrap_or_default();
+    // Prefer the closest containing tip. At equal distance, a local branch
+    // is more useful than its remote-tracking duplicate because the user can
+    // attach HEAD to it directly. This avoids selecting an arbitrary first
+    // branch such as IMS.VITESCO.IO_master when *_errm_common_hip is the
+    // closer context for the active commit.
+    let mut containing = known_branch_tips.iter().filter(|(_, _, _, distance)| distance.is_some()).collect::<Vec<_>>();
+    containing.sort_by(|left, right| {
+        let left_key = (left.3.unwrap_or(usize::MAX), if left.2 { 0 } else { 1 }, left.0.as_str());
+        let right_key = (right.3.unwrap_or(usize::MAX), if right.2 { 0 } else { 1 }, right.0.as_str());
+        left_key.cmp(&right_key)
+    });
+    let current_containing_branches = containing.iter().map(|(name, _, _, _)| name.clone()).collect::<Vec<_>>();
     let history_context_branch = if current_branch.is_empty() { current_containing_branches.first().cloned().unwrap_or_default() } else { current_branch.clone() };
-    let history_start = known_branch_tips.iter().find(|(name, _)| name == &history_context_branch).map(|(_, oid)| *oid).or(current_oid);
+    let history_start = known_branch_tips.iter().find(|(name, _, _, _)| name == &history_context_branch).map(|(_, oid, _, _)| *oid).or(current_oid);
     let mut walk = repo.revwalk().map_err(|error| error.message().to_string())?; let _ = walk.set_sorting(Sort::TIME); if let Some(oid) = history_start { let _ = walk.push(oid); }
-    for oid in walk.flatten().take(HISTORY_LIMIT) { if let Ok(commit) = repo.find_commit(oid) { versions.push(SubmoduleVersion { name: oid.to_string()[..8].into(), revision: oid.to_string(), kind: "commit".into(), current: oid.to_string() == current_revision, subject: commit.summary().unwrap_or("").into(), author: commit.author().name().unwrap_or("Unknown").into(), date: short_date(commit.time().seconds()), attached_branch: None, upstream: None, ahead: None, behind: None }); } }
+    for oid in walk.flatten().take(HISTORY_LIMIT) { if let Ok(commit) = repo.find_commit(oid) { versions.push(SubmoduleVersion { name: oid.to_string()[..8].into(), revision: oid.to_string(), kind: "commit".into(), current: oid.to_string() == current_revision, subject: commit.summary().unwrap_or("").into(), author: commit.author().name().unwrap_or("Unknown").into(), date: short_date(commit.time().seconds()), attached_branch: None, upstream: None, ahead: None, behind: None, contains_current: false, commits_after_current: None }); } }
     perf_log(&format!("submodule_versions: TOTAL ({} refs/commits, {} containing branches)", versions.len(), current_containing_branches.len()), started.elapsed());
     Ok(SubmoduleVersions { path: relative_path, current_revision, current_branch, parent_revision, current_containing_branches, history_context_branch, history_limit: HISTORY_LIMIT, versions })
 }
@@ -7961,6 +7990,9 @@ mod tests {
         assert!(detached_at_known_tip.current_containing_branches.iter().any(|name| name == "main"),
             "detached HEAD may still be reachable from a known branch, but must remain presented as detached");
         assert_eq!(detached_at_known_tip.history_context_branch, "main", "a known containing local branch should provide the history context without attaching HEAD");
+        let main_context = detached_at_known_tip.versions.iter().find(|version| version.kind == "branch" && version.name == "main").unwrap();
+        assert!(main_context.contains_current, "the branch row should identify that its history contains detached HEAD");
+        assert_eq!(main_context.commits_after_current, Some(0), "the active commit is exactly this branch tip");
 
         fs::write(sub_path.join("module.txt"), "v2").unwrap();
         commit_submodule_inner(repo_path.clone(), "vendor/dep".into(), "Detached commit".into(), false).expect("commit_submodule should succeed while detached");
@@ -7971,6 +8003,8 @@ mod tests {
         assert_eq!(versions.current_revision, git(&sub_path.to_string_lossy(), &["rev-parse", "HEAD"]).unwrap().trim());
         assert!(versions.current_containing_branches.is_empty(), "a detached commit created beyond every known branch tip must not be presented as belonging to main or origin/main");
         assert_eq!(versions.history_context_branch, "", "without a containing branch, history must start at detached HEAD instead of guessing main");
+        assert!(versions.versions.iter().filter(|version| version.kind == "branch" || version.kind == "remote").all(|version| !version.contains_current && version.commits_after_current.is_none()),
+            "no inactive branch row may claim ancestry for an unreachable detached commit");
         assert_eq!(versions.history_limit, 100);
 
         let preview_error = push_submodule_preview_inner(repo_path.clone(), "vendor/dep".into()).unwrap_err();
