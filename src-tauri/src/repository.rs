@@ -2312,9 +2312,11 @@ fn reviewer_login(value: &serde_json::Value) -> Option<String> {
 fn pr_reviewers_from_json(item: &serde_json::Value) -> Vec<PullRequestReviewerSummary> {
     let mut reviewers = Vec::new();
 
-    // `gh pr list --json reviewRequests` returns the requested reviewer
-    // objects directly. normalize_graphql_pr deliberately flattens GraphQL's
-    // ReviewRequest nodes to that identical shape.
+    // Provider responses that include reviewRequests return the requested
+    // reviewer objects directly. normalize_graphql_pr deliberately flattens
+    // GraphQL's ReviewRequest nodes to that identical shape. The direct API
+    // asks only for User.login: Team.name/slug require read:org on Enterprise,
+    // and PR visibility must not depend on that additional permission.
     for requested in item.get("reviewRequests").and_then(|value| value.as_array()).into_iter().flatten() {
         let Some(login) = reviewer_login(requested) else { continue };
         if !reviewers.iter().any(|existing: &PullRequestReviewerSummary| existing.login.eq_ignore_ascii_case(&login)) {
@@ -2686,7 +2688,7 @@ query PullRequestsByHead($owner: String!, $name: String!, $branch: String!) {
         headRepository { name }
         headRepositoryOwner { login }
         reviewRequests(first: 20) {
-          nodes { requestedReviewer { ... on User { login } ... on Team { name slug } } }
+          nodes { requestedReviewer { ... on User { login } } }
         }
         latestReviews(first: 20) { nodes { author { login } state url } }
         commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
@@ -2704,7 +2706,7 @@ query PullRequestsByBase($owner: String!, $name: String!, $branch: String!) {
         headRepository { name }
         headRepositoryOwner { login }
         reviewRequests(first: 20) {
-          nodes { requestedReviewer { ... on User { login } ... on Team { name slug } } }
+          nodes { requestedReviewer { ... on User { login } } }
         }
         latestReviews(first: 20) { nodes { author { login } state url } }
         commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
@@ -2741,7 +2743,11 @@ fn normalize_graphql_pr(item: &serde_json::Value) -> serde_json::Value {
     })
 }
 
-const PR_GH_JSON_FIELDS: &str = "number,title,headRefName,headRepository,headRepositoryOwner,baseRefName,state,isDraft,mergeable,reviewDecision,reviewRequests,latestReviews,statusCheckRollup,url";
+// gh expands team review requests with Team.name/slug, which GitHub Enterprise
+// protects with read:org. Keep the CLI path usable with the ordinary repo scope;
+// submitted reviews remain available through latestReviews. The direct API path
+// still reports individually requested users without querying protected fields.
+const PR_GH_JSON_FIELDS: &str = "number,title,headRefName,headRepository,headRepositoryOwner,baseRefName,state,isDraft,mergeable,reviewDecision,latestReviews,statusCheckRollup,url";
 
 fn gh_stderr_looks_like_auth(stderr: &str) -> bool {
     let lower = stderr.to_lowercase();
@@ -6978,6 +6984,19 @@ mod tests {
             host: "github.vitesco.io".into(), owner: "eng".into(), repo: "sw-prj-VWAQ4_000U0".into(),
         }));
         assert_eq!(parse_gh_repo_arg("github.vitesco.io/eng/group/repo"), None);
+    }
+
+    #[test]
+    fn pr_queries_do_not_require_enterprise_organization_scope() {
+        for query in [GITHUB_PRS_BY_HEAD_QUERY, GITHUB_PRS_BY_BASE_QUERY] {
+            assert!(query.contains("... on User { login }"));
+            assert!(!query.contains("... on Team"), "team fields require read:org on GitHub Enterprise");
+            assert!(!query.contains(" slug"), "team slug requires read:org on GitHub Enterprise");
+        }
+        assert!(!PR_GH_JSON_FIELDS.split(',').any(|field| field == "reviewRequests"),
+            "gh expands team review requests and can require read:org");
+        assert!(PR_GH_JSON_FIELDS.split(',').any(|field| field == "latestReviews"),
+            "submitted reviewer activity should remain available");
     }
 
     #[test]
