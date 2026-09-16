@@ -31,7 +31,7 @@
         <button id="pullCurrent" title="Pull current branch">⇣</button>
         <button id="pushCurrent" title="Push current branch">↑</button>
         <button id="mergeCurrent" title="Merge a branch into the current one">⑂</button>
-        <button id="openConsole" title="App actions and Terminal (Ctrl/Cmd+K)">⌘</button>
+        <button id="openConsole" title="Terminal and App actions (Ctrl/Cmd+K)">⌘</button>
         <button id="openHelp" title="Help — what everything in this app does">?</button>
       </div>
     </header>
@@ -217,11 +217,12 @@
   <dialog id="commandPalette" class="command-palette">
     <form method="dialog">
       <div class="command-tabs">
-        <button type="button" class="command-tab active" data-mode="commands">App actions</button>
-        <button type="button" class="command-tab" data-mode="console">Terminal</button>
+        <button type="button" class="command-tab active" data-mode="console">Terminal</button>
+        <button type="button" class="command-tab" data-mode="commands">App actions</button>
         <span class="command-tabs-spacer"></span>
         <button type="button" id="commandCopyTranscript" class="command-clear" title="Copy the complete terminal transcript" hidden>Copy all</button>
         <button type="button" id="commandClearTranscript" class="command-clear" title="Clear console history" hidden>Clear</button>
+        <button type="button" id="closeCommandPalette" class="command-close" title="Close Terminal and App actions" aria-label="Close Terminal and App actions">×</button>
       </div>
       <div id="terminalScopeBar" class="terminal-scope-bar" hidden>
         <span class="terminal-scope-caption">RUN IN</span>
@@ -443,7 +444,7 @@
   </dialog>
   <dialog id="submoduleDialog" class="clone-dialog submodule-dialog">
     <form method="dialog"><div class="dialog-symbol">◇</div><h2>Add Git submodule</h2><p>The repository will be cloned inside the folder currently open in Project Navigator. Git links and staging are handled automatically.</p>
-      <label><span>REPOSITORY URL</span><input id="submoduleUrl" placeholder="https://server/team/module.git" autocomplete="off" autocapitalize="off" spellcheck="false"></label>
+      <label><span>REPOSITORY URL</span><input id="submoduleUrl" placeholder="https://github.vitesco.io/eng/module.git" autocomplete="off" autocapitalize="off" spellcheck="false"></label>
       <label><span>ADD INSIDE CURRENT FOLDER</span><input id="submoduleParent" readonly></label>
       <label><span>SUBMODULE FOLDER NAME</span><input id="submoduleName" placeholder="module" autocomplete="off" autocapitalize="off" spellcheck="false"></label>
       <details class="submodule-auth"><summary>Private repository credentials</summary><label><span>USERNAME (OPTIONAL)</span><input id="submoduleUsername" autocomplete="username" placeholder="Git server username"></label><label><span>PERSONAL ACCESS TOKEN</span><input id="submoduleToken" type="password" autocomplete="off" placeholder="Used once; never saved"></label></details>
@@ -532,9 +533,9 @@
           <p>If restoring a stash can't apply cleanly (the file changed since it was stashed), it doesn't lose anything — the app opens the conflict-resolution dialog and keeps the stash until you finish or explicitly discard the conflicted restore.</p>
         </details>
         <details>
-          <summary>App actions and Terminal (⌘ or Ctrl/Cmd+K)</summary>
+          <summary>Terminal and App actions (⌘ or Ctrl/Cmd+K)</summary>
+          <p><b>Terminal tab</b> — the default tab. Run shell commands such as <code>git status</code>, <code>git remote -v</code>, <code>gh pr status</code>, <code>pwd</code>, <code>ls</code> (macOS) or <code>dir</code> (Windows), and see their real output. “Run in” shows the exact working directory; use its selector to choose another valid location. Git itself treats commands such as <code>git log</code> as repository-wide even when run from a subfolder; use the “Status here”, “History here” and “Diff here” shortcuts when you want a path filter. “Use again” edits an earlier command, and Copy/Copy all shares diagnostic output. Bare Git subcommands such as <code>status</code> still work. Potentially destructive commands ask for confirmation. Interactive prompts are disabled so a command cannot leave the application frozen waiting for invisible input.</p>
           <p><b>App actions tab</b> — a searchable list of everything this app can do. Type what you want ("commit", "merge", "push submodule"); actions relevant to what's currently selected are boosted to the top.</p>
-          <p><b>Terminal tab</b> — run shell commands such as <code>git status</code>, <code>git remote -v</code>, <code>gh pr status</code>, <code>pwd</code>, <code>ls</code> (macOS) or <code>dir</code> (Windows), and see their real output. “Run in” shows the exact working directory; use its selector to choose another valid location. Git itself treats commands such as <code>git log</code> as repository-wide even when run from a subfolder; use the “Status here”, “History here” and “Diff here” shortcuts when you want a path filter. “Use again” edits an earlier command, and Copy/Copy all shares diagnostic output. Bare Git subcommands such as <code>status</code> still work. Potentially destructive commands ask for confirmation. Interactive prompts are disabled so a command cannot leave the application frozen waiting for invisible input.</p>
         </details>
         <details>
           <summary>Remotes</summary>

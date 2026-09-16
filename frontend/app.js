@@ -82,7 +82,7 @@ const state = { repository: null, branches: [], commits: [], allCommits: [], cha
   // the fields above, never this — see activeGraphData(), openSubmoduleGraph
   // and leaveSubmoduleGraph.
   submoduleGraph: null,
-  consoleMode: 'commands', consoleTranscript: [], consoleCmdHistory: [], consoleDrafts: { commands: '', console: '' }, consoleScopeOverride: null, graphPrimaryBranch: null, publishUpto: null,
+  consoleMode: 'console', consoleTranscript: [], consoleCmdHistory: [], consoleDrafts: { commands: '', console: '' }, consoleScopeOverride: null, graphPrimaryBranch: null, publishUpto: null,
   // False only right after openRepositoryFast, until its background
   // refresh_status completes — mutations (stage/unstage, delete, commit,
   // switching branch) are refused while this is false, since they'd act on
@@ -310,10 +310,11 @@ function suggestedRepositoryName(url) { return url.trim().replace(/\/$/, '').spl
 function validateSubmoduleForm() { refs.confirmAddSubmodule.disabled = !refs.submoduleUrl.value.trim() || !refs.submoduleName.value.trim(); if (refs.submoduleDialog.open && refs.submoduleName.value.trim()) { refs.submoduleAddStatus.textContent = `Will add at /${state.currentPath ? `${state.currentPath}/` : ''}${refs.submoduleName.value.trim()}`; refs.submoduleAddStatus.className = 'submodule-operation-status'; } }
 function openAddSubmoduleDialog() {
   if (!state.repository || state.view !== 'explorer') return;
-  refs.submoduleUrl.value = ''; refs.submoduleName.value = ''; refs.submoduleUsername.value = ''; refs.submoduleToken.value = ''; refs.submoduleName.dataset.edited = '';
+  const defaultSubmoduleUrl = 'https://github.vitesco.io/eng/';
+  refs.submoduleUrl.value = defaultSubmoduleUrl; refs.submoduleName.value = ''; refs.submoduleUsername.value = ''; refs.submoduleToken.value = ''; refs.submoduleName.dataset.edited = '';
   refs.submoduleParent.value = state.currentPath ? `/${state.currentPath}` : '/ (repository root)';
   refs.submoduleAddStatus.textContent = `Destination: /${state.currentPath ? `${state.currentPath}/` : ''}…`; refs.submoduleAddStatus.className = 'submodule-operation-status';
-  validateSubmoduleForm(); refs.submoduleDialog.showModal(); refs.submoduleUrl.focus();
+  validateSubmoduleForm(); refs.submoduleDialog.showModal(); refs.submoduleUrl.focus(); refs.submoduleUrl.setSelectionRange(defaultSubmoduleUrl.length, defaultSubmoduleUrl.length);
 }
 async function confirmAddSubmodule() {
   const url = refs.submoduleUrl.value.trim(), folderName = refs.submoduleName.value.trim(), parentPath = state.currentPath, username = refs.submoduleUsername.value.trim(), accessToken = refs.submoduleToken.value;
@@ -3735,7 +3736,9 @@ $('#closeSubmoduleMenu').addEventListener('click', () => { refs.submoduleMenu.hi
 $('#submoduleMenuNewBranch').addEventListener('click', () => {
   if (!submoduleMenuEntry || submoduleMenuEntry.kind !== 'submodule') return;
   const entry = submoduleMenuEntry;
-  refs.submoduleMenu.hidden = true;
+  // Keep the version selector behind the modal. Cancel must return to the
+  // exact branch/tag/history context the user was inspecting, rather than
+  // closing both the child action and its parent selector.
   if (versionFilter === 'tag') openCreateSubmoduleTagDialog(entry); else createSubmoduleBranch(entry);
 });
 document.querySelectorAll('[data-version-filter]').forEach(button => button.addEventListener('click', () => {
@@ -3743,7 +3746,14 @@ document.querySelectorAll('[data-version-filter]').forEach(button => button.addE
 }));
 refs.submoduleVersionSearch.addEventListener('input', renderSubmoduleVersions);
 refs.submoduleOpenGraph.addEventListener('click', () => { if (submoduleMenuEntry) { refs.submoduleMenu.hidden = true; openSubmoduleGraph(submoduleMenuEntry); } });
-document.addEventListener('click', event => { if (!refs.submoduleMenu.hidden && !refs.submoduleMenu.contains(event.target) && !event.target.closest('[data-entry]') && !event.target.closest('[data-detail-action="versions"]')) refs.submoduleMenu.hidden = true; });
+document.addEventListener('click', event => {
+  // A New branch/New tag dialog is a child of the version selector in the
+  // user's workflow even though <dialog> lives elsewhere in the DOM. Do not
+  // mistake clicks in that modal (especially Cancel/X) for an outside click
+  // on the parent selector.
+  const childActionOpen = refs.newBranchDialog.open || $('#newTagDialog').open;
+  if (!childActionOpen && !refs.submoduleMenu.hidden && !refs.submoduleMenu.contains(event.target) && !event.target.closest('[data-entry]') && !event.target.closest('[data-detail-action="versions"]')) refs.submoduleMenu.hidden = true;
+});
 refs.commitScope.addEventListener('click', openScopeCommit);
 refs.showPathHistory.addEventListener('click', showSelectedHistory);
 refs.scopeCommitMessage.addEventListener('input', () => { refs.confirmScopeCommit.disabled = !refs.scopeCommitMessage.value.trim(); });
@@ -4386,9 +4396,9 @@ function openCommandPalette() {
   const input = $('#commandInput');
   commandPaletteOpen = true;
   activeCommands = buildCommands();
-  setConsoleMode('commands');
+  setConsoleMode('console');
   setCommandInputValue('');
-  renderCommandList('');
+  renderConsoleTranscript();
   $('#commandPalette').showModal();
   input.focus();
 }
@@ -4436,6 +4446,7 @@ $('#terminalQuickCommands').addEventListener('click', (e) => { const quick = e.t
 $('#commandScopeSelect').addEventListener('change', (event) => { selectConsoleScope(event.target.value); if (state.consoleMode === 'console') renderConsoleTranscript(); });
 $('#commandClearTranscript').addEventListener('click', () => { state.consoleTranscript = []; renderConsoleTranscript(); });
 $('#commandCopyTranscript').addEventListener('click', () => copyText(state.consoleTranscript.map(consoleEntryAsText).join('\n\n'), 'Terminal transcript copied.'));
+$('#closeCommandPalette').addEventListener('click', () => $('#commandPalette').close());
 $('#commandPalette').addEventListener('close', () => { commandPaletteOpen = false; });
 $('#openConsole').addEventListener('click', () => openCommandPalette());
 $('#openHelp').addEventListener('click', () => $('#helpDialog').showModal());

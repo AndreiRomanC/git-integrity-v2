@@ -791,6 +791,8 @@ dialog form { padding: 28px; text-align: center; }dialog h2 { margin: 0 0 10px; 
 .command-scope-select:disabled { opacity: .5; }
 .command-clear { height: 24px; padding: 0 9px; border: 1px solid #354356; border-radius: 5px; background: #182430; color: #9db3c8; font-size: 10px; }
 .command-clear:hover { border-color: #5794c7; color: white; }
+.command-close { width: 28px; height: 28px; margin: 0 0 0 3px; padding: 0; border: 1px solid transparent; border-radius: 6px; background: transparent; color: #8fa2b4; font-size: 22px; line-height: 24px; }
+.command-close:hover { border-color: #4a5d70; background: #202d39; color: #f0f6fc; }
 #commandInput { flex: 0 0 50px; width: 100%; height: 50px; border: 0; outline: 0; padding: 14px 16px; background: #1a2532; color: #e8eef5; font: 14px ui-monospace, SFMono-Regular, Consolas, monospace; border-bottom: 1px solid var(--border); }
 #commandInput::placeholder { color: #6b7f96; }
 .terminal-quick-commands { flex: 0 0 37px; display: flex; align-items: center; gap: 6px; min-width: 0; padding: 5px 12px; overflow-x: auto; border-bottom: 1px solid var(--border-soft); background: #121b24; scrollbar-width: thin; }

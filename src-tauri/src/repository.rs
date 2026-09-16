@@ -3329,6 +3329,36 @@ pub struct UnpushedSubmoduleReference {
     configured_url: Option<String>,
 }
 
+// Opening Publish already performs the expensive, explicit network refresh
+// of every relevant submodule so it can show an accurate warning before the
+// user confirms. The old confirm path immediately repeated those same fetches
+// for the same parent commit. Keep only a short proof that this exact target
+// was refreshed; Publish still reruns the complete tree/ref safety scan, but
+// can reuse the freshly updated remote-tracking refs instead of doing the
+// network round trips twice. An "unpushed" result is never cached because the
+// user may push that submodule and retry while the dialog is still open.
+const PUBLISH_PREFLIGHT_REUSE_WINDOW: Duration = Duration::from_secs(120);
+static PUBLISH_PREFLIGHT_REFRESH_CACHE: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+
+fn publish_preflight_cache() -> &'static Mutex<HashMap<String, Instant>> {
+    PUBLISH_PREFLIGHT_REFRESH_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn publish_preflight_key(repository_path: &str, branch: &str, remote: &str, target: git2::Oid) -> String {
+    format!("{}\u{0}{}\u{0}{}\u{0}{}", repo_lock_key(repository_path), branch, remote, target)
+}
+
+fn remember_publish_preflight(repository_path: &str, branch: &str, remote: &str, target: git2::Oid) {
+    let mut cache = publish_preflight_cache().lock().unwrap();
+    cache.retain(|_, checked_at| checked_at.elapsed() < PUBLISH_PREFLIGHT_REUSE_WINDOW);
+    cache.insert(publish_preflight_key(repository_path, branch, remote, target), Instant::now());
+}
+
+fn has_recent_publish_preflight(repository_path: &str, branch: &str, remote: &str, target: git2::Oid) -> bool {
+    publish_preflight_cache().lock().unwrap().get(&publish_preflight_key(repository_path, branch, remote, target))
+        .is_some_and(|checked_at| checked_at.elapsed() < PUBLISH_PREFLIGHT_REUSE_WINDOW)
+}
+
 // True for anything only this exact machine (or one with filesystem access
 // to that exact path) could ever resolve: a bare path (absolute, relative,
 // or a Windows drive path) or an explicit file:// URL. False for a real
@@ -3373,7 +3403,7 @@ fn is_local_only_url(url: &str) -> bool {
 // knowledge in place — that can only make this check *more* cautious, never
 // less, which is the right direction to err in for something that decides
 // whether it's safe to publish.
-fn submodule_reference_risks(repository_path: &str, relative_path: &str, oids: &[git2::Oid]) -> (HashMap<git2::Oid, Option<&'static str>>, Option<String>) {
+fn submodule_reference_risks(repository_path: &str, relative_path: &str, oids: &[git2::Oid], refresh_remote: bool) -> (HashMap<git2::Oid, Option<&'static str>>, Option<String>) {
     let started = Instant::now();
     let all = |risk| oids.iter().copied().map(|oid| (oid, risk)).collect();
     // The *effective* clone source: what .gitmodules itself records for this
@@ -3407,12 +3437,16 @@ fn submodule_reference_risks(repository_path: &str, relative_path: &str, oids: &
     // the outgoing parent history. Fetch origin once for the entire batch,
     // never once per revision — the old nested behavior made a single
     // Publish repeat the same network round trip many times.
-    let fetch_started = Instant::now();
-    // Tags and nested-submodule recursion are irrelevant to the question
-    // being answered here (is the gitlink commit reachable from a branch on
-    // this source?) and can add substantial network work on large projects.
-    let result = git(&sub_path, &["fetch", "--no-tags", "--no-recurse-submodules", remote]);
-    perf_log(&format!("publish_safety: submodule={} fetch {} ({})", relative_path, remote, if result.is_ok() { "ok" } else { "failed; using local refs" }), fetch_started.elapsed());
+    if refresh_remote {
+        let fetch_started = Instant::now();
+        // Tags and nested-submodule recursion are irrelevant to the question
+        // being answered here (is the gitlink commit reachable from a branch on
+        // this source?) and can add substantial network work on large projects.
+        let result = git(&sub_path, &["fetch", "--no-tags", "--no-recurse-submodules", remote]);
+        perf_log(&format!("publish_safety: submodule={} fetch {} ({})", relative_path, remote, if result.is_ok() { "ok" } else { "failed; using local refs" }), fetch_started.elapsed());
+    } else {
+        perf_log(&format!("publish_safety: submodule={} reused freshly refreshed refs", relative_path), Duration::ZERO);
+    }
     let remote_pattern = format!("refs/remotes/{remote}/*");
     let remote_tips: Vec<git2::Oid> = repo.references_glob(&remote_pattern).ok().into_iter().flat_map(|references| references.flatten())
         .filter_map(|reference| reference.target()).collect();
@@ -3434,7 +3468,7 @@ fn submodule_reference_risks(repository_path: &str, relative_path: &str, oids: &
 // on, so that older, unsafe gitlink ships right along with it. Distinct
 // (path, submodule oid) pairs are checked once each, no matter how many
 // outgoing commits repeat the same value.
-fn unpushed_submodule_references(repository_path: &str, branch: &str, remote: &str, upto: Option<git2::Oid>) -> Result<Vec<UnpushedSubmoduleReference>, String> {
+fn unpushed_submodule_references(repository_path: &str, branch: &str, remote: &str, upto: Option<git2::Oid>, refresh_remotes: bool) -> Result<Vec<UnpushedSubmoduleReference>, String> {
     let total_started = Instant::now();
     let repo = internal_repository(repository_path)?;
     let step = Instant::now();
@@ -3487,7 +3521,7 @@ fn unpushed_submodule_references(repository_path: &str, branch: &str, remote: &s
     for path in path_order {
         let references = by_path.remove(&path).unwrap_or_default();
         let revisions: Vec<git2::Oid> = references.iter().map(|(sub_oid, _)| *sub_oid).collect();
-        let (mut risks, configured_url) = submodule_reference_risks(repository_path, &path, &revisions);
+        let (mut risks, configured_url) = submodule_reference_risks(repository_path, &path, &revisions, refresh_remotes);
         for (sub_oid, commit_oid) in references {
             let Some(risk) = risks.remove(&sub_oid).flatten() else { continue };
             let commit_subject = repo.find_commit(commit_oid).ok().and_then(|commit| commit.summary().map(str::to_string)).unwrap_or_default();
@@ -3507,7 +3541,9 @@ fn unpushed_submodule_references(repository_path: &str, branch: &str, remote: &s
 const UNPUSHED_SUBMODULE_OVERRIDABLE_PREFIX: &str = "UNPUSHED_SUBMODULE_OVERRIDABLE::";
 
 fn submodule_publish_safety_check(repository_path: &str, branch: &str, remote: &str, upto: Option<git2::Oid>, override_unpushed_submodules: bool) -> Result<(), String> {
-    let violations = unpushed_submodule_references(repository_path, branch, remote, upto)?;
+    let reuse_refresh = upto.is_some_and(|target| has_recent_publish_preflight(repository_path, branch, remote, target));
+    let violations = unpushed_submodule_references(repository_path, branch, remote, upto, !reuse_refresh)?;
+    if reuse_refresh { perf_log("publish_safety: reused dialog network preflight; full local safety scan still ran", Duration::ZERO); }
     if violations.is_empty() { return Ok(()); }
     let hard: Vec<&UnpushedSubmoduleReference> = violations.iter().filter(|v| v.risk == "unpushed").collect();
     if !hard.is_empty() {
@@ -3542,13 +3578,23 @@ fn submodule_publish_risks_inner(repository_path: String, branch: String, remote
     validate_path(&repository_path)?;
     let branch = branch.trim(); let remote = remote.trim();
     if branch.is_empty() || remote.is_empty() { return Ok(Vec::new()); }
-    let upto = if upto_commit.trim().is_empty() { None } else {
-        let repo = internal_repository(&repository_path)?;
+    let repo = internal_repository(&repository_path)?;
+    let (upto, target) = if upto_commit.trim().is_empty() {
+        let target = repo.refname_to_id(&format!("refs/heads/{branch}")).map_err(|error| error.message().to_string())?;
+        (None, target)
+    } else {
         let object = repo.revparse_single(upto_commit.trim()).map_err(|error| format!("Cannot resolve {upto_commit}: {}", error.message()))?;
         let commit = object.peel_to_commit().map_err(|error| error.message().to_string())?;
-        Some(commit.id())
+        (Some(commit.id()), commit.id())
     };
-    unpushed_submodule_references(&repository_path, branch, remote, upto)
+    let risks = unpushed_submodule_references(&repository_path, branch, remote, upto, true)?;
+    // A hard "unpushed" result is deliberately not reusable: the common
+    // next action is to push that submodule and retry from the still-open
+    // dialog, in which case Publish must refresh it again.
+    if !risks.iter().any(|risk| risk.risk == "unpushed") {
+        remember_publish_preflight(&repository_path, branch, remote, target);
+    }
+    Ok(risks)
 }
 
 #[tauri::command]
@@ -9791,6 +9837,21 @@ mod tests {
     }
 
     #[test]
+    fn publish_preflight_reuse_is_scoped_to_the_exact_target_branch_and_remote() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let repository = format!("/tmp/git-integrity-publish-preflight-{suffix}");
+        let target: git2::Oid = "1111111111111111111111111111111111111111".parse().unwrap();
+        let other_target: git2::Oid = "2222222222222222222222222222222222222222".parse().unwrap();
+
+        assert!(!has_recent_publish_preflight(&repository, "main", "origin", target));
+        remember_publish_preflight(&repository, "main", "origin", target);
+        assert!(has_recent_publish_preflight(&repository, "main", "origin", target));
+        assert!(!has_recent_publish_preflight(&repository, "develop", "origin", target));
+        assert!(!has_recent_publish_preflight(&repository, "main", "upstream", target));
+        assert!(!has_recent_publish_preflight(&repository, "main", "origin", other_target));
+    }
+
+    #[test]
     fn publish_branch_can_stop_at_an_earlier_commit_leaving_newer_ones_local() {
         // "Deselecting" a commit before publish can only validly mean "stop
         // pushing here" — publish_branch's `upto_commit` pushes the branch up
@@ -10165,7 +10226,7 @@ mod tests {
         stage_files_inner(&parent_path, vec!["vendor/dep".into()]).unwrap();
         commit_selected_internal(&parent_path, &["vendor/dep".to_string()], "Bump to X2").unwrap();
 
-        let violations = unpushed_submodule_references(&parent_path, "main", "origin", None).unwrap();
+        let violations = unpushed_submodule_references(&parent_path, "main", "origin", None, true).unwrap();
         assert_eq!(violations.len(), 1, "only X1 (carried by the older, already-superseded commit A) should be flagged, not X2: {violations:?}");
         assert_eq!(violations[0].risk, "unpushed");
         assert_eq!(violations[0].submodule_oid, x1, "the flagged reference must be the older, unreachable one");
@@ -10250,7 +10311,7 @@ mod tests {
         stage_files_inner(&parent_string, vec![added.clone()]).unwrap();
         commit_selected_internal(&parent_string, &[added.clone()], "Bump dep").unwrap();
 
-        let violations = unpushed_submodule_references(&parent_string, &branch, "origin", None).unwrap();
+        let violations = unpushed_submodule_references(&parent_string, &branch, "origin", None, true).unwrap();
         assert_eq!(violations.len(), 1);
         assert_eq!(violations[0].risk, "no_remote");
 
@@ -10308,7 +10369,7 @@ mod tests {
         push_submodule_inner(parent_string.clone(), added.clone()).expect("pushing to the local-path remote should succeed, since it's genuinely reachable");
         commit_selected_internal(&parent_string, &[added.clone()], "Bump dep").unwrap();
 
-        let violations = unpushed_submodule_references(&parent_string, &branch, "origin", None).unwrap();
+        let violations = unpushed_submodule_references(&parent_string, &branch, "origin", None, true).unwrap();
         assert_eq!(violations.len(), 1, "{violations:?}");
         assert_eq!(violations[0].risk, "local_only", "reachable or not, a filesystem-path source is never globally available");
         assert_eq!(violations[0].submodule_oid, new_sha);
