@@ -44,8 +44,8 @@ function submoduleCurrentPresentation(data = {}) {
   const matchesProject = Boolean(revision && parentRevision && revision === parentRevision);
   if (!data.current_branch && matchesProject) {
     return {
-      text: `Project version @ ${short} (detached)`,
-      help: 'Restore succeeded. The branches below are saved pointers, not the active checkout. Use Checkout to switch to one.',
+      text: `Detached HEAD @ ${short}`,
+      help: 'The parent project records this exact commit. Branch rows are saved pointers, not the active checkout. Use Checkout to attach HEAD to one.',
     };
   }
   if (!data.current_branch) {
@@ -66,6 +66,72 @@ function submoduleCurrentPresentation(data = {}) {
   };
 }
 
+function submoduleContainingBranchCandidates(data = {}) {
+  const revision = String(data.current_revision || '');
+  const containingNames = new Set(Array.isArray(data.current_containing_branches) ? data.current_containing_branches : []);
+  const all = (Array.isArray(data.versions) ? data.versions : []).filter(item =>
+    ['branch', 'remote'].includes(item.kind) && (item.contains_current === true || containingNames.has(item.name))
+  );
+  // A local branch row already names its upstream. Do not repeat that same
+  // logical branch as a second remote candidate in the compact action list.
+  const representedRemotes = new Set(all.filter(item => item.kind === 'branch' && item.upstream).map(item => item.upstream));
+  return all.filter(item => item.kind !== 'remote' || !representedRemotes.has(item.name)).sort((left, right) => {
+    const distance = item => item.commits_after_current != null && Number.isFinite(Number(item.commits_after_current))
+      ? Number(item.commits_after_current) : (item.revision === revision ? 0 : Number.MAX_SAFE_INTEGER);
+    const leftDistance = distance(left);
+    const rightDistance = distance(right);
+    const kindOrder = (left.kind === 'branch' ? 0 : 1) - (right.kind === 'branch' ? 0 : 1);
+    return leftDistance - rightDistance || kindOrder || String(left.name).localeCompare(String(right.name));
+  });
+}
+
+function submoduleCurrentContextHtml(data = {}) {
+  const esc = escapeSubmoduleVersionHtml;
+  const revision = String(data.current_revision || '');
+  const short = revision.slice(0, 8) || 'unknown';
+  const parent = String(data.parent_revision || '');
+  const candidates = submoduleContainingBranchCandidates(data);
+  const versions = Array.isArray(data.versions) ? data.versions : [];
+  const currentCommit = versions.find(item => item.kind === 'commit' && item.revision === revision) || {};
+  const exactTips = candidates.filter(item => item.revision === revision).map(item => item.name);
+  let relation;
+  if (data.current_branch) relation = `Attached to branch ${data.current_branch}.`;
+  else if (exactTips.length) relation = `Detached at the tip of: ${exactTips.join(', ')}. Checkout a local branch to attach HEAD.`;
+  else if (candidates.length) relation = `Detached inside ${candidates.length} known branch${candidates.length === 1 ? '' : 'es'}. Choose explicitly which branch tip to switch to.`;
+  else relation = 'Detached and not reachable from currently known local or remote-tracking branches.';
+  const projectRelation = parent && parent === revision
+    ? 'The parent project records this exact commit.'
+    : parent ? `The parent project currently records ${parent.slice(0, 8)}.` : 'The parent project version could not be determined.';
+  const visibleCandidates = candidates.slice(0, 6);
+  const candidateRows = !data.current_branch && visibleCandidates.length ? `<div class="version-containing-branches">
+    <h4>BRANCHES CONTAINING THIS COMMIT</h4>
+    ${visibleCandidates.map(item => {
+      const distance = item.commits_after_current != null && Number.isFinite(Number(item.commits_after_current))
+        ? Number(item.commits_after_current) : (item.revision === revision ? 0 : null);
+      const position = distance === 0 ? 'This commit is the branch tip' : distance == null ? 'Contains this commit' : `Branch tip is ${distance} commit${distance === 1 ? '' : 's'} newer`;
+      const action = distance === 0 ? 'Switch to this branch' : 'Switch to branch tip';
+      return `<div class="version-containing-branch" data-revision="${esc(item.revision)}" data-version-kind="${esc(item.kind)}" data-name="${esc(item.name)}">
+        <span><strong>⑂ ${esc(item.name)}</strong><small>${esc(position)}${item.kind === 'remote' ? ' · remote branch' : ''}</small></span>
+        <button type="button" data-switch-version>${esc(action)}</button>
+      </div>`;
+    }).join('')}
+    ${candidates.length > visibleCandidates.length ? `<p class="version-more-branches">+${candidates.length - visibleCandidates.length} more containing branches — use the Branches list below to inspect them.</p>` : ''}
+  </div>` : '';
+  return `<section class="version-current-context">
+    <div><span>ACTIVE CHECKOUT</span><strong>${esc(short)}</strong><b>${data.current_branch ? `BRANCH · ${esc(data.current_branch)}` : 'DETACHED HEAD'}</b></div>
+    ${currentCommit.subject ? `<p>${esc(currentCommit.subject)}</p>` : ''}
+    <small>${esc(relation)} ${esc(projectRelation)}</small>
+    ${candidateRows}
+  </section>`;
+}
+
+function matchesSubmoduleVersion(item = {}, query = '') {
+  const needle = String(query).trim().toLowerCase();
+  if (!needle) return true;
+  return [item.name, item.revision, item.subject, item.author, item.date, item.attached_branch, item.upstream]
+    .filter(Boolean).join(' ').toLowerCase().includes(needle);
+}
+
 function submoduleVersionRowHtml(item) {
   const esc = escapeSubmoduleVersionHtml;
   const kindLabel = { branch: 'BRANCH', remote: 'REMOTE BRANCH', tag: 'TAG', commit: 'COMMIT (detached)' };
@@ -80,17 +146,21 @@ function submoduleVersionRowHtml(item) {
     const ahead = Number(item.ahead) || 0;
     const behind = Number(item.behind) || 0;
     let relation;
-    if (ahead === 0 && behind === 0) relation = 'LOCAL + ORIGIN · in sync';
-    else if (ahead > 0 && behind === 0) relation = `LOCAL AHEAD · ${ahead} commit${ahead === 1 ? '' : 's'} to push`;
-    else if (ahead === 0 && behind > 0) relation = `ORIGIN NEWER · ${behind} commit${behind === 1 ? '' : 's'} to pull`;
-    else relation = `DIVERGED · ${ahead} ahead / ${behind} behind`;
+    if (ahead === 0 && behind === 0) relation = 'BRANCH TIP · matches upstream';
+    else if (ahead > 0 && behind === 0) relation = `BRANCH TIP AHEAD · ${ahead} commit${ahead === 1 ? '' : 's'} to push`;
+    else if (ahead === 0 && behind > 0) relation = `BRANCH TIP BEHIND · ${behind} commit${behind === 1 ? '' : 's'} to pull`;
+    else relation = `BRANCH DIVERGED · ${ahead} ahead / ${behind} behind`;
     upstreamState = `<span class="version-upstream-state" title="Branch ${esc(item.name)} compared with ${esc(item.upstream)}">${relation} · ${esc(item.upstream)}</span>`;
   } else if (item.kind === 'branch') {
     upstreamState = '<span class="version-upstream-state version-no-upstream">LOCAL · no upstream configured</span>';
   }
-  const tagContext = item.kind === 'tag'
+  const commitBranches = Array.isArray(item.context_branches) ? item.context_branches : [];
+  const commitBranchContext = item.kind === 'commit' && item.current && commitBranches.length
+    ? `<span class="version-attached-branch">contained in ⑂ ${esc(commitBranches.slice(0, 2).join(', '))}${commitBranches.length > 2 ? ` +${commitBranches.length - 2}` : ''}</span>`
+    : '';
+  const rowContext = item.kind === 'tag'
     ? `<span class="version-attached-branch">${item.attached_branch ? `on ⑂ ${esc(item.attached_branch)}` : 'no branch here (detached)'}</span>`
-    : upstreamState;
+    : item.kind === 'commit' ? commitBranchContext : upstreamState;
   // Destructive reset is only offered for the active branch. Uncommitted
   // work belongs to the current working tree, not to an inactive branch row;
   // making the user Checkout first keeps the target and consequence explicit.
@@ -99,12 +169,13 @@ function submoduleVersionRowHtml(item) {
     && ((Number(item.ahead) || 0) > 0 || (Number(item.behind) || 0) > 0);
   const actions = `<span class="version-row-actions">
     ${canResetToUpstream ? `<button type="button" class="version-reset-upstream" data-reset-upstream data-name="${esc(item.name)}" data-upstream="${esc(item.upstream)}" data-ahead="${Number(item.ahead) || 0}" data-behind="${Number(item.behind) || 0}" title="Destructive recovery for the active branch: discard its local-only commits and current uncommitted work, then replace it with ${esc(item.upstream)}">Discard local work…</button>` : ''}
+    ${item.kind === 'branch' && item.checkout_detached ? '<span class="version-inactive-label">INACTIVE</span>' : ''}
     ${item.current ? '<span class="current-label">CURRENT</span>' : `<button type="button" class="version-checkout" data-switch-version>Checkout</button>`}
   </span>`;
   return `<div class="version-row ${item.current ? 'current' : ''}" data-revision="${esc(revision)}" data-version-kind="${esc(item.kind)}" data-name="${esc(item.name)}">
     <span class="version-symbol">${symbol[item.kind] || '⑂'}</span>
     <span class="version-sha"><code>${esc(revision.slice(0, 8))}</code><span class="version-copy-sha" role="button" tabindex="0" title="Copy full SHA" data-copy-sha="${esc(revision)}">⧉</span></span>
-    <span class="version-name">${esc(item.name)}<b class="version-kind-badge">${esc(kindLabel[item.kind] || item.kind)}</b>${tagContext}</span>
+    <span class="version-name">${esc(item.name)}<b class="version-kind-badge">${esc(kindLabel[item.kind] || item.kind)}</b>${rowContext}</span>
     <span class="version-copy"><span class="version-subject">${esc(item.subject)}</span><span class="version-meta">${esc(item.author)} · ${esc(item.date)}</span></span>
     ${actions}
   </div>`;
@@ -129,5 +200,5 @@ function submodulePushDialogState(preview) {
 }
 
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { groupSubmoduleBranchVersions, submoduleCurrentPresentation, submoduleVersionRowHtml, submodulePushDialogState };
+  module.exports = { groupSubmoduleBranchVersions, submoduleCurrentPresentation, submoduleContainingBranchCandidates, submoduleCurrentContextHtml, matchesSubmoduleVersion, submoduleVersionRowHtml, submodulePushDialogState };
 }
