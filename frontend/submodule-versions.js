@@ -150,7 +150,7 @@ function submoduleVersionRowHtml(item) {
     else if (ahead > 0 && behind === 0) relation = `BRANCH TIP AHEAD · ${ahead} commit${ahead === 1 ? '' : 's'} to push`;
     else if (ahead === 0 && behind > 0) relation = `BRANCH TIP BEHIND · ${behind} commit${behind === 1 ? '' : 's'} to pull`;
     else relation = `BRANCH DIVERGED · ${ahead} ahead / ${behind} behind`;
-    upstreamState = `<span class="version-upstream-state" title="Branch ${esc(item.name)} compared with ${esc(item.upstream)}">${relation} · ${esc(item.upstream)}</span>`;
+    upstreamState = `<span class="version-upstream-state ${item.upstream === 'origin/main' ? 'version-primary-upstream' : ''}" title="Branch ${esc(item.name)} compared with ${esc(item.upstream)}">${relation} · ${esc(item.upstream)}</span>`;
   } else if (item.kind === 'branch') {
     upstreamState = '<span class="version-upstream-state version-no-upstream">LOCAL · no upstream configured</span>';
   }
@@ -173,7 +173,7 @@ function submoduleVersionRowHtml(item) {
     ${item.kind === 'branch' && item.checkout_detached ? '<span class="version-inactive-label">INACTIVE</span>' : ''}
     ${item.current ? '<span class="current-label">CURRENT</span>' : `<button type="button" class="version-checkout" data-switch-version>Checkout</button>`}
   </span>`;
-  return `<div class="version-row ${item.current ? 'current' : ''}" data-revision="${esc(revision)}" data-version-kind="${esc(item.kind)}" data-name="${esc(item.name)}">
+  return `<div class="version-row version-kind-${esc(item.kind)} ${item.name === 'origin/main' ? 'primary-remote' : ''} ${item.current ? 'current' : ''}" data-revision="${esc(revision)}" data-version-kind="${esc(item.kind)}" data-name="${esc(item.name)}">
     <span class="version-symbol">${symbol[item.kind] || '⑂'}</span>
     <span class="version-sha"><code>${esc(revision.slice(0, 8))}</code><span class="version-copy-sha" role="button" tabindex="0" title="Copy full SHA" data-copy-sha="${esc(revision)}">⧉</span></span>
     <span class="version-name">${esc(item.name)}<b class="version-kind-badge">${esc(kindLabel[item.kind] || item.kind)}</b>${rowContext}</span>

@@ -4419,6 +4419,15 @@ pub async fn switch_submodule_version(repository_path: String, relative_path: St
 fn switch_submodule_version_inner(repository_path: String, relative_path: String, revision: String, version_kind: String, name: String) -> Result<String, String> {
     validate_path(&repository_path)?;
     let absolute = validate_submodule(&repository_path, &relative_path)?;
+    // Preserve the user's existing staging intent. A freshly-added submodule
+    // is already staged by `git submodule add`; if Change version moves its
+    // checkout afterwards, leaving the old gitlink in the index creates the
+    // confusing two-commit workflow (commit A, then discover B as Modified).
+    // An ordinary, previously-unstaged submodule switch must remain unstaged.
+    let parent = internal_repository(&repository_path)?;
+    let was_parent_gitlink_staged = parent_gitlink_oid(&parent, &relative_path, true).is_some()
+        && parent_gitlink_oid(&parent, &relative_path, true) != parent_gitlink_oid(&parent, &relative_path, false);
+    drop(parent);
     let absolute_string = absolute.to_string_lossy().into_owned();
     // The submodule's own lock, held only for the checkout below. This
     // function never touches the parent's index (see the comment after the
@@ -4500,19 +4509,15 @@ fn switch_submodule_version_inner(repository_path: String, relative_path: String
     let selected = repo.head().ok().and_then(|head| head.target()).map(|id| id.to_string()).unwrap_or_default();
     drop(repo);
     drop(sub_lock);
-    // Deliberately does NOT touch the parent's index or gitlink. Switching a
-    // submodule's checked-out branch/remote-branch/tag/commit is a checkout,
-    // not a commit action — from the parent's point of view it must show up
-    // as an ordinary *unstaged* modification (the index-recorded submodule
-    // OID now differs from the submodule's live HEAD), exactly like editing
-    // any other tracked file, and staging it is the user's own explicit
-    // Stage action afterward, same as any other change. This used to call
-    // submodule.add_to_index(true) unconditionally right here, which
-    // silently promoted a mere checkout into a staged parent change the
-    // user never asked for. stage_files_inner already has dedicated
-    // submodule-HEAD-vs-index detection (see its own comment there) that
-    // correctly stages exactly this kind of change once the user asks for
-    // it, so nothing else needs to change to keep that path working.
+    // Do not silently stage a normal checkout. Only refresh a gitlink that
+    // was already staged before this operation (notably `submodule add`).
+    // The submodule lock is released first, so this follows the application's
+    // single-repository-lock invariant before stage_files_inner takes the
+    // parent lock.
+    if was_parent_gitlink_staged {
+        stage_files_inner(&repository_path, vec![relative_path.clone()])
+            .map_err(|error| format!("The submodule was switched to {}, but its already-staged project reference could not be updated: {error}. Stage the submodule again before committing.", &selected[..selected.len().min(8)]))?;
+    }
     invalidate_git_metadata(&repository_path);
     invalidate_submodule_sync(&repository_path); // this app just changed a submodule's registration/version
     Ok(selected)
@@ -4943,6 +4948,26 @@ fn commit_staged_inner(repository_path: String, message: String) -> Result<Strin
     let step = Instant::now();
     let mut index = repo.index().map_err(|error| error.message().to_string())?;
     perf_log("commit_staged: repo.index()", step.elapsed());
+    // Never commit a stale staged gitlink. This can happen when an external
+    // tool changes a submodule checkout after it was staged. The commit would
+    // succeed but record the old SHA, then immediately show the submodule as
+    // Modified and make the user commit/push a second time. Refuse that
+    // misleading partial result and tell the user exactly what to restage.
+    let parent_tree = repo.head().ok().and_then(|head| head.peel_to_commit().ok()).and_then(|commit| commit.tree().ok());
+    let mut stale_gitlinks = Vec::new();
+    for entry in index.iter().filter(|entry| entry.mode == 0o160000) {
+        let path = String::from_utf8_lossy(&entry.path).into_owned();
+        let committed = parent_tree.as_ref().and_then(|tree| tree.get_path(Path::new(&path)).ok()).map(|tree_entry| tree_entry.id());
+        if committed == Some(entry.id) { continue; }
+        let current = internal_submodule_repository(&Path::new(&repository_path).join(&path)).ok()
+            .and_then(|sub_repo| sub_repo.head().ok().and_then(|head| head.target()));
+        if let Some(current) = current.filter(|current| *current != entry.id) {
+            stale_gitlinks.push(format!("{path} (staged {}, current {})", &entry.id.to_string()[..8], &current.to_string()[..8]));
+        }
+    }
+    if !stale_gitlinks.is_empty() {
+        return Err(format!("The staged submodule reference is older than its current checkout: {}. Stage the submodule again, then commit once; this prevents recording the wrong version and needing a second commit.", stale_gitlinks.join(", ")));
+    }
     let step = Instant::now();
     let tree_id = index.write_tree_to(&repo).map_err(|error| error.message().to_string())?;
     perf_log(&format!("commit_staged: write_tree_to ({} index entries)", index.len()), step.elapsed());
@@ -9393,6 +9418,52 @@ mod tests {
         let after_stage = load_repository_inner(repo_path.clone(), Some(true)).unwrap();
         let staged_change = after_stage.changes.iter().find(|change| change.path == "vendor/dep").expect("the submodule change must still be present after staging");
         assert!(staged_change.staged, "explicit Stage must still be able to stage the moved submodule");
+
+        // Once the user has explicitly staged the gitlink, a later Change
+        // version must keep that staging intent but refresh the staged SHA.
+        // This is the exact add -> change version -> commit workflow that
+        // previously recorded the first SHA and left a second Modified item.
+        run_git(&sub_path, &["switch", "-c", "feature-y"]);
+        fs::write(sub_path.join("module.txt"), "v3").unwrap();
+        run_git(&sub_path, &["commit", "-am", "v3 on feature-y"]);
+        let feature_y_oid = Repository::open(&sub_path).unwrap().head().unwrap().target().unwrap();
+        run_git(&sub_path, &["switch", "feature-x"]);
+        switch_submodule_version_inner(repo_path.clone(), "vendor/dep".into(), feature_y_oid.to_string(), "branch".into(), "feature-y".into()).unwrap();
+
+        let parent = Repository::open(&repository).unwrap();
+        assert_eq!(parent_gitlink_oid(&parent, "vendor/dep", true), Some(feature_y_oid), "an already-staged gitlink must follow the selected version");
+        drop(parent);
+        commit_staged_inner(repo_path.clone(), "Record feature-y once".into()).unwrap();
+        let after_commit = load_repository_inner(repo_path.clone(), Some(true)).unwrap();
+        assert!(after_commit.changes.iter().all(|change| change.path != "vendor/dep"), "one parent commit must fully record the selected submodule version");
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn commit_staged_refuses_a_submodule_gitlink_that_became_stale_outside_the_app() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-stale-gitlink-{suffix}"));
+        let repository = base.join("main");
+        let dependency = base.join("dependency");
+        create_libgit2_repository(&repository, "README.md");
+        create_libgit2_repository(&dependency, "module.txt");
+        run_git(&repository, &["-c", "protocol.file.allow=always", "submodule", "add", dependency.to_str().unwrap(), "vendor/dep"]);
+        run_git(&repository, &["commit", "-am", "Add dep"]);
+        let repo_path = repository.to_string_lossy().into_owned();
+        let sub_path = repository.join("vendor/dep");
+        run_git(&sub_path, &["switch", "-c", "first"]);
+        fs::write(sub_path.join("module.txt"), "first").unwrap();
+        run_git(&sub_path, &["commit", "-am", "First"]);
+        stage_files(repo_path.clone(), vec!["vendor/dep".into()]).unwrap();
+        run_git(&sub_path, &["switch", "-c", "second"]);
+        fs::write(sub_path.join("module.txt"), "second").unwrap();
+        run_git(&sub_path, &["commit", "-am", "Second"]);
+
+        let error = commit_staged_inner(repo_path.clone(), "Must not record stale SHA".into()).unwrap_err();
+        assert!(error.contains("staged submodule reference is older"));
+        assert!(error.contains("vendor/dep"));
+        assert_eq!(run_git_capture(&repository, &["log", "-1", "--pretty=%s"]), "Add dep", "the parent must not create a misleading partial commit");
 
         fs::remove_dir_all(base).unwrap();
     }

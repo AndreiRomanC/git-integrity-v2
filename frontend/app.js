@@ -1175,8 +1175,8 @@ async function openSubmoduleMenu(entry, x, y) {
   // Keep the wider, readable selector fully inside the viewport. Its old
   // 440px positioning clamp was left behind after the contents grew, so the
   // recovery and Checkout buttons could overlap text or extend off-screen.
-  const menuWidth = Math.min(720, innerWidth - 32);
-  const menuHeight = Math.min(680, innerHeight - 32);
+  const menuWidth = Math.min(860, innerWidth - 32);
+  const menuHeight = Math.min(760, innerHeight - 32);
   refs.submoduleMenu.style.left = `${Math.max(16, Math.min(x, innerWidth - menuWidth - 16))}px`;
   refs.submoduleMenu.style.top = `${Math.max(16, Math.min(y, innerHeight - menuHeight - 16))}px`;
   refs.submoduleMenuName.textContent = entry.name; refs.currentSubmoduleVersion.textContent = 'Loading…';
@@ -2522,8 +2522,9 @@ const GRAPH_LEGEND_HTML = `<details class="graph-legend">
     <span><i class="legend-glyph">◎</i>HEAD — The commit currently checked out</span>
     <span><i class="legend-glyph">⑂</i>Branch point — A common ancestor or lane transition</span>
     <span><i class="legend-glyph legend-tag">◆</i>TAG — A named release or version</span>
-    <span><i class="legend-swatch kind-local_branch"></i>Branch — Strong cyan label and outlined tip dot</span>
-    <span><i class="legend-swatch kind-remote_branch"></i>Remote branch — Slate label and outlined last-known tip</span>
+    <span><i class="legend-swatch kind-local_branch"></i>Local branch — Cyan rectangular label and solid tip ring</span>
+    <span><i class="legend-swatch kind-remote_branch"></i>Remote branch — Rounded slate label and dashed tip ring</span>
+    <span><i class="legend-swatch primary-remote"></i>origin/main — Red primary-remote marker</span>
     <span><i class="legend-line"></i>Line — A real parent relationship between commits</span>
     <span><i class="legend-swatch legend-merge"></i>MERGE — A commit with multiple parents</span>
     <span><i class="legend-glyph">…</i>Older history is available but not loaded</span>
@@ -2723,10 +2724,11 @@ function buildCommitRowHtml(commit, index, ctx) {
   const refKinds = new Set((node.refs || []).map(r => r.kind));
   const hasLocalBranchRef = refKinds.has('local_branch');
   const hasRemoteBranchRef = refKinds.has('remote_branch');
+  const hasPrimaryRemoteRef = (node.refs || []).some(ref => ref.kind === 'remote_branch' && ref.name === 'origin/main');
   const matchesFilter = ctx.refFilter === 'all' || isBranchPoint || (ctx.refFilter === 'branches' ? (refKinds.has('local_branch') || refKinds.has('remote_branch')) : refKinds.has('tag'));
   const isFilterDimmed = !matchesFilter;
 
-  return `<article class="commit-row ${node.isHead ? 'is-head' : ''} ${hasLocalBranchRef ? 'has-local-branch-tip' : ''} ${!hasLocalBranchRef && hasRemoteBranchRef ? 'has-remote-branch-tip' : ''} ${isBranchPoint ? 'is-branch-point' : ''} ${isMatch ? 'is-search-match' : ''} ${isSearchDimmed || isFilterDimmed ? 'is-search-dimmed' : ''}" data-id="${esc(commit.id)}" data-lane="${node.lane}">
+  return `<article class="commit-row ${node.isHead ? 'is-head' : ''} ${hasPrimaryRemoteRef ? 'has-primary-remote-tip' : hasLocalBranchRef ? 'has-local-branch-tip' : hasRemoteBranchRef ? 'has-remote-branch-tip' : ''} ${isBranchPoint ? 'is-branch-point' : ''} ${isMatch ? 'is-search-match' : ''} ${isSearchDimmed || isFilterDimmed ? 'is-search-dimmed' : ''}" data-id="${esc(commit.id)}" data-lane="${node.lane}">
     <div class="graph-cell"></div>
     <div class="commit-body">
       <div class="commit-card"><div class="commit-main">${isBranchPoint ? '<b class="branch-point-pill" data-tooltip="Common ancestor — where the newer branch above split off">⑂</b>' : ''}<span class="commit-title">${commitSubjectHtml(commit.subject)}</span>${refsBadges(node.refs, node.isHead, ctx.currentBranch)}${stashPills}</div><span class="commit-id">${esc(commit.id.slice(0, 8))}</span>
@@ -3057,7 +3059,8 @@ function drawGraphOverlay(model, lanesWidth) {
     const pos = positions.get(node.commitId); if (!pos) return;
     const color = palette[node.lane % palette.length];
     const refKinds = new Set((node.refs || []).map(ref => ref.kind));
-    const branchTipStroke = refKinds.has('local_branch') ? '#4bd3dc' : refKinds.has('remote_branch') ? '#8298b8' : '';
+    const isPrimaryRemote = (node.refs || []).some(ref => ref.kind === 'remote_branch' && ref.name === 'origin/main');
+    const branchTipStroke = isPrimaryRemote ? '#ff626d' : refKinds.has('local_branch') ? '#4bd3dc' : refKinds.has('remote_branch') ? '#8298b8' : '';
     if (node.isHead) {
       parts.push(`<circle cx="${pos.x}" cy="${pos.y}" r="8" fill="${color}" stroke="#0d1117" stroke-width="2.5"/><circle cx="${pos.x}" cy="${pos.y}" r="8" fill="none" stroke="#e8eef5" stroke-width="1.6"/>`);
     } else if (branchPointIds.has(node.commitId)) {
@@ -3068,7 +3071,7 @@ function drawGraphOverlay(model, lanesWidth) {
     } else {
       parts.push(`<circle cx="${pos.x}" cy="${pos.y}" r="6" fill="${color}" stroke="#0d1117" stroke-width="2.5"/>`);
     }
-    if (branchTipStroke) parts.push(`<circle cx="${pos.x}" cy="${pos.y}" r="11" fill="none" stroke="${branchTipStroke}" stroke-width="2" opacity="0.92"/>`);
+    if (branchTipStroke) parts.push(`<circle cx="${pos.x}" cy="${pos.y}" r="11" fill="none" stroke="${branchTipStroke}" stroke-width="${isPrimaryRemote ? 2.8 : 2}" ${refKinds.has('remote_branch') && !isPrimaryRemote ? 'stroke-dasharray="3 2"' : ''} opacity="0.95"/>`);
   });
 
   // Point 8 of the report: a lane still open (unresolved) at the very last

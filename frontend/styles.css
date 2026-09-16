@@ -138,12 +138,12 @@ button.pr-reviewer:hover { border-color: #59758e; background: #1b2b38; color: #e
 .branch-row.active { border-color: #2b5e8c; background: #17334e; color: #f0f7ff; }
 .branch-bullet { width: 12px; height: 12px; border: 3px solid var(--blue); border-radius: 50%; }
 .branch-row.local-branch:not(.active) .branch-bullet { border-color: #39c5cf; }
-.branch-row.remote-branch .branch-bullet { border-color: #8298b8; background: #2a394b; }
+.branch-row.remote-branch .branch-bullet { border-color: #8298b8; border-style: dashed; border-radius: 2px; background: #2a394b; transform: rotate(45deg); }
 .branch-row.remote-branch .branch-name { color: #c1cede; }
-.branch-row.primary-remote { border-color: #6d87a8; background: linear-gradient(90deg, #26384d, #17212c); }
-.branch-row.primary-remote .branch-bullet { border-color: #a9c9ee; background: #7d9fc7; box-shadow: 0 0 8px #7da9d966; }
-.branch-row.primary-remote .branch-name { color: #e2efff; font-weight: 700; }
-.branch-row.primary-remote small { color: #a9c9ee; font-size: 8px; font-weight: 800; letter-spacing: .35px; }
+.branch-row.primary-remote { border-color: #9b4149; background: linear-gradient(90deg, #3a1e25, #1d1c24); }
+.branch-row.primary-remote .branch-bullet { border-color: #ff7a83; border-style: solid; background: #c64854; box-shadow: 0 0 9px #ff626d66; }
+.branch-row.primary-remote .branch-name { color: #ffd7da; font-weight: 800; }
+.branch-row.primary-remote small { color: #ff9ba2; font-size: 8px; font-weight: 800; letter-spacing: .35px; }
 .branch-row.active .branch-bullet { background: var(--blue); box-shadow: 0 0 10px #58a6ff99; }
 /* A detached checkout's own explicit sidebar row (point 2 of the report)
    — visually distinct from a real branch being HEAD, never the same blue
@@ -490,7 +490,7 @@ button.pr-reviewer:hover { border-color: #59758e; background: #1b2b38; color: #e
 .diff-line { display: block; min-height: 1.55em; margin: 0 -14px; padding: 0 14px; background: #7a541fa8; box-shadow: inset 4px 0 var(--amber); font-weight: 600; }.diff-line.remote-line { background: #2c5487a8; box-shadow: inset 4px 0 var(--blue); }.same-line { display: block; min-height: 1.55em; }.filler-line { display: block; min-height: 1.55em; margin: 0 -14px; padding: 0 14px; background: repeating-linear-gradient(135deg, #ffffff08 0 6px, transparent 6px 12px); }.line-number { display: inline-block; width: 34px; margin-right: 10px; color: #526474; text-align: right; user-select: none; }
 
 .graph-view { flex: 1; min-height: 0; overflow: auto; }
-.lane-legend { position: sticky; z-index: 3; top: 0; min-height: 40px; display: flex; align-items: center; gap: 15px; padding: 0 22px; background: #111820; border-bottom: 1px solid var(--border); }
+.lane-legend { position: sticky; z-index: 3; top: 0; min-height: 40px; display: flex; flex-wrap: wrap; align-items: center; gap: 10px 15px; padding: 8px 22px; background: #111820; border-bottom: 1px solid var(--border); }
 .time-direction { flex: none; display: grid; grid-template-columns: auto auto auto; align-items: center; gap: 7px; padding-right: 15px; border-right: 1px solid #34414c; color: #c0d0dd; font-size: 9px; }.time-direction i { color: var(--blue); font-style: normal; }
 .head-banner { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border: 1px solid #3d5368; border-radius: 999px; background: #182432; color: #cfe3f5; font-size: 11px; font-weight: 600; }.head-banner i { color: #6f8daa; font-style: normal; }.head-banner b { color: #7fc1ff; }
 /* Always visible, whether the parent repository or a submodule's own
@@ -529,6 +529,7 @@ button.pr-reviewer:hover { border-color: #59758e; background: #1b2b38; color: #e
 .commit-row.is-head .commit-card { border-color: #4f8fc8; box-shadow: 0 0 0 1px #4f8fc855, 0 3px 10px #0004; }
 .commit-row.has-local-branch-tip .commit-card { border-left: 4px solid #39c5cf; background: linear-gradient(90deg, #123039 0, #141c24 17%); }
 .commit-row.has-remote-branch-tip .commit-card { border-left: 4px solid #8298b8; background: linear-gradient(90deg, #202b3a 0, #141c24 17%); }
+.commit-row.has-primary-remote-tip .commit-card { border-left: 5px solid #ff626d; background: linear-gradient(90deg, #371c24 0, #141c24 18%); box-shadow: 0 0 0 1px #ff626d33, 0 3px 10px #0004; }
 .commit-row.is-head.has-local-branch-tip .commit-card { border-left-color: #70dce4; box-shadow: 0 0 0 1px #4f8fc888, 0 3px 12px #0006; }
 .commit-row.is-search-match .commit-card { border-color: #d9a25c; box-shadow: 0 0 0 1px #d9a25c55; }
 .commit-row.is-search-dimmed .commit-card { opacity: .38; }
@@ -550,8 +551,8 @@ button.pr-reviewer:hover { border-color: #59758e; background: #1b2b38; color: #e
 .ref-pill { max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 3px 8px; border-radius: 5px; background: #1b2a36; color: #d6e5f0; font-size: 10px; font-weight: 700; }
 .ref-pill i { margin-right: 5px; font-size: 7px; font-style: normal; letter-spacing: .45px; opacity: .78; }
 .ref-pill.kind-local_branch { border: 1px solid #3299a2; border-left: 4px solid #4bd3dc; background: #123139; color: #d2f8fb; box-shadow: 0 0 0 1px #39c5cf18; }
-.ref-pill.kind-remote_branch { border: 1px solid #536984; border-left: 4px solid #8298b8; background: #202b3a; color: #d7e1ef; }
-.ref-pill.kind-remote_branch.primary-remote { border-color: #86a8ce; border-left-color: #b3d5fa; background: linear-gradient(90deg, #29415c, #223247); color: #f0f7ff; box-shadow: 0 0 0 1px #8ebae844, 0 0 10px #578ac933; }
+.ref-pill.kind-remote_branch { border: 1px dashed #667f9d; border-left: 4px solid #8298b8; border-radius: 999px; background: #202b3a; color: #d7e1ef; }
+.ref-pill.kind-remote_branch.primary-remote { border: 1px solid #ff7a83; border-left: 5px solid #ff626d; border-radius: 999px; background: linear-gradient(90deg, #4a2028, #302029); color: #fff0f1; box-shadow: 0 0 0 1px #ff626d3d, 0 0 11px #ff626d35; }
 .ref-pill.kind-tag { border: 1px solid #a4842e; background: #3a2c12; color: #ffe3a3; font-weight: 800; cursor: pointer; }
 .ref-pill.kind-tag:hover { border-color: var(--amber); background: #4a3818; }
 .ref-pill.kind-head { border: 1px solid #e8eef5; background: transparent; color: #e8eef5; font-weight: 800; letter-spacing: .4px; }
@@ -592,6 +593,7 @@ button.pr-reviewer:hover { border-color: #59758e; background: #1b2b38; color: #e
 .legend-swatch { flex: none; width: 10px; height: 10px; border-radius: 2px; }
 .legend-swatch.kind-local_branch { background: #39c5cf; }
 .legend-swatch.kind-remote_branch { background: #6f84a3; }
+.legend-swatch.primary-remote { background: #ff626d; box-shadow: 0 0 6px #ff626d66; }
 .legend-swatch.legend-merge { background: #6f5aad; }
 .legend-line { flex: none; width: 14px; height: 2px; background: #58a6ff; border-radius: 1px; }
 .graph-legend-note { margin: 4px 4px 0; color: #4c5c6c; font-size: 10px; font-style: italic; }
@@ -670,7 +672,7 @@ button.pr-reviewer:hover { border-color: #59758e; background: #1b2b38; color: #e
 .commit-area button { height: 34px; margin-left: auto; padding: 0 15px; border: 1px solid #5ba6ec; border-radius: 6px; background: #286ca8; color: white; }
 .commit-area button:disabled { border-color: #34404b; background: #27313b; color: #71808d; }
 
-.submodule-menu { position: fixed; z-index: 30; width: min(720px, calc(100vw - 32px)); max-height: min(680px, calc(100vh - 32px)); display: flex; flex-direction: column; border: 1px solid #526274; border-radius: 10px; background: #18212b; box-shadow: 0 20px 70px #000c; overflow: hidden; }
+.submodule-menu { position: fixed; z-index: 30; width: min(860px, calc(100vw - 32px)); max-height: min(760px, calc(100vh - 32px)); display: flex; flex-direction: column; border: 1px solid #526274; border-radius: 10px; background: #18212b; box-shadow: 0 20px 70px #000c; overflow: hidden; }
 .submodule-menu > header { min-height: 58px; display: flex; align-items: center; padding: 10px 13px 10px 16px; border-bottom: 1px solid var(--border); background: #1c2631; }
 .submodule-menu > header div { min-width: 0; display: flex; flex-direction: column; gap: 3px; }.submodule-menu > header span { color: #7f92a4; font-size: 9px; letter-spacing: .9px; }.submodule-menu > header strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .submodule-menu > header button { width: 30px; height: 30px; margin-left: auto; border: 0; border-radius: 6px; background: transparent; color: #9babb9; font-size: 22px; }.submodule-menu > header button:hover { background: #2a3642; }
@@ -678,7 +680,15 @@ button.pr-reviewer:hover { border-color: #59758e; background: #1b2b38; color: #e
 .version-tabs { display: flex; align-items: center; gap: 3px; padding: 9px 11px 7px; border-bottom: 1px solid var(--border-soft); }.version-tabs button { height: 29px; padding: 0 11px; border: 0; border-radius: 6px; background: transparent; color: #8fa0b0; font-size: 11px; }.version-tabs button.active { background: #234566; color: #e7f3ff; }.version-tabs .version-graph-link { margin-left: auto; color: #6f95b8; }.version-tabs .version-graph-link:hover { color: #bcdcff; background: #1d2a36; }
 .version-search { margin: 0 11px 9px; width: calc(100% - 22px); height: 28px; padding: 0 10px; border: 1px solid var(--border-soft); border-radius: 6px; background: #131b23; color: #d6e2ec; font-size: 11px; }.version-search:focus { outline: none; border-color: #3a6ea5; }.version-search::placeholder { color: #5a6c7d; }
 .version-attached-branch { font-family: -apple-system, sans-serif; font-size: 9px; color: #7fb88f; }
-.version-list { min-height: 100px; max-height: 440px; overflow: auto; padding: 5px; }.version-row { width: 100%; min-height: 53px; display: grid; grid-template-columns: 24px 78px minmax(135px, 180px) minmax(130px, 1fr) auto; align-items: center; gap: 8px; padding: 5px 9px; border: 1px solid transparent; border-radius: 7px; background: transparent; text-align: left; }.version-row:hover { border-color: #35495c; background: #1d2a36; }.version-row.current { background: #18334d; }.version-symbol { color: var(--purple); font-size: 16px; }.version-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 11px ui-monospace, SFMono-Regular, Consolas, monospace; color: #c5d4e2; display: flex; flex-direction: column; gap: 3px; align-items: flex-start; }.version-kind-badge { padding: 1px 5px; border-radius: 4px; background: #2a3a4a; color: #8fb3d9; font-size: 8px; font-family: -apple-system, sans-serif; font-weight: 700; letter-spacing: .3px; }.version-copy { min-width: 0; display: flex; flex-direction: column; gap: 3px; }.version-subject { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }.version-meta { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #748697; font-size: 10px; }.current-label { padding: 2px 6px; border-radius: 8px; background: #2b6c4a; color: #bff1d1; font-size: 9px; }
+.version-list { min-height: 100px; max-height: 520px; overflow: auto; padding: 5px; }.version-row { width: 100%; min-height: 56px; display: grid; grid-template-columns: 24px 78px minmax(190px, 260px) minmax(180px, 1fr) auto; align-items: center; gap: 9px; padding: 6px 10px; border: 1px solid transparent; border-left: 3px solid transparent; border-radius: 7px; background: transparent; text-align: left; }.version-row:hover { border-color: #35495c; background: #1d2a36; }.version-row.current { background: #18334d; }.version-symbol { color: var(--purple); font-size: 16px; }.version-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 11px ui-monospace, SFMono-Regular, Consolas, monospace; color: #c5d4e2; display: flex; flex-direction: column; gap: 3px; align-items: flex-start; }.version-kind-badge { padding: 1px 5px; border-radius: 4px; background: #2a3a4a; color: #8fb3d9; font-size: 8px; font-family: -apple-system, sans-serif; font-weight: 700; letter-spacing: .3px; }.version-copy { min-width: 0; display: flex; flex-direction: column; gap: 3px; }.version-subject { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }.version-meta { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #748697; font-size: 10px; }.current-label { padding: 2px 6px; border-radius: 8px; background: #2b6c4a; color: #bff1d1; font-size: 9px; }
+.version-row.version-kind-branch { border-left-color: #39c5cf; }
+.version-row.version-kind-remote { border-left-color: #8298b8; border-left-style: dashed; }
+.version-row.version-kind-remote .version-symbol { color: #8298b8; transform: rotate(45deg); }
+.version-row.version-kind-tag { border-left-color: #d7aa42; background-image: linear-gradient(90deg, #33271333, transparent 24%); }
+.version-row.version-kind-tag .version-symbol, .version-row.version-kind-tag .version-kind-badge { color: #ffd77a; }
+.version-row.version-kind-commit { border-left-color: #6f5aad; }
+.version-row.primary-remote { border-color: #93434b; border-left: 4px solid #ff626d; background: linear-gradient(90deg, #3a1d243d, transparent 30%); }
+.version-primary-upstream { color: #ff8d95; font-weight: 700; }
 .version-row-actions { display: flex; align-items: center; justify-content: flex-end; gap: 6px; }
 .version-row-actions button { width: auto; min-width: 58px; height: 25px; padding: 0 8px; border: 1px solid #405365; border-radius: 6px; background: #15222d; color: #a9bfd2; font-size: 9px; white-space: nowrap; }
 .version-row-actions button:hover { border-color: #6695bd; background: #203449; color: white; }
