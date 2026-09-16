@@ -177,6 +177,36 @@ function commitSubjectHtml(subject = '') {
 function status(message, kind = '') { refs.statusText.textContent = message; refs.statusDot.className = `status-dot ${kind}`; }
 let toastTimer; function showOperationToast(message, kind = '') { clearTimeout(toastTimer); refs.operationToast.textContent = message; refs.operationToast.className = `operation-toast ${kind}`; refs.operationToast.hidden = false; toastTimer = setTimeout(() => { refs.operationToast.hidden = true; }, 7000); }
 
+// Keep progress attached to the exact control the user pressed. The global
+// status bar is useful context, but on a busy screen it is too easy to miss
+// and the still-normal-looking button makes a slow Git operation look as if
+// the click was ignored. This helper changes presentation only: it never
+// starts, retries or cancels an operation, and restores the original control
+// if the surrounding view was not replaced by the operation's refresh.
+function beginButtonOperation(button, label) {
+  if (!button) return () => {};
+  const previous = { disabled: button.disabled, html: button.innerHTML, ariaBusy: button.getAttribute('aria-busy'), ariaLabel: button.getAttribute('aria-label'), title: button.title };
+  const compact = button.textContent.trim().length <= 2;
+  button.disabled = true;
+  button.classList.add('action-running');
+  button.classList.toggle('action-running-compact', compact);
+  button.setAttribute('aria-busy', 'true');
+  button.setAttribute('aria-label', label);
+  button.title = label;
+  button.innerHTML = `<i class="spinner" aria-hidden="true"></i>${compact ? '' : `<span>${esc(label)}</span>`}`;
+  return () => {
+    if (!button.isConnected) return;
+    button.disabled = previous.disabled;
+    button.classList.remove('action-running', 'action-running-compact');
+    if (previous.ariaBusy == null) button.removeAttribute('aria-busy');
+    else button.setAttribute('aria-busy', previous.ariaBusy);
+    if (previous.ariaLabel == null) button.removeAttribute('aria-label');
+    else button.setAttribute('aria-label', previous.ariaLabel);
+    button.title = previous.title;
+    button.innerHTML = previous.html;
+  };
+}
+
 function localPathKey(path) {
   const value = String(path || '').replace(/\\/g, '/').replace(/\/+$/, '');
   return /^[A-Za-z]:\//.test(value) ? value.toLowerCase() : value;
@@ -310,11 +340,18 @@ function suggestedRepositoryName(url) { return url.trim().replace(/\/$/, '').spl
 function validateSubmoduleForm() { refs.confirmAddSubmodule.disabled = !refs.submoduleUrl.value.trim() || !refs.submoduleName.value.trim(); if (refs.submoduleDialog.open && refs.submoduleName.value.trim()) { refs.submoduleAddStatus.textContent = `Will add at /${state.currentPath ? `${state.currentPath}/` : ''}${refs.submoduleName.value.trim()}`; refs.submoduleAddStatus.className = 'submodule-operation-status'; } }
 function openAddSubmoduleDialog() {
   if (!state.repository || state.view !== 'explorer') return;
-  const defaultSubmoduleUrl = 'https://github.vitesco.io/eng/';
+  const defaultSubmoduleUrl = '../../eng/';
   refs.submoduleUrl.value = defaultSubmoduleUrl; refs.submoduleName.value = ''; refs.submoduleUsername.value = ''; refs.submoduleToken.value = ''; refs.submoduleName.dataset.edited = '';
   refs.submoduleParent.value = state.currentPath ? `/${state.currentPath}` : '/ (repository root)';
   refs.submoduleAddStatus.textContent = `Destination: /${state.currentPath ? `${state.currentPath}/` : ''}…`; refs.submoduleAddStatus.className = 'submodule-operation-status';
   validateSubmoduleForm(); refs.submoduleDialog.showModal(); refs.submoduleUrl.focus(); refs.submoduleUrl.setSelectionRange(defaultSubmoduleUrl.length, defaultSubmoduleUrl.length);
+}
+
+function portableSubmoduleUrl(url) {
+  const value = String(url || '').trim();
+  const match = value.match(/^(?:https?:\/\/github\.vitesco\.io\/|ssh:\/\/(?:git@)?github\.vitesco\.io\/|git@github\.vitesco\.io:)([^/]+)\/([^/]+?)\/?$/i);
+  if (!match) return value;
+  return `../../${match[1]}/${match[2]}`;
 }
 async function confirmAddSubmodule() {
   const url = refs.submoduleUrl.value.trim(), folderName = refs.submoduleName.value.trim(), parentPath = state.currentPath, username = refs.submoduleUsername.value.trim(), accessToken = refs.submoduleToken.value;
@@ -778,6 +815,7 @@ function iconFor(entry) {
   if (entry.kind === 'folder') return '<span class="entry-icon folder">▰</span>';
   if (entry.kind === 'submodule') return '<span class="entry-icon submodule">◇</span>';
   if (entry.kind === 'symlink') return '<span class="entry-icon symlink">↗</span>';
+  if (['deleted', 'deleted-folder', 'deleted-submodule'].includes(entry.kind)) return '<span class="entry-icon deleted">×</span>';
   return `<span class="entry-icon file">${esc((entry.name.split('.').pop() || '').slice(0, 3).toUpperCase())}</span>`;
 }
 
@@ -867,7 +905,7 @@ function renderExplorer() {
     <span></span><span></span><span></span>
   </button>` : '';
   const rowsHtml = entries.map(entry => `<button class="file-row file-grid ${entry.status || !entry.tracked ? 'has-change' : ''} ${state.selectedEntry?.relative_path === entry.relative_path ? 'selected' : ''}" data-entry="${esc(entry.relative_path)}">
-    <span class="file-main">${iconFor(entry)}<span class="entry-copy"><span class="entry-name">${esc(entry.name)}${entry.kind === 'submodule' ? '<b class="inline-submodule-badge">SUBMODULE</b>' : ''}</span><span class="entry-hint">${entry.kind === 'submodule' ? 'Independent Git repository' : entry.kind}</span></span>${['folder','submodule'].includes(entry.kind) ? '<span class="folder-arrow">›</span>' : ''}</span>
+    <span class="file-main">${iconFor(entry)}<span class="entry-copy"><span class="entry-name">${esc(entry.name)}${entry.kind === 'submodule' ? '<b class="inline-submodule-badge">SUBMODULE</b>' : ''}</span><span class="entry-hint">${entry.kind === 'submodule' ? 'Independent Git repository' : entry.kind === 'deleted-submodule' ? 'Deleted Git submodule' : entry.kind === 'deleted-folder' ? 'Deleted tracked folder' : entry.kind === 'deleted' ? 'Deleted tracked file' : entry.kind}</span></span>${['folder','submodule'].includes(entry.kind) ? '<span class="folder-arrow">›</span>' : ''}</span>
     ${gitState(entry)}<span class="file-size">${entry.kind === 'file' ? formatSize(entry.size) : '—'}</span><span class="file-modified">${formatModified(entry.modified)}</span>
   </button>`).join('') || (state.currentPath ? '' : '<div class="empty-change">This folder is empty</div>');
   const showAllStub = capped ? `<div class="history-truncated-stub"><span>Showing ${EXPLORER_DOM_ROW_CAP} of ${allEntries.length} items</span><button id="explorerShowAll">Show all ${allEntries.length}</button></div>` : '';
@@ -1208,11 +1246,11 @@ function renderSubmoduleVersions() {
   refs.submoduleVersions.querySelectorAll('[data-switch-version]').forEach(button => button.addEventListener('click', event => {
     event.stopPropagation();
     const row = button.closest('[data-revision]');
-    switchSubmoduleVersion(row.dataset.revision, row.dataset.versionKind, row.dataset.name);
+    switchSubmoduleVersion(row.dataset.revision, row.dataset.versionKind, row.dataset.name, button);
   }));
   refs.submoduleVersions.querySelectorAll('[data-reset-upstream]').forEach(button => button.addEventListener('click', event => {
     event.stopPropagation();
-    discardSubmoduleBranchAndUseUpstream(button.dataset);
+    discardSubmoduleBranchAndUseUpstream(button.dataset, button);
   }));
   refs.submoduleVersions.querySelectorAll('[data-copy-sha]').forEach(button => button.addEventListener('click', event => {
     event.stopPropagation();
@@ -1225,8 +1263,9 @@ function renderSubmoduleVersions() {
   }));
 }
 
-async function switchSubmoduleVersion(revision, kind, name) {
+async function switchSubmoduleVersion(revision, kind, name, button = null) {
   if (!invoke) { refs.currentSubmoduleVersion.textContent = `preview · ${revision.slice(0, 8)}`; return; }
+  const finishButton = beginButtonOperation(button, 'Switching…');
   try {
     status('Switching submodule version…', 'busy');
     await invoke('switch_submodule_version', { repositoryPath: state.repository.path, relativePath: submoduleMenuData.path, revision, versionKind: kind, name: name || '' });
@@ -1236,9 +1275,10 @@ async function switchSubmoduleVersion(revision, kind, name) {
     const successMsg = `Submodule switched to ${target}. It now shows as "Modified" here — that's expected: the project hasn't recorded the new pointer yet. Select the submodule and use "Commit this item" to save it.`;
     status(successMsg); showOperationToast(successMsg, 'success');
   } catch (error) { const message = handleError(error); showOperationToast(`Could not switch version: ${message}`, 'error'); }
+  finally { finishButton(); }
 }
 
-async function discardSubmoduleBranchAndUseUpstream({ name, upstream, ahead, behind }) {
+async function discardSubmoduleBranchAndUseUpstream({ name, upstream, ahead, behind }, button = null) {
   if (!submoduleMenuData) return;
   const counts = `${Number(ahead) || 0} ahead / ${Number(behind) || 0} behind`;
   const confirmed = await customConfirm(
@@ -1247,6 +1287,7 @@ async function discardSubmoduleBranchAndUseUpstream({ name, upstream, ahead, beh
   );
   if (!confirmed) return;
   if (!invoke) return status(`Preview: discard local ${name} and use ${upstream}`);
+  const finishButton = beginButtonOperation(button, 'Resetting…');
   try {
     status(`Fetching ${upstream} and replacing local ${name}…`, 'busy');
     const result = await invoke('reset_submodule_branch_to_upstream', { repositoryPath: state.repository.path, relativePath: submoduleMenuData.path, branchName: name });
@@ -1257,6 +1298,7 @@ async function discardSubmoduleBranchAndUseUpstream({ name, upstream, ahead, beh
     const message = `${submoduleMenuEntry?.name || 'Submodule'}: ${result.branch} now matches ${result.upstream} @ ${result.revision.slice(0, 8)}. Local-only work was discarded.`;
     status(message); showOperationToast(message, 'success');
   } catch (error) { const message = handleError(error); showOperationToast(`Could not replace the local branch: ${message}`, 'error'); }
+  finally { finishButton(); }
 }
 
 // Cancelable handle for the deferred entry_details fetch below — shared so
@@ -1271,6 +1313,24 @@ async function selectEntry(path, options = {}) {
   }
   render();
   if (pendingEntryDetailsTimeout) { clearTimeout(pendingEntryDetailsTimeout); pendingEntryDetailsTimeout = null; }
+  // Deleted tracked paths are intentionally present as synthetic Explorer
+  // rows (load_directory cannot discover them through read_dir because they
+  // no longer exist). Do not ask entry_details to stat a path known to be
+  // absent; render its useful Git actions immediately and fetch only the
+  // history lookup, which works for a deleted path.
+  if (['deleted', 'deleted-folder', 'deleted-submodule'].includes(state.selectedEntry?.kind)) {
+    const deletedEntry = { ...state.selectedEntry, item_count: null, last_commit_id: undefined };
+    renderEntryDetails(deletedEntry);
+    if (invoke) invoke('entry_last_commit', { repositoryPath: state.repository.path, relativePath: path })
+      .then(last => {
+        if (state.selectedEntry?.relative_path !== path) return;
+        const section = $('#entryLastCommitSection'); if (!section) return;
+        section.innerHTML = renderEntryLastCommitInner({ ...deletedEntry, last_commit_id: last?.id ?? null, last_commit_subject: last?.subject ?? null, last_commit_author: last?.author ?? null, last_commit_date: last?.date ?? null });
+      })
+      .catch(() => { const section = $('#entryLastCommitSection'); if (section && state.selectedEntry?.relative_path === path) section.innerHTML = renderEntryLastCommitInner({ ...deletedEntry, last_commit_id: null }); });
+    else renderEntryDetails({ ...deletedEntry, last_commit_id: null });
+    return;
+  }
   if (!invoke) return renderEntryDetails({ ...state.selectedEntry, item_count: state.selectedEntry.kind === 'folder' ? 12 : null, submodule_url: state.selectedEntry.kind === 'submodule' ? 'git@example.com:platform/diagnostics-core.git' : null, submodule_branch: state.selectedEntry.kind === 'submodule' ? 'main' : null, last_commit_id: 'a39f21d', last_commit_subject: 'P:423421431 test', last_commit_author: 'Andrei Pop', last_commit_date: '2026-08-14' });
   const fetchDetails = async () => {
     try {
@@ -1409,10 +1469,13 @@ function renderEntryLastCommitInner(entry) {
 }
 
 function renderEntryDetails(entry) {
-  const kindLabel = entry.kind === 'submodule' ? 'Git submodule' : entry.kind.charAt(0).toUpperCase() + entry.kind.slice(1);
+  const deletedEntry = ['deleted', 'deleted-folder', 'deleted-submodule'].includes(entry.kind);
+  const kindLabel = entry.kind === 'submodule' ? 'Git submodule' : entry.kind === 'deleted-submodule' ? 'Deleted Git submodule' : entry.kind === 'deleted-folder' ? 'Deleted tracked folder' : entry.kind === 'deleted' ? 'Deleted tracked file' : entry.kind.charAt(0).toUpperCase() + entry.kind.slice(1);
   const submoduleState = entry.kind === 'submodule' ? SubmoduleStateModel.presentation(entry.submodule_state) : null;
   const changeBanner = submoduleState?.actionable
     ? `<div class="local-change-banner"><i></i><div><strong>${esc(submoduleState.short)}</strong><span>${esc(submoduleState.detail)}</span></div></div>`
+    : deletedEntry
+      ? '<div class="local-change-banner"><i></i><div><strong>Deleted locally</strong><span>Git still tracks this item, but it no longer exists on disk. Commit this deletion to record it, or restore it from HEAD if the removal was accidental.</span></div></div>'
     : entry.status || !entry.tracked
       ? `<div class="local-change-banner"><i></i><div><strong>${entry.tracked ? 'Modified locally' : 'New local file'}</strong><span>This item differs from the committed repository state.</span></div></div>`
       : '';
@@ -1420,7 +1483,7 @@ function renderEntryDetails(entry) {
   refs.details.innerHTML = `<div class="entry-details"><div class="entry-preview ${esc(entry.kind)}">${entry.kind === 'submodule' ? '◇' : entry.kind === 'folder' ? '▰' : '▤'}</div>
     <h2>${esc(entry.name)}</h2><div class="entry-path">${esc(entry.relative_path)}</div>${entry.kind === 'submodule' ? '<span class="submodule-badge">◇ Git submodule</span>' : ''}
     ${changeBanner}
-    <div class="context-actions">${entry.kind === 'file' ? '<button data-detail-action="edit">Edit local file</button>' : '<button data-detail-action="open">Open folder</button>'}<button data-detail-action="server">Open on server ↗</button><button data-detail-action="history">View history</button>${entry.status ? '<button data-detail-action="commit">Commit this item</button>' : ''}${['folder','submodule'].includes(entry.kind) && entry.name === 'r' ? '<button data-detail-action="utrud" data-tooltip="Launches UTRUD for this r folder. If it cannot start, an explicit error is shown. Windows only.">▶ Run UTRUD</button>' : ''}${entry.kind === 'file' && (entry.status || !entry.tracked) ? `<button data-detail-action="stage" data-tooltip="git add — add this file's current content to staging">＋ Stage this file</button><button data-detail-action="unstage" data-tooltip="Unstage — git restore --staged. Removes only the staging entry; your edits on disk are kept exactly as they are.">− Unstage</button><button data-detail-action="stashfile" data-tooltip="Sets this file aside in this repository's own stash. Parent projects and submodules have separate stash lists.">⇕ Stash this file</button><button data-detail-action="head" class="danger-action-soft" data-tooltip="Restore from your last local commit (HEAD) — git checkout HEAD -- file. Permanently discards ALL edits; the file on disk becomes identical to what you last committed. Cannot be undone.">↶ Restore from last commit (HEAD)</button><button data-detail-action="compare" data-tooltip="Open side-by-side compare with restore options">⇄ Compare with remote</button>` : ''}${entry.kind === 'submodule' ? `<button data-detail-action="subserver">Open submodule repository ↗</button><button data-detail-action="subgraph" data-tooltip="Open this submodule's own branch/commit history — never the parent project's">Submodule Branch Map</button><button data-detail-action="subrefchanges" data-tooltip="A different, narrower question: which commits in the PARENT project changed this submodule's recorded version. Not the submodule's own history.">Submodule Reference Changes</button><button data-detail-action="subnewbranch" data-tooltip="Create a new local branch in this submodule, starting from its current commit, and switch to it">＋ New branch…</button><button data-detail-action="versions">Change version</button><button data-detail-action="substash" data-tooltip="Set aside all uncommitted files inside this submodule only. The parent project's work is untouched.">Stash submodule work</button><button data-detail-action="substashes" data-tooltip="View and restore this submodule's own stashes. The parent project's stash list is separate.">Submodule stashes</button><button data-detail-action="subcommit" ${canCommitInsideSubmodule ? '' : 'disabled'} data-tooltip="${canCommitInsideSubmodule ? 'Commit uncommitted changes inside the submodule' : 'No uncommitted files inside this submodule'}">Commit submodule</button><button data-detail-action="subreset" class="danger-action-soft" ${entry.status ? '' : 'disabled'} data-tooltip="${entry.status ? 'Discard local work and restore the exact submodule commit recorded by the parent project. This leaves detached HEAD, like git submodule update.' : 'The submodule already uses the version recorded by the parent project'}">↺ Restore project version…</button><button data-detail-action="subpull" data-tooltip="Fast-forward pull — brings in new commits from the submodule's remote. Refuses if it would require a manual merge.">Pull submodule</button><button data-detail-action="submerge" data-tooltip="Merge a branch into this submodule's current branch, with conflict resolution if needed">Merge branch…</button><button data-detail-action="subpush">Push submodule</button><button data-detail-action="subforcepush" class="danger-action-soft" data-tooltip="⚠️ Overwrites the remote branch with your local history, discarding any commits there aren't in yours. Only safe if nobody else uses that remote.">Force push submodule…</button><button data-detail-action="subfetch">Fetch submodule</button><button data-detail-action="location">Replace repository URL</button>` : ''}<button class="danger-action" data-detail-action="delete">Delete…</button></div>
+    <div class="context-actions">${deletedEntry ? '' : entry.kind === 'file' ? '<button data-detail-action="edit">Edit local file</button>' : '<button data-detail-action="open">Open folder</button>'}<button data-detail-action="server">Open on server ↗</button><button data-detail-action="history">View history</button>${entry.status ? '<button data-detail-action="commit">Commit this item</button>' : ''}${entry.kind === 'deleted' ? '<button data-detail-action="head" data-tooltip="Restore this deleted file from your last local commit (HEAD)">↶ Restore from last commit (HEAD)</button>' : ''}${['folder','submodule'].includes(entry.kind) && entry.name === 'r' ? '<button data-detail-action="utrud" data-tooltip="Launches UTRUD for this r folder. If it cannot start, an explicit error is shown. Windows only.">▶ Run UTRUD</button>' : ''}${entry.kind === 'file' && (entry.status || !entry.tracked) ? `<button data-detail-action="stage" data-tooltip="git add — add this file's current content to staging">＋ Stage this file</button><button data-detail-action="unstage" data-tooltip="Unstage — git restore --staged. Removes only the staging entry; your edits on disk are kept exactly as they are.">− Unstage</button><button data-detail-action="stashfile" data-tooltip="Sets this file aside in this repository's own stash. Parent projects and submodules have separate stash lists.">⇕ Stash this file</button><button data-detail-action="head" class="danger-action-soft" data-tooltip="Restore from your last local commit (HEAD) — git checkout HEAD -- file. Permanently discards ALL edits; the file on disk becomes identical to what you last committed. Cannot be undone.">↶ Restore from last commit (HEAD)</button><button data-detail-action="compare" data-tooltip="Open side-by-side compare with restore options">⇄ Compare with remote</button>` : ''}${entry.kind === 'submodule' ? `<button data-detail-action="subserver">Open submodule repository ↗</button><button data-detail-action="subgraph" data-tooltip="Open this submodule's own branch/commit history — never the parent project's">Submodule Branch Map</button><button data-detail-action="subrefchanges" data-tooltip="A different, narrower question: which commits in the PARENT project changed this submodule's recorded version. Not the submodule's own history.">Submodule Reference Changes</button><button data-detail-action="subnewbranch" data-tooltip="Create a new local branch in this submodule, starting from its current commit, and switch to it">＋ New branch…</button><button data-detail-action="versions">Change version</button><button data-detail-action="substash" data-tooltip="Set aside all uncommitted files inside this submodule only. The parent project's work is untouched.">Stash submodule work</button><button data-detail-action="substashes" data-tooltip="View and restore this submodule's own stashes. The parent project's stash list is separate.">Submodule stashes</button><button data-detail-action="subcommit" ${canCommitInsideSubmodule ? '' : 'disabled'} data-tooltip="${canCommitInsideSubmodule ? 'Commit uncommitted changes inside the submodule' : 'No uncommitted files inside this submodule'}">Commit submodule</button><button data-detail-action="subreset" class="danger-action-soft" ${entry.status ? '' : 'disabled'} data-tooltip="${entry.status ? 'Discard local work and restore the exact submodule commit recorded by the parent project. This leaves detached HEAD, like git submodule update.' : 'The submodule already uses the version recorded by the parent project'}">↺ Restore project version…</button><button data-detail-action="subpull" data-tooltip="Fast-forward pull — brings in new commits from the submodule's remote. Refuses if it would require a manual merge.">Pull submodule</button><button data-detail-action="submerge" data-tooltip="Merge a branch into this submodule's current branch, with conflict resolution if needed">Merge branch…</button><button data-detail-action="subpush">Push submodule</button><button data-detail-action="subforcepush" class="danger-action-soft" data-tooltip="⚠️ Overwrites the remote branch with your local history, discarding any commits there aren't in yours. Only safe if nobody else uses that remote.">Force push submodule…</button><button data-detail-action="subfetch">Fetch submodule</button><button data-detail-action="location">Replace repository URL</button>` : ''}${deletedEntry ? '' : '<button class="danger-action" data-detail-action="delete">Delete…</button>'}</div>
     <div class="detail-section"><h3>GENERAL</h3><div class="detail-grid"><span>Type</span><strong>${kindLabel}</strong><span>Git</span><strong>${entry.tracked ? (entry.status || (entry.unpushed ? (entry.kind === 'folder' ? 'Clean — contains unpushed commits' : 'Committed, not pushed yet') : 'Tracked, clean')) : 'Untracked'}</strong>
     ${entry.item_count != null ? `<span>Items</span><strong>${entry.item_count}</strong>` : `<span>Size</span><strong>${formatSize(entry.size)}</strong>`}<span>Modified</span><strong>${formatModified(entry.modified)}</strong></div></div>
     ${entry.kind === 'submodule' ? `<div class="detail-section"><h3>SUBMODULE</h3><div class="detail-grid"><span>Remote</span><strong>${esc(entry.submodule_url || 'Not configured')}</strong><span>Branch</span><strong>${esc(entry.submodule_branch || 'Default')}</strong><span>Status</span><strong>${esc(submoduleState.short)}</strong></div>
@@ -1528,9 +1591,10 @@ async function openEntryOnServer(entry, submodule) {
 }
 
 async function replaceSubmoduleLocation(entry) {
-  const url = await customPrompt(`New Git repository URL for submodule ${entry.name}:`, entry.submodule_url || '', { title: 'Replace repository URL' });
+  const suggestedUrl = portableSubmoduleUrl(entry.submodule_url || '');
+  const url = await customPrompt(`Portable .gitmodules URL for submodule ${entry.name}:`, suggestedUrl, { title: 'Fix or replace repository URL' });
   if (!url || url.trim() === (entry.submodule_url || '')) return;
-  if (!await customConfirm(`Replace the source repository for ${entry.relative_path}?\n\nThe .gitmodules URL and local origin will change, then the new origin will be fetched.`, { title: 'Replace repository URL', danger: true, okLabel: 'Replace' })) return;
+  if (!await customConfirm(`Update the source for ${entry.relative_path}?\n\n.gitmodules keeps the portable URL. The submodule's local origin is resolved from the parent repository, then fetched.`, { title: 'Fix or replace repository URL', danger: true, okLabel: 'Update URL' })) return;
   if (!invoke) return status(`Preview: change submodule URL to ${url.trim()}`);
   try { status('Changing submodule repository and fetching refs…', 'busy'); await invoke('change_submodule_url', { repositoryPath: state.repository.path, relativePath: entry.relative_path, url: url.trim() }); const folder = state.currentPath; directoryCache.clear(); await loadRepository(state.repository.path, { reopenPath: folder }); status(`${entry.name}: repository location updated`); }
   catch (error) { handleError(error); }
@@ -2144,7 +2208,7 @@ function renderBranches() {
       ${!branch.remote && !branch.isHead ? `<button class="branch-menu" data-branch="${esc(branch.name)}" title="Branch actions" style="width:20px;height:20px;padding:0;font-size:14px;border-radius:3px;">⋮</button>` : ''}
     </div>
   </div>`).join('') || (detached ? '' : '<div class="empty-change">No branches</div>');
-  refs.branches.querySelectorAll('.switch-branch').forEach(button => button.addEventListener('click', event => { event.stopPropagation(); switchBranch(button.dataset.branch); }));
+  refs.branches.querySelectorAll('.switch-branch').forEach(button => button.addEventListener('click', event => { event.stopPropagation(); switchBranch(button.dataset.branch, button); }));
   refs.branches.querySelectorAll('.branch-menu').forEach(button => button.addEventListener('click', event => { event.stopPropagation(); showBranchMenu(button.dataset.branch, event); }));
 }
 
@@ -2215,7 +2279,7 @@ async function deleteBranch(branchName) {
 
 function renderRemotes() {
   refs.remoteCards.innerHTML = state.remotes.map(remote => `<article class="remote-card"><div class="remote-symbol">◎</div><div><h2>${esc(remote.name)}</h2><span>FETCH URL</span><code>${esc(remote.fetch_url)}</code><span>PUSH URL</span><code>${esc(remote.push_url)}</code></div><button data-fetch-remote="${esc(remote.name)}">Fetch now</button></article>`).join('') || '<div class="remote-empty">No remote is configured for this repository.</div>';
-  refs.remoteCards.querySelectorAll('[data-fetch-remote]').forEach(button => button.addEventListener('click', () => fetchRemote(button.dataset.fetchRemote)));
+  refs.remoteCards.querySelectorAll('[data-fetch-remote]').forEach(button => button.addEventListener('click', () => fetchRemote(button.dataset.fetchRemote, button)));
 }
 
 const loadRemotesGuard = createRequestGuard();
@@ -2228,12 +2292,19 @@ async function loadRemotes() {
   } else state.remotes = [{ name: 'origin', fetch_url: 'git@example.com:vehicle-control.git', push_url: 'git@example.com:vehicle-control.git' }];
   if (stillCurrent()) render();
 }
-async function fetchRemote(name) { try { status(`Fetching ${name}…`, 'busy'); await invoke('fetch_remote', { repositoryPath: state.repository.path, remote: name }); await loadRepository(state.repository.path, { keepPath: true }); await loadRemotes(); status(`${name} updated`); } catch (error) { handleError(error); } }
-async function fetchAllRemotes() {
+async function fetchRemote(name, button = null) {
+  const finishButton = beginButtonOperation(button, 'Fetching…');
+  try { status(`Fetching ${name}…`, 'busy'); await invoke('fetch_remote', { repositoryPath: state.repository.path, remote: name }); await loadRepository(state.repository.path, { keepPath: true }); await loadRemotes(); status(`${name} updated`); }
+  catch (error) { handleError(error); }
+  finally { finishButton(); }
+}
+async function fetchAllRemotes(button = null) {
   if (!state.repository) return;
   if (!invoke) return status('Preview: fetched all remotes');
+  const finishButton = beginButtonOperation(button, 'Fetching…');
   try { status('Fetching every remote…', 'busy'); await invoke('fetch_all_remotes', { repositoryPath: state.repository.path }); await loadRepository(state.repository.path, { keepPath: true }); await loadRemotes(); const msg = `${state.remotes.length} remote${state.remotes.length === 1 ? '' : 's'} updated`; status(msg); showOperationToast(msg, 'success'); }
   catch (error) { handleError(error); }
+  finally { finishButton(); }
 }
 
 let stashDialogContext = null;
@@ -3418,9 +3489,10 @@ async function flushPendingTogglesNow(options = {}, context = 'the previous Stag
   }
 }
 
-async function switchBranch(branch) {
+async function switchBranch(branch, button = null) {
   const context = activeRepositoryContext();
   if (!invoke || !context.path) return;
+  const finishButton = beginButtonOperation(button, 'Switching…');
   try {
     // Must land before the checkout itself, not just before the reload after
     // it — a checkout racing a still-pending stage/unstage call is exactly
@@ -3447,6 +3519,7 @@ async function switchBranch(branch) {
     }
   }
   catch (error) { handleError(error); }
+  finally { finishButton(); }
 }
 
 $('#openRepo').addEventListener('click', openRepository); $('#emptyOpen').addEventListener('click', openRepository);
@@ -3675,10 +3748,11 @@ if (typeof ResizeObserver !== 'undefined') { new ResizeObserver(() => scheduleGr
 })();
 $('#saveFile').addEventListener('click', saveEditor); $('#closeEditor').addEventListener('click', () => refs.editorDialog.close()); $('#cancelEditor').addEventListener('click', () => refs.editorDialog.close());
 refs.editorContent.addEventListener('input', updateEditorSaveState);
-$('#fetchCurrent').addEventListener('click', () => { const first = state.remotes[0]?.name || state.branches.find(branch => branch.remote)?.name.split('/')[0]; if (first) fetchRemote(first); else status('No remote is configured', 'error'); });
-$('#fetchAll').addEventListener('click', () => fetchAllRemotes());
-async function syncCurrent(action) {
+$('#fetchCurrent').addEventListener('click', event => { const first = state.remotes[0]?.name || state.branches.find(branch => branch.remote)?.name.split('/')[0]; if (first) fetchRemote(first, event.currentTarget); else status('No remote is configured', 'error'); });
+$('#fetchAll').addEventListener('click', event => fetchAllRemotes(event.currentTarget));
+async function syncCurrent(action, button = null) {
   if (!invoke || !state.repository) return;
+  const finishButton = beginButtonOperation(button, action === 'pull' ? 'Pulling…' : 'Pushing…');
   try { status(`${action === 'pull' ? 'Pulling' : 'Pushing'} ${state.repository.current_branch}…`, 'busy'); await invoke('sync_repository', { repositoryPath: state.repository.path, action }); await loadRepository(state.repository.path, { keepPath: true }); status(`${action === 'pull' ? 'Pull' : 'Push'} complete`); }
   catch (error) {
     const message = handleError(error);
@@ -3686,8 +3760,9 @@ async function syncCurrent(action) {
       showOperationToast(`${message}\nUse "Merge branch…" (⑂) instead — it can resolve conflicts here.`, 'error');
     } else { showOperationToast(message, 'error'); }
   }
+  finally { finishButton(); }
 }
-$('#pullCurrent').addEventListener('click', () => syncCurrent('pull')); $('#pushCurrent').addEventListener('click', () => syncCurrent('push'));
+$('#pullCurrent').addEventListener('click', event => syncCurrent('pull', event.currentTarget)); $('#pushCurrent').addEventListener('click', event => syncCurrent('push', event.currentTarget));
 refs.publishBranch.addEventListener('change', refreshPublish); refs.publishRemote.addEventListener('change', refreshPublish); $('#confirmPublish').addEventListener('click', confirmPublish);
 [['#compareRestoreRemote','remote'],['#compareRestoreHead','head'],['#compareStage','stage'],['#compareUnstage','unstage']].forEach(([selector, action]) => $(selector)?.addEventListener('click', event => { event.preventDefault(); updateRecoveryHelp(action); applyFileRecovery(action).catch(error => handleError(error)); }));
 document.addEventListener('click', event => { const link = event.target.closest('.polarion-link'); if (!link) return; event.preventDefault(); if (invoke) invoke('open_external_url', { url: link.href }).catch(error => status(String(error), 'error')); else window.open(link.href, '_blank', 'noopener'); });

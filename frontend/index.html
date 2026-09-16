@@ -444,11 +444,11 @@
   </dialog>
   <dialog id="submoduleDialog" class="clone-dialog submodule-dialog">
     <form method="dialog"><div class="dialog-symbol">◇</div><h2>Add Git submodule</h2><p>The repository will be cloned inside the folder currently open in Project Navigator. Git links and staging are handled automatically.</p>
-      <label><span>REPOSITORY URL</span><input id="submoduleUrl" placeholder="https://github.vitesco.io/eng/module.git" autocomplete="off" autocapitalize="off" spellcheck="false"></label>
+      <label><span>PORTABLE REPOSITORY URL</span><input id="submoduleUrl" placeholder="../../eng/module.git" autocomplete="off" autocapitalize="off" spellcheck="false"></label>
       <label><span>ADD INSIDE CURRENT FOLDER</span><input id="submoduleParent" readonly></label>
       <label><span>SUBMODULE FOLDER NAME</span><input id="submoduleName" placeholder="module" autocomplete="off" autocapitalize="off" spellcheck="false"></label>
       <details class="submodule-auth"><summary>Private repository credentials</summary><label><span>USERNAME (OPTIONAL)</span><input id="submoduleUsername" autocomplete="username" placeholder="Git server username"></label><label><span>PERSONAL ACCESS TOKEN</span><input id="submoduleToken" type="password" autocomplete="off" placeholder="Used once; never saved"></label></details>
-      <div class="submodule-add-result">Creates the folder, updates <code>.gitmodules</code>, adds the Git link to the index and prepares both changes for one commit.</div>
+      <div class="submodule-add-result">Use <code>../../ORG/REPO</code>. Git DrillDown resolves it through the parent remote for clone/fetch, while <code>.gitmodules</code> stays portable.</div>
       <div id="submoduleAddStatus" class="submodule-operation-status" role="status">Ready — destination will be shown here before anything changes.</div>
       <div class="commit-dialog-actions"><button value="cancel">Cancel</button><button type="button" id="confirmAddSubmodule" class="confirm" disabled>Add submodule</button></div>
     </form>

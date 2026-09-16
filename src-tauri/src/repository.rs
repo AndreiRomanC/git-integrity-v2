@@ -1442,6 +1442,30 @@ fn first_remote_url(repo: &Repository) -> Option<String> {
         .and_then(|remote| remote.url().map(str::to_string))
 }
 
+// Corporate GitHub repositories require the clone-independent form in
+// `.gitmodules`: `../../ORG/REPO`. Keep accepting the convenient full URL
+// users copy from a browser, but persist the portable form. The submodule's
+// own `origin` is resolved separately below, so normal fetch/push operations
+// still use a complete network URL.
+fn portable_submodule_configured_url(url: &str) -> String {
+    let trimmed = url.trim();
+    let Some(repository) = parse_github_repo(trimmed) else { return trimmed.to_string() };
+    if !repository.host.eq_ignore_ascii_case("github.vitesco.io") { return trimmed.to_string(); }
+    let suffix = if trimmed.trim_end_matches('/').ends_with(".git") { ".git" } else { "" };
+    format!("../../{}/{}{}", repository.owner, repository.repo, suffix)
+}
+
+// Resolve only for actual I/O. The returned URL must never be written back
+// to `.gitmodules`: doing that would turn a portable project definition into
+// an HTTPS/SSH-specific one and fail the enterprise submodule policy check.
+fn resolved_submodule_io_url(parent: &Repository, configured_url: &str) -> Result<String, String> {
+    if !is_relative_git_url(configured_url) { return Ok(configured_url.trim().to_string()); }
+    let parent_remote = first_remote_url(parent).ok_or(
+        "This portable submodule URL needs the parent repository to have a remote (normally origin) so it can be resolved"
+    )?;
+    Ok(resolve_relative_git_url(&parent_remote, configured_url))
+}
+
 // The browser base URL for a submodule's *own* repository. Prefers the
 // submodule's resolved `origin` (what `git submodule update` wrote into its
 // `.git/config`) when that is absolute; otherwise resolves the `.gitmodules`
@@ -3413,15 +3437,23 @@ fn submodule_reference_risks(repository_path: &str, relative_path: &str, oids: &
     // mirror or cache). Only falls back to the local "origin" URL when
     // .gitmodules has no URL recorded for this path at all.
     let gitmodules_url = submodule_value(repository_path, relative_path, "url").filter(|url| !url.trim().is_empty());
+    let parent_repo = internal_repository(repository_path).ok();
     let absolute = Path::new(repository_path).join(relative_path);
     let Ok(repo) = internal_submodule_repository(&absolute) else {
         return (all(Some("unverifiable")), gitmodules_url);
     };
     let local_origin_url = repo.find_remote("origin").ok().and_then(|remote| remote.url().map(String::from)).filter(|url| !url.trim().is_empty());
-    let effective_url = gitmodules_url.clone().or_else(|| local_origin_url.clone());
+    let configured_url = gitmodules_url.clone().or_else(|| local_origin_url.clone());
+    // A relative .gitmodules value is not inherently a local filesystem
+    // path. Git resolves it against the parent repository's remote. Thus
+    // `../../eng/sw-pkg-x.git` under a GitHub Enterprise parent is a network
+    // source, while the same text under a local-path parent remains local.
+    let effective_url = gitmodules_url.as_deref().map(|url| {
+        parent_repo.as_ref().and_then(|repo| resolved_submodule_io_url(repo, url).ok()).unwrap_or_else(|| url.to_string())
+    }).or_else(|| local_origin_url.clone());
     match effective_url.as_deref() {
         None => return (all(Some("no_remote")), None),
-        Some(url) if is_local_only_url(url) => return (all(Some("local_only")), effective_url),
+        Some(url) if is_local_only_url(url) => return (all(Some("local_only")), configured_url),
         Some(_) => {}
     }
     // Verify only against origin. Fetching every configured remote was both
@@ -3430,7 +3462,7 @@ fn submodule_reference_risks(repository_path: &str, relative_path: &str, oids: &
     // Do not require literal URL equality here: Git commonly stores an
     // equivalent rewritten/credentialed URL in the local clone, while
     // .gitmodules keeps the portable public form.
-    if repo.find_remote("origin").is_err() { return (all(Some("no_remote")), effective_url); }
+    if repo.find_remote("origin").is_err() { return (all(Some("no_remote")), configured_url); }
     let remote = "origin";
     let sub_path = absolute.to_string_lossy().into_owned();
     // One submodule path can occur at several different gitlink revisions in
@@ -3455,7 +3487,7 @@ fn submodule_reference_risks(repository_path: &str, relative_path: &str, oids: &
         (oid, if reachable { None } else { Some("unpushed") })
     }).collect();
     perf_log(&format!("publish_safety: submodule={} checked {} revision{} after one fetch round", relative_path, oids.len(), if oids.len() == 1 { "" } else { "s" }), started.elapsed());
-    (risks, effective_url)
+    (risks, configured_url)
 }
 
 // Point 3 of the submodule-publish-safety report: inspects every *outgoing*
@@ -3893,6 +3925,7 @@ fn load_directory_inner(repository_path: String, relative_path: String, force: O
         if statuses_sorted.get(idx).map(|(path, _)| path.starts_with(&prefix)).unwrap_or(false) { "•".to_string() } else { String::new() }
     };
     let mut entries = Vec::new();
+    let mut names_on_disk = HashSet::new();
     // Open the owning repository once for all visible submodule rows. Gitlink
     // comparisons below are cheap index/tree lookups and must not rediscover
     // the parent repository once per row.
@@ -3904,6 +3937,7 @@ fn load_directory_inner(repository_path: String, relative_path: String, force: O
         let item = item.map_err(|error| error.to_string())?;
         let name = item.file_name().to_string_lossy().into_owned();
         if name == ".git" { continue; }
+        names_on_disk.insert(name.clone());
         let relative_string = normalized(&relative.join(&name));
         let status_key = if boundary.is_some() { normalized(&Path::new(status_scope).join(&name)) } else { relative_string.clone() };
         // `entry.metadata()` (not `fs::symlink_metadata(entry.path())`) —
@@ -3940,6 +3974,53 @@ fn load_directory_inner(repository_path: String, relative_path: String, force: O
         };
         entries.push(DirectoryEntry { name, relative_path: relative_string, kind, status, tracked, size: if metadata.is_file() { metadata.len() } else { 0 }, modified, submodule_has_unpushed_commits, submodule_is_dirty, submodule_state, unpushed, status_known: true });
     }
+
+    // A deleted tracked path cannot be returned by read_dir: it is absent on
+    // disk by definition. Previously its parent folder correctly received a
+    // "modified files inside" marker from Git, but opening that folder showed
+    // only the surviving (clean) files, making the marker look false. Add a
+    // lightweight synthetic row for each missing direct child reported as D.
+    // A whole deleted subtree is represented once by its first missing path
+    // component; drilling into an existing ancestor will still expose the
+    // exact deleted file at the first level where it is absent. No filesystem
+    // scan or Git command is added here — this reuses the status result already
+    // loaded for this directory.
+    let scope_prefix = if status_scope.is_empty() { String::new() } else { format!("{status_scope}/") };
+    let mut missing_names = HashSet::new();
+    for (changed_path, code) in &git_metadata.statuses {
+        if code != "D" { continue; }
+        let scoped_path = if scope_prefix.is_empty() {
+            changed_path.as_str()
+        } else if let Some(value) = changed_path.strip_prefix(&scope_prefix) {
+            value
+        } else {
+            continue;
+        };
+        let Some(name) = scoped_path.split('/').next().filter(|name| !name.is_empty()) else { continue; };
+        if names_on_disk.contains(name) || !missing_names.insert(name.to_string()) { continue; }
+        let direct_status_key = if status_scope.is_empty() { name.to_string() } else { normalized(&Path::new(status_scope).join(name)) };
+        let missing_kind = if !scoped_path.contains('/') && git_metadata.submodules.contains(&direct_status_key) {
+            "deleted-submodule"
+        } else if scoped_path.contains('/') {
+            "deleted-folder"
+        } else {
+            "deleted"
+        };
+        entries.push(DirectoryEntry {
+            name: name.to_string(),
+            relative_path: normalized(&relative.join(name)),
+            kind: missing_kind.into(),
+            status: "D".into(),
+            tracked: true,
+            size: 0,
+            modified: 0,
+            submodule_has_unpushed_commits: false,
+            submodule_is_dirty: false,
+            submodule_state: String::new(),
+            unpushed: false,
+            status_known: true,
+        });
+    }
     perf_log(&format!("load_directory: readdir loop ({} entries, {submodule_count} submodules)", entries.len()), step.elapsed());
     let step = Instant::now();
     // sort_by_cached_key computes each entry's sort key exactly once (O(n)
@@ -3948,7 +4029,7 @@ fn load_directory_inner(repository_path: String, relative_path: String, force: O
     // comparison the sort makes — O(n log n) allocations. For a folder with
     // 20,000 direct entries that's the difference between ~20,000 and
     // ~570,000 allocations just to sort the listing.
-    entries.sort_by_cached_key(|entry| (!matches!(entry.kind.as_str(), "folder" | "submodule"), entry.name.to_lowercase()));
+    entries.sort_by_cached_key(|entry| (!matches!(entry.kind.as_str(), "folder" | "submodule" | "deleted-folder" | "deleted-submodule"), entry.name.to_lowercase()));
     perf_log(&format!("load_directory: sort ({} entries)", entries.len()), step.elapsed());
     perf_log(&format!("load_directory: TOTAL ({relative_path})"), load_started.elapsed());
     Ok(entries)
@@ -4268,7 +4349,9 @@ fn add_submodule_inner(repository_path: String, parent_path: String, url: String
     let lock_handle = repo_write_lock(&repository_path);
     let _lock = lock_handle.lock().unwrap();
     log_repo_write_lock_acquired(&repository_path, "add_submodule", queue_started.elapsed());
-    let repo = internal_repository(&repository_path)?;
+    let mut repo = internal_repository(&repository_path)?;
+    let configured_url = portable_submodule_configured_url(url);
+    let clone_url = resolved_submodule_io_url(&repo, &configured_url)?;
     let destination = Path::new(&repository_path).join(&relative);
     let indexed = cached_index_metadata(&repository_path).0.contains(&relative_string);
     let stale_name = repo.submodules().ok().and_then(|items| items.into_iter()
@@ -4291,7 +4374,7 @@ fn add_submodule_inner(repository_path: String, parent_path: String, url: String
         let old_storage = repo.path().join("modules").join(&relative);
         if old_storage.is_dir() { fs::remove_dir_all(old_storage).map_err(|error| format!("Cannot clean the previous failed attempt: {error}"))?; }
     }
-    let mut submodule = repo.submodule(url, &relative, true)
+    let mut submodule = repo.submodule(&clone_url, &relative, true)
         .map_err(|error| format!("Cannot prepare submodule: {}", error.message()))?;
     let mut options = git2::SubmoduleUpdateOptions::new();
     options.fetch(authenticated_fetch_options(username, access_token));
@@ -4308,7 +4391,21 @@ fn add_submodule_inner(repository_path: String, parent_path: String, url: String
     if let Err(error) = cloned.checkout_head(Some(&mut checkout)) { return rollback(format!("Cannot check out submodule files: {}", error.message())); }
     if let Err(error) = submodule.add_finalize() { return rollback(format!("Cannot stage submodule: {}", error.message())); }
     if let Err(error) = submodule.add_to_index(true) { return rollback(format!("Cannot add the submodule link to the parent index: {}", error.message())); }
-    if let Ok(mut index) = repo.index() { if let Err(error) = index.add_path(Path::new(".gitmodules")).and_then(|_| index.write()) { return rollback(format!("Cannot stage .gitmodules: {}", error.message())); } }
+    drop(submodule);
+    // All clone/finalize failures above use the shared rollback closure.
+    // Failures from this point perform the same cleanup inline.
+    if let Err(error) = repo.submodule_set_url(&name, &configured_url) {
+        let _ = cleanup_submodule_registration(&repo, &name, &relative);
+        if destination.is_dir() { let _ = fs::remove_dir_all(&destination); }
+        let storage = repo.path().join("modules").join(&relative); if storage.is_dir() { let _ = fs::remove_dir_all(storage); }
+        return Err(format!("Cannot save the portable submodule URL: {}", error.message()));
+    }
+    if let Ok(mut index) = repo.index() { if let Err(error) = index.add_path(Path::new(".gitmodules")).and_then(|_| index.write()) {
+        let _ = cleanup_submodule_registration(&repo, &name, &relative);
+        if destination.is_dir() { let _ = fs::remove_dir_all(&destination); }
+        let storage = repo.path().join("modules").join(&relative); if storage.is_dir() { let _ = fs::remove_dir_all(storage); }
+        return Err(format!("Cannot stage .gitmodules: {}", error.message()));
+    } }
     invalidate_git_metadata(&repository_path);
     invalidate_submodule_sync(&repository_path); // this app just changed a submodule's registration/version
     Ok(relative_string)
@@ -4678,14 +4775,18 @@ fn change_submodule_url_inner(repository_path: String, relative_path: String, ur
     let parent_lock_handle = repo_write_lock(&repository_path);
     let parent_lock = parent_lock_handle.lock().unwrap();
     log_repo_write_lock_acquired(&repository_path, "change_submodule_url(parent)", queue_started.elapsed());
-    let mut repo = internal_repository(&repository_path)?; let name = repo.submodules().map_err(|error| error.message().to_string())?.into_iter().find(|item| normalized(item.path()) == relative).map(|item| item.name().unwrap_or("").to_string()).ok_or("Submodule configuration was not found")?; repo.submodule_set_url(&name, url).map_err(|error| error.message().to_string())?;
+    let mut repo = internal_repository(&repository_path)?;
+    let configured_url = portable_submodule_configured_url(url);
+    let fetch_url = resolved_submodule_io_url(&repo, &configured_url)?;
+    let name = repo.submodules().map_err(|error| error.message().to_string())?.into_iter().find(|item| normalized(item.path()) == relative).map(|item| item.name().unwrap_or("").to_string()).ok_or("Submodule configuration was not found")?;
+    repo.submodule_set_url(&name, &configured_url).map_err(|error| error.message().to_string())?;
     drop(repo); drop(parent_lock); // released before the submodule's own lock, never nested
     let absolute_string = absolute.to_string_lossy().into_owned();
     let queue_started = Instant::now();
     let sub_lock_handle = repo_write_lock(&absolute_string);
     let _sub_lock = sub_lock_handle.lock().unwrap();
     log_repo_write_lock_acquired(&absolute_string, "change_submodule_url(submodule)", queue_started.elapsed());
-    let subrepo = internal_submodule_repository(&absolute)?; subrepo.remote_set_url("origin", url).map_err(|error| error.message().to_string())?; subrepo.find_remote("origin").map_err(|error| error.message().to_string())?; git(absolute.to_str().unwrap_or_default(), &["fetch", "origin"]).map_err(|detail| format!("Fetch failed: {detail}"))?;
+    let subrepo = internal_submodule_repository(&absolute)?; subrepo.remote_set_url("origin", &fetch_url).map_err(|error| error.message().to_string())?; subrepo.find_remote("origin").map_err(|error| error.message().to_string())?; git(absolute.to_str().unwrap_or_default(), &["fetch", "origin"]).map_err(|detail| format!("Fetch failed: {detail}"))?;
     invalidate_git_metadata(&repository_path);
     invalidate_submodule_sync(&repository_path); // this app just changed a submodule's registration/version
     Ok(())
@@ -6927,6 +7028,43 @@ mod tests {
         let details = entry_details_inner(path, "brand-new-folder".into()).unwrap();
         assert!(!details.tracked, "entry_details should also report the new folder as untracked");
         assert!(!details.status.is_empty(), "entry_details should flag the new folder with a status too, got empty status");
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn deleted_tracked_items_remain_visible_inside_a_changed_folder() {
+        // A deleted path is absent from read_dir by definition. The Explorer
+        // used to mark `src` as changed, then show only clean surviving files
+        // after opening it, with no clue which tracked item Git considered
+        // deleted. Both a direct deleted file and a whole missing tracked
+        // subtree must therefore be represented by synthetic rows sourced
+        // from the status result already loaded for this folder.
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-deleted-explorer-items-{suffix}"));
+        create_libgit2_repository(&base, "README.md");
+        fs::create_dir_all(base.join("src/old")).unwrap();
+        fs::write(base.join("src/keep.txt"), "still here").unwrap();
+        fs::write(base.join("src/gone.txt"), "delete me").unwrap();
+        fs::write(base.join("src/old/nested.txt"), "delete this folder").unwrap();
+        run_git(&base, &["add", "."]);
+        run_git(&base, &["commit", "-m", "Add tracked source files"]);
+
+        fs::remove_file(base.join("src/gone.txt")).unwrap();
+        fs::remove_dir_all(base.join("src/old")).unwrap();
+        let path = base.to_string_lossy().into_owned();
+
+        let root = load_directory_inner(path.clone(), "".into(), Some(true)).unwrap();
+        let src = root.iter().find(|entry| entry.relative_path == "src").expect("src should remain visible");
+        assert_eq!(src.status, "•", "the parent folder should advertise nested changes");
+
+        let entries = load_directory_inner(path, "src".into(), Some(true)).unwrap();
+        let keep = entries.iter().find(|entry| entry.relative_path == "src/keep.txt").expect("surviving file should remain visible");
+        assert!(keep.status.is_empty(), "the surviving file itself is unchanged");
+        let gone = entries.iter().find(|entry| entry.relative_path == "src/gone.txt").expect("deleted file should remain visible as a Git row");
+        assert_eq!((gone.kind.as_str(), gone.status.as_str(), gone.tracked), ("deleted", "D", true));
+        let old = entries.iter().find(|entry| entry.relative_path == "src/old").expect("deleted tracked subtree should remain visible as one Git row");
+        assert_eq!((old.kind.as_str(), old.status.as_str(), old.tracked), ("deleted-folder", "D", true));
 
         fs::remove_dir_all(base).unwrap();
     }
@@ -10816,6 +10954,67 @@ mod tests {
         // `./` is a no-op; a non-relative URL is returned untouched.
         assert_eq!(resolve_relative_git_url("https://host/eng/parent.git", "./submodul.git"), "https://host/eng/parent.git/submodul.git");
         assert_eq!(resolve_relative_git_url("https://host/eng/parent.git", "https://elsewhere/x.git"), "https://elsewhere/x.git");
+    }
+
+    #[test]
+    fn vitesco_submodule_urls_are_stored_in_the_portable_enterprise_form() {
+        assert_eq!(portable_submodule_configured_url("https://github.vitesco.io/eng/sw-pkg-0G-errm_statis"), "../../eng/sw-pkg-0G-errm_statis");
+        assert_eq!(portable_submodule_configured_url("git@github.vitesco.io:eng/sw-pkg-0G-errm_common.git"), "../../eng/sw-pkg-0G-errm_common.git");
+        assert_eq!(portable_submodule_configured_url("../../eng/sw-pkg-0G-errm_common.git"), "../../eng/sw-pkg-0G-errm_common.git");
+        assert_eq!(portable_submodule_configured_url("https://github.com/example/public.git"), "https://github.com/example/public.git", "other Git hosts must keep their chosen URL");
+    }
+
+    #[test]
+    fn relative_gitmodules_url_is_classified_after_resolving_the_parent_remote() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-relative-source-{suffix}"));
+        let network_parent = base.join("network-parent");
+        let local_parent = base.join("local-parent");
+        create_libgit2_repository(&network_parent, "README.md");
+        create_libgit2_repository(&local_parent, "README.md");
+
+        let network_repo = Repository::open(&network_parent).unwrap();
+        network_repo.remote("origin", "https://github.vitesco.io/eng/sw-prj-VWAQ4_000U0.git").unwrap();
+        let network_source = resolved_submodule_io_url(&network_repo, "../../eng/sw-pkg-0G-errm_common.git").unwrap();
+        assert_eq!(network_source, "https://github.vitesco.io/eng/sw-pkg-0G-errm_common.git");
+        assert!(!is_local_only_url(&network_source), "errm_common is network-restorable through the parent origin, not local-only");
+
+        let local_remote = base.join("server/eng/parent.git");
+        let local_repo = Repository::open(&local_parent).unwrap();
+        local_repo.remote("origin", local_remote.to_str().unwrap()).unwrap();
+        let local_source = resolved_submodule_io_url(&local_repo, "../../eng/sw-pkg-0G-errm_common.git").unwrap();
+        assert!(is_local_only_url(&local_source), "a relative URL resolved against a filesystem parent remote must remain local-only");
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn add_submodule_keeps_gitmodules_relative_but_uses_a_resolved_origin() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-portable-add-{suffix}"));
+        let server = base.join("server/eng");
+        let parent = base.join("work/parent");
+        let dependency_seed = base.join("dependency-seed");
+        fs::create_dir_all(&server).unwrap();
+        run_git(&server, &["init", "-q", "--bare", "parent.git"]);
+        run_git(&server, &["init", "-q", "--bare", "dependency.git"]);
+        create_libgit2_repository(&dependency_seed, "module.txt");
+        run_git(&dependency_seed, &["branch", "-M", "main"]);
+        run_git(&dependency_seed, &["push", "-q", server.join("dependency.git").to_str().unwrap(), "main"]);
+
+        create_libgit2_repository(&parent, "README.md");
+        run_git(&parent, &["remote", "add", "origin", server.join("parent.git").to_str().unwrap()]);
+        let parent_string = parent.to_string_lossy().into_owned();
+        let relative_url = "../../eng/dependency.git";
+        let added = add_submodule_inner(parent_string, "".into(), relative_url.into(), "dependency".into(), String::new(), String::new()).unwrap();
+
+        let parent_repo = Repository::open(&parent).unwrap();
+        let stored = parent_repo.submodules().unwrap().into_iter().find(|submodule| normalized(submodule.path()) == added).unwrap().url().unwrap().to_string();
+        assert_eq!(stored, relative_url, ".gitmodules must retain the portable value");
+        let submodule_repo = internal_submodule_repository(&parent.join(&added)).unwrap();
+        assert_eq!(first_remote_url(&submodule_repo).as_deref(), Some(server.join("dependency.git").to_str().unwrap()), "local origin must use the resolved source for fetch/push");
+
+        fs::remove_dir_all(base).unwrap();
     }
 
     #[test]
