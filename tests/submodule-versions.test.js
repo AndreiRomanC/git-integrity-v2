@@ -167,6 +167,13 @@ test('a tag row shows the target commit SHA and subject', () => {
   assert.match(html, /Release desktop UI/);
 });
 
+test('a history commit offers tagging that exact commit', () => {
+  const html = submoduleVersionRowHtml({ name: '12345678', kind: 'commit', revision: '1234567890ab', subject: 'Release candidate', author: 'A', date: '2026-09-16' });
+  assert.match(html, /data-tag-version/);
+  assert.match(html, /Tag this commit…/);
+  assert.match(html, /commit 12345678/);
+});
+
 test('identically named refs from different submodules keep their own SHAs', () => {
   const first = submoduleVersionRowHtml({ name: 'main', kind: 'branch', revision: '11111111aaaaaaaa', subject: 'First module', author: 'A', date: '2026-09-12' });
   const second = submoduleVersionRowHtml({ name: 'main', kind: 'branch', revision: '22222222bbbbbbbb', subject: 'Second module', author: 'B', date: '2026-09-12' });

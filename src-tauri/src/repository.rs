@@ -1283,6 +1283,27 @@ pub fn open_external_url(url: String) -> Result<(), String> {
     status.map_err(|error| error.to_string()).and_then(|result| result.success().then_some(()).ok_or_else(|| "Could not open the default browser".into()))
 }
 
+// Check-run Details links are supplied by GitHub itself and may point to an
+// Enterprise integration (Collaborator/Jenkins), not back to `/pull/<n>`.
+// Keep this separate from the narrow PR-link opener and accept only HTTPS
+// links on GitHub or the corporate vitesco.io domain. On Windows, use the
+// shell URL handler directly rather than interpolating the URL into `cmd`.
+#[tauri::command]
+pub fn open_status_check_url(url: String) -> Result<(), String> {
+    let Some(rest) = url.strip_prefix("https://") else { return Err("A check Details link must use HTTPS".into()); };
+    let host = rest.split('/').next().unwrap_or("").split(':').next().unwrap_or("").to_ascii_lowercase();
+    if !(is_github_like_host(&host) || host == "vitesco.io" || host.ends_with(".vitesco.io")) {
+        return Err(format!("Refusing to open a check Details link from an untrusted host: {host}"));
+    }
+    #[cfg(target_os = "macos")]
+    let status = Command::new("open").arg(&url).status();
+    #[cfg(target_os = "windows")]
+    let status = Command::new("explorer.exe").arg(&url).status();
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    let status = Command::new("xdg-open").arg(&url).status();
+    status.map_err(|error| error.to_string()).and_then(|result| result.success().then_some(()).ok_or_else(|| "Could not open the check Details link".into()))
+}
+
 // UTRUD is a legacy internal tool, previously only reachable via Windows
 // Explorer's "Send to" menu (a per-user .bat under
 // AppData\Roaming\Microsoft\Windows\SendTo that just forwards whatever's
@@ -1312,7 +1333,7 @@ fn utrud_command_parts(absolute: &Path) -> (PathBuf, PathBuf) {
 }
 
 #[tauri::command]
-pub fn run_utrud(repository_path: String, relative_path: String) -> Result<(), String> {
+pub fn run_utrud(repository_path: String, relative_path: String) -> Result<String, String> {
     validate_path(&repository_path)?;
     let relative = safe_relative_path(&relative_path)?;
     if relative.file_name().and_then(|name| name.to_str()) != Some("r") {
@@ -1323,9 +1344,23 @@ pub fn run_utrud(repository_path: String, relative_path: String) -> Result<(), S
     let (cwd, argument) = utrud_command_parts(&absolute);
     #[cfg(target_os = "windows")]
     {
+        let batch = Path::new(UTRUD_BATCH_PATH);
+        if !batch.is_file() {
+            return Err(format!("UTRUD was not started because its launcher was not found at {UTRUD_BATCH_PATH}. Install UTRUD or update its configured path."));
+        }
         perf_log(&format!("run_utrud: cwd={} arg={}", cwd.display(), argument.display()), Duration::ZERO);
-        Command::new("cmd").args(["/C", "call", UTRUD_BATCH_PATH]).arg(&argument).current_dir(&cwd).spawn().map_err(|error| format!("Could not start UTRUD: {error}"))?;
-        Ok(())
+        // Start a separate visible command process, like Explorer's Send To
+        // action. The command string is static; paths travel through the
+        // environment so spaces or shell metacharacters cannot change it.
+        // On failure the console stays open with the actual batch error.
+        let status = Command::new("cmd")
+            .args(["/C", "start", "", "cmd", "/C", "call \"%GDD_UTRUD_BATCH%\" \"%GDD_UTRUD_TARGET%\" || (echo. & echo UTRUD failed to start. & pause)"])
+            .env("GDD_UTRUD_BATCH", UTRUD_BATCH_PATH)
+            .env("GDD_UTRUD_TARGET", &argument)
+            .current_dir(&cwd)
+            .status().map_err(|error| format!("Windows could not create the UTRUD process: {error}"))?;
+        if !status.success() { return Err(format!("Windows rejected the UTRUD launch request (exit code {:?}).", status.code())); }
+        Ok(format!("UTRUD launch requested for {}. If the tool fails, its console remains open with the reason.", argument.display()))
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -2190,7 +2225,18 @@ pub struct PullRequestSummary {
     reviewers: Vec<PullRequestReviewerSummary>,
     // "passing" | "failing" | "pending" | "none"
     checks_status: String,
+    // Individual checks from the same request. `details_url` is the exact
+    // target behind GitHub's Details link (never guessed by the app).
+    checks: Vec<PullRequestCheckSummary>,
     url: String,
+}
+
+#[derive(Serialize, Debug, PartialEq)]
+pub struct PullRequestCheckSummary {
+    name: String,
+    // "passing" | "failing" | "pending" | "unknown"
+    status: String,
+    details_url: String,
 }
 
 #[derive(Serialize, Debug, PartialEq)]
@@ -2380,8 +2426,9 @@ fn map_checks_status(rollup: &[serde_json::Value]) -> String {
     let mut any_pending = false;
     let mut any_success = false;
     for entry in rollup {
-        let outcome = entry.get("conclusion").and_then(|v| v.as_str())
+        let outcome = entry.get("conclusion").and_then(|v| v.as_str()).filter(|value| !value.is_empty())
             .or_else(|| entry.get("state").and_then(|v| v.as_str()))
+            .or_else(|| entry.get("status").and_then(|v| v.as_str()))
             .unwrap_or("").to_uppercase();
         match outcome.as_str() {
             "FAILURE" | "ERROR" | "TIMED_OUT" | "CANCELLED" | "FAILED" => return "failing".into(),
@@ -2391,6 +2438,30 @@ fn map_checks_status(rollup: &[serde_json::Value]) -> String {
         }
     }
     if any_pending { "pending".into() } else if any_success { "passing".into() } else { "none".into() }
+}
+
+fn map_check_status(entry: &serde_json::Value) -> String {
+    let outcome = entry.get("conclusion").and_then(|v| v.as_str()).filter(|value| !value.is_empty())
+        .or_else(|| entry.get("state").and_then(|v| v.as_str()))
+        .or_else(|| entry.get("status").and_then(|v| v.as_str()))
+        .unwrap_or("").to_uppercase();
+    match outcome.as_str() {
+        "SUCCESS" | "SUCCESSFUL" | "COMPLETED" | "NEUTRAL" => "passing",
+        "FAILURE" | "ERROR" | "TIMED_OUT" | "CANCELLED" | "FAILED" | "ACTION_REQUIRED" => "failing",
+        "PENDING" | "IN_PROGRESS" | "QUEUED" | "EXPECTED" | "WAITING" | "REQUESTED" => "pending",
+        _ => "unknown",
+    }.into()
+}
+
+fn pr_checks_from_json(rollup: &[serde_json::Value]) -> Vec<PullRequestCheckSummary> {
+    rollup.iter().filter_map(|entry| {
+        let name = entry.get("name").and_then(|v| v.as_str())
+            .or_else(|| entry.get("context").and_then(|v| v.as_str())).unwrap_or("").trim();
+        if name.is_empty() { return None; }
+        let details_url = entry.get("detailsUrl").and_then(|v| v.as_str())
+            .or_else(|| entry.get("targetUrl").and_then(|v| v.as_str())).unwrap_or("").to_string();
+        Some(PullRequestCheckSummary { name: name.into(), status: map_check_status(entry), details_url })
+    }).collect()
 }
 
 // Everything `pr_status` needs to know *before* it shells out to `gh` —
@@ -2718,7 +2789,13 @@ query PullRequestsByHead($owner: String!, $name: String!, $branch: String!) {
           nodes { requestedReviewer { ... on User { login } } }
         }
         latestReviews(first: 20) { nodes { author { login } state url } }
-        commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
+        commits(last: 1) { nodes { commit { statusCheckRollup {
+          state
+          contexts(first: 100) { nodes {
+            ... on CheckRun { name status conclusion detailsUrl }
+            ... on StatusContext { context state targetUrl }
+          } }
+        } } } }
       }
     }
   }
@@ -2736,7 +2813,13 @@ query PullRequestsByBase($owner: String!, $name: String!, $branch: String!) {
           nodes { requestedReviewer { ... on User { login } } }
         }
         latestReviews(first: 20) { nodes { author { login } state url } }
-        commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
+        commits(last: 1) { nodes { commit { statusCheckRollup {
+          state
+          contexts(first: 100) { nodes {
+            ... on CheckRun { name status conclusion detailsUrl }
+            ... on StatusContext { context state targetUrl }
+          } }
+        } } } }
       }
     }
   }
@@ -2744,9 +2827,10 @@ query PullRequestsByBase($owner: String!, $name: String!, $branch: String!) {
 "#;
 
 fn normalize_graphql_pr(item: &serde_json::Value) -> serde_json::Value {
-    let rollup = item.pointer("/commits/nodes/0/commit/statusCheckRollup/state")
-        .and_then(|value| value.as_str())
-        .map(|state| vec![serde_json::json!({ "state": state })])
+    let rollup = item.pointer("/commits/nodes/0/commit/statusCheckRollup/contexts/nodes")
+        .and_then(|value| value.as_array()).cloned()
+        .or_else(|| item.pointer("/commits/nodes/0/commit/statusCheckRollup/state")
+            .and_then(|value| value.as_str()).map(|state| vec![serde_json::json!({ "state": state })]))
         .unwrap_or_default();
     let review_requests = item.pointer("/reviewRequests/nodes").and_then(|value| value.as_array())
         .map(|nodes| nodes.iter().filter_map(|node| node.get("requestedReviewer").cloned()).collect::<Vec<_>>())
@@ -2812,6 +2896,7 @@ fn pr_summary_from_json(item: &serde_json::Value) -> PullRequestSummary {
         review_summary: map_review_summary(item.get("reviewDecision").and_then(|v| v.as_str()).unwrap_or("")),
         reviewers: pr_reviewers_from_json(item),
         checks_status: map_checks_status(&rollup),
+        checks: pr_checks_from_json(&rollup),
         url: item.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string(),
     }
 }
@@ -3099,6 +3184,81 @@ fn pr_status_inner(repository_path: String, branch: Option<String>, context: Opt
     };
     perf_log(&format!("pr_status: [{context_label}] provider=github_api credential=git_or_environment"), Duration::ZERO);
     Ok(pr_status_impl(ctx, &repository_path, &context_label, &|query| api.run(query)))
+}
+
+fn parse_pull_request_target(url: &str) -> Option<(GitHubRepo, u64)> {
+    if !is_generated_pull_request_url(url) { return None; }
+    let rest = url.strip_prefix("https://")?.split('#').next()?;
+    let (host, path) = rest.split_once('/')?;
+    if !is_github_like_host(host) { return None; }
+    let parts: Vec<_> = path.split('/').collect();
+    let [owner, repo, "pull", number] = parts.as_slice() else { return None; };
+    Some((GitHubRepo { host: host.to_ascii_lowercase(), owner: (*owner).into(), repo: (*repo).into() }, number.parse().ok()?))
+}
+
+fn github_rest_endpoint(repo: &GitHubRepo, suffix: &str) -> String {
+    if repo.host.eq_ignore_ascii_case("github.com") {
+        format!("https://api.github.com/repos/{}/{}/{}", repo.owner, repo.repo, suffix.trim_start_matches('/'))
+    } else {
+        format!("https://{}/api/v3/repos/{}/{}/{}", repo.host, repo.owner, repo.repo, suffix.trim_start_matches('/'))
+    }
+}
+
+fn post_pull_request_comment_with_gh(repo: &GitHubRepo, number: u64, body: &str) -> Result<(), String> {
+    let endpoint = format!("repos/{}/{}/issues/{number}/comments", repo.owner, repo.repo);
+    let mut command = Command::new("gh");
+    command.args(["api", "--hostname", &repo.host, "--method", "POST", &endpoint, "--raw-field"])
+        .arg(format!("body={body}")).stdin(std::process::Stdio::null());
+    let output = run_with_timeout_labeled(command, Duration::from_secs(20), "gh comment", "20 seconds")?;
+    if output.status.success() { return Ok(()); }
+    let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    Err(if detail.is_empty() { "GitHub CLI did not accept the comment.".into() } else { detail })
+}
+
+// Explicit external mutation: called only from a PR card's Send button.
+// It deliberately does not share pr_status' refresh path, so opening or
+// refreshing the read-only panel can never send a comment accidentally.
+#[tauri::command]
+pub async fn post_pull_request_comment(repository_path: String, pull_request_url: String, body: String) -> Result<(), String> {
+    off_main_thread(move || post_pull_request_comment_inner(repository_path, pull_request_url, body)).await
+}
+
+fn post_pull_request_comment_inner(repository_path: String, pull_request_url: String, body: String) -> Result<(), String> {
+    validate_path(&repository_path)?;
+    let body = body.trim();
+    if body.is_empty() { return Err("Write a comment before sending it.".into()); }
+    if body.chars().count() > 65_536 { return Err("The comment is too long (maximum 65,536 characters).".into()); }
+    let (repo, number) = parse_pull_request_target(&pull_request_url).ok_or("The pull request link is invalid.")?;
+    let gh_error = if gh_cli_available() {
+        match post_pull_request_comment_with_gh(&repo, number, body) {
+            Ok(()) => {
+                perf_log(&format!("post_pull_request_comment: repo=<{}> pr={number} provider=gh sent", anonymized_repository_id(&repo.gh_repo_arg())), Duration::ZERO);
+                return Ok(());
+            }
+            Err(error) => Some(error),
+        }
+    } else { None };
+    let api = GitHubGraphqlClient::discover(&repository_path, &repo).map_err(|direct_error| {
+        gh_error.map(|gh_error| format!("GitHub CLI could not send the comment ({gh_error}). Direct API fallback also failed: {direct_error}"))
+            .unwrap_or(direct_error)
+    })?;
+    let endpoint = github_rest_endpoint(&repo, &format!("issues/{number}/comments"));
+    let mut request = api.http.post(endpoint).json(&serde_json::json!({ "body": body }));
+    if let Some(token) = &api.token { request = request.bearer_auth(token); }
+    let response = request.send().map_err(|error| format!("Could not send the pull request comment: {error}"))?;
+    let status = response.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        return Err(format!("GitHub refused the comment (HTTP {status}). The saved token needs permission to write pull request comments."));
+    }
+    if !status.is_success() {
+        let detail = response.text().unwrap_or_default();
+        let summary = serde_json::from_str::<serde_json::Value>(&detail).ok()
+            .and_then(|value| value.get("message").and_then(|message| message.as_str()).map(String::from))
+            .unwrap_or_else(|| format!("HTTP {status}"));
+        return Err(format!("GitHub did not accept the comment: {summary}"));
+    }
+    perf_log(&format!("post_pull_request_comment: repo=<{}> pr={number} provider=github_api sent", anonymized_repository_id(&repo.gh_repo_arg())), Duration::ZERO);
+    Ok(())
 }
 
 // Generic merge — works identically on the main repository or a submodule's own
@@ -4236,11 +4396,16 @@ pub struct CreateSubmoduleTagResult {
 // parent's index/gitlink: the submodule's own current commit doesn't change
 // just because a new name now also points at it.
 #[tauri::command]
-pub async fn create_submodule_tag(repository_path: String, relative_path: String, tag_name: String, message: String, push: bool) -> Result<CreateSubmoduleTagResult, String> {
-    off_main_thread(move || create_submodule_tag_inner(repository_path, relative_path, tag_name, message, push)).await
+pub async fn create_submodule_tag(repository_path: String, relative_path: String, tag_name: String, message: String, push: bool, target_revision: Option<String>) -> Result<CreateSubmoduleTagResult, String> {
+    off_main_thread(move || create_submodule_tag_at_inner(repository_path, relative_path, tag_name, message, push, target_revision)).await
 }
 
+#[cfg(test)]
 fn create_submodule_tag_inner(repository_path: String, relative_path: String, tag_name: String, message: String, push: bool) -> Result<CreateSubmoduleTagResult, String> {
+    create_submodule_tag_at_inner(repository_path, relative_path, tag_name, message, push, None)
+}
+
+fn create_submodule_tag_at_inner(repository_path: String, relative_path: String, tag_name: String, message: String, push: bool, target_revision: Option<String>) -> Result<CreateSubmoduleTagResult, String> {
     validate_path(&repository_path)?;
     let absolute = validate_submodule(&repository_path, &relative_path)?;
     let tag_name = tag_name.trim().to_string();
@@ -4257,7 +4422,13 @@ fn create_submodule_tag_inner(repository_path: String, relative_path: String, ta
         if repo.find_reference(&format!("refs/tags/{tag_name}")).is_ok() {
             return Err(format!("Tag '{tag_name}' already exists in this submodule. Choose a different name, or delete the existing tag first."));
         }
-        let target = repo.head().map_err(|error| error.message().to_string())?.peel_to_commit().map_err(|error| error.message().to_string())?;
+        let target = if let Some(revision) = target_revision.as_deref().map(str::trim).filter(|revision| !revision.is_empty()) {
+            repo.revparse_single(revision)
+                .map_err(|_| format!("Commit '{revision}' no longer exists in this submodule. Refresh History and choose it again."))?
+                .peel_to_commit().map_err(|_| format!("'{revision}' does not identify a commit in this submodule."))?
+        } else {
+            repo.head().map_err(|error| error.message().to_string())?.peel_to_commit().map_err(|error| error.message().to_string())?
+        };
         let target_id = target.id();
         let message = message.trim();
         let annotated = !message.is_empty();
@@ -7150,7 +7321,13 @@ mod tests {
                 "url": "https://github.vitesco.io/eng/sw-prj-VWAQ4_000U0/pull/282#pullrequestreview-987"
             }] },
             "url": "https://github.vitesco.io/eng/sw-prj-VWAQ4_000U0/pull/282",
-            "commits": { "nodes": [{ "commit": { "statusCheckRollup": { "state": "SUCCESS" } } }] }
+            "commits": { "nodes": [{ "commit": { "statusCheckRollup": {
+                "state": "PENDING",
+                "contexts": { "nodes": [
+                    { "context": "Collaborator", "state": "PENDING", "targetUrl": "https://github.vitesco.io/eng/sw-prj-VWAQ4_000U0/runs/123" },
+                    { "name": "Submodule status", "status": "COMPLETED", "conclusion": "SUCCESS", "detailsUrl": "https://github.vitesco.io/eng/sw-prj-VWAQ4_000U0/actions/runs/456" }
+                ] }
+            } } }] }
         });
         let normalized = normalize_graphql_pr(&graphql);
         let summary = pr_summary_from_json(&normalized);
@@ -7166,7 +7343,11 @@ mod tests {
                 review_url: "https://github.vitesco.io/eng/sw-prj-VWAQ4_000U0/pull/282#pullrequestreview-987".into(),
             },
         ]);
-        assert_eq!(summary.checks_status, "passing");
+        assert_eq!(summary.checks_status, "pending");
+        assert_eq!(summary.checks, vec![
+            PullRequestCheckSummary { name: "Collaborator".into(), status: "pending".into(), details_url: "https://github.vitesco.io/eng/sw-prj-VWAQ4_000U0/runs/123".into() },
+            PullRequestCheckSummary { name: "Submodule status".into(), status: "passing".into(), details_url: "https://github.vitesco.io/eng/sw-prj-VWAQ4_000U0/actions/runs/456".into() },
+        ]);
         assert_eq!(summary.url, "https://github.vitesco.io/eng/sw-prj-VWAQ4_000U0/pull/282");
     }
 
@@ -8675,12 +8856,24 @@ mod tests {
         assert_eq!(annotated.target, head_sha);
         assert!(annotated.annotated, "a message was given — must be annotated");
 
-        let sub_repo = Repository::open(&sub_path).unwrap();
-        let light_ref = sub_repo.find_reference("refs/tags/v1.0-light").unwrap();
-        assert_eq!(light_ref.target().unwrap().to_string(), head_sha, "a lightweight tag points directly at the commit");
-        let annotated_tag = sub_repo.find_reference("refs/tags/v1.0").unwrap().peel_to_tag().unwrap();
-        assert_eq!(annotated_tag.message(), Some("Release 1.0"));
-        assert_eq!(annotated_tag.target_id(), git2::Oid::from_str(&head_sha).unwrap());
+        {
+            let sub_repo = Repository::open(&sub_path).unwrap();
+            let light_ref = sub_repo.find_reference("refs/tags/v1.0-light").unwrap();
+            assert_eq!(light_ref.target().unwrap().to_string(), head_sha, "a lightweight tag points directly at the commit");
+            let annotated_tag = sub_repo.find_reference("refs/tags/v1.0").unwrap().peel_to_tag().unwrap();
+            assert_eq!(annotated_tag.message(), Some("Release 1.0"));
+            assert_eq!(annotated_tag.target_id(), git2::Oid::from_str(&head_sha).unwrap());
+        }
+
+        // History can intentionally tag an older selected commit even when
+        // the submodule has since moved on; creating that name must not move
+        // HEAD back to the selected commit.
+        fs::write(sub_path.join("module.txt"), "newer commit").unwrap();
+        create_commit(sub_path.to_string_lossy().into_owned(), "Move past release".into()).unwrap();
+        let newer_head = Repository::open(&sub_path).unwrap().head().unwrap().target().unwrap();
+        let selected = create_submodule_tag_at_inner(repo_path.clone(), added.clone(), "v1.0-selected".into(), String::new(), false, Some(head_sha.clone())).unwrap();
+        assert_eq!(selected.target, head_sha);
+        assert_eq!(Repository::open(&sub_path).unwrap().head().unwrap().target().unwrap(), newer_head, "tagging a selected historical commit must not checkout or move HEAD");
 
         // Neither tag may have staged or committed anything in the parent.
         let parent_index_after = { let repo = Repository::open(&repository).unwrap(); repo.index().unwrap().get_path(Path::new(&added), 0).unwrap().id };
@@ -10524,6 +10717,16 @@ mod tests {
         assert!(!is_generated_pull_request_url("https://github.com/owner/repo"), "a bare repo URL is not a PR link");
         assert!(!is_generated_pull_request_url("javascript:alert(1)"));
         assert!(!is_generated_pull_request_url("https://github.com/owner/repo/pull/1\" & calc.exe"));
+    }
+
+    #[test]
+    fn pull_request_comment_target_is_derived_only_from_a_valid_pr_url() {
+        let (repo, number) = parse_pull_request_target("https://github.vitesco.io/eng/sw-prj-VWAQ4_000U0/pull/282").unwrap();
+        assert_eq!(repo.gh_repo_arg(), "github.vitesco.io/eng/sw-prj-VWAQ4_000U0");
+        assert_eq!(number, 282);
+        assert_eq!(github_rest_endpoint(&repo, "issues/282/comments"), "https://github.vitesco.io/api/v3/repos/eng/sw-prj-VWAQ4_000U0/issues/282/comments");
+        assert!(parse_pull_request_target("https://evil.example/eng/repo/pull/282").is_none());
+        assert!(parse_pull_request_target("https://github.vitesco.io/eng/repo/issues/282").is_none());
     }
 
     #[test]

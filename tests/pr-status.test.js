@@ -3,7 +3,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const vm = require('node:vm');
-const { prCardHtml, prReviewerHtml, reviewerDisplayName } = require('../frontend/pr-status.js');
+const { prCardHtml, prReviewerHtml, prCheckHtml, reviewerDisplayName } = require('../frontend/pr-status.js');
 
 const pr = {
   number: 282,
@@ -47,6 +47,16 @@ test('PR cards remain compatible when GitHub returns no reviewer detail', () => 
   const html = prCardHtml(pr);
   assert.match(html, /Review required/);
   assert.doesNotMatch(html, /Reviewer activity/);
+});
+
+test('required checks expose GitHub-provided Details links and a comment form', () => {
+  const html = prCardHtml({ ...pr, checks: [{ name: 'Collaborator', status: 'pending', details_url: 'https://github.example/eng/repo/runs/42' }] });
+  assert.match(html, /Collaborator/);
+  assert.match(html, /Pending/);
+  assert.match(html, /data-open-check-url="https:\/\/github\.example\/eng\/repo\/runs\/42"/);
+  assert.match(html, /data-pr-comment-form/);
+  assert.match(html, /Send a pull request comment/);
+  assert.match(prCheckHtml({ name: 'build-status', status: 'pending', details_url: '' }), /build-status/);
 });
 
 test('the classic browser script exports without leaking names into app.js global scope', () => {

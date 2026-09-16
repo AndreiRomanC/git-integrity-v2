@@ -168,6 +168,7 @@ function submoduleVersionRowHtml(item) {
   const canResetToUpstream = item.kind === 'branch' && item.current && item.upstream
     && ((Number(item.ahead) || 0) > 0 || (Number(item.behind) || 0) > 0);
   const actions = `<span class="version-row-actions">
+    ${item.kind === 'commit' ? `<button type="button" class="version-tag-commit" data-tag-version title="Create a tag pointing exactly at commit ${esc(revision.slice(0, 8))}">Tag this commit…</button>` : ''}
     ${canResetToUpstream ? `<button type="button" class="version-reset-upstream" data-reset-upstream data-name="${esc(item.name)}" data-upstream="${esc(item.upstream)}" data-ahead="${Number(item.ahead) || 0}" data-behind="${Number(item.behind) || 0}" title="Destructive recovery for the active branch: discard its local-only commits and current uncommitted work, then replace it with ${esc(item.upstream)}">Discard local work…</button>` : ''}
     ${item.kind === 'branch' && item.checkout_detached ? '<span class="version-inactive-label">INACTIVE</span>' : ''}
     ${item.current ? '<span class="current-label">CURRENT</span>' : `<button type="button" class="version-checkout" data-switch-version>Checkout</button>`}

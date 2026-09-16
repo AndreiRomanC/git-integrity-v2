@@ -53,6 +53,8 @@ pub fn run() {
             repository::write_text_file,
             repository::remotes::list_remotes,
             repository::pr_status,
+            repository::post_pull_request_comment,
+            repository::open_status_check_url,
             repository::remotes::fetch_remote,
             repository::remotes::fetch_all_remotes,
             repository::remotes::sync_repository,

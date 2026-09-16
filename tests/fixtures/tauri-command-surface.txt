@@ -52,9 +52,11 @@ open_commit_on_server
 open_external_url
 open_repository_fast
 open_repository_item
+open_status_check_url
 open_submodule_on_server
 path_history
 pop_stash
+post_pull_request_comment
 pr_status
 publish_branch
 publish_status

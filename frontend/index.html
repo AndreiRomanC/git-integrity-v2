@@ -84,6 +84,7 @@
             <label class="search"><span>⌕</span><input id="search" placeholder="Filter this folder"></label>
             <button class="scope-action" id="showPathHistory">History</button>
             <button class="scope-action folder-changes-action" id="showFolderChanges">Changes in folder</button>
+            <button class="scope-action" id="runCurrentUtrud" title="Launch UTRUD for the current r folder (Windows only)" hidden>▶ Run UTRUD</button>
             <button class="scope-action" id="addSubmodule">＋ Add submodule</button>
             <button class="scope-action primary" id="commitScope">Commit folder</button>
             <button class="icon-action" id="goUp" title="Parent folder">↑</button>
@@ -111,10 +112,10 @@
 
         <div id="commanderView" class="commander-view" hidden>
           <div class="compare-mode-tabs" role="tablist" aria-label="Folder Sync mode">
-            <button id="compareModeGit" class="active" type="button" role="tab">Git Compare</button>
-            <button id="compareModeDrive" type="button" role="tab">Local Drive</button>
+            <button id="compareModeDrive" class="active" type="button" role="tab">Local Drive</button>
+            <button id="compareModeGit" type="button" role="tab">Git Compare</button>
           </div>
-          <div id="gitComparePanel" class="compare-panel">
+          <div id="gitComparePanel" class="compare-panel" hidden>
             <div class="commander-toolbar">
               <nav id="commanderBreadcrumbs" class="commander-breadcrumbs"></nav>
               <label><span>REMOTE SNAPSHOT</span><select id="remoteRef"></select></label>
@@ -123,7 +124,7 @@
             <div id="commanderRows" class="commander-rows"></div>
             <div class="commander-legend"><span><i class="same"></i>Same</span><span><i class="modified"></i>Modified</span><span><i class="local-only"></i>Only local</span><span><i class="remote-only"></i>Only remote</span></div>
           </div>
-          <div id="localDrivePanel" class="local-drive-panel" hidden>
+          <div id="localDrivePanel" class="local-drive-panel">
             <div class="local-drive-note"><strong>TWO INDEPENDENT LOCAL SIDES.</strong> F9 compares complete folder structures without writing; F10 opens a guided, confirmed merge in either direction.</div>
             <div class="local-drive-columns">
               <section class="local-drive-pane" data-drive-side="left">
@@ -197,8 +198,8 @@
       <div class="version-tabs">
         <button class="active" data-version-filter="branch">Branches</button>
         <button data-version-filter="tag">Tags</button>
-        <button data-version-filter="commit">Current history</button>
-        <button id="submoduleOpenGraph" class="version-graph-link" title="Open the full Submodule Branch Map for this submodule, with search">Submodule Branch Map ↗</button>
+        <button data-version-filter="commit" title="Commit history for the current branch context; when detached, history starts at the active commit">Current branch history</button>
+        <button id="submoduleOpenGraph" class="version-graph-link" title="Open the complete history across this submodule's branches and tags">Full history ↗</button>
       </div>
       <input id="submoduleVersionSearch" class="version-search" type="text" placeholder="Search branches, SHAs or messages…" autocomplete="off" spellcheck="false">
       <div id="submoduleVersions" class="version-list"></div>
@@ -565,7 +566,7 @@
 
   <dialog id="newTagDialog" class="publish-dialog">
     <form method="dialog">
-      <header><div><h2>Create tag</h2><p>Tags the submodule's current commit exactly as it is — never anything uncommitted in its working tree.</p></div><button value="cancel">×</button></header>
+      <header><div><h2>Create tag at commit</h2><p>A tag is a permanent name for the exact commit shown below. It never includes uncommitted working-tree changes.</p></div><button value="cancel">×</button></header>
       <div class="publish-explain" style="margin-top:17px;">
         <b id="newTagSubmoduleName">—</b>
         <span id="newTagContext">—</span>
