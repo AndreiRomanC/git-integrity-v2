@@ -2586,6 +2586,12 @@ fn pr_checks_from_json(rollup: &[serde_json::Value]) -> Vec<PullRequestCheckSumm
         if name.is_empty() { return None; }
         let details_url = entry.get("detailsUrl").and_then(|v| v.as_str())
             .or_else(|| entry.get("targetUrl").and_then(|v| v.as_str())).unwrap_or("").to_string();
+        // Temporary diagnostic: never log the URL itself (could point at an
+        // internal build server) or anything else from the entry — just
+        // whether this check's rollup entry actually carried a details_url/
+        // targetUrl at all, to tell apart "the API never gave us one" from
+        // a parsing bug on our side.
+        perf_log(&format!("pr_checks_from_json: check='{name}' has_details_url={}", !details_url.is_empty()), Duration::ZERO);
         Some(PullRequestCheckSummary { name: name.into(), status: map_check_status(entry), details_url })
     }).collect()
 }
