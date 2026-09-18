@@ -3233,7 +3233,15 @@ let publishSubmoduleRisksHtml = '';
 function submodulePublishRisksHtml(risks) {
   if (!risks.length) return '';
   const reasonText = risk => risk.risk === 'unpushed' ? 'has a commit not yet pushed to its own remote' : risk.risk === 'no_remote' ? 'has no remote configured at all' : risk.risk === 'local_only' ? `is only reachable from a local path or file:// URL (${esc(risk.configured_url || '?')})` : 'could not be checked locally';
-  const items = risks.map(risk => `<li><code>${esc(risk.relative_path)}</code> ${reasonText(risk)} — references <code>${esc(risk.submodule_oid.slice(0, 8))}</code> (${esc(risk.commit_subject)})</li>`).join('');
+  // The outgoing commit being checked can reference an older submodule
+  // commit than what's actually checked out right now (the submodule moved
+  // on locally after that parent commit was made) — spelled out here so a
+  // fully-pushed, in-sync "Push submodule" preview for the *current*
+  // checkout doesn't look like it silently disagrees with this warning.
+  const currentNote = risk => risk.current_submodule_oid && risk.current_submodule_oid !== risk.submodule_oid
+    ? ` — its current checkout has since moved on to <code>${esc(risk.current_submodule_oid.slice(0, 8))}</code>, a different matter; push that separately, or re-stage/commit the submodule in the project to point at the newer commit instead`
+    : '';
+  const items = risks.map(risk => `<li><code>${esc(risk.relative_path)}</code> ${reasonText(risk)} — references <code>${esc(risk.submodule_oid.slice(0, 8))}</code> (${esc(risk.commit_subject)})${currentNote(risk)}</li>`).join('');
   const hardBlocking = risks.some(risk => risk.risk === 'unpushed');
   const headline = hardBlocking ? 'Publishing is blocked until the submodule below is pushed:' : 'Some submodule references may be local-only — another clone might not be able to restore them:';
   return `<div class="submodule-publish-safety-warning">⚠️ ${headline}<ul>${items}</ul></div>`;

@@ -3458,6 +3458,15 @@ pub struct UnpushedSubmoduleReference {
     // local "origin" as a best-effort fallback. None only when neither
     // exists (risk is then always "no_remote" or "unverifiable").
     configured_url: Option<String>,
+    // The submodule's own checkout right now — deliberately not the same
+    // question as submodule_oid above (the gitlink an *outgoing parent
+    // commit* references, which can be an older, since-superseded commit).
+    // Lets the frontend say so explicitly when the two differ, instead of
+    // silently showing what looks like a second, disagreeing SHA with no
+    // explanation — the submodule can be fully pushed and in sync *right
+    // now* while an earlier outgoing commit still references a commit that
+    // isn't, and that is not a contradiction.
+    current_submodule_oid: Option<String>,
 }
 
 // Opening Publish already performs the expensive, explicit network refresh
@@ -3534,7 +3543,7 @@ fn is_local_only_url(url: &str) -> bool {
 // knowledge in place — that can only make this check *more* cautious, never
 // less, which is the right direction to err in for something that decides
 // whether it's safe to publish.
-fn submodule_reference_risks(repository_path: &str, relative_path: &str, oids: &[git2::Oid], refresh_remote: bool) -> (HashMap<git2::Oid, Option<&'static str>>, Option<String>) {
+fn submodule_reference_risks(repository_path: &str, relative_path: &str, oids: &[git2::Oid], refresh_remote: bool) -> (HashMap<git2::Oid, Option<&'static str>>, Option<String>, Option<git2::Oid>) {
     let started = Instant::now();
     let all = |risk| oids.iter().copied().map(|oid| (oid, risk)).collect();
     // The *effective* clone source: what .gitmodules itself records for this
@@ -3547,8 +3556,15 @@ fn submodule_reference_risks(repository_path: &str, relative_path: &str, oids: &
     let parent_repo = internal_repository(repository_path).ok();
     let absolute = Path::new(repository_path).join(relative_path);
     let Ok(repo) = internal_submodule_repository(&absolute) else {
-        return (all(Some("unverifiable")), gitmodules_url);
+        return (all(Some("unverifiable")), gitmodules_url, None);
     };
+    // The submodule's current checkout, purely for context in the message
+    // shown to the user: an outgoing parent commit's gitlink can legitimately
+    // reference an older, since-superseded commit than what's checked out
+    // right now (e.g. the submodule moved on locally after that parent
+    // commit was made) — this is what lets that message say so explicitly
+    // instead of leaving two different SHAs to appear to silently disagree.
+    let current_oid = repo.head().ok().and_then(|head| head.target());
     let local_origin_url = repo.find_remote("origin").ok().and_then(|remote| remote.url().map(String::from)).filter(|url| !url.trim().is_empty());
     let configured_url = gitmodules_url.clone().or_else(|| local_origin_url.clone());
     // A relative .gitmodules value is not inherently a local filesystem
@@ -3559,8 +3575,8 @@ fn submodule_reference_risks(repository_path: &str, relative_path: &str, oids: &
         parent_repo.as_ref().and_then(|repo| resolved_submodule_io_url(repo, url).ok()).unwrap_or_else(|| url.to_string())
     }).or_else(|| local_origin_url.clone());
     match effective_url.as_deref() {
-        None => return (all(Some("no_remote")), None),
-        Some(url) if is_local_only_url(url) => return (all(Some("local_only")), configured_url),
+        None => return (all(Some("no_remote")), None, current_oid),
+        Some(url) if is_local_only_url(url) => return (all(Some("local_only")), configured_url, current_oid),
         Some(_) => {}
     }
     // Verify only against origin. Fetching every configured remote was both
@@ -3569,7 +3585,7 @@ fn submodule_reference_risks(repository_path: &str, relative_path: &str, oids: &
     // Do not require literal URL equality here: Git commonly stores an
     // equivalent rewritten/credentialed URL in the local clone, while
     // .gitmodules keeps the portable public form.
-    if repo.find_remote("origin").is_err() { return (all(Some("no_remote")), configured_url); }
+    if repo.find_remote("origin").is_err() { return (all(Some("no_remote")), configured_url, current_oid); }
     let remote = "origin";
     let sub_path = absolute.to_string_lossy().into_owned();
     // One submodule path can occur at several different gitlink revisions in
@@ -3594,7 +3610,7 @@ fn submodule_reference_risks(repository_path: &str, relative_path: &str, oids: &
         (oid, if reachable { None } else { Some("unpushed") })
     }).collect();
     perf_log(&format!("publish_safety: submodule={} checked {} revision{} after one fetch round", relative_path, oids.len(), if oids.len() == 1 { "" } else { "s" }), started.elapsed());
-    (risks, configured_url)
+    (risks, configured_url, current_oid)
 }
 
 // Point 3 of the submodule-publish-safety report: inspects every *outgoing*
@@ -3660,11 +3676,12 @@ fn unpushed_submodule_references(repository_path: &str, branch: &str, remote: &s
     for path in path_order {
         let references = by_path.remove(&path).unwrap_or_default();
         let revisions: Vec<git2::Oid> = references.iter().map(|(sub_oid, _)| *sub_oid).collect();
-        let (mut risks, configured_url) = submodule_reference_risks(repository_path, &path, &revisions, refresh_remotes);
+        let (mut risks, configured_url, current_oid) = submodule_reference_risks(repository_path, &path, &revisions, refresh_remotes);
+        let current_submodule_oid = current_oid.map(|oid| oid.to_string());
         for (sub_oid, commit_oid) in references {
             let Some(risk) = risks.remove(&sub_oid).flatten() else { continue };
             let commit_subject = repo.find_commit(commit_oid).ok().and_then(|commit| commit.summary().map(str::to_string)).unwrap_or_default();
-            violations.push(UnpushedSubmoduleReference { relative_path: path.clone(), submodule_oid: sub_oid.to_string(), commit_id: commit_oid.to_string(), commit_subject, risk: risk.into(), configured_url: configured_url.clone() });
+            violations.push(UnpushedSubmoduleReference { relative_path: path.clone(), submodule_oid: sub_oid.to_string(), commit_id: commit_oid.to_string(), commit_subject, risk: risk.into(), configured_url: configured_url.clone(), current_submodule_oid: current_submodule_oid.clone() });
         }
     }
     perf_log(&format!("publish_safety: TOTAL ({} violation{})", violations.len(), if violations.len() == 1 { "" } else { "s" }), total_started.elapsed());
@@ -3686,7 +3703,19 @@ fn submodule_publish_safety_check(repository_path: &str, branch: &str, remote: &
     if violations.is_empty() { return Ok(()); }
     let hard: Vec<&UnpushedSubmoduleReference> = violations.iter().filter(|v| v.risk == "unpushed").collect();
     if !hard.is_empty() {
-        let lines: Vec<String> = hard.iter().map(|v| format!("Push submodule {} first. The main project references {}, which is only local.", v.relative_path, &v.submodule_oid[..8.min(v.submodule_oid.len())])).collect();
+        let lines: Vec<String> = hard.iter().map(|v| {
+            let target = &v.submodule_oid[..8.min(v.submodule_oid.len())];
+            // The submodule's current checkout can be fully pushed and in
+            // sync *right now* while an older outgoing commit still
+            // references a different, since-superseded commit that isn't —
+            // say so plainly instead of leaving two SHAs looking like they
+            // silently disagree.
+            let currently_different = v.current_submodule_oid.as_deref().is_some_and(|current| current != v.submodule_oid);
+            let context = if currently_different {
+                format!(" (its current checkout has since moved on to {}, which is a different matter — push it separately, or re-stage/commit this submodule in the project to point at the newer commit instead)", &v.current_submodule_oid.as_deref().unwrap_or_default()[..8.min(v.current_submodule_oid.as_deref().unwrap_or_default().len())])
+            } else { String::new() };
+            format!("Push submodule {} first. The main project references {}, which is only local{}.", v.relative_path, target, context)
+        }).collect();
         return Err(format!("Cannot publish — {} submodule commit{} not yet available on {}'s own remote:\n{}", hard.len(), if hard.len() == 1 { " is" } else { "s are" }, if hard.len() == 1 { "its" } else { "their" }, lines.join("\n")));
     }
     if override_unpushed_submodules { return Ok(()); }
@@ -10808,16 +10837,24 @@ mod tests {
         stage_files_inner(&parent_path, vec!["vendor/dep".into()]).unwrap();
         commit_selected_internal(&parent_path, &["vendor/dep".to_string()], "Bump to X2").unwrap();
 
+        let x2 = git(&sub_path.to_string_lossy(), &["rev-parse", "HEAD"]).unwrap().trim().to_string();
         let violations = unpushed_submodule_references(&parent_path, "main", "origin", None, true).unwrap();
         assert_eq!(violations.len(), 1, "only X1 (carried by the older, already-superseded commit A) should be flagged, not X2: {violations:?}");
         assert_eq!(violations[0].risk, "unpushed");
         assert_eq!(violations[0].submodule_oid, x1, "the flagged reference must be the older, unreachable one");
         assert_eq!(violations[0].commit_subject, "Bump to X1");
+        // The exact report this reproduces: the submodule's current checkout
+        // (X2) is fully pushed and in sync — Push submodule would correctly
+        // say "nothing to do" — while this older, already-superseded outgoing
+        // commit still references X1, which genuinely isn't on the remote.
+        // Both facts are true at once; this is not a contradiction.
+        assert_eq!(violations[0].current_submodule_oid.as_deref(), Some(x2.as_str()), "must report the submodule's actual current checkout for context, not merely the flagged (older) oid again");
 
         let blocked = publish_branch_inner(parent_path.clone(), "main".into(), "origin".into(), String::new(), String::new(), String::new(), false);
         assert!(blocked.is_err(), "publishing must be blocked while an older outgoing commit still carries an unreachable submodule gitlink");
         let message = blocked.unwrap_err();
         assert!(message.contains("vendor/dep"), "message should name the affected submodule, got: {message}");
+        assert!(message.contains(&x2[..8]), "message should explain that the current checkout already moved on to X2, so the reader does not read this as contradicting an in-sync Push submodule preview: {message}");
         assert!(!message.starts_with("UNPUSHED_SUBMODULE_OVERRIDABLE::"), "a submodule that HAS a remote and simply wasn't pushed must never be overridable — push it instead, got: {message}");
         // Confirm the override can't bypass this either — "unpushed" (has a
         // remote, just isn't reachable yet) is never overridable, unlike
