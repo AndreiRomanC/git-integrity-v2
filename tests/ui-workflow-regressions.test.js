@@ -46,3 +46,13 @@ test('deleted tracked paths render without trying to stat a path that no longer 
   assert.match(app, /Deleted tracked file/);
   assert.match(app, /Deleted tracked folder/);
 });
+
+test('a submodule row shows its attached branch or detached state, only when actually checked', () => {
+  // Must never guess: a clean, fully-synced submodule skips the check
+  // entirely (submodule_checked stays false) to avoid opening every
+  // submodule's repository on every folder listing — this function must
+  // fall back to the generic hint rather than claim "detached".
+  assert.match(app, /function submoduleHeadHint\(entry\) \{\s*if \(!entry\.submodule_checked\) return 'Independent Git repository';/);
+  assert.match(app, /entry\.submodule_current_branch \? `Independent Git repository · \$\{entry\.submodule_current_branch\}` : 'Independent Git repository · detached'/);
+  assert.match(app, /entry\.kind === 'submodule' \? esc\(submoduleHeadHint\(entry\)\)/);
+});

@@ -422,6 +422,11 @@ struct SubmoduleStateSnapshot {
     dirty: bool,
     head_oid: Option<Oid>,
     remote_relation: SubmoduleRemoteRelation,
+    // None means detached HEAD; Some(name) means attached to that local
+    // branch. Free to capture here: remote_relation() below already reads
+    // repo.head_detached()/repo.head().shorthand() on this same, already-open
+    // repo — this just keeps what it found instead of discarding it.
+    attached_branch: Option<String>,
 }
 
 static SUBMODULE_STATE_CACHE: OnceLock<Mutex<HashMap<String, (Instant, SubmoduleStateSnapshot)>>> = OnceLock::new();
@@ -469,12 +474,13 @@ fn inspect_submodule_state_in(repo: &Repository) -> SubmoduleStateSnapshot {
     let head_oid = repo.head().ok().and_then(|head| head.target());
     let dirty = !internal_statuses(repo, None).unwrap_or_default().is_empty();
     let remote_relation = head_oid.map(|oid| remote_relation(repo, oid)).unwrap_or(SubmoduleRemoteRelation::Unknown);
-    SubmoduleStateSnapshot { dirty, head_oid, remote_relation }
+    let attached_branch = if repo.head_detached().unwrap_or(true) { None } else { repo.head().ok().and_then(|head| head.shorthand().map(str::to_string)) };
+    SubmoduleStateSnapshot { dirty, head_oid, remote_relation, attached_branch }
 }
 
 fn inspect_submodule_state(sub_path: &str) -> SubmoduleStateSnapshot {
     internal_submodule_repository(Path::new(sub_path)).map(|repo| inspect_submodule_state_in(&repo)).unwrap_or(SubmoduleStateSnapshot {
-        dirty: false, head_oid: None, remote_relation: SubmoduleRemoteRelation::Unknown,
+        dirty: false, head_oid: None, remote_relation: SubmoduleRemoteRelation::Unknown, attached_branch: None,
     })
 }
 
@@ -588,6 +594,21 @@ pub struct DirectoryEntry {
     // repository's HEAD/index gitlinks. The frontend only translates this
     // code into copy; it never guesses Git state from a generic "M".
     submodule_state: String,
+    // Whether submodule_current_branch below is a real answer. A clean,
+    // fully-synced submodule deliberately never opens its own repository at
+    // all here (see the submodule_snapshot gate a few lines down in
+    // load_directory_inner) — unconditionally checking attached/detached on
+    // every submodule row, clean or not, would mean opening every one of
+    // them on every folder listing, which is exactly the kind of per-row
+    // filesystem cost that made navigation slow on a large repository in the
+    // first place. So this stays false (and submodule_current_branch stays
+    // None, meaning "unknown", not "detached") for the common case, and is
+    // only ever true riding along on a submodule row that already had a
+    // reason to be inspected.
+    submodule_checked: bool,
+    // Only meaningful when submodule_checked is true. None means detached
+    // HEAD; Some(name) means attached to that local branch.
+    submodule_current_branch: Option<String>,
     // True when this file is fully committed (no working-tree status at all)
     // but the commit that last touched it isn't on the upstream branch yet —
     // or, for a folder, when something inside it is in that state. Lets the
@@ -769,6 +790,10 @@ fn run_with_timeout(command: Command) -> Result<std::process::Output, String> {
 }
 
 fn run_with_timeout_labeled(mut command: Command, timeout: Duration, program_label: &str, timeout_label: &str) -> Result<std::process::Output, String> {
+    // Put the child in its own process group (Unix) so a timeout kill can
+    // target the whole group, not just this one PID — see the comment on
+    // the kill call below for why that matters. Must be set before spawn().
+    #[cfg(unix)] { use std::os::unix::process::CommandExt; command.process_group(0); }
     let child = command.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().map_err(|e| format!("Cannot start {program_label}: {e}"))?;
     let id = child.id();
     let (tx, rx) = std::sync::mpsc::channel();
@@ -777,8 +802,22 @@ fn run_with_timeout_labeled(mut command: Command, timeout: Duration, program_lab
         Ok(Ok(output)) => Ok(output),
         Ok(Err(error)) => Err(format!("{program_label} process error: {error}")),
         Err(_) => {
-            #[cfg(unix)] { let _ = Command::new("kill").arg("-9").arg(id.to_string()).status(); }
-            #[cfg(windows)] { let _ = Command::new("taskkill").args(["/F", "/PID"]).arg(id.to_string()).status(); }
+            // A negative PID tells kill to signal the whole process GROUP,
+            // not just this one process — process_group(0) above made this
+            // child (e.g. the Terminal's shell, or `git` itself for
+            // anything that shells out further, like `git submodule
+            // update` spawning one git process per submodule) the leader
+            // of its own group, so this reaches every descendant. Killing
+            // only the top PID left those children orphaned and still
+            // running after a timeout, free to keep writing to the working
+            // tree/index in the background — exactly what forces a later
+            // `git reset --hard` to recover, and can leave a submodule
+            // checked out empty from a clone interrupted mid-way with
+            // nothing left to finish or clean it up.
+            #[cfg(unix)] { let _ = Command::new("kill").arg("-9").arg(format!("-{id}")).status(); }
+            // /T is the Windows equivalent: kill the whole process tree
+            // rooted at this PID, not just cmd.exe itself.
+            #[cfg(windows)] { let _ = Command::new("taskkill").args(["/F", "/T", "/PID"]).arg(id.to_string()).status(); }
             Err(format!("{program_label} command timed out after {timeout_label} — check your network connection and try again"))
         }
     }
@@ -1102,7 +1141,25 @@ fn replace_git_metadata(repository: &str, statuses: Vec<(String, String)>) {
     metadata_cache().lock().unwrap().insert(metadata_cache_key(repository, ""), (Instant::now(), metadata));
 }
 
+// submodule_state_cache is deliberately NOT cleared by this or by
+// invalidate_scoped_and_index_metadata below: this runs after essentially
+// every mutation, including an ordinary file stage/commit that has nothing
+// to do with any submodule's own state — clearing it here would force the
+// next fold/load to redo real, expensive submodule I/O regardless, defeating
+// its TTL entirely on the most common action in the app. It's invalidated
+// explicitly instead, wherever it's actually relevant: see
+// invalidate_submodule_sync below.
 fn invalidate_git_metadata(repository: &str) {
+    invalidate_scoped_and_index_metadata(repository);
+    full_status_cache().lock().unwrap().remove(repository);
+}
+
+// The cheap part of invalidate_git_metadata: evicting cache entries costs
+// nothing beyond the HashMap operation itself — each one's real cost (an
+// actual filesystem/libgit2 scan) is only paid lazily, scoped to exactly the
+// folder next opened. Shared with invalidate_git_metadata_for_submodule_checkout
+// below, which handles full_status_cache differently.
+fn invalidate_scoped_and_index_metadata(repository: &str) {
     // Cache keys are "{repository}\0{scope}" (one entry per folder that's been
     // browsed) — a mutation can affect any of them, so drop every scope cached for
     // this repository, not just the unscoped entry.
@@ -1110,16 +1167,54 @@ fn invalidate_git_metadata(repository: &str) {
     metadata_cache().lock().unwrap().retain(|key, _| !key.starts_with(&prefix));
     index_metadata_cache().lock().unwrap().remove(repository);
     unpushed_paths_cache().lock().unwrap().remove(repository);
-    full_status_cache().lock().unwrap().remove(repository);
     sorted_lookups_cache().lock().unwrap().remove(repository);
-    // submodule_state_cache is deliberately NOT cleared here:
-    // invalidate_git_metadata runs after essentially every mutation,
-    // including an ordinary file stage/commit that has nothing to do with
-    // any submodule's own state — clearing it here would force the next
-    // fold/load to redo real, expensive submodule I/O regardless, defeating
-    // its TTL entirely on the most common action in the app. It's
-    // invalidated explicitly instead, wherever it's actually relevant: see
-    // invalidate_submodule_sync below.
+}
+
+// A submodule checkout-only operation (switching version, restoring the
+// project-recorded commit, resetting to upstream) can only ever change ONE
+// thing from the *parent* repository's point of view: this submodule's own
+// gitlink status entry (dirty vs. matching what's recorded) — nothing else
+// in the parent's own working tree is touched. invalidate_git_metadata's
+// blanket full_status_cache eviction forces the next status need to redo a
+// full, unscoped scan of the entire repository — on a large repository this
+// was measured at 5-40+ seconds *per call*, and this exact operation was
+// called repeatedly while a submodule version was worked out interactively.
+// Patch just the one entry that could have changed instead, via a
+// pathspec-limited rescan (same StatusOptions internal_statuses always uses,
+// so the result for that one path is identical to what a full scan would
+// have produced) — every other already-cached path's status is left
+// untouched, and the cache's own TTL clock is left running from when it was
+// last fully verified, not reset by this partial patch. If nothing is
+// cached yet, there is nothing to patch — the next status need just does an
+// ordinary full scan, same as before this function existed. Everything else
+// invalidate_git_metadata clears (the scoped per-folder Explorer cache,
+// index/unpushed/sorted-lookups caches) is still fully cleared exactly as
+// before: those are cheap to evict, so there is no correctness trade-off in
+// leaving that part alone.
+fn invalidate_git_metadata_for_submodule_checkout(repository_path: &str, submodule_relative_path: &str) {
+    invalidate_scoped_and_index_metadata(repository_path);
+    let step = Instant::now();
+    let mut cache = full_status_cache().lock().unwrap();
+    let Some((cached_at, statuses)) = cache.get(repository_path) else {
+        perf_log(&format!("invalidate_git_metadata_for_submodule_checkout: nothing cached to patch ({submodule_relative_path})"), step.elapsed());
+        return;
+    };
+    let cached_at = *cached_at;
+    let mut patched: Vec<(String, String, bool)> = statuses.iter().filter(|(path, _, _)| path != submodule_relative_path).cloned().collect();
+    match internal_repository(repository_path).and_then(|repo| internal_statuses(&repo, Some(submodule_relative_path))) {
+        Ok(fresh) => {
+            let now_dirty = !fresh.is_empty();
+            patched.extend(fresh);
+            cache.insert(repository_path.to_string(), (cached_at, patched));
+            perf_log(&format!("invalidate_git_metadata_for_submodule_checkout: patched in place, avoided a full rescan ({submodule_relative_path}, now {})", if now_dirty { "dirty" } else { "clean" }), step.elapsed());
+        }
+        // Could not verify this one path — do not guess. Falls back to
+        // exactly the old behavior: the next status need does a full scan.
+        Err(_) => {
+            cache.remove(repository_path);
+            perf_log(&format!("invalidate_git_metadata_for_submodule_checkout: could not verify, fell back to a full clear ({submodule_relative_path})"), step.elapsed());
+        }
+    }
 }
 
 fn remove_submodule_section(path: &Path, name: &str) -> Result<(), String> {
@@ -2693,6 +2788,11 @@ fn github_token_from_git_credential_helper(repository_path: &str, repo: &GitHubR
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    // Own process group (Unix) so a timeout kill below can reach the actual
+    // credential helper git spawns as its child too — see
+    // run_with_timeout_labeled's comment for why killing just this PID isn't
+    // enough.
+    #[cfg(unix)] { use std::os::unix::process::CommandExt; command.process_group(0); }
     let mut child = command.spawn().ok()?;
     let id = child.id();
     let request = format!("protocol=https\nhost={}\npath={}/{}.git\n\n", repo.host, repo.owner, repo.repo);
@@ -2709,8 +2809,8 @@ fn github_token_from_git_credential_helper(repository_path: &str, repo: &GitHubR
         Ok(Ok(output)) if output.status.success() => parse_git_credential_password(&output.stdout),
         Ok(_) => None,
         Err(_) => {
-            #[cfg(unix)] { let _ = Command::new("kill").arg("-9").arg(id.to_string()).status(); }
-            #[cfg(windows)] { let _ = Command::new("taskkill").args(["/F", "/PID"]).arg(id.to_string()).status(); }
+            #[cfg(unix)] { let _ = Command::new("kill").arg("-9").arg(format!("-{id}")).status(); }
+            #[cfg(windows)] { let _ = Command::new("taskkill").args(["/F", "/T", "/PID"]).arg(id.to_string()).status(); }
             None
         }
     }
@@ -3838,7 +3938,7 @@ fn list_directory_fast_inner(repository_path: String, relative_path: String) -> 
         let metadata = item.metadata().map_err(|error| error.to_string())?;
         let kind = if metadata.file_type().is_symlink() { "symlink" } else if metadata.is_dir() { "folder" } else { "file" }.to_string();
         let modified = metadata.modified().ok().and_then(|time| time.duration_since(UNIX_EPOCH).ok()).map(|value| value.as_secs()).unwrap_or(0);
-        entries.push(DirectoryEntry { name, relative_path: relative_string, kind, status: String::new(), tracked: false, size: if metadata.is_file() { metadata.len() } else { 0 }, modified, submodule_has_unpushed_commits: false, submodule_is_dirty: false, submodule_state: String::new(), unpushed: false, status_known: false });
+        entries.push(DirectoryEntry { name, relative_path: relative_string, kind, status: String::new(), tracked: false, size: if metadata.is_file() { metadata.len() } else { 0 }, modified, submodule_has_unpushed_commits: false, submodule_is_dirty: false, submodule_state: String::new(), submodule_checked: false, submodule_current_branch: None, unpushed: false, status_known: false });
     }
     entries.sort_by_cached_key(|entry| (!matches!(entry.kind.as_str(), "folder" | "submodule"), entry.name.to_lowercase()));
     perf_log(&format!("list_directory_fast: TOTAL ({} entries, {relative_path})", entries.len()), started.elapsed());
@@ -3972,7 +4072,9 @@ fn load_directory_inner(repository_path: String, relative_path: String, force: O
             _ if kind == "submodule" => "synced".into(),
             _ => String::new(),
         };
-        entries.push(DirectoryEntry { name, relative_path: relative_string, kind, status, tracked, size: if metadata.is_file() { metadata.len() } else { 0 }, modified, submodule_has_unpushed_commits, submodule_is_dirty, submodule_state, unpushed, status_known: true });
+        let submodule_checked = submodule_snapshot.is_some();
+        let submodule_current_branch = submodule_snapshot.as_ref().and_then(|snapshot| snapshot.attached_branch.clone());
+        entries.push(DirectoryEntry { name, relative_path: relative_string, kind, status, tracked, size: if metadata.is_file() { metadata.len() } else { 0 }, modified, submodule_has_unpushed_commits, submodule_is_dirty, submodule_state, submodule_checked, submodule_current_branch, unpushed, status_known: true });
     }
 
     // A deleted tracked path cannot be returned by read_dir: it is absent on
@@ -4017,6 +4119,8 @@ fn load_directory_inner(repository_path: String, relative_path: String, force: O
             submodule_has_unpushed_commits: false,
             submodule_is_dirty: false,
             submodule_state: String::new(),
+            submodule_checked: false,
+            submodule_current_branch: None,
             unpushed: false,
             status_known: true,
         });
@@ -4518,7 +4622,8 @@ fn switch_submodule_version_inner(repository_path: String, relative_path: String
         stage_files_inner(&repository_path, vec![relative_path.clone()])
             .map_err(|error| format!("The submodule was switched to {}, but its already-staged project reference could not be updated: {error}. Stage the submodule again before committing.", &selected[..selected.len().min(8)]))?;
     }
-    invalidate_git_metadata(&repository_path);
+    invalidate_git_metadata(&absolute_string); // the submodule's own cache — its HEAD just moved
+    invalidate_git_metadata_for_submodule_checkout(&repository_path, &relative_path);
     invalidate_submodule_sync(&repository_path); // this app just changed a submodule's registration/version
     Ok(selected)
 }
@@ -4682,10 +4787,19 @@ fn reset_submodule_inner(repository_path: String, relative_path: String) -> Resu
     let sub_repo = internal_submodule_repository(&absolute)?;
     sub_repo.set_head_detached(target_oid).map_err(|error| error.message().to_string())?;
     let mut checkout = git2::build::CheckoutBuilder::new();
-    checkout.force(); // discard dirty working-tree edits too, not just move HEAD
+    // force discards dirty working-tree edits, same as before. remove_untracked
+    // + remove_ignored is the git2-native equivalent of `git clean -fdx`,
+    // folded into this same checkout instead of a separate pass — this button
+    // already promises "the exact submodule commit recorded by the parent
+    // project", so leftover untracked/ignored cruft (notably a clone or
+    // checkout interrupted mid-way by something outside this app, which can
+    // leave partial files force-checkout alone never touches since they
+    // aren't part of the target tree) must not survive it either.
+    checkout.force().remove_untracked(true).remove_ignored(true);
     sub_repo.checkout_head(Some(&mut checkout)).map_err(|error| error.message().to_string())?;
     drop(sub_repo);
-    invalidate_git_metadata(&repository_path);
+    invalidate_git_metadata(&absolute_string); // the submodule's own cache — its HEAD just moved
+    invalidate_git_metadata_for_submodule_checkout(&repository_path, &relative_string);
     invalidate_submodule_sync(&repository_path); // this app just changed a submodule's registration/version
     Ok(target_oid.to_string())
 }
@@ -4755,12 +4869,25 @@ fn reset_submodule_branch_to_upstream_inner(repository_path: String, relative_pa
     repo.set_head(&format!("refs/heads/{branch}")).map_err(|error| error.message().to_string())?;
     repo.reset(&target, git2::ResetType::Hard, None).map_err(|error| format!("Could not reset '{branch}' to {upstream}: {}", error.message()))?;
     drop(target);
+    // Same reasoning as Restore project version's own checkout: this button's
+    // whole point is "match upstream exactly, discard any local divergence" —
+    // a plain ResetType::Hard (like `git reset --hard`) only resets tracked
+    // content, it never removes untracked or .gitignore'd leftovers, and —
+    // empirically confirmed, not assumed — passing remove_untracked/
+    // remove_ignored checkout options directly to reset() does not change
+    // that either; libgit2's hard reset does not honor them there. A
+    // separate, explicit checkout_head pass afterward (the same call Restore
+    // project version uses) does honor them, checking out the exact same
+    // tree reset() just landed on but this time actually sweeping the cruft.
+    let mut cleanup_checkout = git2::build::CheckoutBuilder::new();
+    cleanup_checkout.force().remove_untracked(true).remove_ignored(true);
+    repo.checkout_head(Some(&mut cleanup_checkout)).map_err(|error| error.message().to_string())?;
     if !internal_statuses(&repo, None)?.is_empty() {
         return Err("The branch moved to its upstream, but the index or working tree is not clean. No further action was performed.".into());
     }
     drop(repo);
     invalidate_git_metadata(&sub_path);
-    invalidate_git_metadata(&repository_path);
+    invalidate_git_metadata_for_submodule_checkout(&repository_path, &relative_path);
     invalidate_submodule_sync(&repository_path);
     Ok(ResetSubmoduleBranchResult { branch, upstream, revision: target_oid.to_string() })
 }
@@ -6107,6 +6234,47 @@ mod tests {
         run_git(&repository, &["commit", "-m", "Base"]);
         run_git(&repository, &["switch", "-c", "feature"]);
         (repository, "main".into())
+    }
+
+    // Restore project version (reset_submodule_inner) reads the target
+    // commit from the parent's INDEX, on the documented assumption that a
+    // clean fast-forward leaves the index matching the new HEAD tree for
+    // every path, gitlinks included. Confirms merge_branch's fast-forward
+    // path (checkout_head with force()) actually holds that assumption for
+    // a submodule pointer specifically, not just ordinary files.
+    #[test]
+    fn fast_forward_merge_updates_the_index_gitlink_not_just_head() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-ff-gitlink-{suffix}"));
+        let repository = base.join("main");
+        let dependency = base.join("dependency");
+        create_libgit2_repository(&repository, "README.md");
+        create_libgit2_repository(&dependency, "module.txt");
+        run_git(&repository, &["-c", "protocol.file.allow=always", "submodule", "add", dependency.to_str().unwrap(), "vendor/dep"]);
+        run_git(&repository, &["commit", "-am", "Add dep"]);
+        let repo_path = repository.to_string_lossy().into_owned();
+        let default_branch = Repository::open(&repository).unwrap().head().unwrap().shorthand().unwrap().to_string();
+        run_git(&repository, &["switch", "-c", "feature"]);
+        run_git(&repository, &["switch", &default_branch]);
+
+        let sub_path = repository.join("vendor/dep");
+        fs::write(sub_path.join("module.txt"), "bumped").unwrap();
+        run_git(&sub_path, &["commit", "-am", "Bump"]);
+        let bumped_oid = Repository::open(&sub_path).unwrap().head().unwrap().target().unwrap();
+        run_git(&repository, &["add", "vendor/dep"]);
+        run_git(&repository, &["commit", "-m", "Bump dep"]);
+
+        run_git(&repository, &["switch", "feature"]);
+        run_git(&repository, &["submodule", "update", "vendor/dep"]); // clean checkout matching feature's own pin, like a real user's working tree
+        let outcome = merge_branch(repo_path.clone(), "".into(), default_branch.clone()).unwrap();
+        assert_eq!(outcome.status, "fast_forwarded");
+
+        let repo = Repository::open(&repository).unwrap();
+        let head_oid = parent_gitlink_oid(&repo, "vendor/dep", false);
+        let index_oid = parent_gitlink_oid(&repo, "vendor/dep", true);
+        assert_eq!(head_oid, Some(bumped_oid), "HEAD's tree must show the bumped submodule after fast-forward");
+        assert_eq!(index_oid, Some(bumped_oid), "the INDEX must also show the bumped submodule after fast-forward — this is what Restore project version actually reads");
+        fs::remove_dir_all(base).unwrap();
     }
 
     #[test]
@@ -9227,6 +9395,45 @@ mod tests {
         fs::remove_dir_all(base).unwrap();
     }
 
+    // A process killed mid-operation (a timed-out Terminal command, a crash,
+    // an interrupted clone) can leave a submodule with extra untracked or
+    // even .gitignore'd files that were never part of any commit. force()
+    // alone only overwrites tracked paths — it never deletes something that
+    // isn't in the target tree — so those leftovers survived a plain reset
+    // and kept surprising the user afterward. Restore project version's own
+    // stated purpose is "the exact commit recorded by the parent project",
+    // so it must clear that cruft too.
+    #[test]
+    fn reset_submodule_removes_untracked_and_ignored_leftovers_not_just_tracked_drift() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-reset-submodule-cruft-{suffix}"));
+        let repository = base.join("main");
+        let dependency = base.join("dependency");
+        create_libgit2_repository(&repository, "README.md");
+        create_libgit2_repository(&dependency, "module.txt");
+        run_git(&repository, &["-c", "protocol.file.allow=always", "submodule", "add", dependency.to_str().unwrap(), "vendor/dep"]);
+        run_git(&repository, &["commit", "-am", "Add dep submodule"]);
+        let repo_path = repository.to_string_lossy().into_owned();
+        let sub_path = repository.join("vendor/dep");
+
+        // Simulate what an interrupted clone/checkout or a stray build can
+        // leave behind: an untracked file, an untracked directory, and a
+        // file matching a fresh .gitignore rule.
+        fs::write(sub_path.join("orphaned.tmp"), "leftover from an interrupted process").unwrap();
+        fs::create_dir_all(sub_path.join("partial_clone_dir")).unwrap();
+        fs::write(sub_path.join("partial_clone_dir/incomplete.bin"), "half-written").unwrap();
+        fs::write(sub_path.join(".gitignore"), "*.ignored\n").unwrap();
+        fs::write(sub_path.join("build.ignored"), "stray build output").unwrap();
+
+        let reset_to = reset_submodule_inner(repo_path, "vendor/dep".into()).unwrap();
+        assert_eq!(reset_to, Repository::open(&sub_path).unwrap().head().unwrap().target().unwrap().to_string());
+        assert!(!sub_path.join("orphaned.tmp").exists(), "an untracked leftover file must be removed");
+        assert!(!sub_path.join("partial_clone_dir").exists(), "an untracked leftover directory must be removed");
+        assert!(!sub_path.join("build.ignored").exists(), "a .gitignore'd leftover must be removed too — this action's own promise is the exact recorded commit, nothing else");
+        assert!(!sub_path.join(".gitignore").exists(), ".gitignore itself was untracked here (never committed) — it is cruft like anything else, not special-cased");
+        fs::remove_dir_all(base).unwrap();
+    }
+
     #[test]
     fn reset_submodule_branch_to_upstream_discards_a_divergence_and_leaves_a_clean_attached_branch() {
         let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
@@ -9271,6 +9478,57 @@ mod tests {
         assert!(sub_repo.statuses(None).unwrap().is_empty(), "hard match must leave no staged or unstaged leftovers");
         let upstream = sub_repo.find_branch("main", BranchType::Local).unwrap().upstream().unwrap();
         assert_eq!(upstream.get().target(), sub_repo.head().unwrap().target());
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    // Same reasoning, same gap as reset_submodule's own equivalent test: a
+    // plain hard reset only overwrites tracked content, it never removes an
+    // untracked or .gitignore'd leftover (e.g. from a process interrupted
+    // mid-operation). "Reset to upstream" is the button for "force this
+    // submodule to exactly match origin, discard everything local" — that
+    // promise must include cruft, not just tracked drift.
+    #[test]
+    fn reset_submodule_branch_to_upstream_removes_untracked_and_ignored_leftovers_too() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-reset-upstream-cruft-{suffix}"));
+        let repository = base.join("main");
+        let dependency = base.join("dependency");
+        fs::create_dir_all(&repository).unwrap();
+        fs::create_dir_all(&dependency).unwrap();
+        fs::write(repository.join("README.md"), "root").unwrap();
+        fs::write(dependency.join("module.txt"), "v1").unwrap();
+        for path in [&repository, &dependency] {
+            run_git(path, &["init", "-b", "main"]);
+            run_git(path, &["config", "user.email", "test@example.com"]);
+            run_git(path, &["config", "user.name", "Test User"]);
+            run_git(path, &["add", "."]);
+            run_git(path, &["commit", "-m", "Initial"]);
+        }
+        run_git(&repository, &["-c", "protocol.file.allow=always", "submodule", "add", dependency.to_str().unwrap(), "vendor/dep"]);
+        run_git(&repository, &["commit", "-am", "Add dep submodule"]);
+        let sub_path = repository.join("vendor/dep");
+        run_git(&sub_path, &["config", "user.email", "test@example.com"]);
+        run_git(&sub_path, &["config", "user.name", "Test User"]);
+
+        fs::write(dependency.join("remote.txt"), "remote only").unwrap();
+        run_git(&dependency, &["add", "."]);
+        run_git(&dependency, &["commit", "-m", "Remote moves"]);
+
+        // Leftovers an interrupted process (or a stray build) could have left
+        // behind, never part of any commit.
+        fs::write(sub_path.join("orphaned.tmp"), "leftover").unwrap();
+        fs::create_dir_all(sub_path.join("partial_clone_dir")).unwrap();
+        fs::write(sub_path.join("partial_clone_dir/incomplete.bin"), "half-written").unwrap();
+        fs::write(sub_path.join(".gitignore"), "*.ignored\n").unwrap();
+        fs::write(sub_path.join("build.ignored"), "stray build output").unwrap();
+
+        reset_submodule_branch_to_upstream_inner(repository.to_string_lossy().into_owned(), "vendor/dep".into(), "main".into()).unwrap();
+        assert!(!sub_path.join("orphaned.tmp").exists(), "an untracked leftover file must be removed");
+        assert!(!sub_path.join("partial_clone_dir").exists(), "an untracked leftover directory must be removed");
+        assert!(!sub_path.join("build.ignored").exists(), "a .gitignore'd leftover must be removed too");
+        assert!(!sub_path.join(".gitignore").exists(), ".gitignore itself was untracked here and is cruft like anything else");
+        assert!(Repository::open(&sub_path).unwrap().statuses(None).unwrap().is_empty(), "must land fully clean, not just tracked-content-clean");
 
         fs::remove_dir_all(base).unwrap();
     }
@@ -9436,6 +9694,56 @@ mod tests {
         commit_staged_inner(repo_path.clone(), "Record feature-y once".into()).unwrap();
         let after_commit = load_repository_inner(repo_path.clone(), Some(true)).unwrap();
         assert!(after_commit.changes.iter().all(|change| change.path != "vendor/dep"), "one parent commit must fully record the selected submodule version");
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn switching_a_submodule_version_patches_the_cached_full_status_instead_of_forcing_a_full_rescan() {
+        // On a large repository, a full unscoped status rescan was measured at
+        // 5-40+ seconds; switching a submodule's version only ever changes that
+        // one gitlink's own status entry. Seeds full_status_cache directly with
+        // a recognizable fake entry for an unrelated path (one that could never
+        // come from a real scan) so surviving it proves no full rescan
+        // happened, rather than inferring that from timing.
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-switch-cache-patch-{suffix}"));
+        let repository = base.join("main");
+        let dependency = base.join("dependency");
+        create_libgit2_repository(&repository, "README.md");
+        create_libgit2_repository(&dependency, "module.txt");
+        run_git(&repository, &["-c", "protocol.file.allow=always", "submodule", "add", dependency.to_str().unwrap(), "vendor/dep"]);
+        run_git(&repository, &["commit", "-am", "Add dep submodule"]);
+        let repo_path = repository.to_string_lossy().into_owned();
+        let sub_path = repository.join("vendor/dep");
+        let sub_default_branch = Repository::open(&sub_path).unwrap().head().unwrap().shorthand().unwrap().to_string();
+        run_git(&sub_path, &["switch", "-c", "feature-x"]);
+        fs::write(sub_path.join("module.txt"), "v2").unwrap();
+        run_git(&sub_path, &["commit", "-am", "v2 on feature-x"]);
+        run_git(&sub_path, &["switch", &sub_default_branch]);
+        let versions = submodule_versions_inner(repo_path.clone(), "vendor/dep".into()).unwrap();
+        let feature_branch = versions.versions.iter().find(|v| v.kind == "branch" && v.name == "feature-x").unwrap();
+
+        // Seed a fresh, cached "everything is clean" full scan, as if
+        // load_repository had already run once before this operation.
+        let fake_marker = "__unmistakably_fake_marker__.txt".to_string();
+        full_status_cache().lock().unwrap().insert(repo_path.clone(), (Instant::now(), vec![(fake_marker.clone(), "??".into(), false)]));
+
+        switch_submodule_version_inner(repo_path.clone(), "vendor/dep".into(), feature_branch.revision.clone(), feature_branch.kind.clone(), feature_branch.name.clone()).unwrap();
+
+        let cache = full_status_cache().lock().unwrap();
+        let (_, patched) = cache.get(&repo_path).expect("the cache entry must still exist — patched in place, not thrown away");
+        assert!(patched.iter().any(|(path, _, _)| path == &fake_marker), "an unrelated cached path must survive untouched — proves no full rescan discarded it");
+        let submodule_entry = patched.iter().find(|(path, _, _)| path == "vendor/dep");
+        assert!(submodule_entry.is_some(), "the submodule's own entry must be present and correctly patched — it really did move");
+        assert_eq!(submodule_entry.unwrap().1, "M");
+        drop(cache);
+
+        // The patch must be real, not just copied over: refresh_status_inner
+        // reading through the same cache must see the correct, current
+        // submodule state, not the fake marker's information for that path.
+        let changes = refresh_status_inner(repo_path.clone()).unwrap();
+        assert!(changes.iter().any(|change| change.path == "vendor/dep" && !change.staged), "the live status must reflect the real, current submodule drift");
 
         fs::remove_dir_all(base).unwrap();
     }
@@ -10746,6 +11054,8 @@ mod tests {
         run_git(&sub_path, &["config", "user.email", "test@example.com"]);
         run_git(&sub_path, &["config", "user.name", "Test User"]);
 
+        let default_branch = Repository::open(&sub_path).unwrap().head().unwrap().shorthand().unwrap().to_string();
+
         // State 1: freshly synced, nothing to report anywhere.
         let clean = load_directory_inner(repo_path.clone(), "vendor".into(), Some(true)).unwrap();
         let clean_entry = clean.iter().find(|e| e.name == "dep").unwrap();
@@ -10753,6 +11063,8 @@ mod tests {
         assert_eq!(clean_entry.submodule_state, "synced");
         assert!(!clean_entry.submodule_is_dirty);
         assert!(!clean_entry.submodule_has_unpushed_commits);
+        assert!(!clean_entry.submodule_checked, "a clean, synced submodule must not have its own repository opened just to report attached/detached — that is exactly the per-row cost avoided for the common case");
+        assert_eq!(clean_entry.submodule_current_branch, None);
 
         // State 2: genuinely dirty content inside the submodule, HEAD unchanged.
         fs::write(sub_path.join("module.txt"), "uncommitted edit").unwrap();
@@ -10774,6 +11086,8 @@ mod tests {
         assert_eq!(unpushed_entry.submodule_state, "local_commit_push_needed");
         assert!(!unpushed_entry.submodule_is_dirty, "a clean version bump is never 'dirty', pushed or not");
         assert!(unpushed_entry.submodule_has_unpushed_commits);
+        assert!(unpushed_entry.submodule_checked, "this row already had a reason to be inspected — riding along on that same check is free");
+        assert_eq!(unpushed_entry.submodule_current_branch, Some(default_branch.clone()));
 
         // State 4: pushed to origin, but not staged in the project yet.
         run_git(&sub_path, &["push", "-u", "origin", "HEAD:main"]);
@@ -10813,6 +11127,8 @@ mod tests {
         let detached = load_directory_inner(repo_path, "vendor".into(), Some(true)).unwrap();
         let detached_entry = detached.iter().find(|e| e.name == "dep").unwrap();
         assert_eq!(detached_entry.submodule_state, "detached_choose_branch");
+        assert!(detached_entry.submodule_checked);
+        assert_eq!(detached_entry.submodule_current_branch, None, "detached HEAD must report as None, not silently reuse a stale branch name");
 
         fs::remove_dir_all(base).unwrap();
     }
@@ -10852,6 +11168,8 @@ mod tests {
         // Only groupA is ever listed.
         let listing = load_directory_inner(repo_path, "groupA".into(), Some(true)).unwrap();
         assert_eq!(listing.iter().filter(|e| e.kind == "submodule").count(), 2);
+        assert!(listing.iter().find(|e| e.name == "subA1").unwrap().submodule_checked, "the dirty sibling has a reason to be inspected");
+        assert!(!listing.iter().find(|e| e.name == "subA2").unwrap().submodule_checked, "the clean sibling, in the same listing, must not be");
 
         // Filtered to this test's own repository prefix — the cache is a
         // process-global static shared with every other test in this suite

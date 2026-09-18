@@ -819,6 +819,16 @@ function iconFor(entry) {
   return `<span class="entry-icon file">${esc((entry.name.split('.').pop() || '').slice(0, 3).toUpperCase())}</span>`;
 }
 
+// Only ever a real answer when the backend actually checked this submodule's
+// own repository (submodule_checked) — a clean, fully-synced submodule
+// deliberately skips that check to stay fast on a folder with many
+// submodules, so it must fall back to the generic hint, not guess "detached"
+// or a branch name it never verified.
+function submoduleHeadHint(entry) {
+  if (!entry.submodule_checked) return 'Independent Git repository';
+  return entry.submodule_current_branch ? `Independent Git repository · ${entry.submodule_current_branch}` : 'Independent Git repository · detached';
+}
+
 function gitState(entry) {
   const labels = { M: 'Modified locally', A: 'Added locally', D: 'Deleted locally', R: 'Renamed locally', '??': 'New, untracked', '•': 'Modified files inside' };
   // Not the same as tracked === false ("genuinely untracked", a real answer)
@@ -905,7 +915,7 @@ function renderExplorer() {
     <span></span><span></span><span></span>
   </button>` : '';
   const rowsHtml = entries.map(entry => `<button class="file-row file-grid ${entry.status || !entry.tracked ? 'has-change' : ''} ${state.selectedEntry?.relative_path === entry.relative_path ? 'selected' : ''}" data-entry="${esc(entry.relative_path)}">
-    <span class="file-main">${iconFor(entry)}<span class="entry-copy"><span class="entry-name">${esc(entry.name)}${entry.kind === 'submodule' ? '<b class="inline-submodule-badge">SUBMODULE</b>' : ''}</span><span class="entry-hint">${entry.kind === 'submodule' ? 'Independent Git repository' : entry.kind === 'deleted-submodule' ? 'Deleted Git submodule' : entry.kind === 'deleted-folder' ? 'Deleted tracked folder' : entry.kind === 'deleted' ? 'Deleted tracked file' : entry.kind}</span></span>${['folder','submodule'].includes(entry.kind) ? '<span class="folder-arrow">›</span>' : ''}</span>
+    <span class="file-main">${iconFor(entry)}<span class="entry-copy"><span class="entry-name">${esc(entry.name)}${entry.kind === 'submodule' ? '<b class="inline-submodule-badge">SUBMODULE</b>' : ''}</span><span class="entry-hint">${entry.kind === 'submodule' ? esc(submoduleHeadHint(entry)) : entry.kind === 'deleted-submodule' ? 'Deleted Git submodule' : entry.kind === 'deleted-folder' ? 'Deleted tracked folder' : entry.kind === 'deleted' ? 'Deleted tracked file' : entry.kind}</span></span>${['folder','submodule'].includes(entry.kind) ? '<span class="folder-arrow">›</span>' : ''}</span>
     ${gitState(entry)}<span class="file-size">${entry.kind === 'file' ? formatSize(entry.size) : '—'}</span><span class="file-modified">${formatModified(entry.modified)}</span>
   </button>`).join('') || (state.currentPath ? '' : '<div class="empty-change">This folder is empty</div>');
   const showAllStub = capped ? `<div class="history-truncated-stub"><span>Showing ${EXPLORER_DOM_ROW_CAP} of ${allEntries.length} items</span><button id="explorerShowAll">Show all ${allEntries.length}</button></div>` : '';
@@ -1282,7 +1292,7 @@ async function discardSubmoduleBranchAndUseUpstream({ name, upstream, ahead, beh
   if (!submoduleMenuData) return;
   const counts = `${Number(ahead) || 0} ahead / ${Number(behind) || 0} behind`;
   const confirmed = await customConfirm(
-    `Replace local branch "${name}" with ${upstream} (${counts})?\n\nThis is not Push, Pull, or the normal way to record a new submodule version. It is destructive recovery: it permanently deletes this branch's local-only commits, staged files, and uncommitted edits, then checks out the remote version.\n\nThe parent project's recorded submodule version is not changed automatically.`,
+    `Replace local branch "${name}" with ${upstream} (${counts})?\n\nThis is not Push, Pull, or the normal way to record a new submodule version. It is destructive recovery: it permanently deletes this branch's local-only commits, staged files, and uncommitted edits, deletes untracked and ignored files, then checks out the remote version.\n\nThe parent project's recorded submodule version is not changed automatically.`,
     { title: 'Discard local branch work', okLabel: `Discard local work and use ${upstream}`, danger: true }
   );
   if (!confirmed) return;
@@ -1624,7 +1634,7 @@ async function commitSubmoduleChanges(entry) {
 
 async function resetSubmodule(entry) {
   if (entry.kind !== 'submodule') return;
-  const confirmed = await customConfirm(`Restore "${entry.name}" to the exact commit recorded by the parent project?\n\nThis discards dirty edits, staged files and local-only commits, and leaves the submodule in detached HEAD. It does NOT make a local branch match origin. This cannot be undone from here.`, { title: 'Restore project version', okLabel: 'Restore project version', danger: true });
+  const confirmed = await customConfirm(`Restore "${entry.name}" to the exact commit recorded by the parent project?\n\nThis discards dirty edits, staged files and local-only commits, deletes untracked and ignored files, and leaves the submodule in detached HEAD. It does NOT make a local branch match origin. This cannot be undone from here.`, { title: 'Restore project version', okLabel: 'Restore project version', danger: true });
   if (!confirmed) return;
   if (!invoke) return status(`Preview: reset ${entry.name}`);
   try {
@@ -1997,7 +2007,18 @@ async function deleteEntry(entry, button) {
   }
 }
 
-async function compareEntryWithRemote(entry) { state.commanderFocus = entry.relative_path; state.commanderPath = entry.relative_path.split('/').slice(0, -1).join('/'); state.view = 'commander'; state.commanderRows = []; render(); await openCommanderDirectory(state.commanderPath); const row = state.commanderRows.find(item => item.relative_path === entry.relative_path); if (row?.local?.kind === 'file' && row.remote?.kind === 'file') openFileCompare(row); else status('This file is not available on both local and selected remote', 'error'); }
+async function compareEntryWithRemote(entry) {
+  // Folder Sync now opens on the Local Drive tab by default. Without
+  // forcing Git mode here too, this landed the user on that unrelated
+  // two-independent-folders panel while the actual git-compare data it
+  // had just fetched sat hidden behind it — "took me to Folder Sync and
+  // didn't compare the file" from the outside, even though the row
+  // lookup below did succeed.
+  state.commanderFocus = entry.relative_path; state.commanderPath = entry.relative_path.split('/').slice(0, -1).join('/'); state.view = 'commander'; state.compareMode = 'git'; state.commanderRows = []; render();
+  await openCommanderDirectory(state.commanderPath);
+  const row = state.commanderRows.find(item => item.relative_path === entry.relative_path);
+  if (row?.local?.kind === 'file' && row.remote?.kind === 'file') openFileCompare(row); else status('This file is not available on both local and selected remote', 'error');
+}
 async function runEntryFileAction(entry, action) {
   const explanations = { head: 'RESTORE: this permanently discards ALL uncommitted edits in this file. The file on disk will become identical to the last commit (HEAD). This cannot be undone. Continue?', stage: 'Add this file to the staging area?', unstage: 'UNSTAGE: remove this file from staging. Your edits on disk are kept exactly as they are — only the staging entry is removed. Continue?' };
   const successMessages = { head: `${entry.name}: restored from the last commit (HEAD) — edits on disk were discarded.`, stage: `${entry.name}: staged. It will be included in the next commit.`, unstage: `${entry.name}: unstaged — removed from staging, edits on disk were kept unchanged.` };

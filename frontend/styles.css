@@ -228,7 +228,7 @@ button.pr-reviewer:hover { border-color: #59758e; background: #1b2b38; color: #e
 .entry-icon.deleted { width: 24px; height: 24px; border: 2px dashed #bf756e; border-radius: 4px; color: #ef9a92; font-size: 17px; }
 .entry-copy { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
 .entry-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; }
-.entry-hint { color: #6f8395; font-size: 10px; }
+.entry-hint { color: #6f8395; font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* The label lives in its own inner <span> (not a bare text node) so it can
    shrink and truncate with an ellipsis on its own — the dot (flex-shrink: 0)
    never gets squashed by an overly long label regardless of column width or
