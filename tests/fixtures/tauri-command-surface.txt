@@ -66,6 +66,7 @@ push_submodule_preview
 push_submodule_tag
 read_local_text_file
 read_text_file
+recent_git_commands
 refresh_status
 remove_git_path
 rename_branch

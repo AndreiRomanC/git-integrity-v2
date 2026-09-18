@@ -136,6 +136,7 @@ const refs = {
   graphView: $('#graphView'), emptyState: $('#emptyState'), laneLegend: $('#laneLegend'),
   details: $('#detailsPanel'), currentBranch: $('#currentBranch'), statusText: $('#statusText'),
   statusDot: $('#statusDot'), search: $('#search'), graphSubtitle: $('#graphSubtitle'),
+  statusFooter: $('#statusFooter'), statusCommandHint: $('#statusCommandHint'), commandHistoryDialog: $('#commandHistoryDialog'), commandHistoryList: $('#commandHistoryList'),
   changeBadge: $('#changeBadge'), workspaceSubtitle: $('#workspaceSubtitle'), changes: $('#changes'),
   changesDrawer: $('#changesDrawer'), changesSummary: $('#changesSummary'), commitMessage: $('#commitMessage'),
   defaultCommitMessage: $('#defaultCommitMessage'), defaultCommitPolarionLink: $('#defaultCommitPolarionLink'),
@@ -174,8 +175,56 @@ function commitSubjectHtml(subject = '') {
   }
   parts.push(esc(subject.slice(cursor))); return parts.join('');
 }
-function status(message, kind = '') { refs.statusText.textContent = message; refs.statusDot.className = `status-dot ${kind}`; }
+function status(message, kind = '') {
+  refs.statusText.textContent = message; refs.statusDot.className = `status-dot ${kind}`;
+  // 'busy' means something is still in flight — the command that will
+  // eventually explain it hasn't been recorded yet, so there is nothing
+  // new to show until whatever comes after (success/error/plain) calls
+  // this again. Discreet by design: never awaited, never lets a failure
+  // here surface as if it were the actual action's own error.
+  if (kind !== 'busy') refreshCommandHint();
+}
 let toastTimer; function showOperationToast(message, kind = '') { clearTimeout(toastTimer); refs.operationToast.textContent = message; refs.operationToast.className = `operation-toast ${kind}`; refs.operationToast.hidden = false; toastTimer = setTimeout(() => { refs.operationToast.hidden = true; }, 7000); }
+
+// Report: show the real git commands the app runs, quietly, next to the
+// status text — not a replacement for the Terminal's own transcript (that
+// already covers commands the user typed there directly), just a glanceable
+// trace of what this app itself just did. Double-click the footer for the
+// fuller, still-discreet history (openCommandHistoryDialog below).
+async function refreshCommandHint() {
+  if (!invoke) return;
+  try {
+    const [latest] = await invoke('recent_git_commands');
+    if (!latest) { refs.statusCommandHint.hidden = true; return; }
+    refs.statusCommandHint.textContent = `${latest.repo_hint}: ${latest.command}`;
+    refs.statusCommandHint.classList.toggle('status-command-failed', !latest.success);
+    refs.statusCommandHint.hidden = false;
+  } catch { /* quiet by design — never disturb the action this rode along with */ }
+}
+
+function commandHistoryRowHtml(entry) {
+  const ago = entry.seconds_ago < 60 ? `${Math.max(0, Math.round(entry.seconds_ago))}s ago`
+    : entry.seconds_ago < 3600 ? `${Math.round(entry.seconds_ago / 60)}m ago`
+    : `${Math.round(entry.seconds_ago / 3600)}h ago`;
+  // A dedicated class, not a reuse of .publish-commit: that class assumes a
+  // 4-column grid (index/checkbox, dot, 1fr content, badge) and a clickable
+  // row (cursor:pointer, hover highlight) for toggling what gets pushed —
+  // neither applies here, this list is a plain, unclickable 2-column read
+  // history. .excluded's dim-to-de-prioritize styling is also the wrong
+  // signal for "this command failed", which should stand out, not fade out.
+  return `<div class="command-history-row ${entry.success ? '' : 'failed'}"><span>${entry.success ? '✓' : '✗'}</span><div><strong><code>${esc(entry.command)}</code></strong><small>${esc(entry.repo_hint)} · ${ago}</small></div></div>`;
+}
+
+async function openCommandHistoryDialog() {
+  if (!invoke) { refs.commandHistoryList.innerHTML = '<div class="empty-change">No commands recorded yet this session.</div>'; refs.commandHistoryDialog.showModal(); return; }
+  refs.commandHistoryList.innerHTML = '<div class="loading-row"><i class="spinner"></i>Loading…</div>';
+  refs.commandHistoryDialog.showModal();
+  try {
+    const commands = await invoke('recent_git_commands');
+    refs.commandHistoryList.innerHTML = commands.length ? commands.map(commandHistoryRowHtml).join('') : '<div class="empty-change">No commands recorded yet this session.</div>';
+  } catch (error) { handleError(error); }
+}
+refs.statusFooter.addEventListener('dblclick', openCommandHistoryDialog);
 
 // Keep progress attached to the exact control the user pressed. The global
 // status bar is useful context, but on a busy screen it is too easy to miss
@@ -1497,7 +1546,7 @@ function renderEntryDetails(entry) {
   refs.details.innerHTML = `<div class="entry-details"><div class="entry-preview ${esc(entry.kind)}">${entry.kind === 'submodule' ? '◇' : entry.kind === 'folder' ? '▰' : '▤'}</div>
     <h2>${esc(entry.name)}</h2><div class="entry-path">${esc(entry.relative_path)}</div>${entry.kind === 'submodule' ? '<span class="submodule-badge">◇ Git submodule</span>' : ''}
     ${changeBanner}
-    <div class="context-actions">${deletedEntry ? '' : entry.kind === 'file' ? '<button data-detail-action="edit">Edit local file</button>' : '<button data-detail-action="open">Open folder</button>'}<button data-detail-action="server">Open on server ↗</button><button data-detail-action="history">View history</button>${entry.status ? '<button data-detail-action="commit">Commit this item</button>' : ''}${entry.kind === 'deleted' ? '<button data-detail-action="head" data-tooltip="Restore this deleted file from your last local commit (HEAD)">↶ Restore from last commit (HEAD)</button>' : ''}${['folder','submodule'].includes(entry.kind) && entry.name === 'r' ? '<button data-detail-action="utrud" data-tooltip="Launches UTRUD for this r folder. If it cannot start, an explicit error is shown. Windows only.">▶ Run UTRUD</button>' : ''}${entry.kind === 'file' && (entry.status || !entry.tracked) ? `<button data-detail-action="stage" data-tooltip="git add — add this file's current content to staging">＋ Stage this file</button><button data-detail-action="unstage" data-tooltip="Unstage — git restore --staged. Removes only the staging entry; your edits on disk are kept exactly as they are.">− Unstage</button><button data-detail-action="stashfile" data-tooltip="Sets this file aside in this repository's own stash. Parent projects and submodules have separate stash lists.">⇕ Stash this file</button><button data-detail-action="head" class="danger-action-soft" data-tooltip="Restore from your last local commit (HEAD) — git checkout HEAD -- file. Permanently discards ALL edits; the file on disk becomes identical to what you last committed. Cannot be undone.">↶ Restore from last commit (HEAD)</button><button data-detail-action="compare" data-tooltip="Open side-by-side compare with restore options">⇄ Compare with remote</button>` : ''}${entry.kind === 'submodule' ? `<button data-detail-action="subserver">Open submodule repository ↗</button><button data-detail-action="subgraph" data-tooltip="Open this submodule's own branch/commit history — never the parent project's">Submodule Branch Map</button><button data-detail-action="subrefchanges" data-tooltip="A different, narrower question: which commits in the PARENT project changed this submodule's recorded version. Not the submodule's own history.">Submodule Reference Changes</button><button data-detail-action="subnewbranch" data-tooltip="Create a new local branch in this submodule, starting from its current commit, and switch to it">＋ New branch…</button><button data-detail-action="versions">Change version</button><button data-detail-action="substash" data-tooltip="Set aside all uncommitted files inside this submodule only. The parent project's work is untouched.">Stash submodule work</button><button data-detail-action="substashes" data-tooltip="View and restore this submodule's own stashes. The parent project's stash list is separate.">Submodule stashes</button><button data-detail-action="subcommit" ${canCommitInsideSubmodule ? '' : 'disabled'} data-tooltip="${canCommitInsideSubmodule ? 'Commit uncommitted changes inside the submodule' : 'No uncommitted files inside this submodule'}">Commit submodule</button><button data-detail-action="subreset" class="danger-action-soft" ${entry.status ? '' : 'disabled'} data-tooltip="${entry.status ? 'Discard local work and restore the exact submodule commit recorded by the parent project. This leaves detached HEAD, like git submodule update.' : 'The submodule already uses the version recorded by the parent project'}">↺ Restore project version…</button><button data-detail-action="subpull" data-tooltip="Fast-forward pull — brings in new commits from the submodule's remote. Refuses if it would require a manual merge.">Pull submodule</button><button data-detail-action="submerge" data-tooltip="Merge a branch into this submodule's current branch, with conflict resolution if needed">Merge branch…</button><button data-detail-action="subpush">Push submodule</button><button data-detail-action="subforcepush" class="danger-action-soft" data-tooltip="⚠️ Overwrites the remote branch with your local history, discarding any commits there aren't in yours. Only safe if nobody else uses that remote.">Force push submodule…</button><button data-detail-action="subfetch">Fetch submodule</button><button data-detail-action="location">Replace repository URL</button>` : ''}${deletedEntry ? '' : '<button class="danger-action" data-detail-action="delete">Delete…</button>'}</div>
+    <div class="context-actions">${deletedEntry ? '' : entry.kind === 'file' ? '<button data-detail-action="edit">Edit local file</button>' : '<button data-detail-action="open">Open folder</button>'}${entry.kind === 'submodule' ? '' : '<button data-detail-action="server">Open on server ↗</button>'}${entry.kind === 'submodule' ? '' : '<button data-detail-action="history">View history</button>'}${entry.status ? '<button data-detail-action="commit">Commit this item</button>' : ''}${entry.kind === 'deleted' ? '<button data-detail-action="head" data-tooltip="Restore this deleted file from your last local commit (HEAD)">↶ Restore from last commit (HEAD)</button>' : ''}${['folder','submodule'].includes(entry.kind) && entry.name === 'r' ? '<button data-detail-action="utrud" data-tooltip="Launches UTRUD for this r folder. If it cannot start, an explicit error is shown. Windows only.">▶ Run UTRUD</button>' : ''}${entry.kind === 'file' && (entry.status || !entry.tracked) ? `<button data-detail-action="stage" data-tooltip="git add — add this file's current content to staging">＋ Stage this file</button><button data-detail-action="unstage" data-tooltip="Unstage — git restore --staged. Removes only the staging entry; your edits on disk are kept exactly as they are.">− Unstage</button><button data-detail-action="stashfile" data-tooltip="Sets this file aside in this repository's own stash. Parent projects and submodules have separate stash lists.">⇕ Stash this file</button><button data-detail-action="head" class="danger-action-soft" data-tooltip="Restore from your last local commit (HEAD) — git checkout HEAD -- file. Permanently discards ALL edits; the file on disk becomes identical to what you last committed. Cannot be undone.">↶ Restore from last commit (HEAD)</button><button data-detail-action="compare" data-tooltip="Open side-by-side compare with restore options">⇄ Compare with remote</button>` : ''}${entry.kind === 'submodule' ? `<button data-detail-action="subserver">Open submodule repository ↗</button><button data-detail-action="subgraph" data-tooltip="Open this submodule's own branch/commit history — never the parent project's">Submodule Branch Map</button><button data-detail-action="subrefchanges" data-tooltip="A different, narrower question: which commits in the PARENT project changed this submodule's recorded version. Not the submodule's own history.">Submodule Reference Changes</button><button data-detail-action="subnewbranch" data-tooltip="Create a new local branch in this submodule, starting from its current commit, and switch to it">＋ New branch…</button><button data-detail-action="versions">Change version</button><button data-detail-action="substash" data-tooltip="Set aside all uncommitted files inside this submodule only. The parent project's work is untouched.">Stash submodule work</button><button data-detail-action="substashes" data-tooltip="View and restore this submodule's own stashes. The parent project's stash list is separate.">Submodule stashes</button><button data-detail-action="subcommit" ${canCommitInsideSubmodule ? '' : 'disabled'} data-tooltip="${canCommitInsideSubmodule ? 'Commit uncommitted changes inside the submodule' : 'No uncommitted files inside this submodule'}">Commit submodule</button><button data-detail-action="subreset" class="danger-action-soft" ${entry.status ? '' : 'disabled'} data-tooltip="${entry.status ? 'Discard local work and restore the exact submodule commit recorded by the parent project. This leaves detached HEAD, like git submodule update.' : 'The submodule already uses the version recorded by the parent project'}">↺ Restore project version…</button><button data-detail-action="subpull" data-tooltip="Fast-forward pull — brings in new commits from the submodule's remote. Refuses if it would require a manual merge.">Pull submodule</button><button data-detail-action="submerge" data-tooltip="Merge a branch into this submodule's current branch, with conflict resolution if needed">Merge branch…</button><button data-detail-action="subpush">Push submodule</button><button data-detail-action="subforcepush" class="danger-action-soft" data-tooltip="⚠️ Overwrites the remote branch with your local history, discarding any commits there aren't in yours. Only safe if nobody else uses that remote.">Force push submodule…</button><button data-detail-action="subfetch">Fetch submodule</button><button data-detail-action="location">Replace repository URL</button>` : ''}${deletedEntry ? '' : '<button class="danger-action" data-detail-action="delete">Delete…</button>'}</div>
     <div class="detail-section"><h3>GENERAL</h3><div class="detail-grid"><span>Type</span><strong>${kindLabel}</strong><span>Git</span><strong>${entry.tracked ? (entry.status || (entry.unpushed ? (entry.kind === 'folder' ? 'Clean — contains unpushed commits' : 'Committed, not pushed yet') : 'Tracked, clean')) : 'Untracked'}</strong>
     ${entry.item_count != null ? `<span>Items</span><strong>${entry.item_count}</strong>` : `<span>Size</span><strong>${formatSize(entry.size)}</strong>`}<span>Modified</span><strong>${formatModified(entry.modified)}</strong></div></div>
     ${entry.kind === 'submodule' ? `<div class="detail-section"><h3>SUBMODULE</h3><div class="detail-grid"><span>Remote</span><strong>${esc(entry.submodule_url || 'Not configured')}</strong><span>Branch</span><strong>${esc(entry.submodule_branch || 'Default')}</strong><span>Status</span><strong>${esc(submoduleState.short)}</strong></div>
@@ -1516,9 +1565,11 @@ async function handleDetailAction(action, entry, button) {
   // own branches/commits at all. That's a real, different, narrower
   // question nobody was actually asking here; what "View history" on a
   // submodule row means is its own branch map, same as the dedicated
-  // "Submodule branch map" button already gives — so route both to the same
-  // place instead of leaving a second, confusingly similar option that
-  // shows the wrong repository's history.
+  // "Submodule Branch Map" button already gives. Rather than leave two
+  // identically-behaving buttons on the same row, "View history" itself is
+  // hidden for a submodule entry (see the context-actions template above) —
+  // this branch stays only as a defensive fallback in case something else
+  // still dispatches 'history' for a submodule.
   if (action === 'history') return entry.kind === 'submodule' ? openSubmoduleGraph(entry) : showSelectedHistory();
   if (action === 'commit') return openScopeCommit();
   if (action === 'versions') return await openSubmoduleMenu(entry, innerWidth - 480, 110);
@@ -1526,7 +1577,12 @@ async function handleDetailAction(action, entry, button) {
   if (action === 'subrefchanges') return showSubmoduleReferenceChanges(entry);
   // A submodule isn't a folder inside the parent — "Open on server" on one
   // must go to the submodule's own repository (a sibling of the parent when
-  // its .gitmodules URL is relative), never <parent-url>/tree/…/<path>.
+  // its .gitmodules URL is relative), never <parent-url>/tree/…/<path>. For a
+  // submodule this behaves identically to the dedicated "Open submodule
+  // repository ↗" button below, so "Open on server" itself is hidden there
+  // (see the context-actions template above) rather than leave two
+  // identical buttons on the same row; this branch stays only as a
+  // defensive fallback.
   if (action === 'server') return openEntryOnServer(entry, entry.kind === 'submodule');
   if (action === 'subserver') return openEntryOnServer(entry, true);
   if (action === 'location') return replaceSubmoduleLocation(entry);
@@ -2514,8 +2570,20 @@ function updateStashUI() {
   const relativePath = stashBoundaryForCurrentView();
   const name = state.submoduleGraph?.repository?.name || relativePath?.split('/').pop() || state.repository?.name || 'project';
   const isSubmodule = Boolean(relativePath);
-  $('#stashWorkTitle').textContent = isSubmodule ? `Stash ${name} work` : 'Stash project work';
-  $('#stashWorkSubtitle').textContent = isSubmodule ? 'This submodule only' : 'Main project only';
+  // Moved next to the other folder-scope actions (Commit folder, Add
+  // submodule) — its own label stays the short, static "Stash folder" that
+  // matches those siblings' style; the context (which repository this
+  // actually targets, never just the current folder within one — see its
+  // own base title text) lives in the tooltip instead, same place the
+  // scope it targets already lived for every other button in that row.
+  $('#stashWork').title = `Stash changes in the current repository — sets aside uncommitted changes only in ${isSubmodule ? `the ${name} submodule` : 'the main project'} you are currently browsing (not just this one folder). A parent project and each submodule have separate stashes.`;
+  // Same rule as every other button in that row (Commit folder, Add
+  // submodule, History, Changes in folder) — without this it was the one
+  // button left stranded alone in an otherwise-empty toolbar the moment you
+  // left Explorer for Graph/Folder Sync/Remotes. The Ctrl+Shift+S shortcut
+  // still works everywhere regardless — that's calling stashWork() directly,
+  // never gated on this element's visibility.
+  $('#stashWork').hidden = state.view !== 'explorer' || !state.repository;
   $('#stashListSubtitle').textContent = isSubmodule ? `View saved work in ${name}` : 'View saved project work';
   $('#stashWork').disabled = !state.repository || Boolean(state.activeSubmodule && !state.activeSubmodule.statusReady);
   $('#popStash').disabled = !state.repository;

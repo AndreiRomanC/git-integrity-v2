@@ -1,6 +1,6 @@
 use serde::Serialize;
 use git2::{BranchType, ObjectType, Oid, Repository, Sort, Status, StatusOptions};
-use std::{collections::{HashMap, HashSet}, fs, path::{Component, Path, PathBuf}, process::Command, sync::{Arc, Mutex, OnceLock}, time::{Instant, Duration, UNIX_EPOCH}};
+use std::{collections::{HashMap, HashSet, VecDeque}, fs, path::{Component, Path, PathBuf}, process::Command, sync::{Arc, Mutex, OnceLock}, time::{Instant, Duration, UNIX_EPOCH}};
 
 pub mod stash;
 pub mod branches;
@@ -830,6 +830,44 @@ fn run_with_timeout_labeled(mut command: Command, timeout: Duration, program_lab
     }
 }
 
+// A short, discreet trail of the actual git commands this app just ran on
+// the user's behalf — for the status bar's own quiet "what just happened"
+// hint and its double-click history, not a replacement for the Terminal's
+// own transcript (which already covers commands the *user* typed directly;
+// recording here is scoped to this one shared helper specifically so it
+// never doubles up with that). Bounded so a long session can't grow this
+// without limit; oldest entries are simply dropped.
+const RECENT_GIT_COMMANDS_LIMIT: usize = 50;
+static RECENT_GIT_COMMANDS: OnceLock<Mutex<VecDeque<(String, String, Instant, bool)>>> = OnceLock::new();
+
+fn recent_git_commands_store() -> &'static Mutex<VecDeque<(String, String, Instant, bool)>> {
+    RECENT_GIT_COMMANDS.get_or_init(|| Mutex::new(VecDeque::new()))
+}
+
+fn record_git_command(path: &str, args: &[&str], success: bool) {
+    // The repository/submodule this ran against, not its full (possibly
+    // anonymization-worthy) path — just enough to tell two concurrent
+    // targets apart at a glance.
+    let repo_hint = Path::new(path).file_name().and_then(|name| name.to_str()).unwrap_or(path).to_string();
+    let command = format!("git {}", args.join(" "));
+    let mut store = recent_git_commands_store().lock().unwrap();
+    if store.len() >= RECENT_GIT_COMMANDS_LIMIT { store.pop_front(); }
+    store.push_back((repo_hint, command, Instant::now(), success));
+}
+
+#[derive(Serialize)]
+pub struct RecentGitCommand { repo_hint: String, command: String, seconds_ago: f64, success: bool }
+
+// Newest first. Read fresh on demand (no push/event channel) — this is a
+// deliberately low-stakes, glanceable feature, not something that needs to
+// stay open a socket for.
+#[tauri::command]
+pub fn recent_git_commands() -> Vec<RecentGitCommand> {
+    recent_git_commands_store().lock().unwrap().iter().rev()
+        .map(|(repo_hint, command, when, success)| RecentGitCommand { repo_hint: repo_hint.clone(), command: command.clone(), seconds_ago: when.elapsed().as_secs_f64(), success: *success })
+        .collect()
+}
+
 fn git(path: &str, args: &[&str]) -> Result<String, String> {
     let mut command = Command::new("git");
     // `-c` overrides must come before the subcommand to be recognized as
@@ -838,7 +876,17 @@ fn git(path: &str, args: &[&str]) -> Result<String, String> {
     // subcommand), not after.
     configure_git_command(&mut command);
     command.arg("-C").arg(path).arg("-c").arg("color.ui=false").args(args);
-    let output = run_with_timeout(command)?;
+    // A spawn failure or a timeout (run_with_timeout's own Err cases) is
+    // exactly the kind of event the command history most needs to explain —
+    // record it as a failure here too, not only the "ran, exited non-zero"
+    // case below, so a hung command (the exact failure mode that motivated
+    // this log in the first place) never leaves a silent gap right when it
+    // would matter most.
+    let output = match run_with_timeout(command) {
+        Ok(output) => output,
+        Err(error) => { record_git_command(path, args, false); return Err(error); }
+    };
+    record_git_command(path, args, output.status.success());
     if output.status.success() { Ok(String::from_utf8_lossy(&output.stdout).into_owned()) }
     else { Err(String::from_utf8_lossy(&output.stderr).trim().to_string()) }
 }
@@ -6054,6 +6102,59 @@ mod tests {
         let tree_id = index.write_tree().unwrap(); let tree = repo.find_tree(tree_id).unwrap();
         let signature = git2::Signature::now("Test User", "test@example.com").unwrap();
         repo.commit(Some("HEAD"), &signature, &signature, "Initial commit", &tree, &[]).unwrap();
+    }
+
+    // The two tests below are the only ones that touch RECENT_GIT_COMMANDS
+    // (a process-global static shared across this whole test binary's
+    // threads) — serialized against *each other* only, so the tight,
+    // in-memory eviction loop in the second can never race the slow,
+    // real-subprocess first one out of the buffer before it gets read back.
+    // Without this, that's a genuine intermittent flake: 50+ fast pushes
+    // easily fit inside the time a real `git` child process takes to spawn
+    // and exit. unwrap_or_else recovers from poisoning instead of letting a
+    // panic in one cascade into a spurious failure in the other.
+    static RECENT_GIT_COMMANDS_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    // The status bar's own quiet command hint and its double-click history —
+    // report: show the real git commands the app runs, not just its own
+    // human-readable status messages. Scoped to the shared git() helper only
+    // (never the Terminal's own subprocess call), so a command the user
+    // types there is never double-recorded here too.
+    #[test]
+    fn git_helper_calls_are_recorded_for_the_status_bars_own_command_history() {
+        let _guard = RECENT_GIT_COMMANDS_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let repository = std::env::temp_dir().join(format!("git-integrity-recent-commands-{suffix}"));
+        create_libgit2_repository(&repository, "file.txt");
+        let repo_path = repository.to_string_lossy().into_owned();
+
+        // A unique, unmistakable subcommand — real fixture helpers elsewhere
+        // (run_git/run_git_capture) call the system git binary directly, not
+        // through this app's own git() helper, so this cannot pick up noise
+        // from any other concurrently-running test doing ordinary setup.
+        git(&repo_path, &["rev-parse", "--is-inside-work-tree"]).unwrap();
+
+        let recorded = recent_git_commands();
+        let mine = recorded.iter().find(|entry| entry.command == "git rev-parse --is-inside-work-tree" && entry.repo_hint == repository.file_name().unwrap().to_str().unwrap())
+            .expect("the git() call above must be recorded, with the repository's own directory name as its hint");
+        assert!(mine.success, "a command that actually succeeded must be recorded as such");
+        assert!(mine.seconds_ago >= 0.0 && mine.seconds_ago < 30.0, "should report as just having happened, got {}s ago", mine.seconds_ago);
+
+        fs::remove_dir_all(repository).unwrap();
+    }
+
+    #[test]
+    fn recent_git_commands_never_grows_past_its_bound() {
+        let _guard = RECENT_GIT_COMMANDS_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Exercises record_git_command directly (not real subprocesses) —
+        // this only needs to prove the bound holds, not re-prove git() itself
+        // works, and avoids spawning dozens of real git processes plus
+        // adding that much unrelated noise to the same process-global store
+        // every other test in this file also shares.
+        for _ in 0..(RECENT_GIT_COMMANDS_LIMIT + 20) {
+            record_git_command("/tmp/does-not-need-to-exist", &["status"], true);
+        }
+        assert!(recent_git_commands_store().lock().unwrap().len() <= RECENT_GIT_COMMANDS_LIMIT, "must never grow without bound across a long session");
     }
 
     #[test]

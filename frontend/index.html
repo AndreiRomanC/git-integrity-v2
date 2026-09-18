@@ -54,7 +54,6 @@
         </button>
         <button class="workspace-status publish-status" id="showPublish"><span class="publish-dot">↑</span><span><strong>Unpublished</strong><small id="publishSubtitle">Choose what goes to server</small></span><b id="publishBadge">?</b></button>
         <button class="workspace-status" id="mergeConflictsBanner" data-tooltip="A merge is waiting for you to resolve conflicts" title="Resolve merge conflicts" hidden><span class="workspace-dot" style="background:#f06d75;"></span><span><strong>Merge conflicts</strong><small id="mergeConflictsSubtitle">0 files to resolve</small></span></button>
-        <button class="workspace-status" id="stashWork" data-tooltip="Sets aside uncommitted changes only in the repository you are currently browsing. A parent project and each submodule have separate stashes." title="Stash changes in the current repository"><span class="workspace-dot" style="background:#b294ff;"></span><span><strong id="stashWorkTitle">Stash project work</strong><small id="stashWorkSubtitle">Main project only</small></span></button>
         <button class="workspace-status" id="popStash" data-tooltip="Opens the stash list for the repository you are currently browsing. A parent project and each submodule have separate stash lists." title="View stashes for the current repository"><span class="workspace-dot" style="background:#48cc7e;"></span><span><strong>Stashes</strong><small id="stashListSubtitle">View saved project work</small></span></button>
 
         <div class="side-heading pr-status-heading" id="togglePrStatus" title="Pull request status for the PARENT project's currently checked-out branch — always the parent, never a submodule. Opens disconnected and checks only when you press Connect or Refresh."><span class="branch-heading-arrow" id="prStatusArrow">▸</span><span>PROJECT PULL REQUEST</span></div>
@@ -86,6 +85,7 @@
             <button class="scope-action folder-changes-action" id="showFolderChanges">Changes in folder</button>
             <button class="scope-action" id="runCurrentUtrud" title="Launch UTRUD for the current r folder (Windows only)" hidden>▶ Run UTRUD</button>
             <button class="scope-action" id="addSubmodule">＋ Add submodule</button>
+            <button class="scope-action" id="stashWork" title="Stash changes in the current repository — sets aside uncommitted changes only in the repository you are currently browsing (the whole parent project, or the submodule you're currently inside — not just this one folder). A parent project and each submodule have separate stashes.">Stash folder</button>
             <button class="scope-action primary" id="commitScope">Commit folder</button>
             <button class="icon-action" id="goUp" title="Parent folder">↑</button>
             <button class="icon-action" id="reloadFolder" title="Reload folder">↻</button>
@@ -206,8 +206,9 @@
       <footer id="submoduleVersionHelp" class="version-help">Use Checkout to change version. “Discard local work…” is a destructive recovery action shown only for a branch that differs from origin.</footer>
     </section>
 
-    <footer>
+    <footer id="statusFooter" title="Double-click for recent command history">
       <span id="statusDot" class="status-dot"></span><span id="statusText">Ready</span>
+      <code id="statusCommandHint" class="status-command-hint" hidden></code>
       <span class="footer-spacer"></span><span class="branch-footer">⑂ <b id="currentBranch">No branch</b></span>
       <span class="build-footer" id="buildInfo" title="The exact commit this build was compiled from — check this before reporting a bug as unfixed">build —</span>
     </footer>
@@ -549,6 +550,13 @@
     <form method="dialog">
       <header><div><h2 id="stashesTitle">Stashes</h2><p id="stashesSubtitle">Restore copies only the selected file; the stash stays as a backup until you explicitly drop it.</p></div><button type="button" id="refreshStashes" title="Re-check with the actual state on disk">↻</button><button value="cancel">×</button></header>
       <div id="stashesList" class="conflicts-list"></div>
+      <footer><span style="flex:1"></span><button value="cancel">Close</button></footer>
+    </form>
+  </dialog>
+  <dialog id="commandHistoryDialog" class="publish-dialog">
+    <form method="dialog">
+      <header><div><h2>Recent commands</h2><p>The actual git commands this app just ran on your behalf — not what you type in Terminal, which already keeps its own transcript.</p></div><button value="cancel">×</button></header>
+      <div id="commandHistoryList" class="conflicts-list"></div>
       <footer><span style="flex:1"></span><button value="cancel">Close</button></footer>
     </form>
   </dialog>

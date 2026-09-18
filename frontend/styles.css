@@ -730,6 +730,25 @@ button.pr-reviewer:hover { border-color: #59758e; background: #1b2b38; color: #e
 footer { display: flex; align-items: center; gap: 8px; padding: 0 12px; background: #0b1015; border-top: 1px solid var(--border); color: #7f8f9f; font-size: 11px; }
 .footer-spacer { flex: 1; }.status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); }.status-dot.error { background: var(--red); }.status-dot.busy { background: var(--amber); }.branch-footer { padding-left: 14px; border-left: 1px solid var(--border); }.branch-footer b { color: #a8b8c7; }
 .build-footer { padding-left: 14px; border-left: 1px solid var(--border); font-family: ui-monospace, monospace; color: #5c6b7a; }
+/* Deliberately quieter than the status text next to it — a passing trace of
+   what the app just ran, not something meant to compete for attention.
+   Ellipsis-truncated so a long command can never push the branch/build
+   footer segments around; double-click the footer for the full history. */
+.status-command-hint { min-width: 0; max-width: 340px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding-left: 10px; font: 10px ui-monospace, SFMono-Regular, Consolas, monospace; color: #4c5a68; cursor: default; }
+.status-command-hint.status-command-failed { color: #8a5a5f; }
+#statusFooter { cursor: default; user-select: none; }
+/* Recent-commands dialog rows: a plain 2-column read history (icon,
+   content) — its own class rather than reusing .publish-commit, whose grid
+   expects 4 children (checkbox/index, dot, 1fr content, badge) and whose
+   .excluded modifier means "de-prioritized", not "failed". */
+.command-history-row { display: grid; grid-template-columns: 20px 1fr; align-items: center; gap: 9px; padding: 7px 11px; border-bottom: 1px solid var(--border-soft); }
+.command-history-row:last-child { border-bottom: 0; }
+.command-history-row > span { text-align: center; font-size: 11px; color: var(--muted); }
+.command-history-row div { min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+.command-history-row strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; font-weight: 500; }
+.command-history-row small { color: #728595; font-size: 9px; }
+.command-history-row.failed > span { color: var(--red); }
+.command-history-row.failed strong { color: #d99aa0; }
 
 dialog { width: 430px; border: 1px solid #465563; border-radius: 10px; padding: 0; background: #19222c; color: var(--text); box-shadow: 0 25px 80px #000b; }
 dialog::backdrop { background: #05080cbf; }.dialog-symbol { display: grid; place-items: center; width: 48px; height: 48px; margin: 0 auto 16px; border-radius: 50%; background: #203f5d; color: var(--blue); font-size: 24px; }

@@ -64,3 +64,39 @@ test('Reset to upstream is reachable for a submodule that is only dirty, not jus
   // the active checkout right now.
   assert.match(app, /dirty: item\.current && !!submoduleMenuEntry\?\.submodule_is_dirty/);
 });
+
+test('a submodule row does not show a generic action next to its identically-behaving dedicated one', () => {
+  // "View history"/"Open on server" and "Submodule Branch Map"/"Open
+  // submodule repository ↗" call the exact same function with the exact
+  // same arguments for a submodule entry — report: two buttons doing one
+  // thing is confusing, keep only the more specifically labeled one.
+  assert.match(app, /entry\.kind === 'submodule' \? '' : '<button data-detail-action="server">Open on server ↗<\/button>'/);
+  assert.match(app, /entry\.kind === 'submodule' \? '' : '<button data-detail-action="history">View history<\/button>'/);
+});
+
+test('the status bar quietly shows the last real git command, and the footer opens its full history on double-click', () => {
+  // 'busy' means the action is still in flight — the command that will
+  // explain it hasn't been recorded on the backend yet, so refreshing then
+  // would show last time's stale command instead of this one's.
+  assert.match(app, /function status\(message, kind = ''\) \{[\s\S]*?if \(kind !== 'busy'\) refreshCommandHint\(\);/);
+  assert.match(app, /async function refreshCommandHint\(\)[\s\S]*?invoke\('recent_git_commands'\)/);
+  assert.match(app, /refs\.statusFooter\.addEventListener\('dblclick', openCommandHistoryDialog\)/);
+  assert.match(html, /id="commandHistoryDialog"/);
+  assert.match(html, /id="statusCommandHint"/);
+  // Its own row, not a reuse of .publish-commit: that class assumes a
+  // 4-column grid (checkbox/index, dot, 1fr content, badge) built for a
+  // clickable, togglable push-commit list — neither applies to this plain,
+  // unclickable 2-column read history, and .excluded means "de-prioritized"
+  // there, the wrong signal for "this command failed".
+  assert.match(app, /function commandHistoryRowHtml\(entry\) \{[\s\S]*?class="command-history-row \$\{entry\.success \? '' : 'failed'\}"/);
+});
+
+test('Stash folder disappears with its Explorer row-mates outside Explorer, never left stranded alone', () => {
+  // Every other button in that toolbar row (Commit folder, Add submodule,
+  // History, Changes in folder) already hides whenever state.view isn't
+  // 'explorer' — before this, Stash folder was the one left behind, alone,
+  // in an otherwise-empty header the moment you switched to Graph/Folder
+  // Sync/Remotes. The Ctrl+Shift+S shortcut calls stashWork() directly, so
+  // it stays reachable everywhere regardless of this element's visibility.
+  assert.match(app, /\$\('#stashWork'\)\.hidden = state\.view !== 'explorer' \|\| !state\.repository;/);
+});

@@ -61,6 +61,7 @@ pub fn run() {
             repository::publish_status,
             repository::publish_branch,
             repository::submodule_publish_risks,
+            repository::recent_git_commands,
             repository::submodule_repository,
             repository::stash::stash_changes,
             repository::stash::stash_file,
