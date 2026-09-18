@@ -684,6 +684,13 @@ pub struct SubmoduleVersion {
     // ancestry context for detached HEAD, not a claim that HEAD is attached.
     contains_current: bool,
     commits_after_current: Option<usize>,
+    // Only populated for kind == "commit": known branches whose tip contains
+    // *this specific* commit (never just the active checkout — see
+    // contains_current above for that, a different question). Sorted
+    // closest-tip-first, same ordering as current_containing_branches below.
+    // Lets the History list answer "which branch is this old commit even
+    // on?" for any row, not only the one currently checked out.
+    containing_branches: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -4328,6 +4335,26 @@ fn validate_submodule(repository_path: &str, relative_path: &str) -> Result<Path
     Ok(absolute)
 }
 
+// Which of the known branch/remote tips contain `target`, closest tip first.
+// Reused both for "current_containing_branches" (target = the active
+// checkout) and for each row in the bounded commit-history list below
+// (target = that row's own commit) — same question, just asked about a
+// different commit each time. graph_ahead_behind is a pure in-memory graph
+// walk over commits already loaded for this repository, not filesystem I/O,
+// so repeating it once per (history commit × known tip) stays cheap even for
+// the full 100-commit history window this is bounded to.
+fn branches_containing_commit(repo: &Repository, tips: &[(String, git2::Oid, bool)], target: git2::Oid) -> Vec<String> {
+    let mut containing: Vec<(&str, bool, usize)> = tips.iter().filter_map(|(name, tip, is_local)| {
+        let (ahead, behind) = repo.graph_ahead_behind(*tip, target).ok()?;
+        (behind == 0).then_some((name.as_str(), *is_local, ahead))
+    }).collect();
+    // Prefer the closest containing tip. At equal distance, a local branch is
+    // more useful than its remote-tracking duplicate because the user can
+    // attach HEAD to it directly.
+    containing.sort_by(|left, right| (left.2, !left.1, left.0).cmp(&(right.2, !right.1, right.0)));
+    containing.into_iter().map(|(name, _, _)| name.to_string()).collect()
+}
+
 #[tauri::command]
 pub async fn submodule_versions(repository_path: String, relative_path: String) -> Result<SubmoduleVersions, String> {
     off_main_thread(move || submodule_versions_inner(repository_path, relative_path)).await
@@ -4391,7 +4418,7 @@ fn submodule_versions_inner(repository_path: String, relative_path: String) -> R
             versions.push(SubmoduleVersion {
                 name: name.clone(), revision: oid.to_string(), kind: kind.into(), current: kind == "branch" && name == current_branch,
                 subject: commit.summary().unwrap_or("").into(), author: commit.author().name().unwrap_or("Unknown").into(), date: short_date(commit.time().seconds()),
-                attached_branch: None, upstream, ahead, behind, contains_current, commits_after_current,
+                attached_branch: None, upstream, ahead, behind, contains_current, commits_after_current, containing_branches: Vec::new(),
             });
         }
     }
@@ -4406,26 +4433,21 @@ fn submodule_versions_inner(repository_path: String, relative_path: String) -> R
                 current: commit.id().to_string() == current_revision,
                 subject: commit.summary().unwrap_or("").into(), author: commit.author().name().unwrap_or("Unknown").into(),
                 date: short_date(commit.time().seconds()), attached_branch: branch_tip_names.get(&commit.id().to_string()).cloned(),
-                upstream: None, ahead: None, behind: None, contains_current: false, commits_after_current: None,
+                upstream: None, ahead: None, behind: None, contains_current: false, commits_after_current: None, containing_branches: Vec::new(),
             });
         }
     }
-    // Prefer the closest containing tip. At equal distance, a local branch
-    // is more useful than its remote-tracking duplicate because the user can
-    // attach HEAD to it directly. This avoids selecting an arbitrary first
-    // branch such as IMS.VITESCO.IO_master when *_errm_common_hip is the
-    // closer context for the active commit.
-    let mut containing = known_branch_tips.iter().filter(|(_, _, _, distance)| distance.is_some()).collect::<Vec<_>>();
-    containing.sort_by(|left, right| {
-        let left_key = (left.3.unwrap_or(usize::MAX), if left.2 { 0 } else { 1 }, left.0.as_str());
-        let right_key = (right.3.unwrap_or(usize::MAX), if right.2 { 0 } else { 1 }, right.0.as_str());
-        left_key.cmp(&right_key)
-    });
-    let current_containing_branches = containing.iter().map(|(name, _, _, _)| name.clone()).collect::<Vec<_>>();
+    let branch_tips_simple: Vec<(String, git2::Oid, bool)> = known_branch_tips.iter().map(|(name, oid, is_local, _)| (name.clone(), *oid, *is_local)).collect();
+    let current_containing_branches = current_oid.map(|oid| branches_containing_commit(&repo, &branch_tips_simple, oid)).unwrap_or_default();
     let history_context_branch = if current_branch.is_empty() { current_containing_branches.first().cloned().unwrap_or_default() } else { current_branch.clone() };
     let history_start = known_branch_tips.iter().find(|(name, _, _, _)| name == &history_context_branch).map(|(_, oid, _, _)| *oid).or(current_oid);
     let mut walk = repo.revwalk().map_err(|error| error.message().to_string())?; let _ = walk.set_sorting(Sort::TIME); if let Some(oid) = history_start { let _ = walk.push(oid); }
-    for oid in walk.flatten().take(HISTORY_LIMIT) { if let Ok(commit) = repo.find_commit(oid) { versions.push(SubmoduleVersion { name: oid.to_string()[..8].into(), revision: oid.to_string(), kind: "commit".into(), current: oid.to_string() == current_revision, subject: commit.summary().unwrap_or("").into(), author: commit.author().name().unwrap_or("Unknown").into(), date: short_date(commit.time().seconds()), attached_branch: None, upstream: None, ahead: None, behind: None, contains_current: false, commits_after_current: None }); } }
+    for oid in walk.flatten().take(HISTORY_LIMIT) {
+        if let Ok(commit) = repo.find_commit(oid) {
+            let containing_branches = branches_containing_commit(&repo, &branch_tips_simple, oid);
+            versions.push(SubmoduleVersion { name: oid.to_string()[..8].into(), revision: oid.to_string(), kind: "commit".into(), current: oid.to_string() == current_revision, subject: commit.summary().unwrap_or("").into(), author: commit.author().name().unwrap_or("Unknown").into(), date: short_date(commit.time().seconds()), attached_branch: None, upstream: None, ahead: None, behind: None, contains_current: false, commits_after_current: None, containing_branches });
+        }
+    }
     perf_log(&format!("submodule_versions: TOTAL ({} refs/commits, {} containing branches)", versions.len(), current_containing_branches.len()), started.elapsed());
     Ok(SubmoduleVersions { path: relative_path, current_revision, current_branch, parent_revision, current_containing_branches, history_context_branch, history_limit: HISTORY_LIMIT, versions })
 }
@@ -8883,6 +8905,49 @@ mod tests {
         let sub_repo = Repository::open(&sub_path).unwrap();
         assert!(sub_repo.head_detached().unwrap(), "checking out a tag must detach HEAD, exactly like `git checkout <tag>`");
         assert_eq!(sub_repo.head().unwrap().target().unwrap().to_string(), tip_commit, "HEAD must land on the commit the tag points at, not on the tag object itself");
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    // Report: containing_branches used to be computed only for the active
+    // checkout (current_containing_branches, a single value for the whole
+    // response) — every other row in the History list had no way to answer
+    // "what branch is this old commit even on?". Now computed per commit row.
+    #[test]
+    fn submodule_versions_reports_which_branches_contain_each_history_commit_not_only_the_current_one() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-containing-branches-{suffix}"));
+        let repository = base.join("main");
+        let dependency = base.join("dependency");
+        create_libgit2_repository(&repository, "README.md");
+        create_libgit2_repository(&dependency, "module.txt");
+        run_git(&repository, &["-c", "protocol.file.allow=always", "submodule", "add", dependency.to_str().unwrap(), "vendor/dep"]);
+        run_git(&repository, &["commit", "-am", "Add dep submodule"]);
+        let repo_path = repository.to_string_lossy().into_owned();
+        let sub_path = repository.join("vendor/dep");
+        let default_branch = Repository::open(&sub_path).unwrap().head().unwrap().shorthand().unwrap().to_string();
+        let shared_ancestor = Repository::open(&sub_path).unwrap().head().unwrap().target().unwrap().to_string();
+
+        // "feature" branches off the shared ancestor and never advances
+        // further — the default branch alone gets a second, newer commit.
+        run_git(&sub_path, &["branch", "feature"]);
+        fs::write(sub_path.join("module.txt"), "v2").unwrap();
+        run_git(&sub_path, &["commit", "-am", "Only on the default branch"]);
+        let default_only_commit = Repository::open(&sub_path).unwrap().head().unwrap().target().unwrap().to_string();
+
+        let versions = submodule_versions_inner(repo_path, "vendor/dep".into()).unwrap();
+        let shared_row = versions.versions.iter().find(|v| v.kind == "commit" && v.revision == shared_ancestor).expect("the shared ancestor must be in the bounded history");
+        let mut shared_branches = shared_row.containing_branches.clone();
+        shared_branches.sort();
+        // Also contains the remote-tracking branch git submodule add's own
+        // clone step creates (origin/master, still parked at this same
+        // commit since nothing has fetched or pushed since).
+        let mut expected = vec![default_branch.clone(), "feature".to_string(), format!("origin/{default_branch}")];
+        expected.sort();
+        assert_eq!(shared_branches, expected, "a commit reachable from multiple branch tips must list all of them, not only whichever happens to be current");
+
+        let newer_row = versions.versions.iter().find(|v| v.kind == "commit" && v.revision == default_only_commit).expect("the newer, default-branch-only commit must be in history too");
+        assert_eq!(newer_row.containing_branches, vec![default_branch], "a commit only 'feature' never advanced to must not claim feature contains it");
 
         fs::remove_dir_all(base).unwrap();
     }

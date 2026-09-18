@@ -1238,12 +1238,11 @@ function renderSubmoduleVersions() {
       + (remoteRows.length ? `<div class="version-section-heading">REMOTE ONLY</div>${remoteRows.map(renderBranch).join('')}` : '');
     html = currentContext + (rows || `<div class="version-loading">${query ? 'No matches' : 'No branches found'}</div>`);
   } else {
+    // containing_branches now comes straight from the backend for every
+    // commit row (not just the active checkout) — see submodule_versions_inner.
     const versions = submoduleMenuData.versions
       .filter(item => versionFilter === 'tag' ? item.kind === 'tag' : item.kind === 'commit')
-      .filter(matches)
-      .map(item => item.kind === 'commit' && item.current
-        ? { ...item, context_branches: submoduleContainingBranchCandidates(submoduleMenuData).map(branch => branch.name) }
-        : item);
+      .filter(matches);
     const rows = versions.map(submoduleVersionRowHtml).join('') || `<div class="version-loading">${query ? 'No matches' : versionFilter === 'tag' ? 'No tags in this submodule' : 'No versions found'}</div>`;
     const historyContext = submoduleMenuData.history_context_branch
       ? `History of ${submoduleMenuData.history_context_branch}. The active checkout is marked CURRENT even when it is inside the branch rather than at its tip.`

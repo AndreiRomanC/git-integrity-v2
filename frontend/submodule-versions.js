@@ -154,9 +154,14 @@ function submoduleVersionRowHtml(item) {
   } else if (item.kind === 'branch') {
     upstreamState = '<span class="version-upstream-state version-no-upstream">LOCAL · no upstream configured</span>';
   }
-  const commitBranches = Array.isArray(item.context_branches) ? item.context_branches : [];
-  const commitBranchContext = item.kind === 'commit' && item.current && commitBranches.length
-    ? `<span class="version-attached-branch">contained in ⑂ ${esc(commitBranches.slice(0, 2).join(', '))}${commitBranches.length > 2 ? ` +${commitBranches.length - 2}` : ''}</span>`
+  // Backend-computed for every commit row (not just the active checkout) —
+  // which known branch(es), if any, actually contain this exact commit. The
+  // question this answers ("what branch is this old commit even on?") only
+  // makes sense while looking at History; a branch/tag row already names
+  // itself, so this is commit-only.
+  const commitBranches = Array.isArray(item.containing_branches) ? item.containing_branches : [];
+  const commitBranchContext = item.kind === 'commit'
+    ? `<span class="version-attached-branch">${commitBranches.length ? `contained in ⑂ ${esc(commitBranches.slice(0, 2).join(', '))}${commitBranches.length > 2 ? ` +${commitBranches.length - 2}` : ''}` : 'no known branch contains this commit'}</span>`
     : '';
   const rowContext = item.kind === 'tag'
     ? `<span class="version-attached-branch">${item.attached_branch ? `on ⑂ ${esc(item.attached_branch)}` : 'no branch here (detached)'}</span>`

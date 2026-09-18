@@ -135,14 +135,32 @@ test('detached context offers explicit switch actions ordered by nearest useful 
   assert.equal((html.match(/data-switch-version/g) || []).length, 2);
 });
 
-test('the active commit row names branches that contain it without claiming attachment', () => {
+test('a commit row names branches that contain it without claiming attachment', () => {
   const html = submoduleVersionRowHtml({
     name: '11111111', kind: 'commit', revision: '11111111aaaa', current: true,
     subject: 'Detached change', author: 'A', date: '2026-09-15',
-    context_branches: ['feature/errm_common_hip', 'origin/feature/errm_common_hip'],
+    containing_branches: ['feature/errm_common_hip', 'origin/feature/errm_common_hip'],
   });
   assert.match(html, /contained in ⑂ feature\/errm_common_hip, origin\/feature\/errm_common_hip/);
   assert.match(html, /COMMIT \(detached\)/);
+});
+
+test('this also answers "what branch is it on" for an older commit, not only the active checkout', () => {
+  const html = submoduleVersionRowHtml({
+    name: '22222222', kind: 'commit', revision: '22222222bbbb', current: false,
+    subject: 'An older commit further back in History', author: 'A', date: '2026-08-01',
+    containing_branches: ['develop'],
+  });
+  assert.match(html, /contained in ⑂ develop/);
+});
+
+test('a commit that no known branch contains says so plainly, instead of silently omitting the row context', () => {
+  const html = submoduleVersionRowHtml({
+    name: '33333333', kind: 'commit', revision: '33333333cccc', current: false,
+    subject: 'Only reachable through a tag', author: 'A', date: '2025-01-01',
+    containing_branches: [],
+  });
+  assert.match(html, /no known branch contains this commit/);
 });
 
 test('submodule search includes SHA, subject, author and date from the loaded response', () => {
