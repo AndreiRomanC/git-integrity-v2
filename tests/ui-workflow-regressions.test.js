@@ -56,3 +56,11 @@ test('a submodule row shows its attached branch or detached state, only when act
   assert.match(app, /entry\.submodule_current_branch \? `Independent Git repository · \$\{entry\.submodule_current_branch\}` : 'Independent Git repository · detached'/);
   assert.match(app, /entry\.kind === 'submodule' \? esc\(submoduleHeadHint\(entry\)\)/);
 });
+
+test('Reset to upstream is reachable for a submodule that is only dirty, not just ahead/behind', () => {
+  // submodule_is_dirty is already computed by load_directory for this exact
+  // row whenever there was anything to explain — reused here instead of a
+  // second, new check, and only meaningful for whichever branch is actually
+  // the active checkout right now.
+  assert.match(app, /dirty: item\.current && !!submoduleMenuEntry\?\.submodule_is_dirty/);
+});

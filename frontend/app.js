@@ -1233,7 +1233,12 @@ function renderSubmoduleVersions() {
     const { local, remoteOnly } = groupSubmoduleBranchVersions(submoduleMenuData.versions);
     const localRows = local.filter(matches);
     const remoteRows = remoteOnly.filter(matches);
-    const renderBranch = item => submoduleVersionRowHtml({ ...item, checkout_detached: detached });
+    // Reset to upstream's own gate also needs to know about a dirty working
+    // tree, not just committed ahead/behind divergence — submodule_is_dirty
+    // (already computed for this exact row by load_directory, whenever there
+    // was anything here to explain) is the same signal the Explorer's own
+    // "Modified"/"New version" distinction already relies on.
+    const renderBranch = item => submoduleVersionRowHtml({ ...item, checkout_detached: detached, dirty: item.current && !!submoduleMenuEntry?.submodule_is_dirty });
     const rows = localRows.map(renderBranch).join('')
       + (remoteRows.length ? `<div class="version-section-heading">REMOTE ONLY</div>${remoteRows.map(renderBranch).join('')}` : '');
     html = currentContext + (rows || `<div class="version-loading">${query ? 'No matches' : 'No branches found'}</div>`);

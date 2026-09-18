@@ -263,6 +263,15 @@ test('destructive remote matching is offered only for the active branch', () => 
 
   const synced = submoduleVersionRowHtml({ name: 'main', kind: 'branch', revision: 'cccccccc1234', subject: 'Synced', author: 'A', date: '2026-09-13', current: true, upstream: 'origin/main', ahead: 0, behind: 0 });
   assert.doesNotMatch(synced, /data-reset-upstream/);
+
+  // Report: a submodule with only uncommitted local edits (no divergent
+  // commits at all — ahead/behind both 0) had no way to reach "Discard
+  // local work…" from here, even though the backend already handles this
+  // exact case (see reset_submodule_branch_to_upstream_inner's own dirty
+  // handling) whenever the target is the currently active branch.
+  const dirtyOnly = submoduleVersionRowHtml({ name: 'main', kind: 'branch', revision: 'eeeeeeee1234', subject: 'Dirty but not diverged', author: 'A', date: '2026-09-13', current: true, upstream: 'origin/main', ahead: 0, behind: 0, dirty: true });
+  assert.match(dirtyOnly, /data-reset-upstream/, 'a purely dirty active branch must still offer Discard local work, not only a committed-ahead/behind one');
+  assert.match(dirtyOnly, /a purely dirty working tree with no divergent commits/);
 });
 
 test('a branch without upstream is explicitly local and does not show invented counts', () => {
