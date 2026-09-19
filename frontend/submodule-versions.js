@@ -166,6 +166,13 @@ function submoduleVersionRowHtml(item) {
   const rowContext = item.kind === 'tag'
     ? `<span class="version-attached-branch">${item.attached_branch ? `on ⑂ ${esc(item.attached_branch)}` : 'no branch here (detached)'}</span>`
     : item.kind === 'commit' ? commitBranchContext : upstreamState;
+  // Report: "matches upstream" next to a destructive "Discard local work…"
+  // button reads as a contradiction — nothing here said *why* the button was
+  // still offered. It's this: canResetToUpstream below also fires on a
+  // purely dirty working tree, which "matches upstream" (a branch-tip
+  // comparison) says nothing about either way. Surface that plainly instead
+  // of leaving it to the button's own hover tooltip to explain.
+  const dirtyNote = item.dirty ? '<span class="version-dirty-note" title="Uncommitted changes on disk in this submodule right now — independent of whether the commit above has been pushed anywhere">● Uncommitted changes present</span>' : '';
   // Destructive reset is only offered for the active branch. Uncommitted
   // work belongs to the current working tree, not to an inactive branch row;
   // making the user Checkout first keeps the target and consequence explicit.
@@ -178,8 +185,16 @@ function submoduleVersionRowHtml(item) {
   // UI that could reach it either.
   const canResetToUpstream = item.kind === 'branch' && item.current && item.upstream
     && ((Number(item.ahead) || 0) > 0 || (Number(item.behind) || 0) > 0 || !!item.dirty);
+  // Report: "BRANCH TIP AHEAD · N commits to push" told the story, but the
+  // only button on the row was the destructive "Discard local work…" —
+  // reading as if throwing the new commit away were the suggested move.
+  // Offer the actual constructive counterpart right here too, ahead of (to
+  // the left of) Discard, whenever there is something to send.
+  const aheadCount = Number(item.ahead) || 0;
+  const canPushAhead = item.kind === 'branch' && item.current && item.upstream && aheadCount > 0;
   const actions = `<span class="version-row-actions">
     ${item.kind === 'commit' ? `<button type="button" class="version-tag-commit" data-tag-version title="Create a tag pointing exactly at commit ${esc(revision.slice(0, 8))}">Tag this commit…</button>` : ''}
+    ${canPushAhead ? `<button type="button" class="version-push-ahead" data-push-version title="Send ${aheadCount} local commit${aheadCount === 1 ? '' : 's'} on ${esc(item.name)} to ${esc(item.upstream)}">Push</button>` : ''}
     ${canResetToUpstream ? `<button type="button" class="version-reset-upstream" data-reset-upstream data-name="${esc(item.name)}" data-upstream="${esc(item.upstream)}" data-ahead="${Number(item.ahead) || 0}" data-behind="${Number(item.behind) || 0}" title="Destructive recovery for the active branch: discard its local-only commits and current uncommitted work (including a purely dirty working tree with no divergent commits), then replace it with ${esc(item.upstream)}">Discard local work…</button>` : ''}
     ${item.kind === 'branch' && item.checkout_detached ? '<span class="version-inactive-label">INACTIVE</span>' : ''}
     ${item.current ? '<span class="current-label">CURRENT</span>' : `<button type="button" class="version-checkout" data-switch-version>Checkout</button>`}
@@ -187,7 +202,7 @@ function submoduleVersionRowHtml(item) {
   return `<div class="version-row version-kind-${esc(item.kind)} ${item.name === 'origin/main' ? 'primary-remote' : ''} ${item.current ? 'current' : ''}" data-revision="${esc(revision)}" data-version-kind="${esc(item.kind)}" data-name="${esc(item.name)}">
     <span class="version-symbol">${symbol[item.kind] || '⑂'}</span>
     <span class="version-sha"><code>${esc(revision.slice(0, 8))}</code><span class="version-copy-sha" role="button" tabindex="0" title="Copy full SHA" data-copy-sha="${esc(revision)}">⧉</span></span>
-    <span class="version-name">${esc(item.name)}<b class="version-kind-badge">${esc(kindLabel[item.kind] || item.kind)}</b>${rowContext}</span>
+    <span class="version-name">${esc(item.name)}<b class="version-kind-badge">${esc(kindLabel[item.kind] || item.kind)}</b>${rowContext}${dirtyNote}</span>
     <span class="version-copy"><span class="version-subject">${esc(item.subject)}</span><span class="version-meta">${esc(item.author)} · ${esc(item.date)}</span></span>
     ${actions}
   </div>`;

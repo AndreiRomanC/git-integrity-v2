@@ -19,6 +19,11 @@
         <span class="repo-picker-copy"><strong id="repoName">Open a repository</strong><small id="repoPath">Choose an existing Git folder</small></span>
         <span class="chevron">⌄</span>
       </button>
+      <div id="repoPickerMenu" class="repo-picker-menu" hidden>
+        <button type="button" id="repoMenuOpen"><strong>Open repository…</strong><small>Choose an existing local Git folder</small></button>
+        <button type="button" id="repoMenuClone"><strong>Clone from server…</strong><small>Download a repository, optionally branch/submodules</small></button>
+        <button type="button" id="repoMenuCreate"><strong>Create repository…</strong><small>Initialize Git in a local folder</small></button>
+      </div>
       <div class="default-commit-bar" title="Pre-fills every commit message box below — still editable there before you commit">
         <input id="defaultCommitMessage" type="text" list="defaultCommitMessageHistory" placeholder="Default commit message (optional) — e.g. P:OMBMS-21610 - fix X" autocomplete="off">
         <datalist id="defaultCommitMessageHistory"></datalist>
@@ -220,10 +225,15 @@
       <div class="command-tabs">
         <button type="button" class="command-tab active" data-mode="console">Terminal</button>
         <button type="button" class="command-tab" data-mode="commands">App actions</button>
+        <button type="button" class="command-tab" data-mode="saved">Saved actions</button>
         <span class="command-tabs-spacer"></span>
         <button type="button" id="commandCopyTranscript" class="command-clear" title="Copy the complete terminal transcript" hidden>Copy all</button>
         <button type="button" id="commandClearTranscript" class="command-clear" title="Clear console history" hidden>Clear</button>
         <button type="button" id="closeCommandPalette" class="command-close" title="Close Terminal and App actions" aria-label="Close Terminal and App actions">×</button>
+      </div>
+      <div id="commandModeOptions" class="command-mode-options">
+        <span id="commandModeHint"></span>
+        <button type="button" id="commandAddSaved" class="command-clear" title="Save a reusable action made of one or more commands" hidden>＋ Save action</button>
       </div>
       <div id="terminalScopeBar" class="terminal-scope-bar" hidden>
         <span class="terminal-scope-caption">RUN IN</span>
@@ -260,6 +270,7 @@
     <h2 id="appPromptTitle">Enter value</h2>
     <p id="appPromptMessage"></p>
     <input type="text" id="appPromptInput" style="width:100%;height:38px;margin-top:6px;border:1px solid #405263;border-radius:6px;padding:0 10px;background:#0d151c;color:#d4e0ea;font:13px ui-monospace, monospace;">
+    <textarea id="appPromptTextarea" hidden style="width:100%;height:130px;margin-top:6px;border:1px solid #405263;border-radius:6px;padding:9px 10px;background:#0d151c;color:#d4e0ea;font:12px/1.45 ui-monospace, monospace;resize:vertical;"></textarea>
     <div class="commit-dialog-actions" style="justify-content:center;margin-top:16px;">
       <button type="button" id="appPromptCancel">Cancel</button>
       <button type="button" id="appPromptOk" class="confirm">OK</button>
@@ -440,6 +451,10 @@
       <label><span>REPOSITORY URL</span><input id="cloneUrl" placeholder="https://server/team/project.git"></label>
       <div class="clone-location"><label><span>PARENT FOLDER</span><input id="cloneParent" readonly placeholder="Choose a local folder"></label><button type="button" id="chooseCloneParent">Choose…</button></div>
       <label><span>LOCAL FOLDER NAME</span><input id="cloneName" placeholder="project" autocomplete="off" autocapitalize="off" spellcheck="false"></label>
+      <details class="clone-options"><summary>Clone options</summary>
+        <label><span>BRANCH (OPTIONAL)</span><input id="cloneBranch" placeholder="main, develop, feature/name" autocomplete="off" autocapitalize="off" spellcheck="false"></label>
+        <label class="inline-check"><input id="cloneRecurseSubmodules" type="checkbox"><span>Initialize submodules after clone</span></label>
+      </details>
       <div class="commit-dialog-actions"><button value="cancel">Cancel</button><button value="default" id="confirmClone" class="confirm" disabled>Clone repository</button></div>
     </form>
   </dialog>

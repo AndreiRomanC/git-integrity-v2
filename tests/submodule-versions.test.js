@@ -264,6 +264,18 @@ test('destructive remote matching is offered only for the active branch', () => 
   const synced = submoduleVersionRowHtml({ name: 'main', kind: 'branch', revision: 'cccccccc1234', subject: 'Synced', author: 'A', date: '2026-09-13', current: true, upstream: 'origin/main', ahead: 0, behind: 0 });
   assert.doesNotMatch(synced, /data-reset-upstream/);
 
+  // Report: "BRANCH TIP AHEAD · N commits to push" next to the only button
+  // being the destructive "Discard local work…" read as if throwing the new
+  // commit away were the suggested move. The constructive counterpart must
+  // be offered too, for the active branch, whenever there is something to
+  // push — regardless of whether it's also behind (diverged, like `current`
+  // here: ahead=1, behind=1) — never for an inactive row, and never when
+  // there is nothing committed yet to send (synced or purely dirty).
+  assert.match(current, /data-push-version/, 'ahead>0 on the active branch must also offer Push, not only Discard');
+  assert.match(current, /Send 1 local commit on main to origin\/main/);
+  assert.doesNotMatch(other, /data-push-version/, 'push is only offered for the currently active branch');
+  assert.doesNotMatch(synced, /data-push-version/, 'nothing to push when ahead is 0');
+
   // Report: a submodule with only uncommitted local edits (no divergent
   // commits at all — ahead/behind both 0) had no way to reach "Discard
   // local work…" from here, even though the backend already handles this
@@ -272,6 +284,15 @@ test('destructive remote matching is offered only for the active branch', () => 
   const dirtyOnly = submoduleVersionRowHtml({ name: 'main', kind: 'branch', revision: 'eeeeeeee1234', subject: 'Dirty but not diverged', author: 'A', date: '2026-09-13', current: true, upstream: 'origin/main', ahead: 0, behind: 0, dirty: true });
   assert.match(dirtyOnly, /data-reset-upstream/, 'a purely dirty active branch must still offer Discard local work, not only a committed-ahead/behind one');
   assert.match(dirtyOnly, /a purely dirty working tree with no divergent commits/);
+  assert.doesNotMatch(dirtyOnly, /data-push-version/, 'uncommitted edits are not something git push can send — nothing committed yet to push');
+
+  // Report: "BRANCH TIP · matches upstream" right next to "Discard local
+  // work…" read as a contradiction — nothing in the row itself said why the
+  // button was still there (only the button's own hover tooltip did). The
+  // dirty case must say so plainly in the row; the clean/synced case above
+  // must not claim it.
+  assert.match(dirtyOnly, /class="version-dirty-note"[^>]*>● Uncommitted changes present</);
+  assert.doesNotMatch(synced, /version-dirty-note/);
 });
 
 test('a branch without upstream is explicitly local and does not show invented counts', () => {

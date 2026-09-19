@@ -23,6 +23,7 @@ test('Local Drive derives a useful left pane from macOS, Linux and Windows repos
 test('Local Drive displays missing comparison paths with the native separator', () => {
   assert.equal(nativeChildPath('/work/left', 'nested/file.txt'), '/work/left/nested/file.txt');
   assert.equal(nativeChildPath('D:\\work\\right', 'nested/file.txt'), 'D:\\work\\right\\nested\\file.txt');
+  assert.equal(nativeChildPath('/work/left', ''), '/work/left');
 });
 
 function classList() { return { toggle() {} }; }
@@ -122,6 +123,25 @@ test('F5 copies the selected item from the active right pane into the left pane'
 
   const copy = calls.find(call => call.command === 'copy_local_item');
   assert.deepEqual(copy.args, { sourcePath: '/repo/a.txt', destinationDirectory: '/work' });
+});
+
+test('Local Drive can sync the right pane to the current repository folder without changing the left pane', async () => {
+  const dom = fakeLocalDriveDom();
+  const calls = [];
+  const invoke = async (command, args) => {
+    calls.push({ command, args });
+    if (command === 'list_local_directory' && args.path === '/repo') return { path: '/repo', parent: '/work', entries: [] };
+    if (command === 'list_local_directory' && args.path === '/work') return { path: '/work', parent: '/', entries: [] };
+    if (command === 'list_local_directory' && args.path === '/repo/src/module') return { path: '/repo/src/module', parent: '/repo/src', entries: [] };
+    throw new Error(`Unexpected command ${command}`);
+  };
+  const workspace = create({ root: dom.root, document: { querySelector: () => null, addEventListener() {} }, invoke });
+  await workspace.activate('/repo');
+  await workspace.openRepositoryLocation('/repo', 'src/module');
+
+  assert.equal(calls.filter(call => call.command === 'list_local_directory').at(-1).args.path, '/repo/src/module');
+  assert.equal(dom.panes.right.querySelector('[data-drive-path]').textContent, '/repo/src/module');
+  assert.equal(dom.panes.left.querySelector('[data-drive-path]').textContent, '/work');
 });
 
 test('F2 compares the selected file from each pane with two reads and no filesystem mutation', async () => {
@@ -231,6 +251,8 @@ test('F10 scans current folders and a new left file needs a separate confirmed l
   assert.deepEqual(calls.find(call => call.command === 'compare_local_directories').args, { leftPath: '/left', rightPath: '/right', ignoreSubmodules: true });
   assert.equal(document.nodes.localFolderMergeDialog.open, true);
   assert.equal(calls.some(call => call.command === 'copy_local_merge_file'), false, 'a scan must never write');
+  assert.match(document.nodes.localFolderMergeRows.innerHTML, /local-folder-side left only/);
+  assert.match(document.nodes.localFolderMergeRows.innerHTML, /local-folder-side right missing/);
 
   document.nodes.ignoreLocalFolderSubmodules.checked = false;
   await document.nodes.ignoreLocalFolderSubmodules.listeners.change();
@@ -297,6 +319,7 @@ test('Folder Compare is read-only and opens a one-sided text difference against 
 
   const row = { dataset: { folderMergeEntry: 'right.txt' } };
   document.nodes.localFolderMergeRows.listeners.click({ target: { closest: selector => selector === '[data-folder-merge-entry]' ? row : null } });
+  document.nodes.localFolderMergeRows.listeners.dblclick({ target: { closest: selector => selector === '[data-folder-merge-entry]' ? row : null } });
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(document.nodes.localDriveCompareDialog.open, true);
   assert.equal(calls.filter(call => call.command === 'read_local_text_file').length, 1, 'only the side that exists is read');

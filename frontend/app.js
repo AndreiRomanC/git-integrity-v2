@@ -64,6 +64,23 @@ let submoduleMenuData = null;
 let submoduleMenuEntry = null;
 let versionFilter = 'branch';
 const recentRepos = JSON.parse(localStorage.getItem('recentRepos') || '[]');
+const SAVED_TERMINAL_COMMANDS_KEY = 'git-drilldown-saved-terminal-commands';
+const SAVED_ACTIONS_KEY = 'git-drilldown-saved-actions';
+function normalizeSavedAction(item) {
+  if (!item || typeof item.name !== 'string') return null;
+  const commands = Array.isArray(item.commands) ? item.commands : typeof item.command === 'string' ? [item.command] : [];
+  const cleaned = commands.map(command => String(command).trim()).filter(Boolean);
+  return cleaned.length ? { name: item.name.trim() || 'Untitled action', commands: cleaned } : null;
+}
+function loadSavedActions() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(SAVED_ACTIONS_KEY) || localStorage.getItem(SAVED_TERMINAL_COMMANDS_KEY) || '[]');
+    return Array.isArray(parsed) ? parsed.map(normalizeSavedAction).filter(Boolean) : [];
+  } catch { return []; }
+}
+function saveSavedActions() {
+  localStorage.setItem(SAVED_ACTIONS_KEY, JSON.stringify(state.savedActions));
+}
 
 function addRecentRepo(path, name) {
   const existing = recentRepos.findIndex(r => r.path === path);
@@ -82,7 +99,7 @@ const state = { repository: null, branches: [], commits: [], allCommits: [], cha
   // the fields above, never this — see activeGraphData(), openSubmoduleGraph
   // and leaveSubmoduleGraph.
   submoduleGraph: null,
-  consoleMode: 'console', consoleTranscript: [], consoleCmdHistory: [], consoleDrafts: { commands: '', console: '' }, consoleScopeOverride: null, graphPrimaryBranch: null, publishUpto: null,
+  consoleMode: 'console', consoleTranscript: [], consoleCmdHistory: [], consoleDrafts: { commands: '', console: '', saved: '' }, consoleScopeOverride: null, graphPrimaryBranch: null, publishUpto: null, branchStartMarker: null, savedActions: loadSavedActions(),
   // False only right after openRepositoryFast, until its background
   // refresh_status completes — mutations (stage/unstage, delete, commit,
   // switching branch) are refused while this is false, since they'd act on
@@ -146,7 +163,7 @@ const refs = {
   submoduleMenu: $('#submoduleMenu'), submoduleVersions: $('#submoduleVersions'), submoduleMenuName: $('#submoduleMenuName'), currentSubmoduleVersion: $('#currentSubmoduleVersion'), submoduleVersionSearch: $('#submoduleVersionSearch'), submoduleOpenGraph: $('#submoduleOpenGraph'),
   commitScope: $('#commitScope'), showPathHistory: $('#showPathHistory'), commitScopeDialog: $('#commitScopeDialog'), commitScopeName: $('#commitScopeName'), scopeCommitMessage: $('#scopeCommitMessage'), confirmScopeCommit: $('#confirmScopeCommit'),
   commanderView: $('#commanderView'), commanderRows: $('#commanderRows'), commanderBreadcrumbs: $('#commanderBreadcrumbs'), remoteRef: $('#remoteRef'), gitComparePanel: $('#gitComparePanel'), localDrivePanel: $('#localDrivePanel'), compareModeGit: $('#compareModeGit'), compareModeDrive: $('#compareModeDrive'), compareDialog: $('#compareDialog'), compareTitle: $('#compareTitle'), compareSubtitle: $('#compareSubtitle'), localCompare: $('#localCompare'), remoteCompare: $('#remoteCompare'),
-  remotesView: $('#remotesView'), remoteCards: $('#remoteCards'), editorDialog: $('#editorDialog'), editorTitle: $('#editorTitle'), editorPath: $('#editorPath'), editorContent: $('#editorContent'), locationRepository: $('#locationRepository'), locationBranch: $('#locationBranch'), locationPath: $('#locationPath'), leaveSubmoduleGraph: $('#leaveSubmoduleGraph'), publishDialog: $('#publishDialog'), publishBranch: $('#publishBranch'), publishRemote: $('#publishRemote'), publishCommits: $('#publishCommits'), publishSummary: $('#publishSummary'), publishDestination: $('#publishDestination'), publishBadge: $('#publishBadge'), publishSubtitle: $('#publishSubtitle'), cloneDialog: $('#cloneDialog'), cloneUrl: $('#cloneUrl'), cloneParent: $('#cloneParent'), cloneName: $('#cloneName'), confirmClone: $('#confirmClone'), submoduleDialog: $('#submoduleDialog'), submoduleUrl: $('#submoduleUrl'), submoduleParent: $('#submoduleParent'), submoduleName: $('#submoduleName'), submoduleUsername: $('#submoduleUsername'), submoduleToken: $('#submoduleToken'), submoduleAddStatus: $('#submoduleAddStatus'), confirmAddSubmodule: $('#confirmAddSubmodule'), operationToast: $('#operationToast'), drawerScopeTitle: $('#drawerScopeTitle'),
+  remotesView: $('#remotesView'), remoteCards: $('#remoteCards'), editorDialog: $('#editorDialog'), editorTitle: $('#editorTitle'), editorPath: $('#editorPath'), editorContent: $('#editorContent'), locationRepository: $('#locationRepository'), locationBranch: $('#locationBranch'), locationPath: $('#locationPath'), leaveSubmoduleGraph: $('#leaveSubmoduleGraph'), publishDialog: $('#publishDialog'), publishBranch: $('#publishBranch'), publishRemote: $('#publishRemote'), publishCommits: $('#publishCommits'), publishSummary: $('#publishSummary'), publishDestination: $('#publishDestination'), publishBadge: $('#publishBadge'), publishSubtitle: $('#publishSubtitle'), cloneDialog: $('#cloneDialog'), cloneUrl: $('#cloneUrl'), cloneParent: $('#cloneParent'), cloneName: $('#cloneName'), cloneBranch: $('#cloneBranch'), cloneRecurseSubmodules: $('#cloneRecurseSubmodules'), confirmClone: $('#confirmClone'), submoduleDialog: $('#submoduleDialog'), submoduleUrl: $('#submoduleUrl'), submoduleParent: $('#submoduleParent'), submoduleName: $('#submoduleName'), submoduleUsername: $('#submoduleUsername'), submoduleToken: $('#submoduleToken'), submoduleAddStatus: $('#submoduleAddStatus'), confirmAddSubmodule: $('#confirmAddSubmodule'), operationToast: $('#operationToast'), drawerScopeTitle: $('#drawerScopeTitle'),
   mergeBranchDialog: $('#mergeBranchDialog'), mergeBranchSubtitle: $('#mergeBranchSubtitle'), mergeBranchCurrent: $('#mergeBranchCurrent'), mergeBranchSource: $('#mergeBranchSource'), mergeBranchStatus: $('#mergeBranchStatus'), confirmMergeBranch: $('#confirmMergeBranch'),
   stashesDialog: $('#stashesDialog'), stashesList: $('#stashesList'),
   togglePrStatus: $('#togglePrStatus'), prStatusArrow: $('#prStatusArrow'), prStatusPanel: $('#prStatusPanel'),
@@ -351,13 +368,18 @@ function customPrompt(message, defaultValue = '', options = {}) {
     const dialog = $('#appPromptDialog');
     $('#appPromptTitle').textContent = options.title || 'Enter value';
     $('#appPromptMessage').textContent = message;
-    const input = $('#appPromptInput'); input.value = defaultValue;
+    const singleInput = $('#appPromptInput');
+    const textarea = $('#appPromptTextarea');
+    singleInput.hidden = !!options.multiline;
+    textarea.hidden = !options.multiline;
+    const input = options.multiline ? textarea : singleInput;
+    input.value = defaultValue;
     const okButton = $('#appPromptOk'); const cancelButton = $('#appPromptCancel');
     okButton.textContent = options.okLabel || 'OK';
     const cleanup = (result) => { dialog.close(); okButton.removeEventListener('click', onOk); cancelButton.removeEventListener('click', onCancel); input.removeEventListener('keydown', onKeydown); dialog.removeEventListener('cancel', onCancel); resolve(result); };
     const onOk = () => cleanup(input.value);
     const onCancel = () => cleanup(null);
-    const onKeydown = (event) => { if (event.key === 'Enter') { event.preventDefault(); onOk(); } };
+    const onKeydown = (event) => { if (event.key === 'Enter' && (!options.multiline || event.metaKey || event.ctrlKey)) { event.preventDefault(); onOk(); } };
     okButton.addEventListener('click', onOk); cancelButton.addEventListener('click', onCancel); input.addEventListener('keydown', onKeydown); dialog.addEventListener('cancel', onCancel);
     dialog.showModal(); input.focus(); input.select();
   });
@@ -372,15 +394,21 @@ function openRepository() {
     .then(path => { jsPerfLog(`choose_folder result (${(performance.now() - startedAt).toFixed(0)}ms): ${path || '(cancelled — no path chosen)'}`, 0); return path && openRepositoryFast(path); })
     .catch(error => { jsPerfLog(`choose_folder ERROR (${(performance.now() - startedAt).toFixed(0)}ms): ${String(error)}`, 0); handleError(error); });
 }
+function closeRepoPickerMenu() { $('#repoPickerMenu').hidden = true; }
+function toggleRepoPickerMenu() { const menu = $('#repoPickerMenu'); menu.hidden = !menu.hidden; }
+async function createRepositoryFromPicker() {
+  if (!invoke) return refs.browserDialog.showModal();
+  try { const path = await invoke('choose_folder'); if (path) { await invoke('init_repository', { path }); await openRepositoryFast(path); } } catch (error) { handleError(error); }
+}
 
 function validateCloneForm() { refs.confirmClone.disabled = !refs.cloneUrl.value.trim() || !refs.cloneParent.value.trim() || !refs.cloneName.value.trim(); }
-function openCloneDialog() { refs.cloneUrl.value = ''; refs.cloneParent.value = ''; refs.cloneName.value = ''; refs.cloneName.dataset.edited = ''; validateCloneForm(); refs.cloneDialog.showModal(); refs.cloneUrl.focus(); }
+function openCloneDialog() { refs.cloneUrl.value = ''; refs.cloneParent.value = ''; refs.cloneName.value = ''; refs.cloneBranch.value = ''; refs.cloneRecurseSubmodules.checked = false; refs.cloneName.dataset.edited = ''; validateCloneForm(); refs.cloneDialog.showModal(); refs.cloneUrl.focus(); }
 async function chooseCloneParent() { if (!invoke) { refs.cloneParent.value = '/projects'; validateCloneForm(); return; } const path = await invoke('choose_folder'); if (path) { refs.cloneParent.value = path; validateCloneForm(); } }
 async function confirmClone(event) {
-  event.preventDefault(); const url = refs.cloneUrl.value.trim(); const parentPath = refs.cloneParent.value.trim(); const folderName = refs.cloneName.value.trim(); if (!url || !parentPath || !folderName) return;
+  event.preventDefault(); const url = refs.cloneUrl.value.trim(); const parentPath = refs.cloneParent.value.trim(); const folderName = refs.cloneName.value.trim(); const branch = refs.cloneBranch.value.trim(); const recurseSubmodules = refs.cloneRecurseSubmodules.checked; if (!url || !parentPath || !folderName) return;
   if (!invoke) { refs.cloneDialog.close(); status(`Preview: cloned ${folderName}`); return; }
   refs.confirmClone.disabled = true; refs.confirmClone.textContent = 'Cloning…'; status(`Cloning ${folderName}…`, 'busy');
-  try { const path = await invoke('clone_repository', { url, parentPath, folderName }); refs.cloneDialog.close(); await openRepositoryFast(path); status(`Cloned and opened ${folderName}`); }
+  try { const path = await invoke('clone_repository', { url, parentPath, folderName, branch: branch || null, recurseSubmodules }); refs.cloneDialog.close(); await openRepositoryFast(path); status(`Cloned and opened ${folderName}`); }
   catch (error) { status(String(error), 'error'); refs.confirmClone.disabled = false; }
   finally { refs.confirmClone.textContent = 'Clone repository'; }
 }
@@ -598,6 +626,17 @@ document.addEventListener('drop', (e) => {
 });
 
 const updatePublishIndicatorGuard = createRequestGuard();
+function publishAheadBehindText(info) {
+  if (!info) return '';
+  if (!info.remote_branch_exists) return 'new remote branch';
+  const ahead = Number(info.ahead) || 0;
+  const behind = Number(info.behind) || 0;
+  if (ahead && behind) return `${ahead} ahead / ${behind} behind`;
+  if (ahead) return `${ahead} ahead`;
+  if (behind) return `${behind} behind`;
+  return 'in sync';
+}
+
 async function updatePublishIndicator() {
   if (!invoke || !state.repository) return;
   const stillCurrent = updatePublishIndicatorGuard();
@@ -609,7 +648,10 @@ async function updatePublishIndicator() {
     const info = await invoke('publish_status', { repositoryPath: state.repository.path, branch, remote });
     if (!stillCurrent()) return;
     refs.publishBadge.textContent = info.commits.length;
-    refs.publishSubtitle.textContent = info.commits.length ? `${info.commits.length} commit${info.commits.length === 1 ? '' : 's'} not on ${remote}` : 'Everything is on the server';
+    const comparison = publishAheadBehindText(info);
+    refs.publishSubtitle.textContent = info.commits.length
+      ? `${info.commits.length} commit${info.commits.length === 1 ? '' : 's'} to publish · ${comparison}`
+      : `Everything is on the server · ${comparison}`;
   } catch (_) { if (stillCurrent()) { refs.publishBadge.textContent = '!'; refs.publishSubtitle.textContent = 'Cannot compare with server branch'; } }
 }
 
@@ -1315,6 +1357,13 @@ function renderSubmoduleVersions() {
     event.stopPropagation();
     discardSubmoduleBranchAndUseUpstream(button.dataset, button);
   }));
+  // The active branch is exactly what submoduleMenuEntry already names —
+  // reuses the same preview-then-confirm flow as "Push submodule" elsewhere
+  // (Explorer context menu, command palette), not a second push path.
+  refs.submoduleVersions.querySelectorAll('[data-push-version]').forEach(button => button.addEventListener('click', event => {
+    event.stopPropagation();
+    if (submoduleMenuEntry) pushSubmodule(submoduleMenuEntry);
+  }));
   refs.submoduleVersions.querySelectorAll('[data-copy-sha]').forEach(button => button.addEventListener('click', event => {
     event.stopPropagation();
     navigator.clipboard?.writeText(button.dataset.copySha).then(() => status('Copied SHA to clipboard')).catch(() => {});
@@ -2010,6 +2059,11 @@ async function pushSubmodule(entry) {
     status(`Pushing ${entry.name} to its remote…`, 'busy');
     const result = await invoke('push_submodule', { repositoryPath: state.repository.path, relativePath: entry.relative_path });
     directoryCache.clear(); await loadRepository(state.repository.path, { reopenPath: state.currentPath });
+    // Same convention as this menu's own Checkout/Discard actions: its data
+    // (e.g. "N commits to push") is now stale, so close it rather than leave
+    // it showing a state that no longer exists. A no-op when this was
+    // reached from anywhere else the menu was never open in the first place.
+    refs.submoduleMenu.hidden = true;
     const shortSha = (result?.revision || '').slice(0, 8);
     const successMsg = `${entry.name}: pushed to branch "${result?.branch}" on its remote (now at ${shortSha}). The project's link to it was staged, not committed — commit the project when you're ready to share that.`;
     status(successMsg); showOperationToast(successMsg, 'success');
@@ -2818,13 +2872,14 @@ function buildCommitRowHtml(commit, index, ctx) {
   const hasLocalBranchRef = refKinds.has('local_branch');
   const hasRemoteBranchRef = refKinds.has('remote_branch');
   const hasPrimaryRemoteRef = (node.refs || []).some(ref => ref.kind === 'remote_branch' && ref.name === 'origin/main');
+  const isCommandBranchStart = state.branchStartMarker?.repositoryPath === activeGraphData().path && state.branchStartMarker?.id === commit.id;
   const matchesFilter = ctx.refFilter === 'all' || isBranchPoint || (ctx.refFilter === 'branches' ? (refKinds.has('local_branch') || refKinds.has('remote_branch')) : refKinds.has('tag'));
   const isFilterDimmed = !matchesFilter;
 
-  return `<article class="commit-row ${node.isHead ? 'is-head' : ''} ${hasPrimaryRemoteRef ? 'has-primary-remote-tip' : hasLocalBranchRef ? 'has-local-branch-tip' : hasRemoteBranchRef ? 'has-remote-branch-tip' : ''} ${isBranchPoint ? 'is-branch-point' : ''} ${isMatch ? 'is-search-match' : ''} ${isSearchDimmed || isFilterDimmed ? 'is-search-dimmed' : ''}" data-id="${esc(commit.id)}" data-lane="${node.lane}">
+  return `<article class="commit-row ${node.isHead ? 'is-head' : ''} ${hasPrimaryRemoteRef ? 'has-primary-remote-tip' : hasLocalBranchRef ? 'has-local-branch-tip' : hasRemoteBranchRef ? 'has-remote-branch-tip' : ''} ${isBranchPoint ? 'is-branch-point' : ''} ${isCommandBranchStart ? 'is-command-branch-start' : ''} ${isMatch ? 'is-search-match' : ''} ${isSearchDimmed || isFilterDimmed ? 'is-search-dimmed' : ''}" data-id="${esc(commit.id)}" data-lane="${node.lane}">
     <div class="graph-cell"></div>
     <div class="commit-body">
-      <div class="commit-card"><div class="commit-main">${isBranchPoint ? '<b class="branch-point-pill" data-tooltip="Common ancestor — where the newer branch above split off">⑂</b>' : ''}<span class="commit-title">${commitSubjectHtml(commit.subject)}</span>${refsBadges(node.refs, node.isHead, ctx.currentBranch)}${stashPills}</div><span class="commit-id">${esc(commit.id.slice(0, 8))}</span>
+      <div class="commit-card"><div class="commit-main">${isBranchPoint ? '<b class="branch-point-pill" data-tooltip="Common ancestor — where the newer branch above split off">⑂</b>' : ''}${isCommandBranchStart ? `<b class="branch-point-pill" data-tooltip="merge-base with ${esc(state.branchStartMarker.baseRef)} — where this branch split from the selected base">START</b>` : ''}<span class="commit-title">${commitSubjectHtml(commit.subject)}</span>${refsBadges(node.refs, node.isHead, ctx.currentBranch)}${stashPills}</div><span class="commit-id">${esc(commit.id.slice(0, 8))}</span>
       <span class="topology-badges">${commit.parents?.length > 1 ? `<b class="merge-badge">MERGE</b>` : ''}</span><span class="commit-author">${esc(commit.author)}</span></div>
       ${ahead ? `<div class="ahead-annotation">${esc(ahead)}</div>` : ''}${stashDetails}
     </div>
@@ -3320,10 +3375,18 @@ function submodulePublishRisksHtml(risks) {
   return `<div class="submodule-publish-safety-warning">⚠️ ${headline}<ul>${items}</ul></div>`;
 }
 
+function publishRemoteAheadWarningHtml(publish) {
+  const behind = Number(publish?.behind) || 0;
+  if (!behind) return '';
+  const remoteBranch = publish.remote_branch || `${publish.remote}/${publish.branch}`;
+  const diverged = (Number(publish?.ahead) || 0) > 0;
+  return `<div class="publish-remote-ahead-warning">⚠️ ${esc(remoteBranch)} has ${behind} commit${behind === 1 ? '' : 's'} you do not have locally.${diverged ? ' Your local branch also has commits to publish, so the histories have diverged.' : ''} Fetch/pull or merge the remote changes before publishing if this is shared work.</div>`;
+}
+
 function renderPublishCommits() {
   const commits = state.publish?.commits || [];
   const uptoIndex = state.publishUpto ? commits.findIndex(commit => commit.id === state.publishUpto) : commits.length - 1;
-  refs.publishCommits.innerHTML = publishSubmoduleRisksHtml + (commits.map((commit, index) => {
+  refs.publishCommits.innerHTML = publishRemoteAheadWarningHtml(state.publish) + publishSubmoduleRisksHtml + (commits.map((commit, index) => {
     const willPush = index <= uptoIndex;
     return `<div class="publish-commit ${willPush ? '' : 'excluded'}" data-commit-id="${esc(commit.id)}">
       <span>${index + 1}</span><input type="checkbox" class="publish-check" data-index="${index}" ${willPush ? 'checked' : ''}>
@@ -3370,8 +3433,13 @@ async function refreshPublish() {
   if (!stillCurrent() || refs.publishBranch.value !== branch || refs.publishRemote.value !== remote) return; // repository changed, or the dialog's own selection moved on
   state.publish = publish;
   publishSubmoduleRisksHtml = submodulePublishRisksHtml(risks);
+  const comparison = publishAheadBehindText(publish);
+  refs.publishDestination.textContent = `${branch} → ${remote}/${branch}${comparison ? ` · ${comparison}` : ''}`;
   renderPublishCommits();
-  refs.publishBadge.textContent = state.publish.commits.length; refs.publishSubtitle.textContent = state.publish.commits.length ? `${state.publish.commits.length} local commits not on ${remote}` : 'Everything is on the server';
+  refs.publishBadge.textContent = state.publish.commits.length;
+  refs.publishSubtitle.textContent = state.publish.commits.length
+    ? `${state.publish.commits.length} local commit${state.publish.commits.length === 1 ? '' : 's'} to publish · ${comparison}`
+    : `Everything is on the server · ${comparison}`;
   updatePublishSummary();
 }
 
@@ -3626,7 +3694,12 @@ async function switchBranch(branch, button = null) {
   finally { finishButton(); }
 }
 
-$('#openRepo').addEventListener('click', openRepository); $('#emptyOpen').addEventListener('click', openRepository);
+$('#openRepo').addEventListener('click', (event) => { event.stopPropagation(); toggleRepoPickerMenu(); });
+$('#repoMenuOpen').addEventListener('click', () => { closeRepoPickerMenu(); openRepository(); });
+$('#repoMenuClone').addEventListener('click', () => { closeRepoPickerMenu(); openCloneDialog(); });
+$('#repoMenuCreate').addEventListener('click', () => { closeRepoPickerMenu(); createRepositoryFromPicker(); });
+document.addEventListener('click', (event) => { if (!event.target.closest('#openRepo') && !event.target.closest('#repoPickerMenu')) closeRepoPickerMenu(); });
+$('#emptyOpen').addEventListener('click', openRepository);
 $('#cloneRepo').addEventListener('click', openCloneDialog); $('#chooseCloneParent').addEventListener('click', () => chooseCloneParent().catch(error => status(String(error), 'error'))); refs.confirmClone.addEventListener('click', confirmClone);
 refs.cloneUrl.addEventListener('input', () => { if (!refs.cloneName.dataset.edited) { const inferred = refs.cloneUrl.value.trim().split(/[\\/]/).pop()?.replace(/\.git$/, '') || ''; refs.cloneName.value = inferred; } validateCloneForm(); }); refs.cloneParent.addEventListener('input', validateCloneForm); refs.cloneName.addEventListener('input', () => { refs.cloneName.dataset.edited = refs.cloneName.value ? '1' : ''; validateCloneForm(); });
 $('#addSubmodule').addEventListener('click', openAddSubmoduleDialog); refs.confirmAddSubmodule.addEventListener('click', confirmAddSubmodule);
@@ -3816,9 +3889,14 @@ async function returnToProjectNavigator() {
   if (selectedPath) selectEntry(selectedPath); else clearDetails('Select a file or folder');
 }
 $('#navExplorer').addEventListener('click', returnToProjectNavigator);
-$('#navCommander').addEventListener('click', () => { closeSubmoduleGraph(); const selected = state.selectedEntry; state.commanderFocus = selected?.kind === 'file' ? selected.relative_path : ''; state.commanderPath = selected?.kind === 'file' ? selected.relative_path.split('/').slice(0, -1).join('/') : selected?.kind === 'folder' ? selected.relative_path : state.currentPath; state.commanderRows = []; state.view = 'commander'; refs.search.value = ''; render(); if (state.compareMode === 'git') openCommanderDirectory(state.commanderPath); });
+function syncLocalDriveToCommanderPath() {
+  if (state.repository && state.view === 'commander' && state.compareMode === 'local-drive') {
+    localDriveWorkspace?.openRepositoryLocation(state.repository.path, state.commanderPath || '');
+  }
+}
+$('#navCommander').addEventListener('click', () => { closeSubmoduleGraph(); const selected = state.selectedEntry; state.commanderFocus = selected?.kind === 'file' ? selected.relative_path : ''; state.commanderPath = selected?.kind === 'file' ? selected.relative_path.split('/').slice(0, -1).join('/') : selected?.kind === 'folder' ? selected.relative_path : state.currentPath; state.commanderRows = []; state.view = 'commander'; refs.search.value = ''; render(); if (state.compareMode === 'git') openCommanderDirectory(state.commanderPath); else syncLocalDriveToCommanderPath(); });
 refs.compareModeGit.addEventListener('click', () => { if (state.compareMode === 'git') return; state.compareMode = 'git'; refs.search.value = ''; render(); openCommanderDirectory(state.commanderPath); });
-refs.compareModeDrive.addEventListener('click', () => { if (state.compareMode === 'local-drive') return; state.compareMode = 'local-drive'; refs.search.value = ''; render(); });
+refs.compareModeDrive.addEventListener('click', () => { if (state.compareMode === 'local-drive') return; state.compareMode = 'local-drive'; refs.search.value = ''; render(); syncLocalDriveToCommanderPath(); });
 $('#navGraph').addEventListener('click', () => { closeSubmoduleGraph(); state.commits = state.allCommits.length ? state.allCommits : state.commits; state.historyScope = ''; state.historyKind = ''; state.selectedEntry = null; state.selectedCommit = null; state.view = 'graph'; refs.search.value = ''; clearDetails('Select a commit'); render(); });
 $('#navRemotes').addEventListener('click', () => { closeSubmoduleGraph(); loadRemotes(); });
 refs.leaveSubmoduleGraph.addEventListener('click', leaveSubmoduleGraph);
@@ -3926,21 +4004,21 @@ document.querySelectorAll('[data-version-filter]').forEach(button => button.addE
 refs.submoduleVersionSearch.addEventListener('input', renderSubmoduleVersions);
 refs.submoduleOpenGraph.addEventListener('click', () => { if (submoduleMenuEntry) { refs.submoduleMenu.hidden = true; openSubmoduleGraph(submoduleMenuEntry); } });
 document.addEventListener('click', event => {
-  // A New branch/New tag dialog is a child of the version selector in the
-  // user's workflow even though <dialog> lives elsewhere in the DOM. Do not
-  // mistake clicks in that modal (especially Cancel/X) for an outside click
-  // on the parent selector.
-  const childActionOpen = refs.newBranchDialog.open || $('#newTagDialog').open;
+  // A New branch/New tag/Push dialog is a child of the version selector in
+  // the user's workflow even though <dialog> lives elsewhere in the DOM. Do
+  // not mistake clicks in that modal (especially Cancel/X) for an outside
+  // click on the parent selector — without this, clicking anything inside
+  // the Push preview opened via this menu's own new Push button (including
+  // just Cancel) would hide the versions menu underneath before the push
+  // dialog itself even closes.
+  const childActionOpen = refs.newBranchDialog.open || $('#newTagDialog').open || $('#submodulePublishDialog').open;
   if (!childActionOpen && !refs.submoduleMenu.hidden && !refs.submoduleMenu.contains(event.target) && !event.target.closest('[data-entry]') && !event.target.closest('[data-detail-action="versions"]')) refs.submoduleMenu.hidden = true;
 });
 refs.commitScope.addEventListener('click', openScopeCommit);
 refs.showPathHistory.addEventListener('click', showSelectedHistory);
 refs.scopeCommitMessage.addEventListener('input', () => { refs.confirmScopeCommit.disabled = !refs.scopeCommitMessage.value.trim(); });
 refs.confirmScopeCommit.addEventListener('click', commitSelectedScope);
-$('#initRepo').addEventListener('click', async () => {
-  if (!invoke) return refs.browserDialog.showModal();
-  try { const path = await invoke('choose_folder'); if (path) { await invoke('init_repository', { path }); await openRepositoryFast(path); } } catch (error) { handleError(error); }
-});
+$('#initRepo').addEventListener('click', createRepositoryFromPicker);
 $('#newBranch').addEventListener('click', async () => {
   if (!state.repository) return;
   // While a submodule's own Branch Map is actually open, this button is
@@ -4089,6 +4167,39 @@ function currentConsoleContext() {
   return { label: `${state.currentPath || state.repository.name} · branch ${state.repository.current_branch || 'detached'}`, tags: ['explorer'] };
 }
 
+function defaultBranchStartBaseRef() {
+  const graph = activeGraphData();
+  const branchNames = (graph?.branches || []).map(branch => branch.name);
+  if (branchNames.includes('origin/main')) return 'origin/main';
+  if (branchNames.includes('origin/master')) return 'origin/master';
+  if (branchNames.includes('main')) return 'main';
+  if (branchNames.includes('master')) return 'master';
+  return 'origin/main';
+}
+
+async function findBranchStartCommit() {
+  if (!state.repository) return status('Open a repository first.', 'error');
+  setConsoleMode('console');
+  const target = consoleGitTarget();
+  const baseRef = defaultBranchStartBaseRef();
+  status(`Finding branch start against ${baseRef}…`, 'busy');
+  const mergeBase = await runTerminalFromConsole(`git merge-base HEAD ${baseRef}`);
+  const sha = mergeBase?.stdout?.trim().split(/\s+/)[0];
+  if (!mergeBase?.success || !/^[0-9a-f]{7,40}$/i.test(sha || '')) {
+    status(`Could not find merge-base against ${baseRef}. Check that the branch exists/fetch is up to date.`, 'error');
+    return;
+  }
+  await runTerminalFromConsole(`git show --no-patch --decorate --date=short --stat ${sha}`);
+  state.branchStartMarker = { repositoryPath: target.path, id: sha, baseRef };
+  if (state.submoduleGraph || activeGraphData().path !== target.path) closeSubmoduleGraph();
+  state.view = 'graph';
+  refs.search.value = sha.slice(0, 8);
+  render();
+  const row = refs.graph.querySelector(`.commit-row[data-id="${CSS.escape(sha)}"]`);
+  if (row) { row.scrollIntoView({ block: 'center' }); selectCommit(sha); }
+  status(`Branch start found: ${sha.slice(0, 8)} against ${baseRef}. Commands are shown in Terminal.`);
+}
+
 function buildCommands() {
   const entry = state.selectedEntry;
   const list = [
@@ -4100,6 +4211,7 @@ function buildCommands() {
     { id: 'merge', name: 'Merge Branch…', description: 'Bring another branch\'s commits into your current one — stays local, resolves conflicts here if any', keys: '', keywords: 'combine join', tags: ['explorer', 'graph'], fn: () => state.repository && openMergeBranchDialog(mergeTargetForMain()) },
     { id: 'fetch', name: 'Fetch Remote', description: 'Download new commits/refs from the server without changing your branch', keys: 'Ctrl+Shift+F', tags: ['explorer', 'graph'], fn: () => $('#fetchCurrent').click() },
     { id: 'fetchall', name: 'Fetch All Remotes', description: 'Download new commits/refs from every configured remote, not just the first one', keywords: 'multiple upstream mirror', tags: ['explorer', 'graph'], fn: () => fetchAllRemotes() },
+    { id: 'branch-start', name: 'Find Branch Start Commit', description: 'Run merge-base against origin/main, show the commit details, and mark that split point on the Branch Map', keys: '', keywords: 'merge-base parent start base fork origin/main', tags: ['explorer', 'graph', 'relevant'], keepOpen: true, fn: findBranchStartCommit },
     { id: 'stash', name: 'Stash Work in Current Repository', description: 'Set aside changes only in the project or submodule currently being browsed', keys: 'Ctrl+Shift+S', tags: ['explorer'], fn: stashWork },
     { id: 'pop', name: 'View Stashes in Current Repository', description: 'View or restore saved work for this project or submodule', keys: '', tags: ['explorer'], fn: popStash },
     { id: 'conflicts', name: 'Resolve Merge Conflicts', description: 'Open the conflict resolution dialog for a merge in progress', keys: '', keywords: 'merge conflict resolve', tags: state.pendingMainConflicts?.length ? ['explorer', 'graph', 'relevant'] : [], fn: () => openConflictsDialog(mergeTargetForMain(), state.pendingMainConflicts || []) },
@@ -4126,6 +4238,18 @@ function buildCommands() {
       { id: 'file-compare', name: `Compare ${entry.name} with Remote`, description: 'Side-by-side diff against the server version, with restore options', tags: ['file', 'relevant'], keywords: 'diff', fn: () => compareEntryWithRemote(entry) },
     );
   }
+  state.savedActions.forEach((action, index) => {
+    const commands = savedActionCommands(action);
+    list.push({
+      id: `saved-action-${index}`,
+      name: `Saved action: ${action.name}`,
+      description: commands.length === 1 ? commands[0] : `${commands.length} commands · ${commands.join(' → ')}`,
+      keywords: `custom saved preset macro ${commands.join(' ')}`,
+      tags: ['explorer', 'graph', 'commander'],
+      keepOpen: true,
+      fn: () => runSavedAction(action),
+    });
+  });
   return list;
 }
 
@@ -4273,6 +4397,73 @@ function renderCommandList(query) {
   </div>`).join('') || (gitHint ? '' : '<div class="command-item" style="text-align:center;color:#6b7f96;">No matching commands</div>'));
 }
 
+function savedActionCommands(action) {
+  return normalizeSavedAction(action)?.commands || [];
+}
+function splitSavedActionCommandText(text) {
+  return text.split(/\n|&&/).map(command => command.trim()).filter(Boolean);
+}
+async function runSavedAction(action) {
+  const normalized = normalizeSavedAction(action);
+  if (!normalized) return status('Saved action has no commands to run.', 'error');
+  setConsoleMode('console');
+  status(`Running saved action: ${normalized.name}`, 'busy');
+  for (const command of normalized.commands) {
+    const result = await runTerminalFromConsole(command);
+    if (!result?.success) {
+      status(`Saved action stopped at failed command: ${command}`, 'error');
+      return result;
+    }
+  }
+  status(`Saved action completed: ${normalized.name}`);
+  return { success: true };
+}
+
+function renderSavedActions(query = '') {
+  const list = $('#commandList'); list.classList.remove('console-transcript');
+  const q = query.trim().toLowerCase();
+  const rows = state.savedActions
+    .map((item, index) => ({ item, index }))
+    .filter(({ item }) => !q || `${item.name} ${savedActionCommands(item).join(' ')}`.toLowerCase().includes(q));
+  list.innerHTML = rows.map(({ item, index }, rowIndex) => `<div class="command-item ${rowIndex === 0 ? 'selected' : ''}" data-saved-index="${index}">
+    <div class="command-item-head"><span class="command-name">${esc(item.name)}</span><span class="saved-command-actions"><button type="button" data-saved-run="${index}">Run</button><button type="button" data-saved-edit="${index}">Edit</button><button type="button" class="danger" data-saved-delete="${index}">Delete</button></span></div>
+    <span class="command-desc">${esc(savedActionCommands(item).length === 1 ? savedActionCommands(item)[0] : `${savedActionCommands(item).length} commands · ${savedActionCommands(item).join('  →  ')}`)}</span>
+  </div>`).join('') || '<div class="command-item" style="text-align:center;color:#6b7f96;">No saved actions yet. Press ＋ Save to add a named command group.</div>';
+}
+
+async function addOrEditSavedAction(index = -1) {
+  const existing = index >= 0 ? state.savedActions[index] : null;
+  const existingCommands = savedActionCommands(existing);
+  const name = await customPrompt('Name for this saved action:', existing?.name || '', { title: existing ? 'Edit saved action' : 'Save action', okLabel: 'Next' });
+  if (name == null) return;
+  const trimmedName = name.trim();
+  if (!trimmedName) return status('Saved action needs a name.', 'error');
+  const defaultCommands = existingCommands.length ? existingCommands.join('\n') : $('#commandInput').value.trim();
+  const commandText = await customPrompt('Commands to run, one per line. You can also separate simple commands with &&. They run in order and stop on first failure:', defaultCommands, { title: existing ? 'Edit saved action commands' : 'Save action commands', okLabel: existing ? 'Save' : 'Add', multiline: true });
+  if (commandText == null) return;
+  const commands = splitSavedActionCommandText(commandText);
+  if (!commands.length) return status('Saved action needs at least one command.', 'error');
+  const item = { name: trimmedName, commands };
+  if (existing) state.savedActions.splice(index, 1, item); else state.savedActions.push(item);
+  saveSavedActions();
+  setConsoleMode('saved');
+  activeCommands = buildCommands();
+  renderSavedActions($('#commandInput').value);
+  status(existing ? 'Saved action updated.' : 'Saved action added.');
+}
+
+async function deleteSavedAction(index) {
+  const item = state.savedActions[index];
+  if (!item) return;
+  const ok = await customConfirm(`Delete saved action "${item.name}"?`, { title: 'Delete saved action', danger: true, okLabel: 'Delete' });
+  if (!ok) return;
+  state.savedActions.splice(index, 1);
+  saveSavedActions();
+  activeCommands = buildCommands();
+  renderSavedActions($('#commandInput').value);
+  status('Saved action deleted.');
+}
+
 // ---- Terminal — persistent shell transcript -------------------------------
 // Deliberately separate from the app's own tested actions above: this is the
 // explicit escape hatch for real shell commands. A known bare Git subcommand
@@ -4415,17 +4606,17 @@ async function runTerminalFromConsole(input) {
   setConsoleMode('console');
   const command = normalizeTerminalCommand(input);
   setCommandInputValue('');
-  if (/^(clear|cls)$/i.test(command)) { state.consoleTranscript = []; renderConsoleTranscript(); return; }
-  if (!state.repository) { state.consoleTranscript.push({ command, targetLabel: '—', targetPath: '', targetDisplayPath: '', status: 'FAILED', elapsedMs: 0, result: { success: false, stdout: '', stderr: 'Open a repository first.' } }); renderConsoleTranscript(); return; }
+  if (/^(clear|cls)$/i.test(command)) { state.consoleTranscript = []; renderConsoleTranscript(); return { success: true, stdout: '', stderr: '', exit_code: 0, read_only: true }; }
+  if (!state.repository) { const result = { success: false, stdout: '', stderr: 'Open a repository first.' }; state.consoleTranscript.push({ command, targetLabel: '—', targetPath: '', targetDisplayPath: '', status: 'FAILED', elapsedMs: 0, result }); renderConsoleTranscript(); return result; }
   // Repeated Enter while one is already running is a no-op, not a queued-up
   // second command — only one Git command is ever active at a time, and the
   // centralized invoke wrapper enforces this the same way for every other
   // mutation too, not just another console command.
-  if (state.consoleCommandRunning) { status('A Terminal command is already running — wait for it to finish.', 'error'); return; }
+  if (state.consoleCommandRunning) { status('A Terminal command is already running — wait for it to finish.', 'error'); return { success: false, stdout: '', stderr: 'A Terminal command is already running.' }; }
   if (looksDestructiveTerminalCommand(command)) {
     const target = consoleGitTarget();
     const ok = await customConfirm(`This command may overwrite or delete data: "${command}" in ${target.label}. Continue?`, { title: 'Potentially destructive command', danger: true, okLabel: 'Run it anyway' });
-    if (!ok) return;
+    if (!ok) return { success: false, stdout: '', stderr: 'Cancelled.' };
   }
   if (state.consoleCmdHistory[state.consoleCmdHistory.length - 1] !== command) state.consoleCmdHistory.push(command);
   if (state.consoleCmdHistory.length > 100) state.consoleCmdHistory.splice(0, state.consoleCmdHistory.length - 100);
@@ -4437,7 +4628,7 @@ async function runTerminalFromConsole(input) {
   // true, so this is belt-and-suspenders, not the only thing preventing it).
   const target = consoleGitTarget();
   const capturedRepositoryPath = state.repository.path;
-  if (!invoke) { state.consoleTranscript.push({ command, targetLabel: target.label, targetPath: target.path, targetDisplayPath: target.displayPath, status: 'SUCCESS', elapsedMs: 0, result: { success: true, stdout: '(preview mode — not actually run)', stderr: '' } }); renderConsoleTranscript(); return; }
+  if (!invoke) { const result = { success: true, stdout: '(preview mode — not actually run)', stderr: '' }; state.consoleTranscript.push({ command, targetLabel: target.label, targetPath: target.path, targetDisplayPath: target.displayPath, status: 'SUCCESS', elapsedMs: 0, result }); renderConsoleTranscript(); return result; }
 
   const entry = { command, targetLabel: target.label, targetPath: target.path, targetDisplayPath: target.displayPath, status: 'RUNNING', startedAt: performance.now(), elapsedMs: 0, result: null };
   state.consoleTranscript.push(entry);
@@ -4463,6 +4654,7 @@ async function runTerminalFromConsole(input) {
       // submodule but the parent repository must also notice its new state).
       directoryCache.clear(); await loadRepository(capturedRepositoryPath, { keepPath: true, force: true });
     }
+    return result;
   } catch (error) {
     const message = String(error);
     entry.status = message.toLowerCase().includes('timed out') ? 'TIMED_OUT' : 'FAILED';
@@ -4471,6 +4663,7 @@ async function runTerminalFromConsole(input) {
     clearInterval(consoleRunningTicker); consoleRunningTicker = null;
     state.consoleCommandRunning = false;
     renderConsoleTranscript();
+    return entry.result;
   }
 }
 
@@ -4559,12 +4752,21 @@ function setConsoleMode(mode) {
   }
   document.querySelectorAll('.command-tab').forEach(tab => tab.classList.toggle('active', tab.dataset.mode === mode));
   $('#terminalQuickCommands').hidden = mode !== 'console';
-  $('#terminalScopeBar').hidden = mode !== 'console';
+  $('#terminalScopeBar').hidden = !['console', 'saved'].includes(mode);
+  $('#commandAddSaved').hidden = mode !== 'saved';
   if (mode === 'console') {
+    $('#commandModeHint').textContent = 'Terminal keeps its own transcript and command draft. Use quick Git buttons or type any command.';
     input.placeholder = 'Type a command… e.g. git status, pwd, gh pr status';
     $('#commandHelp').textContent = '↑↓ history · Enter to run · “Run in” is the exact working directory · use “… here” shortcuts to path-filter Git';
     updateConsoleScopeLabel(); renderConsoleTranscript(); renderGitHints();
+  } else if (mode === 'saved') {
+    $('#commandModeHint').textContent = 'Saved actions are your named command groups. They run in order and stop on the first failed command.';
+    input.placeholder = 'Search saved actions…';
+    $('#commandHelp').textContent = 'Enter/click Run to execute in “Run in” · ＋ Save adds or edits reusable commands';
+    updateConsoleScopeLabel(); $('#commandGitHints').hidden = true; $('#commandClearTranscript').hidden = true; $('#commandCopyTranscript').hidden = true; renderSavedActions(input.value);
   } else {
+    activeCommands = buildCommands();
+    $('#commandModeHint').textContent = 'App actions include built-in actions plus your Saved actions. Search by name or command.';
     input.placeholder = 'Type a command… (Cmd/Ctrl+K)';
     $('#commandHelp').textContent = '↑↓ to navigate · Enter to run · Esc to close';
     $('#commandScope').textContent = ''; $('#commandScope').title = ''; $('#commandList').classList.remove('console-transcript'); $('#commandGitHints').hidden = true; $('#commandClearTranscript').hidden = true; $('#commandCopyTranscript').hidden = true; renderCommandList(input.value);
@@ -4575,9 +4777,7 @@ function openCommandPalette() {
   const input = $('#commandInput');
   commandPaletteOpen = true;
   activeCommands = buildCommands();
-  setConsoleMode('console');
-  setCommandInputValue('');
-  renderConsoleTranscript();
+  setConsoleMode(state.consoleMode || 'console');
   $('#commandPalette').showModal();
   input.focus();
 }
@@ -4588,6 +4788,7 @@ function filterCommands(query) {
 $('#commandInput').addEventListener('input', (e) => {
   state.consoleDrafts[state.consoleMode] = e.target.value;
   if (state.consoleMode === 'console') { consoleHistoryPointer = -1; consoleHistoryDraft = e.target.value; renderGitHints(); return; }
+  if (state.consoleMode === 'saved') { renderSavedActions(e.target.value); return; }
   filterCommands(e.target.value);
 });
 $('#commandInput').addEventListener('keydown', (e) => {
@@ -4597,6 +4798,14 @@ $('#commandInput').addEventListener('keydown', (e) => {
     else if (e.key === 'ArrowDown') { e.preventDefault(); recallConsoleHistory(1); renderGitHints(); }
     return;
   }
+  if (state.consoleMode === 'saved') {
+    const items = Array.from($('#commandList').querySelectorAll('.command-item[data-saved-index]'));
+    const selected = items.find(i => i.classList.contains('selected'));
+    if (e.key === 'ArrowDown') { e.preventDefault(); const next = selected?.nextElementSibling || items[0]; items.forEach(i => i.classList.remove('selected')); next?.classList.add('selected'); next?.scrollIntoView({ block: 'nearest' }); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); const prev = selected?.previousElementSibling || items[items.length - 1]; items.forEach(i => i.classList.remove('selected')); prev?.classList.add('selected'); prev?.scrollIntoView({ block: 'nearest' }); }
+    else if (e.key === 'Enter') { e.preventDefault(); const item = state.savedActions[Number(selected?.dataset.savedIndex)]; if (item) runSavedAction(item); }
+    return;
+  }
   const items = Array.from($('#commandList').querySelectorAll('.command-item'));
   const selected = items.find(i => i.classList.contains('selected'));
   if (e.key === 'ArrowDown') { e.preventDefault(); const next = selected?.nextElementSibling || items[0]; items.forEach(i => i.classList.remove('selected')); next?.classList.add('selected'); next?.scrollIntoView({ block: 'nearest' }); }
@@ -4604,7 +4813,7 @@ $('#commandInput').addEventListener('keydown', (e) => {
   else if (e.key === 'Enter') {
     e.preventDefault();
     if (selected?.dataset.rawGitSuggest !== undefined) { runTerminalFromConsole(selected.dataset.rawGitSuggest); return; }
-    const cmd = activeCommands.find(c => c.id === selected?.dataset.cmdId); if (cmd) { $('#commandPalette').close(); cmd.fn(); commandPaletteOpen = false; }
+    const cmd = activeCommands.find(c => c.id === selected?.dataset.cmdId); if (cmd) { if (cmd.keepOpen) cmd.fn(); else { $('#commandPalette').close(); cmd.fn(); commandPaletteOpen = false; } }
   }
 });
 $('#commandList').addEventListener('click', (e) => {
@@ -4614,14 +4823,22 @@ $('#commandList').addEventListener('click', (e) => {
   if (copy) { const entry = state.consoleTranscript[Number(copy.dataset.consoleCopy)]; if (entry) copyText(consoleEntryAsText(entry), 'Command output copied.'); return; }
   const suggest = e.target.closest('[data-raw-git-suggest]');
   if (suggest) { runTerminalFromConsole(suggest.dataset.rawGitSuggest); return; }
+  const savedRun = e.target.closest('[data-saved-run]');
+  if (savedRun) { const item = state.savedActions[Number(savedRun.dataset.savedRun)]; if (item) runSavedAction(item); return; }
+  const savedEdit = e.target.closest('[data-saved-edit]');
+  if (savedEdit) { addOrEditSavedAction(Number(savedEdit.dataset.savedEdit)); return; }
+  const savedDelete = e.target.closest('[data-saved-delete]');
+  if (savedDelete) { deleteSavedAction(Number(savedDelete.dataset.savedDelete)); return; }
   const item = e.target.closest('.command-item');
+  if (item?.dataset.savedIndex !== undefined) { const saved = state.savedActions[Number(item.dataset.savedIndex)]; if (saved) runSavedAction(saved); return; }
   if (item && item.dataset.cmdId) {
     const cmd = activeCommands.find(c => c.id === item.dataset.cmdId);
-    if (cmd) { $('#commandPalette').close(); cmd.fn(); commandPaletteOpen = false; }
+    if (cmd) { if (cmd.keepOpen) cmd.fn(); else { $('#commandPalette').close(); cmd.fn(); commandPaletteOpen = false; } }
   }
 });
 document.querySelectorAll('.command-tab').forEach(tab => tab.addEventListener('click', () => { setConsoleMode(tab.dataset.mode); $('#commandInput').focus(); }));
 $('#terminalQuickCommands').addEventListener('click', (e) => { const quick = e.target.closest('[data-terminal-fill]'); if (quick) { setCommandInputValue(quick.dataset.terminalFill); $('#commandInput').focus(); renderGitHints(); } });
+$('#commandAddSaved').addEventListener('click', () => addOrEditSavedAction());
 $('#commandScopeSelect').addEventListener('change', (event) => { selectConsoleScope(event.target.value); if (state.consoleMode === 'console') renderConsoleTranscript(); });
 $('#commandClearTranscript').addEventListener('click', () => { state.consoleTranscript = []; renderConsoleTranscript(); });
 $('#commandCopyTranscript').addEventListener('click', () => copyText(state.consoleTranscript.map(consoleEntryAsText).join('\n\n'), 'Terminal transcript copied.'));

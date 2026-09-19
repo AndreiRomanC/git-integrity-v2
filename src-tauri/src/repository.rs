@@ -287,6 +287,23 @@ fn cached_full_statuses(repository: &Repository, repository_path: &str) -> Resul
             return Ok(statuses.clone());
         }
     }
+    // Share the same per-repository single-flight gate as refresh_status and
+    // stage_all. Without this, a fast repository open could start its
+    // background refresh_status scan while a normal load_repository (or a
+    // forced folder reload) simultaneously starts this long-cache scan of the
+    // exact same working tree. On large Windows repositories that meant two
+    // multi-second/minute `git status` walks fighting for the same disk. This
+    // does not make the cache any staler: it only waits for an in-flight scan
+    // and re-checks the cache before deciding whether a real scan is still
+    // needed.
+    let lock_handle = status_scan_lock(repository_path);
+    let _guard = lock_handle.lock().unwrap();
+    if let Some((cached_at, statuses)) = full_status_cache().lock().unwrap().get(repository_path) {
+        if cached_at.elapsed() < GIT_METADATA_TTL {
+            perf_log("cached_full_statuses: HIT (after a concurrent scan)", Duration::ZERO);
+            return Ok(statuses.clone());
+        }
+    }
     let step = Instant::now();
     let statuses = internal_statuses(repository, None)?;
     perf_log("cached_full_statuses: MISS, scanned", step.elapsed());
@@ -752,7 +769,15 @@ pub struct TextFile { relative_path: String, content: String }
 pub struct PublishCommit { id: String, subject: String, author: String, date: String }
 
 #[derive(Serialize)]
-pub struct PublishStatus { branch: String, remote: String, remote_branch: String, commits: Vec<PublishCommit> }
+pub struct PublishStatus {
+    branch: String,
+    remote: String,
+    remote_branch: String,
+    commits: Vec<PublishCommit>,
+    ahead: usize,
+    behind: usize,
+    remote_branch_exists: bool,
+}
 
 // `GIT_TERMINAL_PROMPT=0` + a null stdin are the real fix for the app
 // "freezing" on some machines (reported worse on Windows): without them, if a
@@ -1373,7 +1398,7 @@ pub fn init_repository(path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn clone_repository(url: String, parent_path: String, folder_name: String) -> Result<String, String> {
+pub fn clone_repository(url: String, parent_path: String, folder_name: String, branch: Option<String>, recurse_submodules: Option<bool>) -> Result<String, String> {
     validate_path(&parent_path)?;
     let url = url.trim(); let folder_name = folder_name.trim();
     if url.is_empty() { return Err("Repository URL cannot be empty".into()); }
@@ -1381,7 +1406,19 @@ pub fn clone_repository(url: String, parent_path: String, folder_name: String) -
     if folder.components().count() != 1 || folder_name.is_empty() { return Err("Choose a simple local folder name".into()); }
     let destination = Path::new(&parent_path).join(&folder);
     if destination.exists() { return Err("The destination folder already exists".into()); }
-    let mut builder = git2::build::RepoBuilder::new(); let fetch = network_fetch_options(); builder.fetch_options(fetch); builder.clone(url, &destination).map_err(|error| format!("Clone failed: {}", error.message()))?;
+    let mut builder = git2::build::RepoBuilder::new();
+    if let Some(branch) = branch.as_deref().map(str::trim).filter(|branch| !branch.is_empty()) {
+        if branch.starts_with('-') || branch.contains("..") || branch.contains('\\') {
+            return Err("Choose a valid branch name to clone".into());
+        }
+        builder.branch(branch);
+    }
+    let fetch = network_fetch_options(); builder.fetch_options(fetch); builder.clone(url, &destination).map_err(|error| format!("Clone failed: {}", error.message()))?;
+    if recurse_submodules.unwrap_or(false) {
+        let destination_string = destination.to_string_lossy().into_owned();
+        git(&destination_string, &["submodule", "update", "--init", "--recursive"])
+            .map_err(|error| format!("Repository cloned, but submodules could not be initialized: {error}"))?;
+    }
     Ok(destination.to_string_lossy().into_owned())
 }
 
@@ -3489,9 +3526,18 @@ pub fn publish_status(repository_path: String, branch: String, remote: String) -
     if branch.is_empty() || remote.is_empty() { return Err("Choose a local branch and a remote".into()); }
     let repo = internal_repository(&repository_path)?;
     let remote_branch = format!("{remote}/{branch}");
+    let local_oid = repo.refname_to_id(&format!("refs/heads/{branch}")).map_err(|error| error.message().to_string())?;
+    let remote_oid = repo.refname_to_id(&format!("refs/remotes/{remote}/{branch}")).ok();
     let outgoing = outgoing_commit_ids(&repo, branch, remote)?;
     let mut commits = outgoing.iter().take(100).filter_map(|&oid| repo.find_commit(oid).ok().map(|commit| PublishCommit { id: oid.to_string(), subject: commit.summary().unwrap_or("No message").into(), author: commit.author().name().unwrap_or("Unknown").into(), date: short_date(commit.time().seconds()) })).collect::<Vec<_>>(); commits.reverse();
-    Ok(PublishStatus { branch: branch.into(), remote: remote.into(), remote_branch, commits })
+    let (ahead, behind, remote_branch_exists) = match remote_oid {
+        Some(remote_oid) => {
+            let (ahead, behind) = repo.graph_ahead_behind(local_oid, remote_oid).map_err(|error| error.message().to_string())?;
+            (ahead, behind, true)
+        }
+        None => (commits.len(), 0, false),
+    };
+    Ok(PublishStatus { branch: branch.into(), remote: remote.into(), remote_branch, commits, ahead, behind, remote_branch_exists })
 }
 
 // One outgoing parent commit's gitlink that cannot be confirmed safe to
@@ -6319,7 +6365,7 @@ mod tests {
         assert!(!read_text_file(repository.to_string_lossy().into_owned(), "src/main.c".into()).unwrap().content.contains("return 3"));
         assert_eq!(submodule_repository_inner(repository.to_string_lossy().into_owned(), "vendor/dependency".into()).unwrap().repository.name, "dependency");
         assert_eq!(list_remotes(repository.to_string_lossy().into_owned()).unwrap().len(), 1);
-        let cloned = clone_repository(dependency.to_string_lossy().into_owned(), base.to_string_lossy().into_owned(), "cloned-dependency".into()).unwrap();
+        let cloned = clone_repository(dependency.to_string_lossy().into_owned(), base.to_string_lossy().into_owned(), "cloned-dependency".into(), None, None).unwrap();
         assert_eq!(load_repository_inner(cloned.clone(), Some(true)).unwrap().repository.name, "cloned-dependency");
         remove_git_path_inner(&cloned, "README.md").unwrap();
         assert!(!Path::new(&cloned).join("README.md").exists());
@@ -10068,7 +10114,9 @@ mod tests {
         let path = repository.to_string_lossy().into_owned();
 
         // main IS published — nothing unexpected there.
-        assert_eq!(publish_status(path.clone(), "main".into(), "origin".into()).unwrap().commits.len(), 0);
+        let main_status = publish_status(path.clone(), "main".into(), "origin".into()).unwrap();
+        assert_eq!(main_status.commits.len(), 0);
+        assert_eq!((main_status.ahead, main_status.behind, main_status.remote_branch_exists), (0, 0, true));
 
         // A brand new branch created right at main's tip, with no new work of
         // its own yet, shares 100% of its history with origin/main — it should
@@ -10076,6 +10124,7 @@ mod tests {
         create_branch(path.clone(), "feature-x".into()).unwrap();
         let unpublished = publish_status(path.clone(), "feature-x".into(), "origin".into()).unwrap();
         assert_eq!(unpublished.commits.len(), 0, "a new branch with no commits of its own should have nothing new to publish, even though origin/feature-x doesn't exist yet");
+        assert_eq!((unpublished.ahead, unpublished.behind, unpublished.remote_branch_exists), (0, 0, false));
 
         // Now make one genuinely new commit on it — only *that* should show up.
         fs::write(repository.join("a.txt"), "three").unwrap();
@@ -10083,9 +10132,47 @@ mod tests {
         let unpublished = publish_status(path.clone(), "feature-x".into(), "origin".into()).unwrap();
         assert_eq!(unpublished.commits.len(), 1);
         assert_eq!(unpublished.commits[0].subject, "Commit 3 on feature-x");
+        assert_eq!((unpublished.ahead, unpublished.behind, unpublished.remote_branch_exists), (1, 0, false));
+
+        run_git(&repository, &["checkout", "main"]);
+        let other = std::env::temp_dir().join(format!("git-integrity-new-branch-other-{suffix}"));
+        run_git(std::env::temp_dir().as_path(), &["-c", "protocol.file.allow=always", "clone", remote.to_str().unwrap(), other.file_name().unwrap().to_str().unwrap()]);
+        run_git(&other, &["config", "user.email", "test@example.com"]);
+        run_git(&other, &["config", "user.name", "Someone Else"]);
+        fs::write(other.join("a.txt"), "remote-three").unwrap();
+        run_git(&other, &["commit", "-am", "Remote commit on main"]);
+        run_git(&other, &["-c", "protocol.file.allow=always", "push", "origin", "HEAD:main"]);
+        run_git(&repository, &["fetch", "origin"]);
+        let behind_status = publish_status(path.clone(), "main".into(), "origin".into()).unwrap();
+        assert_eq!(behind_status.commits.len(), 0, "being behind is not the same as having local commits to publish");
+        assert_eq!((behind_status.ahead, behind_status.behind, behind_status.remote_branch_exists), (0, 1, true));
 
         fs::remove_dir_all(repository).unwrap();
         fs::remove_dir_all(remote).unwrap();
+        fs::remove_dir_all(other).unwrap();
+    }
+
+    #[test]
+    fn clone_repository_can_checkout_an_explicit_branch() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-clone-branch-{suffix}"));
+        let source = base.join("source");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("file.txt"), "main").unwrap();
+        run_git(&source, &["init", "-b", "main"]);
+        run_git(&source, &["config", "user.email", "test@example.com"]);
+        run_git(&source, &["config", "user.name", "Test User"]);
+        run_git(&source, &["add", "."]);
+        run_git(&source, &["commit", "-m", "main"]);
+        run_git(&source, &["checkout", "-b", "release/test"]);
+        fs::write(source.join("file.txt"), "release").unwrap();
+        run_git(&source, &["commit", "-am", "release"]);
+
+        let cloned = clone_repository(source.to_string_lossy().into_owned(), base.to_string_lossy().into_owned(), "clone".into(), Some("release/test".into()), Some(false)).unwrap();
+        assert_eq!(git(&cloned, &["branch", "--show-current"]).unwrap().trim(), "release/test");
+        assert_eq!(fs::read_to_string(Path::new(&cloned).join("file.txt")).unwrap(), "release");
+
+        fs::remove_dir_all(base).unwrap();
     }
 
     #[test]

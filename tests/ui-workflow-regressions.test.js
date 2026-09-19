@@ -10,9 +10,14 @@ const app = fs.readFileSync(path.join(root, 'frontend/app.js'), 'utf8');
 test('Terminal is the first default command panel and has an explicit close button', () => {
   const terminalTab = html.indexOf('data-mode="console"');
   const actionsTab = html.indexOf('data-mode="commands"');
+  const savedTab = html.indexOf('data-mode="saved"');
   assert.ok(terminalTab >= 0 && terminalTab < actionsTab);
+  assert.ok(savedTab > actionsTab);
   assert.match(html, /id="closeCommandPalette"[^>]*>×<\/button>/);
-  assert.match(app, /function openCommandPalette\(\)[\s\S]*?setConsoleMode\('console'\)/);
+  assert.match(html, /id="commandModeOptions"/);
+  assert.match(app, /function openCommandPalette\(\)[\s\S]*?setConsoleMode\(state\.consoleMode \|\| 'console'\)/);
+  const openPaletteBody = app.match(/function openCommandPalette\(\) \{([\s\S]*?)\n\}/)?.[1] || '';
+  assert.doesNotMatch(openPaletteBody, /setCommandInputValue\(''\)/);
 });
 
 test('Add submodule starts at the Vitesco engineering namespace', () => {
@@ -99,4 +104,64 @@ test('Stash folder disappears with its Explorer row-mates outside Explorer, neve
   // Sync/Remotes. The Ctrl+Shift+S shortcut calls stashWork() directly, so
   // it stays reachable everywhere regardless of this element's visibility.
   assert.match(app, /\$\('#stashWork'\)\.hidden = state\.view !== 'explorer' \|\| !state\.repository;/);
+});
+
+test('the version selector\'s own Push button reuses the real push flow, not a second one, and never leaks the menu underneath it', () => {
+  // data-push-version just names the active branch that submoduleMenuEntry
+  // already is — no per-row data needed, unlike data-reset-upstream.
+  assert.match(app, /refs\.submoduleVersions\.querySelectorAll\('\[data-push-version\]'\)\.forEach\(button => button\.addEventListener\('click', event => \{[\s\S]*?pushSubmodule\(submoduleMenuEntry\)/);
+  // Its preview/confirm dialog is a *child* of the version selector exactly
+  // like the New branch/New tag dialogs already were — without this, any
+  // click inside it (Cancel included) would hide the menu underneath before
+  // the dialog itself even closes, the same bug class the branch/tag dialog
+  // fix already covered once.
+  assert.match(app, /const childActionOpen = refs\.newBranchDialog\.open \|\| \$\('#newTagDialog'\)\.open \|\| \$\('#submodulePublishDialog'\)\.open;/);
+  // A successful push makes the menu's own displayed data (e.g. "N commits
+  // to push") stale — closed the same way its Checkout/Discard siblings
+  // already close it on their own success, not left open showing a state
+  // that no longer exists.
+  assert.match(app, /const result = await invoke\('push_submodule',[\s\S]*?refs\.submoduleMenu\.hidden = true;/);
+});
+
+test('clone is reachable outside the empty state and sends explicit clone options', () => {
+  assert.match(html, /id="repoPickerMenu"/, 'repository picker must offer a compact menu while a repository is already open');
+  assert.match(html, /id="repoMenuClone"/, 'repository picker menu must include Clone');
+  assert.match(html, /id="cloneBranch"/, 'clone dialog should support an optional branch');
+  assert.match(html, /id="cloneRecurseSubmodules"/, 'clone dialog should make recursive submodule init an explicit opt-in');
+  assert.match(app, /\$\('#repoMenuClone'\)\.addEventListener\('click', \(\) => \{ closeRepoPickerMenu\(\); openCloneDialog\(\); \}\)/);
+  assert.match(app, /invoke\('clone_repository', \{ url, parentPath, folderName, branch: branch \|\| null, recurseSubmodules \}\)/);
+});
+
+test('App actions can find and mark the branch start commit via visible git commands', () => {
+  assert.match(app, /id: 'branch-start'/);
+  assert.match(app, /git merge-base HEAD \$\{baseRef\}/);
+  assert.match(app, /git show --no-patch --decorate --date=short --stat \$\{sha\}/);
+  assert.match(app, /branchStartMarker/);
+  assert.match(app, /is-command-branch-start/);
+});
+
+test('Saved actions are a separate persistent command tab and appear in App actions', () => {
+  assert.match(html, /data-mode="saved"/);
+  assert.match(html, /Saved actions/);
+  assert.match(html, /id="commandAddSaved"/);
+  assert.match(html, /Save action/);
+  assert.match(app, /SAVED_ACTIONS_KEY/);
+  assert.match(app, /function renderSavedActions/);
+  assert.match(app, /function addOrEditSavedAction/);
+  assert.match(app, /function runSavedAction/);
+  assert.match(app, /commands to run/i);
+  assert.match(app, /state\.savedActions\.forEach/);
+  assert.match(app, /Saved action: \$\{action\.name\}/);
+  assert.match(app, /data-saved-run/);
+});
+
+test('publish indicator surfaces ahead and behind, not only outgoing commit count', () => {
+  assert.match(app, /function publishAheadBehindText\(info\)/);
+  assert.match(app, /function publishRemoteAheadWarningHtml\(publish\)/);
+  assert.match(app, /new remote branch/);
+  assert.match(app, /\$\{ahead\} ahead \/ \$\{behind\} behind/);
+  assert.match(app, /Everything is on the server · \$\{comparison\}/);
+  assert.match(app, /local commit\$\{state\.publish\.commits\.length === 1 \? '' : 's'\} to publish · \$\{comparison\}/);
+  assert.match(app, /has \$\{behind\} commit\$\{behind === 1 \? '' : 's'\} you do not have locally/);
+  assert.match(app, /publishRemoteAheadWarningHtml\(state\.publish\) \+ publishSubmoduleRisksHtml/);
 });
