@@ -15,7 +15,7 @@ const MUTATING_COMMANDS = new Set([
   'restore_file', 'restore_remote_file', 'restore_folder', 'add_submodule', 'switch_submodule_version', 'reset_submodule', 'reset_submodule_branch_to_upstream', 'change_submodule_url',
   'commit_submodule', 'push_submodule', 'pull_submodule', 'force_push_submodule', 'fetch_submodule',
   'create_submodule_branch', 'merge_branch', 'open_merge_tool', 'resolve_conflict', 'complete_merge', 'abort_merge',
-  'sync_repository', 'publish_branch', 'fetch_remote', 'fetch_all_remotes', 'write_text_file', 'run_git_command', 'run_terminal_command',
+  'sync_repository', 'publish_branch', 'fetch_remote', 'fetch_all_remotes', 'fetch_project', 'write_text_file', 'run_git_command', 'run_terminal_command',
 ]);
 // While an embedded Terminal command is running, every mutation *and* switching to
 // a different repository (which would otherwise let that command's delayed
@@ -121,6 +121,7 @@ const state = { repository: null, branches: [], commits: [], allCommits: [], cha
   // submodule" costs nothing extra on ordinary (non-submodule) folder
   // clicks. See submoduleBoundaryFor.
   submodule_paths: [],
+  drillDownNotes: {}, drillDownNotesRepositoryPath: '', drillDownNotesError: '',
   statusReady: true, consoleCommandRunning: false, activeSubmodule: null, localDriveGitRefreshPending: false };
 const previewData = {
   repository: { name: 'vehicle-control', path: '/projects/vehicle-control', current_branch: 'feature/diagnostics' },
@@ -206,6 +207,78 @@ function status(message, kind = '') {
   if (kind !== 'busy') refreshCommandHint();
 }
 let toastTimer; function showOperationToast(message, kind = '') { clearTimeout(toastTimer); refs.operationToast.textContent = message; refs.operationToast.className = `operation-toast ${kind}`; refs.operationToast.hidden = false; toastTimer = setTimeout(() => { refs.operationToast.hidden = true; }, 7000); }
+
+function normalizeNotePath(path = '') {
+  return String(path).replace(/\\/g, '/').replace(/^\/+|\/+$/g, '').split('/').filter(part => part && part !== '.').join('/');
+}
+function noteForPath(path) {
+  return state.drillDownNotes?.[normalizeNotePath(path)] || '';
+}
+function folderHasPersonalNote(entry) {
+  return entry?.kind === 'folder' && Boolean(noteForPath(entry.relative_path));
+}
+async function ensureDrillDownNotesLoaded(repositoryPath, force = false) {
+  if (!repositoryPath) return;
+  if (!force && state.drillDownNotesRepositoryPath === repositoryPath) return;
+  state.drillDownNotesRepositoryPath = repositoryPath;
+  state.drillDownNotes = {};
+  state.drillDownNotesError = '';
+  if (!invoke) return;
+  try {
+    const loaded = await invoke('load_drill_down_notes', { repositoryPath });
+    state.drillDownNotes = loaded?.notes || {};
+    state.drillDownNotesError = loaded?.error || '';
+    if (state.drillDownNotesError) status(state.drillDownNotesError, 'error');
+  } catch (error) {
+    state.drillDownNotes = {};
+    state.drillDownNotesError = String(error);
+    status(`Personal notes unavailable: ${String(error)}`, 'error');
+  }
+}
+async function editFolderPersonalNote(entry) {
+  if (entry.kind !== 'folder') return;
+  const current = noteForPath(entry.relative_path);
+  const text = await customPrompt(`Personal note for ${entry.relative_path}:`, current, { title: current ? 'Edit personal note' : 'Add personal note', okLabel: 'Save note', multiline: true });
+  if (text === null || text === current) return;
+  if (!invoke) {
+    const key = normalizeNotePath(entry.relative_path);
+    if (text.trim()) state.drillDownNotes[key] = text.trim(); else delete state.drillDownNotes[key];
+    render(); renderEntryDetails({ ...entry });
+    return;
+  }
+  try {
+    const saved = await invoke('set_drill_down_note', { repositoryPath: state.repository.path, relativePath: entry.relative_path, note: text });
+    state.drillDownNotes = saved?.notes || {};
+    state.drillDownNotesError = saved?.error || '';
+    render(); renderEntryDetails({ ...entry });
+    status(text.trim() ? `${entry.name}: personal note saved` : `${entry.name}: personal note removed`);
+  } catch (error) { handleError(error); }
+}
+async function deleteFolderPersonalNote(entry) {
+  if (entry.kind !== 'folder' || !noteForPath(entry.relative_path)) return;
+  if (!await customConfirm(`Delete the personal note for "${entry.relative_path}"?`, { title: 'Delete personal note', danger: true, okLabel: 'Delete note' })) return;
+  if (!invoke) {
+    delete state.drillDownNotes[normalizeNotePath(entry.relative_path)];
+    render(); renderEntryDetails({ ...entry });
+    return;
+  }
+  try {
+    const saved = await invoke('delete_drill_down_note', { repositoryPath: state.repository.path, relativePath: entry.relative_path });
+    state.drillDownNotes = saved?.notes || {};
+    state.drillDownNotesError = saved?.error || '';
+    render(); renderEntryDetails({ ...entry });
+    status(`${entry.name}: personal note deleted`);
+  } catch (error) { handleError(error); }
+}
+function renderFolderPersonalNoteSection(entry) {
+  if (entry.kind !== 'folder') return '';
+  const note = noteForPath(entry.relative_path);
+  if (!note) {
+    return `<div class="detail-section personal-note-section"><h3>PERSONAL NOTE</h3><button class="personal-note-add" data-note-action="edit">＋ Add note</button></div>`;
+  }
+  const preview = note.length > 140 ? `${note.slice(0, 140).trimEnd()}…` : note;
+  return `<div class="detail-section personal-note-section"><h3>PERSONAL NOTE</h3><p>${esc(preview)}</p><div class="personal-note-actions"><button data-note-action="edit">Edit</button><button data-note-action="delete">Delete</button></div></div>`;
+}
 
 // Report: show the real git commands the app runs, quietly, next to the
 // status text — not a replacement for the Terminal's own transcript (that
@@ -491,7 +564,7 @@ async function loadRepository(path, options = {}) {
     // A newer open/reload already started (and will do its own render) while
     // this one's backend call was in flight — applying this one now would
     // stomp whatever that newer one already showed.
-    if (generation !== repoOpenGeneration) return;
+    if (generation !== repoOpenGeneration) return false;
     // `data.commits` (assigned onto state.commits below) is always the full,
     // unscoped history — a scoped "History · <path>" view can't stay correctly
     // scoped through a refresh without re-querying that same scope, so it
@@ -502,6 +575,7 @@ async function loadRepository(path, options = {}) {
     // openRepositoryFast's still-pending background fetch was doing is moot now.
     state.statusReady = true;
     state.remoteRef = data.branches.find(branch => branch.remote)?.name || '';
+    await ensureDrillDownNotesLoaded(data.repository.path);
     // Keep the parent's stash count current. The sidebar exposes Stash and
     // Stashes as separate actions even when this is zero; submodules have
     // their own independently loaded lists.
@@ -510,7 +584,23 @@ async function loadRepository(path, options = {}) {
     addRecentRepo(path, data.repository.name);
     updatePublishIndicator();
     await checkForMergeConflicts();
-  } catch (error) { handleError(error); }
+    return true;
+  } catch (error) { handleError(error); return false; }
+}
+
+async function refreshRepository(button = null) {
+  if (!state.repository) return;
+  const finishButton = beginButtonOperation(button, 'Refreshing…');
+  try {
+    status('Refreshing repository from disk…', 'busy');
+    const refreshed = await loadRepository(state.repository.path, { keepPath: true, force: true });
+    if (!refreshed) return;
+    const msg = `Repository refreshed — ${state.commits.length} commits loaded.`;
+    status(msg);
+    showOperationToast(msg, 'success');
+  } finally {
+    finishButton();
+  }
 }
 
 // The fast, read-only first phase for *opening a repository specifically* —
@@ -556,6 +646,7 @@ async function openRepositoryFast(path) {
     state.graphPrimaryBranch = null; // a different repository's branches share nothing with the last one's picker choice
     state.allCommits = data.commits; state.historyScope = ''; state.historyKind = ''; state.view = 'explorer'; state.commanderPath = ''; state.commanderRows = [];
     state.remoteRef = data.branches.find(branch => branch.remote)?.name || '';
+    await ensureDrillDownNotesLoaded(data.repository.path);
     state.hasStash = state.stashes.length > 0; updateStashUI();
     // Filesystem-only, no Git calls at all — see list_directory_fast's own
     // doc comment for exactly what this replaces: calling the *normal*
@@ -1009,8 +1100,8 @@ function renderExplorer() {
     <span class="file-main"><span class="entry-icon folder">▲</span><span class="entry-copy"><span class="entry-name">..</span><span class="entry-hint">Parent folder</span></span></span>
     <span></span><span></span><span></span>
   </button>` : '';
-  const rowsHtml = entries.map(entry => `<button class="file-row file-grid ${entry.status || !entry.tracked ? 'has-change' : ''} ${state.selectedEntry?.relative_path === entry.relative_path ? 'selected' : ''}" data-entry="${esc(entry.relative_path)}">
-    <span class="file-main">${iconFor(entry)}<span class="entry-copy"><span class="entry-name">${esc(entry.name)}${entry.kind === 'submodule' ? '<b class="inline-submodule-badge">SUBMODULE</b>' : ''}</span><span class="entry-hint">${entry.kind === 'submodule' ? esc(submoduleHeadHint(entry)) : entry.kind === 'deleted-submodule' ? 'Deleted Git submodule' : entry.kind === 'deleted-folder' ? 'Deleted tracked folder' : entry.kind === 'deleted' ? 'Deleted tracked file' : entry.kind}</span></span>${['folder','submodule'].includes(entry.kind) ? '<span class="folder-arrow">›</span>' : ''}</span>
+  const rowsHtml = entries.map(entry => `<button class="file-row file-grid ${entry.status || !entry.tracked ? 'has-change' : ''} ${folderHasPersonalNote(entry) ? 'has-personal-note' : ''} ${state.selectedEntry?.relative_path === entry.relative_path ? 'selected' : ''}" data-entry="${esc(entry.relative_path)}">
+    <span class="file-main">${iconFor(entry)}<span class="entry-copy"><span class="entry-name">${esc(entry.name)}${folderHasPersonalNote(entry) ? '<b class="personal-note-dot" title="Personal note">✎</b>' : ''}${entry.kind === 'submodule' ? '<b class="inline-submodule-badge">SUBMODULE</b>' : ''}</span><span class="entry-hint">${entry.kind === 'submodule' ? esc(submoduleHeadHint(entry)) : entry.kind === 'deleted-submodule' ? 'Deleted Git submodule' : entry.kind === 'deleted-folder' ? 'Deleted tracked folder' : entry.kind === 'deleted' ? 'Deleted tracked file' : entry.kind}</span></span>${['folder','submodule'].includes(entry.kind) ? '<span class="folder-arrow">›</span>' : ''}</span>
     ${gitState(entry)}<span class="file-size">${entry.kind === 'file' ? formatSize(entry.size) : '—'}</span><span class="file-modified">${formatModified(entry.modified)}</span>
   </button>`).join('') || (state.currentPath ? '' : '<div class="empty-change">This folder is empty</div>');
   const showAllStub = capped ? `<div class="history-truncated-stub"><span>Showing ${EXPLORER_DOM_ROW_CAP} of ${allEntries.length} items</span><button id="explorerShowAll">Show all ${allEntries.length}</button></div>` : '';
@@ -1572,6 +1663,39 @@ async function showSubmoduleReferenceChanges(entry) {
   } catch (error) { if (stillCurrent()) handleError(error); }
 }
 
+const SPEC_ID_PATTERN = /\b[A-Z0-9]{8}\.[A-Z0-9]{3}\b/g;
+function extractSpecIds(text = '') {
+  const seen = new Set();
+  const matches = String(text).match(SPEC_ID_PATTERN) || [];
+  return matches.filter(value => {
+    if (seen.has(value)) return false;
+    seen.add(value);
+    return true;
+  });
+}
+function specDetailRows(...texts) {
+  const specs = extractSpecIds(texts.filter(Boolean).join(' '));
+  if (!specs.length) return '';
+  return `<span>Spec</span><strong class="spec-list">${specs.map(spec => `<code>${esc(spec)}</code>`).join(' ')}</strong>`;
+}
+function compactRepositoryLabel(url = '') {
+  const trimmed = String(url).trim().replace(/\.git$/, '').replace(/\/$/, '');
+  if (!trimmed) return 'Open repository';
+  try {
+    const parsed = new URL(trimmed);
+    return `${parsed.host}${parsed.pathname}`.replace(/\.git$/, '').replace(/\/$/, '');
+  } catch (_) {
+    const scpLike = trimmed.match(/^[^@]+@([^:]+):(.+)$/);
+    if (scpLike) return `${scpLike[1]}/${scpLike[2]}`.replace(/\.git$/, '').replace(/\/$/, '');
+    return trimmed.replace(/^(ssh:\/\/git@|https?:\/\/)/, '').replace(/\.git$/, '');
+  }
+}
+function submoduleRepositoryLinkHtml(entry) {
+  if (!entry.submodule_web_url) return esc(entry.submodule_url || 'Not configured');
+  const label = compactRepositoryLabel(entry.submodule_web_url);
+  return `<a href="${esc(entry.submodule_web_url)}" class="submodule-repository-link" data-submodule-path="${esc(entry.relative_path)}" title="${esc(entry.submodule_web_url)}">${esc(label)} ↗</a>`;
+}
+
 // "Last commit touching this path" can be a genuinely heavy history walk on
 // a large repository — computed separately from the rest of entry_details
 // (see selectEntry) so it never blocks the fast details from showing.
@@ -1581,7 +1705,7 @@ async function showSubmoduleReferenceChanges(entry) {
 function renderEntryLastCommitInner(entry) {
   const title = entry.kind === 'submodule' ? 'PROJECT COMMIT (gitlink update)' : 'LAST COMMIT';
   if (entry.last_commit_id === undefined) return `<h3>${title}</h3><div class="detail-grid"><span>Commit</span><strong><i class="spinner"></i> Loading…</strong></div>`;
-  return `<h3>${title}</h3><div class="detail-grid"><span>Commit</span><strong>${entry.last_commit_id ? `<a href="#" class="commit-server-link" data-commit-id="${esc(entry.last_commit_id)}" title="Open this commit on the server">${esc(entry.last_commit_id.slice(0, 8))} ↗</a>` : 'No commit'}</strong><span>Message</span><strong>${commitSubjectHtml(entry.last_commit_subject || '—')}</strong><span>Author</span><strong>${esc(entry.last_commit_author || '—')}</strong><span>Date</span><strong>${esc(entry.last_commit_date || '—')}</strong></div>`;
+  return `<h3>${title}</h3><div class="detail-grid"><span>Commit</span><strong>${entry.last_commit_id ? `<a href="#" class="commit-server-link" data-commit-id="${esc(entry.last_commit_id)}" title="Open this commit on the server">${esc(entry.last_commit_id.slice(0, 8))} ↗</a>` : 'No commit'}</strong><span>Message</span><strong>${commitSubjectHtml(entry.last_commit_subject || '—')}</strong>${specDetailRows(entry.last_commit_subject)}<span>Author</span><strong>${esc(entry.last_commit_author || '—')}</strong><span>Date</span><strong>${esc(entry.last_commit_date || '—')}</strong></div>`;
 }
 
 function renderEntryDetails(entry) {
@@ -1602,11 +1726,13 @@ function renderEntryDetails(entry) {
     <div class="context-actions">${deletedEntry ? '' : entry.kind === 'file' ? '<button data-detail-action="edit">Edit local file</button>' : '<button data-detail-action="open">Open folder</button>'}${entry.kind === 'submodule' ? '' : '<button data-detail-action="server">Open on server ↗</button>'}${entry.kind === 'submodule' ? '' : '<button data-detail-action="history">View history</button>'}${entry.kind === 'folder' ? '<button data-detail-action="restorefolder" class="danger-action-soft" data-tooltip="Restore only this folder from HEAD or a selected commit. Does not move HEAD or switch branch.">↶ Restore folder…</button>' : ''}${entry.status ? '<button data-detail-action="commit">Commit this item</button>' : ''}${entry.kind === 'deleted' ? '<button data-detail-action="head" data-tooltip="Restore this deleted file from your last local commit (HEAD)">↶ Restore from last commit (HEAD)</button>' : ''}${['folder','submodule'].includes(entry.kind) && entry.name === 'r' ? '<button data-detail-action="utrud" data-tooltip="Launches UTRUD for this r folder. If it cannot start, an explicit error is shown. Windows only.">▶ Run UTRUD</button>' : ''}${entry.kind === 'file' && (entry.status || !entry.tracked) ? `<button data-detail-action="stage" data-tooltip="git add — add this file's current content to staging">＋ Stage this file</button><button data-detail-action="unstage" data-tooltip="Unstage — git restore --staged. Removes only the staging entry; your edits on disk are kept exactly as they are.">− Unstage</button><button data-detail-action="stashfile" data-tooltip="Sets this file aside in this repository's own stash. Parent projects and submodules have separate stash lists.">⇕ Stash this file</button><button data-detail-action="head" class="danger-action-soft" data-tooltip="Restore from your last local commit (HEAD) — git checkout HEAD -- file. Permanently discards ALL edits; the file on disk becomes identical to what you last committed. Cannot be undone.">↶ Restore from last commit (HEAD)</button><button data-detail-action="compare" data-tooltip="Open side-by-side compare with restore options">⇄ Compare with remote</button>` : ''}${entry.kind === 'submodule' ? `<button data-detail-action="subserver">Open submodule repository ↗</button><button data-detail-action="subgraph" data-tooltip="Open this submodule's own branch/commit history — never the parent project's">Submodule Branch Map</button><button data-detail-action="subrefchanges" data-tooltip="A different, narrower question: which commits in the PARENT project changed this submodule's recorded version. Not the submodule's own history.">Submodule Reference Changes</button><button data-detail-action="subnewbranch" data-tooltip="Create a new local branch in this submodule, starting from its current commit, and switch to it">＋ New branch…</button><button data-detail-action="versions">Change version</button><button data-detail-action="substash" data-tooltip="Set aside all uncommitted files inside this submodule only. The parent project's work is untouched.">Stash submodule work</button><button data-detail-action="substashes" data-tooltip="View and restore this submodule's own stashes. The parent project's stash list is separate.">Submodule stashes</button><button data-detail-action="subcommit" ${canCommitInsideSubmodule ? '' : 'disabled'} data-tooltip="${canCommitInsideSubmodule ? 'Commit uncommitted changes inside the submodule' : 'No uncommitted files inside this submodule'}">Commit submodule</button><button data-detail-action="subreset" class="danger-action-soft" ${entry.status ? '' : 'disabled'} data-tooltip="${entry.status ? 'Discard local work and restore the exact submodule commit recorded by the parent project. This leaves detached HEAD, like git submodule update.' : 'The submodule already uses the version recorded by the parent project'}">↺ Restore project version…</button><button data-detail-action="subpull" data-tooltip="Fast-forward pull — brings in new commits from the submodule's remote. Refuses if it would require a manual merge.">Pull submodule</button><button data-detail-action="submerge" data-tooltip="Merge a branch into this submodule's current branch, with conflict resolution if needed">Merge branch…</button><button data-detail-action="subpush">Push submodule</button><button data-detail-action="subforcepush" class="danger-action-soft" data-tooltip="⚠️ Overwrites the remote branch with your local history, discarding any commits there aren't in yours. Only safe if nobody else uses that remote.">Force push submodule…</button><button data-detail-action="subfetch">Fetch submodule</button><button data-detail-action="location">Replace repository URL</button>` : ''}${deletedEntry ? '' : '<button class="danger-action" data-detail-action="delete">Delete…</button>'}</div>
     <div class="detail-section"><h3>GENERAL</h3><div class="detail-grid"><span>Type</span><strong>${kindLabel}</strong><span>Git</span><strong>${entry.tracked ? (entry.status || (entry.unpushed ? (entry.kind === 'folder' ? 'Clean — contains unpushed commits' : 'Committed, not pushed yet') : 'Tracked, clean')) : 'Untracked'}</strong>
     ${entry.item_count != null ? `<span>Items</span><strong>${entry.item_count}</strong>` : `<span>Size</span><strong>${formatSize(entry.size)}</strong>`}<span>Modified</span><strong>${formatModified(entry.modified)}</strong></div></div>
-    ${entry.kind === 'submodule' ? `<div class="detail-section"><h3>SUBMODULE</h3><div class="detail-grid"><span>Remote</span><strong>${esc(entry.submodule_url || 'Not configured')}</strong><span>Branch</span><strong>${esc(entry.submodule_branch || 'Default')}</strong><span>Status</span><strong>${esc(submoduleState.short)}</strong></div>
+    ${renderFolderPersonalNoteSection(entry)}
+    ${entry.kind === 'submodule' ? `<div class="detail-section"><h3>SUBMODULE</h3><div class="detail-grid"><span>Remote</span><strong>${esc(entry.submodule_url || 'Not configured')}</strong><span>GitHub</span><strong>${submoduleRepositoryLinkHtml(entry)}</strong><span>Branch</span><strong>${esc(entry.submodule_branch || 'Default')}</strong><span>Status</span><strong>${esc(submoduleState.short)}</strong></div>
     ${entry.submodule_unpushed_commits?.length ? `<div class="submodule-push-banner"><i></i><span>${entry.submodule_unpushed_commits.length} commit${entry.submodule_unpushed_commits.length === 1 ? '' : 's'} not yet pushed to its own remote:</span></div><div class="submodule-unpushed-list">${entry.submodule_unpushed_commits.map(commit => `<div class="submodule-unpushed-commit"><strong>${commitSubjectHtml(commit.subject)}</strong><small>${esc(commit.id.slice(0, 8))} · ${esc(commit.author)} · ${esc(commit.date)}</small></div>`).join('')}</div>` : entry.submodule_push_status ? `<div class="submodule-push-banner"><i></i><span>${esc(entry.submodule_push_status)}</span></div>` : ''}</div>` : ''}
-    ${entry.kind === 'submodule' ? `<div class="detail-section"><h3>SUBMODULE COMMIT (actual change)</h3><div class="detail-grid"><span>Commit</span><strong>${entry.submodule_commit_id ? `<a href="#" class="commit-server-link" data-commit-id="${esc(entry.submodule_commit_id)}" data-submodule-path="${esc(entry.relative_path)}" title="Open this commit on the submodule's own server">${esc(entry.submodule_commit_id.slice(0, 8))} ↗</a>` : 'No commit'}</strong><span>Message</span><strong>${commitSubjectHtml(entry.submodule_commit_subject || '—')}</strong><span>Author</span><strong>${esc(entry.submodule_commit_author || '—')}</strong><span>Date</span><strong>${esc(entry.submodule_commit_date || '—')}</strong></div></div>` : ''}
+    ${entry.kind === 'submodule' ? `<div class="detail-section"><h3>SUBMODULE COMMIT (actual change)</h3><div class="detail-grid"><span>Commit</span><strong>${entry.submodule_commit_id ? `<a href="#" class="commit-server-link" data-commit-id="${esc(entry.submodule_commit_id)}" data-submodule-path="${esc(entry.relative_path)}" title="Open this commit on the submodule's own server">${esc(entry.submodule_commit_id.slice(0, 8))} ↗</a>` : 'No commit'}</strong><span>Message</span><strong>${commitSubjectHtml(entry.submodule_commit_subject || '—')}</strong>${specDetailRows(entry.submodule_commit_subject)}<span>Author</span><strong>${esc(entry.submodule_commit_author || '—')}</strong><span>Date</span><strong>${esc(entry.submodule_commit_date || '—')}</strong></div></div>` : ''}
     <div class="detail-section" id="entryLastCommitSection">${renderEntryLastCommitInner(entry)}</div></div>`;
   refs.details.querySelectorAll('[data-detail-action]').forEach(button => button.addEventListener('click', () => { Promise.resolve(handleDetailAction(button.dataset.detailAction, entry, button)).catch(error => handleError(error)); }));
+  refs.details.querySelectorAll('[data-note-action]').forEach(button => button.addEventListener('click', () => { Promise.resolve(button.dataset.noteAction === 'delete' ? deleteFolderPersonalNote(entry) : editFolderPersonalNote(entry)).catch(error => handleError(error)); }));
 }
 
 function folderRestoreSourceRevision() {
@@ -2663,6 +2789,32 @@ async function fetchAllRemotes(button = null) {
   if (!invoke) return status('Preview: fetched all remotes');
   const finishButton = beginButtonOperation(button, 'Fetching…');
   try { status('Fetching every remote…', 'busy'); await invoke('fetch_all_remotes', { repositoryPath: state.repository.path }); await loadRepository(state.repository.path, { keepPath: true }); await loadRemotes(); const msg = `${state.remotes.length} remote${state.remotes.length === 1 ? '' : 's'} updated`; status(msg); showOperationToast(msg, 'success'); }
+  catch (error) { handleError(error); }
+  finally { finishButton(); }
+}
+function limitedFetchProjectDetails(label, list = []) {
+  if (!list.length) return '';
+  const visible = list.slice(0, 4).map(item => `- ${item}`).join('\n');
+  const extra = list.length > 4 ? `\n- …and ${list.length - 4} more` : '';
+  return `\n${label}:\n${visible}${extra}`;
+}
+async function fetchProjectAndSubmodules(button = null) {
+  if (!state.repository) return;
+  if (!invoke) return status('Preview: fetched parent repository and submodules');
+  const finishButton = beginButtonOperation(button, 'Fetching…');
+  try {
+    status('Fetching parent repository and initialized submodules…', 'busy');
+    const result = await invoke('fetch_project', { repositoryPath: state.repository.path });
+    await loadRepository(state.repository.path, { keepPath: true });
+    await loadRemotes();
+    const parentText = result.parent_fetched ? 'Parent updated' : 'Parent not updated';
+    const submoduleText = `${result.submodules_fetched}/${result.submodules_total} submodule${result.submodules_total === 1 ? '' : 's'} fetched`;
+    const skippedText = result.submodules_skipped ? ` · ${result.submodules_skipped} skipped` : '';
+    const msg = `${parentText} · ${submoduleText}${skippedText}`;
+    const details = `${limitedFetchProjectDetails('Skipped', result.warnings)}${limitedFetchProjectDetails('Errors', result.errors)}`;
+    status(msg, result.errors?.length ? 'error' : '');
+    showOperationToast(`${msg}${details}`, result.errors?.length ? 'error' : 'success');
+  }
   catch (error) { handleError(error); }
   finally { finishButton(); }
 }
@@ -4108,7 +4260,7 @@ refs.cloneUrl.addEventListener('input', () => { if (!refs.cloneName.dataset.edit
 $('#addSubmodule').addEventListener('click', openAddSubmoduleDialog); refs.confirmAddSubmodule.addEventListener('click', confirmAddSubmodule);
 refs.submoduleUrl.addEventListener('input', () => { if (!refs.submoduleName.dataset.edited) refs.submoduleName.value = suggestedRepositoryName(refs.submoduleUrl.value); validateSubmoduleForm(); });
 refs.submoduleName.addEventListener('input', () => { refs.submoduleName.dataset.edited = refs.submoduleName.value ? '1' : ''; validateSubmoduleForm(); });
-$('#refresh').addEventListener('click', () => state.repository && loadRepository(state.repository.path, { keepPath: true, force: true }));
+$('#refresh').addEventListener('click', event => refreshRepository(event.currentTarget));
 // Opening the drawer with everything already selected (staged) is what most
 // people expect from "here's what changed, commit it" — having to manually
 // tick every file first before Commit even becomes clickable read as "commit
@@ -4335,6 +4487,7 @@ $('#saveFile').addEventListener('click', saveEditor); $('#closeEditor').addEvent
 refs.editorContent.addEventListener('input', updateEditorSaveState);
 $('#fetchCurrent').addEventListener('click', event => { const first = state.remotes[0]?.name || state.branches.find(branch => branch.remote)?.name.split('/')[0]; if (first) fetchRemote(first, event.currentTarget); else status('No remote is configured', 'error'); });
 $('#fetchAll').addEventListener('click', event => fetchAllRemotes(event.currentTarget));
+$('#fetchProject').addEventListener('click', event => fetchProjectAndSubmodules(event.currentTarget));
 async function syncCurrent(action, button = null) {
   if (!invoke || !state.repository) return;
   const finishButton = beginButtonOperation(button, action === 'pull' ? 'Pulling…' : 'Pushing…');
@@ -4351,6 +4504,13 @@ $('#pullCurrent').addEventListener('click', event => syncCurrent('pull', event.c
 refs.publishBranch.addEventListener('change', refreshPublish); refs.publishRemote.addEventListener('change', refreshPublish); $('#confirmPublish').addEventListener('click', confirmPublish);
 [['#compareRestoreRemote','remote'],['#compareRestoreHead','head'],['#compareStage','stage'],['#compareUnstage','unstage']].forEach(([selector, action]) => $(selector)?.addEventListener('click', event => { event.preventDefault(); updateRecoveryHelp(action); applyFileRecovery(action).catch(error => handleError(error)); }));
 document.addEventListener('click', event => { const link = event.target.closest('.polarion-link'); if (!link) return; event.preventDefault(); if (invoke) invoke('open_external_url', { url: link.href }).catch(error => status(String(error), 'error')); else window.open(link.href, '_blank', 'noopener'); });
+document.addEventListener('click', event => {
+  const link = event.target.closest('.submodule-repository-link'); if (!link) return; event.preventDefault();
+  const path = link.dataset.submodulePath;
+  const entry = state.selectedEntry?.relative_path === path ? state.selectedEntry : state.entries.find(item => item.relative_path === path);
+  if (entry) return openEntryOnServer(entry, true);
+  if (!invoke) window.open(link.href, '_blank', 'noopener');
+});
 document.addEventListener('click', event => {
   const link = event.target.closest('.commit-server-link'); if (!link || !state.repository) return; event.preventDefault();
   const commitId = link.dataset.commitId;
@@ -4630,6 +4790,7 @@ function buildCommands() {
     { id: 'merge', name: 'Merge Branch…', description: 'Bring another branch\'s commits into your current one — stays local, resolves conflicts here if any', keys: '', keywords: 'combine join', tags: ['explorer', 'graph'], fn: () => state.repository && openMergeBranchDialog(mergeTargetForMain()) },
     { id: 'fetch', name: 'Fetch Remote', description: 'Download new commits/refs from the server without changing your branch', keys: 'Ctrl+Shift+F', tags: ['explorer', 'graph'], fn: () => $('#fetchCurrent').click() },
     { id: 'fetchall', name: 'Fetch All Remotes', description: 'Download new commits/refs from every configured remote, not just the first one', keywords: 'multiple upstream mirror', tags: ['explorer', 'graph'], fn: () => fetchAllRemotes() },
+    { id: 'fetch-project', name: 'Fetch Project + Submodules', description: 'Safe update: fetch parent remotes and initialized submodule origins without pull, checkout or branch changes', keywords: 'submodule update all refresh server safe', tags: ['explorer', 'graph'], fn: () => fetchProjectAndSubmodules() },
     { id: 'branch-start', name: 'Find Branch Start Commit', description: 'Run merge-base against origin/main, show the commit details, and mark that split point on the Branch Map', keys: '', keywords: 'merge-base parent start base fork origin/main', tags: ['explorer', 'graph', 'relevant'], keepOpen: true, fn: findBranchStartCommit },
     { id: 'stash', name: 'Stash Work in Current Repository', description: 'Set aside changes only in the project or submodule currently being browsed', keys: 'Ctrl+Shift+S', tags: ['explorer'], fn: stashWork },
     { id: 'pop', name: 'View Stashes in Current Repository', description: 'View or restore saved work for this project or submodule', keys: '', tags: ['explorer'], fn: popStash },

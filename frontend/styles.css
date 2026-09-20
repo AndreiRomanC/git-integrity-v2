@@ -24,7 +24,7 @@ button, input, textarea { font: inherit; color: inherit; }
 button { cursor: default; }
 .app-shell { height: 100vh; min-width: 1000px; display: grid; grid-template-rows: 64px 1fr 28px; }
 
-.topbar { display: flex; align-items: center; gap: 16px; padding: 0 18px; background: #10161d; border-bottom: 1px solid var(--border); }
+.topbar { display: flex; align-items: center; gap: 12px; padding: 0 14px; background: #10161d; border-bottom: 1px solid var(--border); }
 .brand { position: relative; display: flex; align-items: center; gap: 9px; width: 172px; height: 46px; padding: 3px 11px 3px 8px; overflow: hidden; flex: 0 0 172px; border: 1px solid #3b4856; border-radius: 10px; background: linear-gradient(145deg, #1c2732 0%, #131b23 75%); box-shadow: inset 0 1px 0 #ffffff0b, 0 5px 16px #00000030; }
 .brand::after { content: ''; position: absolute; inset: 7px 0 7px auto; width: 2px; border-radius: 2px 0 0 2px; background: linear-gradient(#ef5523, #8f3021); opacity: .85; }
 .brand-mark { width: 27px; height: 40px; display: grid; place-items: center; overflow: hidden; flex: 0 0 27px; }
@@ -32,14 +32,14 @@ button { cursor: default; }
 .brand-copy { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
 .brand-copy strong { color: #f0f4f8; font-size: 17px; font-weight: 750; line-height: 1.05; letter-spacing: -.45px; white-space: nowrap; }
 .brand-copy small { color: #7f94a7; font-size: 7px; font-weight: 750; line-height: 1; letter-spacing: 1.35px; white-space: nowrap; }
-.repo-picker { width: min(520px, 46vw); height: 44px; display: flex; align-items: center; gap: 12px; padding: 0 13px; border: 1px solid #3a4756; border-radius: 8px; background: #171f29; text-align: left; }
+.repo-picker { flex: 0 1 360px; width: min(360px, 32vw); min-width: 210px; height: 44px; display: flex; align-items: center; gap: 10px; padding: 0 11px; border: 1px solid #3a4756; border-radius: 8px; background: #171f29; text-align: left; }
 .repo-picker:hover { border-color: var(--blue); background: #1b2632; }
 .folder-icon { color: var(--blue); font-size: 21px; }
 .repo-picker-copy { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
 .repo-picker-copy strong, .repo-picker-copy small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .repo-picker-copy small { color: var(--muted); font-size: 11px; }
 .chevron { margin-left: auto; color: var(--muted); font-size: 18px; }
-.repo-picker-menu { position: absolute; z-index: 70; top: 57px; left: 206px; width: min(360px, 42vw); border: 1px solid #354a5f; border-radius: 10px; padding: 7px; background: #121b24; box-shadow: 0 16px 50px #0009; }
+.repo-picker-menu { position: absolute; z-index: 70; top: 57px; left: 198px; width: min(330px, 36vw); border: 1px solid #354a5f; border-radius: 10px; padding: 7px; background: #121b24; box-shadow: 0 16px 50px #0009; }
 .repo-picker-menu[hidden] { display: none; }
 .repo-picker-menu button { width: 100%; min-height: 54px; margin: 0; padding: 9px 11px; border: 1px solid transparent; border-radius: 7px; background: transparent; color: #c9d7e3; text-align: left; }
 .repo-picker-menu button:hover { border-color: #3d5a76; background: #1a2936; }
@@ -47,10 +47,14 @@ button { cursor: default; }
 .repo-picker-menu strong { font-size: 12px; }
 .repo-picker-menu small { margin-top: 3px; color: #74899d; font-size: 10px; }
 .default-commit-bar { flex: 1; min-width: 140px; display: flex; align-items: center; gap: 6px; }.default-commit-bar input { width: 100%; height: 32px; border: 1px solid var(--border); border-radius: 7px; padding: 0 10px; background: var(--surface); color: #cddae6; font-size: 11px; }.default-commit-bar input::placeholder { color: #5b6c7c; }.default-commit-bar input:focus { outline: 0; border-color: var(--blue); }.subtle-polarion-link { flex: none; color: #5b7690; font-size: 10px; font-weight: 600; text-decoration: none; opacity: .75; }.subtle-polarion-link:hover { color: var(--blue); opacity: 1; }
-.top-actions { display: flex; margin-left: auto; gap: 6px; }
+.top-actions { display: flex; margin-left: auto; gap: 5px; flex: 0 0 auto; }
 .top-actions button { width: 32px; height: 32px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface); color: #aec0d2; font-size: 15px; }
 .top-actions button:hover { border-color: #526273; background: var(--surface-soft); color: white; }
 .top-actions button.fetch-all-btn { width: auto; padding: 0 8px; font-size: 11px; font-weight: 700; letter-spacing: .3px; }
+.top-actions button.fetch-project-btn { border-color: #335e80; color: #b9d9f5; font-weight: 800; }
+.spec-list { display: flex; flex-wrap: wrap; gap: 4px; }
+.spec-list code { padding: 2px 5px; border: 1px solid #34506a; border-radius: 5px; background: #102235; color: #a9d6ff; font-size: 10px; }
+.submodule-repository-link { display: inline-block; max-width: 100%; overflow: hidden; color: #8dc7ff; text-overflow: ellipsis; vertical-align: bottom; white-space: nowrap; }
 
 .main-layout { min-height: 0; display: grid; grid-template-columns: 244px minmax(540px, 1fr) 300px; }
 .sidebar { padding: 13px 10px; background: #111820; border-right: 1px solid var(--border); overflow: auto; }
@@ -223,6 +227,7 @@ button.pr-reviewer:hover { border-color: #59758e; background: #1b2b38; color: #e
 .file-row.up-row, .commander-row.up-row { color: #8fa2b4; }.file-row.up-row .entry-name, .commander-row.up-row strong { color: #8fa2b4; font-weight: 500; }
 .file-row.has-change { border-left-color: var(--amber); background: linear-gradient(90deg, #4c38182e, transparent 38%); }.file-row.has-change .entry-name { color: #fff0cf; font-weight: 650; }
 .inline-submodule-badge { margin-left: 7px; padding: 1px 6px; border: 1px solid #6e5aa0; border-radius: 999px; background: #2a2340; color: #b8a6e8; font-size: 8px; font-weight: 600; letter-spacing: .08em; vertical-align: 1px; opacity: .85; }
+.personal-note-dot { margin-left: 6px; color: #8ec7ff; font-size: 10px; font-weight: 700; opacity: .85; vertical-align: 1px; }
 .file-row.selected { border-color: #3b6d9a; background: #19314a; color: #eef7ff; }
 .file-main { min-width: 0; display: flex; align-items: center; gap: 12px; }
 .entry-icon { position: relative; flex: none; width: 24px; height: 21px; display: grid; place-items: center; color: #9eb2c5; font-size: 15px; }
@@ -663,6 +668,13 @@ button.pr-reviewer:hover { border-color: #59758e; background: #1b2b38; color: #e
 .entry-path { color: #7691aa; font: 10px ui-monospace, SFMono-Regular, Consolas, monospace; overflow-wrap: anywhere; }
 .detail-section { margin-top: 14px; padding-top: 11px; border-top: 1px solid var(--border); }
 .detail-section h3 { margin: 0 0 8px; color: #8497a8; font-size: 9px; letter-spacing: .8px; }
+.personal-note-section { padding: 9px 10px; border: 1px solid #2e4458; border-radius: 7px; background: #101b25; }
+.personal-note-section h3 { margin-bottom: 6px; }
+.personal-note-section p { margin: 0; color: #cad7e3; font-size: 11px; line-height: 1.45; white-space: pre-wrap; overflow-wrap: anywhere; }
+.personal-note-section button { width: auto; height: 26px; margin: 0; padding: 0 9px; border: 1px solid #3a5267; border-radius: 5px; background: #192a39; color: #bfd5e6; font-size: 10px; }
+.personal-note-section button:hover { border-color: #5794c7; background: #20384c; }
+.personal-note-add { color: #8ec7ff !important; }
+.personal-note-actions { display: flex; gap: 6px; margin-top: 8px; }
 .submodule-badge { display: inline-flex; align-items: center; gap: 6px; margin-top: 8px; padding: 4px 8px; border: 1px solid #5f4d8c; border-radius: 6px; background: #221c38; color: #c4b6e6; font-size: 10px; opacity: .9; }
 .context-actions { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 14px; }.context-actions button { flex: 1 1 calc(33.33% - 4px); min-width: 100px; min-height: 26px; padding: 0 6px; border: 1px solid #3a5267; border-radius: 5px; background: #192a39; color: #bfd5e6; font-size: 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }.context-actions button:hover { border-color: #5794c7; background: #20384c; }
 .context-actions .danger-action { border-color: #7c3c44; color: #ff9da8; background: #25171b; }.context-actions .danger-action:hover { background: #3a1d23; border-color: #d45c69; }

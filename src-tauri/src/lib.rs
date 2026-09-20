@@ -1,4 +1,5 @@
 mod local_drive;
+mod notes;
 mod repository;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -6,6 +7,9 @@ pub fn run() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
             repository::build_info,
+            notes::load_drill_down_notes,
+            notes::set_drill_down_note,
+            notes::delete_drill_down_note,
             repository::frontend_perf_log,
             repository::choose_folder,
             repository::init_repository,
@@ -83,6 +87,7 @@ pub fn run() {
             repository::push_submodule,
             repository::push_submodule_preview,
             repository::fetch_submodule,
+            repository::fetch_project,
             repository::pull_submodule,
             repository::force_push_submodule,
             repository::file_blame,

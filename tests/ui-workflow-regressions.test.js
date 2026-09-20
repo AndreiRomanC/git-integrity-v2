@@ -44,7 +44,55 @@ test('slow Git actions expose progress on the exact button that was pressed', ()
   assert.match(app, /function beginButtonOperation\(button, label\)[\s\S]*?button\.disabled = true;[\s\S]*?aria-busy[\s\S]*?spinner/);
   assert.match(app, /switchSubmoduleVersion\(row\.dataset\.revision, row\.dataset\.versionKind, row\.dataset\.name, button\)/);
   assert.match(app, /const finishButton = beginButtonOperation\(button, 'Switching…'\)/);
+  assert.match(app, /async function refreshRepository\(button = null\)/);
+  assert.match(app, /const finishButton = beginButtonOperation\(button, 'Refreshing…'\)/);
+  assert.match(app, /Refreshing repository from disk…/);
+  assert.match(app, /Repository refreshed — \$\{state\.commits\.length\} commits loaded\./);
+  assert.match(html, /Refresh repository from disk — re-read branches, commits and working tree status; does not fetch from the server/);
   assert.match(app, /finally \{ finishButton\(\); \}/);
+});
+
+test('top bar has a safe project fetch that updates parent and submodule refs without pulling', () => {
+  assert.match(html, /id="fetchProject"/);
+  assert.match(html, /Fetch parent repository and initialized submodules — safe update only, no pull, checkout or branch change/);
+  assert.match(app, /'fetch_project'/);
+  assert.match(app, /async function fetchProjectAndSubmodules\(button = null\)/);
+  assert.match(app, /invoke\('fetch_project', \{ repositoryPath: state\.repository\.path \}\)/);
+  assert.match(app, /Parent updated/);
+  assert.match(app, /submodule\$\{result\.submodules_total === 1 \? '' : 's'\} fetched/);
+  assert.match(app, /id: 'fetch-project'/);
+  assert.match(css, /\.repo-picker \{ flex: 0 1 360px;/);
+});
+
+test('details panel extracts spec ids from loaded commit text and shows compact submodule repository links', () => {
+  assert.match(app, /const SPEC_ID_PATTERN =/);
+  assert.match(app, /function extractSpecIds\(text = ''\)/);
+  assert.match(app, /function specDetailRows\(\.\.\.texts\)/);
+  assert.match(app, /specDetailRows\(entry\.last_commit_subject\)/);
+  assert.match(app, /specDetailRows\(entry\.submodule_commit_subject\)/);
+  assert.match(app, /function compactRepositoryLabel\(url = ''\)/);
+  assert.match(app, /function submoduleRepositoryLinkHtml\(entry\)/);
+  assert.match(app, /class="submodule-repository-link"/);
+  assert.match(app, /entry\.submodule_web_url/);
+  assert.match(app, /event\.target\.closest\('\.submodule-repository-link'\)/);
+  assert.match(css, /\.spec-list code/);
+  assert.match(css, /\.submodule-repository-link/);
+});
+
+test('folder personal notes stay outside Git and are rendered from an in-memory map', () => {
+  assert.match(app, /drillDownNotes: \{\}/);
+  assert.match(app, /function ensureDrillDownNotesLoaded\(repositoryPath, force = false\)/);
+  assert.match(app, /if \(!force && state\.drillDownNotesRepositoryPath === repositoryPath\) return;/);
+  assert.match(app, /invoke\('load_drill_down_notes', \{ repositoryPath \}\)/);
+  assert.match(app, /function noteForPath\(path\)/);
+  assert.match(app, /function folderHasPersonalNote\(entry\)/);
+  assert.match(app, /entry\?\.kind === 'folder'/);
+  assert.match(app, /function renderFolderPersonalNoteSection\(entry\)/);
+  assert.match(app, /PERSONAL NOTE/);
+  assert.match(app, /invoke\('set_drill_down_note', \{ repositoryPath: state\.repository\.path, relativePath: entry\.relative_path, note: text \}\)/);
+  assert.match(app, /invoke\('delete_drill_down_note', \{ repositoryPath: state\.repository\.path, relativePath: entry\.relative_path \}\)/);
+  assert.match(app, /class="personal-note-dot"/);
+  assert.match(css, /\.personal-note-section/);
 });
 
 test('deleted tracked paths render without trying to stat a path that no longer exists', () => {

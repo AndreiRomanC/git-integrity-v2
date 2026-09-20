@@ -14,8 +14,9 @@ use branches::{branch_creation_context, checkout_commit, create_branch, create_b
 use branches::merge::{abort_merge, complete_merge, conflict_sides, list_conflicts, merge_branch, merge_in_progress, resolve_conflict};
 #[cfg(test)]
 use command_console::{is_definitely_read_only_terminal_command, is_read_only_git_subcommand, run_git_command, run_terminal_command_inner, tokenize_git_args};
+use remotes::fetch_all_remotes_inner;
 #[cfg(test)]
-use remotes::{fetch_all_remotes_inner, list_remotes, sync_repository_inner};
+use remotes::{list_remotes, sync_repository_inner};
 
 // Temporary performance diagnostics: appends "<label>: <ms>ms" lines to a log
 // file so real-world slowness can be diagnosed without guessing. Safe to leave
@@ -653,6 +654,7 @@ pub struct EntryDetails {
     modified: u64,
     item_count: Option<usize>,
     submodule_url: Option<String>,
+    submodule_web_url: Option<String>,
     submodule_branch: Option<String>,
     submodule_push_status: Option<String>,
     submodule_unpushed_commits: Vec<PublishCommit>,
@@ -4348,8 +4350,9 @@ fn entry_details_inner(repository_path: String, relative_path: String) -> Result
     // "describe this submodule" read. Open the submodule's own repo once
     // here and share it; the parent-side url/branch lookup is now a single
     // scan too (submodule_url_and_branch), not two.
-    let (submodule_url, submodule_branch, submodule_push_status, submodule_unpushed_commits, submodule_commit, submodule_snapshot) = if kind == "submodule" {
+    let (submodule_url, submodule_web_url, submodule_branch, submodule_push_status, submodule_unpushed_commits, submodule_commit, submodule_snapshot) = if kind == "submodule" {
         let (url, branch) = submodule_url_and_branch(&repository_path, &relative_string);
+        let web_url = submodule_browser_base(&repository_path, &relative_string).ok();
         match internal_submodule_repository(&absolute) {
             Ok(sub_repo) => {
                 let snapshot = inspect_submodule_state_in(&sub_repo);
@@ -4359,11 +4362,11 @@ fn entry_details_inner(repository_path: String, relative_path: String) -> Result
                     let author_name = commit.author().name().unwrap_or("Unknown").to_string();
                     (commit.id().to_string(), commit.summary().unwrap_or("No message").to_string(), author_name, short_date(commit.time().seconds()))
                 });
-                (url, branch, push_status, unpushed_commits, commit, Some(snapshot))
+                (url, web_url, branch, push_status, unpushed_commits, commit, Some(snapshot))
             }
-            Err(_) => (url, branch, None, Vec::new(), None, None),
+            Err(_) => (url, web_url, branch, None, Vec::new(), None, None),
         }
-    } else { (None, None, None, Vec::new(), None, None) };
+    } else { (None, None, None, None, Vec::new(), None, None) };
     let submodule_is_dirty = submodule_snapshot.as_ref().is_some_and(|snapshot| snapshot.dirty);
     let submodule_state = if kind == "submodule" {
         match (internal_repository(status_repo).ok(), submodule_snapshot.as_ref()) {
@@ -4374,7 +4377,7 @@ fn entry_details_inner(repository_path: String, relative_path: String) -> Result
 
     Ok(EntryDetails {
         name: absolute.file_name().and_then(|name| name.to_str()).unwrap_or(&relative_string).to_string(), relative_path: relative_string,
-        kind, status, tracked, unpushed, size: if metadata.is_file() { metadata.len() } else { 0 }, modified, item_count, submodule_url, submodule_branch, submodule_push_status, submodule_unpushed_commits, submodule_is_dirty, submodule_state,
+        kind, status, tracked, unpushed, size: if metadata.is_file() { metadata.len() } else { 0 }, modified, item_count, submodule_url, submodule_web_url, submodule_branch, submodule_push_status, submodule_unpushed_commits, submodule_is_dirty, submodule_state,
         last_commit_id: last.as_ref().map(|value| value.0.clone()),
         last_commit_subject: last.as_ref().map(|value| value.1.clone()), last_commit_author: last.as_ref().map(|value| value.2.clone()), last_commit_date: last.as_ref().map(|value| value.3.clone()),
         submodule_commit_id: submodule_commit.as_ref().map(|value| value.0.clone()),
@@ -6177,6 +6180,73 @@ fn fetch_submodule_inner(repository_path: String, relative_path: String) -> Resu
     invalidate_git_metadata(&sub_path);
     invalidate_submodule_sync(&repository_path); // this app just changed the submodule's own commit
     Ok(())
+}
+
+#[derive(Serialize)]
+pub struct FetchProjectResult {
+    parent_fetched: bool,
+    submodules_total: usize,
+    submodules_fetched: usize,
+    submodules_skipped: usize,
+    warnings: Vec<String>,
+    errors: Vec<String>,
+}
+
+#[tauri::command]
+pub async fn fetch_project(repository_path: String) -> Result<FetchProjectResult, String> {
+    off_main_thread(move || fetch_project_inner(repository_path)).await
+}
+
+fn fetch_project_inner(repository_path: String) -> Result<FetchProjectResult, String> {
+    validate_path(&repository_path)?;
+    let repo = internal_repository(&repository_path)?;
+    let submodule_paths = repo
+        .submodules()
+        .map_err(|error| error.message().to_string())?
+        .into_iter()
+        .map(|submodule| normalized(submodule.path()))
+        .collect::<Vec<_>>();
+    drop(repo);
+
+    let mut result = FetchProjectResult {
+        parent_fetched: false,
+        submodules_total: submodule_paths.len(),
+        submodules_fetched: 0,
+        submodules_skipped: 0,
+        warnings: Vec::new(),
+        errors: Vec::new(),
+    };
+
+    match fetch_all_remotes_inner(repository_path.clone()) {
+        Ok(()) => result.parent_fetched = true,
+        Err(error) => result.errors.push(format!("Parent repository: {error}")),
+    }
+
+    for relative_path in submodule_paths {
+        let absolute = Path::new(&repository_path).join(&relative_path);
+        let sub_path = absolute.to_string_lossy().into_owned();
+        let fetch_result = internal_submodule_repository(&absolute).and_then(|repo| {
+            repo.find_remote("origin")
+                .map_err(|_| "No 'origin' remote configured for this submodule".to_string())?;
+            git(&sub_path, &["fetch", "origin"])?;
+            Ok(())
+        });
+        match fetch_result {
+            Ok(()) => {
+                result.submodules_fetched += 1;
+                invalidate_git_metadata(&sub_path);
+            }
+            Err(error) if error.contains("not initialized") || error.contains("No 'origin' remote") => {
+                result.submodules_skipped += 1;
+                result.warnings.push(format!("{relative_path}: {error}"));
+            }
+            Err(error) => result.errors.push(format!("{relative_path}: {error}")),
+        }
+    }
+
+    invalidate_git_metadata(&repository_path);
+    invalidate_submodule_sync(&repository_path);
+    Ok(result)
 }
 
 #[tauri::command]

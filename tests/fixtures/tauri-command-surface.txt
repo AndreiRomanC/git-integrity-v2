@@ -26,11 +26,13 @@ create_local_merge_directory
 create_submodule_branch
 create_submodule_tag
 delete_branch
+delete_drill_down_note
 delete_local_path
 drop_stash
 entry_details
 entry_last_commit
 fetch_all_remotes
+fetch_project
 fetch_remote
 fetch_submodule
 file_blame
@@ -42,6 +44,7 @@ init_repository
 list_conflicts
 list_directory_fast
 list_local_directory
+load_drill_down_notes
 list_remotes
 list_stashes
 list_submodule_stashes
@@ -86,6 +89,7 @@ restore_stash_paths
 run_git_command
 run_terminal_command
 run_utrud
+set_drill_down_note
 stage_all
 stage_files
 stash_changes
