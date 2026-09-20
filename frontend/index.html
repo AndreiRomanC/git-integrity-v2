@@ -429,6 +429,26 @@
       </footer>
     </div>
   </dialog>
+  <dialog id="folderRestoreDialog" class="folder-restore-dialog">
+    <form method="dialog">
+      <header><div><h2>Restore folder</h2><p id="folderRestoreSubtitle">Make only this folder match a selected revision.</p></div><button value="cancel">×</button></header>
+      <div class="folder-restore-body">
+        <div class="folder-restore-target"><span>FOLDER</span><strong id="folderRestorePath">—</strong></div>
+        <div class="folder-restore-options">
+          <label><input type="radio" name="folderRestoreMode" id="folderRestoreModeHead" value="head" checked><span><b>Restore to HEAD</b><small>Discard local tracked changes in this folder and match the current committed version.</small></span></label>
+          <label><input type="radio" name="folderRestoreMode" id="folderRestoreModeCommit" value="commit"><span><b>Restore from commit…</b><small>Bring this folder's snapshot from a previous commit into the current branch.</small></span></label>
+        </div>
+        <div id="folderRestoreCommitPicker" class="folder-restore-commit-picker" hidden>
+          <div class="folder-restore-commit-head"><strong>COMMITS TOUCHING THIS FOLDER</strong><button type="button" id="refreshFolderRestoreCommits">Refresh</button></div>
+          <div id="folderRestoreCommitList" class="folder-restore-commit-list"></div>
+        </div>
+        <label class="folder-restore-clean"><input type="checkbox" id="folderRestoreClean" checked><span><b>Clean folder</b><small>Preview and remove untracked, non-ignored items inside this folder after restore.</small></span></label>
+        <div id="folderRestorePreview" class="folder-restore-preview"><p>Choose a restore source, then preview the exact scoped operation.</p></div>
+        <p id="folderRestoreStatus" class="submodule-operation-status" role="status"></p>
+      </div>
+      <footer><span>This does not move HEAD, switch branch, commit or push.</span><button value="cancel">Cancel</button><button type="button" id="previewFolderRestore">Preview</button><button type="button" id="confirmFolderRestore" class="danger-action-soft" disabled>Restore folder</button></footer>
+    </form>
+  </dialog>
   <dialog id="publishDialog" class="publish-dialog">
     <form method="dialog"><header><div><h2>Publish to server</h2><p>A push publishes commits, not uncommitted files.</p></div><button value="cancel">×</button></header>
       <div class="publish-controls"><label><span>LOCAL BRANCH</span><select id="publishBranch"></select></label><span class="publish-arrow">→</span><label><span>REMOTE</span><select id="publishRemote"></select></label></div>

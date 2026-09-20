@@ -538,6 +538,9 @@ button.pr-reviewer:hover { border-color: #59758e; background: #1b2b38; color: #e
 .back-context { margin: 12px 20px 0; height: 32px; padding: 0 12px; border: 1px solid #3c5368; border-radius: 6px; background: #172737; color: #bcd8ef; }
 .graph { position: relative; padding: 14px 20px 30px; }
 .graph-overlay { position: absolute; top: 0; left: 0; pointer-events: none; overflow: visible; }
+.graph-overlay .graph-edge-underlay { fill: none; stroke: #071018; stroke-width: 7; stroke-linecap: round; stroke-linejoin: round; opacity: .82; }
+.graph-overlay .graph-edge { fill: none; stroke-linecap: round; stroke-linejoin: round; filter: drop-shadow(0 0 2px #0008); }
+.graph-overlay .graph-continuation { opacity: .6; }
 /* 48px — the middle of the ~46-52px target (point 2 of the rework),
    deliberately, not an emergent side effect of nested padding: .commit-card's
    own 40px min-height plus .commit-body's 4px+4px padding around it add up
@@ -557,6 +560,8 @@ button.pr-reviewer:hover { border-color: #59758e; background: #1b2b38; color: #e
 .commit-row.is-head.has-local-branch-tip .commit-card { border-left-color: #70dce4; box-shadow: 0 0 0 1px #4f8fc888, 0 3px 12px #0006; }
 .commit-row.is-search-match .commit-card { border-color: #d9a25c; box-shadow: 0 0 0 1px #d9a25c55; }
 .commit-row.is-command-branch-start .commit-card { border-color: #f0b65a; box-shadow: 0 0 0 1px #f0b65a88, 0 0 22px #f0b65a22; }
+.commit-row.is-common-ancestor-main .commit-card { border-color: #f0b65a; background: linear-gradient(90deg, #302817 0, #141c24 16%); box-shadow: 0 0 0 1px #f0b65a66, 0 0 18px #f0b65a1f; }
+.commit-row.is-merge-commit .commit-card { border-style: solid; }
 .commit-row.is-search-dimmed .commit-card { opacity: .38; }
 .commit-row.is-search-dimmed:hover .commit-card { opacity: .7; }
 .search-match-count { color: #d9a25c; font-size: 10px; font-weight: 700; }
@@ -604,6 +609,15 @@ button.pr-reviewer:hover { border-color: #59758e; background: #1b2b38; color: #e
 .ref-pill-more { border-left: 0; background: #202b36; color: #8fa2b4; cursor: default; }
 .branch-point-pill { flex-shrink: 0; display: grid; place-items: center; width: 16px; height: 16px; border-radius: 50%; border: 1px dashed #6f8daa; color: #9db3c8; font-size: 9px; }
 .commit-row.is-branch-point .commit-card { border-style: dashed; }
+.common-main-pill { color: #ffd79a; border-color: #b47a2f; background: #2e2110; }
+.branch-ref-pill { cursor: context-menu; }
+.floating-action-menu { position: fixed; z-index: 120; min-width: 230px; overflow: hidden; border: 1px solid #465563; border-radius: 8px; background: #1a2530; box-shadow: 0 14px 34px #0009; }
+.floating-action-menu button { display: block; width: 100%; padding: 9px 12px; text-align: left; border: 0; border-bottom: 1px solid #304151; background: transparent; color: #d8e5f0; cursor: pointer; }
+.floating-action-menu button:last-child { border-bottom: 0; }
+.floating-action-menu button:hover:not(:disabled) { background: #213448; }
+.floating-action-menu button:disabled { opacity: .45; cursor: not-allowed; }
+.floating-action-menu strong { display: block; font-size: 12px; }
+.floating-action-menu small { display: block; margin-top: 2px; color: #8fa3b4; font-size: 10px; }
 
 /* Point 5 of the rework: a subtle, collapsible legend at the base of the
    graph. <details>/<summary> for the collapse — no JS needed for it, same
@@ -819,6 +833,50 @@ dialog form { padding: 28px; text-align: center; }dialog h2 { margin: 0 0 10px; 
 .publish-remote-ahead-warning { margin: 0 18px 12px; padding: 11px 13px; border-left: 3px solid var(--red); background: #2b181d; color: #ffb7be; font-size: 11px; line-height: 1.45; }
 .publish-check { width: 15px; height: 15px; accent-color: var(--blue); cursor: pointer; }
 .commit-scope-label { display: flex; flex-direction: column; gap: 6px; margin: 0 18px 12px; color: #7f92a3; font-size: 9px; letter-spacing: .8px; }.commit-scope-label input { height: 36px; border: 1px solid #405365; border-radius: 6px; padding: 0 10px; background: #0d151c; color: #d4e1eb; font-size: 13px; }
+.folder-restore-dialog { width: min(840px, 92vw); max-width: 840px; }
+.folder-restore-dialog form { padding: 0; text-align: left; }
+.folder-restore-dialog header { display: flex; align-items: center; padding: 14px 18px; border-bottom: 1px solid var(--border); }
+.folder-restore-dialog header h2 { margin: 0 0 3px; }
+.folder-restore-dialog header p { margin: 0; color: #8497a7; font-size: 11px; }
+.folder-restore-dialog header button { width: 32px; height: 32px; margin: 0 0 0 auto; border: 0; background: transparent; color: #9aaab8; font-size: 22px; }
+.folder-restore-body { max-height: min(690px, 72vh); overflow: auto; padding: 14px 18px 0; }
+.folder-restore-target { display: grid; gap: 5px; margin-bottom: 12px; padding: 10px 12px; border: 1px solid #334556; border-radius: 7px; background: #101923; }
+.folder-restore-target span, .folder-restore-commit-head strong { color: #6d8194; font-size: 9px; font-weight: 800; letter-spacing: .8px; }
+.folder-restore-target strong { overflow-wrap: anywhere; color: #a9cfee; font: 11px ui-monospace, SFMono-Regular, Consolas, monospace; }
+.folder-restore-options { display: grid; gap: 8px; margin-bottom: 11px; }
+.folder-restore-options label, .folder-restore-clean { display: flex; gap: 10px; align-items: flex-start; padding: 10px 12px; border: 1px solid #314353; border-radius: 7px; background: #101820; color: #c1ced8; }
+.folder-restore-options input, .folder-restore-clean input { margin-top: 3px; accent-color: #5aa7e8; }
+.folder-restore-options b, .folder-restore-clean b { display: block; color: #e0ebf5; font-size: 12px; }
+.folder-restore-options small, .folder-restore-clean small { display: block; margin-top: 3px; color: #8799a9; font-size: 10px; line-height: 1.45; }
+.folder-restore-commit-picker { margin-bottom: 11px; border: 1px solid #314353; border-radius: 7px; overflow: hidden; background: #0e161d; }
+.folder-restore-commit-head { min-height: 34px; display: flex; align-items: center; gap: 10px; padding: 0 10px; border-bottom: 1px solid #263744; background: #121d27; }
+.folder-restore-commit-head button { width: auto; height: 24px; margin: 0 0 0 auto; padding: 0 8px; border: 1px solid #3a5267; border-radius: 5px; background: #192a39; color: #bfd5e6; font-size: 9px; }
+.folder-restore-commit-list { max-height: 220px; overflow: auto; padding: 5px; }
+.folder-restore-commit { width: 100%; min-height: 45px; display: grid; gap: 4px; margin: 0 0 3px; padding: 7px 9px; border: 1px solid transparent; border-radius: 5px; background: #121b23; color: #cbd7e1; text-align: left; }
+.folder-restore-commit:hover { border-color: #3e566a; background: #172532; }
+.folder-restore-commit.selected { border-color: #5794c7; background: #183550; }
+.folder-restore-commit strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
+.folder-restore-commit small { color: #8598a8; font-size: 10px; }
+.folder-restore-empty { padding: 18px; color: #8395a6; text-align: center; font-size: 11px; }
+.folder-restore-empty.error { color: #ff9ba5; }
+.folder-restore-preview { margin: 12px 0; border: 1px solid #2f4150; border-radius: 7px; background: #0d141b; }
+.folder-restore-preview > p { margin: 0; padding: 15px; color: #8295a5; text-align: center; font-size: 11px; }
+.folder-restore-preview-card { display: grid; gap: 3px; padding: 11px 13px; border-bottom: 1px solid #263744; background: #111b24; }
+.folder-restore-preview-card span { color: #687c8e; font-size: 9px; font-weight: 800; letter-spacing: .8px; }
+.folder-restore-preview-card strong { color: #d6e4ef; font-size: 12px; }
+.folder-restore-preview-card small { color: #8295a5; font-size: 10px; }
+.folder-restore-preview-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0; }
+.folder-restore-preview-grid section { min-width: 0; padding: 12px; }
+.folder-restore-preview-grid section + section { border-left: 1px solid #263744; }
+.folder-restore-preview-grid h4 { margin: 0 0 8px; color: #9aacbb; font-size: 10px; letter-spacing: .5px; text-transform: uppercase; }
+.folder-restore-preview-grid p { margin: 0; color: #8395a6; font-size: 10px; line-height: 1.5; }
+.folder-restore-preview-grid ul { max-height: 180px; overflow: auto; margin: 0; padding: 0; list-style: none; }
+.folder-restore-preview-grid li { padding: 4px 0; border-bottom: 1px solid #ffffff08; color: #b9c7d2; font: 10px/1.35 ui-monospace, SFMono-Regular, Consolas, monospace; overflow-wrap: anywhere; }
+.folder-restore-preview-grid li b { display: inline-block; min-width: 22px; color: var(--amber); }
+.folder-restore-preview-grid .danger-list li { color: #ffb1ba; }
+.folder-restore-dialog footer { display: flex; align-items: center; gap: 8px; padding: 12px 18px; border-top: 1px solid var(--border); background: #151f28; }
+.folder-restore-dialog footer span { flex: 1; color: #7f92a3; font-size: 10px; }
+.folder-restore-dialog footer button { width: auto; min-width: 82px; height: 32px; margin: 0; padding: 0 11px; }
 .conflicts-list { max-height: 330px; overflow: auto; margin: 0 18px 14px; border: 1px solid var(--border); border-radius: 7px; }
 .conflict-row { padding: 10px 12px; border-bottom: 1px solid var(--border-soft); }.conflict-row:last-child { border-bottom: 0; }
 .conflict-row.resolved { opacity: .55; }

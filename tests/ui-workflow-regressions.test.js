@@ -6,6 +6,7 @@ const path = require('node:path');
 const root = path.resolve(__dirname, '..');
 const html = fs.readFileSync(path.join(root, 'frontend/index.html'), 'utf8');
 const app = fs.readFileSync(path.join(root, 'frontend/app.js'), 'utf8');
+const css = fs.readFileSync(path.join(root, 'frontend/styles.css'), 'utf8');
 
 test('Terminal is the first default command panel and has an explicit close button', () => {
   const terminalTab = html.indexOf('data-mode="console"');
@@ -164,4 +165,65 @@ test('publish indicator surfaces ahead and behind, not only outgoing commit coun
   assert.match(app, /local commit\$\{state\.publish\.commits\.length === 1 \? '' : 's'\} to publish · \$\{comparison\}/);
   assert.match(app, /has \$\{behind\} commit\$\{behind === 1 \? '' : 's'\} you do not have locally/);
   assert.match(app, /publishRemoteAheadWarningHtml\(state\.publish\) \+ publishSubmoduleRisksHtml/);
+});
+
+test('folder restore is an explicit right-panel action with preview and scoped backend commands', () => {
+  assert.match(html, /id="folderRestoreDialog"/);
+  assert.match(html, /Restore to HEAD/);
+  assert.match(html, /Restore from commit/);
+  assert.match(html, /id="folderRestoreClean" checked/);
+  assert.match(app, /entry\.kind === 'folder' \? '<button data-detail-action="restorefolder"/);
+  assert.match(app, /if \(action === 'restorefolder'\) return openFolderRestoreDialog\(entry\)/);
+  assert.match(app, /invoke\('preview_folder_restore', \{ repositoryPath: state\.repository\.path, relativePath: model\.entry\.relative_path, sourceRevision, cleanUntracked: refs\.folderRestoreClean\.checked \}\)/);
+  assert.match(app, /invoke\('restore_folder', \{ repositoryPath: state\.repository\.path, relativePath: restoredPath, sourceRevision: model\.preview\.source_id, cleanPaths \}\)/);
+  assert.match(html, /This does not move HEAD, switch branch, commit or push/);
+});
+
+test('folder restore gives visible progress and rechecks the restored folder after refresh', () => {
+  assert.match(app, /function updateFolderRestoreActionState\(\)/);
+  assert.match(app, /refs\.confirmFolderRestore\.textContent = model\.preview \? 'Restore folder' : 'Preview & restore'/);
+  assert.match(app, /if \(!model\.preview\) \{[\s\S]*?await previewFolderRestore\(\);[\s\S]*?if \(!model\.preview\) \{ finishConfirmButton\(\); updateFolderRestoreActionState\(\); return; \}/);
+  assert.match(app, /beginButtonOperation\(refs\.previewFolderRestore, 'Previewing…'\)/);
+  assert.match(app, /status\(`Previewing restore for \$\{model\.entry\.name\}…`, 'busy'\)/);
+  assert.match(app, /beginButtonOperation\(refs\.confirmFolderRestore, model\.preview \? 'Restoring…' : 'Previewing…'\)/);
+  assert.match(app, /status\(`Restoring \$\{restoredName\} from \$\{sourceLabel\}…`, 'busy'\)/);
+  assert.match(app, /await refreshStatusAndFolder\(state\.repository\.path, reopenPath\)/);
+  assert.doesNotMatch(app, /await loadRepository\(state\.repository\.path, \{ reopenPath \}\);[\s\S]*?const freshEntry = state\.entries\.find\(entry => entry\.relative_path === restoredPath\)/);
+  assert.match(app, /const freshEntry = state\.entries\.find\(entry => entry\.relative_path === restoredPath\);[\s\S]*?if \(freshEntry\) await selectEntry\(restoredPath\);/);
+  assert.match(app, /function folderRestoreResultMessage\(name, sourceLabel, remainingCount\)/);
+  assert.match(app, /restore finished, but \$\{remainingCount\} local change/);
+  assert.match(app, /restored from \$\{sourceLabel\}\. \$\{remainingCount\} local change/);
+});
+
+test('graph exposes branch and commit context actions without relying on lane identity', () => {
+  assert.match(app, /data-graph-ref-name="\$\{esc\(badge\.name\)\}"/);
+  assert.match(app, /showGraphBranchContextMenu\(event, pill\.dataset\.graphRefName\)/);
+  assert.match(app, /function graphBranchRefsForCommit\(commitId\)/);
+  assert.match(app, /function graphMergeUnavailableReason\(branchName\)/);
+  assert.match(app, /Checkout or switch to a branch first — HEAD is detached\./);
+  assert.match(app, /Merge \$\{branchName\} into current branch/);
+  assert.match(app, /\$\{branchName\} → \$\{current\}\. Current branch is the only branch changed\./);
+  assert.match(app, /openMergeBranchDialog\(activeGraphMergeTarget\(\), branchName\)/);
+  assert.match(app, /showGraphCommitContextMenu\(event, row\.dataset\.id\)/);
+  assert.match(app, /const mergeItems = branchRefs\.map\(\(ref, index\) => graphMergeMenuItem\(ref\.name, `merge-\$\{index\}`\)\)/);
+  assert.match(app, /Create branch from this commit/);
+  assert.match(app, /Checkout this commit/);
+  assert.match(app, /invoke\('create_branch_at_commit', \{ repositoryPath: context\.path, branch: name\.trim\(\), commitId \}\)/);
+  assert.match(app, /invoke\('checkout_commit', \{ repositoryPath: context\.path, commitId \}\)/);
+  assert.match(app, /function updateMergeDirectionPreview\(\)/);
+  assert.match(app, /Direction: \$\{source\} → \$\{target\}/);
+  assert.match(app, /refs\.mergeBranchSource\.addEventListener\('change', updateMergeDirectionPreview\)/);
+  assert.match(app, /Resolve with Git mergetool/);
+  assert.match(app, /invoke\('open_merge_tool', \{ repositoryPath: conflictRepositoryPath\(target\), targetPath: target\.targetPath, relativePath: path \}\)/);
+  assert.match(app, /Configured Git merge\.tool = \$\{tool\.trim\(\)\}\. Retrying…/);
+  assert.match(app, /UNRESOLVED/);
+  assert.match(app, /Resolved\/staged — ready to complete the merge/);
+  assert.match(app, /invoke\('graph_head_main_merge_base', \{ repositoryPath: g\.path \}\)/);
+  assert.match(app, /commonAncestorRows/);
+  assert.match(app, /Branch start/);
+  assert.match(app, /Real merge-base between HEAD and \$\{esc\(commonAncestorBaseRef\)\}/);
+  assert.match(app, /MERGE MAIN/);
+  assert.match(app, /const palette = \[[\s\S]*?'#b4f1cf'[\s\S]*?\]/);
+  assert.match(app, /class="graph-edge-underlay"/);
+  assert.match(css, /\.graph-overlay \.graph-edge-underlay/);
 });

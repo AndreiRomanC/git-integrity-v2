@@ -140,6 +140,41 @@ pub fn conflict_sides(repository_path: String, target_path: String, relative_pat
 }
 
 #[tauri::command]
+pub async fn open_merge_tool(repository_path: String, target_path: String, relative_path: String) -> Result<String, String> {
+    off_main_thread(move || open_merge_tool_inner(repository_path, target_path, relative_path)).await
+}
+
+fn open_merge_tool_inner(repository_path: String, target_path: String, relative_path: String) -> Result<String, String> {
+    let repository_path = resolve_target_repository(&repository_path, &target_path)?;
+    validate_path(&repository_path)?;
+    let relative = safe_relative_path(&relative_path)?;
+    let relative = normalized(&relative);
+    let configured_tool = Command::new("git")
+        .args(["config", "--get", "merge.tool"])
+        .current_dir(&repository_path)
+        .output()
+        .ok()
+        .and_then(|output| output.status.success().then(|| String::from_utf8_lossy(&output.stdout).trim().to_string()))
+        .filter(|tool| !tool.is_empty());
+    let output = Command::new("git")
+        .args(["mergetool", "--no-prompt", "--", &relative])
+        .current_dir(&repository_path)
+        .output()
+        .map_err(|error| format!("Could not start git mergetool: {error}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let detail = if !stderr.is_empty() { stderr } else { stdout };
+        return Err(if detail.is_empty() {
+            "Git mergetool failed. Configure one with `git config merge.tool <tool>` or check `git mergetool --tool-help`.".into()
+        } else { detail });
+    }
+    invalidate_git_metadata(&repository_path);
+    Ok(configured_tool.map(|tool| format!("Merge tool \"{tool}\" finished for {relative}."))
+        .unwrap_or_else(|| format!("Git mergetool finished for {relative}.")))
+}
+
+#[tauri::command]
 pub fn resolve_conflict(repository_path: String, target_path: String, relative_path: String, resolution: String) -> Result<(), String> {
     let repository_path = resolve_target_repository(&repository_path, &target_path)?;
     validate_path(&repository_path)?;

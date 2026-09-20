@@ -9,7 +9,7 @@ pub mod remotes;
 #[cfg(test)]
 use stash::{abort_stash_conflict, drop_stash, list_stashes, list_submodule_stashes, pop_stash, restore_stash_paths, stash_changes, stash_entry_files, stash_file};
 #[cfg(test)]
-use branches::{branch_creation_context, create_branch, create_submodule_branch, delete_branch, graph_branch_divergence, rename_branch, switch_branch};
+use branches::{branch_creation_context, checkout_commit, create_branch, create_branch_at_commit, create_submodule_branch, delete_branch, graph_branch_divergence, rename_branch, switch_branch};
 #[cfg(test)]
 use branches::merge::{abort_merge, complete_merge, conflict_sides, list_conflicts, merge_branch, merge_in_progress, resolve_conflict};
 #[cfg(test)]
@@ -769,6 +769,18 @@ pub struct TextFile { relative_path: String, content: String }
 pub struct PublishCommit { id: String, subject: String, author: String, date: String }
 
 #[derive(Serialize)]
+pub struct FolderRestorePreview {
+    folder: String,
+    source_revision: String,
+    source_id: String,
+    source_subject: String,
+    source_author: String,
+    source_date: String,
+    tracked_changes: Vec<Change>,
+    clean_candidates: Vec<String>,
+}
+
+#[derive(Serialize)]
 pub struct PublishStatus {
     branch: String,
     remote: String,
@@ -914,6 +926,11 @@ fn git(path: &str, args: &[&str]) -> Result<String, String> {
     record_git_command(path, args, output.status.success());
     if output.status.success() { Ok(String::from_utf8_lossy(&output.stdout).into_owned()) }
     else { Err(String::from_utf8_lossy(&output.stderr).trim().to_string()) }
+}
+
+fn git_owned(path: &str, args: Vec<String>) -> Result<String, String> {
+    let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+    git(path, &refs)
 }
 
 fn internal_repository(path: &str) -> Result<Repository, String> {
@@ -5416,6 +5433,127 @@ pub fn restore_remote_file(repository_path: String, relative_path: String, remot
     restore_file(repository_path, relative_path, remote_ref.to_string())
 }
 
+fn parse_name_status(output: &str) -> Vec<Change> {
+    output.lines().filter_map(|line| {
+        let mut parts = line.split('\t');
+        let status = parts.next()?.trim().to_string();
+        let path = parts.last().unwrap_or_default().trim().to_string();
+        (!status.is_empty() && !path.is_empty()).then_some(Change { status, path, staged: false })
+    }).collect()
+}
+
+fn parse_porcelain_status(output: &str) -> Vec<Change> {
+    output.lines().filter_map(|line| {
+        if line.len() < 4 { return None; }
+        let status = line[..2].trim().to_string();
+        if status == "??" { return None; }
+        let path = line[3..].trim().trim_matches('"').to_string();
+        (!status.is_empty() && !path.is_empty()).then_some(Change { status, path, staged: line.as_bytes().first().is_some_and(|byte| *byte != b' ') })
+    }).collect()
+}
+
+fn parse_clean_dry_run(output: &str) -> Vec<String> {
+    output.lines().filter_map(|line| {
+        line.strip_prefix("Would remove ")
+            .map(|path| path.trim().trim_matches('"').trim_end_matches('/').replace('\\', "/"))
+            .filter(|path| !path.is_empty())
+    }).collect()
+}
+
+fn commit_for_folder_restore<'repo>(repo: &'repo Repository, source_revision: &str) -> Result<git2::Commit<'repo>, String> {
+    repo.revparse_single(source_revision.trim())
+        .or_else(|_| repo.revparse_single(&format!("refs/remotes/{}", source_revision.trim())))
+        .and_then(|object| object.peel(ObjectType::Commit))
+        .and_then(|object| object.into_commit().map_err(|_| git2::Error::from_str("Selected revision is not a commit")))
+        .map_err(|error| format!("Cannot resolve {source_revision}: {}", error.message()))
+}
+
+fn folder_restore_preview_inner(repository_path: &str, relative_path: &str, source_revision: &str, clean_untracked: bool) -> Result<FolderRestorePreview, String> {
+    validate_path(repository_path)?;
+    let relative = safe_relative_path(relative_path)?;
+    if relative.as_os_str().is_empty() { return Err("Select a folder to restore".into()); }
+    let relative_string = normalized(&relative);
+    let folder_path = Path::new(repository_path).join(&relative);
+    if !folder_path.is_dir() { return Err("Folder restore works only for an existing normal folder".into()); }
+    let repo = internal_repository(repository_path)?;
+    let commit = commit_for_folder_restore(&repo, source_revision)?;
+    let tree = commit.tree().map_err(|error| error.message().to_string())?;
+    let tree_entry = tree.get_path(&relative).map_err(|_| format!("{relative_string} does not exist in {}", source_revision.trim()))?;
+    if tree_entry.kind() != Some(ObjectType::Tree) {
+        return Err(format!("{relative_string} is not a folder in {}", source_revision.trim()));
+    }
+    let source_id = commit.id().to_string();
+    let tracked_changes = if source_revision.trim() == "HEAD" || source_id == repo.head().ok().and_then(|head| head.target()).map(|id| id.to_string()).unwrap_or_default() {
+        parse_porcelain_status(&git(repository_path, &["status", "--porcelain", "--", &relative_string])?)
+    } else {
+        parse_name_status(&git(repository_path, &["diff", "--name-status", "HEAD", &source_id, "--", &relative_string])?)
+    };
+    let clean_candidates = if clean_untracked {
+        parse_clean_dry_run(&git(repository_path, &["clean", "-nd", "--", &relative_string])?)
+    } else { Vec::new() };
+    let source_subject = commit.summary().unwrap_or("No message").to_string();
+    let source_author = commit.author().name().unwrap_or("Unknown").to_string();
+    let source_date = short_date(commit.time().seconds());
+    Ok(FolderRestorePreview {
+        folder: relative_string,
+        source_revision: source_revision.trim().to_string(),
+        source_id,
+        source_subject,
+        source_author,
+        source_date,
+        tracked_changes,
+        clean_candidates,
+    })
+}
+
+#[tauri::command]
+pub fn preview_folder_restore(repository_path: String, relative_path: String, source_revision: String, clean_untracked: bool) -> Result<FolderRestorePreview, String> {
+    folder_restore_preview_inner(&repository_path, &relative_path, &source_revision, clean_untracked)
+}
+
+#[tauri::command]
+pub fn restore_folder(repository_path: String, relative_path: String, source_revision: String, clean_paths: Vec<String>) -> Result<(), String> {
+    let started = Instant::now();
+    validate_path(&repository_path)?;
+    let relative = safe_relative_path(&relative_path)?;
+    if relative.as_os_str().is_empty() { return Err("Select a folder to restore".into()); }
+    let relative_string = normalized(&relative);
+    let folder_path = Path::new(&repository_path).join(&relative);
+    if !folder_path.is_dir() { return Err("Folder restore works only for an existing normal folder".into()); }
+    let repo = internal_repository(&repository_path)?;
+    let commit = commit_for_folder_restore(&repo, &source_revision)?;
+    let tree = commit.tree().map_err(|error| error.message().to_string())?;
+    let tree_entry = tree.get_path(&relative).map_err(|_| format!("{relative_string} does not exist in {}", source_revision.trim()))?;
+    if tree_entry.kind() != Some(ObjectType::Tree) {
+        return Err(format!("{relative_string} is not a folder in {}", source_revision.trim()));
+    }
+
+    let clean_relative = clean_paths.into_iter().map(|path| {
+        let safe = safe_relative_path(path.trim_end_matches(['/', '\\']))?;
+        let normalized_safe = normalized(&safe);
+        if normalized_safe != relative_string && !normalized_safe.starts_with(&format!("{relative_string}/")) {
+            return Err("Clean path escaped the selected folder".to_string());
+        }
+        Ok(normalized_safe)
+    }).collect::<Result<Vec<_>, _>>()?;
+
+    let queue_started = Instant::now();
+    let lock_handle = repo_write_lock(&repository_path);
+    let _lock = lock_handle.lock().unwrap();
+    log_repo_write_lock_acquired(&repository_path, "restore_folder", queue_started.elapsed());
+    let source_id = commit.id().to_string();
+    git(&repository_path, &["restore", "--source", &source_id, "--staged", "--worktree", "--", &relative_string])
+        .map_err(|detail| format!("Folder restore failed: {detail}"))?;
+    if !clean_relative.is_empty() {
+        let mut args = vec!["clean".to_string(), "-fd".to_string(), "--".to_string()];
+        args.extend(clean_relative);
+        git_owned(&repository_path, args).map_err(|detail| format!("Folder restored, but clean failed: {detail}"))?;
+    }
+    invalidate_git_metadata(&repository_path);
+    perf_log("restore_folder: TOTAL", started.elapsed());
+    Ok(())
+}
+
 // entry_details only needs the single most recent commit that touched a path (for
 // its "Last Commit" section) — it used to get this via `path_history(...).next()`,
 // which computed the *entire* matching history (walking up to 500 commits, diffing
@@ -6225,6 +6363,58 @@ mod tests {
         fs::remove_dir_all(repository).unwrap();
     }
 
+    #[test]
+    fn folder_restore_from_old_commit_is_path_scoped_and_never_moves_head() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let repository = std::env::temp_dir().join(format!("git-integrity-folder-restore-{suffix}"));
+        fs::create_dir_all(repository.join("folder")).unwrap();
+        fs::write(repository.join(".gitignore"), "folder/ignored.log\n").unwrap();
+        fs::write(repository.join("folder/file1.txt"), "A1\n").unwrap();
+        fs::write(repository.join("folder/file2.txt"), "A2\n").unwrap();
+        fs::write(repository.join("outside.txt"), "outside A\n").unwrap();
+        run_git(&repository, &["init", "-b", "main"]);
+        run_git(&repository, &["config", "user.email", "test@example.com"]);
+        run_git(&repository, &["config", "user.name", "Test User"]);
+        run_git(&repository, &["add", "."]);
+        run_git(&repository, &["commit", "-m", "A folder base"]);
+        let commit_a = run_git_capture(&repository, &["rev-parse", "HEAD"]);
+
+        fs::write(repository.join("folder/file1.txt"), "B1\n").unwrap();
+        run_git(&repository, &["commit", "-am", "B modifies file1"]);
+        fs::write(repository.join("outside.txt"), "outside C\n").unwrap();
+        run_git(&repository, &["commit", "-am", "C unrelated outside folder"]);
+        fs::write(repository.join("folder/file2.txt"), "D2\n").unwrap();
+        fs::write(repository.join("folder/file3.txt"), "D3\n").unwrap();
+        run_git(&repository, &["add", "."]);
+        run_git(&repository, &["commit", "-m", "D modifies folder"]);
+        let head_before = run_git_capture(&repository, &["rev-parse", "HEAD"]);
+        let branch_before = run_git_capture(&repository, &["branch", "--show-current"]);
+
+        fs::write(repository.join("folder/file1.txt"), "staged local\n").unwrap();
+        run_git(&repository, &["add", "folder/file1.txt"]);
+        fs::write(repository.join("folder/file2.txt"), "unstaged local\n").unwrap();
+        fs::write(repository.join("folder/temp.txt"), "remove me\n").unwrap();
+        fs::write(repository.join("folder/ignored.log"), "keep me\n").unwrap();
+
+        let repo_string = repository.to_string_lossy().into_owned();
+        let preview = folder_restore_preview_inner(&repo_string, "folder", &commit_a, true).unwrap();
+        assert!(preview.clean_candidates.iter().any(|path| path == "folder/temp.txt"), "untracked temp file must be previewed for clean: {:?}", preview.clean_candidates);
+        assert!(!preview.clean_candidates.iter().any(|path| path == "folder/ignored.log"), "ignored files must not be cleaned by default");
+        assert!(!preview.tracked_changes.iter().any(|change| change.status == "??"), "untracked items belong in clean preview, not tracked changes");
+
+        restore_folder(repo_string, "folder".into(), commit_a, preview.clean_candidates).unwrap();
+        assert_eq!(run_git_capture(&repository, &["rev-parse", "HEAD"]), head_before, "restore must not move HEAD");
+        assert_eq!(run_git_capture(&repository, &["branch", "--show-current"]), branch_before, "restore must not switch branches");
+        assert_eq!(fs::read_to_string(repository.join("folder/file1.txt")).unwrap(), "A1\n");
+        assert_eq!(fs::read_to_string(repository.join("folder/file2.txt")).unwrap(), "A2\n");
+        assert!(!repository.join("folder/file3.txt").exists(), "tracked files absent in the source snapshot should be removed from the folder");
+        assert!(!repository.join("folder/temp.txt").exists(), "confirmed untracked clean candidate should be removed");
+        assert_eq!(fs::read_to_string(repository.join("folder/ignored.log")).unwrap(), "keep me\n", "ignored file must remain untouched");
+        assert_eq!(fs::read_to_string(repository.join("outside.txt")).unwrap(), "outside C\n", "unrelated paths must be untouched");
+
+        fs::remove_dir_all(repository).unwrap();
+    }
+
     // Test-only: rewrites .gitmodules' recorded `url =` line(s) to a fake
     // https:// address, without touching the submodule's own actual "origin"
     // remote (still whatever local bare repo the test already pushes/fetches
@@ -6786,6 +6976,7 @@ mod tests {
         run_git(&base, &["add", "."]); run_git(&base, &["commit", "-m", "Unrelated root, no shared history"]);
 
         run_git(&base, &["checkout", "main"]);
+        run_git(&base, &["update-ref", "refs/remotes/origin/main", "main"]);
         let repo_path = base.to_string_lossy().into_owned();
 
         let divergence = graph_branch_divergence(repo_path, "main".into()).unwrap();
@@ -6795,6 +6986,10 @@ mod tests {
         assert_eq!(main.tip, merge_commit);
         assert_eq!((main.ahead, main.behind), (0, 0), "main compared against itself must be exactly in sync");
         assert_eq!(main.merge_base.as_deref(), Some(merge_commit.as_str()));
+
+        let origin_main = by_name("origin/main");
+        assert_eq!(origin_main.tip, merge_commit, "remote-tracking origin/main must be reported too so the graph can mark the common ancestor with main");
+        assert_eq!(origin_main.merge_base.as_deref(), Some(merge_commit.as_str()));
 
         let feature = by_name("feature");
         assert_eq!(feature.tip, commit_b);
@@ -6831,6 +7026,29 @@ mod tests {
         assert_eq!(context.current_branch, "master");
 
         fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn graph_commit_actions_create_branch_from_commit_and_checkout_detached_safely() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let repository = std::env::temp_dir().join(format!("git-integrity-graph-commit-actions-{suffix}"));
+        create_libgit2_repository(&repository, "a.txt");
+        run_git(&repository, &["branch", "-M", "main"]);
+        let first = run_git_capture(&repository, &["rev-parse", "HEAD"]);
+        fs::write(repository.join("a.txt"), "second\n").unwrap();
+        run_git(&repository, &["commit", "-am", "second"]);
+        let second = run_git_capture(&repository, &["rev-parse", "HEAD"]);
+        let path = repository.to_string_lossy().into_owned();
+
+        create_branch_at_commit(path.clone(), "from-first".into(), first.clone()).unwrap();
+        assert_eq!(run_git_capture(&repository, &["branch", "--show-current"]), "from-first");
+        assert_eq!(run_git_capture(&repository, &["rev-parse", "HEAD"]), first);
+
+        checkout_commit(path, second.clone()).unwrap();
+        assert!(run_git_capture(&repository, &["branch", "--show-current"]).is_empty(), "checking out a raw commit must detach HEAD rather than moving a branch");
+        assert_eq!(run_git_capture(&repository, &["rev-parse", "HEAD"]), second);
+
+        fs::remove_dir_all(repository).unwrap();
     }
 
     #[test]

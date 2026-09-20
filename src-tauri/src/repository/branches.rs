@@ -23,6 +23,12 @@ pub struct BranchDivergence {
     pub(super) merge_base: Option<String>,
 }
 
+#[derive(Serialize)]
+pub struct GraphBranchStart {
+    pub(super) base_ref: String,
+    pub(super) oid: String,
+}
+
 // Computes OID-based divergence independently of the graph renderer.
 #[tauri::command]
 pub fn graph_branch_divergence(repository_path: String, primary_branch: String) -> Result<Vec<BranchDivergence>, String> {
@@ -32,16 +38,46 @@ pub fn graph_branch_divergence(repository_path: String, primary_branch: String) 
         return Ok(Vec::new());
     };
     let mut result = Vec::new();
-    if let Ok(iterator) = repo.branches(Some(BranchType::Local)) {
-        for item in iterator.flatten() {
-            let name = match item.0.name().ok().flatten() { Some(name) => name.to_string(), None => continue };
-            let Some(tip) = item.0.get().target() else { continue };
-            let (ahead, behind) = repo.graph_ahead_behind(tip, primary_tip).unwrap_or((0, 0));
-            let merge_base = repo.merge_base(tip, primary_tip).ok().map(|oid| oid.to_string());
-            result.push(BranchDivergence { name, tip: tip.to_string(), ahead, behind, merge_base });
+    for branch_type in [BranchType::Local, BranchType::Remote] {
+        if let Ok(iterator) = repo.branches(Some(branch_type)) {
+            for item in iterator.flatten() {
+                let name = match item.0.name().ok().flatten() { Some(name) => name.to_string(), None => continue };
+                let Some(tip) = item.0.get().target() else { continue };
+                let (ahead, behind) = repo.graph_ahead_behind(tip, primary_tip).unwrap_or((0, 0));
+                let merge_base = repo.merge_base(tip, primary_tip).ok().map(|oid| oid.to_string());
+                result.push(BranchDivergence { name, tip: tip.to_string(), ahead, behind, merge_base });
+            }
         }
     }
     Ok(result)
+}
+
+// The graph's explicit "Branch start" marker is the real merge-base between
+// the currently checked-out commit (branch or detached HEAD) and the primary
+// remote main ref. This intentionally does not depend on visual lane order or
+// on the graph's "Primary" picker.
+#[tauri::command]
+pub fn graph_head_main_merge_base(repository_path: String) -> Result<Option<GraphBranchStart>, String> {
+    validate_path(&repository_path)?;
+    let repo = internal_repository(&repository_path)?;
+    let head = repo.head().map_err(|error| error.message().to_string())?;
+    let head_oid = head.peel_to_commit().map_err(|error| error.message().to_string())?.id();
+
+    let mut main_remote_branch = None;
+    for candidate in ["origin/main", "origin/master"] {
+        if repo.find_branch(candidate, BranchType::Remote).is_ok() {
+            main_remote_branch = Some(candidate.to_string());
+            break;
+        }
+    }
+    if main_remote_branch.is_none() { main_remote_branch = default_remote_ref(&repository_path); }
+
+    let Some(base_ref) = main_remote_branch else { return Ok(None); };
+    let Some(remote_oid) = repo.find_branch(&base_ref, BranchType::Remote).ok().and_then(|branch| branch.get().target()) else {
+        return Ok(None);
+    };
+    let oid = repo.merge_base(head_oid, remote_oid).ok().map(|oid| oid.to_string());
+    Ok(oid.map(|oid| GraphBranchStart { base_ref, oid }))
 }
 
 // Describes exactly where a new branch would start and how that position
@@ -84,6 +120,50 @@ pub fn create_branch(path: String, branch: String) -> Result<(), String> {
     drop(_lock);
     // switch_branch acquires the same lock; release ours before calling it.
     switch_branch(path, branch)
+}
+
+#[tauri::command]
+pub fn create_branch_at_commit(repository_path: String, branch: String, commit_id: String) -> Result<(), String> {
+    validate_path(&repository_path)?;
+    let branch = branch.trim();
+    if branch.is_empty() { return Err("Branch name cannot be empty".into()); }
+    let queue_started = Instant::now();
+    let lock_handle = repo_write_lock(&repository_path);
+    let _lock = lock_handle.lock().unwrap();
+    log_repo_write_lock_acquired(&repository_path, "create_branch_at_commit", queue_started.elapsed());
+    let repo = internal_repository(&repository_path)?;
+    let object = repo.revparse_single(commit_id.trim())
+        .or_else(|_| Oid::from_str(commit_id.trim()).and_then(|oid| repo.find_object(oid, Some(ObjectType::Commit))))
+        .map_err(|error| format!("Cannot resolve commit \"{commit_id}\": {}", error.message()))?;
+    let commit = object.peel_to_commit().map_err(|_| format!("\"{commit_id}\" is not a commit"))?;
+    repo.branch(branch, &commit, false).map_err(|error| error.message().to_string())?;
+    let target = commit.as_object();
+    let mut checkout = git2::build::CheckoutBuilder::new();
+    checkout.safe();
+    repo.checkout_tree(target, Some(&mut checkout)).map_err(|error| format!("Branch created, but checkout refused: {}", error.message()))?;
+    repo.set_head(&format!("refs/heads/{branch}")).map_err(|error| error.message().to_string())?;
+    invalidate_git_metadata(&repository_path);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn checkout_commit(repository_path: String, commit_id: String) -> Result<(), String> {
+    validate_path(&repository_path)?;
+    let queue_started = Instant::now();
+    let lock_handle = repo_write_lock(&repository_path);
+    let _lock = lock_handle.lock().unwrap();
+    log_repo_write_lock_acquired(&repository_path, "checkout_commit", queue_started.elapsed());
+    let repo = internal_repository(&repository_path)?;
+    let object = repo.revparse_single(commit_id.trim())
+        .or_else(|_| Oid::from_str(commit_id.trim()).and_then(|oid| repo.find_object(oid, Some(ObjectType::Commit))))
+        .map_err(|error| format!("Cannot resolve commit \"{commit_id}\": {}", error.message()))?;
+    let commit = object.peel_to_commit().map_err(|_| format!("\"{commit_id}\" is not a commit"))?;
+    let mut checkout = git2::build::CheckoutBuilder::new();
+    checkout.safe();
+    repo.checkout_tree(commit.as_object(), Some(&mut checkout)).map_err(|error| format!("Cannot checkout commit: {}", error.message()))?;
+    repo.set_head_detached(commit.id()).map_err(|error| error.message().to_string())?;
+    invalidate_git_metadata(&repository_path);
+    Ok(())
 }
 
 // Resolves the target to the submodule's own repository, then refreshes only
