@@ -8,8 +8,8 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { groupSubmoduleBranchVersions, submoduleCurrentPresentation, submoduleContainingBranchCandidates, submoduleCurrentContextHtml, matchesSubmoduleVersion, submoduleVersionRowHtml, submodulePushDialogState } = require('../frontend/submodule-versions.js');
 
-function branch(name, upstream) { return { name, kind: 'branch', upstream: upstream || null }; }
-function remote(name) { return { name, kind: 'remote' }; }
+function branch(name, upstream, revision = '11111111aaaa') { return { name, kind: 'branch', upstream: upstream || null, revision }; }
+function remote(name, revision = '11111111aaaa') { return { name, kind: 'remote', revision }; }
 
 test('a local branch with a tracked upstream hides the matching remote-tracking entry', () => {
   const { local, remoteOnly } = groupSubmoduleBranchVersions([
@@ -32,15 +32,29 @@ test('a remote-tracking branch with no local counterpart lands in remoteOnly', (
   assert.equal(remoteOnly[0].name, 'origin/feature/never-checked-out');
 });
 
-test('a local branch with no upstream configured never hides any remote entry by name coincidence', () => {
-  // Same shorthand name locally and on the remote, but *not* actually
-  // tracked (upstream is null) — must not be matched by name alone.
+test('a local branch with no upstream configured groups a same-named remote only when it is the same commit', () => {
+  // Same shorthand name locally and on the remote, no upstream configured yet,
+  // but both refs point at the same commit. This is the common result of
+  // checking out origin/release and ending up on a local release branch before
+  // upstream has been configured; showing origin/release under "REMOTE ONLY"
+  // makes it look like a second unrelated branch.
   const { local, remoteOnly } = groupSubmoduleBranchVersions([
-    branch('release', null),
-    remote('origin/release'),
+    branch('release', null, 'aaaaaaaa1111'),
+    remote('origin/release', 'aaaaaaaa1111'),
   ]);
   assert.equal(local.length, 1);
-  assert.equal(remoteOnly.length, 1, 'an untracked local branch must never suppress a same-named remote entry — only a real configured upstream can');
+  assert.equal(local[0].same_name_remote, 'origin/release');
+  assert.deepEqual(remoteOnly, []);
+});
+
+test('a local branch with no upstream configured does not hide a same-named remote at a different commit', () => {
+  const { local, remoteOnly } = groupSubmoduleBranchVersions([
+    branch('release', null, 'aaaaaaaa1111'),
+    remote('origin/release', 'bbbbbbbb2222'),
+  ]);
+  assert.equal(local.length, 1);
+  assert.equal(local[0].same_name_remote, undefined);
+  assert.equal(remoteOnly.length, 1, 'a same-named remote at a different commit must remain visible for inspection');
 });
 
 test('a local branch can track a differently-named remote branch', () => {
@@ -299,4 +313,14 @@ test('a branch without upstream is explicitly local and does not show invented c
   const row = submoduleVersionRowHtml({ name: 'work', kind: 'branch', revision: 'dddddddd1234', subject: 'Work', author: 'A', date: '2026-09-13', upstream: null, ahead: null, behind: null });
   assert.match(row, /LOCAL · no upstream configured/);
   assert.doesNotMatch(row, /0 ahead|0 behind|in sync/);
+});
+
+test('a no-upstream branch can still show the same origin branch without duplicating it as remote-only', () => {
+  const row = submoduleVersionRowHtml({
+    name: 'Test_branch_1', kind: 'branch', revision: '0d2b51611234',
+    subject: 'Test-123-b1', author: 'Andrei', date: '2026-08-18',
+    same_name_remote: 'origin/Test_branch_1', same_name_remote_revision: '0d2b51611234',
+  });
+  assert.match(row, /LOCAL \+ ORIGIN · same commit · origin\/Test_branch_1 · upstream not configured/);
+  assert.doesNotMatch(row, /LOCAL · no upstream configured/);
 });

@@ -16,16 +16,38 @@
 // functions already are.
 //
 // A local branch's own `upstream` field (set by submodule_versions,
-// "<remote>/<branch>" shorthand) is the only signal used to match it to a
-// remote-tracking entry's `name` — never a guess from the branch's own name,
-// since a local branch can track a differently-named remote one.
+// "<remote>/<branch>" shorthand) is the authoritative signal used to match it
+// to a remote-tracking entry's `name`. There is one extra UX-only grouping:
+// when a local branch has no configured upstream yet but `origin/<same-name>`
+// points to the exact same commit, show that as one logical row. Git users read
+// "remote only" as "there is no local branch"; duplicating the same commit in a
+// remote-only section after Checkout made a successful switch look unfinished.
 function groupSubmoduleBranchVersions(versions) {
   const all = versions || [];
   const local = all.filter(version => version.kind === 'branch');
   const remote = all.filter(version => version.kind === 'remote');
-  const trackedRemoteNames = new Set(local.filter(version => version.upstream).map(version => version.upstream));
-  const remoteOnly = remote.filter(version => !trackedRemoteNames.has(version.name));
-  return { local, remoteOnly };
+  const remoteBySameLocalName = new Map();
+  remote.forEach(version => {
+    const name = String(version.name || '');
+    const slash = name.indexOf('/');
+    if (slash > 0 && slash < name.length - 1) remoteBySameLocalName.set(name.slice(slash + 1), version);
+  });
+  const groupedLocal = local.map(version => {
+    if (version.upstream) return version;
+    const sameNameRemote = remoteBySameLocalName.get(version.name);
+    if (!sameNameRemote || sameNameRemote.revision !== version.revision) return version;
+    return {
+      ...version,
+      same_name_remote: sameNameRemote.name,
+      same_name_remote_revision: sameNameRemote.revision,
+    };
+  });
+  const representedRemoteNames = new Set(groupedLocal.flatMap(version => [
+    version.upstream,
+    version.same_name_remote,
+  ].filter(Boolean)));
+  const remoteOnly = remote.filter(version => !representedRemoteNames.has(version.name));
+  return { local: groupedLocal, remoteOnly };
 }
 
 // Pure row renderer: all branch/tag data is supplied by the one existing
@@ -151,6 +173,8 @@ function submoduleVersionRowHtml(item) {
     else if (ahead === 0 && behind > 0) relation = `BRANCH TIP BEHIND · ${behind} commit${behind === 1 ? '' : 's'} to pull`;
     else relation = `BRANCH DIVERGED · ${ahead} ahead / ${behind} behind`;
     upstreamState = `<span class="version-upstream-state ${item.upstream === 'origin/main' ? 'version-primary-upstream' : ''}" title="Branch ${esc(item.name)} compared with ${esc(item.upstream)}">${relation} · ${esc(item.upstream)}</span>`;
+  } else if (item.kind === 'branch' && item.same_name_remote) {
+    upstreamState = `<span class="version-upstream-state version-no-upstream" title="A same-named remote branch exists at this exact commit, but this local branch is not configured to track it yet">LOCAL + ORIGIN · same commit · ${esc(item.same_name_remote)} · upstream not configured</span>`;
   } else if (item.kind === 'branch') {
     upstreamState = '<span class="version-upstream-state version-no-upstream">LOCAL · no upstream configured</span>';
   }

@@ -502,6 +502,14 @@ fn inspect_submodule_state(sub_path: &str) -> SubmoduleStateSnapshot {
     })
 }
 
+fn fresh_submodule_state(sub_path: &str) -> SubmoduleStateSnapshot {
+    let lock_handle = submodule_unpushed_lock(sub_path);
+    let _guard = lock_handle.lock().unwrap();
+    let value = inspect_submodule_state(sub_path);
+    submodule_state_cache().lock().unwrap().insert(sub_path.to_string(), (Instant::now(), value.clone()));
+    value
+}
+
 fn cached_submodule_state(sub_path: &str) -> SubmoduleStateSnapshot {
     if let Some((cached_at, value)) = submodule_state_cache().lock().unwrap().get(sub_path) {
         if cached_at.elapsed() < INDEX_METADATA_TTL { return value.clone(); }
@@ -4218,7 +4226,17 @@ fn load_directory_inner(repository_path: String, relative_path: String, force: O
         // Only a row whose parent status/unpushed information says there is
         // something to explain gets one cached, consolidated inspection.
         let submodule_snapshot = (kind == "submodule" && (!status.is_empty() || unpushed))
-            .then(|| cached_submodule_state(item.path().to_str().unwrap_or_default()));
+            .then(|| {
+                let sub_path = item.path().to_string_lossy().into_owned();
+                // If the parent status already reports the gitlink/worktree as
+                // changed, the submodule's own cached snapshot can be stale
+                // after an external editor touched files inside it. In that
+                // case the expensive signal has already happened (this visible
+                // submodule row is changed), so pay for one fresh submodule
+                // inspection and keep the row truthful: "Changes inside" must
+                // outrank any older "project push" / "synced" cached answer.
+                if status.is_empty() { cached_submodule_state(&sub_path) } else { fresh_submodule_state(&sub_path) }
+            });
         let submodule_has_unpushed_commits = submodule_snapshot.as_ref().is_some_and(|snapshot| snapshot.remote_relation == SubmoduleRemoteRelation::PushNeeded);
         let submodule_is_dirty = submodule_snapshot.as_ref().is_some_and(|snapshot| snapshot.dirty);
         let submodule_state = match (&status_repository, &submodule_snapshot) {
@@ -4720,7 +4738,7 @@ fn switch_submodule_version_inner(repository_path: String, relative_path: String
     // order is the opposite: safely update the tree/index while HEAD still
     // describes their current baseline, then attach/detach HEAD only after
     // that checkout succeeds.
-    let (target_oid, attach_reference, create_local_branch) = if version_kind == "branch" {
+    let (target_oid, attach_reference, create_local_branch, configure_upstream) = if version_kind == "branch" {
         // `name` is the actual branch name (e.g. "main"); `revision` is only the SHA
         // it currently points at and is NOT a valid ref on its own — using it here
         // produced "reference 'refs/heads/<sha>' not found" for every local branch.
@@ -4728,7 +4746,7 @@ fn switch_submodule_version_inner(repository_path: String, relative_path: String
         let reference = format!("refs/heads/{branch_name}");
         let target = repo.find_reference(&reference).map_err(|error| format!("Branch '{branch_name}' not found: {}", error.message()))?
             .peel_to_commit().map_err(|error| error.message().to_string())?.id();
-        (target, Some(reference), None)
+        (target, Some(reference), None, None)
     } else if version_kind == "remote" {
         // Picking a remote branch (e.g. "origin/main") from the list feels like
         // picking "main" — landing on a detached HEAD there is technically correct
@@ -4746,11 +4764,12 @@ fn switch_submodule_version_inner(repository_path: String, relative_path: String
         let local_name = name.split_once('/').map(|(_, rest)| rest).unwrap_or(&name);
         match repo.find_branch(local_name, BranchType::Local) {
             Ok(existing) if existing.get().target() == Some(commit.id()) => {
-                (target, Some(format!("refs/heads/{local_name}")), None)
+                let needs_upstream = existing.upstream().is_err();
+                (target, Some(format!("refs/heads/{local_name}")), None, needs_upstream.then(|| (local_name.to_string(), name.clone())))
             }
-            Ok(_) => (target, None, None),
+            Ok(_) => (target, None, None, None),
             Err(_) => {
-                (target, Some(format!("refs/heads/{local_name}")), Some(local_name.to_string()))
+                (target, Some(format!("refs/heads/{local_name}")), Some(local_name.to_string()), Some((local_name.to_string(), name.clone())))
             }
         }
     } else if version_kind == "tag" {
@@ -4762,11 +4781,11 @@ fn switch_submodule_version_inner(repository_path: String, relative_path: String
         let object = repo.find_reference(&format!("refs/tags/{tag_name}")).and_then(|reference| reference.peel(git2::ObjectType::Commit))
             .or_else(|_| repo.revparse_single(&revision).and_then(|object| object.peel(git2::ObjectType::Commit)))
             .map_err(|error| error.message().to_string())?;
-        (object.id(), None, None)
+        (object.id(), None, None, None)
     } else {
         let object = repo.revparse_single(&revision).map_err(|error| error.message().to_string())?;
         let commit = object.peel_to_commit().map_err(|error| error.message().to_string())?;
-        (commit.id(), None, None)
+        (commit.id(), None, None, None)
     };
     let target = repo.find_object(target_oid, Some(ObjectType::Commit)).map_err(|error| error.message().to_string())?;
     let mut checkout = git2::build::CheckoutBuilder::new(); checkout.safe();
@@ -4775,6 +4794,12 @@ fn switch_submodule_version_inner(repository_path: String, relative_path: String
     if let Some(branch_name) = create_local_branch {
         let commit = repo.find_commit(target_oid).map_err(|error| error.message().to_string())?;
         repo.branch(&branch_name, &commit, false).map_err(|error| error.message().to_string())?;
+    }
+    if let Some((local_branch, upstream_name)) = configure_upstream {
+        let mut branch = repo.find_branch(&local_branch, BranchType::Local)
+            .map_err(|error| format!("Local branch '{local_branch}' was selected, but could not be reopened to set its upstream: {}", error.message()))?;
+        branch.set_upstream(Some(&upstream_name))
+            .map_err(|error| format!("Local branch '{local_branch}' was selected, but tracking '{upstream_name}' could not be configured: {}", error.message()))?;
     }
     if let Some(reference) = attach_reference {
         repo.set_head(&reference).map_err(|error| error.message().to_string())?;
@@ -5359,7 +5384,10 @@ fn commit_selected_internal(repository_path: &str, files: &[String], message: &s
     perf_log(&format!("commit: build scratch index ({} files)", files.len()), commit_started.elapsed());
     let step = Instant::now();
     for file in &files_to_add { index.add_path(file).map_err(|error| error.message().to_string())?; }
-    if !dirs_to_add.is_empty() { index.add_all(&dirs_to_add, git2::IndexAddOption::DEFAULT, None).map_err(|error| error.message().to_string())?; }
+    if !dirs_to_add.is_empty() {
+        index.add_all(&dirs_to_add, git2::IndexAddOption::DEFAULT, None).map_err(|error| error.message().to_string())?;
+        index.update_all(&dirs_to_add, None).map_err(|error| error.message().to_string())?;
+    }
     if !to_remove.is_empty() { index.remove_all(&to_remove, None).map_err(|error| error.message().to_string())?; }
     perf_log("commit: add_path/add_all/remove_all (scratch index)", step.elapsed());
     if includes_submodule && Path::new(repository_path).join(".gitmodules").exists() { index.add_path(Path::new(".gitmodules")).map_err(|error| error.message().to_string())?; }
@@ -5390,7 +5418,10 @@ fn commit_selected_internal(repository_path: &str, files: &[String], message: &s
         if absolute.is_dir() { dirs_to_add.push(relative); } else if absolute.exists() { files_to_add.push(relative); } else { to_remove.push(relative); }
     }
     for file in &files_to_add { index.add_path(file).map_err(|error| error.message().to_string())?; }
-    if !dirs_to_add.is_empty() { index.add_all(&dirs_to_add, git2::IndexAddOption::DEFAULT, None).map_err(|error| error.message().to_string())?; }
+    if !dirs_to_add.is_empty() {
+        index.add_all(&dirs_to_add, git2::IndexAddOption::DEFAULT, None).map_err(|error| error.message().to_string())?;
+        index.update_all(&dirs_to_add, None).map_err(|error| error.message().to_string())?;
+    }
     if !to_remove.is_empty() { index.remove_all(&to_remove, None).map_err(|error| error.message().to_string())?; }
     index.write().map_err(|error| error.message().to_string())?;
     perf_log("commit: sync real index", step.elapsed());
@@ -6683,6 +6714,40 @@ mod tests {
         let parent_listing = load_directory_inner(parent_string, "".into(), None).unwrap();
         let submodule_after = parent_listing.iter().find(|entry| entry.relative_path == added).expect("submodule should still be listed in its parent");
         assert_eq!(submodule_after.submodule_state, "changes_inside", "the parent Explorer row must also drop the cached clean snapshot immediately after an in-app edit");
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn externally_dirty_submodule_bypasses_stale_clean_submodule_snapshot() {
+        // This is the real Explorer-row failure mode: the submodule-state
+        // cache was warmed while the submodule was clean, then another tool
+        // edited a file inside the submodule. A fresh parent status correctly
+        // reports the gitlink row as changed, but reusing the stale clean
+        // submodule snapshot made the row say "project push/synced" instead
+        // of "changes inside". A changed submodule row must force one fresh
+        // submodule inspection.
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-external-dirty-submodule-{suffix}"));
+        let parent = base.join("parent"); let dependency = base.join("dependency");
+        create_libgit2_repository(&parent, "README.md");
+        create_libgit2_repository(&dependency, "module.txt");
+        let parent_string = parent.to_string_lossy().into_owned();
+        let added = add_submodule_inner(parent_string.clone(), "".into(), dependency.to_string_lossy().into_owned(), "dep".into(), String::new(), String::new()).unwrap();
+        create_commit(parent_string.clone(), "Add dep submodule".into()).unwrap();
+        let sub_path = parent.join(&added);
+        let sub_path_string = sub_path.to_string_lossy().into_owned();
+
+        let cached_before_edit = cached_submodule_state(&sub_path_string);
+        assert!(!cached_before_edit.dirty, "sanity check: cache starts with a clean submodule snapshot");
+        invalidate_git_metadata(&parent_string);
+        fs::write(sub_path.join("module.txt"), "changed outside the app").unwrap();
+
+        let parent_listing = load_directory_inner(parent_string, "".into(), None).unwrap();
+        let submodule_after = parent_listing.iter().find(|entry| entry.relative_path == added).expect("submodule should be listed in parent");
+        assert_eq!(submodule_after.status, "M");
+        assert_eq!(submodule_after.submodule_state, "changes_inside", "a parent-visible dirty submodule must not reuse a stale clean submodule snapshot");
+        assert!(submodule_after.submodule_is_dirty);
 
         fs::remove_dir_all(base).unwrap();
     }
@@ -9159,6 +9224,54 @@ mod tests {
         assert!(switched.is_ok(), "switching to a local branch by name should succeed, got: {:?}", switched);
         assert!(!Repository::open(&sub_path).unwrap().head_detached().unwrap(), "switching to a branch must leave HEAD attached to it, not detached");
         assert_eq!(Repository::open(&sub_path).unwrap().head().unwrap().shorthand(), Some("feature-x"));
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn switch_submodule_version_to_a_remote_branch_creates_a_tracking_local_branch() {
+        // A remote-tracking row like "origin/feature-x" is not a real branch
+        // a worktree can attach to. The user-facing operation should mirror
+        // `git switch --track origin/feature-x`: create a local branch,
+        // attach HEAD to it, and remember the upstream so the UI does not
+        // show a confusing duplicate "REMOTE ONLY" entry afterwards.
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-switch-remote-branch-{suffix}"));
+        let repository = base.join("main");
+        let dependency = base.join("dependency");
+        fs::create_dir_all(&repository).unwrap();
+        fs::create_dir_all(&dependency).unwrap();
+        fs::write(repository.join("README.md"), "root").unwrap();
+        fs::write(dependency.join("module.txt"), "v1").unwrap();
+        for path in [&repository, &dependency] {
+            run_git(path, &["init", "-b", "main"]);
+            run_git(path, &["config", "user.email", "test@example.com"]);
+            run_git(path, &["config", "user.name", "Test User"]);
+            run_git(path, &["add", "."]);
+            run_git(path, &["commit", "-m", "Initial"]);
+        }
+        run_git(&repository, &["-c", "protocol.file.allow=always", "submodule", "add", dependency.to_str().unwrap(), "vendor/dep"]);
+        run_git(&repository, &["commit", "-am", "Add dep submodule"]);
+        let repo_path = repository.to_string_lossy().into_owned();
+        let sub_path = repository.join("vendor/dep");
+
+        run_git(&dependency, &["switch", "-c", "feature-x"]);
+        fs::write(dependency.join("feature.txt"), "remote feature").unwrap();
+        run_git(&dependency, &["add", "."]);
+        run_git(&dependency, &["commit", "-m", "Remote feature"]);
+        run_git(&sub_path, &["fetch", "origin"]);
+
+        let versions = submodule_versions_inner(repo_path.clone(), "vendor/dep".into()).unwrap();
+        let remote_branch = versions.versions.iter().find(|version| version.kind == "remote" && version.name == "origin/feature-x").expect("origin/feature-x should be listed as a remote branch");
+
+        let switched = switch_submodule_version_inner(repo_path, "vendor/dep".into(), remote_branch.revision.clone(), remote_branch.kind.clone(), remote_branch.name.clone());
+        assert!(switched.is_ok(), "switching to a remote branch should create a local tracking branch, got: {:?}", switched);
+        let sub_repo = Repository::open(&sub_path).unwrap();
+        assert!(!sub_repo.head_detached().unwrap(), "remote checkout must leave HEAD attached to a local branch, not detached");
+        assert_eq!(sub_repo.head().unwrap().shorthand(), Some("feature-x"));
+        let upstream = sub_repo.find_branch("feature-x", BranchType::Local).unwrap().upstream().unwrap();
+        assert_eq!(upstream.name().unwrap(), Some("origin/feature-x"));
+        assert_eq!(upstream.get().target(), sub_repo.head().unwrap().target());
 
         fs::remove_dir_all(base).unwrap();
     }
@@ -12285,6 +12398,47 @@ mod tests {
             let index = repo.index().unwrap();
             assert!(index.get_path(Path::new("outside_the_folder.txt"), 0).is_some(), "variant {variant:?}: the untouched staged file should remain staged");
         }
+    }
+
+    #[test]
+    fn scoped_commit_consumes_only_selected_scope_and_preserves_other_staged_files() {
+        let repo_path = std::env::temp_dir().join(format!("git-integrity-scoped-commit-stage-{}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+        fs::create_dir_all(repo_path.join("scope")).unwrap();
+        fs::write(repo_path.join("scope/a.txt"), "scope v1\n").unwrap();
+        fs::write(repo_path.join("scope/deleted.txt"), "delete me\n").unwrap();
+        fs::write(repo_path.join("other.txt"), "other v1\n").unwrap();
+        create_libgit2_repository(&repo_path, "README.md");
+        run_git(&repo_path, &["config", "user.name", "Test User"]);
+        run_git(&repo_path, &["config", "user.email", "test@example.com"]);
+        run_git(&repo_path, &["add", "scope/a.txt", "scope/deleted.txt", "other.txt"]);
+        run_git(&repo_path, &["commit", "-m", "Seed files"]);
+
+        fs::write(repo_path.join("scope/a.txt"), "scope v2\n").unwrap();
+        fs::write(repo_path.join("other.txt"), "other v2\n").unwrap();
+        run_git(&repo_path, &["add", "scope/a.txt", "other.txt"]);
+
+        // The selected folder changed again after staging; "Commit this item"
+        // must behave like staging that folder for the scoped commit, while
+        // temporarily keeping unrelated staged work out of the commit.
+        fs::write(repo_path.join("scope/a.txt"), "scope v3\n").unwrap();
+        fs::remove_file(repo_path.join("scope/deleted.txt")).unwrap();
+
+        let repo_string = repo_path.to_string_lossy().into_owned();
+        let oid = commit_path(repo_string.clone(), "scope".into(), "Commit only scope".into()).unwrap();
+        let repo = internal_repository(&repo_string).unwrap();
+        let commit = repo.find_commit(git2::Oid::from_str(&oid).unwrap()).unwrap();
+        let tree = commit.tree().unwrap();
+        let scoped_blob = repo.find_blob(tree.get_path(Path::new("scope/a.txt")).unwrap().id()).unwrap();
+        let outside_blob = repo.find_blob(tree.get_path(Path::new("other.txt")).unwrap().id()).unwrap();
+        assert_eq!(std::str::from_utf8(scoped_blob.content()).unwrap(), "scope v3\n", "the scoped commit should include the selected folder's current working-tree content");
+        assert!(tree.get_path(Path::new("scope/deleted.txt")).is_err(), "tracked deletions inside the selected folder must be included in the scoped commit");
+        assert_eq!(std::str::from_utf8(outside_blob.content()).unwrap(), "other v1\n", "unrelated staged work must not be included in the scoped commit");
+
+        let cached = run_git_capture(&repo_path, &["diff", "--cached", "--name-only"]);
+        assert_eq!(cached, "other.txt", "only the unrelated pre-existing staged file should remain staged after the scoped commit; selected-scope staged entries were consumed");
+        assert_eq!(run_git_capture(&repo_path, &["diff", "--", "scope"]), "", "the selected scope should be clean after it was committed");
+
+        fs::remove_dir_all(repo_path).unwrap();
     }
 
     // The real-world shape this is meant to catch: a huge monorepo (here,

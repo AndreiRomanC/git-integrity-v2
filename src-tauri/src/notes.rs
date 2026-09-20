@@ -21,7 +21,7 @@ pub struct DrillDownNotes {
 fn normalized_folder_path(path: &str) -> Result<String, String> {
     let cleaned = path.trim().replace('\\', "/").trim_matches('/').to_string();
     if cleaned.is_empty() {
-        return Err("Select a folder before adding a personal note".into());
+        return Err("Select a folder or submodule before adding a personal note".into());
     }
     if cleaned.contains(':') {
         return Err("Personal note paths must be repository-relative".into());
@@ -35,7 +35,7 @@ fn normalized_folder_path(path: &str) -> Result<String, String> {
         }
     }
     if parts.is_empty() {
-        return Err("Select a folder before adding a personal note".into());
+        return Err("Select a folder or submodule before adding a personal note".into());
     }
     Ok(parts.join("/"))
 }
@@ -169,7 +169,7 @@ fn ensure_existing_folder(repository_path: &str, relative_path: &str) -> Result<
     let absolute = Path::new(repository_path).join(&normalized);
     let metadata = fs::symlink_metadata(&absolute).map_err(|error| error.to_string())?;
     if !metadata.is_dir() {
-        return Err("Personal notes are available for folders only".into());
+        return Err("Personal notes are available for folders and submodules only".into());
     }
     for component in Path::new(&normalized).components() {
         if matches!(component, Component::ParentDir | Component::RootDir | Component::Prefix(_)) {

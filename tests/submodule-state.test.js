@@ -5,10 +5,12 @@ const { presentation } = require('../frontend/submodule-state.js');
 test('submodule workflow states have short, unambiguous next-action labels', () => {
   assert.equal(presentation('changes_inside').short, 'Changes inside · commit needed');
   assert.equal(presentation('local_commit_push_needed').short, 'Local commit · push needed');
-  assert.equal(presentation('on_origin_stage_project').short, 'On origin · stage project');
-  assert.equal(presentation('on_origin_commit_project').short, 'On origin · commit project');
-  assert.equal(presentation('project_commit_push_needed').short, 'Project commit · push needed');
-  assert.equal(presentation('on_origin_commit_project').row, 'On origin · commit');
+  assert.equal(presentation('on_origin_stage_project').short, 'New version on origin · stage project');
+  assert.equal(presentation('on_origin_commit_project').short, 'New version on origin · commit project');
+  assert.equal(presentation('project_commit_push_needed').short, 'Parent project commit · push pending');
+  assert.equal(presentation('project_commit_push_needed').row, 'Parent push pending');
+  assert.match(presentation('project_commit_push_needed').detail, /submodule itself is already in sync/i);
+  assert.equal(presentation('on_origin_commit_project').row, 'New version · commit');
 });
 
 test('detached local commits never masquerade as ordinary unpushed branch commits', () => {

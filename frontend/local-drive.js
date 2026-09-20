@@ -135,6 +135,7 @@
     let activeSide = 'right';
     let filter = '';
     let operationBusy = false;
+    let lastFolderMergeClick = { path: '', time: 0 };
 
     function paneFor(side) { return root?.querySelector(`[data-drive-side="${side}"]`); }
     function selectedEntry(side = activeSide) { return sides[side].entries.find(entry => entry.path === sides[side].selectedPath) || null; }
@@ -866,6 +867,7 @@
       if (!folderMerge.dialog) return;
       const compareOnly = folderMerge.mode === 'compare';
       const counts = folderMerge.countsModel || { same: 0, modified: 0, left_only: 0, right_only: 0, conflicts: 0, ignored_submodules: 0 };
+      folderMerge.dialog.classList.toggle('compare-mode', compareOnly);
       if (folderMerge.title) folderMerge.title.textContent = compareOnly ? 'Compare folders' : 'Guided folder merge';
       folderMerge.compareMode?.classList.toggle('active', compareOnly);
       folderMerge.guidedMode?.classList.toggle('active', !compareOnly);
@@ -1268,6 +1270,9 @@
       }
       const row = event.target.closest('[data-folder-merge-entry]');
       if (!row) return;
+      const now = Date.now();
+      const isDoubleClick = lastFolderMergeClick.path === row.dataset.folderMergeEntry && now - lastFolderMergeClick.time < 750;
+      lastFolderMergeClick = { path: row.dataset.folderMergeEntry, time: now };
       folderMerge.selectedPath = row.dataset.folderMergeEntry;
       const entry = selectedFolderMergeEntry();
       if (folderMerge.mode === 'merge' && folderMerge.direction) {
@@ -1276,6 +1281,10 @@
       }
       renderFolderMerge();
       renderFolderPreview();
+      if (isDoubleClick && entry?.item_kind === 'file' && entry.reviewable) {
+        lastFolderMergeClick = { path: '', time: 0 };
+        reviewFolderMergeEntry();
+      }
     });
     folderMerge.rows?.addEventListener('dblclick', event => {
       const row = event.target.closest('[data-folder-merge-entry]');

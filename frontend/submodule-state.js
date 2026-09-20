@@ -35,21 +35,21 @@
       tone: 'changed', actionable: true,
     },
     on_origin_stage_project: {
-      row: 'On origin · stage',
-      short: 'On origin · stage project',
+      row: 'New version · stage',
+      short: 'New version on origin · stage project',
       detail: 'The submodule commit is already on origin. Stage the new submodule reference in the main project.',
       tone: 'new-version', actionable: true,
     },
     on_origin_commit_project: {
-      row: 'On origin · commit',
-      short: 'On origin · commit project',
+      row: 'New version · commit',
+      short: 'New version on origin · commit project',
       detail: 'The new submodule reference is staged in the main project. Commit the main project to record it.',
       tone: 'new-version', actionable: true,
     },
     project_commit_push_needed: {
-      row: 'Project · push needed',
-      short: 'Project commit · push needed',
-      detail: 'The main project records this submodule version locally, but that project commit has not been pushed yet.',
+      row: 'Parent push pending',
+      short: 'Parent project commit · push pending',
+      detail: 'The submodule itself is already in sync. The main project has a local commit that records this submodule reference and that parent commit still needs to be pushed.',
       tone: 'unpushed', actionable: true,
     },
     unavailable: {

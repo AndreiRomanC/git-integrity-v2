@@ -214,8 +214,11 @@ function normalizeNotePath(path = '') {
 function noteForPath(path) {
   return state.drillDownNotes?.[normalizeNotePath(path)] || '';
 }
-function folderHasPersonalNote(entry) {
-  return entry?.kind === 'folder' && Boolean(noteForPath(entry.relative_path));
+function entrySupportsPersonalNote(entry) {
+  return entry && ['folder', 'submodule'].includes(entry.kind);
+}
+function entryHasPersonalNote(entry) {
+  return entrySupportsPersonalNote(entry) && Boolean(noteForPath(entry.relative_path));
 }
 async function ensureDrillDownNotesLoaded(repositoryPath, force = false) {
   if (!repositoryPath) return;
@@ -235,8 +238,8 @@ async function ensureDrillDownNotesLoaded(repositoryPath, force = false) {
     status(`Personal notes unavailable: ${String(error)}`, 'error');
   }
 }
-async function editFolderPersonalNote(entry) {
-  if (entry.kind !== 'folder') return;
+async function editEntryPersonalNote(entry) {
+  if (!entrySupportsPersonalNote(entry)) return;
   const current = noteForPath(entry.relative_path);
   const text = await customPrompt(`Personal note for ${entry.relative_path}:`, current, { title: current ? 'Edit personal note' : 'Add personal note', okLabel: 'Save note', multiline: true });
   if (text === null || text === current) return;
@@ -254,8 +257,8 @@ async function editFolderPersonalNote(entry) {
     status(text.trim() ? `${entry.name}: personal note saved` : `${entry.name}: personal note removed`);
   } catch (error) { handleError(error); }
 }
-async function deleteFolderPersonalNote(entry) {
-  if (entry.kind !== 'folder' || !noteForPath(entry.relative_path)) return;
+async function deleteEntryPersonalNote(entry) {
+  if (!entrySupportsPersonalNote(entry) || !noteForPath(entry.relative_path)) return;
   if (!await customConfirm(`Delete the personal note for "${entry.relative_path}"?`, { title: 'Delete personal note', danger: true, okLabel: 'Delete note' })) return;
   if (!invoke) {
     delete state.drillDownNotes[normalizeNotePath(entry.relative_path)];
@@ -270,8 +273,8 @@ async function deleteFolderPersonalNote(entry) {
     status(`${entry.name}: personal note deleted`);
   } catch (error) { handleError(error); }
 }
-function renderFolderPersonalNoteSection(entry) {
-  if (entry.kind !== 'folder') return '';
+function renderPersonalNoteSection(entry) {
+  if (!entrySupportsPersonalNote(entry)) return '';
   const note = noteForPath(entry.relative_path);
   if (!note) {
     return `<div class="detail-section personal-note-section"><h3>PERSONAL NOTE</h3><button class="personal-note-add" data-note-action="edit">＋ Add note</button></div>`;
@@ -639,7 +642,6 @@ async function openRepositoryFast(path) {
     );
     if (generation !== repoOpenGeneration) { jsPerfLog('openRepositoryFast generation mismatch, discarding result', 0); return; }
     directoryCache.clear();
-    warmSubmodules = new Set(); // a different repository's submodule paths mean nothing here
     closeSubmoduleGraph(); // a stale submodule context must never survive switching repositories
     Object.assign(state, data);
     state.changes = []; state.statusReady = false; state.activeSubmodule = null;
@@ -1069,6 +1071,7 @@ const EXPLORER_DOM_ROW_CAP = 500;
 
 let explorerRenderState = { path: null, query: null, entries: null, showAll: false, pendingShowAll: false };
 let lastExplorerClick = { path: null, time: 0 };
+const EXPLORER_DOUBLE_CLICK_MS = 800;
 function renderExplorer() {
   if (!state.repository) return;
   renderBreadcrumbs();
@@ -1100,8 +1103,8 @@ function renderExplorer() {
     <span class="file-main"><span class="entry-icon folder">▲</span><span class="entry-copy"><span class="entry-name">..</span><span class="entry-hint">Parent folder</span></span></span>
     <span></span><span></span><span></span>
   </button>` : '';
-  const rowsHtml = entries.map(entry => `<button class="file-row file-grid ${entry.status || !entry.tracked ? 'has-change' : ''} ${folderHasPersonalNote(entry) ? 'has-personal-note' : ''} ${state.selectedEntry?.relative_path === entry.relative_path ? 'selected' : ''}" data-entry="${esc(entry.relative_path)}">
-    <span class="file-main">${iconFor(entry)}<span class="entry-copy"><span class="entry-name">${esc(entry.name)}${folderHasPersonalNote(entry) ? '<b class="personal-note-dot" title="Personal note">✎</b>' : ''}${entry.kind === 'submodule' ? '<b class="inline-submodule-badge">SUBMODULE</b>' : ''}</span><span class="entry-hint">${entry.kind === 'submodule' ? esc(submoduleHeadHint(entry)) : entry.kind === 'deleted-submodule' ? 'Deleted Git submodule' : entry.kind === 'deleted-folder' ? 'Deleted tracked folder' : entry.kind === 'deleted' ? 'Deleted tracked file' : entry.kind}</span></span>${['folder','submodule'].includes(entry.kind) ? '<span class="folder-arrow">›</span>' : ''}</span>
+  const rowsHtml = entries.map(entry => `<button class="file-row file-grid ${entry.status || !entry.tracked ? 'has-change' : ''} ${entryHasPersonalNote(entry) ? 'has-personal-note' : ''} ${state.selectedEntry?.relative_path === entry.relative_path ? 'selected' : ''}" data-entry="${esc(entry.relative_path)}">
+    <span class="file-main">${iconFor(entry)}<span class="entry-copy"><span class="entry-name">${esc(entry.name)}${entryHasPersonalNote(entry) ? '<b class="personal-note-dot" title="Personal note">✎</b>' : ''}${entry.kind === 'submodule' ? '<b class="inline-submodule-badge">SUBMODULE</b>' : ''}</span><span class="entry-hint">${entry.kind === 'submodule' ? esc(submoduleHeadHint(entry)) : entry.kind === 'deleted-submodule' ? 'Deleted Git submodule' : entry.kind === 'deleted-folder' ? 'Deleted tracked folder' : entry.kind === 'deleted' ? 'Deleted tracked file' : entry.kind}</span></span>${['folder','submodule'].includes(entry.kind) ? '<span class="folder-arrow">›</span>' : ''}</span>
     ${gitState(entry)}<span class="file-size">${entry.kind === 'file' ? formatSize(entry.size) : '—'}</span><span class="file-modified">${formatModified(entry.modified)}</span>
   </button>`).join('') || (state.currentPath ? '' : '<div class="empty-change">This folder is empty</div>');
   const showAllStub = capped ? `<div class="history-truncated-stub"><span>Showing ${EXPLORER_DOM_ROW_CAP} of ${allEntries.length} items</span><button id="explorerShowAll">Show all ${allEntries.length}</button></div>` : '';
@@ -1132,7 +1135,7 @@ function attachFileListDelegation() {
     const upRow = event.target.closest('[data-go-up]');
     if (upRow) {
       const now = Date.now();
-      const isDoubleClick = lastExplorerClick.path === '..' && now - lastExplorerClick.time < 500;
+      const isDoubleClick = lastExplorerClick.path === '..' && now - lastExplorerClick.time < EXPLORER_DOUBLE_CLICK_MS;
       lastExplorerClick = { path: '..', time: now };
       if (isDoubleClick) { lastExplorerClick = { path: null, time: 0 }; openDirectory(state.currentPath.split('/').slice(0, -1).join('/')); }
       return;
@@ -1149,7 +1152,7 @@ function attachFileListDelegation() {
     // Detecting the double-click ourselves — by comparing the clicked path
     // and a timestamp, not the DOM node — sidesteps that entirely.
     const now = Date.now();
-    const isDoubleClick = lastExplorerClick.path === row.dataset.entry && now - lastExplorerClick.time < 500;
+    const isDoubleClick = lastExplorerClick.path === row.dataset.entry && now - lastExplorerClick.time < EXPLORER_DOUBLE_CLICK_MS;
     lastExplorerClick = { path: row.dataset.entry, time: now };
     const entry = state.entries.find(item => item.relative_path === row.dataset.entry);
     if (isDoubleClick && entry && ['folder', 'submodule'].includes(entry.kind)) {
@@ -1162,7 +1165,7 @@ function attachFileListDelegation() {
     // this first click is the common case where a second one follows right
     // after to navigate in, at which point the branch above cancels this
     // before it ever reaches the backend.
-    selectEntry(row.dataset.entry, { deferMs: entry && ['folder', 'submodule'].includes(entry.kind) ? 500 : 0 });
+    selectEntry(row.dataset.entry, { deferMs: entry && ['folder', 'submodule'].includes(entry.kind) ? EXPLORER_DOUBLE_CLICK_MS : 0 });
   });
   refs.fileList.addEventListener('contextmenu', event => {
     const row = event.target.closest('[data-entry]');
@@ -1226,19 +1229,6 @@ function createRequestGuard() {
 }
 
 let explorerRequestSeq = 0;
-// Submodules this session has already confirmed have a warm, current status
-// snapshot on the backend — either because openDirectory's own background
-// scan (below) finished, or because submodule_navigation_status found one
-// already sitting there (from Submodule branch map, a submodule commit/push/
-// pull, or any other flow that happens to read that submodule's status).
-// Session-only and never assumed stale on its own — a submodule that goes
-// unvisited long enough for the backend's own TTL to expire just falls back
-// to load_directory's ordinary per-folder scoped scan next time, same as
-// before this existed; nothing here depends on tracking that expiry too.
-// Cleared whenever a different repository is opened (paths aren't
-// meaningfully comparable across repositories).
-let warmSubmodules = new Set();
-
 // Purely client-side, no backend call: state.submodule_paths comes from
 // load_repository/open_repository_fast's own index read, so this costs
 // nothing beyond an array scan — every ordinary (non-submodule) folder click
@@ -1247,8 +1237,9 @@ function submoduleBoundaryFor(path) {
   return state.submodule_paths.find(sub => path === sub || path.startsWith(`${sub}/`)) || null;
 }
 
-// The actual load_directory round-trip + render, shared by the normal path
-// and by the two-phase submodule flow's repaint once its scan lands.
+// The actual load_directory round-trip + render. Keep this as one coherent
+// backend read even inside a submodule: a previous fast-paint/background-scan
+// experiment caused flicker and unreliable-feeling navigation on Windows.
 async function fetchAndRenderDirectory(path, requestId, options) {
   if (!options.force && directoryCache.has(path)) { state.entries = directoryCache.get(path); render(); return; }
   refs.fileList.innerHTML = '<div class="loading-row"><i class="spinner"></i>Loading folder…</div>';
@@ -1282,23 +1273,6 @@ async function fetchAndRenderDirectory(path, requestId, options) {
 // rescan. Conflating the two here previously meant every post-mutation
 // repaint re-triggered a full backend rescan a few hundred milliseconds
 // after the mutation's own reload had just paid for one.
-//
-// A first navigation into a submodule (per warmSubmodules above) is a third,
-// separate case: rather than block on that submodule's own status scan
-// synchronously — which used to mean every single folder browsed inside a
-// submodule paid for its own ~220-600ms scoped Git scan — this shows the
-// existing filesystem-only listing immediately (status marked Loading/
-// unknown) with NO awaited call in front of it, not even the cheap,
-// index-only submodule_navigation_status check: a real click→first-paint
-// measurement is what this app promises everywhere else, and an IPC round
-// trip in front of it — however fast — is still a real, avoidable delay the
-// user asked never to reintroduce. The status check and the submodule's one
-// real, read-only, single-flight status scan both happen only *after* that
-// paint, in the background; the folder repaints with real status once they
-// land. Every subsequent folder inside that same submodule (this call, from
-// then on) goes through the normal path below and reuses that one scan via
-// the backend's existing cache-reuse path — no scoped rescan per folder.
-// Never pre-scans any *other* submodule; only the one just entered.
 async function openDirectory(path, options = {}) {
   if (!state.repository) return;
   state.currentPath = path; state.selectedEntry = null;
@@ -1306,43 +1280,16 @@ async function openDirectory(path, options = {}) {
 
   const boundary = submoduleBoundaryFor(path);
   if (!boundary) { state.activeSubmodule = null; return fetchAndRenderDirectory(path, requestId, options); }
-  if (warmSubmodules.has(boundary)) { state.activeSubmodule = { path: boundary, statusReady: true }; return fetchAndRenderDirectory(path, requestId, options); }
-
-  // Cold submodule: paint first, decide/scan after — see the comment above.
-  state.activeSubmodule = { path: boundary, statusReady: false };
-  await paintDirectoryFast(path, requestId);
-  if (requestId !== explorerRequestSeq) return; // navigated away while the fast paint itself was in flight
-
-  let alreadyWarm = false;
-  if (invoke) {
-    try {
-      const nav = await invoke('submodule_navigation_status', { repositoryPath: state.repository.path, relativePath: path });
-      alreadyWarm = Boolean(nav?.ready);
-    } catch { /* treat as cold — the scan below is always correct, just not free */ }
-  }
-  if (requestId !== explorerRequestSeq) return; // navigated away while checking
-  if (!alreadyWarm && invoke) {
-    try { await invoke('submodule_folder_status', { repositoryPath: state.repository.path, relativePath: path }); }
-    catch (error) { status(String(error), 'error'); /* fall through: mutations must not stay disabled forever over a failed scan */ }
-  }
-  warmSubmodules.add(boundary);
-  if (requestId !== explorerRequestSeq || state.currentPath !== path) return;
   state.activeSubmodule = { path: boundary, statusReady: true };
-  // Real status is in cache now — repaint with it. `force` alone (never
-  // invalidateGit, even if the original call asked for it): the scan above
-  // already *is* the fresh, read-only rescan the caller wanted — reuse what
-  // it just computed, don't ask the backend to throw it away and pay for a
-  // second one right behind it.
-  return fetchAndRenderDirectory(path, requestId, { ...options, force: true, invalidateGit: false });
+  return fetchAndRenderDirectory(path, requestId, options);
 }
 
 // Filesystem-only variant of openDirectory used for the very first render of
 // the repository root while opening it (see list_directory_fast's doc
-// comment) and, via paintDirectoryFast below, for the first render of a
-// submodule folder while its own status scan warms up — never populates
-// directoryCache, so a later, real openDirectory(force:false) for the same
-// folder can never accidentally serve this incomplete data back as if it
-// were a real, status-complete listing.
+// comment). It never populates directoryCache, so a later, real
+// openDirectory(force:false) for the same folder can never accidentally
+// serve this incomplete data back as if it were a real, status-complete
+// listing.
 async function paintDirectoryFast(path, requestId) {
   refs.fileList.innerHTML = '<div class="loading-row"><i class="spinner"></i>Loading folder…</div>';
   if (!invoke) { state.entries = previewData.entries; render(); return; }
@@ -1364,9 +1311,32 @@ async function openDirectoryFast(path) {
 }
 
 const openSubmoduleMenuGuard = createRequestGuard();
+function closeSubmoduleMenu() {
+  refs.submoduleMenu.hidden = true;
+  submoduleMenuData = null;
+}
+async function refreshSubmoduleMenu(button = null) {
+  if (!submoduleMenuEntry || refs.submoduleMenu.hidden) return;
+  const entry = submoduleMenuEntry;
+  const entryPath = entry.relative_path;
+  const stillCurrent = openSubmoduleMenuGuard();
+  const finishButton = button ? beginButtonOperation(button, '↻') : () => {};
+  refs.currentSubmoduleVersion.textContent = 'Refreshing…';
+  refs.submoduleVersions.innerHTML = '<div class="version-loading"><i class="spinner"></i>Refreshing branches, tags and commits…</div>';
+  if (!invoke) { renderSubmoduleVersions(); finishButton(); return; }
+  try {
+    const data = await invoke('submodule_versions', { repositoryPath: state.repository.path, relativePath: entryPath });
+    if (!stillCurrent() || refs.submoduleMenu.hidden || submoduleMenuEntry?.relative_path !== entryPath) return;
+    submoduleMenuData = data;
+    renderSubmoduleVersions();
+    if (button) status(`${entry.name}: submodule versions refreshed`);
+  } catch (error) {
+    if (stillCurrent() && !refs.submoduleMenu.hidden && submoduleMenuEntry?.relative_path === entryPath) refs.submoduleVersions.innerHTML = `<div class="version-loading">${esc(String(error))}</div>`;
+  } finally { finishButton(); }
+}
 async function openSubmoduleMenu(entry, x, y) {
   submoduleMenuEntry = entry;
-  const stillCurrent = openSubmoduleMenuGuard();
+  openSubmoduleMenuGuard();
   refs.submoduleMenu.hidden = false;
   // Keep the wider, readable selector fully inside the viewport. Its old
   // 440px positioning clamp was left behind after the contents grew, so the
@@ -1389,11 +1359,7 @@ async function openSubmoduleMenu(entry, x, y) {
       { name: 'bd51e40', revision: 'bd51e40ca112', kind: 'commit', current: false, subject: 'Release configuration', author: 'Maria Ionescu', date: '2026-08-12' }
     ] }; renderSubmoduleVersions(); return;
   }
-  try {
-    const data = await invoke('submodule_versions', { repositoryPath: state.repository.path, relativePath: entry.relative_path });
-    if (!stillCurrent() || submoduleMenuEntry !== entry) return; // a newer submodule's menu (same guard), or this one was closed/reopened elsewhere
-    submoduleMenuData = data; renderSubmoduleVersions();
-  } catch (error) { if (stillCurrent() && submoduleMenuEntry === entry) refs.submoduleVersions.innerHTML = `<div class="version-loading">${esc(String(error))}</div>`; }
+  await refreshSubmoduleMenu();
 }
 
 function renderSubmoduleVersions() {
@@ -1477,7 +1443,7 @@ async function switchSubmoduleVersion(revision, kind, name, button = null) {
     status('Switching submodule version…', 'busy');
     await invoke('switch_submodule_version', { repositoryPath: state.repository.path, relativePath: submoduleMenuData.path, revision, versionKind: kind, name: name || '' });
     const folder = state.currentPath; const data = await invoke('load_repository', { path: state.repository.path, force: false });
-    Object.assign(state, data); state.view = 'explorer'; directoryCache.clear(); refs.submoduleMenu.hidden = true; await openDirectory(folder, { force: true });
+    Object.assign(state, data); state.view = 'explorer'; directoryCache.clear(); closeSubmoduleMenu(); await openDirectory(folder, { force: true });
     const target = kind === 'branch' ? `branch "${name}"` : kind === 'remote' ? `remote branch "${name}" (detached at that commit)` : kind === 'tag' ? `tag "${name}" (detached at that commit)` : `commit ${revision.slice(0, 8)} (detached — not on any branch)`;
     const successMsg = `Submodule switched to ${target}. It now shows as "Modified" here — that's expected: the project hasn't recorded the new pointer yet. Select the submodule and use "Commit this item" to save it.`;
     status(successMsg); showOperationToast(successMsg, 'success');
@@ -1500,7 +1466,7 @@ async function discardSubmoduleBranchAndUseUpstream({ name, upstream, ahead, beh
     const result = await invoke('reset_submodule_branch_to_upstream', { repositoryPath: state.repository.path, relativePath: submoduleMenuData.path, branchName: name });
     const folder = state.currentPath;
     const data = await invoke('load_repository', { path: state.repository.path, force: false });
-    Object.assign(state, data); state.view = 'explorer'; directoryCache.clear(); refs.submoduleMenu.hidden = true;
+    Object.assign(state, data); state.view = 'explorer'; directoryCache.clear(); closeSubmoduleMenu();
     await openDirectory(folder, { force: true });
     const message = `${submoduleMenuEntry?.name || 'Submodule'}: ${result.branch} now matches ${result.upstream} @ ${result.revision.slice(0, 8)}. Local-only work was discarded.`;
     status(message); showOperationToast(message, 'success');
@@ -1695,6 +1661,11 @@ function submoduleRepositoryLinkHtml(entry) {
   const label = compactRepositoryLabel(entry.submodule_web_url);
   return `<a href="${esc(entry.submodule_web_url)}" class="submodule-repository-link" data-submodule-path="${esc(entry.relative_path)}" title="${esc(entry.submodule_web_url)}">${esc(label)} ↗</a>`;
 }
+function submoduleRepositoryRowsHtml(entry) {
+  const remote = entry.submodule_url || 'Not configured';
+  const github = entry.submodule_web_url ? `<span>GitHub</span><strong>${submoduleRepositoryLinkHtml(entry)}</strong>` : '';
+  return `<span>Remote</span><strong>${esc(remote)}</strong>${github}`;
+}
 
 // "Last commit touching this path" can be a genuinely heavy history walk on
 // a large repository — computed separately from the rest of entry_details
@@ -1726,13 +1697,13 @@ function renderEntryDetails(entry) {
     <div class="context-actions">${deletedEntry ? '' : entry.kind === 'file' ? '<button data-detail-action="edit">Edit local file</button>' : '<button data-detail-action="open">Open folder</button>'}${entry.kind === 'submodule' ? '' : '<button data-detail-action="server">Open on server ↗</button>'}${entry.kind === 'submodule' ? '' : '<button data-detail-action="history">View history</button>'}${entry.kind === 'folder' ? '<button data-detail-action="restorefolder" class="danger-action-soft" data-tooltip="Restore only this folder from HEAD or a selected commit. Does not move HEAD or switch branch.">↶ Restore folder…</button>' : ''}${entry.status ? '<button data-detail-action="commit">Commit this item</button>' : ''}${entry.kind === 'deleted' ? '<button data-detail-action="head" data-tooltip="Restore this deleted file from your last local commit (HEAD)">↶ Restore from last commit (HEAD)</button>' : ''}${['folder','submodule'].includes(entry.kind) && entry.name === 'r' ? '<button data-detail-action="utrud" data-tooltip="Launches UTRUD for this r folder. If it cannot start, an explicit error is shown. Windows only.">▶ Run UTRUD</button>' : ''}${entry.kind === 'file' && (entry.status || !entry.tracked) ? `<button data-detail-action="stage" data-tooltip="git add — add this file's current content to staging">＋ Stage this file</button><button data-detail-action="unstage" data-tooltip="Unstage — git restore --staged. Removes only the staging entry; your edits on disk are kept exactly as they are.">− Unstage</button><button data-detail-action="stashfile" data-tooltip="Sets this file aside in this repository's own stash. Parent projects and submodules have separate stash lists.">⇕ Stash this file</button><button data-detail-action="head" class="danger-action-soft" data-tooltip="Restore from your last local commit (HEAD) — git checkout HEAD -- file. Permanently discards ALL edits; the file on disk becomes identical to what you last committed. Cannot be undone.">↶ Restore from last commit (HEAD)</button><button data-detail-action="compare" data-tooltip="Open side-by-side compare with restore options">⇄ Compare with remote</button>` : ''}${entry.kind === 'submodule' ? `<button data-detail-action="subserver">Open submodule repository ↗</button><button data-detail-action="subgraph" data-tooltip="Open this submodule's own branch/commit history — never the parent project's">Submodule Branch Map</button><button data-detail-action="subrefchanges" data-tooltip="A different, narrower question: which commits in the PARENT project changed this submodule's recorded version. Not the submodule's own history.">Submodule Reference Changes</button><button data-detail-action="subnewbranch" data-tooltip="Create a new local branch in this submodule, starting from its current commit, and switch to it">＋ New branch…</button><button data-detail-action="versions">Change version</button><button data-detail-action="substash" data-tooltip="Set aside all uncommitted files inside this submodule only. The parent project's work is untouched.">Stash submodule work</button><button data-detail-action="substashes" data-tooltip="View and restore this submodule's own stashes. The parent project's stash list is separate.">Submodule stashes</button><button data-detail-action="subcommit" ${canCommitInsideSubmodule ? '' : 'disabled'} data-tooltip="${canCommitInsideSubmodule ? 'Commit uncommitted changes inside the submodule' : 'No uncommitted files inside this submodule'}">Commit submodule</button><button data-detail-action="subreset" class="danger-action-soft" ${entry.status ? '' : 'disabled'} data-tooltip="${entry.status ? 'Discard local work and restore the exact submodule commit recorded by the parent project. This leaves detached HEAD, like git submodule update.' : 'The submodule already uses the version recorded by the parent project'}">↺ Restore project version…</button><button data-detail-action="subpull" data-tooltip="Fast-forward pull — brings in new commits from the submodule's remote. Refuses if it would require a manual merge.">Pull submodule</button><button data-detail-action="submerge" data-tooltip="Merge a branch into this submodule's current branch, with conflict resolution if needed">Merge branch…</button><button data-detail-action="subpush">Push submodule</button><button data-detail-action="subforcepush" class="danger-action-soft" data-tooltip="⚠️ Overwrites the remote branch with your local history, discarding any commits there aren't in yours. Only safe if nobody else uses that remote.">Force push submodule…</button><button data-detail-action="subfetch">Fetch submodule</button><button data-detail-action="location">Replace repository URL</button>` : ''}${deletedEntry ? '' : '<button class="danger-action" data-detail-action="delete">Delete…</button>'}</div>
     <div class="detail-section"><h3>GENERAL</h3><div class="detail-grid"><span>Type</span><strong>${kindLabel}</strong><span>Git</span><strong>${entry.tracked ? (entry.status || (entry.unpushed ? (entry.kind === 'folder' ? 'Clean — contains unpushed commits' : 'Committed, not pushed yet') : 'Tracked, clean')) : 'Untracked'}</strong>
     ${entry.item_count != null ? `<span>Items</span><strong>${entry.item_count}</strong>` : `<span>Size</span><strong>${formatSize(entry.size)}</strong>`}<span>Modified</span><strong>${formatModified(entry.modified)}</strong></div></div>
-    ${renderFolderPersonalNoteSection(entry)}
-    ${entry.kind === 'submodule' ? `<div class="detail-section"><h3>SUBMODULE</h3><div class="detail-grid"><span>Remote</span><strong>${esc(entry.submodule_url || 'Not configured')}</strong><span>GitHub</span><strong>${submoduleRepositoryLinkHtml(entry)}</strong><span>Branch</span><strong>${esc(entry.submodule_branch || 'Default')}</strong><span>Status</span><strong>${esc(submoduleState.short)}</strong></div>
+    ${renderPersonalNoteSection(entry)}
+    ${entry.kind === 'submodule' ? `<div class="detail-section"><h3>SUBMODULE</h3><div class="detail-grid">${submoduleRepositoryRowsHtml(entry)}<span>Branch</span><strong>${esc(entry.submodule_branch || 'Default')}</strong><span>Status</span><strong>${esc(submoduleState.short)}</strong></div>
     ${entry.submodule_unpushed_commits?.length ? `<div class="submodule-push-banner"><i></i><span>${entry.submodule_unpushed_commits.length} commit${entry.submodule_unpushed_commits.length === 1 ? '' : 's'} not yet pushed to its own remote:</span></div><div class="submodule-unpushed-list">${entry.submodule_unpushed_commits.map(commit => `<div class="submodule-unpushed-commit"><strong>${commitSubjectHtml(commit.subject)}</strong><small>${esc(commit.id.slice(0, 8))} · ${esc(commit.author)} · ${esc(commit.date)}</small></div>`).join('')}</div>` : entry.submodule_push_status ? `<div class="submodule-push-banner"><i></i><span>${esc(entry.submodule_push_status)}</span></div>` : ''}</div>` : ''}
     ${entry.kind === 'submodule' ? `<div class="detail-section"><h3>SUBMODULE COMMIT (actual change)</h3><div class="detail-grid"><span>Commit</span><strong>${entry.submodule_commit_id ? `<a href="#" class="commit-server-link" data-commit-id="${esc(entry.submodule_commit_id)}" data-submodule-path="${esc(entry.relative_path)}" title="Open this commit on the submodule's own server">${esc(entry.submodule_commit_id.slice(0, 8))} ↗</a>` : 'No commit'}</strong><span>Message</span><strong>${commitSubjectHtml(entry.submodule_commit_subject || '—')}</strong>${specDetailRows(entry.submodule_commit_subject)}<span>Author</span><strong>${esc(entry.submodule_commit_author || '—')}</strong><span>Date</span><strong>${esc(entry.submodule_commit_date || '—')}</strong></div></div>` : ''}
     <div class="detail-section" id="entryLastCommitSection">${renderEntryLastCommitInner(entry)}</div></div>`;
   refs.details.querySelectorAll('[data-detail-action]').forEach(button => button.addEventListener('click', () => { Promise.resolve(handleDetailAction(button.dataset.detailAction, entry, button)).catch(error => handleError(error)); }));
-  refs.details.querySelectorAll('[data-note-action]').forEach(button => button.addEventListener('click', () => { Promise.resolve(button.dataset.noteAction === 'delete' ? deleteFolderPersonalNote(entry) : editFolderPersonalNote(entry)).catch(error => handleError(error)); }));
+  refs.details.querySelectorAll('[data-note-action]').forEach(button => button.addEventListener('click', () => { Promise.resolve(button.dataset.noteAction === 'delete' ? deleteEntryPersonalNote(entry) : editEntryPersonalNote(entry)).catch(error => handleError(error)); }));
 }
 
 function folderRestoreSourceRevision() {
@@ -1996,6 +1967,7 @@ $('#confirmNewTag').addEventListener('click', async () => {
     const result = await invoke('create_submodule_tag', { repositoryPath: state.repository.path, relativePath: target.relative_path, tagName: name, message: $('#newTagMessage').value.trim(), push: $('#newTagPush').checked, targetRevision: state.newTagRevision || null });
     $('#newTagDialog').close();
     directoryCache.clear(); if (state.selectedEntry?.relative_path === target.relative_path) await selectEntry(target.relative_path);
+    if (!refs.submoduleMenu.hidden && submoduleMenuEntry?.relative_path === target.relative_path) await refreshSubmoduleMenu();
     const pushNote = !$('#newTagPush').checked ? '' : result.pushed ? ` ${result.push_detail}` : ` Not pushed: ${result.push_detail}`;
     const msg = `${target.name}: tag "${name}" created at ${result.target.slice(0, 8)} (${result.annotated ? 'annotated' : 'lightweight'}).${pushNote}`;
     status(msg); showOperationToast(msg, !$('#newTagPush').checked || result.pushed ? 'success' : '');
@@ -2408,13 +2380,13 @@ async function pushSubmodule(entry) {
 
   try {
     status(`Pushing ${entry.name} to its remote…`, 'busy');
+    const menuWasOpenForEntry = !refs.submoduleMenu.hidden && submoduleMenuEntry?.relative_path === entry.relative_path;
     const result = await invoke('push_submodule', { repositoryPath: state.repository.path, relativePath: entry.relative_path });
     directoryCache.clear(); await loadRepository(state.repository.path, { reopenPath: state.currentPath });
-    // Same convention as this menu's own Checkout/Discard actions: its data
-    // (e.g. "N commits to push") is now stale, so close it rather than leave
-    // it showing a state that no longer exists. A no-op when this was
-    // reached from anywhere else the menu was never open in the first place.
-    refs.submoduleMenu.hidden = true;
+    if (menuWasOpenForEntry) {
+      submoduleMenuEntry = state.entries.find(item => item.relative_path === entry.relative_path) || submoduleMenuEntry;
+      await refreshSubmoduleMenu();
+    }
     const shortSha = (result?.revision || '').slice(0, 8);
     const successMsg = `${entry.name}: pushed to branch "${result?.branch}" on its remote (now at ${shortSha}). The project's link to it was staged, not committed — commit the project when you're ready to share that.`;
     status(successMsg); showOperationToast(successMsg, 'success');
@@ -3288,12 +3260,17 @@ function buildCommitRowHtml(commit, index, ctx) {
   const matchesFilter = ctx.refFilter === 'all' || isBranchPoint || (ctx.refFilter === 'branches' ? (refKinds.has('local_branch') || refKinds.has('remote_branch')) : refKinds.has('tag'));
   const isFilterDimmed = !matchesFilter;
   const mergePresentation = mergeCommitPresentation(commit, ctx);
+  const structuralBadges = [
+    isCommonAncestorWithMain ? `<b class="branch-point-pill common-main-pill" data-tooltip="Real merge-base between HEAD and ${esc(commonAncestorBaseRef)} — where this checkout diverged from main">Branch start</b>` : '',
+    !isCommonAncestorWithMain && isBranchPoint ? '<b class="branch-point-pill" data-tooltip="Common ancestor or lane transition — computed from commit parents, not lane color">⑂</b>' : '',
+    isCommandBranchStart ? `<b class="branch-point-pill command-start-pill" data-tooltip="merge-base with ${esc(state.branchStartMarker.baseRef)} — where this branch split from the selected base">Command start</b>` : '',
+  ].join('');
 
   return `<article class="commit-row ${node.isHead ? 'is-head' : ''} ${hasPrimaryRemoteRef ? 'has-primary-remote-tip' : hasLocalBranchRef ? 'has-local-branch-tip' : hasRemoteBranchRef ? 'has-remote-branch-tip' : ''} ${isBranchPoint ? 'is-branch-point' : ''} ${isCommonAncestorWithMain ? 'is-common-ancestor-main' : ''} ${isMergeCommit ? 'is-merge-commit' : ''} ${isCommandBranchStart ? 'is-command-branch-start' : ''} ${isMatch ? 'is-search-match' : ''} ${isSearchDimmed || isFilterDimmed ? 'is-search-dimmed' : ''}" data-id="${esc(commit.id)}" data-lane="${node.lane}">
     <div class="graph-cell"></div>
     <div class="commit-body">
-      <div class="commit-card"><div class="commit-main">${isCommonAncestorWithMain ? `<b class="branch-point-pill common-main-pill" data-tooltip="Real merge-base between HEAD and ${esc(commonAncestorBaseRef)} — where this checkout diverged from main">Branch start</b>` : isBranchPoint ? '<b class="branch-point-pill" data-tooltip="Common ancestor or lane transition — computed from commit parents, not lane color">⑂</b>' : ''}${isCommandBranchStart ? `<b class="branch-point-pill" data-tooltip="merge-base with ${esc(state.branchStartMarker.baseRef)} — where this branch split from the selected base">START</b>` : ''}<span class="commit-title">${commitSubjectHtml(commit.subject)}</span>${refsBadges(node.refs, node.isHead, ctx.currentBranch)}${stashPills}</div><span class="commit-id">${esc(commit.id.slice(0, 8))}</span>
-      <span class="topology-badges">${mergePresentation ? `<b class="merge-badge" data-tooltip="${esc(mergePresentation.tooltip)}">${esc(mergePresentation.label)}</b>` : ''}</span><span class="commit-author">${esc(commit.author)}</span></div>
+      <div class="commit-card"><div class="commit-main"><div class="commit-title-line">${structuralBadges}<span class="commit-title">${commitSubjectHtml(commit.subject)}</span></div><div class="commit-ref-line">${refsBadges(node.refs, node.isHead, ctx.currentBranch)}${stashPills}</div></div><span class="commit-id-wrap"><button type="button" class="commit-copy-sha" data-copy-commit-sha="${esc(commit.id)}" title="Copy full commit SHA">${esc(commit.id.slice(0, 8))} ⧉</button></span>
+      <span class="commit-date">${esc(commit.date || '—')}</span><span class="topology-badges">${mergePresentation ? `<b class="merge-badge" data-tooltip="${esc(mergePresentation.tooltip)}">${esc(mergePresentation.label)}</b>` : ''}</span><span class="commit-author">${esc(commit.author)}</span></div>
       ${ahead ? `<div class="ahead-annotation">${esc(ahead)}</div>` : ''}${stashDetails}
     </div>
   </article>`;
@@ -3437,6 +3414,10 @@ function showGraphCommitContextMenu(event, commitId) {
 function wireGraphRowInteractions(rowElements) {
   rowElements.forEach(row => row.addEventListener('click', () => selectCommit(row.dataset.id)));
   rowElements.forEach(row => row.addEventListener('contextmenu', event => showGraphCommitContextMenu(event, row.dataset.id)));
+  rowElements.forEach(row => row.querySelectorAll('[data-copy-commit-sha]').forEach(button => button.addEventListener('click', event => {
+    event.stopPropagation();
+    copyText(button.dataset.copyCommitSha || '', 'Commit SHA copied.');
+  })));
   rowElements.forEach(row => row.querySelectorAll('[data-graph-ref-name]').forEach(pill => pill.addEventListener('contextmenu', event => showGraphBranchContextMenu(event, pill.dataset.graphRefName))));
   rowElements.forEach(row => row.querySelectorAll('[data-tag-name]').forEach(pill => pill.addEventListener('click', event => { event.stopPropagation(); showTagDetails(pill.dataset.tagName); })));
   rowElements.forEach(row => row.querySelectorAll('[data-toggle-stash]').forEach(pill => pill.addEventListener('click', event => {
@@ -4533,11 +4514,6 @@ refs.goUp.addEventListener('click', () => { const commander = state.view === 'co
 refs.reloadFolder.addEventListener('click', () => {
   if (state.view === 'commander' && state.compareMode === 'local-drive') return localDriveWorkspace?.reload();
   if (state.view === 'commander') return openCommanderDirectory(state.commanderPath);
-  // An explicit reload invalidates the submodule's backend snapshot too (see
-  // load_directory's `force`/status_repo) — forget it was warm so the next
-  // navigation inside it redoes the fast-paint + single background scan
-  // instead of relying on a snapshot that was just thrown away.
-  if (state.activeSubmodule) warmSubmodules.delete(state.activeSubmodule.path);
   return openDirectory(state.currentPath, { force: true, invalidateGit: true });
 });
 refs.runCurrentUtrud.addEventListener('click', () => {
@@ -4546,7 +4522,8 @@ refs.runCurrentUtrud.addEventListener('click', () => {
 });
 document.addEventListener('keydown', event => { if (event.key !== 'Escape' || state.view !== 'commander' || document.querySelector('dialog[open]')) return; event.preventDefault(); returnToProjectNavigator(); });
 refs.remoteRef.addEventListener('change', () => { state.remoteRef = refs.remoteRef.value; if (state.compareMode === 'git') openCommanderDirectory(state.commanderPath); });
-$('#closeSubmoduleMenu').addEventListener('click', () => { refs.submoduleMenu.hidden = true; });
+$('#closeSubmoduleMenu').addEventListener('click', closeSubmoduleMenu);
+$('#refreshSubmoduleMenu').addEventListener('click', event => refreshSubmoduleMenu(event.currentTarget));
 // Uses submoduleMenuEntry (the entry the popup was actually opened for), not
 // state.selectedEntry — this panel isn't modal, so the selection elsewhere in
 // the app can move on while it's still open; reusing that here would be
@@ -4565,7 +4542,7 @@ document.querySelectorAll('[data-version-filter]').forEach(button => button.addE
   versionFilter = button.dataset.versionFilter; document.querySelectorAll('[data-version-filter]').forEach(item => item.classList.toggle('active', item === button)); renderSubmoduleVersions();
 }));
 refs.submoduleVersionSearch.addEventListener('input', renderSubmoduleVersions);
-refs.submoduleOpenGraph.addEventListener('click', () => { if (submoduleMenuEntry) { refs.submoduleMenu.hidden = true; openSubmoduleGraph(submoduleMenuEntry); } });
+refs.submoduleOpenGraph.addEventListener('click', () => { if (submoduleMenuEntry) { closeSubmoduleMenu(); openSubmoduleGraph(submoduleMenuEntry); } });
 document.addEventListener('click', event => {
   // A New branch/New tag/Push dialog is a child of the version selector in
   // the user's workflow even though <dialog> lives elsewhere in the DOM. Do
@@ -4575,7 +4552,14 @@ document.addEventListener('click', event => {
   // just Cancel) would hide the versions menu underneath before the push
   // dialog itself even closes.
   const childActionOpen = refs.newBranchDialog.open || $('#newTagDialog').open || $('#submodulePublishDialog').open;
-  if (!childActionOpen && !refs.submoduleMenu.hidden && !refs.submoduleMenu.contains(event.target) && !event.target.closest('[data-entry]') && !event.target.closest('[data-detail-action="versions"]')) refs.submoduleMenu.hidden = true;
+  if (!childActionOpen && !refs.submoduleMenu.hidden && !refs.submoduleMenu.contains(event.target) && !event.target.closest('[data-entry]') && !event.target.closest('[data-detail-action="versions"]')) closeSubmoduleMenu();
+});
+document.addEventListener('keydown', event => {
+  if (event.key !== 'Escape' || refs.submoduleMenu.hidden) return;
+  const childActionOpen = refs.newBranchDialog.open || $('#newTagDialog').open || $('#submodulePublishDialog').open;
+  if (childActionOpen) return;
+  event.preventDefault();
+  closeSubmoduleMenu();
 });
 refs.commitScope.addEventListener('click', openScopeCommit);
 refs.showPathHistory.addEventListener('click', showSelectedHistory);
@@ -4779,6 +4763,15 @@ async function findBranchStartCommit() {
   status(`Branch start found: ${sha.slice(0, 8)} against ${baseRef}. Commands are shown in Terminal.`);
 }
 
+async function initAndUpdateSubmodulesFromActions() {
+  if (!state.repository) return status('Open a repository first.', 'error');
+  status('Initializing and updating submodules recursively…', 'busy');
+  const result = await runTerminalFromConsole('git submodule update --init --recursive');
+  if (result?.success) status('Submodules initialized/updated. Repository was refreshed.');
+  else status('Submodule init/update failed. See Terminal output.', 'error');
+  return result;
+}
+
 function buildCommands() {
   const entry = state.selectedEntry;
   const list = [
@@ -4791,6 +4784,7 @@ function buildCommands() {
     { id: 'fetch', name: 'Fetch Remote', description: 'Download new commits/refs from the server without changing your branch', keys: 'Ctrl+Shift+F', tags: ['explorer', 'graph'], fn: () => $('#fetchCurrent').click() },
     { id: 'fetchall', name: 'Fetch All Remotes', description: 'Download new commits/refs from every configured remote, not just the first one', keywords: 'multiple upstream mirror', tags: ['explorer', 'graph'], fn: () => fetchAllRemotes() },
     { id: 'fetch-project', name: 'Fetch Project + Submodules', description: 'Safe update: fetch parent remotes and initialized submodule origins without pull, checkout or branch changes', keywords: 'submodule update all refresh server safe', tags: ['explorer', 'graph'], fn: () => fetchProjectAndSubmodules() },
+    { id: 'init-update-submodules', name: 'Init / Update Submodules', description: 'Run git submodule update --init --recursive, then refresh the project. Use when submodule folders are empty or Git metadata is missing.', keywords: 'submodule init initialize recursive update empty missing metadata', tags: ['explorer', 'graph', 'relevant'], keepOpen: true, fn: initAndUpdateSubmodulesFromActions },
     { id: 'branch-start', name: 'Find Branch Start Commit', description: 'Run merge-base against origin/main, show the commit details, and mark that split point on the Branch Map', keys: '', keywords: 'merge-base parent start base fork origin/main', tags: ['explorer', 'graph', 'relevant'], keepOpen: true, fn: findBranchStartCommit },
     { id: 'stash', name: 'Stash Work in Current Repository', description: 'Set aside changes only in the project or submodule currently being browsed', keys: 'Ctrl+Shift+S', tags: ['explorer'], fn: stashWork },
     { id: 'pop', name: 'View Stashes in Current Repository', description: 'View or restore saved work for this project or submodule', keys: '', tags: ['explorer'], fn: popStash },

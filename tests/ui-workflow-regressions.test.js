@@ -61,6 +61,8 @@ test('top bar has a safe project fetch that updates parent and submodule refs wi
   assert.match(app, /Parent updated/);
   assert.match(app, /submodule\$\{result\.submodules_total === 1 \? '' : 's'\} fetched/);
   assert.match(app, /id: 'fetch-project'/);
+  assert.match(app, /id: 'init-update-submodules'/);
+  assert.match(app, /git submodule update --init --recursive/);
   assert.match(css, /\.repo-picker \{ flex: 0 1 360px;/);
 });
 
@@ -72,6 +74,8 @@ test('details panel extracts spec ids from loaded commit text and shows compact 
   assert.match(app, /specDetailRows\(entry\.submodule_commit_subject\)/);
   assert.match(app, /function compactRepositoryLabel\(url = ''\)/);
   assert.match(app, /function submoduleRepositoryLinkHtml\(entry\)/);
+  assert.match(app, /function submoduleRepositoryRowsHtml\(entry\)/);
+  assert.match(app, /entry\.submodule_web_url \? `<span>GitHub<\/span>/);
   assert.match(app, /class="submodule-repository-link"/);
   assert.match(app, /entry\.submodule_web_url/);
   assert.match(app, /event\.target\.closest\('\.submodule-repository-link'\)/);
@@ -79,15 +83,16 @@ test('details panel extracts spec ids from loaded commit text and shows compact 
   assert.match(css, /\.submodule-repository-link/);
 });
 
-test('folder personal notes stay outside Git and are rendered from an in-memory map', () => {
+test('folder and submodule personal notes stay outside Git and are rendered from an in-memory map', () => {
   assert.match(app, /drillDownNotes: \{\}/);
   assert.match(app, /function ensureDrillDownNotesLoaded\(repositoryPath, force = false\)/);
   assert.match(app, /if \(!force && state\.drillDownNotesRepositoryPath === repositoryPath\) return;/);
   assert.match(app, /invoke\('load_drill_down_notes', \{ repositoryPath \}\)/);
   assert.match(app, /function noteForPath\(path\)/);
-  assert.match(app, /function folderHasPersonalNote\(entry\)/);
-  assert.match(app, /entry\?\.kind === 'folder'/);
-  assert.match(app, /function renderFolderPersonalNoteSection\(entry\)/);
+  assert.match(app, /function entrySupportsPersonalNote\(entry\)/);
+  assert.match(app, /\['folder', 'submodule'\]\.includes\(entry\.kind\)/);
+  assert.match(app, /function entryHasPersonalNote\(entry\)/);
+  assert.match(app, /function renderPersonalNoteSection\(entry\)/);
   assert.match(app, /PERSONAL NOTE/);
   assert.match(app, /invoke\('set_drill_down_note', \{ repositoryPath: state\.repository\.path, relativePath: entry\.relative_path, note: text \}\)/);
   assert.match(app, /invoke\('delete_drill_down_note', \{ repositoryPath: state\.repository\.path, relativePath: entry\.relative_path \}\)/);
@@ -109,6 +114,17 @@ test('a submodule row shows its attached branch or detached state, only when act
   assert.match(app, /function submoduleHeadHint\(entry\) \{\s*if \(!entry\.submodule_checked\) return 'Independent Git repository';/);
   assert.match(app, /entry\.submodule_current_branch \? `Independent Git repository · \$\{entry\.submodule_current_branch\}` : 'Independent Git repository · detached'/);
   assert.match(app, /entry\.kind === 'submodule' \? esc\(submoduleHeadHint\(entry\)\)/);
+});
+
+test('Explorer submodule navigation stays one coherent folder load', () => {
+  // The fast-paint/background-scan experiment made Windows navigation feel
+  // flickery and sometimes looked like the submodule had not opened. A
+  // submodule folder click should go through the same load_directory path as
+  // a normal folder, relying on the backend cache instead of a multi-phase
+  // frontend repaint.
+  assert.match(app, /const EXPLORER_DOUBLE_CLICK_MS = 800/);
+  assert.doesNotMatch(app, /invoke\('submodule_folder_status'/);
+  assert.doesNotMatch(app, /invoke\('submodule_navigation_status'/);
 });
 
 test('Reset to upstream is reachable for a submodule that is only dirty, not just ahead/behind', () => {
@@ -166,10 +182,10 @@ test('the version selector\'s own Push button reuses the real push flow, not a s
   // fix already covered once.
   assert.match(app, /const childActionOpen = refs\.newBranchDialog\.open \|\| \$\('#newTagDialog'\)\.open \|\| \$\('#submodulePublishDialog'\)\.open;/);
   // A successful push makes the menu's own displayed data (e.g. "N commits
-  // to push") stale — closed the same way its Checkout/Discard siblings
-  // already close it on their own success, not left open showing a state
-  // that no longer exists.
-  assert.match(app, /const result = await invoke\('push_submodule',[\s\S]*?refs\.submoduleMenu\.hidden = true;/);
+  // to push") stale; when it was launched from that menu, refresh it instead
+  // of leaving stale rows underneath the push dialog.
+  assert.match(app, /const menuWasOpenForEntry = !refs\.submoduleMenu\.hidden && submoduleMenuEntry\?\.relative_path === entry\.relative_path;/);
+  assert.match(app, /await refreshSubmoduleMenu\(\);/);
 });
 
 test('clone is reachable outside the empty state and sends explicit clone options', () => {
@@ -269,6 +285,9 @@ test('graph exposes branch and commit context actions without relying on lane id
   assert.match(app, /invoke\('graph_head_main_merge_base', \{ repositoryPath: g\.path \}\)/);
   assert.match(app, /commonAncestorRows/);
   assert.match(app, /Branch start/);
+  assert.match(app, /class="commit-date"/);
+  assert.match(app, /data-copy-commit-sha/);
+  assert.match(css, /\.commit-copy-sha/);
   assert.match(app, /Real merge-base between HEAD and \$\{esc\(commonAncestorBaseRef\)\}/);
   assert.match(app, /MERGE MAIN/);
   assert.match(app, /const palette = \[[\s\S]*?'#b4f1cf'[\s\S]*?\]/);
