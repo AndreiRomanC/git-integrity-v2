@@ -1569,6 +1569,17 @@ fn create_utrud_launcher_script(cwd: &Path, argument: &Path) -> Result<PathBuf, 
     ));
     let script = format!(
         "@echo off\r\n\
+echo Git Drill Down UTRUD launcher\r\n\
+echo Working directory: \"{}\"\r\n\
+echo Selected folder:   \"{}\"\r\n\
+echo UTRUD launcher:    \"{}\"\r\n\
+echo.\r\n\
+if not exist \"{}\" (\r\n\
+  echo UTRUD failed to start.\r\n\
+  echo The configured UTRUD launcher does not exist.\r\n\
+  pause\r\n\
+  exit /b 1\r\n\
+)\r\n\
 cd /d \"{}\"\r\n\
 call \"{}\" \"{}\"\r\n\
 if errorlevel 1 (\r\n\
@@ -1576,6 +1587,10 @@ if errorlevel 1 (\r\n\
   echo UTRUD failed to start.\r\n\
   pause\r\n\
 )\r\n",
+        utrud_batch_literal(cwd),
+        utrud_batch_literal(argument),
+        UTRUD_BATCH_PATH.replace('%', "%%"),
+        UTRUD_BATCH_PATH.replace('%', "%%"),
         utrud_batch_literal(cwd),
         UTRUD_BATCH_PATH.replace('%', "%%"),
         utrud_batch_literal(argument),
