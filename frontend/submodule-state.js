@@ -58,6 +58,12 @@
       detail: 'The submodule repository or its current commit could not be read.',
       tone: 'changed', actionable: true,
     },
+    not_initialized: {
+      row: 'Not initialized',
+      short: 'Not initialized locally',
+      detail: 'The parent project records this submodule, but its working tree has not been checked out on this machine yet. Initialize it before opening its files or history.',
+      tone: 'changed', actionable: true,
+    },
     status_unknown: {
       row: 'Status unknown',
       short: 'Status unavailable · refresh',

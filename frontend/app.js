@@ -12,7 +12,7 @@ const MUTATING_COMMANDS = new Set([
   'stage_files', 'unstage_files', 'stage_all', 'commit_files', 'commit_staged', 'commit_path',
   'remove_git_path', 'delete_local_path', 'switch_branch', 'create_branch', 'create_branch_at_commit', 'checkout_commit', 'rename_branch', 'delete_branch',
   'stash_changes', 'stash_file', 'pop_stash', 'drop_stash', 'restore_stash_paths', 'abort_stash_conflict',
-  'restore_file', 'restore_remote_file', 'restore_folder', 'add_submodule', 'switch_submodule_version', 'reset_submodule', 'reset_submodule_branch_to_upstream', 'change_submodule_url',
+  'restore_file', 'restore_remote_file', 'restore_folder', 'restore_exact_checkpoint', 'add_submodule', 'init_submodule', 'switch_submodule_version', 'reset_submodule', 'reset_submodule_branch_to_upstream', 'change_submodule_url',
   'commit_submodule', 'push_submodule', 'pull_submodule', 'force_push_submodule', 'fetch_submodule',
   'create_submodule_branch', 'merge_branch', 'open_merge_tool', 'resolve_conflict', 'complete_merge', 'abort_merge',
   'sync_repository', 'publish_branch', 'fetch_remote', 'fetch_all_remotes', 'fetch_project', 'write_text_file', 'run_git_command', 'run_terminal_command',
@@ -1013,6 +1013,7 @@ function iconFor(entry) {
 // submodules, so it must fall back to the generic hint, not guess "detached"
 // or a branch name it never verified.
 function submoduleHeadHint(entry) {
+  if (entry.submodule_initialized === false) return 'Git submodule · not initialized';
   if (!entry.submodule_checked) return 'Independent Git repository';
   return entry.submodule_current_branch ? `Independent Git repository · ${entry.submodule_current_branch}` : 'Independent Git repository · detached';
 }
@@ -1031,6 +1032,7 @@ function gitState(entry) {
   // to do exactly that.
   if (!entry.tracked) return '<span class="git-state untracked"><i class="git-dot"></i><span>New, untracked</span></span>';
   if (entry.kind === 'submodule') {
+    if (entry.submodule_initialized === false) return '<span class="git-state changed" title="Submodule is registered but not initialized locally"><i class="git-dot"></i><span>Not initialized</span></span>';
     const stateView = SubmoduleStateModel.presentation(entry.submodule_state);
     if (stateView.actionable) return `<span class="git-state ${esc(stateView.tone)}" title="${esc(stateView.short)}"><i class="git-dot"></i><span>${esc(stateView.row)}</span></span>`;
   }
@@ -1682,7 +1684,7 @@ function renderEntryLastCommitInner(entry) {
 function renderEntryDetails(entry) {
   const deletedEntry = ['deleted', 'deleted-folder', 'deleted-submodule'].includes(entry.kind);
   const kindLabel = entry.kind === 'submodule' ? 'Git submodule' : entry.kind === 'deleted-submodule' ? 'Deleted Git submodule' : entry.kind === 'deleted-folder' ? 'Deleted tracked folder' : entry.kind === 'deleted' ? 'Deleted tracked file' : entry.kind.charAt(0).toUpperCase() + entry.kind.slice(1);
-  const submoduleState = entry.kind === 'submodule' ? SubmoduleStateModel.presentation(entry.submodule_state) : null;
+  const submoduleState = entry.kind === 'submodule' ? SubmoduleStateModel.presentation(entry.submodule_initialized === false ? 'not_initialized' : entry.submodule_state) : null;
   const changeBanner = submoduleState?.actionable
     ? `<div class="local-change-banner"><i></i><div><strong>${esc(submoduleState.short)}</strong><span>${esc(submoduleState.detail)}</span></div></div>`
     : deletedEntry
@@ -1691,10 +1693,13 @@ function renderEntryDetails(entry) {
       ? `<div class="local-change-banner"><i></i><div><strong>${entry.tracked ? 'Modified locally' : 'New local file'}</strong><span>This item differs from the committed repository state.</span></div></div>`
       : '';
   const canCommitInsideSubmodule = entry.kind === 'submodule' && entry.submodule_state === 'changes_inside';
+  const submoduleInitButton = entry.kind === 'submodule' && entry.submodule_initialized === false
+    ? '<button data-detail-action="subinit" data-tooltip="Clone/check out this submodule at the commit recorded by the parent project. Equivalent to git submodule update --init for this path.">Initialize submodule</button>'
+    : '';
   refs.details.innerHTML = `<div class="entry-details"><div class="entry-preview ${esc(entry.kind)}">${entry.kind === 'submodule' ? '◇' : entry.kind === 'folder' ? '▰' : '▤'}</div>
     <h2>${esc(entry.name)}</h2><div class="entry-path">${esc(entry.relative_path)}</div>${entry.kind === 'submodule' ? '<span class="submodule-badge">◇ Git submodule</span>' : ''}
     ${changeBanner}
-    <div class="context-actions">${deletedEntry ? '' : entry.kind === 'file' ? '<button data-detail-action="edit">Edit local file</button>' : '<button data-detail-action="open">Open folder</button>'}${entry.kind === 'submodule' ? '' : '<button data-detail-action="server">Open on server ↗</button>'}${entry.kind === 'submodule' ? '' : '<button data-detail-action="history">View history</button>'}${entry.kind === 'folder' ? '<button data-detail-action="restorefolder" class="danger-action-soft" data-tooltip="Restore only this folder from HEAD or a selected commit. Does not move HEAD or switch branch.">↶ Restore folder…</button>' : ''}${entry.status ? '<button data-detail-action="commit">Commit this item</button>' : ''}${entry.kind === 'deleted' ? '<button data-detail-action="head" data-tooltip="Restore this deleted file from your last local commit (HEAD)">↶ Restore from last commit (HEAD)</button>' : ''}${['folder','submodule'].includes(entry.kind) && entry.name === 'r' ? '<button data-detail-action="utrud" data-tooltip="Launches UTRUD for this r folder. If it cannot start, an explicit error is shown. Windows only.">▶ Run UTRUD</button>' : ''}${entry.kind === 'file' && (entry.status || !entry.tracked) ? `<button data-detail-action="stage" data-tooltip="git add — add this file's current content to staging">＋ Stage this file</button><button data-detail-action="unstage" data-tooltip="Unstage — git restore --staged. Removes only the staging entry; your edits on disk are kept exactly as they are.">− Unstage</button><button data-detail-action="stashfile" data-tooltip="Sets this file aside in this repository's own stash. Parent projects and submodules have separate stash lists.">⇕ Stash this file</button><button data-detail-action="head" class="danger-action-soft" data-tooltip="Restore from your last local commit (HEAD) — git checkout HEAD -- file. Permanently discards ALL edits; the file on disk becomes identical to what you last committed. Cannot be undone.">↶ Restore from last commit (HEAD)</button><button data-detail-action="compare" data-tooltip="Open side-by-side compare with restore options">⇄ Compare with remote</button>` : ''}${entry.kind === 'submodule' ? `<button data-detail-action="subserver">Open submodule repository ↗</button><button data-detail-action="subgraph" data-tooltip="Open this submodule's own branch/commit history — never the parent project's">Submodule Branch Map</button><button data-detail-action="subrefchanges" data-tooltip="A different, narrower question: which commits in the PARENT project changed this submodule's recorded version. Not the submodule's own history.">Submodule Reference Changes</button><button data-detail-action="subnewbranch" data-tooltip="Create a new local branch in this submodule, starting from its current commit, and switch to it">＋ New branch…</button><button data-detail-action="versions">Change version</button><button data-detail-action="substash" data-tooltip="Set aside all uncommitted files inside this submodule only. The parent project's work is untouched.">Stash submodule work</button><button data-detail-action="substashes" data-tooltip="View and restore this submodule's own stashes. The parent project's stash list is separate.">Submodule stashes</button><button data-detail-action="subcommit" ${canCommitInsideSubmodule ? '' : 'disabled'} data-tooltip="${canCommitInsideSubmodule ? 'Commit uncommitted changes inside the submodule' : 'No uncommitted files inside this submodule'}">Commit submodule</button><button data-detail-action="subreset" class="danger-action-soft" ${entry.status ? '' : 'disabled'} data-tooltip="${entry.status ? 'Discard local work and restore the exact submodule commit recorded by the parent project. This leaves detached HEAD, like git submodule update.' : 'The submodule already uses the version recorded by the parent project'}">↺ Restore project version…</button><button data-detail-action="subpull" data-tooltip="Fast-forward pull — brings in new commits from the submodule's remote. Refuses if it would require a manual merge.">Pull submodule</button><button data-detail-action="submerge" data-tooltip="Merge a branch into this submodule's current branch, with conflict resolution if needed">Merge branch…</button><button data-detail-action="subpush">Push submodule</button><button data-detail-action="subforcepush" class="danger-action-soft" data-tooltip="⚠️ Overwrites the remote branch with your local history, discarding any commits there aren't in yours. Only safe if nobody else uses that remote.">Force push submodule…</button><button data-detail-action="subfetch">Fetch submodule</button><button data-detail-action="location">Replace repository URL</button>` : ''}${deletedEntry ? '' : '<button class="danger-action" data-detail-action="delete">Delete…</button>'}</div>
+    <div class="context-actions">${deletedEntry ? '' : entry.kind === 'file' ? '<button data-detail-action="edit">Edit local file</button>' : '<button data-detail-action="open">Open folder</button>'}${entry.kind === 'submodule' ? '' : '<button data-detail-action="server">Open on server ↗</button>'}${entry.kind === 'submodule' ? '' : '<button data-detail-action="history">View history</button>'}${entry.kind === 'folder' ? '<button data-detail-action="restorefolder" class="danger-action-soft" data-tooltip="Restore only this folder from HEAD or a selected commit. Does not move HEAD or switch branch.">↶ Restore folder…</button>' : ''}${entry.status ? '<button data-detail-action="commit">Commit this item</button>' : ''}${entry.kind === 'deleted' ? '<button data-detail-action="head" data-tooltip="Restore this deleted file from your last local commit (HEAD)">↶ Restore from last commit (HEAD)</button>' : ''}${['folder','submodule'].includes(entry.kind) && entry.name === 'r' ? '<button data-detail-action="utrud" data-tooltip="Launches UTRUD for this r folder. If it cannot start, an explicit error is shown. Windows only.">▶ Run UTRUD</button>' : ''}${entry.kind === 'file' && (entry.status || !entry.tracked) ? `<button data-detail-action="stage" data-tooltip="git add — add this file's current content to staging">＋ Stage this file</button><button data-detail-action="unstage" data-tooltip="Unstage — git restore --staged. Removes only the staging entry; your edits on disk are kept exactly as they are.">− Unstage</button><button data-detail-action="stashfile" data-tooltip="Sets this file aside in this repository's own stash. Parent projects and submodules have separate stash lists.">⇕ Stash this file</button><button data-detail-action="head" class="danger-action-soft" data-tooltip="Restore from your last local commit (HEAD) — git checkout HEAD -- file. Permanently discards ALL edits; the file on disk becomes identical to what you last committed. Cannot be undone.">↶ Restore from last commit (HEAD)</button><button data-detail-action="compare" data-tooltip="Open side-by-side compare with restore options">⇄ Compare with remote</button>` : ''}${entry.kind === 'submodule' ? `${submoduleInitButton}<button data-detail-action="subserver">Open submodule repository ↗</button><button data-detail-action="subgraph" data-tooltip="Open this submodule's own branch/commit history — never the parent project's">Submodule Branch Map</button><button data-detail-action="subrefchanges" data-tooltip="A different, narrower question: which commits in the PARENT project changed this submodule's recorded version. Not the submodule's own history.">Submodule Reference Changes</button><button data-detail-action="subnewbranch" data-tooltip="Create a new local branch in this submodule, starting from its current commit, and switch to it">＋ New branch…</button><button data-detail-action="versions">Change version</button><button data-detail-action="substash" data-tooltip="Set aside all uncommitted files inside this submodule only. The parent project's work is untouched.">Stash submodule work</button><button data-detail-action="substashes" data-tooltip="View and restore this submodule's own stashes. The parent project's stash list is separate.">Submodule stashes</button><button data-detail-action="subcommit" ${canCommitInsideSubmodule ? '' : 'disabled'} data-tooltip="${canCommitInsideSubmodule ? 'Commit uncommitted changes inside the submodule' : 'No uncommitted files inside this submodule'}">Commit submodule</button><button data-detail-action="subreset" class="danger-action-soft" ${entry.status ? '' : 'disabled'} data-tooltip="${entry.status ? 'Discard local work and restore the exact submodule commit recorded by the parent project. This leaves detached HEAD, like git submodule update.' : 'The submodule already uses the version recorded by the parent project'}">↺ Restore project version…</button><button data-detail-action="subpull" data-tooltip="Fast-forward pull — brings in new commits from the submodule's remote. Refuses if it would require a manual merge.">Pull submodule</button><button data-detail-action="submerge" data-tooltip="Merge a branch into this submodule's current branch, with conflict resolution if needed">Merge branch…</button><button data-detail-action="subpush">Push submodule</button><button data-detail-action="subforcepush" class="danger-action-soft" data-tooltip="⚠️ Overwrites the remote branch with your local history, discarding any commits there aren't in yours. Only safe if nobody else uses that remote.">Force push submodule…</button><button data-detail-action="subfetch">Fetch submodule</button><button data-detail-action="location">Replace repository URL</button>` : ''}${deletedEntry ? '' : '<button class="danger-action" data-detail-action="delete">Delete…</button>'}</div>
     <div class="detail-section"><h3>GENERAL</h3><div class="detail-grid"><span>Type</span><strong>${kindLabel}</strong><span>Git</span><strong>${entry.tracked ? (entry.status || (entry.unpushed ? (entry.kind === 'folder' ? 'Clean — contains unpushed commits' : 'Committed, not pushed yet') : 'Tracked, clean')) : 'Untracked'}</strong>
     ${entry.item_count != null ? `<span>Items</span><strong>${entry.item_count}</strong>` : `<span>Size</span><strong>${formatSize(entry.size)}</strong>`}<span>Modified</span><strong>${formatModified(entry.modified)}</strong></div></div>
     ${renderPersonalNoteSection(entry)}
@@ -1878,6 +1883,24 @@ async function confirmFolderRestore() {
   }
 }
 
+async function initializeSubmodule(entry, button = null) {
+  if (!state.repository || entry?.kind !== 'submodule') return;
+  const finishButton = button ? beginButtonOperation(button, 'Initializing…') : () => {};
+  try {
+    status(`Initializing submodule ${entry.relative_path}…`, 'busy');
+    await invoke('init_submodule', { repositoryPath: state.repository.path, relativePath: entry.relative_path });
+    directoryCache.clear();
+    await refreshStatusAndFolder(state.repository.path, state.currentPath);
+    if (state.selectedEntry?.relative_path === entry.relative_path || !state.selectedEntry) await selectEntry(entry.relative_path);
+    const message = `Submodule ${entry.name} initialized.`;
+    status(message); showOperationToast(message, 'success');
+  } catch (error) {
+    handleError(error);
+  } finally {
+    finishButton();
+  }
+}
+
 async function handleDetailAction(action, entry, button) {
   if (action === 'edit') return openEditor(entry);
   if (action === 'open') return openDirectory(entry.relative_path);
@@ -1908,6 +1931,7 @@ async function handleDetailAction(action, entry, button) {
   // defensive fallback.
   if (action === 'server') return openEntryOnServer(entry, entry.kind === 'submodule');
   if (action === 'subserver') return openEntryOnServer(entry, true);
+  if (action === 'subinit') return initializeSubmodule(entry, button);
   if (action === 'location') return replaceSubmoduleLocation(entry);
   if (action === 'delete') return deleteEntry(entry, button);
   if (action === 'utrud') return runUtrud(entry);
@@ -3260,7 +3284,11 @@ function buildCommitRowHtml(commit, index, ctx) {
   const matchesFilter = ctx.refFilter === 'all' || isBranchPoint || (ctx.refFilter === 'branches' ? (refKinds.has('local_branch') || refKinds.has('remote_branch')) : refKinds.has('tag'));
   const isFilterDimmed = !matchesFilter;
   const mergePresentation = mergeCommitPresentation(commit, ctx);
+  const headLocationPill = node.isHead
+    ? `<b class="head-location-pill" data-tooltip="This is the commit currently checked out in ${esc(ctx.repositoryName || 'this repository')}">YOU ARE HERE · HEAD</b>`
+    : '';
   const structuralBadges = [
+    headLocationPill,
     isCommonAncestorWithMain ? `<b class="branch-point-pill common-main-pill" data-tooltip="Real merge-base between HEAD and ${esc(commonAncestorBaseRef)} — where this checkout diverged from main">Branch start</b>` : '',
     !isCommonAncestorWithMain && isBranchPoint ? '<b class="branch-point-pill" data-tooltip="Common ancestor or lane transition — computed from commit parents, not lane color">⑂</b>' : '',
     isCommandBranchStart ? `<b class="branch-point-pill command-start-pill" data-tooltip="merge-base with ${esc(state.branchStartMarker.baseRef)} — where this branch split from the selected base">Command start</b>` : '',
@@ -3278,6 +3306,26 @@ function buildCommitRowHtml(commit, index, ctx) {
 
 function graphTruncationStubHtml(truncated) {
   return truncated ? `<div class="history-truncated-stub"><span>⋯ continues in older history</span><button id="loadOlderCommits" ${loadingOlderCommits ? 'disabled' : ''}>${loadingOlderCommits ? '<i class="spinner"></i> Loading…' : 'Load older'}</button></div>` : '';
+}
+
+function graphHeadBannerHtml(g, currentBranch, headVisible) {
+  const label = g.headDetached ? `Detached at ${(g.headOid || '').slice(0, 8)}` : currentBranch;
+  if (!label) return '';
+  const visibility = headVisible
+    ? '<button type="button" class="head-jump" data-jump-head>Jump to HEAD</button>'
+    : '<em>not in loaded rows</em>';
+  return `<span class="head-banner ${headVisible ? 'head-visible' : 'head-missing'}" data-tooltip="HEAD is the commit currently checked out">HEAD <i>→</i> <b>${esc(label)}</b>${visibility}</span>`;
+}
+
+function jumpToGraphHead() {
+  const row = refs.graph?.querySelector('.commit-row.is-head[data-id]');
+  if (!row) {
+    status('HEAD is not visible in the currently loaded history window. Load older commits or clear filters/search.', 'error');
+    return;
+  }
+  row.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  selectCommit(row.dataset.id);
+  if (row.animate) row.animate([{ boxShadow: '0 0 0 0 rgba(126, 211, 255, .85)' }, { boxShadow: '0 0 0 12px rgba(126, 211, 255, 0)' }], { duration: 900, easing: 'ease-out' });
 }
 
 function activeGraphMergeTarget() {
@@ -3394,6 +3442,25 @@ async function checkoutGraphCommit(commitId) {
   } catch (error) { handleError(error); }
 }
 
+async function restoreExactCheckpointFromGraphCommit(commitId) {
+  const context = activeRepositoryContext();
+  if (!context.path) return;
+  const shortId = commitId.slice(0, 8);
+  const ok = await customConfirm(
+    `Restore exact checkpoint ${shortId} in ${context.name}?\n\nThis is stronger than Checkout:\n• detaches HEAD at this commit\n• discards tracked local edits\n• removes untracked, non-ignored leftovers\n• forces submodules to the versions recorded by this checkpoint\n\nIgnored build artifacts are not removed. This cannot be undone from the app.`,
+    { title: 'Restore exact checkpoint', danger: true, okLabel: 'Restore exact checkpoint' }
+  );
+  if (!ok) return;
+  if (!invoke) { status(`Preview: restore exact checkpoint ${shortId}`); return; }
+  try {
+    status(`Restoring exact checkpoint ${shortId} and cleaning leftovers…`, 'busy');
+    await invoke('restore_exact_checkpoint', { repositoryPath: context.path, commitId });
+    await refreshAfterGraphCommitAction(context.path);
+    const message = `Workspace restored exactly to checkpoint ${shortId}.`;
+    status(message); showOperationToast(message, 'success');
+  } catch (error) { handleError(error); }
+}
+
 function showGraphCommitContextMenu(event, commitId) {
   const branchRefs = graphBranchRefsForCommit(commitId).slice(0, 6);
   const mergeItems = branchRefs.map((ref, index) => graphMergeMenuItem(ref.name, `merge-${index}`));
@@ -3401,6 +3468,7 @@ function showGraphCommitContextMenu(event, commitId) {
     ...mergeItems,
     { id: 'branch', label: 'Create branch from this commit', detail: commitId.slice(0, 8), run: () => createBranchFromGraphCommit(commitId) },
     { id: 'checkout', label: 'Checkout this commit', detail: 'Detached HEAD', run: () => checkoutGraphCommit(commitId) },
+    { id: 'restore-exact', label: 'Restore exact checkpoint…', detail: 'Clean workspace to this commit', danger: true, run: () => restoreExactCheckpointFromGraphCommit(commitId) },
   ]);
 }
 
@@ -3481,6 +3549,7 @@ function renderGraph() {
   const nodeById = new Map(commits.map((commit, index) => [commit.id, model[index]]));
   const headEntry = g.headDetached ? commits.find(c => c.id === g.headOid) : currentBranch ? commits.find(commit => hasRefNamed(commit, currentBranch)) : null;
   if (headEntry) { nodeById.get(headEntry.id).isHead = true; }
+  const headVisible = !!headEntry;
   const maxLanes = Math.max(1, ...model.map(n => Math.max(n.before.length, n.after.length)));
   const lanesWidth = maxLanes * LANE_WIDTH;
   jsPerfLog(`renderGraph model build (${commits.length} commits)`, performance.now() - modelStarted);
@@ -3510,12 +3579,13 @@ function renderGraph() {
   refs.laneLegend.innerHTML = `<span class="time-direction"><b>NEWEST</b><i>↓</i><b>OLDEST</b></span>
     <span class="graph-path-badge" data-tooltip="${esc(g.path || '')}">${esc(g.path || '')}</span>
     ${identityBadges}
-    ${g.headDetached ? `<span class="head-banner">HEAD <i>→</i> <b>Detached at ${esc((g.headOid || '').slice(0, 8))}</b></span>` : currentBranch ? `<span class="head-banner">HEAD <i>→</i> <b>${esc(currentBranch)}</b></span>` : ''}
+    ${graphHeadBannerHtml(g, currentBranch, headVisible)}
     ${query ? `<span class="search-match-count">${matchCount} match${matchCount === 1 ? '' : 'es'} — rest shown as context</span>` : ''}
     <div class="ref-filter-group" role="group" aria-label="Filter by ref kind">${filterOptions.map(([value, label]) => `<button type="button" class="ref-filter-btn ${refFilter === value ? 'active' : ''}" data-ref-filter="${value}">${label}</button>`).join('')}</div>
     ${pickerOptions.length > 1 ? `<label class="primary-branch-picker"><span>Primary</span><select id="graphPrimaryBranch">${pickerOptions.map(opt => `<option value="${esc(opt.value)}" ${opt.value === selectedPickerValue ? 'selected' : ''}>${esc(opt.label)}</option>`).join('')}</select></label>` : ''}
     <span class="lane-header"><span>GRAPH</span><span>COMMIT</span></span>`;
   $('#graphPrimaryBranch')?.addEventListener('change', event => { setActiveGraphPrimaryBranch(event.target.value); renderGraph(); });
+  refs.laneLegend.querySelector('[data-jump-head]')?.addEventListener('click', jumpToGraphHead);
   refs.laneLegend.querySelectorAll('[data-ref-filter]').forEach(button => button.addEventListener('click', () => { setActiveGraphRefFilter(button.dataset.refFilter); renderGraph(); }));
 
   // Stash entries are informational pointers, not real DAG commits. Rendering
@@ -3576,7 +3646,7 @@ function renderGraph() {
   // recompute the exact same inputs for just the newly-arrived rows,
   // without a second, drifting copy of the actual row markup — both paths
   // call buildCommitRowHtml for the real template.
-  lastGraphRenderContext = { model, lanesWidth, stashesByBase, aheadAnnotations, branchPointRows, commonAncestorRows, headMainBase, commitById: new Map(commits.map(commit => [commit.id, commit])), query, matchesQuery, currentBranch, refFilter };
+  lastGraphRenderContext = { model, lanesWidth, stashesByBase, aheadAnnotations, branchPointRows, commonAncestorRows, headMainBase, commitById: new Map(commits.map(commit => [commit.id, commit])), query, matchesQuery, currentBranch, refFilter, repositoryName: g.name };
   const rowsStarted = performance.now();
   const rows = commits.map((commit, index) => buildCommitRowHtml(commit, index, lastGraphRenderContext)).join('') || '<div class="empty-change">No commits in this history</div>';
 
@@ -3686,7 +3756,7 @@ function appendOlderGraphRows(previousCommitCount) {
   // (set once per full renderGraph) must be kept in sync here too, or the
   // "GRAPH | COMMIT" labels stop lining up with the wider rows below them.
   refs.graphView.style.setProperty('--lanes-width', `${lanesWidth}px`);
-  const ctx = { model, lanesWidth, stashesByBase: lastGraphRenderContext.stashesByBase, aheadAnnotations, branchPointRows, commonAncestorRows, headMainBase, commitById: new Map(commits.map(commit => [commit.id, commit])), query: '', matchesQuery: () => false, currentBranch, refFilter };
+  const ctx = { model, lanesWidth, stashesByBase: lastGraphRenderContext.stashesByBase, aheadAnnotations, branchPointRows, commonAncestorRows, headMainBase, commitById: new Map(commits.map(commit => [commit.id, commit])), query: '', matchesQuery: () => false, currentBranch, refFilter, repositoryName: g.name };
   jsPerfLog(`appendOlderGraphRows model build (${commits.length} commits)`, performance.now() - modelStarted);
 
   const domStarted = performance.now();
@@ -3745,7 +3815,7 @@ function drawGraphOverlay(model, lanesWidth) {
     const isPrimaryRemote = (node.refs || []).some(ref => ref.kind === 'remote_branch' && ref.name === 'origin/main');
     const branchTipStroke = isPrimaryRemote ? '#ff626d' : refKinds.has('local_branch') ? '#4bd3dc' : refKinds.has('remote_branch') ? '#8298b8' : '';
     if (node.isHead) {
-      parts.push(`<circle cx="${pos.x}" cy="${pos.y}" r="8" fill="${color}" stroke="#0d1117" stroke-width="2.5"/><circle cx="${pos.x}" cy="${pos.y}" r="8" fill="none" stroke="#e8eef5" stroke-width="1.6"/>`);
+      parts.push(`<circle cx="${pos.x}" cy="${pos.y}" r="14" fill="#7ed3ff" opacity="0.22"/><circle cx="${pos.x}" cy="${pos.y}" r="10" fill="none" stroke="#7ed3ff" stroke-width="2.2"/><circle cx="${pos.x}" cy="${pos.y}" r="6" fill="${color}" stroke="#0d1117" stroke-width="2.5"/><circle cx="${pos.x}" cy="${pos.y}" r="3" fill="#eaf7ff"/>`);
     } else if (branchPointIds.has(node.commitId)) {
       // The common ancestor two differently-labeled refs share — a distinct
       // ring marks it as the split point, without bending the (real, single)
@@ -4797,6 +4867,9 @@ function buildCommands() {
     { id: 'refresh', name: 'Refresh Repository', description: 'Re-read branches, commits and status from disk (e.g. after external Git commands)', keys: '', keywords: 'reload', tags: [], fn: () => $('#refresh').click() },
   ];
   if (entry?.kind === 'submodule') {
+    if (entry.submodule_initialized === false) {
+      list.push({ id: 'sub-init', name: `Initialize Submodule (${entry.name})`, description: 'Clone/check out this submodule at the commit recorded by the parent project', tags: ['submodule', 'relevant'], keywords: 'empty missing init update checkout', fn: () => initializeSubmodule(entry) });
+    }
     list.push(
       { id: 'sub-pull', name: `Pull Submodule (${entry.name})`, description: 'Fast-forward this submodule from its own remote', tags: ['submodule', 'relevant'], keywords: 'submodule update', fn: () => pullSubmodule(entry) },
       { id: 'sub-push', name: `Push Submodule (${entry.name})`, description: 'Send this submodule\'s local commits to its own remote', tags: ['submodule', 'relevant'], fn: () => pushSubmodule(entry) },

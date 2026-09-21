@@ -41,6 +41,7 @@ frontend_perf_log
 graph_branch_divergence
 graph_head_main_merge_base
 init_repository
+init_submodule
 list_conflicts
 list_directory_fast
 list_local_directory
@@ -83,6 +84,7 @@ reset_submodule
 reset_submodule_branch_to_upstream
 resolve_conflict
 restore_file
+restore_exact_checkpoint
 restore_folder
 restore_remote_file
 restore_stash_paths

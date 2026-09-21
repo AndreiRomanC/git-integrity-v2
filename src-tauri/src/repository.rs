@@ -9,7 +9,7 @@ pub mod remotes;
 #[cfg(test)]
 use stash::{abort_stash_conflict, drop_stash, list_stashes, list_submodule_stashes, pop_stash, restore_stash_paths, stash_changes, stash_entry_files, stash_file};
 #[cfg(test)]
-use branches::{branch_creation_context, checkout_commit, create_branch, create_branch_at_commit, create_submodule_branch, delete_branch, graph_branch_divergence, rename_branch, switch_branch};
+use branches::{branch_creation_context, checkout_commit, create_branch, create_branch_at_commit, create_submodule_branch, delete_branch, graph_branch_divergence, rename_branch, restore_exact_checkpoint_inner, switch_branch};
 #[cfg(test)]
 use branches::merge::{abort_merge, complete_merge, conflict_sides, list_conflicts, merge_branch, merge_in_progress, resolve_conflict};
 #[cfg(test)]
@@ -632,6 +632,11 @@ pub struct DirectoryEntry {
     // only ever true riding along on a submodule row that already had a
     // reason to be inspected.
     submodule_checked: bool,
+    // Cheap filesystem signal: a registered submodule whose worktree folder
+    // exists but has no .git file/directory is known to Git, yet not
+    // initialized locally. This lets the UI offer a narrow "Initialize this
+    // submodule" action without opening every clean submodule repository.
+    submodule_initialized: bool,
     // Only meaningful when submodule_checked is true. None means detached
     // HEAD; Some(name) means attached to that local branch.
     submodule_current_branch: Option<String>,
@@ -669,6 +674,7 @@ pub struct EntryDetails {
     // See DirectoryEntry's own doc comment — same signal, same reason.
     submodule_is_dirty: bool,
     submodule_state: String,
+    submodule_initialized: bool,
     last_commit_id: Option<String>,
     last_commit_subject: Option<String>,
     last_commit_author: Option<String>,
@@ -4101,7 +4107,7 @@ fn list_directory_fast_inner(repository_path: String, relative_path: String) -> 
         let metadata = item.metadata().map_err(|error| error.to_string())?;
         let kind = if metadata.file_type().is_symlink() { "symlink" } else if metadata.is_dir() { "folder" } else { "file" }.to_string();
         let modified = metadata.modified().ok().and_then(|time| time.duration_since(UNIX_EPOCH).ok()).map(|value| value.as_secs()).unwrap_or(0);
-        entries.push(DirectoryEntry { name, relative_path: relative_string, kind, status: String::new(), tracked: false, size: if metadata.is_file() { metadata.len() } else { 0 }, modified, submodule_has_unpushed_commits: false, submodule_is_dirty: false, submodule_state: String::new(), submodule_checked: false, submodule_current_branch: None, unpushed: false, status_known: false });
+        entries.push(DirectoryEntry { name, relative_path: relative_string, kind, status: String::new(), tracked: false, size: if metadata.is_file() { metadata.len() } else { 0 }, modified, submodule_has_unpushed_commits: false, submodule_is_dirty: false, submodule_state: String::new(), submodule_checked: false, submodule_initialized: false, submodule_current_branch: None, unpushed: false, status_known: false });
     }
     entries.sort_by_cached_key(|entry| (!matches!(entry.kind.as_str(), "folder" | "submodule"), entry.name.to_lowercase()));
     perf_log(&format!("list_directory_fast: TOTAL ({} entries, {relative_path})", entries.len()), started.elapsed());
@@ -4246,8 +4252,9 @@ fn load_directory_inner(repository_path: String, relative_path: String, force: O
             _ => String::new(),
         };
         let submodule_checked = submodule_snapshot.is_some();
+        let submodule_initialized = kind == "submodule" && item.path().join(".git").exists();
         let submodule_current_branch = submodule_snapshot.as_ref().and_then(|snapshot| snapshot.attached_branch.clone());
-        entries.push(DirectoryEntry { name, relative_path: relative_string, kind, status, tracked, size: if metadata.is_file() { metadata.len() } else { 0 }, modified, submodule_has_unpushed_commits, submodule_is_dirty, submodule_state, submodule_checked, submodule_current_branch, unpushed, status_known: true });
+        entries.push(DirectoryEntry { name, relative_path: relative_string, kind, status, tracked, size: if metadata.is_file() { metadata.len() } else { 0 }, modified, submodule_has_unpushed_commits, submodule_is_dirty, submodule_state, submodule_checked, submodule_initialized, submodule_current_branch, unpushed, status_known: true });
     }
 
     // A deleted tracked path cannot be returned by read_dir: it is absent on
@@ -4293,6 +4300,7 @@ fn load_directory_inner(repository_path: String, relative_path: String, force: O
             submodule_is_dirty: false,
             submodule_state: String::new(),
             submodule_checked: false,
+            submodule_initialized: false,
             submodule_current_branch: None,
             unpushed: false,
             status_known: true,
@@ -4386,6 +4394,7 @@ fn entry_details_inner(repository_path: String, relative_path: String) -> Result
         }
     } else { (None, None, None, None, Vec::new(), None, None) };
     let submodule_is_dirty = submodule_snapshot.as_ref().is_some_and(|snapshot| snapshot.dirty);
+    let submodule_initialized = kind == "submodule" && submodule_snapshot.is_some();
     let submodule_state = if kind == "submodule" {
         match (internal_repository(status_repo).ok(), submodule_snapshot.as_ref()) {
             (Some(parent), Some(snapshot)) => submodule_workflow_state(&parent, status_scope, unpushed, snapshot),
@@ -4395,7 +4404,7 @@ fn entry_details_inner(repository_path: String, relative_path: String) -> Result
 
     Ok(EntryDetails {
         name: absolute.file_name().and_then(|name| name.to_str()).unwrap_or(&relative_string).to_string(), relative_path: relative_string,
-        kind, status, tracked, unpushed, size: if metadata.is_file() { metadata.len() } else { 0 }, modified, item_count, submodule_url, submodule_web_url, submodule_branch, submodule_push_status, submodule_unpushed_commits, submodule_is_dirty, submodule_state,
+        kind, status, tracked, unpushed, size: if metadata.is_file() { metadata.len() } else { 0 }, modified, item_count, submodule_url, submodule_web_url, submodule_branch, submodule_push_status, submodule_unpushed_commits, submodule_is_dirty, submodule_state, submodule_initialized,
         last_commit_id: last.as_ref().map(|value| value.0.clone()),
         last_commit_subject: last.as_ref().map(|value| value.1.clone()), last_commit_author: last.as_ref().map(|value| value.2.clone()), last_commit_date: last.as_ref().map(|value| value.3.clone()),
         submodule_commit_id: submodule_commit.as_ref().map(|value| value.0.clone()),
@@ -4500,6 +4509,33 @@ fn validate_submodule(repository_path: &str, relative_path: &str) -> Result<Path
     if !absolute.is_dir() { return Err("The submodule is not initialized".into()); }
     internal_submodule_repository(&absolute)?;
     Ok(absolute)
+}
+
+// `git submodule update --init` clones/fetches over the network — must not run
+// on the webview UI thread.
+#[tauri::command]
+pub async fn init_submodule(repository_path: String, relative_path: String) -> Result<(), String> {
+    off_main_thread(move || init_submodule_inner(repository_path, relative_path)).await
+}
+
+fn init_submodule_inner(repository_path: String, relative_path: String) -> Result<(), String> {
+    validate_path(&repository_path)?;
+    let relative = safe_relative_path(&relative_path)?;
+    let normalized_path = normalized(&relative);
+    if !cached_index_metadata(&repository_path).1.contains(&normalized_path) {
+        return Err("The selected folder is not a Git submodule".into());
+    }
+    let queue_started = Instant::now();
+    let lock_handle = repo_write_lock(&repository_path);
+    let _lock = lock_handle.lock().unwrap();
+    log_repo_write_lock_acquired(&repository_path, "init_submodule", queue_started.elapsed());
+    let step = Instant::now();
+    let result = git(&repository_path, &["-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive", "--", &normalized_path]);
+    perf_log(&format!("init_submodule: update {normalized_path} {}", if result.is_ok() { "ok" } else { "ERROR" }), step.elapsed());
+    result?;
+    invalidate_git_metadata(&repository_path);
+    invalidate_submodule_sync(&repository_path);
+    Ok(())
 }
 
 // Which of the known branch/remote tips contain `target`, closest tip first.
@@ -7184,6 +7220,90 @@ mod tests {
         assert_eq!(run_git_capture(&repository, &["rev-parse", "HEAD"]), second);
 
         fs::remove_dir_all(repository).unwrap();
+    }
+
+    #[test]
+    fn restore_exact_checkpoint_cleans_parent_and_submodule_leftovers() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-exact-checkpoint-{suffix}"));
+        let repository = base.join("main");
+        let dependency = base.join("dependency");
+        let extra_dependency = base.join("extra-dependency");
+        fs::create_dir_all(&repository).unwrap();
+        fs::create_dir_all(&dependency).unwrap();
+        fs::create_dir_all(&extra_dependency).unwrap();
+        fs::write(repository.join("README.md"), "root v1").unwrap();
+        fs::write(dependency.join("module.txt"), "dep v1").unwrap();
+        fs::write(extra_dependency.join("extra.txt"), "extra v1").unwrap();
+        for path in [&repository, &dependency, &extra_dependency] {
+            run_git(path, &["init", "-b", "main"]);
+            run_git(path, &["config", "user.email", "test@example.com"]);
+            run_git(path, &["config", "user.name", "Test User"]);
+            run_git(path, &["add", "."]);
+            run_git(path, &["commit", "-m", "Initial"]);
+        }
+        run_git(&repository, &["-c", "protocol.file.allow=always", "submodule", "add", dependency.to_str().unwrap(), "vendor/dep"]);
+        run_git(&repository, &["commit", "-am", "Add dep submodule"]);
+        let checkpoint = run_git_capture(&repository, &["rev-parse", "HEAD"]);
+        let sub_path = repository.join("vendor/dep");
+        let checkpoint_sub = run_git_capture(&sub_path, &["rev-parse", "HEAD"]);
+
+        fs::write(repository.join("README.md"), "root v2").unwrap();
+        fs::write(sub_path.join("module.txt"), "dep v2").unwrap();
+        run_git(&sub_path, &["commit", "-am", "Submodule v2"]);
+        run_git(&repository, &["add", "."]);
+        run_git(&repository, &["commit", "-m", "Move parent and submodule"]);
+        run_git(&repository, &["-c", "protocol.file.allow=always", "submodule", "add", extra_dependency.to_str().unwrap(), "vendor/extra"]);
+        run_git(&repository, &["commit", "-m", "Add extra submodule"]);
+        fs::write(repository.join("leftover.tmp"), "parent leftover").unwrap();
+        fs::write(sub_path.join("sub-leftover.tmp"), "submodule leftover").unwrap();
+        fs::write(repository.join("vendor/extra/extra-leftover.tmp"), "extra submodule leftover").unwrap();
+
+        restore_exact_checkpoint_inner(repository.to_string_lossy().into_owned(), checkpoint.clone()).unwrap();
+        assert!(run_git_capture(&repository, &["branch", "--show-current"]).is_empty(), "exact checkpoint restore intentionally leaves detached HEAD");
+        assert_eq!(run_git_capture(&repository, &["rev-parse", "HEAD"]), checkpoint);
+        assert_eq!(run_git_capture(&sub_path, &["rev-parse", "HEAD"]), checkpoint_sub);
+        assert!(!repository.join("leftover.tmp").exists(), "parent untracked leftovers from the previous checkpoint must be removed");
+        assert!(!sub_path.join("sub-leftover.tmp").exists(), "submodule untracked leftovers from the previous checkpoint must be removed too");
+        assert!(!repository.join("vendor/extra").exists(), "submodules that only existed in the previous checkpoint must be removed");
+        assert!(refresh_status_inner(repository.to_string_lossy().into_owned()).unwrap().is_empty(), "workspace should be clean after exact checkpoint restore");
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn init_submodule_populates_a_registered_empty_submodule() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-init-submodule-{suffix}"));
+        let repository = base.join("main");
+        let dependency = base.join("dependency");
+        fs::create_dir_all(&repository).unwrap();
+        fs::create_dir_all(&dependency).unwrap();
+        fs::write(repository.join("README.md"), "root").unwrap();
+        fs::write(dependency.join("module.txt"), "dep").unwrap();
+        for path in [&repository, &dependency] {
+            run_git(path, &["init", "-b", "main"]);
+            run_git(path, &["config", "user.email", "test@example.com"]);
+            run_git(path, &["config", "user.name", "Test User"]);
+            run_git(path, &["add", "."]);
+            run_git(path, &["commit", "-m", "Initial"]);
+        }
+        run_git(&repository, &["-c", "protocol.file.allow=always", "submodule", "add", dependency.to_str().unwrap(), "vendor/dep"]);
+        run_git(&repository, &["commit", "-am", "Add dep submodule"]);
+        let recorded = run_git_capture(&repository.join("vendor/dep"), &["rev-parse", "HEAD"]);
+        run_git(&repository, &["submodule", "deinit", "--all", "--force"]);
+        fs::remove_dir_all(repository.join("vendor/dep")).unwrap();
+        fs::create_dir_all(repository.join("vendor/dep")).unwrap();
+
+        let listing = load_directory_inner(repository.to_string_lossy().into_owned(), "vendor".into(), None).unwrap();
+        let row = listing.iter().find(|entry| entry.name == "dep").unwrap();
+        assert_eq!(row.kind, "submodule");
+        assert!(!row.submodule_initialized);
+
+        init_submodule_inner(repository.to_string_lossy().into_owned(), "vendor/dep".into()).unwrap();
+        assert_eq!(run_git_capture(&repository.join("vendor/dep"), &["rev-parse", "HEAD"]), recorded);
+
+        fs::remove_dir_all(base).unwrap();
     }
 
     #[test]

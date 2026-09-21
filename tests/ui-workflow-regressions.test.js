@@ -110,10 +110,16 @@ test('a submodule row shows its attached branch or detached state, only when act
   // Must never guess: a clean, fully-synced submodule skips the check
   // entirely (submodule_checked stays false) to avoid opening every
   // submodule's repository on every folder listing — this function must
-  // fall back to the generic hint rather than claim "detached".
-  assert.match(app, /function submoduleHeadHint\(entry\) \{\s*if \(!entry\.submodule_checked\) return 'Independent Git repository';/);
+  // fall back to the generic hint rather than claim "detached". A
+  // registered-but-not-initialized submodule is the one exception because
+  // that answer comes from a cheap `.git` existence check, not opening the
+  // submodule repository.
+  assert.match(app, /function submoduleHeadHint\(entry\) \{\s*if \(entry\.submodule_initialized === false\) return 'Git submodule · not initialized';\s*if \(!entry\.submodule_checked\) return 'Independent Git repository';/);
   assert.match(app, /entry\.submodule_current_branch \? `Independent Git repository · \$\{entry\.submodule_current_branch\}` : 'Independent Git repository · detached'/);
   assert.match(app, /entry\.kind === 'submodule' \? esc\(submoduleHeadHint\(entry\)\)/);
+  assert.match(app, /data-detail-action="subinit"/);
+  assert.match(app, /invoke\('init_submodule', \{ repositoryPath: state\.repository\.path, relativePath: entry\.relative_path \}\)/);
+  assert.match(app, /entry\.submodule_initialized === false[\s\S]*?Initialize submodule/);
 });
 
 test('Explorer submodule navigation stays one coherent folder load', () => {
@@ -272,8 +278,12 @@ test('graph exposes branch and commit context actions without relying on lane id
   assert.match(app, /const mergeItems = branchRefs\.map\(\(ref, index\) => graphMergeMenuItem\(ref\.name, `merge-\$\{index\}`\)\)/);
   assert.match(app, /Create branch from this commit/);
   assert.match(app, /Checkout this commit/);
+  assert.match(app, /Restore exact checkpoint…/);
+  assert.match(app, /Clean workspace to this commit/);
   assert.match(app, /invoke\('create_branch_at_commit', \{ repositoryPath: context\.path, branch: name\.trim\(\), commitId \}\)/);
   assert.match(app, /invoke\('checkout_commit', \{ repositoryPath: context\.path, commitId \}\)/);
+  assert.match(app, /invoke\('restore_exact_checkpoint', \{ repositoryPath: context\.path, commitId \}\)/);
+  assert.match(app, /forces submodules to the versions recorded by this checkpoint/);
   assert.match(app, /function updateMergeDirectionPreview\(\)/);
   assert.match(app, /Direction: \$\{source\} → \$\{target\}/);
   assert.match(app, /refs\.mergeBranchSource\.addEventListener\('change', updateMergeDirectionPreview\)/);
@@ -288,6 +298,11 @@ test('graph exposes branch and commit context actions without relying on lane id
   assert.match(app, /class="commit-date"/);
   assert.match(app, /data-copy-commit-sha/);
   assert.match(css, /\.commit-copy-sha/);
+  assert.match(app, /function graphHeadBannerHtml\(g, currentBranch, headVisible\)/);
+  assert.match(app, /data-jump-head/);
+  assert.match(app, /function jumpToGraphHead\(\)/);
+  assert.match(app, /YOU ARE HERE · HEAD/);
+  assert.match(css, /\.head-location-pill/);
   assert.match(app, /Real merge-base between HEAD and \$\{esc\(commonAncestorBaseRef\)\}/);
   assert.match(app, /MERGE MAIN/);
   assert.match(app, /const palette = \[[\s\S]*?'#b4f1cf'[\s\S]*?\]/);

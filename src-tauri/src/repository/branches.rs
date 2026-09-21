@@ -166,6 +166,78 @@ pub fn checkout_commit(repository_path: String, commit_id: String) -> Result<(),
     Ok(())
 }
 
+// Several sequential `git submodule ...` runs (deinit, clean, update --init,
+// foreach) that can take minutes on a real project — must not run on the
+// webview UI thread.
+#[tauri::command]
+pub async fn restore_exact_checkpoint(repository_path: String, commit_id: String) -> Result<(), String> {
+    off_main_thread(move || restore_exact_checkpoint_inner(repository_path, commit_id)).await
+}
+
+pub(super) fn restore_exact_checkpoint_inner(repository_path: String, commit_id: String) -> Result<(), String> {
+    validate_path(&repository_path)?;
+    let trimmed = commit_id.trim();
+    if trimmed.is_empty() { return Err("Select a commit/checkpoint to restore".into()); }
+    let queue_started = Instant::now();
+    let lock_handle = repo_write_lock(&repository_path);
+    let _lock = lock_handle.lock().unwrap();
+    log_repo_write_lock_acquired(&repository_path, "restore_exact_checkpoint", queue_started.elapsed());
+
+    let repo = internal_repository(&repository_path)?;
+    let object = repo.revparse_single(trimmed)
+        .or_else(|_| Oid::from_str(trimmed).and_then(|oid| repo.find_object(oid, Some(ObjectType::Commit))))
+        .map_err(|error| format!("Cannot resolve commit \"{commit_id}\": {}", error.message()))?;
+    let commit = object.peel_to_commit().map_err(|_| format!("\"{commit_id}\" is not a commit"))?;
+    let oid = commit.id().to_string();
+    drop(commit);
+    drop(object);
+    drop(repo);
+
+    // This is intentionally separate from ordinary "Checkout this commit":
+    // it is the destructive "make my workspace exactly this checkpoint"
+    // operation. It discards tracked edits, removes untracked non-ignored
+    // leftovers, and forces submodule worktrees to the gitlinks recorded by
+    // the selected parent commit. Do not use -x: ignored build artifacts stay
+    // ignored instead of being deleted unexpectedly.
+    //
+    // Important subtlety: jumping between checkpoints with different
+    // submodule sets can leave old submodule worktrees behind unless the
+    // currently-registered submodules are deinitialized first. A plain
+    // checkout + submodule update only moves modules that still exist in the
+    // target commit; it does not reliably remove modules that existed only in
+    // the previous checkpoint.
+    let _ = restore_checkpoint_optional_step(&repository_path, "deinit current submodules", &["submodule", "deinit", "--all", "--force"]);
+    restore_checkpoint_step(&repository_path, "pre-clean parent leftovers", &["clean", "-fd"])
+        .map_err(|detail| format!("Could not prepare workspace for checkpoint {oid}: {detail}"))?;
+    restore_checkpoint_step(&repository_path, "checkout detached checkpoint", &["checkout", "--detach", "--force", &oid])
+        .map_err(|detail| format!("Could not restore checkpoint {oid}: {detail}"))?;
+    let _ = restore_checkpoint_optional_step(&repository_path, "sync submodule urls", &["submodule", "sync", "--recursive"]);
+    restore_checkpoint_step(&repository_path, "post-checkout clean parent leftovers", &["clean", "-fd"])
+        .map_err(|detail| format!("Checkpoint restored, but parent clean failed: {detail}"))?;
+    restore_checkpoint_step(&repository_path, "init/update submodules", &["submodule", "update", "--init", "--recursive", "--force"])
+        .map_err(|detail| format!("Checkpoint restored, but submodule update failed: {detail}"))?;
+    let _ = restore_checkpoint_optional_step(&repository_path, "reset submodules hard", &["submodule", "foreach", "--recursive", "git reset --hard"]);
+    restore_checkpoint_step(&repository_path, "clean submodule leftovers", &["submodule", "foreach", "--recursive", "git clean -fd"])
+        .map_err(|detail| format!("Checkpoint restored, but submodule clean failed: {detail}"))?;
+    invalidate_git_metadata(&repository_path);
+    invalidate_submodule_sync(&repository_path);
+    Ok(())
+}
+
+fn restore_checkpoint_step(repository_path: &str, label: &str, args: &[&str]) -> Result<String, String> {
+    let started = Instant::now();
+    let result = git(repository_path, args);
+    perf_log(&format!("restore_exact_checkpoint: {label} {}", if result.is_ok() { "ok" } else { "ERROR" }), started.elapsed());
+    result
+}
+
+fn restore_checkpoint_optional_step(repository_path: &str, label: &str, args: &[&str]) -> Result<String, String> {
+    let started = Instant::now();
+    let result = git(repository_path, args);
+    perf_log(&format!("restore_exact_checkpoint: {label} {}", if result.is_ok() { "ok" } else { "ignored ERROR" }), started.elapsed());
+    result
+}
+
 // Resolves the target to the submodule's own repository, then refreshes only
 // the parent index metadata after the branch was created successfully.
 #[tauri::command]
