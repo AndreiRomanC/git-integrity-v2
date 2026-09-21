@@ -61,6 +61,18 @@ test('comparison rules classify unimportant differences without changing origina
   assert.equal(letterCase.ignoredDifferences, 1);
 });
 
+test('default file alignment treats CRLF and LF as the same lines', () => {
+  const result = buildLineDiff('{\r\n  "build": []\r\n}', '{\n  "build": []\n}');
+  assert.equal(result.equivalent, true);
+  assert.equal(result.hunks.length, 0);
+  assert.equal(result.ignoredDifferences, 2);
+  assert.deepEqual(result.rows.map(row => [row.leftNumber, row.rightNumber, row.same, row.ignored]), [
+    [1, 1, true, true],
+    [2, 2, true, true],
+    [3, 3, true, false],
+  ]);
+});
+
 test('large but similar comparisons keep exact alignment without the LCS matrix', () => {
   const result = buildLineDiff('a\nb\nc', 'a\nx\nc', 1);
   assert.equal(result.approximate, false);

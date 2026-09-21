@@ -653,6 +653,11 @@ pub struct DirectoryEntry {
     // treating them as real answers. Always true from the normal
     // load_directory, which always has real status by the time it returns.
     status_known: bool,
+    // True when this exact file, or at least one path below this folder, is
+    // preserved in any stash belonging to the repository currently being
+    // browsed. Independent from current worktree status: a path may have a
+    // stashed backup and also have newer local edits at the same time.
+    stashed: bool,
 }
 
 #[derive(Serialize)]
@@ -687,6 +692,7 @@ pub struct EntryDetails {
     submodule_commit_subject: Option<String>,
     submodule_commit_author: Option<String>,
     submodule_commit_date: Option<String>,
+    submodule_commit_tags: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -1528,7 +1534,7 @@ pub fn open_status_check_url(url: String) -> Result<(), String> {
 // Explorer's "Send to" menu (a per-user .bat under
 // AppData\Roaming\Microsoft\Windows\SendTo that just forwards whatever's
 // selected as `%*` to "C:\LegacyApp\UTRUD\2.0.0\UTRUD.bat"). This gives the
-// same launch from inside the app for a folder named "r" anywhere in the
+// same launch from inside the app for any selected folder in the
 // tree — `spawn` (not `status`/`output`) because UTRUD opens and runs its
 // own window independently, the same "fire and forget" way Send To behaves;
 // waiting on it here would block the app until the user closes UTRUD.
@@ -1540,13 +1546,10 @@ const UTRUD_BATCH_PATH: &str = r"C:\LegacyApp\UTRUD\2.0.0\UTRUD.bat";
 // results path by appending the selected folder's *name* to its process's
 // current directory — mirroring Explorer's "Send to", where the current
 // directory is the *parent* of whatever you right-clicked, not the item
-// itself. Setting current_dir to the selected folder itself (an earlier fix,
-// needed to make UTRUD find the right folder at all after it inherited this
-// app's own directory) overcorrected: with cwd == the "r" folder itself,
-// UTRUD's own `cwd + name` logic doubled it into ".../r/r", confirmed by the
-// reported "Default Result directory structures created: ...\r\r". The
-// absolute path stays the argument either way (some of UTRUD's own logic
-// does use it directly, per the first fix); only cwd needed to move up one.
+// itself. Setting current_dir to the selected folder itself overcorrected:
+// UTRUD's own `cwd + name` logic doubled the final folder name (for example
+// ".../r/r"). The absolute selected-folder path stays the argument either
+// way; only cwd must be the parent.
 fn utrud_command_parts(absolute: &Path) -> (PathBuf, PathBuf) {
     let cwd = absolute.parent().map(Path::to_path_buf).unwrap_or_else(|| absolute.to_path_buf());
     (cwd, absolute.to_path_buf())
@@ -1603,9 +1606,6 @@ if errorlevel 1 (\r\n\
 pub fn run_utrud(repository_path: String, relative_path: String) -> Result<String, String> {
     validate_path(&repository_path)?;
     let relative = safe_relative_path(&relative_path)?;
-    if relative.file_name().and_then(|name| name.to_str()) != Some("r") {
-        return Err("UTRUD can only be launched from a folder named \"r\"".into());
-    }
     let absolute = Path::new(&repository_path).join(&relative);
     if !absolute.is_dir() { return Err("The selected path is not a folder".into()); }
     let (cwd, argument) = utrud_command_parts(&absolute);
@@ -1622,7 +1622,7 @@ pub fn run_utrud(repository_path: String, relative_path: String) -> Result<Strin
         // very sensitive to Windows quoting and has produced literal
         // `\"C:\...\"` launcher names on real machines. The wrapper keeps
         // the effective command obvious and identical to Send To:
-        //   call "C:\LegacyApp\UTRUD\2.0.0\UTRUD.bat" "<selected r folder>"
+        //   call "C:\LegacyApp\UTRUD\2.0.0\UTRUD.bat" "<selected folder>"
         // On failure the console stays open with the actual batch error.
         let launcher = create_utrud_launcher_script(&cwd, &argument)?;
         let status = Command::new("cmd")
@@ -1948,6 +1948,18 @@ fn collect_ref_seeds_and_badges(repo: &Repository) -> (Vec<git2::Oid>, HashMap<S
         by_commit.entry(oid.to_string()).or_default().push(CommitRef { name: shorthand, kind: kind.to_string() });
     }
     (seeds, by_commit)
+}
+
+fn tags_pointing_at_commit(repo: &Repository, target: git2::Oid) -> Vec<String> {
+    let mut tags = Vec::new();
+    let Ok(names) = repo.tag_names(None) else { return tags };
+    for name in names.iter().flatten() {
+        let Ok(reference) = repo.find_reference(&format!("refs/tags/{name}")) else { continue };
+        let Ok(object) = reference.peel(ObjectType::Commit) else { continue };
+        if object.id() == target { tags.push(name.to_string()); }
+    }
+    tags.sort();
+    tags
 }
 
 #[tauri::command]
@@ -2750,11 +2762,9 @@ fn map_check_status(entry: &serde_json::Value) -> String {
 
 fn pr_checks_from_json(rollup: &[serde_json::Value]) -> Vec<PullRequestCheckSummary> {
     rollup.iter().filter_map(|entry| {
-        let name = entry.get("name").and_then(|v| v.as_str())
-            .or_else(|| entry.get("context").and_then(|v| v.as_str())).unwrap_or("").trim();
+        let name = pr_check_name(entry).unwrap_or_default();
         if name.is_empty() { return None; }
-        let details_url = entry.get("detailsUrl").and_then(|v| v.as_str())
-            .or_else(|| entry.get("targetUrl").and_then(|v| v.as_str())).unwrap_or("").to_string();
+        let details_url = pr_check_details_url(entry).unwrap_or("").to_string();
         // Temporary diagnostic: never log the URL itself (could point at an
         // internal build server) or anything else from the entry — just
         // whether this check's rollup entry actually carried a details_url/
@@ -2763,6 +2773,72 @@ fn pr_checks_from_json(rollup: &[serde_json::Value]) -> Vec<PullRequestCheckSumm
         perf_log(&format!("pr_checks_from_json: check='{name}' has_details_url={}", !details_url.is_empty()), Duration::ZERO);
         Some(PullRequestCheckSummary { name: name.into(), status: map_check_status(entry), details_url })
     }).collect()
+}
+
+fn pr_check_name(entry: &serde_json::Value) -> Option<String> {
+    entry.get("name").and_then(|v| v.as_str())
+        .or_else(|| entry.get("context").and_then(|v| v.as_str()))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(String::from)
+}
+
+fn pr_check_details_url(entry: &serde_json::Value) -> Option<&str> {
+    entry.get("detailsUrl").and_then(|v| v.as_str())
+        .or_else(|| entry.get("targetUrl").and_then(|v| v.as_str()))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn normalized_pr_check_name(name: &str) -> String {
+    name.trim().to_ascii_lowercase()
+}
+
+fn set_pr_check_details_url(entry: &mut serde_json::Value, url: &str) {
+    let field = if entry.get("context").is_some() { "targetUrl" } else { "detailsUrl" };
+    if let Some(object) = entry.as_object_mut() {
+        object.insert(field.into(), serde_json::Value::String(url.to_string()));
+    }
+}
+
+fn collect_rest_check_detail_urls(status_payload: Option<&serde_json::Value>, check_runs_payload: Option<&serde_json::Value>) -> HashMap<String, String> {
+    let mut urls = HashMap::new();
+    if let Some(statuses) = status_payload.and_then(|payload| payload.get("statuses")).and_then(|value| value.as_array()) {
+        for status in statuses {
+            let Some(name) = status.get("context").and_then(|value| value.as_str()).map(str::trim).filter(|value| !value.is_empty()) else { continue };
+            let Some(url) = status.get("target_url").and_then(|value| value.as_str()).map(str::trim).filter(|value| !value.is_empty()) else { continue };
+            urls.entry(normalized_pr_check_name(name)).or_insert_with(|| url.to_string());
+        }
+    }
+    if let Some(check_runs) = check_runs_payload.and_then(|payload| payload.get("check_runs")).and_then(|value| value.as_array()) {
+        for check_run in check_runs {
+            let Some(name) = check_run.get("name").and_then(|value| value.as_str()).map(str::trim).filter(|value| !value.is_empty()) else { continue };
+            let Some(url) = check_run.get("details_url").and_then(|value| value.as_str())
+                .or_else(|| check_run.get("html_url").and_then(|value| value.as_str()))
+                .map(str::trim).filter(|value| !value.is_empty()) else { continue };
+            urls.entry(normalized_pr_check_name(name)).or_insert_with(|| url.to_string());
+        }
+    }
+    urls
+}
+
+fn fill_missing_pr_check_details_from_urls(pr: &mut serde_json::Value, urls: &HashMap<String, String>) -> usize {
+    let Some(entries) = pr.get_mut("statusCheckRollup").and_then(|value| value.as_array_mut()) else { return 0 };
+    let mut filled = 0usize;
+    for entry in entries {
+        if pr_check_details_url(entry).is_some() { continue; }
+        let Some(name) = pr_check_name(entry) else { continue };
+        let Some(url) = urls.get(&normalized_pr_check_name(&name)) else { continue };
+        set_pr_check_details_url(entry, url);
+        filled += 1;
+    }
+    filled
+}
+
+fn count_missing_pr_check_details(pr: &serde_json::Value) -> usize {
+    pr.get("statusCheckRollup").and_then(|value| value.as_array())
+        .map(|entries| entries.iter().filter(|entry| pr_check_name(entry).is_some() && pr_check_details_url(entry).is_none()).count())
+        .unwrap_or(0)
 }
 
 // Everything `pr_status` needs to know *before* it shells out to `gh` —
@@ -3067,7 +3143,52 @@ impl GitHubGraphqlClient {
         let Some(nodes) = payload.pointer("/data/repository/pullRequests/nodes").and_then(|value| value.as_array()) else {
             return GhOutcome::Failure { stderr: "GitHub API response did not contain a pull-request list.".into() };
         };
-        GhOutcome::Prs(nodes.iter().map(normalize_graphql_pr).collect())
+        GhOutcome::Prs(nodes.iter().map(|node| {
+            let mut pr = normalize_graphql_pr(node);
+            self.fill_missing_check_details(&repo, &mut pr);
+            pr
+        }).collect())
+    }
+
+    fn rest_get_json(&self, repo: &GitHubRepo, suffix: &str) -> Result<serde_json::Value, String> {
+        let mut request = self.http.get(github_rest_endpoint(repo, suffix))
+            .header("Accept", "application/vnd.github+json");
+        if let Some(token) = &self.token { request = request.bearer_auth(token); }
+        let response = request.send().map_err(|error| format!("GitHub REST API request failed: {error}"))?;
+        let status = response.status();
+        let payload = response.json::<serde_json::Value>()
+            .map_err(|error| format!("GitHub REST API returned HTTP {status} with an unreadable response: {error}"))?;
+        if !status.is_success() {
+            return Err(format!("GitHub REST API request failed with HTTP {status}."));
+        }
+        Ok(payload)
+    }
+
+    fn fill_missing_check_details(&self, repo: &GitHubRepo, pr: &mut serde_json::Value) {
+        let missing = count_missing_pr_check_details(pr);
+        if missing == 0 { return; }
+        let Some(head_sha) = pr.get("headSha").and_then(|value| value.as_str()).map(str::trim).filter(|value| !value.is_empty()) else {
+            perf_log(&format!("pr_check_details_rest_fallback: missing={missing} skipped=no_head_sha"), Duration::ZERO);
+            return;
+        };
+        let short_sha: String = head_sha.chars().take(8).collect();
+        let status_payload = match self.rest_get_json(repo, &format!("commits/{head_sha}/status")) {
+            Ok(payload) => Some(payload),
+            Err(_) => {
+                perf_log(&format!("pr_check_details_rest_fallback: sha={short_sha} status_api_failed=true"), Duration::ZERO);
+                None
+            }
+        };
+        let check_runs_payload = match self.rest_get_json(repo, &format!("commits/{head_sha}/check-runs?per_page=100")) {
+            Ok(payload) => Some(payload),
+            Err(_) => {
+                perf_log(&format!("pr_check_details_rest_fallback: sha={short_sha} check_runs_api_failed=true"), Duration::ZERO);
+                None
+            }
+        };
+        let urls = collect_rest_check_detail_urls(status_payload.as_ref(), check_runs_payload.as_ref());
+        let filled = fill_missing_pr_check_details_from_urls(pr, &urls);
+        perf_log(&format!("pr_check_details_rest_fallback: sha={short_sha} missing={missing} filled={filled}"), Duration::ZERO);
     }
 }
 
@@ -3095,7 +3216,7 @@ query PullRequestsByHead($owner: String!, $name: String!, $branch: String!) {
           nodes { requestedReviewer { ... on User { login } } }
         }
         latestReviews(first: 20) { nodes { author { login } state url } }
-        commits(last: 1) { nodes { commit { statusCheckRollup {
+        commits(last: 1) { nodes { commit { oid statusCheckRollup {
           state
           contexts(first: 100) { nodes {
             ... on CheckRun { name status conclusion detailsUrl }
@@ -3119,7 +3240,7 @@ query PullRequestsByBase($owner: String!, $name: String!, $branch: String!) {
           nodes { requestedReviewer { ... on User { login } } }
         }
         latestReviews(first: 20) { nodes { author { login } state url } }
-        commits(last: 1) { nodes { commit { statusCheckRollup {
+        commits(last: 1) { nodes { commit { oid statusCheckRollup {
           state
           contexts(first: 100) { nodes {
             ... on CheckRun { name status conclusion detailsUrl }
@@ -3133,6 +3254,7 @@ query PullRequestsByBase($owner: String!, $name: String!, $branch: String!) {
 "#;
 
 fn normalize_graphql_pr(item: &serde_json::Value) -> serde_json::Value {
+    let head_sha = item.pointer("/commits/nodes/0/commit/oid").cloned().unwrap_or(serde_json::Value::Null);
     let rollup = item.pointer("/commits/nodes/0/commit/statusCheckRollup/contexts/nodes")
         .and_then(|value| value.as_array()).cloned()
         .or_else(|| item.pointer("/commits/nodes/0/commit/statusCheckRollup/state")
@@ -3155,6 +3277,7 @@ fn normalize_graphql_pr(item: &serde_json::Value) -> serde_json::Value {
         "reviewDecision": item.get("reviewDecision").cloned().unwrap_or(serde_json::Value::Null),
         "reviewRequests": review_requests,
         "latestReviews": latest_reviews,
+        "headSha": head_sha,
         "statusCheckRollup": rollup,
         "url": item.get("url").cloned().unwrap_or(serde_json::Value::Null),
     })
@@ -4158,7 +4281,7 @@ fn list_directory_fast_inner(repository_path: String, relative_path: String) -> 
         let metadata = item.metadata().map_err(|error| error.to_string())?;
         let kind = if metadata.file_type().is_symlink() { "symlink" } else if metadata.is_dir() { "folder" } else { "file" }.to_string();
         let modified = metadata.modified().ok().and_then(|time| time.duration_since(UNIX_EPOCH).ok()).map(|value| value.as_secs()).unwrap_or(0);
-        entries.push(DirectoryEntry { name, relative_path: relative_string, kind, status: String::new(), tracked: false, size: if metadata.is_file() { metadata.len() } else { 0 }, modified, submodule_has_unpushed_commits: false, submodule_is_dirty: false, submodule_state: String::new(), submodule_checked: false, submodule_initialized: false, submodule_current_branch: None, unpushed: false, status_known: false });
+        entries.push(DirectoryEntry { name, relative_path: relative_string, kind, status: String::new(), tracked: false, size: if metadata.is_file() { metadata.len() } else { 0 }, modified, submodule_has_unpushed_commits: false, submodule_is_dirty: false, submodule_state: String::new(), submodule_checked: false, submodule_initialized: false, submodule_current_branch: None, unpushed: false, status_known: false, stashed: false });
     }
     entries.sort_by_cached_key(|entry| (!matches!(entry.kind.as_str(), "folder" | "submodule"), entry.name.to_lowercase()));
     perf_log(&format!("list_directory_fast: TOTAL ({} entries, {relative_path})", entries.len()), started.elapsed());
@@ -4229,6 +4352,20 @@ fn load_directory_inner(repository_path: String, relative_path: String, force: O
     let sorted_lookups = cached_sorted_lookups(status_repo);
     let tracked_sorted = &sorted_lookups.tracked;
     let unpushed_sorted = &sorted_lookups.unpushed;
+    // One repository handle serves both stash inspection and the submodule
+    // gitlink comparisons below. Opening it twice on every folder click is
+    // unnecessary filesystem work, especially on Windows/network drives.
+    let mut status_repository = internal_repository(status_repo).ok();
+    let stashed_paths = status_repository.as_mut()
+        .map(|repo| stash::all_stashed_paths(status_repo, repo))
+        .transpose()
+        .unwrap_or_else(|error| {
+            perf_log(&format!("load_directory: could not inspect stashes ({error})"), Duration::ZERO);
+            None
+        })
+        .unwrap_or_else(|| Arc::new(HashSet::new()));
+    let mut stashed_sorted: Vec<String> = stashed_paths.iter().cloned().collect();
+    stashed_sorted.sort_unstable();
     let has_prefix = has_sorted_prefix;
     // Same fix, same reason, for the third and last O(entries × something)
     // scan in this loop: status_for did up to two linear scans through every
@@ -4249,7 +4386,6 @@ fn load_directory_inner(repository_path: String, relative_path: String, force: O
     // Open the owning repository once for all visible submodule rows. Gitlink
     // comparisons below are cheap index/tree lookups and must not rediscover
     // the parent repository once per row.
-    let status_repository = internal_repository(status_repo).ok();
     let step = Instant::now();
     let mut submodule_count = 0usize;
 
@@ -4279,6 +4415,7 @@ fn load_directory_inner(repository_path: String, relative_path: String, force: O
         if kind == "submodule" { submodule_count += 1; }
         let status = status_for_entry(&status_key);
         let unpushed = if kind == "folder" { git_metadata.unpushed.contains(&status_key) || has_prefix(unpushed_sorted, &tracked_prefix) } else { git_metadata.unpushed.contains(&status_key) };
+        let stashed = stashed_paths.contains(&status_key) || has_prefix(&stashed_sorted, &tracked_prefix);
         // A clean, fully synchronized submodule needs no sub-repository scan.
         // Only a row whose parent status/unpushed information says there is
         // something to explain gets one cached, consolidated inspection.
@@ -4305,7 +4442,7 @@ fn load_directory_inner(repository_path: String, relative_path: String, force: O
         let submodule_checked = submodule_snapshot.is_some();
         let submodule_initialized = kind == "submodule" && item.path().join(".git").exists();
         let submodule_current_branch = submodule_snapshot.as_ref().and_then(|snapshot| snapshot.attached_branch.clone());
-        entries.push(DirectoryEntry { name, relative_path: relative_string, kind, status, tracked, size: if metadata.is_file() { metadata.len() } else { 0 }, modified, submodule_has_unpushed_commits, submodule_is_dirty, submodule_state, submodule_checked, submodule_initialized, submodule_current_branch, unpushed, status_known: true });
+        entries.push(DirectoryEntry { name, relative_path: relative_string, kind, status, tracked, size: if metadata.is_file() { metadata.len() } else { 0 }, modified, submodule_has_unpushed_commits, submodule_is_dirty, submodule_state, submodule_checked, submodule_initialized, submodule_current_branch, unpushed, status_known: true, stashed });
     }
 
     // A deleted tracked path cannot be returned by read_dir: it is absent on
@@ -4355,6 +4492,7 @@ fn load_directory_inner(repository_path: String, relative_path: String, force: O
             submodule_current_branch: None,
             unpushed: false,
             status_known: true,
+            stashed: stashed_paths.contains(&direct_status_key) || has_prefix(&stashed_sorted, &format!("{direct_status_key}/")),
         });
     }
     perf_log(&format!("load_directory: readdir loop ({} entries, {submodule_count} submodules)", entries.len()), step.elapsed());
@@ -4427,7 +4565,7 @@ fn entry_details_inner(repository_path: String, relative_path: String) -> Result
     // "describe this submodule" read. Open the submodule's own repo once
     // here and share it; the parent-side url/branch lookup is now a single
     // scan too (submodule_url_and_branch), not two.
-    let (submodule_url, submodule_web_url, submodule_branch, submodule_push_status, submodule_unpushed_commits, submodule_commit, submodule_snapshot) = if kind == "submodule" {
+    let (submodule_url, submodule_web_url, submodule_branch, submodule_push_status, submodule_unpushed_commits, submodule_commit, submodule_commit_tags, submodule_snapshot) = if kind == "submodule" {
         let (url, branch) = submodule_url_and_branch(&repository_path, &relative_string);
         let web_url = submodule_browser_base(&repository_path, &relative_string).ok();
         match internal_submodule_repository(&absolute) {
@@ -4439,11 +4577,12 @@ fn entry_details_inner(repository_path: String, relative_path: String) -> Result
                     let author_name = commit.author().name().unwrap_or("Unknown").to_string();
                     (commit.id().to_string(), commit.summary().unwrap_or("No message").to_string(), author_name, short_date(commit.time().seconds()))
                 });
-                (url, web_url, branch, push_status, unpushed_commits, commit, Some(snapshot))
+                let commit_tags = sub_repo.head().ok().and_then(|head| head.target()).map(|oid| tags_pointing_at_commit(&sub_repo, oid)).unwrap_or_default();
+                (url, web_url, branch, push_status, unpushed_commits, commit, commit_tags, Some(snapshot))
             }
-            Err(_) => (url, web_url, branch, None, Vec::new(), None, None),
+            Err(_) => (url, web_url, branch, None, Vec::new(), None, Vec::new(), None),
         }
-    } else { (None, None, None, None, Vec::new(), None, None) };
+    } else { (None, None, None, None, Vec::new(), None, Vec::new(), None) };
     let submodule_is_dirty = submodule_snapshot.as_ref().is_some_and(|snapshot| snapshot.dirty);
     let submodule_initialized = kind == "submodule" && submodule_snapshot.is_some();
     let submodule_state = if kind == "submodule" {
@@ -4460,6 +4599,7 @@ fn entry_details_inner(repository_path: String, relative_path: String) -> Result
         last_commit_subject: last.as_ref().map(|value| value.1.clone()), last_commit_author: last.as_ref().map(|value| value.2.clone()), last_commit_date: last.as_ref().map(|value| value.3.clone()),
         submodule_commit_id: submodule_commit.as_ref().map(|value| value.0.clone()),
         submodule_commit_subject: submodule_commit.as_ref().map(|value| value.1.clone()), submodule_commit_author: submodule_commit.as_ref().map(|value| value.2.clone()), submodule_commit_date: submodule_commit.as_ref().map(|value| value.3.clone()),
+        submodule_commit_tags,
     })
 }
 
@@ -5633,7 +5773,11 @@ pub fn preview_folder_restore(repository_path: String, relative_path: String, so
 }
 
 #[tauri::command]
-pub fn restore_folder(repository_path: String, relative_path: String, source_revision: String, clean_paths: Vec<String>) -> Result<(), String> {
+pub async fn restore_folder(repository_path: String, relative_path: String, source_revision: String, clean_paths: Vec<String>) -> Result<(), String> {
+    off_main_thread(move || restore_folder_inner(repository_path, relative_path, source_revision, clean_paths)).await
+}
+
+fn restore_folder_inner(repository_path: String, relative_path: String, source_revision: String, clean_paths: Vec<String>) -> Result<(), String> {
     let started = Instant::now();
     validate_path(&repository_path)?;
     let relative = safe_relative_path(&relative_path)?;
@@ -5665,12 +5809,20 @@ pub fn restore_folder(repository_path: String, relative_path: String, source_rev
     let source_id = commit.id().to_string();
     git(&repository_path, &["restore", "--source", &source_id, "--staged", "--worktree", "--", &relative_string])
         .map_err(|detail| format!("Folder restore failed: {detail}"))?;
+    let submodule_status = git(&repository_path, &["submodule", "status", "--recursive", "--", &relative_string])
+        .unwrap_or_default();
+    if !submodule_status.trim().is_empty() {
+        let _ = git(&repository_path, &["submodule", "sync", "--recursive", "--", &relative_string]);
+        git(&repository_path, &["-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive", "--force", "--", &relative_string])
+            .map_err(|detail| format!("Folder restored, but submodule checkout failed: {detail}"))?;
+    }
     if !clean_relative.is_empty() {
         let mut args = vec!["clean".to_string(), "-fd".to_string(), "--".to_string()];
         args.extend(clean_relative);
         git_owned(&repository_path, args).map_err(|detail| format!("Folder restored, but clean failed: {detail}"))?;
     }
     invalidate_git_metadata(&repository_path);
+    invalidate_submodule_sync(&repository_path);
     perf_log("restore_folder: TOTAL", started.elapsed());
     Ok(())
 }
@@ -6590,7 +6742,7 @@ mod tests {
         assert!(!preview.clean_candidates.iter().any(|path| path == "folder/ignored.log"), "ignored files must not be cleaned by default");
         assert!(!preview.tracked_changes.iter().any(|change| change.status == "??"), "untracked items belong in clean preview, not tracked changes");
 
-        restore_folder(repo_string, "folder".into(), commit_a, preview.clean_candidates).unwrap();
+        restore_folder_inner(repo_string, "folder".into(), commit_a, preview.clean_candidates).unwrap();
         assert_eq!(run_git_capture(&repository, &["rev-parse", "HEAD"]), head_before, "restore must not move HEAD");
         assert_eq!(run_git_capture(&repository, &["branch", "--show-current"]), branch_before, "restore must not switch branches");
         assert_eq!(fs::read_to_string(repository.join("folder/file1.txt")).unwrap(), "A1\n");
@@ -6601,6 +6753,43 @@ mod tests {
         assert_eq!(fs::read_to_string(repository.join("outside.txt")).unwrap(), "outside C\n", "unrelated paths must be untouched");
 
         fs::remove_dir_all(repository).unwrap();
+    }
+
+    #[test]
+    fn folder_restore_updates_nested_submodule_worktrees_to_the_recorded_revision() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-folder-restore-submodule-{suffix}"));
+        let repository = base.join("main");
+        let dependency = base.join("dependency");
+        fs::create_dir_all(&repository).unwrap();
+        fs::create_dir_all(&dependency).unwrap();
+        fs::write(repository.join("README.md"), "root").unwrap();
+        fs::write(dependency.join("module.txt"), "dep v1\n").unwrap();
+        for path in [&repository, &dependency] {
+            run_git(path, &["init", "-b", "main"]);
+            run_git(path, &["config", "user.email", "test@example.com"]);
+            run_git(path, &["config", "user.name", "Test User"]);
+            run_git(path, &["add", "."]);
+            run_git(path, &["commit", "-m", "Initial"]);
+        }
+
+        run_git(&repository, &["-c", "protocol.file.allow=always", "submodule", "add", dependency.to_str().unwrap(), "folder/dep"]);
+        run_git(&repository, &["commit", "-am", "Add dep submodule"]);
+        let checkpoint = run_git_capture(&repository, &["rev-parse", "HEAD"]);
+        let sub_path = repository.join("folder/dep");
+        let checkpoint_sub = run_git_capture(&sub_path, &["rev-parse", "HEAD"]);
+
+        fs::write(sub_path.join("module.txt"), "dep v2\n").unwrap();
+        run_git(&sub_path, &["commit", "-am", "Submodule v2"]);
+        assert_ne!(run_git_capture(&sub_path, &["rev-parse", "HEAD"]), checkpoint_sub);
+        assert!(!refresh_status_inner(repository.to_string_lossy().into_owned()).unwrap().is_empty(), "advancing only the submodule checkout should make the parent folder look modified");
+
+        restore_folder_inner(repository.to_string_lossy().into_owned(), "folder".into(), checkpoint, Vec::new()).unwrap();
+        assert_eq!(run_git_capture(&sub_path, &["rev-parse", "HEAD"]), checkpoint_sub, "folder restore must move nested submodule worktrees to the gitlink recorded by the selected source");
+        assert_eq!(fs::read_to_string(sub_path.join("module.txt")).unwrap(), "dep v1\n");
+        assert!(refresh_status_inner(repository.to_string_lossy().into_owned()).unwrap().is_empty(), "parent repo should be clean after restoring the folder and its nested submodule");
+
+        fs::remove_dir_all(base).unwrap();
     }
 
     // Test-only: rewrites .gitmodules' recorded `url =` line(s) to a fake
@@ -6655,11 +6844,13 @@ mod tests {
         assert_eq!(repo.index().unwrap().get_path(Path::new("components/engine"), 0).unwrap().mode, 0o160000);
         drop(repo);
         create_commit(parent_string.clone(), "P:89312 add engine".into()).unwrap();
+        run_git(&parent.join("components/engine"), &["tag", "IMS.VITESCO.IO_HM_MHB01L04.00A"]);
         assert_eq!(entry_last_commit_inner(parent_string.clone(), "README.md".into()).unwrap().map(|c| c.subject), Some("Initial commit".to_string()));
         let engine_details = entry_details_inner(parent_string.clone(), "components/engine".into()).unwrap();
         assert_eq!(entry_last_commit_inner(parent_string.clone(), "components/engine".into()).unwrap().map(|c| c.subject), Some("P:89312 add engine".to_string()), "last-commit-touching-path must stay the parent's gitlink-bump commit");
         assert_eq!(engine_details.submodule_commit_subject.as_deref(), Some("Initial commit"), "submodule_commit_* must be the submodule's own HEAD commit, not the parent's");
         assert!(engine_details.submodule_commit_id.is_some());
+        assert_eq!(engine_details.submodule_commit_tags, vec!["IMS.VITESCO.IO_HM_MHB01L04.00A".to_string()]);
         let versions = submodule_versions_inner(parent_string.clone(), added.clone()).unwrap();
         switch_submodule_version_inner(parent_string.clone(), added.clone(), versions.current_revision, "commit".into(), String::new()).unwrap();
         remove_git_path_inner(&parent_string, &added).unwrap();
@@ -7642,6 +7833,14 @@ mod tests {
         let files = stash_entry_files(path.clone(), 0).unwrap();
         assert_eq!(files, vec!["a.txt".to_string()], "only a.txt was stashed — b.txt was never touched");
 
+        let entries = load_directory_inner(path.clone(), String::new(), Some(true)).unwrap();
+        assert!(entries.iter().find(|entry| entry.name == "a.txt").unwrap().stashed, "the Explorer row must show that a.txt is preserved in a stash");
+        assert!(!entries.iter().find(|entry| entry.name == "b.txt").unwrap().stashed, "an unrelated clean file must not receive the stash badge");
+
+        drop_stash(path.clone(), 0).unwrap();
+        let entries_after_drop = load_directory_inner(path.clone(), String::new(), Some(true)).unwrap();
+        assert!(!entries_after_drop.iter().find(|entry| entry.name == "a.txt").unwrap().stashed, "the badge must disappear as soon as the stash is dropped");
+
         fs::remove_dir_all(repository).unwrap();
     }
 
@@ -8426,7 +8625,7 @@ mod tests {
                 "url": "https://github.vitesco.io/eng/sw-prj-VWAQ4_000U0/pull/282#pullrequestreview-987"
             }] },
             "url": "https://github.vitesco.io/eng/sw-prj-VWAQ4_000U0/pull/282",
-            "commits": { "nodes": [{ "commit": { "statusCheckRollup": {
+            "commits": { "nodes": [{ "commit": { "oid": "abc1234567890def", "statusCheckRollup": {
                 "state": "PENDING",
                 "contexts": { "nodes": [
                     { "context": "Collaborator", "state": "PENDING", "targetUrl": "https://github.vitesco.io/eng/sw-prj-VWAQ4_000U0/runs/123" },
@@ -8454,6 +8653,38 @@ mod tests {
             PullRequestCheckSummary { name: "Submodule status".into(), status: "passing".into(), details_url: "https://github.vitesco.io/eng/sw-prj-VWAQ4_000U0/actions/runs/456".into() },
         ]);
         assert_eq!(summary.url, "https://github.vitesco.io/eng/sw-prj-VWAQ4_000U0/pull/282");
+    }
+
+    #[test]
+    fn pr_check_details_rest_fallback_fills_missing_links_without_overwriting_existing_ones() {
+        let mut pr = serde_json::json!({
+            "headSha": "abc1234567890def",
+            "statusCheckRollup": [
+                { "name": "build-status", "status": "COMPLETED", "conclusion": "SUCCESS", "detailsUrl": "https://existing.example/build" },
+                { "context": "Collaborator", "state": "PENDING" },
+                { "context": "Polarion Link", "state": "SUCCESS" },
+                { "name": "Submodule status", "status": "COMPLETED", "conclusion": "SUCCESS" }
+            ]
+        });
+        let statuses = serde_json::json!({
+            "statuses": [
+                { "context": "Collaborator", "target_url": "https://github.vitesco.io/eng/repo/status/collaborator" },
+                { "context": "Polarion Link", "target_url": "https://github.vitesco.io/eng/repo/status/polarion" }
+            ]
+        });
+        let check_runs = serde_json::json!({
+            "check_runs": [
+                { "name": "Submodule status", "details_url": "https://github.vitesco.io/eng/repo/actions/runs/123" },
+                { "name": "build-status", "details_url": "https://github.vitesco.io/eng/repo/actions/runs/should-not-overwrite" }
+            ]
+        });
+        let urls = collect_rest_check_detail_urls(Some(&statuses), Some(&check_runs));
+        assert_eq!(fill_missing_pr_check_details_from_urls(&mut pr, &urls), 3);
+        let checks = pr.get("statusCheckRollup").and_then(|value| value.as_array()).unwrap();
+        assert_eq!(checks[0].get("detailsUrl").and_then(|value| value.as_str()), Some("https://existing.example/build"));
+        assert_eq!(checks[1].get("targetUrl").and_then(|value| value.as_str()), Some("https://github.vitesco.io/eng/repo/status/collaborator"));
+        assert_eq!(checks[2].get("targetUrl").and_then(|value| value.as_str()), Some("https://github.vitesco.io/eng/repo/status/polarion"));
+        assert_eq!(checks[3].get("detailsUrl").and_then(|value| value.as_str()), Some("https://github.vitesco.io/eng/repo/actions/runs/123"));
     }
 
     #[test]
@@ -12760,18 +12991,17 @@ mod tests {
     }
 
     #[test]
-    fn utrud_command_uses_the_parent_as_cwd_and_the_full_path_as_the_argument() {
-        // Reproduces the report: with cwd set to the "r" folder itself (an
-        // earlier fix), UTRUD's own script appended the selected folder's
-        // name to its current directory and produced ".../r/r" instead of
-        // ".../r". cwd must be the *parent* of the selected folder — the
-        // same relationship Explorer's "Send to" has with whatever you
-        // right-clicked — while the argument stays the full path to "r".
-        let absolute = Path::new("/int_opm/sw-prj-OMBMS_000U0/work/asw/aggr/errm/agf/errm_envd1/r");
+    fn utrud_command_uses_the_parent_as_cwd_and_the_selected_folder_as_the_argument() {
+        // UTRUD is launched like Explorer's "Send to": cwd is the parent of
+        // whatever folder the user clicked, while the argument is the full
+        // selected folder path. This must work for any folder name, not only
+        // a folder literally named "r"; UTRUD itself decides whether the
+        // selected folder is meaningful for its workflow.
+        let absolute = Path::new("/int_opm/sw-prj-OMBMS_000U0/work/asw/aggr/errm/agf/errm_envd1/any_folder");
         let (cwd, argument) = utrud_command_parts(absolute);
         assert_eq!(cwd, Path::new("/int_opm/sw-prj-OMBMS_000U0/work/asw/aggr/errm/agf/errm_envd1"));
         assert_eq!(argument, absolute);
-        assert_ne!(cwd.file_name(), argument.file_name(), "cwd must not itself be named \"r\" — that's what caused the doubled \"r\\r\" path");
+        assert_ne!(cwd.file_name(), argument.file_name(), "cwd must not itself be the selected folder — that's what caused doubled folder paths");
     }
 
     #[test]

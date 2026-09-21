@@ -185,6 +185,57 @@ pub fn abort_stash_conflict(repository_path: String) -> Result<(), String> {
     Ok(())
 }
 
+fn paths_in_stash(repo: &Repository, stash_oid: git2::Oid) -> Result<std::collections::BTreeSet<String>, String> {
+    let stash_commit = repo.find_commit(stash_oid).map_err(|error| error.message().to_string())?;
+    let stash_tree = stash_commit.tree().map_err(|error| error.message().to_string())?;
+    let base_tree = stash_commit.parent(0).and_then(|commit| commit.tree()).ok();
+    let mut paths = std::collections::BTreeSet::new();
+    let diff = repo.diff_tree_to_tree(base_tree.as_ref(), Some(&stash_tree), None).map_err(|error| error.message().to_string())?;
+    for delta in diff.deltas() {
+        if let Some(path) = delta.new_file().path().or_else(|| delta.old_file().path()) { paths.insert(normalized(path)); }
+    }
+    if let Some(untracked_tree) = stash_commit.parent(2).ok().and_then(|commit| commit.tree().ok()) {
+        let untracked_diff = repo.diff_tree_to_tree(None, Some(&untracked_tree), None).map_err(|error| error.message().to_string())?;
+        for delta in untracked_diff.deltas() {
+            if let Some(path) = delta.new_file().path().or_else(|| delta.old_file().path()) { paths.insert(normalized(path)); }
+        }
+    }
+    Ok(paths)
+}
+
+#[derive(Clone)]
+struct StashedPathsCacheEntry {
+    // Stash commits are immutable. The ordered refs/stash walk therefore
+    // forms a complete, cheap cache key: if these OIDs did not change, the
+    // union of paths inside all stashes cannot have changed either.
+    stash_oids: Vec<git2::Oid>,
+    paths: Arc<HashSet<String>>,
+}
+
+static STASHED_PATHS_CACHE: OnceLock<Mutex<HashMap<String, StashedPathsCacheEntry>>> = OnceLock::new();
+
+fn stashed_paths_cache() -> &'static Mutex<HashMap<String, StashedPathsCacheEntry>> {
+    STASHED_PATHS_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+// Explorer rows need one aggregate answer, not one Git walk per visible
+// file. Enumerate refs/stash once, diff each immutable stash commit only when
+// the stash OID list changes, and share the resulting path set across folder
+// navigation. This also notices stashes created or dropped outside the app.
+pub(super) fn all_stashed_paths(repository_path: &str, repo: &mut Repository) -> Result<Arc<HashSet<String>>, String> {
+    let mut stash_oids = Vec::new();
+    repo.stash_foreach(|_, _, oid| { stash_oids.push(*oid); true }).map_err(|error| error.message().to_string())?;
+    if let Some(cached) = stashed_paths_cache().lock().unwrap().get(repository_path).filter(|entry| entry.stash_oids == stash_oids).cloned() {
+        return Ok(cached.paths);
+    }
+
+    let mut paths = HashSet::new();
+    for oid in &stash_oids { paths.extend(paths_in_stash(&repo, *oid)?); }
+    let paths = Arc::new(paths);
+    stashed_paths_cache().lock().unwrap().insert(repository_path.to_string(), StashedPathsCacheEntry { stash_oids, paths: paths.clone() });
+    Ok(paths)
+}
+
 #[tauri::command]
 pub fn stash_entry_files(repository_path: String, stash_index: usize) -> Result<Vec<String>, String> {
     validate_path(&repository_path)?;
@@ -193,15 +244,5 @@ pub fn stash_entry_files(repository_path: String, stash_index: usize) -> Result<
     let mut repo_for_walk = internal_repository(&repository_path)?;
     repo_for_walk.stash_foreach(|index, _, oid| { if index == stash_index { target_oid = Some(*oid); } true }).map_err(|error| error.message().to_string())?;
     let stash_oid = target_oid.ok_or("That stash entry no longer exists")?;
-    let stash_commit = repo.find_commit(stash_oid).map_err(|error| error.message().to_string())?;
-    let stash_tree = stash_commit.tree().map_err(|error| error.message().to_string())?;
-    let base_tree = stash_commit.parent(0).and_then(|commit| commit.tree()).ok();
-    let mut paths = std::collections::BTreeSet::new();
-    let diff = repo.diff_tree_to_tree(base_tree.as_ref(), Some(&stash_tree), None).map_err(|error| error.message().to_string())?;
-    for delta in diff.deltas() { if let Some(path) = delta.new_file().path().or_else(|| delta.old_file().path()) { paths.insert(normalized(path)); } }
-    if let Some(untracked_tree) = stash_commit.parent(2).ok().and_then(|commit| commit.tree().ok()) {
-        let untracked_diff = repo.diff_tree_to_tree(None, Some(&untracked_tree), None).map_err(|error| error.message().to_string())?;
-        for delta in untracked_diff.deltas() { if let Some(path) = delta.new_file().path().or_else(|| delta.old_file().path()) { paths.insert(normalized(path)); } }
-    }
-    Ok(paths.into_iter().collect())
+    Ok(paths_in_stash(&repo, stash_oid)?.into_iter().collect())
 }

@@ -66,12 +66,34 @@ test('top bar has a safe project fetch that updates parent and submodule refs wi
   assert.match(css, /\.repo-picker \{ flex: 0 1 360px;/);
 });
 
+test('fast repository open keeps folder navigation filesystem-only until the first status scan completes', () => {
+  assert.match(app, /async function openDirectory\(path, options = \{\}\)/);
+  assert.match(app, /if \(!state\.statusReady && !options\.force && !options\.invalidateGit\) \{/);
+  assert.match(app, /return paintDirectoryFast\(path, requestId\)/);
+  assert.match(app, /completeRepositoryOpenStatus\(state\.repository\.path, generation\)/);
+  assert.match(app, /await openDirectory\(state\.currentPath, \{ force: true \}\)/);
+  assert.match(app, /completeRepositoryOpenStatus finishes, it reloads the \*current\* folder/);
+});
+
+test('UTRUD can be launched for any selected folder, not only folders named r', () => {
+  assert.match(app, /data-detail-action="utrud"/);
+  assert.match(app, /Launches UTRUD with this folder path/);
+  assert.doesNotMatch(app, /entry\.name === 'r'/);
+  assert.doesNotMatch(app, /currentPath\.split\('\/'\)\.filter\(Boolean\)\.at\(-1\) !== 'r'/);
+  assert.match(app, /runUtrud\(\{ kind: 'folder', name, relative_path: state\.currentPath \}\)/);
+  assert.match(html, /Launch UTRUD for the current folder/);
+});
+
 test('details panel extracts spec ids from loaded commit text and shows compact submodule repository links', () => {
   assert.match(app, /const SPEC_ID_PATTERN =/);
   assert.match(app, /function extractSpecIds\(text = ''\)/);
+  assert.match(app, /\[A-Z0-9\]\{8\}\\\.\[A-Z0-9\]\{3\}/);
+  assert.match(app, /matchAll\(SPEC_ID_PATTERN\)\]\.map\(match => match\[1\]\)/);
   assert.match(app, /function specDetailRows\(\.\.\.texts\)/);
   assert.match(app, /specDetailRows\(entry\.last_commit_subject\)/);
-  assert.match(app, /specDetailRows\(entry\.submodule_commit_subject\)/);
+  assert.match(app, /specDetailRows\(entry\.submodule_commit_subject, \.\.\.\(entry\.submodule_commit_tags \|\| \[\]\)\)/);
+  assert.match(app, /entry\.submodule_commit_tags\?\.length/);
+  assert.match(app, /function tagListHtml\(tags = \[\]\)/);
   assert.match(app, /function compactRepositoryLabel\(url = ''\)/);
   assert.match(app, /function submoduleRepositoryLinkHtml\(entry\)/);
   assert.match(app, /function submoduleRepositoryRowsHtml\(entry\)/);
@@ -104,6 +126,12 @@ test('deleted tracked paths render without trying to stat a path that no longer 
   assert.match(app, /\['deleted', 'deleted-folder', 'deleted-submodule'\]\.includes\(state\.selectedEntry\?\.kind\)/);
   assert.match(app, /Deleted tracked file/);
   assert.match(app, /Deleted tracked folder/);
+});
+
+test('Explorer marks paths preserved in a stash without hiding their current Git state', () => {
+  assert.match(app, /entry\.stashed \? `<b class="inline-stash-badge"/);
+  assert.match(app, />STASHED<\/b>/);
+  assert.match(css, /\.inline-stash-badge/);
 });
 
 test('a submodule row shows its attached branch or detached state, only when actually checked', () => {
