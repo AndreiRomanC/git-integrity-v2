@@ -358,3 +358,29 @@ test('graph exposes branch and commit context actions without relying on lane id
   assert.match(app, /class="graph-edge-underlay"/);
   assert.match(css, /\.graph-overlay \.graph-edge-underlay/);
 });
+
+test('every local frontend script and stylesheet carries the same cache-busting version', () => {
+  // The WebView can keep serving an older cached copy of a same-named asset
+  // after an app update. Every local <script src> / stylesheet href in
+  // index.html therefore ends in ?v=<release tag>, and the tag must be identical
+  // so a stale mix of old and new files can never load together. Bump the tag
+  // in one place per release; a file added without it fails here.
+  const refs = [...html.matchAll(/<(?:script[^>]*\ssrc|link[^>]*\shref)="([^"]+)"/g)].map(match => match[1])
+    .filter(ref => !/^(?:https?:)?\/\//.test(ref) && /\.(?:js|css)(?:\?|$)/.test(ref));
+  assert.ok(refs.length >= 9, `expected the local scripts and stylesheet, found ${refs.length}: ${refs.join(', ')}`);
+  const versions = new Set();
+  for (const ref of refs) {
+    const match = ref.match(/^[\w./-]+\.(?:js|css)\?v=([\w.-]+)$/);
+    assert.ok(match, `local asset "${ref}" must end with ?v=<release tag>`);
+    versions.add(match[1]);
+    assert.ok(fs.existsSync(path.join(root, 'frontend', ref.split('?')[0])), `"${ref}" points to a file that does not exist`);
+  }
+  assert.equal(versions.size, 1, `all assets must share one version tag, found: ${[...versions].join(', ')}`);
+});
+
+test('submodule stash is disabled without local changes, and stage/unstage failures are shown as a toast', () => {
+  assert.match(app, /const canStashInsideSubmodule = entry\.kind === 'submodule' && entry\.submodule_is_dirty;/);
+  assert.match(app, /data-detail-action="substash" \$\{canStashInsideSubmodule \? '' : 'disabled'\}/);
+  const flush = app.match(/async function flushOneBatch\(options\) \{([\s\S]*?)\n\}\n/)?.[1] || '';
+  assert.match(flush, /const message = handleError\(error\);\s*showOperationToast\(`Stage\/Unstage failed: \$\{message\}`, 'error'\);/);
+});
