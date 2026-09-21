@@ -124,16 +124,18 @@ function submoduleCurrentContextHtml(data = {}) {
   const projectRelation = parent && parent === revision
     ? 'The parent project records this exact commit.'
     : parent ? `The parent project currently records ${parent.slice(0, 8)}.` : 'The parent project version could not be determined.';
-  const visibleCandidates = candidates.slice(0, 6);
+  const visibleCandidates = candidates.slice(0, 3);
   const candidateRows = !data.current_branch && visibleCandidates.length ? `<div class="version-containing-branches">
     <h4>BRANCHES CONTAINING THIS COMMIT</h4>
     ${visibleCandidates.map(item => {
       const distance = item.commits_after_current != null && Number.isFinite(Number(item.commits_after_current))
         ? Number(item.commits_after_current) : (item.revision === revision ? 0 : null);
       const position = distance === 0 ? 'This commit is the branch tip' : distance == null ? 'Contains this commit' : `Branch tip is ${distance} commit${distance === 1 ? '' : 's'} newer`;
-      const action = distance === 0 ? 'Switch to this branch' : 'Switch to branch tip';
-      return `<div class="version-containing-branch" data-revision="${esc(item.revision)}" data-version-kind="${esc(item.kind)}" data-name="${esc(item.name)}">
-        <span><strong>⑂ ${esc(item.name)}</strong><small>${esc(position)}${item.kind === 'remote' ? ' · remote branch' : ''}</small></span>
+      const remote = item.kind === 'remote';
+      const action = remote ? 'Checkout remote tip' : distance === 0 ? 'Attach to branch' : 'Checkout branch tip';
+      return `<div class="version-containing-branch ${remote ? 'remote' : 'local'}" data-revision="${esc(item.revision)}" data-version-kind="${esc(item.kind)}" data-name="${esc(item.name)}">
+        <strong title="${esc(item.name)}">⑂ ${esc(item.name)}</strong>
+        <small><b>${remote ? 'REMOTE' : 'LOCAL'}</b>${esc(position)}</small>
         <button type="button" data-switch-version>${esc(action)}</button>
       </div>`;
     }).join('')}

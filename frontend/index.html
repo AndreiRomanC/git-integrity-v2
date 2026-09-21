@@ -520,10 +520,11 @@
           <p><b>Status colors next to a file/folder:</b></p>
           <ul>
             <li><b class="help-tag amber">Modified locally</b> — has real uncommitted edits.</li>
-            <li><b class="help-tag amber">New, untracked</b> — a file Git doesn't know about yet.</li>
+            <li><b class="help-tag amber">Untracked</b> — a file Git doesn't know about yet.</li>
             <li><b class="help-tag blue">Not pushed yet</b> — fully committed, but that commit hasn't reached the server. Nothing to commit here — it needs a push.</li>
             <li><b class="help-tag blue">New version</b> (submodules only) — the submodule has a new commit, already recorded in the project, just not pushed to its own server yet.</li>
           </ul>
+          <p>One state is written in full. When several facts apply at once, the Git column uses compact badges so none are hidden: <code>ML</code> modified locally, <code>ST</code> stashed work, <code>NP</code> not pushed, <code>UN</code> untracked. Hover the badges to read every full description.</p>
         </details>
         <details>
           <summary>Working tree (Commit)</summary>

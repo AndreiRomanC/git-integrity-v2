@@ -248,8 +248,18 @@ button.pr-reviewer:hover { border-color: #59758e; background: #1b2b38; color: #e
    how long any future label ends up being ("Contains unpushed commits" on a
    folder used to do exactly that, deforming the whole row). */
 .git-state { display: inline-flex; align-items: center; gap: 6px; min-width: 0; max-width: 100%; color: #7f91a2; font-size: 11px; }
-.git-state > span { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.git-state > span { min-width: 0; display: inline-flex; align-items: center; gap: 6px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.git-state > span > em { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-style: normal; }
+.git-state.combined > span { gap: 7px; }
 .git-state.changed { color: var(--amber); }.git-state.untracked { color: #8a9aaa; }.git-state.new-version { color: var(--blue); }.git-state.unpushed { color: var(--blue); }.git-state.loading { color: #5c6b7a; font-style: italic; }
+.git-badge-tray { flex: none; display: inline-flex; align-items: center; gap: 4px; }
+.git-code-badge { flex: none; min-width: 18px; height: 15px; display: inline-flex; align-items: center; justify-content: center; padding: 0 4px; border: 1px solid #35495a; border-radius: 999px; background: #17222c; color: #9fb1c2; font-size: 7px; font-weight: 900; letter-spacing: .07em; font-style: normal; line-height: 1; opacity: .9; }
+.git-code-badge.changed { border-color: #9b6b2e; background: #3a2a12; color: #ffd38c; }
+.git-code-badge.untracked { border-color: #566879; background: #202a34; color: #c3ced8; }
+.git-code-badge.new-version { border-color: #3e78a9; background: #152d43; color: #9ed4ff; }
+.git-code-badge.unpushed { border-color: #3e78a9; background: #152d43; color: #9ed4ff; }
+.git-code-badge.stashed { border-color: #447a66; background: #19352d; color: #81d5b3; }
+.git-code-badge.loading { border-color: #3a4650; background: #131b22; color: #66798a; }
 .git-dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; flex-shrink: 0; }
 .file-size, .file-modified { color: #8293a3; font-size: 11px; white-space: nowrap; }
 .folder-arrow { margin-left: auto; color: #64809a; font-size: 18px; }
@@ -790,16 +800,19 @@ button.pr-reviewer:hover { border-color: #59758e; background: #1b2b38; color: #e
 .version-current-context > div b { margin-left: auto; padding: 2px 6px; border-radius: 4px; background: #26384a; color: #a7bfd4; font-size: 8px; letter-spacing: .4px; }
 .version-current-context p { margin: 5px 0 3px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #d2dee8; font-size: 10px; }
 .version-current-context small { display: block; color: #8095a7; font-size: 9px; line-height: 1.4; }
-.version-containing-branches { margin-top: 9px; padding-top: 8px; border-top: 1px solid #294156; }
-.version-containing-branches h4 { margin: 0 0 5px; color: #7592ab; font-size: 8px; letter-spacing: .75px; }
-.version-containing-branch { min-height: 38px; display: flex; align-items: center; gap: 12px; padding: 5px 7px; border-radius: 6px; background: #162a3b; }
-.version-containing-branch + .version-containing-branch { margin-top: 4px; }
-.version-containing-branch > span { min-width: 0; display: flex; flex: 1; flex-direction: column; gap: 2px; }
-.version-containing-branch strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #c8e9ff; font: 11px ui-monospace, SFMono-Regular, Consolas, monospace; }
-.version-containing-branch small { color: #7f9aae; font-size: 9px; }
-.version-containing-branch button { flex: none; height: 27px; padding: 0 10px; border: 1px solid #4d7ca4; border-radius: 6px; background: #1d4261; color: #d9efff; font-size: 9px; font-weight: 600; }
+.version-containing-branches { width: min(560px, 100%); min-width: 0; box-sizing: border-box; margin-top: 9px; padding-top: 7px; border-top: 1px solid #294156; display: flex; flex-direction: column; align-items: stretch; gap: 4px; overflow: hidden; }
+.version-containing-branches h4 { margin: 0 0 2px; color: #83a0b8; font-size: 8px; line-height: 1.25; letter-spacing: .7px; }
+.version-containing-branch { min-width: 0; min-height: 27px; display: grid; grid-template-columns: minmax(0, 1fr) auto; grid-template-areas: "name action" "meta action"; align-items: center; gap: 1px 7px; padding: 3px 5px 3px 8px; border: 1px solid #20384c; border-left: 2px solid #42c9d1; border-radius: 5px; background: rgba(20, 38, 55, .62); }
+.version-containing-branch.remote { border-color: #253544; background: rgba(20, 33, 44, .62); }
+.version-containing-branch.remote { border-left-color: #7991a4; }
+.version-containing-branch + .version-containing-branch { margin-top: 0; }
+.version-containing-branch strong { grid-area: name; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #c8e9ff; font: 10px ui-monospace, SFMono-Regular, Consolas, monospace; }
+.version-containing-branch small { grid-area: meta; min-width: 0; display: inline-flex !important; align-items: center; gap: 5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #7f9aae; font-size: 8px; }
+.version-containing-branch small b { flex: none; margin-left: 0; padding: 1px 4px; border-radius: 3px; background: #244966; color: #acd9fa; font-size: 6.5px; letter-spacing: .42px; }
+.version-containing-branch.remote small b { background: #293642; color: #92a6b7; }
+.version-containing-branch button { grid-area: action; justify-self: end; width: auto; max-width: 118px; height: 22px; padding: 0 8px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; border: 1px solid #416a8b; border-radius: 5px; background: #18384f; color: #d9efff; font-size: 8px; font-weight: 600; }
 .version-containing-branch button:hover { border-color: #79b6e8; background: #285779; }
-.version-more-branches { margin: 6px 2px 0 !important; color: #70879a !important; font-size: 9px !important; white-space: normal !important; }
+.version-more-branches { margin: 2px 2px 0 !important; color: #70879a !important; font-size: 8px !important; white-space: normal !important; }
 .version-inactive-label { color: #738493; font-size: 8px; font-weight: 700; letter-spacing: .4px; }
 .version-history-limit { margin: 3px 5px 7px; color: #718495; font-size: 9px; line-height: 1.35; }
 .commit-scope-label textarea { min-height: 52px; padding: 8px 10px; border: 1px solid #405365; border-radius: 6px; background: #0d151c; color: #d4e1eb; font-size: 12px; font-family: inherit; resize: vertical; }

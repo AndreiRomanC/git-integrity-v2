@@ -129,9 +129,18 @@ test('deleted tracked paths render without trying to stat a path that no longer 
 });
 
 test('Explorer marks paths preserved in a stash without hiding their current Git state', () => {
-  assert.match(app, /entry\.stashed \? `<b class="inline-stash-badge"/);
-  assert.match(app, />STASHED<\/b>/);
-  assert.match(css, /\.inline-stash-badge/);
+  assert.match(app, /if \(entry\.stashed\) addState\('ST'/);
+  assert.match(app, /states\.length === 1/);
+  assert.match(app, /primaryState = states\.find\(state => !\['ST', 'NP'\]\.includes\(state\.code\)\)/);
+  assert.match(app, /git-badge-tray/);
+  assert.match(css, /\.git-code-badge\.stashed/);
+});
+
+test('Git column keeps full single-state labels and abbreviates only real combinations', () => {
+  assert.match(app, /M: \{ code: 'ML', label: 'Modified locally'/);
+  assert.match(app, /'\?\?': \{ code: 'UN', label: 'Untracked'/);
+  assert.match(app, /if \(!states\.length\) addState\('TR', 'Tracked'\)/);
+  assert.match(app, /ML \+ ST \+ NP/);
 });
 
 test('a submodule row shows its attached branch or detached state, only when actually checked', () => {
@@ -195,14 +204,19 @@ test('the status bar quietly shows the last real git command, and the footer ope
   assert.match(app, /function commandHistoryRowHtml\(entry\) \{[\s\S]*?class="command-history-row \$\{entry\.success \? '' : 'failed'\}"/);
 });
 
-test('Stash folder disappears with its Explorer row-mates outside Explorer, never left stranded alone', () => {
-  // Every other button in that toolbar row (Commit folder, Add submodule,
-  // History, Changes in folder) already hides whenever state.view isn't
-  // 'explorer' — before this, Stash folder was the one left behind, alone,
-  // in an otherwise-empty header the moment you switched to Graph/Folder
-  // Sync/Remotes. The Ctrl+Shift+S shortcut calls stashWork() directly, so
-  // it stays reachable everywhere regardless of this element's visibility.
-  assert.match(app, /\$\('#stashWork'\)\.hidden = state\.view !== 'explorer' \|\| !state\.repository;/);
+test('stash and scoped commit are item-detail actions, not crowded toolbar actions', () => {
+  // These actions depend on the selected file/folder/submodule. Keeping them
+  // in the header made the scope unclear and pushed the toolbar outside the
+  // page; they now live in the right-side details panel.
+  assert.match(app, /refs\.commitScope\.hidden = true;/);
+  assert.match(app, /\$\('#stashWork'\)\.hidden = true;/);
+  assert.match(app, /data-detail-action="stashwork"/);
+  assert.match(app, /data-detail-action="commit"/);
+});
+
+test('stashed paths are shown as compact Git-column state, not beside the folder name', () => {
+  assert.doesNotMatch(app, /entry\.stashed \? `<b class="inline-stash-badge"/);
+  assert.match(app, /if \(entry\.stashed\) addState\('ST'/);
 });
 
 test('the version selector\'s own Push button reuses the real push flow, not a second one, and never leaks the menu underneath it', () => {
@@ -220,6 +234,13 @@ test('the version selector\'s own Push button reuses the real push flow, not a s
   // of leaving stale rows underneath the push dialog.
   assert.match(app, /const menuWasOpenForEntry = !refs\.submoduleMenu\.hidden && submoduleMenuEntry\?\.relative_path === entry\.relative_path;/);
   assert.match(app, /await refreshSubmoduleMenu\(\);/);
+});
+
+test('branches containing a detached commit render as a compact bounded list', () => {
+  assert.match(css, /\.version-containing-branches \{[^}]*width: min\(560px, 100%\)/);
+  assert.match(css, /\.version-containing-branches \{[^}]*flex-direction: column/);
+  assert.match(css, /\.version-containing-branch \{[^}]*grid-template-areas: "name action" "meta action"/);
+  assert.match(css, /\.version-containing-branch strong \{[^}]*text-overflow: ellipsis/);
 });
 
 test('clone is reachable outside the empty state and sends explicit clone options', () => {

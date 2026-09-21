@@ -2841,6 +2841,59 @@ fn count_missing_pr_check_details(pr: &serde_json::Value) -> usize {
         .unwrap_or(0)
 }
 
+fn decode_html_attr_minimal(value: &str) -> String {
+    value.replace("&amp;", "&")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+}
+
+fn html_tag_attr(tag: &str, attr: &str) -> Option<String> {
+    let needle = format!("{attr}=");
+    let start = tag.find(&needle)? + needle.len();
+    let quote = tag[start..].chars().next()?;
+    if quote != '"' && quote != '\'' { return None; }
+    let value_start = start + quote.len_utf8();
+    let value_end = tag[value_start..].find(quote)? + value_start;
+    Some(decode_html_attr_minimal(&tag[value_start..value_end]))
+}
+
+fn absolute_github_html_url(base_url: &str, href: &str) -> String {
+    let href = href.trim();
+    if href.starts_with("http://") || href.starts_with("https://") { return href.to_string(); }
+    if href.starts_with('/') {
+        if let Some(rest) = base_url.strip_prefix("https://").or_else(|| base_url.strip_prefix("http://")) {
+            if let Some(host) = rest.split('/').next() {
+                let scheme = if base_url.starts_with("http://") { "http" } else { "https" };
+                return format!("{scheme}://{host}{href}");
+            }
+        }
+    }
+    href.to_string()
+}
+
+fn collect_pr_check_detail_urls_from_html(pr_url: &str, html: &str) -> HashMap<String, String> {
+    let mut urls = HashMap::new();
+    let mut remaining = html;
+    while let Some(start) = remaining.find("<a") {
+        remaining = &remaining[start..];
+        let Some(end) = remaining.find('>') else { break };
+        let tag = &remaining[..=end];
+        remaining = &remaining[end + 1..];
+        let class = html_tag_attr(tag, "class").unwrap_or_default();
+        if !class.split_whitespace().any(|name| name == "status-actions") { continue; }
+        let Some(label) = html_tag_attr(tag, "aria-label") else { continue };
+        let Some(raw_name) = label.strip_prefix("Details for ") else { continue };
+        let name = raw_name.trim().trim_end_matches('.').trim();
+        if name.is_empty() { continue; }
+        let Some(href) = html_tag_attr(tag, "href") else { continue };
+        if href.trim().is_empty() { continue; }
+        urls.entry(normalized_pr_check_name(name)).or_insert_with(|| absolute_github_html_url(pr_url, &href));
+    }
+    urls
+}
+
 // Everything `pr_status` needs to know *before* it shells out to `gh` —
 // resolved straight from Git, never from what the frontend believes.
 struct PrQueryContext {
@@ -3164,6 +3217,17 @@ impl GitHubGraphqlClient {
         Ok(payload)
     }
 
+    fn get_text(&self, url: &str) -> Result<String, String> {
+        let mut request = self.http.get(url).header("Accept", "text/html");
+        if let Some(token) = &self.token { request = request.bearer_auth(token); }
+        let response = request.send().map_err(|error| format!("GitHub HTML request failed: {error}"))?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(format!("GitHub HTML request failed with HTTP {status}."));
+        }
+        response.text().map_err(|error| format!("GitHub HTML response could not be read: {error}"))
+    }
+
     fn fill_missing_check_details(&self, repo: &GitHubRepo, pr: &mut serde_json::Value) {
         let missing = count_missing_pr_check_details(pr);
         if missing == 0 { return; }
@@ -3189,6 +3253,22 @@ impl GitHubGraphqlClient {
         let urls = collect_rest_check_detail_urls(status_payload.as_ref(), check_runs_payload.as_ref());
         let filled = fill_missing_pr_check_details_from_urls(pr, &urls);
         perf_log(&format!("pr_check_details_rest_fallback: sha={short_sha} missing={missing} filled={filled}"), Duration::ZERO);
+        let missing_after_rest = count_missing_pr_check_details(pr);
+        if missing_after_rest == 0 { return; }
+        let Some(pr_url) = pr.get("url").and_then(|value| value.as_str()).map(str::trim).filter(|value| !value.is_empty()) else {
+            perf_log(&format!("pr_check_details_html_fallback: sha={short_sha} missing={missing_after_rest} skipped=no_pr_url"), Duration::ZERO);
+            return;
+        };
+        match self.get_text(pr_url) {
+            Ok(html) => {
+                let html_urls = collect_pr_check_detail_urls_from_html(pr_url, &html);
+                let html_filled = fill_missing_pr_check_details_from_urls(pr, &html_urls);
+                perf_log(&format!("pr_check_details_html_fallback: sha={short_sha} missing={missing_after_rest} filled={html_filled}"), Duration::ZERO);
+            }
+            Err(_) => {
+                perf_log(&format!("pr_check_details_html_fallback: sha={short_sha} missing={missing_after_rest} html_failed=true"), Duration::ZERO);
+            }
+        }
     }
 }
 
@@ -8685,6 +8765,28 @@ mod tests {
         assert_eq!(checks[1].get("targetUrl").and_then(|value| value.as_str()), Some("https://github.vitesco.io/eng/repo/status/collaborator"));
         assert_eq!(checks[2].get("targetUrl").and_then(|value| value.as_str()), Some("https://github.vitesco.io/eng/repo/status/polarion"));
         assert_eq!(checks[3].get("detailsUrl").and_then(|value| value.as_str()), Some("https://github.vitesco.io/eng/repo/actions/runs/123"));
+    }
+
+    #[test]
+    fn pr_check_details_html_fallback_extracts_status_action_links_from_github_page() {
+        let html = r#"
+          <div class="merge-status-item">
+            <strong class="text-emphasized mr-2">Collaborator</strong>
+            <a class="status-actions" href="https://collaborator.vitesco.io/ui#review:id=601412" aria-label="Details for Collaborator.">Details</a>
+          </div>
+          <div class="merge-status-item">
+            <strong class="text-emphasized mr-2">Polarion Link</strong>
+            <a class="status-actions" href="/eng/sw-prj-VWAQ4_000U0/pull/282/checks?check_run_id=2765725&amp;foo=bar" aria-label="Details for Polarion Link.">Details</a>
+          </div>
+          <div class="merge-status-item">
+            <strong class="text-emphasized mr-2">Submodule status</strong>
+            <a class="status-actions" href="/eng/sw-prj-VWAQ4_000U0/pull/282/checks?check_run_id=2765726" aria-label="Details for Submodule status.">Details</a>
+          </div>
+        "#;
+        let urls = collect_pr_check_detail_urls_from_html("https://github.vitesco.io/eng/sw-prj-VWAQ4_000U0/pull/282", html);
+        assert_eq!(urls.get("collaborator").map(String::as_str), Some("https://collaborator.vitesco.io/ui#review:id=601412"));
+        assert_eq!(urls.get("polarion link").map(String::as_str), Some("https://github.vitesco.io/eng/sw-prj-VWAQ4_000U0/pull/282/checks?check_run_id=2765725&foo=bar"));
+        assert_eq!(urls.get("submodule status").map(String::as_str), Some("https://github.vitesco.io/eng/sw-prj-VWAQ4_000U0/pull/282/checks?check_run_id=2765726"));
     }
 
     #[test]

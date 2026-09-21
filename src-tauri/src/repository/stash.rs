@@ -8,6 +8,9 @@ pub fn stash_changes(repository_path: String) -> Result<(), String> {
     let _lock = lock_handle.lock().unwrap();
     log_repo_write_lock_acquired(&repository_path, "stash_changes", queue_started.elapsed());
     let mut repo = internal_repository(&repository_path)?;
+    if internal_statuses(&repo, None)?.is_empty() {
+        return Err("Nothing to stash — this repository has no uncommitted local changes.".into());
+    }
     let signature = repo.signature().map_err(|_| "Configure user.name and user.email for this repository".to_string())?;
     repo.stash_save2(&signature, None, Some(git2::StashFlags::INCLUDE_UNTRACKED)).map_err(|error| format!("Cannot stash changes: {}", error.message()))?;
     invalidate_git_metadata(&repository_path);
