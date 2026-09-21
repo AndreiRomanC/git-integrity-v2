@@ -1552,6 +1552,38 @@ fn utrud_command_parts(absolute: &Path) -> (PathBuf, PathBuf) {
     (cwd, absolute.to_path_buf())
 }
 
+#[cfg(target_os = "windows")]
+fn utrud_batch_literal(path: &Path) -> String {
+    // Batch files expand `%NAME%` even inside quotes. A normal Windows path
+    // almost never contains `%`, but if it does, doubling it is the correct
+    // way to write a literal percent in a generated .cmd file.
+    path.display().to_string().replace('%', "%%")
+}
+
+#[cfg(target_os = "windows")]
+fn create_utrud_launcher_script(cwd: &Path, argument: &Path) -> Result<PathBuf, String> {
+    let temp = std::env::temp_dir().join(format!(
+        "git-drilldown-run-utrud-{}-{}.cmd",
+        std::process::id(),
+        std::time::SystemTime::now().duration_since(UNIX_EPOCH).map(|value| value.as_nanos()).unwrap_or(0)
+    ));
+    let script = format!(
+        "@echo off\r\n\
+cd /d \"{}\"\r\n\
+call \"{}\" \"{}\"\r\n\
+if errorlevel 1 (\r\n\
+  echo.\r\n\
+  echo UTRUD failed to start.\r\n\
+  pause\r\n\
+)\r\n",
+        utrud_batch_literal(cwd),
+        UTRUD_BATCH_PATH.replace('%', "%%"),
+        utrud_batch_literal(argument),
+    );
+    fs::write(&temp, script).map_err(|error| format!("Could not create temporary UTRUD launcher: {error}"))?;
+    Ok(temp)
+}
+
 #[tauri::command]
 pub fn run_utrud(repository_path: String, relative_path: String) -> Result<String, String> {
     validate_path(&repository_path)?;
@@ -1570,13 +1602,17 @@ pub fn run_utrud(repository_path: String, relative_path: String) -> Result<Strin
         }
         perf_log(&format!("run_utrud: cwd={} arg={}", cwd.display(), argument.display()), Duration::ZERO);
         // Start a separate visible command process, like Explorer's Send To
-        // action. The command string is static; paths travel through the
-        // environment so spaces or shell metacharacters cannot change it.
+        // action. Use a generated .cmd wrapper instead of a nested
+        // `cmd /C start ... cmd /C call ...` command line: the nested form is
+        // very sensitive to Windows quoting and has produced literal
+        // `\"C:\...\"` launcher names on real machines. The wrapper keeps
+        // the effective command obvious and identical to Send To:
+        //   call "C:\LegacyApp\UTRUD\2.0.0\UTRUD.bat" "<selected r folder>"
         // On failure the console stays open with the actual batch error.
+        let launcher = create_utrud_launcher_script(&cwd, &argument)?;
         let status = Command::new("cmd")
-            .args(["/C", "start", "", "cmd", "/C", "call \"%GDD_UTRUD_BATCH%\" \"%GDD_UTRUD_TARGET%\" || (echo. & echo UTRUD failed to start. & pause)"])
-            .env("GDD_UTRUD_BATCH", UTRUD_BATCH_PATH)
-            .env("GDD_UTRUD_TARGET", &argument)
+            .args(["/C", "start", ""])
+            .arg(&launcher)
             .current_dir(&cwd)
             .status().map_err(|error| format!("Windows could not create the UTRUD process: {error}"))?;
         if !status.success() { return Err(format!("Windows rejected the UTRUD launch request (exit code {:?}).", status.code())); }
