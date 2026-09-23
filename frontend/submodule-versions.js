@@ -124,22 +124,27 @@ function submoduleCurrentContextHtml(data = {}) {
   const projectRelation = parent && parent === revision
     ? 'The parent project records this exact commit.'
     : parent ? `The parent project currently records ${parent.slice(0, 8)}.` : 'The parent project version could not be determined.';
-  const visibleCandidates = candidates.slice(0, 3);
-  const candidateRows = !data.current_branch && visibleCandidates.length ? `<div class="version-containing-branches">
-    <h4>BRANCHES CONTAINING THIS COMMIT</h4>
-    ${visibleCandidates.map(item => {
+  const visibleCandidates = candidates.slice(0, 5);
+  const candidateSection = (title, items, extraClass = '') => items.length ? `<div class="version-containing-group ${extraClass}">
+    <h5>${esc(title)}</h5>
+    ${items.map(item => {
       const distance = item.commits_after_current != null && Number.isFinite(Number(item.commits_after_current))
         ? Number(item.commits_after_current) : (item.revision === revision ? 0 : null);
-      const position = distance === 0 ? 'This commit is the branch tip' : distance == null ? 'Contains this commit' : `Branch tip is ${distance} commit${distance === 1 ? '' : 's'} newer`;
+      const position = distance === 0 ? 'tip is this commit' : distance == null ? 'contains this commit' : `tip +${distance} commit${distance === 1 ? '' : 's'}`;
       const remote = item.kind === 'remote';
-      const action = remote ? 'Checkout remote tip' : distance === 0 ? 'Attach to branch' : 'Checkout branch tip';
+      const action = remote ? 'Checkout remote' : distance === 0 ? 'Attach' : 'Checkout tip';
       return `<div class="version-containing-branch ${remote ? 'remote' : 'local'}" data-revision="${esc(item.revision)}" data-version-kind="${esc(item.kind)}" data-name="${esc(item.name)}">
-        <strong title="${esc(item.name)}">⑂ ${esc(item.name)}</strong>
-        <small><b>${remote ? 'REMOTE' : 'LOCAL'}</b>${esc(position)}</small>
+        <span><strong title="${esc(item.name)}">${esc(item.name)}</strong><small>${esc(remote ? 'remote ref' : 'local branch')} · ${esc(position)}</small></span>
         <button type="button" data-switch-version>${esc(action)}</button>
       </div>`;
-    }).join('')}
-    ${candidates.length > visibleCandidates.length ? `<p class="version-more-branches">+${candidates.length - visibleCandidates.length} more containing branches — use the Branches list below to inspect them.</p>` : ''}
+    }).join('')}</div>` : '';
+  const localCandidates = visibleCandidates.filter(item => item.kind === 'branch');
+  const remoteCandidates = visibleCandidates.filter(item => item.kind === 'remote');
+  const candidateRows = !data.current_branch && visibleCandidates.length ? `<div class="version-containing-branches">
+    <h4>DETACHED COMMIT — SAFE PLACES TO ATTACH OR CHECKOUT</h4>
+    ${candidateSection('Local branches', localCandidates, 'local')}
+    ${candidateSection('Remote refs', remoteCandidates, 'remote')}
+    ${candidates.length > visibleCandidates.length ? `<p class="version-more-branches">+${candidates.length - visibleCandidates.length} more refs in the Branches list below.</p>` : ''}
   </div>` : '';
   return `<section class="version-current-context">
     <div><span>ACTIVE CHECKOUT</span><strong>${esc(short)}</strong><b>${data.current_branch ? `BRANCH · ${esc(data.current_branch)}` : 'DETACHED HEAD'}</b></div>

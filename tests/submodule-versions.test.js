@@ -118,8 +118,8 @@ test('detached context distinguishes a containing branch from an exact branch ti
     ],
   });
   assert.match(contained, /Detached inside 1 known branch/);
-  assert.match(contained, /⑂ develop/);
-  assert.match(contained, /Checkout branch tip/);
+  assert.match(contained, /develop/);
+  assert.match(contained, /Checkout tip/);
 
   const exact = submoduleCurrentContextHtml({
     current_revision: '44444444aaaa', current_branch: '', parent_revision: '44444444aaaa',
@@ -143,10 +143,10 @@ test('detached context offers explicit switch actions ordered by nearest useful 
   assert.deepEqual(candidates.map(item => item.name), ['feature/errm_common_hip', 'IMS.VITESCO.IO_master']);
   const html = submoduleCurrentContextHtml(data);
   assert.ok(html.indexOf('feature/errm_common_hip') < html.indexOf('IMS.VITESCO.IO_master'));
-  assert.match(html, /BRANCHES CONTAINING THIS COMMIT/);
-  assert.match(html, /Branch tip is 1 commit newer/);
-  assert.match(html, /Checkout branch tip/);
-  assert.match(html, />LOCAL</);
+  assert.match(html, /DETACHED COMMIT — SAFE PLACES TO ATTACH OR CHECKOUT/);
+  assert.match(html, /Local branches/);
+  assert.match(html, /tip \+1 commit/);
+  assert.match(html, /Checkout tip/);
   assert.equal((html.match(/data-switch-version/g) || []).length, 2);
 });
 
@@ -160,9 +160,9 @@ test('remote-only containing refs are clearly labeled and never pretend to attac
     ],
   });
   assert.match(html, /version-containing-branch remote/);
-  assert.match(html, />REMOTE</);
-  assert.match(html, /Checkout remote tip/);
-  assert.doesNotMatch(html, /Attach to branch/);
+  assert.match(html, /Remote refs/);
+  assert.match(html, /Checkout remote/);
+  assert.doesNotMatch(html, /Attach<\/button>/);
 });
 
 test('a commit row names branches that contain it without claiming attachment', () => {

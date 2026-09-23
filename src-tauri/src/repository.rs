@@ -680,6 +680,10 @@ pub struct EntryDetails {
     submodule_is_dirty: bool,
     submodule_state: String,
     submodule_initialized: bool,
+    // Entry details always open the selected submodule repository once when it
+    // exists, so this is a real current checkout signal there: Some(branch)
+    // means attached to that local branch, None means detached/unavailable.
+    submodule_current_branch: Option<String>,
     last_commit_id: Option<String>,
     last_commit_subject: Option<String>,
     last_commit_author: Option<String>,
@@ -3854,6 +3858,18 @@ pub struct UnpushedSubmoduleReference {
     // now* while an earlier outgoing commit still references a commit that
     // isn't, and that is not a contradiction.
     current_submodule_oid: Option<String>,
+    // The submodule commit recorded by the final parent commit that will be
+    // pushed. When this differs from submodule_oid, the unsafe gitlink belongs
+    // to an older intermediate parent commit, not to the branch tip the user is
+    // trying to share now.
+    target_submodule_oid: Option<String>,
+    // True when the final parent commit's submodule revision is a descendant
+    // of this revision. In that case pushing the final submodule tip really
+    // would also make this older gitlink reachable. When false, the two
+    // revisions are siblings/divergent history, which is the confusing real
+    // report: "but I pushed the later one" is true, just not relevant to this
+    // older parent commit.
+    target_contains_submodule_oid: bool,
 }
 
 // Opening Publish already performs the expensive, explicit network refresh
@@ -4015,6 +4031,10 @@ fn unpushed_submodule_references(repository_path: &str, branch: &str, remote: &s
     let repo = internal_repository(repository_path)?;
     let step = Instant::now();
     let mut outgoing = outgoing_commit_ids(&repo, branch, remote)?;
+    let target_parent_oid = match upto {
+        Some(oid) => oid,
+        None => repo.refname_to_id(&format!("refs/heads/{branch}")).map_err(|error| error.message().to_string())?,
+    };
     perf_log(&format!("publish_safety: outgoing history ({} commits)", outgoing.len()), step.elapsed());
     // A partial publish ("stop at an earlier commit", see publish_branch's
     // own doc comment) only ever actually pushes commits up to and
@@ -4062,13 +4082,45 @@ fn unpushed_submodule_references(repository_path: &str, branch: &str, remote: &s
     let mut violations = Vec::new();
     for path in path_order {
         let references = by_path.remove(&path).unwrap_or_default();
-        let revisions: Vec<git2::Oid> = references.iter().map(|(sub_oid, _)| *sub_oid).collect();
+        let target_submodule_oid = repo.find_commit(target_parent_oid).ok()
+            .and_then(|commit| commit.tree().ok())
+            .and_then(|tree| tree.get_path(Path::new(&path)).ok())
+            .filter(|entry| entry.filemode() == 0o160000)
+            .map(|entry| entry.id());
+        let mut revision_seen = HashSet::new();
+        let mut revisions: Vec<git2::Oid> = references.iter()
+            .filter_map(|(sub_oid, _)| revision_seen.insert(*sub_oid).then_some(*sub_oid))
+            .collect();
+        if let Some(target_oid) = target_submodule_oid {
+            if revision_seen.insert(target_oid) { revisions.push(target_oid); }
+        }
         let (mut risks, configured_url, current_oid) = submodule_reference_risks(repository_path, &path, &revisions, refresh_remotes);
         let current_submodule_oid = current_oid.map(|oid| oid.to_string());
+        let target_is_known_safe = target_submodule_oid.and_then(|oid| risks.get(&oid).copied()).is_some_and(|risk| risk.is_none());
+        let target_submodule_oid_string = target_submodule_oid.map(|oid| oid.to_string());
+        let submodule_repo_for_graph = internal_submodule_repository(&Path::new(repository_path).join(&path)).ok();
         for (sub_oid, commit_oid) in references {
             let Some(risk) = risks.remove(&sub_oid).flatten() else { continue };
+            let target_contains_submodule_oid = target_submodule_oid.is_some_and(|target_oid| {
+                target_oid == sub_oid || submodule_repo_for_graph.as_ref()
+                    .is_some_and(|sub_repo| sub_repo.graph_descendant_of(target_oid, sub_oid).unwrap_or(false))
+            });
+            let risk = if risk == "unpushed" && target_submodule_oid.is_some_and(|target_oid| target_oid != sub_oid) && target_is_known_safe {
+                if target_contains_submodule_oid {
+                    // If the final, safely pushed submodule tip actually
+                    // contains this older commit, the older gitlink is safe
+                    // too: a normal push of the final branch carries its
+                    // ancestors. Keep this invariant explicit so we never
+                    // recreate the "two commits in order but first is missing"
+                    // false alarm.
+                    continue;
+                }
+                "superseded_unpushed"
+            } else {
+                risk
+            };
             let commit_subject = repo.find_commit(commit_oid).ok().and_then(|commit| commit.summary().map(str::to_string)).unwrap_or_default();
-            violations.push(UnpushedSubmoduleReference { relative_path: path.clone(), submodule_oid: sub_oid.to_string(), commit_id: commit_oid.to_string(), commit_subject, risk: risk.into(), configured_url: configured_url.clone(), current_submodule_oid: current_submodule_oid.clone() });
+            violations.push(UnpushedSubmoduleReference { relative_path: path.clone(), submodule_oid: sub_oid.to_string(), commit_id: commit_oid.to_string(), commit_subject, risk: risk.into(), configured_url: configured_url.clone(), current_submodule_oid: current_submodule_oid.clone(), target_submodule_oid: target_submodule_oid_string.clone(), target_contains_submodule_oid });
         }
     }
     perf_log(&format!("publish_safety: TOTAL ({} violation{})", violations.len(), if violations.len() == 1 { "" } else { "s" }), total_started.elapsed());
@@ -4099,7 +4151,7 @@ fn submodule_publish_safety_check(repository_path: &str, branch: &str, remote: &
             // silently disagree.
             let currently_different = v.current_submodule_oid.as_deref().is_some_and(|current| current != v.submodule_oid);
             let context = if currently_different {
-                format!(" (its current checkout has since moved on to {}, which is a different matter — push it separately, or re-stage/commit this submodule in the project to point at the newer commit instead)", &v.current_submodule_oid.as_deref().unwrap_or_default()[..8.min(v.current_submodule_oid.as_deref().unwrap_or_default().len())])
+                format!(" (its current checkout has since moved on to {}, but the parent branch still publishes a commit that points at the older local-only version)", &v.current_submodule_oid.as_deref().unwrap_or_default()[..8.min(v.current_submodule_oid.as_deref().unwrap_or_default().len())])
             } else { String::new() };
             format!("Push submodule {} first. The main project references {}, which is only local{}.", v.relative_path, target, context)
         }).collect();
@@ -4108,6 +4160,14 @@ fn submodule_publish_safety_check(repository_path: &str, branch: &str, remote: &
     if override_unpushed_submodules { return Ok(()); }
     let lines: Vec<String> = violations.iter().map(|v| {
         let reason = match v.risk.as_str() {
+            "superseded_unpushed" => {
+                let target = v.target_submodule_oid.as_deref().unwrap_or_default();
+                if v.target_contains_submodule_oid {
+                    format!("has an older intermediate gitlink, but the final parent commit points at descendant {}", &target[..8.min(target.len())])
+                } else {
+                    format!("has an older intermediate gitlink to a divergent local-only commit; the final parent commit points at {}", &target[..8.min(target.len())])
+                }
+            }
             "no_remote" => "has no configured remote".to_string(),
             "local_only" => format!("is only reachable from a filesystem path or file:// URL ({})", v.configured_url.as_deref().unwrap_or("?")),
             _ => "could not be checked locally".to_string(),
@@ -4665,6 +4725,7 @@ fn entry_details_inner(repository_path: String, relative_path: String) -> Result
     } else { (None, None, None, None, Vec::new(), None, Vec::new(), None) };
     let submodule_is_dirty = submodule_snapshot.as_ref().is_some_and(|snapshot| snapshot.dirty);
     let submodule_initialized = kind == "submodule" && submodule_snapshot.is_some();
+    let submodule_current_branch = submodule_snapshot.as_ref().and_then(|snapshot| snapshot.attached_branch.clone());
     let submodule_state = if kind == "submodule" {
         match (internal_repository(status_repo).ok(), submodule_snapshot.as_ref()) {
             (Some(parent), Some(snapshot)) => submodule_workflow_state(&parent, status_scope, unpushed, snapshot),
@@ -4674,7 +4735,7 @@ fn entry_details_inner(repository_path: String, relative_path: String) -> Result
 
     Ok(EntryDetails {
         name: absolute.file_name().and_then(|name| name.to_str()).unwrap_or(&relative_string).to_string(), relative_path: relative_string,
-        kind, status, tracked, unpushed, size: if metadata.is_file() { metadata.len() } else { 0 }, modified, item_count, submodule_url, submodule_web_url, submodule_branch, submodule_push_status, submodule_unpushed_commits, submodule_is_dirty, submodule_state, submodule_initialized,
+        kind, status, tracked, unpushed, size: if metadata.is_file() { metadata.len() } else { 0 }, modified, item_count, submodule_url, submodule_web_url, submodule_branch, submodule_push_status, submodule_unpushed_commits, submodule_is_dirty, submodule_state, submodule_initialized, submodule_current_branch,
         last_commit_id: last.as_ref().map(|value| value.0.clone()),
         last_commit_subject: last.as_ref().map(|value| value.1.clone()), last_commit_author: last.as_ref().map(|value| value.2.clone()), last_commit_date: last.as_ref().map(|value| value.3.clone()),
         submodule_commit_id: submodule_commit.as_ref().map(|value| value.0.clone()),
@@ -5629,6 +5690,32 @@ fn commit_files_inner(repository_path: String, files: Vec<String>, message: Stri
     commit_selected_internal(&repository_path, &safe_files, message.trim())
 }
 
+fn ensure_changed_submodule_gitlinks_are_publishable(repository_path: &str, repo: &Repository, parent_tree: Option<&git2::Tree<'_>>, new_tree: &git2::Tree<'_>) -> Result<(), String> {
+    let Ok(diff) = repo.diff_tree_to_tree(parent_tree, Some(new_tree), None) else { return Ok(()); };
+    let mut seen = HashSet::new();
+    let mut blocked = Vec::new();
+    for delta in diff.deltas() {
+        if delta.status() == git2::Delta::Deleted { continue; }
+        let new_file = delta.new_file();
+        if new_file.mode() != git2::FileMode::Commit { continue; }
+        let (Some(path), oid) = (new_file.path(), new_file.id()) else { continue };
+        if oid.is_zero() { continue; }
+        let path = normalized(path);
+        if !seen.insert((path.clone(), oid)) { continue; }
+        let (mut risks, _, _) = submodule_reference_risks(repository_path, &path, &[oid], true);
+        if risks.remove(&oid).flatten() == Some("unpushed") {
+            let short = oid.to_string();
+            blocked.push(format!("{path} -> {}", &short[..8.min(short.len())]));
+        }
+    }
+    if blocked.is_empty() { return Ok(()); }
+    Err(format!(
+        "Cannot commit the project submodule reference yet. Push the submodule commit first, then commit the project link.\n\nUnpublished submodule gitlink{}:\n{}",
+        if blocked.len() == 1 { "" } else { "s" },
+        blocked.join("\n")
+    ))
+}
+
 fn commit_selected_internal(repository_path: &str, files: &[String], message: &str) -> Result<String, String> {
     let commit_started = Instant::now();
     // See repo_write_lock's doc comment — shared by both commit_files and
@@ -5699,7 +5786,7 @@ fn commit_selected_internal(repository_path: &str, files: &[String], message: &s
     perf_log("commit: add_path/add_all/remove_all (scratch index)", step.elapsed());
     if includes_submodule && Path::new(repository_path).join(".gitmodules").exists() { index.add_path(Path::new(".gitmodules")).map_err(|error| error.message().to_string())?; }
     let step = Instant::now();
-    let tree_id = index.write_tree_to(&repo).map_err(|error| error.message().to_string())?; if parent_tree.as_ref().map(|tree| tree.id()) == Some(tree_id) { return Err("There are no changes to commit in the selected files".into()); } let tree = repo.find_tree(tree_id).map_err(|error| error.message().to_string())?; let signature = repo.signature().map_err(|_| "Configure user.name and user.email for this repository".to_string())?; let parents: Vec<&git2::Commit<'_>> = parent.iter().collect(); let oid = repo.commit(Some("HEAD"), &signature, &signature, message, &tree, &parents).map_err(|error| error.message().to_string())?;
+    let tree_id = index.write_tree_to(&repo).map_err(|error| error.message().to_string())?; if parent_tree.as_ref().map(|tree| tree.id()) == Some(tree_id) { return Err("There are no changes to commit in the selected files".into()); } let tree = repo.find_tree(tree_id).map_err(|error| error.message().to_string())?; if includes_submodule { ensure_changed_submodule_gitlinks_are_publishable(repository_path, &repo, parent_tree.as_ref(), &tree)?; } let signature = repo.signature().map_err(|_| "Configure user.name and user.email for this repository".to_string())?; let parents: Vec<&git2::Commit<'_>> = parent.iter().collect(); let oid = repo.commit(Some("HEAD"), &signature, &signature, message, &tree, &parents).map_err(|error| error.message().to_string())?;
     perf_log("commit: write_tree_to + commit", step.elapsed());
     // `index` above was repurposed as an in-memory scratch copy (parent tree plus
     // only the selected files) to build the commit tree, and `repo.index()` returns
@@ -6155,6 +6242,16 @@ fn commit_submodule_inner(repository_path: String, relative_path: String, messag
         let _lock = lock_handle.lock().unwrap();
         log_repo_write_lock_acquired(&sub_path, "commit_submodule", queue_started.elapsed());
         let repo = internal_submodule_repository(&absolute)?;
+        if repo.head_detached().unwrap_or(true) {
+            let short = repo.head().ok()
+                .and_then(|head| head.target())
+                .map(|oid| {
+                    let value = oid.to_string();
+                    value[..8.min(value.len())].to_string()
+                })
+                .unwrap_or_else(|| "unknown".into());
+            return Err(format!("Commit unavailable — this submodule is detached at {short}. Create a new branch from this commit, or checkout an existing branch, then commit. This keeps the new commit pushable and avoids losing track of it."));
+        }
         let mut index = repo.index().map_err(|error| error.message().to_string())?;
         index.add_all(["*"], git2::IndexAddOption::DEFAULT, None).map_err(|error| error.message().to_string())?;
         index.write().map_err(|error| error.message().to_string())?;
@@ -9614,8 +9711,14 @@ mod tests {
         assert_eq!(main_context.commits_after_current, Some(0), "the active commit is exactly this branch tip");
 
         fs::write(sub_path.join("module.txt"), "v2").unwrap();
-        commit_submodule_inner(repo_path.clone(), "vendor/dep".into(), "Detached commit".into(), false).expect("commit_submodule should succeed while detached");
-        assert!(Repository::open(&sub_path).unwrap().head_detached().unwrap(), "committing must not implicitly attach HEAD to a branch");
+        let commit_error = commit_submodule_inner(repo_path.clone(), "vendor/dep".into(), "Detached commit".into(), false).unwrap_err();
+        assert!(commit_error.contains("detached") && commit_error.contains("branch"), "the app must require a branch before creating a submodule commit: {commit_error}");
+
+        // A commit can still be created externally while detached. The app
+        // must present and protect that state correctly, because users can
+        // arrive here through tools outside Git Drill Down.
+        run_git(&sub_path, &["commit", "-am", "Detached commit"]);
+        assert!(Repository::open(&sub_path).unwrap().head_detached().unwrap(), "external Git can still create a detached commit");
 
         let versions = submodule_versions_inner(repo_path.clone(), "vendor/dep".into()).unwrap();
         assert_eq!(versions.current_branch, "", "the version dialog must not expose Git's synthetic HEAD shorthand as a branch name");
@@ -11867,7 +11970,7 @@ mod tests {
     }
 
     #[test]
-    fn publish_branch_blocks_even_when_only_an_older_outgoing_commit_carries_an_unpushed_submodule_gitlink() {
+    fn publish_branch_warns_but_can_override_when_only_an_older_outgoing_commit_carries_an_unpushed_submodule_gitlink() {
         // Point 3 of the submodule-publish-safety report: the CURRENT tip's
         // gitlink can be perfectly fine while an OLDER outgoing commit still
         // carries one that only ever existed locally — git can't push the
@@ -11921,8 +12024,11 @@ mod tests {
         fs::write(sub_path.join("module.txt"), "x1").unwrap();
         run_git(&sub_path, &["commit", "-am", "X1"]);
         let x1 = git(&sub_path.to_string_lossy(), &["rev-parse", "HEAD"]).unwrap().trim().to_string();
-        stage_files_inner(&parent_path, vec!["vendor/dep".into()]).unwrap();
-        commit_selected_internal(&parent_path, &["vendor/dep".to_string()], "Bump to X1").unwrap();
+        // This test deliberately constructs a historical bad parent commit.
+        // The app's normal commit path now blocks this exact mistake, so use
+        // raw Git here to keep the publish-safety regression fixture possible.
+        run_git(&parent, &["add", "vendor/dep"]);
+        run_git(&parent, &["commit", "-m", "Bump to X1"]);
 
         // Discard X1 from the submodule's own checkout (its own remote never
         // sees it) and commit a genuinely different, sibling commit instead —
@@ -11933,14 +12039,15 @@ mod tests {
         run_git(&sub_path, &["-c", "protocol.file.allow=always", "push", "origin", "HEAD:main"]);
 
         // Commit B: bumps the submodule again, to the commit that IS pushed.
-        stage_files_inner(&parent_path, vec!["vendor/dep".into()]).unwrap();
-        commit_selected_internal(&parent_path, &["vendor/dep".to_string()], "Bump to X2").unwrap();
+        run_git(&parent, &["add", "vendor/dep"]);
+        run_git(&parent, &["commit", "-m", "Bump to X2"]);
 
         let x2 = git(&sub_path.to_string_lossy(), &["rev-parse", "HEAD"]).unwrap().trim().to_string();
         let violations = unpushed_submodule_references(&parent_path, "main", "origin", None, true).unwrap();
         assert_eq!(violations.len(), 1, "only X1 (carried by the older, already-superseded commit A) should be flagged, not X2: {violations:?}");
-        assert_eq!(violations[0].risk, "unpushed");
+        assert_eq!(violations[0].risk, "superseded_unpushed");
         assert_eq!(violations[0].submodule_oid, x1, "the flagged reference must be the older, unreachable one");
+        assert_eq!(violations[0].target_submodule_oid.as_deref(), Some(x2.as_str()), "the branch tip records the pushed replacement gitlink, so the stale X1 pointer is only an intermediate-history risk");
         assert_eq!(violations[0].commit_subject, "Bump to X1");
         // The exact report this reproduces: the submodule's current checkout
         // (X2) is fully pushed and in sync — Push submodule would correctly
@@ -11949,17 +12056,64 @@ mod tests {
         // Both facts are true at once; this is not a contradiction.
         assert_eq!(violations[0].current_submodule_oid.as_deref(), Some(x2.as_str()), "must report the submodule's actual current checkout for context, not merely the flagged (older) oid again");
 
-        let blocked = publish_branch_inner(parent_path.clone(), "main".into(), "origin".into(), String::new(), String::new(), String::new(), false);
-        assert!(blocked.is_err(), "publishing must be blocked while an older outgoing commit still carries an unreachable submodule gitlink");
-        let message = blocked.unwrap_err();
+        let warned = publish_branch_inner(parent_path.clone(), "main".into(), "origin".into(), String::new(), String::new(), String::new(), false);
+        assert!(warned.is_err(), "the user must still explicitly acknowledge that an intermediate parent commit is not restorable");
+        let message = warned.unwrap_err();
         assert!(message.contains("vendor/dep"), "message should name the affected submodule, got: {message}");
-        assert!(message.contains(&x2[..8]), "message should explain that the current checkout already moved on to X2, so the reader does not read this as contradicting an in-sync Push submodule preview: {message}");
-        assert!(!message.starts_with("UNPUSHED_SUBMODULE_OVERRIDABLE::"), "a submodule that HAS a remote and simply wasn't pushed must never be overridable — push it instead, got: {message}");
-        // Confirm the override can't bypass this either — "unpushed" (has a
-        // remote, just isn't reachable yet) is never overridable, unlike
-        // "no_remote"/"unverifiable".
-        let still_blocked = publish_branch_inner(parent_path, "main".into(), "origin".into(), String::new(), String::new(), String::new(), true);
-        assert!(still_blocked.is_err(), "override_unpushed_submodules must never bypass a risk of 'unpushed' — only push can fix that");
+        assert!(message.contains(&x2[..8]), "message should explain that the final parent commit points to X2, so this does not look like it contradicts an in-sync Push submodule preview: {message}");
+        assert!(message.starts_with("UNPUSHED_SUBMODULE_OVERRIDABLE::"), "a superseded intermediate gitlink should be an explicit override, not a hard block: {message}");
+        // Confirm the override can publish this branch: the branch tip is
+        // restorable because it records X2. Only someone checking out the
+        // intermediate parent commit "Bump to X1" would hit the missing gitlink.
+        publish_branch_inner(parent_path, "main".into(), "origin".into(), String::new(), String::new(), String::new(), true)
+            .expect("override should allow publishing a branch whose final gitlink is already safely pushed");
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn parent_gitlink_commit_requires_the_submodule_commit_to_be_on_its_remote_first() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-block-local-gitlink-{suffix}"));
+        let parent = base.join("main");
+        let dep_remote = base.join("dep-remote.git");
+        let dep_seed = base.join("dep-seed");
+        fs::create_dir_all(&parent).unwrap();
+        fs::create_dir_all(&dep_seed).unwrap();
+        fs::create_dir_all(&dep_remote).unwrap();
+        fs::write(parent.join("README.md"), "root").unwrap();
+        fs::write(dep_seed.join("module.txt"), "v0").unwrap();
+
+        run_git(&dep_remote, &["init", "--bare"]);
+        for path in [&parent, &dep_seed] {
+            run_git(path, &["init"]);
+            run_git(path, &["config", "user.email", "test@example.com"]);
+            run_git(path, &["config", "user.name", "Test User"]);
+            run_git(path, &["add", "."]);
+            run_git(path, &["commit", "-m", "Initial"]);
+        }
+        run_git(&dep_seed, &["remote", "add", "origin", dep_remote.to_str().unwrap()]);
+        run_git(&dep_seed, &["-c", "protocol.file.allow=always", "push", "origin", "HEAD:main"]);
+        run_git(&parent, &["-c", "protocol.file.allow=always", "submodule", "add", dep_remote.to_str().unwrap(), "vendor/dep"]);
+        fake_https_gitmodules_url(&parent);
+        run_git(&parent, &["commit", "-am", "Add dep submodule"]);
+
+        let parent_path = parent.to_string_lossy().into_owned();
+        let sub_path = parent.join("vendor/dep");
+        run_git(&sub_path, &["config", "user.email", "test@example.com"]);
+        run_git(&sub_path, &["config", "user.name", "Test User"]);
+        fs::write(sub_path.join("module.txt"), "v1").unwrap();
+        commit_submodule_inner(parent_path.clone(), "vendor/dep".into(), "Submodule v1".into(), false).unwrap();
+
+        let blocked = commit_selected_internal(&parent_path, &["vendor/dep".to_string()], "Record dep v1");
+        assert!(blocked.is_err(), "a parent gitlink commit must not record a remote-unreachable submodule revision");
+        let message = blocked.unwrap_err();
+        assert!(message.contains("Push the submodule commit first"), "message should explain the safe order: {message}");
+        assert!(message.contains("vendor/dep"), "message should name the submodule path: {message}");
+
+        push_submodule_inner(parent_path.clone(), "vendor/dep".into()).unwrap();
+        commit_selected_internal(&parent_path, &["vendor/dep".to_string()], "Record dep v1")
+            .expect("once the submodule commit is on origin, recording the project gitlink is safe");
 
         fs::remove_dir_all(base).unwrap();
     }

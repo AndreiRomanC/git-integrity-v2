@@ -139,6 +139,7 @@ test('Explorer marks paths preserved in a stash without hiding their current Git
 test('Git column keeps full single-state labels and abbreviates only real combinations', () => {
   assert.match(app, /M: \{ code: 'ML', label: 'Modified locally'/);
   assert.match(app, /'\?\?': \{ code: 'UN', label: 'Untracked'/);
+  assert.match(app, /entry\.kind !== 'submodule' && entry\.unpushed/);
   assert.match(app, /if \(!states\.length\) addState\('TR', 'Tracked'\)/);
   assert.match(app, /ML \+ ST \+ NP/);
 });
@@ -154,6 +155,9 @@ test('a submodule row shows its attached branch or detached state, only when act
   assert.match(app, /function submoduleHeadHint\(entry\) \{\s*if \(entry\.submodule_initialized === false\) return 'Git submodule · not initialized';\s*if \(!entry\.submodule_checked\) return 'Independent Git repository';/);
   assert.match(app, /entry\.submodule_current_branch \? `Independent Git repository · \$\{entry\.submodule_current_branch\}` : 'Independent Git repository · detached'/);
   assert.match(app, /entry\.kind === 'submodule' \? esc\(submoduleHeadHint\(entry\)\)/);
+  assert.match(app, /function submoduleCheckoutBadgeHtml\(entry\)/);
+  assert.match(app, /On branch ·/);
+  assert.match(app, /Detached HEAD/);
   assert.match(app, /data-detail-action="subinit"/);
   assert.match(app, /invoke\('init_submodule', \{ repositoryPath: state\.repository\.path, relativePath: entry\.relative_path \}\)/);
   assert.match(app, /entry\.submodule_initialized === false[\s\S]*?Initialize submodule/);
@@ -237,9 +241,10 @@ test('the version selector\'s own Push button reuses the real push flow, not a s
 });
 
 test('branches containing a detached commit render as a compact bounded list', () => {
-  assert.match(css, /\.version-containing-branches \{[^}]*width: min\(560px, 100%\)/);
+  assert.match(css, /\.version-containing-branches \{[^}]*display: flex/);
   assert.match(css, /\.version-containing-branches \{[^}]*flex-direction: column/);
-  assert.match(css, /\.version-containing-branch \{[^}]*grid-template-areas: "name action" "meta action"/);
+  assert.match(css, /\.version-containing-group h5/);
+  assert.match(css, /\.version-containing-branch \{[^}]*grid-template-columns: minmax\(0, 1fr\) auto/);
   assert.match(css, /\.version-containing-branch strong \{[^}]*text-overflow: ellipsis/);
 });
 
@@ -383,4 +388,12 @@ test('submodule stash is disabled without local changes, and stage/unstage failu
   assert.match(app, /data-detail-action="substash" \$\{canStashInsideSubmodule \? '' : 'disabled'\}/);
   const flush = app.match(/async function flushOneBatch\(options\) \{([\s\S]*?)\n\}\n/)?.[1] || '';
   assert.match(flush, /const message = handleError\(error\);\s*showOperationToast\(`Stage\/Unstage failed: \$\{message\}`, 'error'\);/);
+});
+
+test('detached dirty submodules ask for a branch before commit or push', () => {
+  assert.match(app, /const detachedDirtySubmodule = entry\.kind === 'submodule' && entry\.submodule_initialized !== false && !submoduleBranchName && entry\.submodule_is_dirty;/);
+  assert.match(app, /Detached HEAD with local changes/);
+  assert.match(app, /data-detail-action="subnewbranch">Create branch here…/);
+  assert.match(app, /Commit requires an attached local branch/);
+  assert.match(app, /Push requires an attached local branch/);
 });

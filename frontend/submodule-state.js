@@ -5,14 +5,14 @@
 })(typeof globalThis !== 'undefined' ? globalThis : this, function () {
   const states = {
     changes_inside: {
-      row: 'Changes inside',
-      short: 'Changes inside · commit needed',
+      row: 'Commit inside',
+      short: 'Commit submodule changes',
       detail: 'Files inside this submodule have not been committed yet. Commit them in the submodule first.',
       tone: 'changed', actionable: true,
     },
     local_commit_push_needed: {
-      row: 'Local commit',
-      short: 'Local commit · push needed',
+      row: 'Push submodule',
+      short: 'Push submodule commit',
       detail: 'The submodule commit exists locally but is not on origin yet. Push the submodule before recording it in the project.',
       tone: 'unpushed', actionable: true,
     },
@@ -23,8 +23,8 @@
       tone: 'changed', actionable: true,
     },
     detached_choose_branch: {
-      row: 'Choose branch',
-      short: 'Choose branch before push',
+      row: 'Detached · branch needed',
+      short: 'Detached HEAD · choose branch before push',
       detail: 'This local commit is not known on origin and HEAD is detached. Switch to or create a branch before pushing.',
       tone: 'changed', actionable: true,
     },
@@ -35,19 +35,19 @@
       tone: 'changed', actionable: true,
     },
     on_origin_stage_project: {
-      row: 'New version · stage',
-      short: 'New version on origin · stage project',
+      row: 'Stage project link',
+      short: 'New version on origin · stage project link',
       detail: 'The submodule commit is already on origin. Stage the new submodule reference in the main project.',
       tone: 'new-version', actionable: true,
     },
     on_origin_commit_project: {
-      row: 'New version · commit',
-      short: 'New version on origin · commit project',
+      row: 'Commit project link',
+      short: 'New version on origin · commit project link',
       detail: 'The new submodule reference is staged in the main project. Commit the main project to record it.',
       tone: 'new-version', actionable: true,
     },
     project_commit_push_needed: {
-      row: 'Parent push pending',
+      row: 'Push project',
       short: 'Parent project commit · push pending',
       detail: 'The submodule itself is already in sync. The main project has a local commit that records this submodule reference and that parent commit still needs to be pushed.',
       tone: 'unpushed', actionable: true,
