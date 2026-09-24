@@ -138,10 +138,27 @@ test('Explorer marks paths preserved in a stash without hiding their current Git
 
 test('Git column keeps full single-state labels and abbreviates only real combinations', () => {
   assert.match(app, /M: \{ code: 'ML', label: 'Modified locally'/);
-  assert.match(app, /'\?\?': \{ code: 'UN', label: 'Untracked'/);
+  assert.match(app, /'\?\?': \{ code: 'UN', label: 'New file'/);
+  assert.match(app, /A: \{ code: 'AL', label: 'Staged new file'/);
+  assert.match(app, /function entryGitSummary\(entry\)/);
+  assert.match(app, /if \(entry\.status === 'A'\) return 'Staged new file';/);
+  assert.match(app, /<span>Git<\/span><strong>\$\{esc\(entryGitSummary\(entry\)\)\}<\/strong>/);
   assert.match(app, /entry\.kind !== 'submodule' && entry\.unpushed/);
   assert.match(app, /if \(!states\.length\) addState\('TR', 'Tracked'\)/);
   assert.match(app, /ML \+ ST \+ NP/);
+});
+
+test('brand-new untracked files and folders are labelled as new items in Explorer and details', () => {
+  assert.match(app, /function untrackedItemLabel\(entry\)/);
+  assert.match(app, /if \(entry\.kind === 'folder'\) return 'New folder';/);
+  assert.match(app, /return 'New file';/);
+  assert.match(app, /entryKindHint\(entry\)/);
+  assert.match(app, /function changeDisplayState\(change\)/);
+  assert.match(app, /if \(change\.status === '\?\?'\) return 'New file';/);
+  assert.match(app, /if \(change\.status === 'A'\) return change\.staged \? 'Staged new file' : 'New file';/);
+  assert.match(app, /This item is new on disk\. Stage it to include it in the next commit\./);
+  assert.match(app, /\$\{untrackedItemLabel\(entry\)\} — not tracked yet/);
+  assert.match(app, /entry\.status \|\| !entry\.tracked \? '<button data-detail-action="commit">Commit this item<\/button>'/);
 });
 
 test('a submodule row shows its attached branch or detached state, only when actually checked', () => {
@@ -154,7 +171,8 @@ test('a submodule row shows its attached branch or detached state, only when act
   // submodule repository.
   assert.match(app, /function submoduleHeadHint\(entry\) \{\s*if \(entry\.submodule_initialized === false\) return 'Git submodule · not initialized';\s*if \(!entry\.submodule_checked\) return 'Independent Git repository';/);
   assert.match(app, /entry\.submodule_current_branch \? `Independent Git repository · \$\{entry\.submodule_current_branch\}` : 'Independent Git repository · detached'/);
-  assert.match(app, /entry\.kind === 'submodule' \? esc\(submoduleHeadHint\(entry\)\)/);
+  assert.match(app, /if \(entry\.kind === 'submodule'\) return submoduleHeadHint\(entry\);/);
+  assert.match(app, /entry-hint">\$\{esc\(entryKindHint\(entry\)\)\}/);
   assert.match(app, /function submoduleCheckoutBadgeHtml\(entry\)/);
   assert.match(app, /On branch ·/);
   assert.match(app, /Detached HEAD/);
@@ -388,6 +406,14 @@ test('submodule stash is disabled without local changes, and stage/unstage failu
   assert.match(app, /data-detail-action="substash" \$\{canStashInsideSubmodule \? '' : 'disabled'\}/);
   const flush = app.match(/async function flushOneBatch\(options\) \{([\s\S]*?)\n\}\n/)?.[1] || '';
   assert.match(flush, /const message = handleError\(error\);\s*showOperationToast\(`Stage\/Unstage failed: \$\{message\}`, 'error'\);/);
+});
+
+test('checkbox stage flush waits only for index writes, not for the slow visual refresh', () => {
+  assert.match(app, /async function refreshStatusAndFolderInBackground\(repositoryPath, folder, reason = 'stage'\)/);
+  assert.match(app, /refreshStatusAndFolderInBackground\(repositoryPath, folder, `checkbox generation=\$\{generation\}`\)/);
+  assert.match(app, /flushOneBatch scheduled background refresh/);
+  assert.doesNotMatch(app, /await refreshStatusAndFolder\(repositoryPath, folder\);\n\s*jsPerfLog\(`flushOneBatch refresh/);
+  assert.match(app, /if \(state\.currentPath === folder\) await openDirectory\(folder, \{ force: true \}\);/);
 });
 
 test('detached dirty submodules ask for a branch before commit or push', () => {

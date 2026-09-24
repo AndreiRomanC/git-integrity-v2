@@ -368,6 +368,16 @@ fn recent_full_statuses(repository: &Repository, repository_path: &str) -> Resul
     Ok(statuses)
 }
 
+fn fresh_full_statuses(repository: &Repository, repository_path: &str, label: &str) -> Result<Vec<(String, String, bool)>, String> {
+    let lock_handle = status_scan_lock(repository_path);
+    let _guard = lock_handle.lock().unwrap();
+    let step = Instant::now();
+    let statuses = internal_statuses(repository, None)?;
+    perf_log(&format!("{label}: fresh full status scan"), step.elapsed());
+    full_status_cache().lock().unwrap().insert(repository_path.to_string(), (Instant::now(), statuses.clone()));
+    Ok(statuses)
+}
+
 // The branch's real configured upstream — branch.<local>.remote +
 // branch.<local>.merge, via git2's own Branch::upstream() — not a hardcoded
 // assumption that the remote is named `origin` and that the remote-tracking
@@ -2260,13 +2270,13 @@ fn stage_all_inner(repository_path: &str, scope: &str) -> Result<StageResult, St
     }
     let step = Instant::now();
     let repo = internal_repository(repository_path)?;
-    // recent_full_statuses (not a plain fresh scan) — this still needs the
-    // true current disk state, but shares that requirement with
-    // refresh_status via the same short reuse window/single-flight instead
-    // of always paying for its own separate scan: opening the Working tree
-    // drawer immediately followed by Stage all is exactly the case that
-    // used to mean two full scans back to back.
-    let full = recent_full_statuses(&repo, repository_path)?;
+    // Stage all is a mutating command, so correctness must beat the short
+    // status-reuse optimization used by passive refreshes. A file copied in
+    // from Explorer/right before clicking Stage all must be discovered even
+    // if a refresh_status call populated the cache a few milliseconds ago.
+    // Keep the same single-flight lock to avoid concurrent status walks, but
+    // deliberately take a fresh snapshot here before deciding what to stage.
+    let full = fresh_full_statuses(&repo, repository_path, "stage_all")?;
     let paths: Vec<String> = if scope.is_empty() {
         full.into_iter().map(|(path, _, _)| path).collect()
     } else {
@@ -5837,7 +5847,30 @@ pub fn restore_file(repository_path: String, relative_path: String, source_ref: 
     let repo = internal_repository(&repository_path)?;
     let object = repo.revparse_single(source_ref.trim()).or_else(|_| repo.revparse_single(&format!("refs/remotes/{}", source_ref.trim()))).map_err(|error| format!("Cannot resolve {source_ref}: {}", error.message()))?;
     let commit = object.peel_to_commit().map_err(|error| error.message().to_string())?; let tree = commit.tree().map_err(|error| error.message().to_string())?;
-    let entry = tree.get_path(&relative).map_err(|_| format!("{} does not exist in {source_ref}", normalized(&relative)))?; let blob = repo.find_blob(entry.id()).map_err(|error| error.message().to_string())?;
+    let entry = match tree.get_path(&relative) {
+        Ok(entry) => entry,
+        Err(_) => {
+            // Restoring a path that is new relative to the selected source is
+            // a discard, not a blob checkout. The common case is: create a new
+            // file, stage it (so it is "tracked" in the index), delete it from
+            // disk, then choose Restore from HEAD. That path genuinely does
+            // not exist in HEAD, so the only correct restore result is to
+            // remove the staged add and leave no file behind — otherwise the
+            // UI keeps showing a confusing tracked/new/deleted remnant.
+            let mut index = repo.index().map_err(|error| error.message().to_string())?;
+            let _ = index.remove_path(relative.as_path());
+            index.write().map_err(|error| error.message().to_string())?;
+            let destination = Path::new(&repository_path).join(&relative);
+            if destination.is_dir() {
+                fs::remove_dir_all(&destination).map_err(|error| error.to_string())?;
+            } else if destination.exists() {
+                fs::remove_file(&destination).map_err(|error| error.to_string())?;
+            }
+            invalidate_git_metadata(&repository_path);
+            return Ok(());
+        }
+    };
+    let blob = repo.find_blob(entry.id()).map_err(|error| error.message().to_string())?;
     let destination = Path::new(&repository_path).join(&relative);
     if let Some(parent) = destination.parent() { fs::create_dir_all(parent).map_err(|error| error.to_string())?; }
     fs::write(destination, blob.content()).map_err(|error| error.to_string())?;
@@ -6730,7 +6763,7 @@ fn pull_submodule_inner(repository_path: String, relative_path: String) -> Resul
     let (analysis, _) = repo.merge_analysis(&[&annotated]).map_err(|error| error.message().to_string())?;
     if analysis.is_up_to_date() { return Err(format!("Already up to date with {}.", destination.display)); }
     if !analysis.is_fast_forward() {
-        return Err(format!("Cannot fast-forward — your local commit(s) and {} have diverged (both have commits the other doesn't). Keep both histories with the app's \"Merge branch…\" action, or deliberately delete the local-only history with \"Change version\" → \"Discard local work…\".", destination.display));
+        return Err(format!("Cannot fast-forward — your local commit(s) and {} have diverged (both have commits the other doesn't). Keep both histories with the app's \"Merge branch…\" action, or deliberately replace the local branch with the remote version via \"Change version\" → \"Replace with remote…\".", destination.display));
     }
     let mut local = repo.find_reference(&format!("refs/heads/{branch}")).map_err(|error| error.message().to_string())?;
     local.set_target(target, "fast-forward pull").map_err(|error| error.message().to_string())?;
@@ -13303,14 +13336,13 @@ mod tests {
     }
 
     #[test]
-    fn refresh_status_then_stage_all_reuse_the_same_recent_scan() {
-        // Reproduces the report exactly: opening Working tree (refresh_status)
-        // immediately followed by Stage all used to each pay for their own
-        // separate full status scan of the same thing a moment apart. Seeds
-        // full_status_cache directly with a recognizable fake entry (a path
-        // that could never come from a real scan of this repo) so a HIT can
-        // be told apart from a real scan with certainty, rather than
-        // inferring it from timing.
+    fn stage_all_ignores_stale_recent_status_and_catches_new_external_files() {
+        // Reproduces the correctness side of the Windows report: a passive
+        // refresh may have populated the short reuse cache, then a file is
+        // added from outside the app, and Stage all must still discover and
+        // stage that new file. Stage all is a mutating command, so it must
+        // take a fresh status snapshot instead of trusting the recent-cache
+        // optimization used by passive refreshes.
         let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let repo_path = std::env::temp_dir().join(format!("git-integrity-status-reuse-{suffix}"));
         create_libgit2_repository(&repo_path, "README.md");
@@ -13323,17 +13355,37 @@ mod tests {
         assert_eq!(changes.len(), 1, "should have reused the seeded entry, not scanned the (actually empty) real repository");
         assert_eq!(changes[0].path, fake_marker);
 
-        let staged = stage_all_inner(&repo_string, "").unwrap();
-        assert_eq!(staged.staged_paths.len(), 1, "stage_all right after should reuse the same still-fresh scan, not run its own");
+        fs::write(repo_path.join("external-new-file.txt"), "created outside the cached status").unwrap();
 
-        // Age the cache entry past the reuse window (without a real sleep) —
-        // the next call must fall through to a genuine fresh scan and stop
-        // seeing the fake marker, since it was never a real file on disk.
-        if let Some(entry) = full_status_cache().lock().unwrap().get_mut(&repo_string) {
-            entry.0 = Instant::now() - FRESH_STATUS_REUSE_WINDOW - Duration::from_millis(500);
-        }
+        let staged = stage_all_inner(&repo_string, "").unwrap();
+        assert_eq!(staged.staged_paths, vec!["external-new-file.txt".to_string()], "stage_all must ignore stale recent status and stage the real new file");
+
         let changes_after_expiry = refresh_status_inner(repo_string.clone()).unwrap();
-        assert!(changes_after_expiry.is_empty(), "past the reuse window, this must be a real fresh scan of the (clean) repository, not the stale fake entry");
+        assert_eq!(changes_after_expiry.len(), 1);
+        assert_eq!(changes_after_expiry[0].path, "external-new-file.txt");
+        assert_eq!(changes_after_expiry[0].status, "A");
+        assert!(changes_after_expiry[0].staged);
+    }
+
+    #[test]
+    fn restoring_a_staged_new_file_absent_from_head_discards_it_completely() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let repo_path = std::env::temp_dir().join(format!("git-integrity-restore-new-file-{suffix}"));
+        create_libgit2_repository(&repo_path, "README.md");
+        let repo_string = repo_path.to_string_lossy().into_owned();
+
+        fs::write(repo_path.join("new-file.txt"), "local only").unwrap();
+        stage_files_inner(&repo_string, vec!["new-file.txt".into()]).unwrap();
+        fs::remove_file(repo_path.join("new-file.txt")).unwrap();
+        assert!(refresh_status_inner(repo_string.clone()).unwrap().iter().any(|change| change.path == "new-file.txt"));
+
+        restore_file(repo_string.clone(), "new-file.txt".into(), "HEAD".into()).unwrap();
+
+        assert!(!repo_path.join("new-file.txt").exists(), "a file absent from HEAD must not be recreated");
+        let status = refresh_status_inner(repo_string.clone()).unwrap();
+        assert!(!status.iter().any(|change| change.path == "new-file.txt"), "restoring a staged new file absent from HEAD must remove both the worktree file and the staged add");
+        let cached = load_directory_inner(repo_string, "".into(), Some(true)).unwrap();
+        assert!(!cached.iter().any(|entry| entry.relative_path == "new-file.txt"), "Explorer must not keep showing the discarded local-only file as tracked");
     }
 
     fn setup_parent_with_two_submodules(base: &Path) -> (String, PathBuf, PathBuf) {

@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Git DrillDown</title>
   <link rel="icon" type="image/png" href="assets/git-drilldown-mark.png">
-  <link rel="stylesheet" href="styles.css?v=20260923-safe-submodule-branch-workflow">
+  <link rel="stylesheet" href="styles.css?v=20260924-no-work-wording">
 </head>
 <body>
   <div class="app-shell">
@@ -60,7 +60,7 @@
         </button>
         <button class="workspace-status publish-status" id="showPublish"><span class="publish-dot">↑</span><span><strong>Unpublished</strong><small id="publishSubtitle">Choose what goes to server</small></span><b id="publishBadge">?</b></button>
         <button class="workspace-status" id="mergeConflictsBanner" data-tooltip="A merge is waiting for you to resolve conflicts" title="Resolve merge conflicts" hidden><span class="workspace-dot" style="background:#f06d75;"></span><span><strong>Merge conflicts</strong><small id="mergeConflictsSubtitle">0 files to resolve</small></span></button>
-        <button class="workspace-status" id="popStash" data-tooltip="Opens the stash list for the repository you are currently browsing. A parent project and each submodule have separate stash lists." title="View stashes for the current repository"><span class="workspace-dot" style="background:#48cc7e;"></span><span><strong>Stashes</strong><small id="stashListSubtitle">View saved project work</small></span></button>
+        <button class="workspace-status" id="popStash" data-tooltip="Opens the stash list for the repository you are currently browsing. A parent project and each submodule have separate stash lists." title="View stashes for the current repository"><span class="workspace-dot" style="background:#48cc7e;"></span><span><strong>Stashes</strong><small id="stashListSubtitle">View saved project changes</small></span></button>
 
         <div class="side-heading pr-status-heading" id="togglePrStatus" title="Pull request status for the PARENT project's currently checked-out branch — always the parent, never a submodule. Opens disconnected and checks only when you press Connect or Refresh."><span class="branch-heading-arrow" id="prStatusArrow">▸</span><span>PROJECT PULL REQUEST</span></div>
         <div id="prStatusPanel" class="pr-status-panel collapsed"></div>
@@ -91,7 +91,7 @@
             <button class="scope-action folder-changes-action" id="showFolderChanges">Changes in folder</button>
             <button class="scope-action" id="runCurrentUtrud" title="Launch UTRUD for the current folder (Windows only)" hidden>▶ Run UTRUD</button>
             <button class="scope-action" id="addSubmodule">＋ Add submodule</button>
-            <button class="scope-action" id="stashWork" title="Stash changes in the current repository — sets aside uncommitted changes only in the repository you are currently browsing (the whole parent project, or the submodule you're currently inside — not just this one folder). A parent project and each submodule have separate stashes.">Stash folder</button>
+            <button class="scope-action" id="stashWork" title="Stash changes in the current repository — sets aside uncommitted changes only in the repository you are currently browsing (the whole parent project, or the submodule you're currently inside — not just this one folder). A parent project and each submodule have separate stashes.">Stash changes</button>
             <button class="scope-action primary" id="commitScope">Commit folder</button>
             <button class="icon-action" id="goUp" title="Parent folder">↑</button>
             <button class="icon-action" id="reloadFolder" title="Reload folder">↻</button>
@@ -211,7 +211,7 @@
       </div>
       <input id="submoduleVersionSearch" class="version-search" type="text" placeholder="Search branches, SHAs or messages…" autocomplete="off" spellcheck="false">
       <div id="submoduleVersions" class="version-list"></div>
-      <footer id="submoduleVersionHelp" class="version-help">Use Checkout to change version. “Discard local work…” is a destructive recovery action shown only for a branch that differs from origin.</footer>
+      <footer id="submoduleVersionHelp" class="version-help">Use Checkout to change version. “Replace with remote…” is a destructive recovery action shown only for a branch that differs from origin.</footer>
     </section>
 
     <footer id="statusFooter" title="Double-click for recent command history">
@@ -292,7 +292,7 @@
     <form method="dialog">
       <div class="commit-dialog-icon">✓</div>
       <h2>Commit selected changes</h2>
-      <p>Only changes inside <strong id="commitScopeName">the current folder</strong> will be committed. Other staged changes remain untouched.</p>
+      <p>Only changes inside <strong id="commitScopeName">the current folder</strong> will be staged for this scoped commit. Existing staged changes outside this scope stay staged, but are not included.</p>
       <label><span>Commit message</span><textarea id="scopeCommitMessage" placeholder="Describe this change…"></textarea></label>
       <div class="commit-dialog-actions"><button value="cancel">Cancel</button><button value="default" id="confirmScopeCommit" class="confirm" disabled>Commit selection</button></div>
     </form>
@@ -524,12 +524,12 @@
             <li><b class="help-tag blue">Not pushed yet</b> — fully committed, but that commit hasn't reached the server. Nothing to commit here — it needs a push.</li>
             <li><b class="help-tag blue">New version</b> (submodules only) — the submodule has a new commit, already recorded in the project, just not pushed to its own server yet.</li>
           </ul>
-          <p>One state is written in full. When several facts apply at once, the Git column uses compact badges so none are hidden: <code>ML</code> modified locally, <code>ST</code> stashed work, <code>NP</code> not pushed, <code>UN</code> untracked. Hover the badges to read every full description.</p>
+          <p>One state is written in full. When several facts apply at once, the Git column uses compact badges so none are hidden: <code>ML</code> modified locally, <code>ST</code> stashed changes, <code>NP</code> not pushed, <code>UN</code> untracked. Hover the badges to read every full description.</p>
         </details>
         <details>
           <summary>Working tree (Commit)</summary>
-          <p>Click "Working tree" in the sidebar (or "Changes in folder" in the toolbar) to see everything changed. Opening it auto-stages everything in scope, so Commit works immediately — untick anything you don't want included, then write a message and hit Commit.</p>
-          <p>"Commit this item" in a file/folder's details panel commits just that one item, same idea, scoped to it.</p>
+          <p>Click "Working tree" in the sidebar (or "Changes in folder" in the toolbar) to see everything changed. Tick the files you want, or use "Stage all", then write a message and hit Commit.</p>
+          <p>"Commit this item" in a file/folder's details panel stages only that selected file or folder for the scoped commit. Existing staged changes outside it stay staged, but are not included in that commit.</p>
           <p>The "Default commit message" field at the top pre-fills every commit box for you — handy when several commits in a row are against the same ticket. It remembers your last 10 messages (click the field to see them again) and shows a small Polarion link when the text matches <code>P:ID</code>.</p>
         </details>
         <details>
@@ -565,8 +565,8 @@
         </details>
         <details>
           <summary>Stash</summary>
-          <p>The stash is a temporary holding area — changes you put there are set aside and won't be part of any commit until you bring them back. "Stash work" sets aside the uncommitted work in the <i>repository currently being browsed</i>, leaving that working folder clean.</p>
-          <p>The main project and every submodule are independent Git repositories, so they also have independent stash lists. Stashing the main project never hides edits inside a submodule. Enter that submodule (or use its details panel) to stash its work.</p>
+          <p>The stash is a temporary holding area — changes you put there are set aside and won't be part of any commit until you bring them back. "Stash changes" sets aside the uncommitted changes in the <i>repository currently being browsed</i>, leaving that repository clean.</p>
+          <p>The main project and every submodule are independent Git repositories, so they also have independent stash lists. Stashing the main project never hides edits inside a submodule. Enter that submodule (or use its details panel) to stash its changes.</p>
           <p>"Stashes" opens the full list for the current repository — one row for every entry and the files it contains. Click "⇈ Restore" next to any file to bring back only that file. The original stash remains as a safety backup until you explicitly use "Drop"; Drop permanently discards the whole saved entry.</p>
           <p>To set aside just <i>one</i> file instead of everything, use the "⇕ Stash" button next to it in the Working tree drawer, or "⇕ Stash this file" in that file's own details panel (select it in Explorer to see it) — either way, only that file is stashed; every other change stays untouched.</p>
           <p>Stashes show up as small ⇕ markers in the Branch Map on the commit they were based on, not as real history — click one to expand it and see exactly which files it contains, before you decide to bring it back.</p>
@@ -627,13 +627,13 @@
       <footer><button value="cancel">Cancel</button><button type="button" value="default" id="confirmNewTag" class="confirm">Create tag</button></footer>
     </form>
   </dialog>
-  <script src="console-context.js?v=20260923-safe-submodule-branch-workflow"></script>
-  <script src="graph-model.js?v=20260923-safe-submodule-branch-workflow"></script>
-  <script src="submodule-state.js?v=20260923-safe-submodule-branch-workflow"></script>
-  <script src="submodule-versions.js?v=20260923-safe-submodule-branch-workflow"></script>
-  <script src="local-diff.js?v=20260923-safe-submodule-branch-workflow"></script>
-  <script src="local-drive.js?v=20260923-safe-submodule-branch-workflow"></script>
-  <script src="pr-status.js?v=20260923-safe-submodule-branch-workflow"></script>
-  <script src="app.js?v=20260923-safe-submodule-branch-workflow"></script>
+  <script src="console-context.js?v=20260924-no-work-wording"></script>
+  <script src="graph-model.js?v=20260924-no-work-wording"></script>
+  <script src="submodule-state.js?v=20260924-no-work-wording"></script>
+  <script src="submodule-versions.js?v=20260924-no-work-wording"></script>
+  <script src="local-diff.js?v=20260924-no-work-wording"></script>
+  <script src="local-drive.js?v=20260924-no-work-wording"></script>
+  <script src="pr-status.js?v=20260924-no-work-wording"></script>
+  <script src="app.js?v=20260924-no-work-wording"></script>
 </body>
 </html>

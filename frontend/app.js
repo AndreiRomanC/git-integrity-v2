@@ -404,7 +404,7 @@ function handleError(error) {
     'no upstream': 'Go to Branch Map (Ctrl+Shift+G) → Right-click branch → Set upstream',
     'not a git': 'Open a valid Git repository with File > Open Repository',
     'merge conflict': 'Resolve conflicts manually in the files, then stage them',
-    'diverged': 'To keep both histories, use “Merge branch…”. To throw away the local branch history, open “Change version” and use “Discard local work…” on that branch.',
+    'diverged': 'To keep both histories, use “Merge branch…”. To throw away the local branch history, open “Change version” and use “Replace with remote…” on that branch.',
     'non-fast-forward': 'Use "Pull submodule" first. If it also refuses (diverged), resolve manually in a terminal: `git fetch`, `git merge origin/<branch>`, fix conflicts, commit, then push.',
     'authentication': 'Check your Git credentials and SSH keys',
     'permission denied': 'Check file permissions and access rights',
@@ -1019,14 +1019,30 @@ function submoduleHeadHint(entry) {
   return entry.submodule_current_branch ? `Independent Git repository · ${entry.submodule_current_branch}` : 'Independent Git repository · detached';
 }
 
+function untrackedItemLabel(entry) {
+  if (!entry || entry.tracked) return '';
+  if (entry.kind === 'folder') return 'New folder';
+  if (entry.kind === 'symlink') return 'New symlink';
+  if (entry.kind === 'submodule') return 'New submodule';
+  return 'New file';
+}
+
+function entryKindHint(entry) {
+  if (entry.kind === 'submodule') return submoduleHeadHint(entry);
+  if (entry.kind === 'deleted-submodule') return 'Deleted Git submodule';
+  if (entry.kind === 'deleted-folder') return 'Deleted tracked folder';
+  if (entry.kind === 'deleted') return 'Deleted tracked file';
+  return untrackedItemLabel(entry) || entry.kind;
+}
+
 function gitState(entry) {
   const statusStates = {
     M: { code: 'ML', label: 'Modified locally', tone: 'changed' },
-    A: { code: 'AL', label: 'Added locally', tone: 'changed' },
+    A: { code: 'AL', label: 'Staged new file', tone: 'changed' },
     D: { code: 'DL', label: 'Deleted locally', tone: 'changed' },
     R: { code: 'RL', label: 'Renamed locally', tone: 'changed' },
     U: { code: 'CF', label: 'Conflict', tone: 'changed' },
-    '??': { code: 'UN', label: 'Untracked', tone: 'untracked' },
+    '??': { code: 'UN', label: 'New file', tone: 'untracked' },
     '•': { code: 'MI', label: 'Modified files inside', tone: 'changed' },
   };
   const submoduleCodes = {
@@ -1056,7 +1072,7 @@ function gitState(entry) {
   // this fixed-width grid column instead of overflowing and squashing the
   // dot or deforming the row — "Contains unpushed commits" on a folder used
   // to do exactly that.
-  else if (!entry.tracked) addState('UN', 'Untracked', 'untracked');
+  else if (!entry.tracked) addState('UN', untrackedItemLabel(entry) || 'New file', 'untracked');
   else if (entry.kind === 'submodule') {
     if (entry.submodule_initialized === false) addState('NI', 'Not initialized', 'changed');
     const stateView = SubmoduleStateModel.presentation(entry.submodule_state);
@@ -1066,14 +1082,16 @@ function gitState(entry) {
       addState(state.code, state.label, state.tone);
     }
   } else if (entry.status) {
-    const state = statusStates[entry.status] || { code: entry.status, label: entry.status, tone: 'changed' };
+    const state = entry.status === '??'
+      ? { code: 'UN', label: untrackedItemLabel(entry) || 'New file', tone: 'untracked' }
+      : statusStates[entry.status] || { code: entry.status, label: entry.status, tone: 'changed' };
     addState(state.code, state.label, state.tone);
   }
   // Fully committed (no working-tree status at all) but that commit hasn't
   // reached the branch's upstream yet — a real, distinct state from both
   // "clean" and "modified": nothing here needs a commit, it needs a push.
   if (entry.kind !== 'submodule' && entry.unpushed && !states.some(state => ['LP', 'PP'].includes(state.code))) addState('NP', entry.kind === 'folder' ? 'Contains unpushed commits' : 'Not pushed yet', 'unpushed');
-  if (entry.stashed) addState('ST', ['folder', 'deleted-folder'].includes(entry.kind) ? 'Contains stashed work' : 'Stashed version exists', 'stashed');
+  if (entry.stashed) addState('ST', ['folder', 'deleted-folder'].includes(entry.kind) ? 'Contains stashed changes' : 'Stashed version exists', 'stashed');
   if (!states.length) addState('TR', 'Tracked');
 
   const title = states.map(state => `${state.code}: ${state.label}`).join(' · ');
@@ -1088,6 +1106,27 @@ function gitState(entry) {
     ? `<em>${esc(states[0].label)}</em>`
     : `<em>${esc(primaryState.label)}</em>${extraStates.length ? `<span class="git-badge-tray">${extraStates.map(badgeFor).join('')}</span>` : ''}`;
   return `<span class="git-state ${esc(tone)} ${states.length > 1 ? 'combined' : ''}" title="${esc(title)}"><i class="git-dot"></i><span>${content}</span></span>`;
+}
+
+function entryGitSummary(entry) {
+  if (!entry) return 'Unknown';
+  if (entry.status_known === false) return 'Loading Git status…';
+  if (!entry.tracked) return `${untrackedItemLabel(entry)} — not tracked yet`;
+  if (entry.kind === 'submodule') {
+    if (entry.submodule_initialized === false) return 'Submodule not initialized';
+    const stateView = SubmoduleStateModel.presentation(entry.submodule_state);
+    if (stateView?.actionable) return stateView.short;
+  }
+  if (entry.status === '??') return untrackedItemLabel(entry) || 'New file';
+  if (entry.status === 'A') return 'Staged new file';
+  if (entry.status === 'M') return entry.kind === 'folder' ? 'Modified files inside' : 'Modified locally';
+  if (entry.status === 'D') return 'Deleted locally';
+  if (entry.status === 'R') return 'Renamed locally';
+  if (entry.status === 'U') return 'Conflict';
+  if (entry.status === '•') return 'Modified files inside';
+  if (entry.status) return entry.status;
+  if (entry.unpushed) return entry.kind === 'folder' ? 'Clean — contains unpushed commits' : 'Committed, not pushed yet';
+  return 'Tracked, clean';
 }
 
 function renderBreadcrumbs() {
@@ -1152,7 +1191,7 @@ function renderExplorer() {
     <span></span><span></span><span></span>
   </button>` : '';
   const rowsHtml = entries.map(entry => `<button class="file-row file-grid ${entry.status || !entry.tracked ? 'has-change' : ''} ${entryHasPersonalNote(entry) ? 'has-personal-note' : ''} ${state.selectedEntry?.relative_path === entry.relative_path ? 'selected' : ''}" data-entry="${esc(entry.relative_path)}">
-    <span class="file-main">${iconFor(entry)}<span class="entry-copy"><span class="entry-name">${esc(entry.name)}${entryHasPersonalNote(entry) ? '<b class="personal-note-dot" title="Personal note">✎</b>' : ''}${entry.kind === 'submodule' ? '<b class="inline-submodule-badge">SUBMODULE</b>' : ''}</span><span class="entry-hint">${entry.kind === 'submodule' ? esc(submoduleHeadHint(entry)) : entry.kind === 'deleted-submodule' ? 'Deleted Git submodule' : entry.kind === 'deleted-folder' ? 'Deleted tracked folder' : entry.kind === 'deleted' ? 'Deleted tracked file' : entry.kind}</span></span>${['folder','submodule'].includes(entry.kind) ? '<span class="folder-arrow">›</span>' : ''}</span>
+    <span class="file-main">${iconFor(entry)}<span class="entry-copy"><span class="entry-name">${esc(entry.name)}${entryHasPersonalNote(entry) ? '<b class="personal-note-dot" title="Personal note">✎</b>' : ''}${entry.kind === 'submodule' ? '<b class="inline-submodule-badge">SUBMODULE</b>' : ''}</span><span class="entry-hint">${esc(entryKindHint(entry))}</span></span>${['folder','submodule'].includes(entry.kind) ? '<span class="folder-arrow">›</span>' : ''}</span>
     ${gitState(entry)}<span class="file-size">${entry.kind === 'file' ? formatSize(entry.size) : '—'}</span><span class="file-modified">${formatModified(entry.modified)}</span>
   </button>`).join('') || (state.currentPath ? '' : '<div class="empty-change">This folder is empty</div>');
   const showAllStub = capped ? `<div class="history-truncated-stub"><span>Showing ${EXPLORER_DOM_ROW_CAP} of ${allEntries.length} items</span><button id="explorerShowAll">Show all ${allEntries.length}</button></div>` : '';
@@ -1525,7 +1564,7 @@ async function discardSubmoduleBranchAndUseUpstream({ name, upstream, ahead, beh
   const counts = `${Number(ahead) || 0} ahead / ${Number(behind) || 0} behind`;
   const confirmed = await customConfirm(
     `Replace local branch "${name}" with ${upstream} (${counts})?\n\nThis is not Push, Pull, or the normal way to record a new submodule version. It is destructive recovery: it permanently deletes this branch's local-only commits, staged files, and uncommitted edits, deletes untracked and ignored files, then checks out the remote version.\n\nThe parent project's recorded submodule version is not changed automatically.`,
-    { title: 'Discard local branch work', okLabel: `Discard local work and use ${upstream}`, danger: true }
+    { title: 'Replace local branch with remote', okLabel: `Replace with ${upstream}`, danger: true }
   );
   if (!confirmed) return;
   if (!invoke) return status(`Preview: discard local ${name} and use ${upstream}`);
@@ -1537,7 +1576,7 @@ async function discardSubmoduleBranchAndUseUpstream({ name, upstream, ahead, beh
     const data = await invoke('load_repository', { path: state.repository.path, force: false });
     Object.assign(state, data); state.view = 'explorer'; directoryCache.clear(); closeSubmoduleMenu();
     await openDirectory(folder, { force: true });
-    const message = `${submoduleMenuEntry?.name || 'Submodule'}: ${result.branch} now matches ${result.upstream} @ ${result.revision.slice(0, 8)}. Local-only work was discarded.`;
+    const message = `${submoduleMenuEntry?.name || 'Submodule'}: ${result.branch} now matches ${result.upstream} @ ${result.revision.slice(0, 8)}. Local-only commits and changes were discarded.`;
     status(message); showOperationToast(message, 'success');
   } catch (error) { const message = handleError(error); showOperationToast(`Could not replace the local branch: ${message}`, 'error'); }
   finally { finishButton(); }
@@ -1771,7 +1810,7 @@ function renderEntryDetails(entry) {
     : deletedEntry
       ? '<div class="local-change-banner"><i></i><div><strong>Deleted locally</strong><span>Git still tracks this item, but it no longer exists on disk. Commit this deletion to record it, or restore it from HEAD if the removal was accidental.</span></div></div>'
     : entry.status || !entry.tracked
-      ? `<div class="local-change-banner"><i></i><div><strong>${entry.tracked ? 'Modified locally' : 'New local file'}</strong><span>This item differs from the committed repository state.</span></div></div>`
+      ? `<div class="local-change-banner"><i></i><div><strong>${entry.tracked ? 'Modified locally' : untrackedItemLabel(entry)}</strong><span>${entry.tracked ? 'This item differs from the committed repository state.' : 'This item is new on disk. Stage it to include it in the next commit.'}</span></div></div>`
       : '';
   const submoduleBranchName = entry.kind === 'submodule' ? (entry.submodule_current_branch || '') : '';
   const canCommitInsideSubmodule = entry.kind === 'submodule' && entry.submodule_state === 'changes_inside' && Boolean(submoduleBranchName);
@@ -1779,7 +1818,7 @@ function renderEntryDetails(entry) {
   const canPushSubmodule = entry.kind === 'submodule' && entry.submodule_initialized !== false && Boolean(submoduleBranchName);
   const detachedDirtySubmodule = entry.kind === 'submodule' && entry.submodule_initialized !== false && !submoduleBranchName && entry.submodule_is_dirty;
   const detachedDirtyBanner = detachedDirtySubmodule
-    ? '<div class="detached-work-banner"><i></i><div><strong>Detached HEAD with local changes</strong><span>Create a branch here before Commit or Push. Your files stay as they are; the branch only gives this work a safe name.</span></div><button data-detail-action="subnewbranch">Create branch here…</button></div>'
+    ? '<div class="detached-work-banner"><i></i><div><strong>Detached HEAD with local changes</strong><span>Create a branch here before Commit or Push. Your files stay as they are; the branch only gives these changes a safe name.</span></div><button data-detail-action="subnewbranch">Create branch here…</button></div>'
     : '';
   const submoduleCommitTooltip = canCommitInsideSubmodule
     ? `Commit uncommitted changes inside the checked-out branch "${submoduleBranchName}"`
@@ -1796,8 +1835,8 @@ function renderEntryDetails(entry) {
     <h2>${esc(entry.name)}</h2><div class="entry-path">${esc(entry.relative_path)}</div>${entry.kind === 'submodule' ? `<div class="submodule-badges"><span class="submodule-badge">◇ Git submodule</span>${submoduleCheckoutBadgeHtml(entry)}</div>` : ''}
     ${changeBanner}
     ${detachedDirtyBanner}
-    <div class="context-actions">${deletedEntry ? '' : entry.kind === 'file' ? '<button data-detail-action="edit">Edit local file</button>' : ''}${entry.kind === 'submodule' ? '' : '<button data-detail-action="server">Open on server ↗</button>'}${entry.kind === 'submodule' ? '' : '<button data-detail-action="history">View history</button>'}${entry.kind === 'folder' ? '<button data-detail-action="restorefolder" class="danger-action-soft" data-tooltip="Restore only this folder from HEAD or a selected commit. Does not move HEAD or switch branch.">↶ Restore folder…</button><button data-detail-action="stashwork" data-tooltip="Stash uncommitted work in the current repository. This is repository-scoped, not only this folder. If there is nothing local to save, Git Drill Down will refuse and explain why.">Stash repository work</button>' : ''}${entry.status ? '<button data-detail-action="commit">Commit this item</button>' : ''}${entry.kind === 'deleted' ? '<button data-detail-action="head" data-tooltip="Restore this deleted file from your last local commit (HEAD)">↶ Restore from last commit (HEAD)</button>' : ''}${['folder','submodule'].includes(entry.kind) ? '<button data-detail-action="utrud" data-tooltip="Launches UTRUD with this folder path. UTRUD decides whether the selected folder is valid. Windows only.">▶ Run UTRUD</button>' : ''}${entry.kind === 'file' && (entry.status || !entry.tracked) ? `<button data-detail-action="stage" data-tooltip="git add — add this file's current content to staging">＋ Stage this file</button><button data-detail-action="unstage" data-tooltip="Unstage — git restore --staged. Removes only the staging entry; your edits on disk are kept exactly as they are.">− Unstage</button><button data-detail-action="stashfile" data-tooltip="Sets this file aside in this repository's own stash. Parent projects and submodules have separate stash lists.">⇕ Stash this file</button><button data-detail-action="head" class="danger-action-soft" data-tooltip="Restore from your last local commit (HEAD) — git checkout HEAD -- file. Permanently discards ALL edits; the file on disk becomes identical to what you last committed. Cannot be undone.">↶ Restore from last commit (HEAD)</button><button data-detail-action="compare" data-tooltip="Open side-by-side compare with restore options">⇄ Compare with remote</button>` : ''}${entry.kind === 'submodule' ? `${submoduleInitButton}<button data-detail-action="subserver">Open submodule repository ↗</button><button data-detail-action="subgraph" data-tooltip="Open this submodule's own branch/commit history — never the parent project's">Submodule Branch Map</button><button data-detail-action="subrefchanges" data-tooltip="A different, narrower question: which commits in the PARENT project changed this submodule's recorded version. Not the submodule's own history.">Submodule Reference Changes</button><button data-detail-action="subnewbranch" data-tooltip="Create a new local branch in this submodule, starting from its current commit, and switch to it">＋ New branch…</button><button data-detail-action="versions">Change version</button><button data-detail-action="substash" ${canStashInsideSubmodule ? '' : 'disabled'} data-tooltip="${canStashInsideSubmodule ? 'Set aside uncommitted files inside this submodule only. The parent project is untouched.' : 'No uncommitted local files inside this submodule to stash.'}">Stash submodule work</button><button data-detail-action="substashes" data-tooltip="View and restore this submodule's own stashes. The parent project's stash list is separate.">Submodule stashes</button><button data-detail-action="subcommit" ${canCommitInsideSubmodule ? '' : 'disabled'} data-tooltip="${esc(submoduleCommitTooltip)}">Commit submodule</button><button data-detail-action="subreset" class="danger-action-soft" ${entry.status ? '' : 'disabled'} data-tooltip="${entry.status ? 'Discard local work and restore the exact submodule commit recorded by the parent project. This leaves detached HEAD, like git submodule update.' : 'The submodule already uses the version recorded by the parent project'}">↺ Restore project version…</button><button data-detail-action="subpull" data-tooltip="Fast-forward pull — brings in new commits from the submodule's remote. Refuses if it would require a manual merge.">Pull submodule</button><button data-detail-action="submerge" data-tooltip="Merge a branch into this submodule's current branch, with conflict resolution if needed">Merge branch…</button><button data-detail-action="subpush" ${canPushSubmodule ? '' : 'disabled'} data-tooltip="${esc(submodulePushTooltip)}">Push submodule</button><button data-detail-action="subforcepush" ${canPushSubmodule ? '' : 'disabled'} class="danger-action-soft" data-tooltip="${canPushSubmodule ? '⚠️ Overwrites the remote branch with your local history, discarding any commits there are not in yours. Only safe if nobody else uses that remote.' : esc(submodulePushTooltip)}">Force push submodule…</button><button data-detail-action="subfetch">Fetch submodule</button><button data-detail-action="location">Replace repository URL</button>` : ''}${deletedEntry ? '' : '<button class="danger-action" data-detail-action="delete">Delete…</button>'}</div>
-    <div class="detail-section"><h3>GENERAL</h3><div class="detail-grid"><span>Type</span><strong>${kindLabel}</strong><span>Git</span><strong>${entry.tracked ? (entry.status || (entry.unpushed ? (entry.kind === 'folder' ? 'Clean — contains unpushed commits' : 'Committed, not pushed yet') : 'Tracked, clean')) : 'Untracked'}</strong>
+    <div class="context-actions">${deletedEntry ? '' : entry.kind === 'file' ? '<button data-detail-action="edit">Edit local file</button>' : ''}${entry.kind === 'submodule' ? '' : '<button data-detail-action="server">Open on server ↗</button>'}${entry.kind === 'submodule' ? '' : '<button data-detail-action="history">View history</button>'}${entry.kind === 'folder' ? '<button data-detail-action="restorefolder" class="danger-action-soft" data-tooltip="Restore only this folder from HEAD or a selected commit. Does not move HEAD or switch branch.">↶ Restore folder…</button><button data-detail-action="stashwork" data-tooltip="Stash uncommitted changes in the current repository. This is repository-scoped, not only this folder. If there is nothing local to save, Git Drill Down will refuse and explain why.">Stash repository changes</button>' : ''}${entry.status || !entry.tracked ? '<button data-detail-action="commit">Commit this item</button>' : ''}${entry.kind === 'deleted' ? '<button data-detail-action="head" data-tooltip="Restore this deleted file from your last local commit (HEAD)">↶ Restore from last commit (HEAD)</button>' : ''}${['folder','submodule'].includes(entry.kind) ? '<button data-detail-action="utrud" data-tooltip="Launches UTRUD with this folder path. UTRUD decides whether the selected folder is valid. Windows only.">▶ Run UTRUD</button>' : ''}${entry.kind === 'file' && (entry.status || !entry.tracked) ? `<button data-detail-action="stage" data-tooltip="git add — add this file's current content to staging">＋ Stage this file</button><button data-detail-action="unstage" data-tooltip="Unstage — git restore --staged. Removes only the staging entry; your edits on disk are kept exactly as they are.">− Unstage</button><button data-detail-action="stashfile" data-tooltip="Sets this file aside in this repository's own stash. Parent projects and submodules have separate stash lists.">⇕ Stash this file</button><button data-detail-action="head" class="danger-action-soft" data-tooltip="Restore from your last local commit (HEAD) — git checkout HEAD -- file. Permanently discards ALL edits; the file on disk becomes identical to what you last committed. Cannot be undone.">↶ Restore from last commit (HEAD)</button><button data-detail-action="compare" data-tooltip="Open side-by-side compare with restore options">⇄ Compare with remote</button>` : ''}${entry.kind === 'submodule' ? `${submoduleInitButton}<button data-detail-action="subserver">Open submodule repository ↗</button><button data-detail-action="subgraph" data-tooltip="Open this submodule's own branch/commit history — never the parent project's">Submodule Branch Map</button><button data-detail-action="subrefchanges" data-tooltip="A different, narrower question: which commits in the PARENT project changed this submodule's recorded version. Not the submodule's own history.">Submodule Reference Changes</button><button data-detail-action="subnewbranch" data-tooltip="Create a new local branch in this submodule, starting from its current commit, and switch to it">＋ New branch…</button><button data-detail-action="versions">Change version</button><button data-detail-action="substash" ${canStashInsideSubmodule ? '' : 'disabled'} data-tooltip="${canStashInsideSubmodule ? 'Set aside uncommitted files inside this submodule only. The parent project is untouched.' : 'No uncommitted local files inside this submodule to stash.'}">Stash submodule changes</button><button data-detail-action="substashes" data-tooltip="View and restore this submodule's own stashes. The parent project's stash list is separate.">Submodule stashes</button><button data-detail-action="subcommit" ${canCommitInsideSubmodule ? '' : 'disabled'} data-tooltip="${esc(submoduleCommitTooltip)}">Commit submodule</button><button data-detail-action="subreset" class="danger-action-soft" ${entry.status ? '' : 'disabled'} data-tooltip="${entry.status ? 'Discard local changes and restore the exact submodule commit recorded by the parent project. This leaves detached HEAD, like git submodule update.' : 'The submodule already uses the version recorded by the parent project'}">↺ Restore project version…</button><button data-detail-action="subpull" data-tooltip="Fast-forward pull — brings in new commits from the submodule's remote. Refuses if it would require a manual merge.">Pull submodule</button><button data-detail-action="submerge" data-tooltip="Merge a branch into this submodule's current branch, with conflict resolution if needed">Merge branch…</button><button data-detail-action="subpush" ${canPushSubmodule ? '' : 'disabled'} data-tooltip="${esc(submodulePushTooltip)}">Push submodule</button><button data-detail-action="subforcepush" ${canPushSubmodule ? '' : 'disabled'} class="danger-action-soft" data-tooltip="${canPushSubmodule ? '⚠️ Overwrites the remote branch with your local history, discarding any commits there are not in yours. Only safe if nobody else uses that remote.' : esc(submodulePushTooltip)}">Force push submodule…</button><button data-detail-action="subfetch">Fetch submodule</button><button data-detail-action="location">Replace repository URL</button>` : ''}${deletedEntry ? '' : '<button class="danger-action" data-detail-action="delete">Delete…</button>'}</div>
+    <div class="detail-section"><h3>GENERAL</h3><div class="detail-grid"><span>Type</span><strong>${kindLabel}</strong><span>Git</span><strong>${esc(entryGitSummary(entry))}</strong>
     ${entry.item_count != null ? `<span>Items</span><strong>${entry.item_count}</strong>` : `<span>Size</span><strong>${formatSize(entry.size)}</strong>`}<span>Modified</span><strong>${formatModified(entry.modified)}</strong></div></div>
     ${renderPersonalNoteSection(entry)}
     ${entry.kind === 'submodule' ? `<div class="detail-section"><h3>SUBMODULE</h3><div class="detail-grid">${submoduleRepositoryRowsHtml(entry)}<span>Current checkout</span><strong>${submoduleBranchName ? `On branch ${esc(submoduleBranchName)}` : entry.submodule_initialized === false ? 'Not initialized' : 'Detached HEAD'}</strong><span>Default branch</span><strong>${esc(entry.submodule_branch || 'Default')}</strong><span>Status</span><strong>${esc(submoduleState.short)}</strong></div>
@@ -2167,7 +2206,7 @@ async function pullSubmodule(entry) {
   catch (error) {
     const message = handleError(error);
     if (String(error).toLowerCase().includes('diverged')) {
-      showOperationToast(`${message}\nKeep both histories with “Merge branch…”, or deliberately discard local-only work with “Change version” → “Discard local work…”.`, 'error');
+      showOperationToast(`${message}\nKeep both histories with “Merge branch…”, or deliberately replace the local branch with the remote version via “Change version” → “Replace with remote…”.`, 'error');
     } else { showOperationToast(message, 'error'); }
   }
 }
@@ -2946,12 +2985,12 @@ async function stashWork() {
   if (!state.repository) return;
   try {
     const context = await resolveStashContext(); if (!context) return;
-    if (!invoke) { status(`Preview: work stashed in ${context.repository_name}`); return; }
-    status(`Saving work in ${context.repository_name}…`, 'busy');
+    if (!invoke) { status(`Preview: changes stashed in ${context.repository_name}`); return; }
+    status(`Saving changes in ${context.repository_name}…`, 'busy');
     await invoke('stash_changes', { repositoryPath: context.repository_path });
     if (!context.is_submodule) refs.commitMessage.value = '';
     await refreshAfterStashContext(context);
-    const message = `Work in ${context.repository_name} was stashed. Open “Stashes” while browsing this same repository to restore it.`;
+    const message = `Changes in ${context.repository_name} were stashed. Open “Stashes” while browsing this same repository to restore them.`;
     status(message); showOperationToast(message, 'success'); updateStashUI();
   } catch (error) { handleError(error); }
 }
@@ -2960,11 +2999,11 @@ async function stashSubmoduleWork(entry) {
   if (!state.repository || entry.kind !== 'submodule') return;
   try {
     const context = await resolveStashContext('', entry.relative_path); if (!context) return;
-    if (!invoke) return status(`Preview: work stashed in ${entry.name}`);
-    status(`Saving work inside ${entry.name}…`, 'busy');
+    if (!invoke) return status(`Preview: changes stashed in ${entry.name}`);
+    status(`Saving changes inside ${entry.name}…`, 'busy');
     await invoke('stash_changes', { repositoryPath: context.repository_path });
     await refreshAfterStashContext(context);
-    const message = `Uncommitted work inside ${entry.name} was stashed. The parent project was not changed.`;
+    const message = `Uncommitted changes inside ${entry.name} were stashed. The parent project was not changed.`;
     status(message); showOperationToast(message, 'success'); updateStashUI();
   } catch (error) { handleError(error); }
 }
@@ -2973,8 +3012,8 @@ function openStashesDialogForContext(context) {
   stashDialogContext = context;
   $('#stashesTitle').textContent = `Stashes · ${context.repository_name}`;
   $('#stashesSubtitle').textContent = context.is_submodule
-    ? `Saved work inside this submodule only. Restore copies one file and keeps this stash as a backup.`
-    : `Saved work in the main project only. Restore copies one file and keeps this stash as a backup.`;
+    ? `Saved changes inside this submodule only. Restore copies one file and keeps this stash as a backup.`
+    : `Saved changes in the main project only. Restore copies one file and keeps this stash as a backup.`;
   refs.stashesDialog.showModal();
   renderStashesList();
 }
@@ -3036,7 +3075,7 @@ function renderStashesList() {
   const generation = ++stashesRenderGeneration;
   const stashes = stashDialogContext?.stashes || [];
   refs.stashesList.innerHTML = stashes.map(stash => `<div class="conflict-row stash-entry-row" data-stash-index="${stash.index}">
-    <div class="conflict-head"><span class="conflict-path">stash@{${stash.index}}: ${esc(stash.message.replace(/^WIP on [^:]+:\s*[0-9a-f]+\s*/, 'WIP on ') || 'Saved work')}</span><button class="stash-drop-icon" data-drop-stash="${stash.index}" title="Drop this entire stash — discards everything left in it, for good">✕</button></div>
+    <div class="conflict-head"><span class="conflict-path">stash@{${stash.index}}: ${esc(stash.message.replace(/^WIP on [^:]+:\s*[0-9a-f]+\s*/, 'WIP on ') || 'Saved changes')}</span><button class="stash-drop-icon" data-drop-stash="${stash.index}" title="Drop this entire stash — discards everything left in it, for good">✕</button></div>
     <div class="stash-file-list" data-stash-file-list="${stash.index}"><i class="spinner"></i></div>
   </div>`).join('') || '<div class="empty-change">Nothing set aside right now.</div>';
   stashes.forEach(stash => loadStashFileList(stash.index, generation));
@@ -3095,12 +3134,10 @@ function updateStashUI() {
   const relativePath = stashBoundaryForCurrentView();
   const name = state.submoduleGraph?.repository?.name || relativePath?.split('/').pop() || state.repository?.name || 'project';
   const isSubmodule = Boolean(relativePath);
-  // Moved next to the other folder-scope actions (Commit folder, Add
-  // submodule) — its own label stays the short, static "Stash folder" that
-  // matches those siblings' style; the context (which repository this
-  // actually targets, never just the current folder within one — see its
-  // own base title text) lives in the tooltip instead, same place the
-  // scope it targets already lived for every other button in that row.
+  // This is intentionally repository-scoped, not folder-scoped: it stashes
+  // the main project or the submodule currently being browsed. Keep the
+  // short visible label generic ("Stash changes") and explain the exact scope in
+  // the tooltip so it cannot be mistaken for a folder-only operation.
   $('#stashWork').title = `Stash changes in the current repository — sets aside uncommitted changes only in ${isSubmodule ? `the ${name} submodule` : 'the main project'} you are currently browsing (not just this one folder). A parent project and each submodule have separate stashes.`;
   // Same rule as every other button in that row (Commit folder, Add
   // submodule, History, Changes in folder) — without this it was the one
@@ -3112,7 +3149,7 @@ function updateStashUI() {
   // sidebar's Stashes section; the header should stay focused on navigation
   // and repository-level actions.
   $('#stashWork').hidden = true;
-  $('#stashListSubtitle').textContent = isSubmodule ? `View saved work in ${name}` : 'View saved project work';
+  $('#stashListSubtitle').textContent = isSubmodule ? `View saved changes in ${name}` : 'View saved project changes';
   $('#stashWork').disabled = !state.repository || Boolean(state.activeSubmodule && !state.activeSubmodule.statusReady);
   $('#popStash').disabled = !state.repository;
 }
@@ -3358,7 +3395,7 @@ function buildCommitRowHtml(commit, index, ctx) {
   const node = ctx.model[index];
   const stashPills = (ctx.stashesByBase.get(commit.id) || []).map(stash => `<b class="stash-pill" data-toggle-stash="${stash.index}" data-tooltip="stash@{${stash.index}} — click for details">⇕ stash</b>`).join('');
   const stashDetails = (ctx.stashesByBase.get(commit.id) || []).map(stash => `<div class="stash-internals" data-stash-detail="${stash.index}" hidden>
-    <div>stash@{${stash.index}}: ${esc(stash.message.replace(/^WIP on [^:]+:\s*[0-9a-f]+\s*/, 'WIP on ') || 'Saved work')} — bundles working-tree changes, staged index${stash.message.includes('untracked') ? ', untracked files' : ''}</div>
+    <div>stash@{${stash.index}}: ${esc(stash.message.replace(/^WIP on [^:]+:\s*[0-9a-f]+\s*/, 'WIP on ') || 'Saved changes')} — bundles working-tree changes, staged index${stash.message.includes('untracked') ? ', untracked files' : ''}</div>
     <div class="stash-file-list" data-stash-file-list="${stash.index}"></div>
   </div>`).join('');
   const ahead = ctx.aheadAnnotations.get(index);
@@ -4009,6 +4046,16 @@ function updateChangeBadge() {
   refs.workspaceSubtitle.textContent = !state.repository ? 'No repository loaded' : !state.statusReady ? 'Loading status…' : state.changes.length ? `${state.changes.length} changed files` : 'Everything committed';
 }
 
+function changeDisplayState(change) {
+  if (!change) return 'Modified';
+  if (change.status === '??') return 'New file';
+  if (change.status === 'A') return change.staged ? 'Staged new file' : 'New file';
+  if (change.status === 'D') return change.staged ? 'Staged deletion' : 'Deleted locally';
+  if (change.status === 'R') return change.staged ? 'Staged rename' : 'Renamed locally';
+  if (change.status === 'U') return 'Conflict';
+  return change.staged ? 'Staged' : 'Modified';
+}
+
 function renderChanges() {
   updateChangeBadge();
   const scope = state.changesScope === 'folder' ? state.currentPath : ''; const scopedChanges = state.changes.filter(change => !scope || change.path === scope || change.path.startsWith(`${scope}/`));
@@ -4017,7 +4064,7 @@ function renderChanges() {
   $('#stageAllButton').disabled = scopedChanges.length === 0;
   $('#unstageAllButton').disabled = !scopedChanges.some(change => change.staged);
   refs.changes.innerHTML = scopedChanges.map(change => `<div class="change-row-wrap"><label class="change-row"><input type="checkbox" data-change-path="${esc(change.path)}" ${change.staged ? 'checked' : ''}>
-    <span class="status-code">${esc(change.status)}</span><span class="change-path">${esc(change.path)}</span><span class="change-state">${change.staged ? 'Staged' : 'Modified'}</span></label>
+    <span class="status-code">${esc(change.status)}</span><span class="change-path">${esc(change.path)}</span><span class="change-state">${esc(changeDisplayState(change))}</span></label>
     <button class="stash-file-btn" data-stash-path="${esc(change.path)}" title="Set aside just this file in its own repository's stash. Parent projects and submodules have separate stash lists.">⇕ Stash</button></div>`).join('') || `<div class="empty-change">No changes inside /${esc(scope)}</div>`;
   refs.changes.querySelectorAll('[data-stash-path]').forEach(button => button.addEventListener('click', () => stashOneFile(button.dataset.stashPath)));
   refs.changes.querySelectorAll('[data-change-path]').forEach(input => {
@@ -4095,7 +4142,7 @@ function publishRemoteAheadWarningHtml(publish) {
   if (!behind) return '';
   const remoteBranch = publish.remote_branch || `${publish.remote}/${publish.branch}`;
   const diverged = (Number(publish?.ahead) || 0) > 0;
-  return `<div class="publish-remote-ahead-warning">⚠️ ${esc(remoteBranch)} has ${behind} commit${behind === 1 ? '' : 's'} you do not have locally.${diverged ? ' Your local branch also has commits to publish, so the histories have diverged.' : ''} Fetch/pull or merge the remote changes before publishing if this is shared work.</div>`;
+  return `<div class="publish-remote-ahead-warning">⚠️ ${esc(remoteBranch)} has ${behind} commit${behind === 1 ? '' : 's'} you do not have locally.${diverged ? ' Your local branch also has commits to publish, so the histories have diverged.' : ''} Fetch/pull or merge the remote changes before publishing if this branch is shared.</div>`;
 }
 
 function renderPublishCommits() {
@@ -4320,9 +4367,8 @@ async function flushOneBatch(options) {
     // own commit-then-reload, so a checkbox ticked just before Commit was
     // clicked doesn't trigger two reloads back to back.
     if (stillSameRepo() && !options.skipReload) {
-      const refreshStarted = performance.now();
-      await refreshStatusAndFolder(repositoryPath, folder);
-      jsPerfLog(`flushOneBatch refresh (generation=${generation}, ${(performance.now() - refreshStarted).toFixed(0)}ms)`, 0);
+      refreshStatusAndFolderInBackground(repositoryPath, folder, `checkbox generation=${generation}`);
+      jsPerfLog(`flushOneBatch scheduled background refresh (generation=${generation})`, 0);
     }
   } catch (error) {
     if (activeStagingOperation === run) activeStagingOperation = null;
@@ -4551,6 +4597,28 @@ async function refreshChangesLightweight() {
     // response would otherwise still match on identity alone.
     if (stillCurrent() && state.repository?.path === repositoryPath) { state.changes = changes; updateChangeBadge(); if (refs.changesDrawer.classList.contains('open')) renderChanges(); }
   } catch { /* best-effort — a manual Refresh remains the explicit fallback */ }
+}
+
+let postStageRefreshSeq = 0;
+
+async function refreshStatusAndFolderInBackground(repositoryPath, folder, reason = 'stage') {
+  if (!invoke) return;
+  const seq = ++postStageRefreshSeq;
+  const startedAt = performance.now();
+  jsPerfLog(`postStageRefresh START (${reason}, ${folder || '/'})`, 0);
+  try {
+    const changes = await invoke('refresh_status', { repositoryPath });
+    if (seq !== postStageRefreshSeq || state.repository?.path !== repositoryPath) {
+      jsPerfLog(`postStageRefresh END (${reason}, stale after status)`, performance.now() - startedAt);
+      return;
+    }
+    state.changes = changes; state.statusReady = true; updateChangeBadge();
+    if (refs.changesDrawer.classList.contains('open')) renderChanges();
+    if (state.currentPath === folder) await openDirectory(folder, { force: true });
+    jsPerfLog(`postStageRefresh END (${reason}, applied)`, performance.now() - startedAt);
+  } catch (error) {
+    jsPerfLog(`postStageRefresh ERROR (${reason}): ${String(error)}`, performance.now() - startedAt);
+  }
 }
 
 // What an ordinary Stage/Unstage/single-file-restore actually needs to
@@ -4967,12 +5035,12 @@ function buildCommands() {
     { id: 'fetch-project', name: 'Fetch Project + Submodules', description: 'Safe update: fetch parent remotes and initialized submodule origins without pull, checkout or branch changes', keywords: 'submodule update all refresh server safe', tags: ['explorer', 'graph'], fn: () => fetchProjectAndSubmodules() },
     { id: 'init-update-submodules', name: 'Init / Update Submodules', description: 'Run git submodule update --init --recursive, then refresh the project. Use when submodule folders are empty or Git metadata is missing.', keywords: 'submodule init initialize recursive update empty missing metadata', tags: ['explorer', 'graph', 'relevant'], keepOpen: true, fn: initAndUpdateSubmodulesFromActions },
     { id: 'branch-start', name: 'Find Branch Start Commit', description: 'Run merge-base against origin/main, show the commit details, and mark that split point on the Branch Map', keys: '', keywords: 'merge-base parent start base fork origin/main', tags: ['explorer', 'graph', 'relevant'], keepOpen: true, fn: findBranchStartCommit },
-    { id: 'stash', name: 'Stash Work in Current Repository', description: 'Set aside changes only in the project or submodule currently being browsed', keys: 'Ctrl+Shift+S', tags: ['explorer'], fn: stashWork },
-    { id: 'pop', name: 'View Stashes in Current Repository', description: 'View or restore saved work for this project or submodule', keys: '', tags: ['explorer'], fn: popStash },
+    { id: 'stash', name: 'Stash Changes in Current Repository', description: 'Set aside changes only in the project or submodule currently being browsed', keys: 'Ctrl+Shift+S', tags: ['explorer'], fn: stashWork },
+    { id: 'pop', name: 'View Stashes in Current Repository', description: 'View or restore saved changes for this project or submodule', keys: '', tags: ['explorer'], fn: popStash },
     { id: 'conflicts', name: 'Resolve Merge Conflicts', description: 'Open the conflict resolution dialog for a merge in progress', keys: '', keywords: 'merge conflict resolve', tags: state.pendingMainConflicts?.length ? ['explorer', 'graph', 'relevant'] : [], fn: () => openConflictsDialog(mergeTargetForMain(), state.pendingMainConflicts || []) },
     { id: 'search', name: 'Search Repository', description: 'Filter the current view by name, author or commit id', keys: 'Ctrl+F', tags: ['explorer', 'graph', 'commander'], fn: () => refs.search.focus() },
     { id: 'explorer', name: 'Go to Project Explorer', description: 'Browse files, folders and submodules', keys: '', keywords: 'files browse', tags: [], fn: () => $('#navExplorer').click() },
-    { id: 'commander', name: 'Go to Folder Sync', description: 'Compare Git snapshots or work between two local folders', keys: 'Ctrl+Shift+L', keywords: 'diff compare folder sync local drive remote', tags: [], fn: () => $('#navCommander').click() },
+    { id: 'commander', name: 'Go to Folder Sync', description: 'Compare Git snapshots or sync/copy between two local folders', keys: 'Ctrl+Shift+L', keywords: 'diff compare folder sync local drive remote', tags: [], fn: () => $('#navCommander').click() },
     { id: 'graph', name: 'Go to Branch Map', description: 'See commit history and branches as a graph', keys: 'Ctrl+Shift+G', keywords: 'log history commits', tags: [], fn: () => $('#navGraph').click() },
     { id: 'remotes', name: 'Go to Remotes', description: 'View and fetch configured server locations', keys: '', tags: [], fn: () => $('#navRemotes').click() },
     { id: 'refresh', name: 'Refresh Repository', description: 'Re-read branches, commits and status from disk (e.g. after external Git commands)', keys: '', keywords: 'reload', tags: [], fn: () => $('#refresh').click() },
