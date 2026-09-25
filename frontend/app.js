@@ -4554,7 +4554,26 @@ async function unstageAllInScope(scope) {
 // pieces of work against — every time the Working tree drawer is opened.
 // Only fills it in when the box is empty, so it never clobbers a message
 // you're already partway through typing in a still-open drawer.
-function applyDefaultCommitMessage() { if (!refs.commitMessage.value.trim() && refs.defaultCommitMessage.value.trim()) refs.commitMessage.value = refs.defaultCommitMessage.value.trim(); }
+let lastAppliedDefaultCommitMessage = '';
+function applyDefaultCommitMessage() {
+  if (!refs.commitMessage.value.trim() && refs.defaultCommitMessage.value.trim()) {
+    lastAppliedDefaultCommitMessage = refs.defaultCommitMessage.value.trim();
+    refs.commitMessage.value = lastAppliedDefaultCommitMessage;
+  }
+}
+function syncOpenDrawerDefaultCommitMessage() {
+  if (!refs.changesDrawer.classList.contains('open')) return;
+  const next = refs.defaultCommitMessage.value.trim();
+  const current = refs.commitMessage.value.trim();
+  // If the drawer is already open, keep it in sync only while it is still
+  // using the old default (or is empty). A manually typed drawer message is
+  // deliberately left alone.
+  if (!current || current === lastAppliedDefaultCommitMessage) {
+    lastAppliedDefaultCommitMessage = next;
+    refs.commitMessage.value = next;
+    renderChanges();
+  }
+}
 
 // Remembers every default commit message you've typed in, most recent
 // first, capped at 10 — persisted in this browser profile so it survives a
@@ -4647,6 +4666,7 @@ refs.defaultCommitMessage.addEventListener('input', () => {
   const match = refs.defaultCommitMessage.value.match(/P:([A-Za-z0-9][A-Za-z0-9_]*-\d+)/);
   if (match) { const workitemId = match[1]; const project = workitemId.split('-')[0]; refs.defaultCommitPolarionLink.href = `https://polarion.vitesco.io/polarion/#/project/${project}/workitem?id=${workitemId}`; refs.defaultCommitPolarionLink.hidden = false; }
   else { refs.defaultCommitPolarionLink.hidden = true; }
+  syncOpenDrawerDefaultCommitMessage();
 });
 refs.defaultCommitMessage.addEventListener('change', recordDefaultCommitMessage);
 $('#showPublish').addEventListener('click', () => openPublish().catch(error => status(String(error), 'error')));

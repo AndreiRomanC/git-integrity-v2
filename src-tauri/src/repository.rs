@@ -2874,6 +2874,7 @@ fn html_tag_attr(tag: &str, attr: &str) -> Option<String> {
 }
 
 fn absolute_github_html_url(base_url: &str, href: &str) -> String {
+    let href = normalize_html_href(href);
     let href = href.trim();
     if href.starts_with("http://") || href.starts_with("https://") { return href.to_string(); }
     if href.starts_with('/') {
@@ -2885,6 +2886,66 @@ fn absolute_github_html_url(base_url: &str, href: &str) -> String {
         }
     }
     href.to_string()
+}
+
+fn normalize_html_href(href: &str) -> String {
+    let trimmed = href.trim();
+    // Some copied GitHub snippets arrive through Markdown as
+    // `[https://host/path](https://host/path)`. The real page uses a normal
+    // href, but accepting this shape keeps the fallback testable from the
+    // exact text users paste out of the browser/chat without making the
+    // parser more permissive in any dangerous way.
+    if trimmed.starts_with('[') {
+        if let Some(open) = trimmed.find("](") {
+            if trimmed.ends_with(')') && open + 2 < trimmed.len() - 1 {
+                return trimmed[open + 2..trimmed.len() - 1].trim().to_string();
+            }
+        }
+    }
+    trimmed.to_string()
+}
+
+fn html_text_content_minimal(fragment: &str) -> String {
+    let mut text = String::new();
+    let mut in_tag = false;
+    for ch in fragment.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => text.push(ch),
+            _ => {}
+        }
+    }
+    decode_html_attr_minimal(&text)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn first_status_action_href(block: &str) -> Option<String> {
+    let mut remaining = block;
+    while let Some(start) = remaining.find("<a") {
+        remaining = &remaining[start..];
+        let Some(end) = remaining.find('>') else { break };
+        let tag = &remaining[..=end];
+        remaining = &remaining[end + 1..];
+        let class = html_tag_attr(tag, "class").unwrap_or_default();
+        if !class.split_whitespace().any(|name| name == "status-actions") { continue; }
+        let href = html_tag_attr(tag, "href")?;
+        if href.trim().is_empty() { continue; }
+        return Some(href);
+    }
+    None
+}
+
+fn first_status_item_name(block: &str) -> Option<String> {
+    let strong_start = block.find("<strong")?;
+    let after_strong = &block[strong_start..];
+    let tag_end = after_strong.find('>')? + 1;
+    let after_tag = &after_strong[tag_end..];
+    let close = after_tag.find("</strong>")?;
+    let name = html_text_content_minimal(&after_tag[..close]);
+    if name.is_empty() { None } else { Some(name) }
 }
 
 fn collect_pr_check_detail_urls_from_html(pr_url: &str, html: &str) -> HashMap<String, String> {
@@ -2904,6 +2965,26 @@ fn collect_pr_check_detail_urls_from_html(pr_url: &str, html: &str) -> HashMap<S
         let Some(href) = html_tag_attr(tag, "href") else { continue };
         if href.trim().is_empty() { continue; }
         urls.entry(normalized_pr_check_name(name)).or_insert_with(|| absolute_github_html_url(pr_url, &href));
+    }
+    // GitHub Enterprise has changed this markup several times. The strict
+    // `aria-label="Details for X"` parser above is ideal when available,
+    // but the real PR page also gives us a stable local structure: each
+    // `.merge-status-item` block contains the check name in `<strong>` and
+    // its Details link as `a.status-actions`. Parse that too so Collaborator,
+    // Polarion and custom submodule checks keep working even if aria-labels
+    // or whitespace differ.
+    let mut block_search = html;
+    while let Some(marker) = block_search.find("merge-status-item") {
+        let block_start = block_search[..marker].rfind("<div").unwrap_or(marker);
+        let after_marker = &block_search[marker + "merge-status-item".len()..];
+        let block_end = after_marker.find("merge-status-item")
+            .map(|next| marker + "merge-status-item".len() + next)
+            .unwrap_or(block_search.len());
+        let block = &block_search[block_start..block_end];
+        if let (Some(name), Some(href)) = (first_status_item_name(block), first_status_action_href(block)) {
+            urls.entry(normalized_pr_check_name(&name)).or_insert_with(|| absolute_github_html_url(pr_url, &href));
+        }
+        block_search = &block_search[block_end..];
     }
     urls
 }
@@ -3276,8 +3357,9 @@ impl GitHubGraphqlClient {
         match self.get_text(pr_url) {
             Ok(html) => {
                 let html_urls = collect_pr_check_detail_urls_from_html(pr_url, &html);
+                let found = html_urls.len();
                 let html_filled = fill_missing_pr_check_details_from_urls(pr, &html_urls);
-                perf_log(&format!("pr_check_details_html_fallback: sha={short_sha} missing={missing_after_rest} filled={html_filled}"), Duration::ZERO);
+                perf_log(&format!("pr_check_details_html_fallback: sha={short_sha} missing={missing_after_rest} found={found} filled={html_filled}"), Duration::ZERO);
             }
             Err(_) => {
                 perf_log(&format!("pr_check_details_html_fallback: sha={short_sha} missing={missing_after_rest} html_failed=true"), Duration::ZERO);
@@ -5516,6 +5598,21 @@ fn remove_git_path_inner(repository_path: &str, relative_path: &str) -> Result<(
     validate_path(repository_path)?;
     let relative = normalized(&safe_relative_path(relative_path)?);
     if relative.is_empty() { return Err("The repository root cannot be removed".into()); }
+    // A file inside a submodule is tracked by the submodule's own index, not
+    // by the parent project. Route the deletion to the owning repository so a
+    // tracked submodule file can be removed/staged correctly instead of being
+    // rejected as "not tracked" by the parent, which only knows the gitlink.
+    if let Some((submodule_relative, sub_path, inner_relative)) = resolve_submodule_boundary_with_path(repository_path, &relative) {
+        if !inner_relative.is_empty() {
+            let result = remove_git_path_inner(&sub_path, &inner_relative);
+            if result.is_ok() {
+                invalidate_git_metadata(&sub_path);
+                invalidate_git_metadata_for_submodule_checkout(repository_path, &submodule_relative);
+                invalidate_submodule_sync(repository_path);
+            }
+            return result;
+        }
+    }
     let (tracked, _) = cached_index_metadata(repository_path);
     let prefix = format!("{relative}/");
     if !tracked.contains(&relative) && !tracked.iter().any(|path| path.starts_with(&prefix)) {
@@ -5572,6 +5669,20 @@ pub fn delete_local_path(repository_path: String, relative_path: String) -> Resu
     let relative = safe_relative_path(&relative_path)?;
     let relative_string = normalized(&relative);
     if relative_string.is_empty() { return Err("The repository root cannot be deleted".into()); }
+    // Same ownership rule as remove_git_path_inner: if the selected file is
+    // inside a submodule, the submodule decides whether it is local-only or
+    // tracked. The parent index cannot answer that question.
+    if let Some((submodule_relative, sub_path, inner_relative)) = resolve_submodule_boundary_with_path(&repository_path, &relative_string) {
+        if !inner_relative.is_empty() {
+            let result = delete_local_path(sub_path.clone(), inner_relative);
+            if result.is_ok() {
+                invalidate_git_metadata(&sub_path);
+                invalidate_git_metadata_for_submodule_checkout(&repository_path, &submodule_relative);
+                invalidate_submodule_sync(&repository_path);
+            }
+            return result;
+        }
+    }
     // Destructive checks must reflect the current index, not an older Explorer snapshot.
     let (tracked, _) = cached_index_metadata(&repository_path);
     let prefix = format!("{relative_string}/");
@@ -6129,6 +6240,15 @@ fn default_remote_ref(repository: &str) -> Option<String> {
 fn resolve_submodule_boundary(repository_path: &str, relative_path: &str) -> Option<(String, String)> {
     let (_, submodules) = cached_index_metadata(repository_path);
     resolve_submodule_boundary_from(&submodules, repository_path, relative_path)
+}
+
+fn resolve_submodule_boundary_with_path(repository_path: &str, relative_path: &str) -> Option<(String, String, String)> {
+    let (_, submodules) = cached_index_metadata(repository_path);
+    let submodule_path = submodules.iter().find(|sub| relative_path == sub.as_str() || relative_path.starts_with(&format!("{sub}/")))?.clone();
+    let absolute_sub = Path::new(repository_path).join(&submodule_path);
+    let sub_path_string = absolute_sub.to_string_lossy().into_owned();
+    let inner_relative = if relative_path == submodule_path { String::new() } else { relative_path[submodule_path.len() + 1..].to_string() };
+    Some((submodule_path, sub_path_string, inner_relative))
 }
 
 // Same lookup, taking an already-fetched submodules set — `cached_index_metadata`
@@ -8920,6 +9040,52 @@ mod tests {
     }
 
     #[test]
+    fn pr_check_details_html_fallback_extracts_status_links_from_enterprise_blocks_without_aria() {
+        let html = r#"
+          <div class="merge-status-item d-flex flex-items-baseline">
+            <div class="color-fg-muted col-10 css-truncate css-truncate-target">
+              <strong class="text-emphasized mr-2">
+                Collaborator
+              </strong>
+              <span class="text-italic">Pending</span>
+              —
+              <span class="text-italic">Review still in progress</span>
+            </div>
+            <div class="d-flex col-2 flex-shrink-0">
+              <span class="label Label--primary">Required</span>
+              <a class="status-actions" href="[https://collaborator.vitesco.io/ui#review:id=603480](https://collaborator.vitesco.io/ui#review:id=603480)">Details</a>
+            </div>
+          </div>
+          <div class="merge-status-item d-flex flex-items-baseline">
+            <div class="color-fg-muted col-10 css-truncate css-truncate-target">
+              <strong class="text-emphasized mr-2">
+                Polarion Link
+              </strong>
+              Successful in 1s
+            </div>
+            <div class="d-flex col-2 flex-shrink-0">
+              <a class="status-actions" href="/eng/sw-prj-VWAQ4_000U0/pull/282/checks?check_run_id=2781386">Details</a>
+            </div>
+          </div>
+          <div class="merge-status-item d-flex flex-items-baseline">
+            <div class="color-fg-muted col-10 css-truncate css-truncate-target">
+              <strong class="text-emphasized mr-2">
+                Submodule status
+              </strong>
+              Successful in 2m
+            </div>
+            <div class="d-flex col-2 flex-shrink-0">
+              <a class="status-actions" href="/eng/sw-prj-VWAQ4_000U0/pull/282/checks?check_run_id=2781387">Details</a>
+            </div>
+          </div>
+        "#;
+        let urls = collect_pr_check_detail_urls_from_html("https://github.vitesco.io/eng/sw-prj-VWAQ4_000U0/pull/282", html);
+        assert_eq!(urls.get("collaborator").map(String::as_str), Some("https://collaborator.vitesco.io/ui#review:id=603480"));
+        assert_eq!(urls.get("polarion link").map(String::as_str), Some("https://github.vitesco.io/eng/sw-prj-VWAQ4_000U0/pull/282/checks?check_run_id=2781386"));
+        assert_eq!(urls.get("submodule status").map(String::as_str), Some("https://github.vitesco.io/eng/sw-prj-VWAQ4_000U0/pull/282/checks?check_run_id=2781387"));
+    }
+
+    #[test]
     fn pr_status_reports_no_remote_when_the_repository_has_none() {
         let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let base = std::env::temp_dir().join(format!("git-integrity-pr-status-no-remote-{suffix}"));
@@ -11256,6 +11422,60 @@ mod tests {
         // entry for a path that was never part of its tree.
         let parent_repo = Repository::open(&parent).unwrap();
         assert!(parent_repo.index().unwrap().get_path(Path::new(&file_path), 0).is_none());
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn deleting_a_tracked_file_inside_a_submodule_uses_the_submodule_index() {
+        // Reproduces the errm_common shape: the Explorer is opened through the
+        // parent project, but the selected file lives inside a submodule. The
+        // parent index only knows the submodule gitlink, so Remove from Git
+        // must be routed to the submodule's own index.
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-remove-file-inside-submodule-{suffix}"));
+        let parent = base.join("parent"); let dependency = base.join("dependency");
+        create_libgit2_repository(&parent, "README.md"); create_libgit2_repository(&dependency, "module.txt");
+        let parent_string = parent.to_string_lossy().into_owned();
+        let added = add_submodule_inner(parent_string.clone(), "".into(), dependency.to_string_lossy().into_owned(), "dep".into(), String::new(), String::new()).unwrap();
+        create_commit(parent_string.clone(), "Add dep submodule".into()).unwrap();
+        let file_path = format!("{added}/module.txt");
+
+        remove_git_path_inner(&parent_string, &file_path).unwrap();
+
+        assert!(!parent.join(&file_path).exists(), "the working file should be removed from the submodule checkout");
+        let sub_repo = Repository::open(parent.join(&added)).unwrap();
+        let staged_delete = sub_repo.statuses(None).unwrap().iter().any(|entry| {
+            entry.path() == Some("module.txt") && entry.status().contains(git2::Status::INDEX_DELETED)
+        });
+        assert!(staged_delete, "the deletion must be staged in the submodule's own index, not rejected by the parent");
+        drop(sub_repo);
+
+        let parent_repo = Repository::open(&parent).unwrap();
+        assert!(parent_repo.index().unwrap().get_path(Path::new(&file_path), 0).is_none(), "the parent index must not get a bogus nested file entry");
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn local_delete_inside_a_submodule_refuses_tracked_files_but_deletes_untracked_ones() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-delete-local-inside-submodule-{suffix}"));
+        let parent = base.join("parent"); let dependency = base.join("dependency");
+        create_libgit2_repository(&parent, "README.md"); create_libgit2_repository(&dependency, "module.txt");
+        let parent_string = parent.to_string_lossy().into_owned();
+        let added = add_submodule_inner(parent_string.clone(), "".into(), dependency.to_string_lossy().into_owned(), "dep".into(), String::new(), String::new()).unwrap();
+        create_commit(parent_string.clone(), "Add dep submodule".into()).unwrap();
+        let tracked_path = format!("{added}/module.txt");
+        let untracked_path = format!("{added}/scratch.tmp");
+        fs::write(parent.join(&untracked_path), "temporary").unwrap();
+
+        let tracked_error = delete_local_path(parent_string.clone(), tracked_path.clone()).unwrap_err();
+        assert!(tracked_error.contains("tracked"), "a tracked submodule file must not be removed through local-only delete: {tracked_error}");
+        assert!(parent.join(&tracked_path).exists(), "tracked file must be preserved after refused local delete");
+
+        delete_local_path(parent_string, untracked_path.clone()).unwrap();
+        assert!(!parent.join(&untracked_path).exists(), "untracked file inside the submodule can be locally deleted");
 
         fs::remove_dir_all(base).unwrap();
     }
