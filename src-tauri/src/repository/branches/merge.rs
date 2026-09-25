@@ -5,6 +5,7 @@ pub struct ConflictedFile {
     pub(in crate::repository) path: String,
     pub(in crate::repository) has_ours: bool,
     pub(in crate::repository) has_theirs: bool,
+    pub(in crate::repository) kind: String,
 }
 
 #[derive(Serialize)]
@@ -27,6 +28,9 @@ fn blob_text(repo: &Repository, id: Option<git2::Oid>) -> Option<String> {
     Some(String::from_utf8_lossy(blob.content()).into_owned())
 }
 
+const GIT_FILEMODE_COMMIT: u32 = 0o160000;
+const GIT_INDEX_ENTRY_STAGEMASK: u16 = 0x3000;
+
 fn gather_conflicts(repo: &Repository) -> Result<Vec<ConflictedFile>, String> {
     let index = repo.index().map_err(|error| error.message().to_string())?;
     let conflicts = index.conflicts().map_err(|error| error.message().to_string())?;
@@ -35,7 +39,12 @@ fn gather_conflicts(repo: &Repository) -> Result<Vec<ConflictedFile>, String> {
         let path = conflict.our.as_ref().or(conflict.their.as_ref()).or(conflict.ancestor.as_ref())
             .map(|entry| String::from_utf8_lossy(&entry.path).into_owned());
         if let Some(path) = path {
-            files.push(ConflictedFile { path, has_ours: conflict.our.is_some(), has_theirs: conflict.their.is_some() });
+            let kind = if conflict.our.as_ref().or(conflict.their.as_ref()).or(conflict.ancestor.as_ref()).map(|entry| entry.mode) == Some(GIT_FILEMODE_COMMIT) {
+                "submodule"
+            } else {
+                "file"
+            };
+            files.push(ConflictedFile { path, has_ours: conflict.our.is_some(), has_theirs: conflict.their.is_some(), kind: kind.into() });
         }
     }
     Ok(files)
@@ -187,16 +196,43 @@ pub fn resolve_conflict(repository_path: String, target_path: String, relative_p
     let absolute = Path::new(&repository_path).join(&relative);
     match resolution.as_str() {
         "ours" | "theirs" => {
-            let index = repo.index().map_err(|error| error.message().to_string())?;
-            let conflicts = index.conflicts().map_err(|error| error.message().to_string())?;
             let target = normalized(&relative);
-            let mut content = None;
-            for conflict in conflicts.flatten() {
-                let entry = if resolution == "ours" { conflict.our } else { conflict.their };
-                let Some(entry) = entry else { continue };
-                if String::from_utf8_lossy(&entry.path) != target { continue; }
-                content = blob_text(&repo, Some(entry.id));
-                break;
+            let mut gitlink_entry = None;
+            let mut gitlink_oid = None;
+            let content = {
+                let index = repo.index().map_err(|error| error.message().to_string())?;
+                let conflicts = index.conflicts().map_err(|error| error.message().to_string())?;
+                let mut content = None;
+                for conflict in conflicts.flatten() {
+                    let entry = if resolution == "ours" { conflict.our } else { conflict.their };
+                    let Some(mut entry) = entry else { continue };
+                    if String::from_utf8_lossy(&entry.path) != target { continue; }
+                    if entry.mode == GIT_FILEMODE_COMMIT {
+                        gitlink_oid = Some(entry.id);
+                        entry.flags &= !GIT_INDEX_ENTRY_STAGEMASK;
+                        gitlink_entry = Some(entry);
+                    } else {
+                        content = blob_text(&repo, Some(entry.id));
+                    }
+                    break;
+                }
+                content
+            };
+            if let Some(entry) = gitlink_entry {
+                let mut index = repo.index().map_err(|error| error.message().to_string())?;
+                index.conflict_remove(&relative).map_err(|error| error.message().to_string())?;
+                index.add(&entry).map_err(|error| error.message().to_string())?;
+                index.write().map_err(|error| error.message().to_string())?;
+                if let Some(oid) = gitlink_oid {
+                    let submodule_path = Path::new(&repository_path).join(&relative);
+                    if internal_submodule_repository(&submodule_path).is_ok() {
+                        let submodule_path_string = submodule_path.to_string_lossy().into_owned();
+                        git(&submodule_path_string, &["checkout", "--detach", &oid.to_string()])?;
+                        invalidate_git_metadata(&submodule_path_string);
+                    }
+                }
+                invalidate_git_metadata(&repository_path);
+                return Ok(());
             }
             let content = content.ok_or_else(|| format!("No {resolution} version exists for {relative_path} (it may have been added only on one side — deleting or keeping the existing file may be more appropriate)."))?;
             fs::write(&absolute, content).map_err(|error| format!("Cannot write {}: {error}", absolute.display()))?;

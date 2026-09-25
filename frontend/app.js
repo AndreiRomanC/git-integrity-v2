@@ -2235,6 +2235,12 @@ async function openMergeBranchDialog(target, preselectedSource = '') {
     const branches = target.isSubmodule
       ? (await invoke('submodule_repository', { repositoryPath: state.repository.path, relativePath: target.targetPath })).branches
       : state.branches;
+    if (target.isSubmodule) {
+      const current = branches.find(branch => branch.current);
+      const currentName = current?.name || 'detached HEAD';
+      refs.mergeBranchCurrent.value = `${currentName} · ${target.label}`;
+      refs.mergeBranchSubtitle.textContent = `Merge a branch into the current checkout of submodule "${target.label}". Only this submodule repository changes.`;
+    }
     const options = branches.filter(branch => !branch.current);
     refs.mergeBranchSource.innerHTML = options.map(branch => `<option value="${esc(branch.name)}">${esc(branch.name)}${branch.remote ? ' (remote)' : ''}</option>`).join('') || '<option value="" disabled>No other branches</option>';
     if (preselectedSource && options.some(branch => branch.name === preselectedSource)) refs.mergeBranchSource.value = preselectedSource;
@@ -2271,15 +2277,21 @@ refs.confirmMergeBranch.addEventListener('click', async () => {
 refs.mergeBranchSource.addEventListener('change', updateMergeDirectionPreview);
 
 function renderConflictsList(target, conflicts) {
-  refs.conflictsList.innerHTML = conflicts.map(conflict => `<div class="conflict-row" data-path="${esc(conflict.path)}">
-    <div class="conflict-head"><span class="conflict-path">${esc(conflict.path)}</span><span class="conflict-state pending" data-tooltip="Git still reports this file as unresolved in the index">UNRESOLVED</span></div>
+  refs.conflictsList.innerHTML = conflicts.map(conflict => {
+    const isSubmoduleConflict = conflict.kind === 'submodule';
+    const itemLabel = isSubmoduleConflict ? 'submodule version' : 'file';
+    const mineTip = isSubmoduleConflict ? 'Keep the submodule commit recorded by the current branch' : 'Keep your version of this file';
+    const theirsTip = isSubmoduleConflict ? 'Use the submodule commit recorded by the incoming branch' : "Keep the incoming branch's version of this file";
+    return `<div class="conflict-row" data-path="${esc(conflict.path)}">
+    <div class="conflict-head"><span class="conflict-path">${esc(conflict.path)}</span><span class="conflict-state pending" data-tooltip="Git still reports this ${esc(itemLabel)} as unresolved in the index">${isSubmoduleConflict ? 'SUBMODULE VERSION' : 'UNRESOLVED'}</span></div>
     <div class="conflict-actions">
-      <button data-resolve="ours" ${conflict.has_ours ? '' : 'disabled'} data-tooltip="Keep your version of this file">↤ Keep mine</button>
-      <button data-resolve="theirs" ${conflict.has_theirs ? '' : 'disabled'} data-tooltip="Keep the incoming branch's version of this file">↦ Keep theirs</button>
-      <button data-resolve="mergetool" data-tooltip="Use Git's configured mergetool for this conflicted file">◇ Resolve with Git mergetool</button>
-      <button data-resolve="manual" data-tooltip="Open the file (with conflict markers) and edit it yourself">✎ Edit manually</button>
+      <button data-resolve="ours" ${conflict.has_ours ? '' : 'disabled'} data-tooltip="${esc(mineTip)}">↤ Keep mine</button>
+      <button data-resolve="theirs" ${conflict.has_theirs ? '' : 'disabled'} data-tooltip="${esc(theirsTip)}">↦ Keep theirs</button>
+      <button data-resolve="mergetool" ${isSubmoduleConflict ? 'disabled' : ''} data-tooltip="Use Git's configured mergetool for this conflicted file">◇ Resolve with Git mergetool</button>
+      <button data-resolve="manual" ${isSubmoduleConflict ? 'disabled' : ''} data-tooltip="Open the file (with conflict markers) and edit it yourself">✎ Edit manually</button>
     </div>
-  </div>`).join('') || '<div class="empty-change">No unresolved conflicts remain. Files resolved through this dialog have been staged in Git; complete the merge when you are ready.</div>';
+  </div>`;
+  }).join('') || '<div class="empty-change">No unresolved conflicts remain. Files resolved through this dialog have been staged in Git; complete the merge when you are ready.</div>';
   refs.conflictsList.querySelectorAll('[data-resolve]').forEach(button => button.addEventListener('click', () => {
     const path = button.closest('.conflict-row').dataset.path; const kind = button.dataset.resolve;
     if (kind === 'manual') editConflictFile(target, path);
@@ -2921,8 +2933,10 @@ async function fetchAllRemotes(button = null) {
   if (!state.repository) return;
   if (!invoke) return status('Preview: fetched all remotes');
   const finishButton = beginButtonOperation(button, 'Fetching…');
-  try { status('Fetching every remote…', 'busy'); await invoke('fetch_all_remotes', { repositoryPath: state.repository.path }); await loadRepository(state.repository.path, { keepPath: true }); await loadRemotes(); const msg = `${state.remotes.length} remote${state.remotes.length === 1 ? '' : 's'} updated`; status(msg); showOperationToast(msg, 'success'); }
-  catch (error) { handleError(error); }
+  const startedAt = performance.now();
+  jsPerfLog('fetchAllRemotes START', 0);
+  try { status('Fetching every remote…', 'busy'); await invoke('fetch_all_remotes', { repositoryPath: state.repository.path }); await loadRepository(state.repository.path, { keepPath: true }); await loadRemotes(); const msg = `${state.remotes.length} remote${state.remotes.length === 1 ? '' : 's'} updated`; status(msg); showOperationToast(msg, 'success'); jsPerfLog('fetchAllRemotes SUCCESS', performance.now() - startedAt); }
+  catch (error) { jsPerfLog(`fetchAllRemotes ERROR: ${String(error)}`, performance.now() - startedAt); handleError(error); }
   finally { finishButton(); }
 }
 function limitedFetchProjectDetails(label, list = []) {
@@ -2935,6 +2949,8 @@ async function fetchProjectAndSubmodules(button = null) {
   if (!state.repository) return;
   if (!invoke) return status('Preview: fetched parent repository and submodules');
   const finishButton = beginButtonOperation(button, 'Fetching…');
+  const startedAt = performance.now();
+  jsPerfLog('fetchProjectAndSubmodules START', 0);
   try {
     status('Fetching parent repository and initialized submodules…', 'busy');
     const result = await invoke('fetch_project', { repositoryPath: state.repository.path });
@@ -2947,8 +2963,9 @@ async function fetchProjectAndSubmodules(button = null) {
     const details = `${limitedFetchProjectDetails('Skipped', result.warnings)}${limitedFetchProjectDetails('Errors', result.errors)}`;
     status(msg, result.errors?.length ? 'error' : '');
     showOperationToast(`${msg}${details}`, result.errors?.length ? 'error' : 'success');
+    jsPerfLog(`fetchProjectAndSubmodules SUCCESS (parent=${result.parent_fetched}, submodules=${result.submodules_fetched}/${result.submodules_total}, skipped=${result.submodules_skipped}, errors=${result.errors?.length || 0})`, performance.now() - startedAt);
   }
-  catch (error) { handleError(error); }
+  catch (error) { jsPerfLog(`fetchProjectAndSubmodules ERROR: ${String(error)}`, performance.now() - startedAt); handleError(error); }
   finally { finishButton(); }
 }
 
@@ -5489,6 +5506,7 @@ async function runTerminalFromConsole(input) {
     clearInterval(consoleRunningTicker); consoleRunningTicker = null;
     state.consoleCommandRunning = false;
     renderConsoleTranscript();
+    refreshCommandHint();
     // The strict read-only allowlist (status/log/diff/show/blame/ls-files,
     // matched on the subcommand alone) is the only case that skips a full
     // reload — anything else, including a command this app has never heard
@@ -5509,6 +5527,7 @@ async function runTerminalFromConsole(input) {
     clearInterval(consoleRunningTicker); consoleRunningTicker = null;
     state.consoleCommandRunning = false;
     renderConsoleTranscript();
+    refreshCommandHint();
     return entry.result;
   }
 }

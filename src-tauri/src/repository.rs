@@ -6971,9 +6971,9 @@ mod tests {
 
     // The status bar's own quiet command hint and its double-click history —
     // report: show the real git commands the app runs, not just its own
-    // human-readable status messages. Scoped to the shared git() helper only
-    // (never the Terminal's own subprocess call), so a command the user
-    // types there is never double-recorded here too.
+    // human-readable status messages. It includes the shared git() helper,
+    // the Git-only command box, and Terminal/App Actions commands that start
+    // with `git`; non-Git shell commands stay in the Terminal transcript.
     #[test]
     fn git_helper_calls_are_recorded_for_the_status_bars_own_command_history() {
         let _guard = RECENT_GIT_COMMANDS_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -6993,6 +6993,16 @@ mod tests {
             .expect("the git() call above must be recorded, with the repository's own directory name as its hint");
         assert!(mine.success, "a command that actually succeeded must be recorded as such");
         assert!(mine.seconds_ago >= 0.0 && mine.seconds_ago < 30.0, "should report as just having happened, got {}s ago", mine.seconds_ago);
+
+        let command_box = run_git_command(repo_path.clone(), "rev-parse --show-toplevel".into()).unwrap();
+        assert!(command_box.success);
+        assert!(recent_git_commands().iter().any(|entry| entry.command == "git rev-parse --show-toplevel" && entry.repo_hint == repository.file_name().unwrap().to_str().unwrap()),
+            "Git commands launched through the command box must also show up in the footer history");
+
+        let terminal = run_terminal_command_inner(repo_path.clone(), "git rev-parse --is-bare-repository".into()).unwrap();
+        assert!(terminal.success);
+        assert!(recent_git_commands().iter().any(|entry| entry.command == "git rev-parse --is-bare-repository" && entry.repo_hint == repository.file_name().unwrap().to_str().unwrap()),
+            "Git commands launched through Terminal/App Actions must also show up in the footer history");
 
         fs::remove_dir_all(repository).unwrap();
     }
@@ -7491,6 +7501,57 @@ mod tests {
         assert!(load_repository_inner(path, Some(true)).unwrap().changes.is_empty());
 
         fs::remove_dir_all(repository).unwrap();
+    }
+
+    #[test]
+    fn parent_merge_can_resolve_a_submodule_gitlink_conflict_by_choosing_one_side() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-gitlink-conflict-{suffix}"));
+        let parent = base.join("parent");
+        let dependency = base.join("dependency");
+        create_libgit2_repository(&parent, "README.md");
+        create_libgit2_repository(&dependency, "module.txt");
+        run_git(&parent, &["-c", "protocol.file.allow=always", "submodule", "add", dependency.to_str().unwrap(), "vendor/dep"]);
+        run_git(&parent, &["commit", "-am", "Add dep"]);
+        let parent_branch = run_git_capture(&parent, &["branch", "--show-current"]);
+        let sub_path = parent.join("vendor/dep");
+
+        run_git(&sub_path, &["switch", "-c", "left"]);
+        fs::write(sub_path.join("module.txt"), "left\n").unwrap();
+        run_git(&sub_path, &["commit", "-am", "Left submodule pin"]);
+        let left_oid = Repository::open(&sub_path).unwrap().head().unwrap().target().unwrap();
+        run_git(&parent, &["add", "vendor/dep"]);
+        run_git(&parent, &["commit", "-m", "Parent records left pin"]);
+
+        run_git(&parent, &["switch", "-c", "incoming", "HEAD~1"]);
+        run_git(&parent, &["submodule", "update", "--checkout", "vendor/dep"]);
+        run_git(&sub_path, &["switch", "-c", "right"]);
+        fs::write(sub_path.join("module.txt"), "right\n").unwrap();
+        run_git(&sub_path, &["commit", "-am", "Right submodule pin"]);
+        let right_oid = Repository::open(&sub_path).unwrap().head().unwrap().target().unwrap();
+        run_git(&parent, &["add", "vendor/dep"]);
+        run_git(&parent, &["commit", "-m", "Parent records right pin"]);
+
+        run_git(&parent, &["switch", &parent_branch]);
+        run_git(&parent, &["submodule", "update", "--checkout", "vendor/dep"]);
+        assert_eq!(Repository::open(&sub_path).unwrap().head().unwrap().target(), Some(left_oid));
+        let parent_string = parent.to_string_lossy().into_owned();
+        let outcome = merge_branch(parent_string.clone(), "".into(), "incoming".into()).unwrap();
+        assert_eq!(outcome.status, "conflicts");
+        assert_eq!(outcome.conflicts.len(), 1);
+        assert_eq!(outcome.conflicts[0].path, "vendor/dep");
+        assert_eq!(outcome.conflicts[0].kind, "submodule");
+
+        resolve_conflict(parent_string.clone(), "".into(), "vendor/dep".into(), "theirs".into()).unwrap();
+        assert!(list_conflicts(parent_string.clone(), "".into()).unwrap().is_empty());
+        let repo = Repository::open(&parent).unwrap();
+        assert_eq!(parent_gitlink_oid(&repo, "vendor/dep", true), Some(right_oid), "the resolved index must record the incoming submodule commit");
+        assert_eq!(Repository::open(&sub_path).unwrap().head().unwrap().target(), Some(right_oid), "the initialized submodule checkout should be aligned to the selected gitlink");
+        let oid = complete_merge(parent_string.clone(), "".into(), "Merge incoming".into()).unwrap();
+        assert!(!oid.is_empty());
+        assert!(load_repository_inner(parent_string, Some(true)).unwrap().changes.is_empty());
+
+        fs::remove_dir_all(base).unwrap();
     }
 
     #[test]
