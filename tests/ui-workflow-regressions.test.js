@@ -289,6 +289,11 @@ test('Saved actions are a separate persistent command tab and appear in App acti
   assert.match(html, /id="commandAddSaved"/);
   assert.match(html, /Save action/);
   assert.match(app, /SAVED_ACTIONS_KEY/);
+  assert.match(app, /DEFAULT_SAVED_ACTIONS/);
+  assert.match(app, /Compare branch with origin\/main/);
+  assert.match(app, /git diff --stat origin\/main\.\.\.HEAD/);
+  assert.match(app, /git diff --name-status origin\/main\.\.\.HEAD/);
+  assert.match(app, /git log --oneline --decorate --left-right origin\/main\.\.\.HEAD/);
   assert.match(app, /function renderSavedActions/);
   assert.match(app, /function addOrEditSavedAction/);
   assert.match(app, /function runSavedAction/);
@@ -335,6 +340,7 @@ test('folder restore gives visible progress and rechecks the restored folder aft
   assert.match(app, /function folderRestoreResultMessage\(name, sourceLabel, remainingCount\)/);
   assert.match(app, /restore finished, but \$\{remainingCount\} local change/);
   assert.match(app, /restored from \$\{sourceLabel\}\. \$\{remainingCount\} local change/);
+  assert.match(app, /model\.loadingCommits = false;[\s\S]*?renderFolderRestoreCommits\(\)/);
 });
 
 test('graph exposes branch and commit context actions without relying on lane identity', () => {
@@ -373,13 +379,24 @@ test('graph exposes branch and commit context actions without relying on lane id
   assert.match(app, /function graphHeadBannerHtml\(g, currentBranch, headVisible\)/);
   assert.match(app, /data-jump-head/);
   assert.match(app, /function jumpToGraphHead\(\)/);
+  assert.match(app, /class="graph-current-jump"/);
   assert.match(app, /YOU ARE HERE · HEAD/);
   assert.match(css, /\.head-location-pill/);
+  assert.match(css, /\.graph-current-jump/);
   assert.match(app, /Real merge-base between HEAD and \$\{esc\(commonAncestorBaseRef\)\}/);
   assert.match(app, /MERGE MAIN/);
   assert.match(app, /const palette = \[[\s\S]*?'#b4f1cf'[\s\S]*?\]/);
   assert.match(app, /class="graph-edge-underlay"/);
   assert.match(css, /\.graph-overlay \.graph-edge-underlay/);
+});
+
+test('submodule compare can export both exact compared revisions as snapshots', () => {
+  assert.match(html, /id="subCompareDownload"/);
+  assert.match(app, /subCompareDownload: \$\('#subCompareDownload'\)/);
+  assert.match(app, /function exportSubmoduleCompareSnapshots\(\)/);
+  assert.match(app, /invoke\('choose_folder'\)/);
+  assert.match(app, /invoke\('export_submodule_compare_snapshots', \{/);
+  assert.match(app, /leftRef: compare\.leftRevision \|\| compare\.leftRef|const leftRef = compare\.leftRevision \|\| compare\.leftRef/);
 });
 
 test('every local frontend script and stylesheet carries the same cache-busting version', () => {

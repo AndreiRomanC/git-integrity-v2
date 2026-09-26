@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Git DrillDown</title>
   <link rel="icon" type="image/png" href="assets/git-drilldown-mark.png">
-  <link rel="stylesheet" href="styles.css?v=20260924-no-work-wording">
+  <link rel="stylesheet" href="styles.css?v=20260926-submodule-compare-export">
 </head>
 <body>
   <div class="app-shell">
@@ -138,6 +138,7 @@
               <button type="button" id="subCompareSwap" title="Swap left and right revisions">⇄</button>
               <label><span>RIGHT REVISION</span><div class="revision-input-row"><input id="subCompareRightRef" placeholder="branch, tag or SHA…" autocomplete="off" spellcheck="false"><button type="button" id="subComparePickRight" title="Pick or search right revision">⌕</button></div></label>
               <button type="button" id="subCompareRefresh" title="Re-run comparison for these revisions">Compare</button>
+              <button type="button" id="subCompareDownload" title="Compare two submodule revisions first" disabled>Download</button>
               <datalist id="subCompareSubmoduleOptions"></datalist>
             </div>
             <div class="submodule-compare-exact" id="subCompareExact">Choose a submodule and two revisions.</div>
@@ -659,13 +660,13 @@
       <footer><button value="cancel">Cancel</button><button type="button" value="default" id="confirmNewTag" class="confirm">Create tag</button></footer>
     </form>
   </dialog>
-  <script src="console-context.js?v=20260924-no-work-wording"></script>
-  <script src="graph-model.js?v=20260924-no-work-wording"></script>
-  <script src="submodule-state.js?v=20260924-no-work-wording"></script>
-  <script src="submodule-versions.js?v=20260924-no-work-wording"></script>
-  <script src="local-diff.js?v=20260924-no-work-wording"></script>
-  <script src="local-drive.js?v=20260924-no-work-wording"></script>
-  <script src="pr-status.js?v=20260924-no-work-wording"></script>
-  <script src="app.js?v=20260924-no-work-wording"></script>
+  <script src="console-context.js?v=20260926-submodule-compare-export"></script>
+  <script src="graph-model.js?v=20260926-submodule-compare-export"></script>
+  <script src="submodule-state.js?v=20260926-submodule-compare-export"></script>
+  <script src="submodule-versions.js?v=20260926-submodule-compare-export"></script>
+  <script src="local-diff.js?v=20260926-submodule-compare-export"></script>
+  <script src="local-drive.js?v=20260926-submodule-compare-export"></script>
+  <script src="pr-status.js?v=20260926-submodule-compare-export"></script>
+  <script src="app.js?v=20260926-submodule-compare-export"></script>
 </body>
 </html>

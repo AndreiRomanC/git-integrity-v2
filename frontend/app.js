@@ -69,6 +69,17 @@ let versionFilter = 'branch';
 const recentRepos = JSON.parse(localStorage.getItem('recentRepos') || '[]');
 const SAVED_TERMINAL_COMMANDS_KEY = 'git-drilldown-saved-terminal-commands';
 const SAVED_ACTIONS_KEY = 'git-drilldown-saved-actions';
+const SEEDED_SAVED_ACTIONS_KEY = 'git-drilldown-seeded-saved-actions-v1';
+const DEFAULT_SAVED_ACTIONS = [
+  {
+    name: 'Compare branch with origin/main',
+    commands: [
+      'git diff --stat origin/main...HEAD',
+      'git diff --name-status origin/main...HEAD',
+      'git log --oneline --decorate --left-right origin/main...HEAD',
+    ],
+  },
+];
 function normalizeSavedAction(item) {
   if (!item || typeof item.name !== 'string') return null;
   const commands = Array.isArray(item.commands) ? item.commands : typeof item.command === 'string' ? [item.command] : [];
@@ -78,7 +89,18 @@ function normalizeSavedAction(item) {
 function loadSavedActions() {
   try {
     const parsed = JSON.parse(localStorage.getItem(SAVED_ACTIONS_KEY) || localStorage.getItem(SAVED_TERMINAL_COMMANDS_KEY) || '[]');
-    return Array.isArray(parsed) ? parsed.map(normalizeSavedAction).filter(Boolean) : [];
+    const saved = Array.isArray(parsed) ? parsed.map(normalizeSavedAction).filter(Boolean) : [];
+    if (localStorage.getItem(SEEDED_SAVED_ACTIONS_KEY) !== '1') {
+      const withDefaults = [...saved];
+      DEFAULT_SAVED_ACTIONS.map(normalizeSavedAction).filter(Boolean).forEach(defaultAction => {
+        const exists = withDefaults.some(action => action.name.toLowerCase() === defaultAction.name.toLowerCase());
+        if (!exists) withDefaults.push(defaultAction);
+      });
+      localStorage.setItem(SEEDED_SAVED_ACTIONS_KEY, '1');
+      localStorage.setItem(SAVED_ACTIONS_KEY, JSON.stringify(withDefaults));
+      return withDefaults;
+    }
+    return saved;
   } catch { return []; }
 }
 function saveSavedActions() {
@@ -167,7 +189,7 @@ const refs = {
   submoduleMenu: $('#submoduleMenu'), submoduleVersions: $('#submoduleVersions'), submoduleMenuName: $('#submoduleMenuName'), currentSubmoduleVersion: $('#currentSubmoduleVersion'), submoduleVersionSearch: $('#submoduleVersionSearch'), submoduleOpenGraph: $('#submoduleOpenGraph'),
   commitScope: $('#commitScope'), showPathHistory: $('#showPathHistory'), commitScopeDialog: $('#commitScopeDialog'), commitScopeName: $('#commitScopeName'), scopeCommitMessage: $('#scopeCommitMessage'), confirmScopeCommit: $('#confirmScopeCommit'),
   folderRestoreDialog: $('#folderRestoreDialog'), folderRestorePath: $('#folderRestorePath'), folderRestoreSubtitle: $('#folderRestoreSubtitle'), folderRestoreModeHead: $('#folderRestoreModeHead'), folderRestoreModeCommit: $('#folderRestoreModeCommit'), folderRestoreCommitPicker: $('#folderRestoreCommitPicker'), folderRestoreCommitList: $('#folderRestoreCommitList'), refreshFolderRestoreCommits: $('#refreshFolderRestoreCommits'), folderRestoreClean: $('#folderRestoreClean'), folderRestorePreview: $('#folderRestorePreview'), folderRestoreStatus: $('#folderRestoreStatus'), previewFolderRestore: $('#previewFolderRestore'), confirmFolderRestore: $('#confirmFolderRestore'),
-  commanderView: $('#commanderView'), commanderRows: $('#commanderRows'), commanderBreadcrumbs: $('#commanderBreadcrumbs'), remoteRef: $('#remoteRef'), gitComparePanel: $('#gitComparePanel'), localDrivePanel: $('#localDrivePanel'), compareModeGit: $('#compareModeGit'), compareModeDrive: $('#compareModeDrive'), compareModeSubmodule: $('#compareModeSubmodule'), submoduleComparePanel: $('#submoduleComparePanel'), subCompareSubmodule: $('#subCompareSubmodule'), subCompareSubmoduleOptions: $('#subCompareSubmoduleOptions'), subCompareLeftRef: $('#subCompareLeftRef'), subCompareRightRef: $('#subCompareRightRef'), subComparePickLeft: $('#subComparePickLeft'), subComparePickRight: $('#subComparePickRight'), subCompareSwap: $('#subCompareSwap'), subCompareRefresh: $('#subCompareRefresh'), subCompareExact: $('#subCompareExact'), subCompareCommits: $('#subCompareCommits'), subCompareBreadcrumbs: $('#subCompareBreadcrumbs'), subCompareRows: $('#subCompareRows'), subRevisionDialog: $('#subCompareRevisionDialog'), subRevisionDialogSide: $('#subRevisionDialogSide'), subRevisionDialogTitle: $('#subRevisionDialogTitle'), subRevisionSearch: $('#subRevisionSearch'), subRevisionSearchAll: $('#subRevisionSearchAll'), subRevisionResults: $('#subRevisionResults'), subRevisionHelp: $('#subRevisionHelp'), compareDialog: $('#compareDialog'), compareTitle: $('#compareTitle'), compareSubtitle: $('#compareSubtitle'), localCompare: $('#localCompare'), remoteCompare: $('#remoteCompare'),
+  commanderView: $('#commanderView'), commanderRows: $('#commanderRows'), commanderBreadcrumbs: $('#commanderBreadcrumbs'), remoteRef: $('#remoteRef'), gitComparePanel: $('#gitComparePanel'), localDrivePanel: $('#localDrivePanel'), compareModeGit: $('#compareModeGit'), compareModeDrive: $('#compareModeDrive'), compareModeSubmodule: $('#compareModeSubmodule'), submoduleComparePanel: $('#submoduleComparePanel'), subCompareSubmodule: $('#subCompareSubmodule'), subCompareSubmoduleOptions: $('#subCompareSubmoduleOptions'), subCompareLeftRef: $('#subCompareLeftRef'), subCompareRightRef: $('#subCompareRightRef'), subComparePickLeft: $('#subComparePickLeft'), subComparePickRight: $('#subComparePickRight'), subCompareSwap: $('#subCompareSwap'), subCompareRefresh: $('#subCompareRefresh'), subCompareDownload: $('#subCompareDownload'), subCompareExact: $('#subCompareExact'), subCompareCommits: $('#subCompareCommits'), subCompareBreadcrumbs: $('#subCompareBreadcrumbs'), subCompareRows: $('#subCompareRows'), subRevisionDialog: $('#subCompareRevisionDialog'), subRevisionDialogSide: $('#subRevisionDialogSide'), subRevisionDialogTitle: $('#subRevisionDialogTitle'), subRevisionSearch: $('#subRevisionSearch'), subRevisionSearchAll: $('#subRevisionSearchAll'), subRevisionResults: $('#subRevisionResults'), subRevisionHelp: $('#subRevisionHelp'), compareDialog: $('#compareDialog'), compareTitle: $('#compareTitle'), compareSubtitle: $('#compareSubtitle'), localCompare: $('#localCompare'), remoteCompare: $('#remoteCompare'),
   remotesView: $('#remotesView'), remoteCards: $('#remoteCards'), editorDialog: $('#editorDialog'), editorTitle: $('#editorTitle'), editorPath: $('#editorPath'), editorContent: $('#editorContent'), locationRepository: $('#locationRepository'), locationBranch: $('#locationBranch'), locationPath: $('#locationPath'), leaveSubmoduleGraph: $('#leaveSubmoduleGraph'), publishDialog: $('#publishDialog'), publishBranch: $('#publishBranch'), publishRemote: $('#publishRemote'), publishCommits: $('#publishCommits'), publishSummary: $('#publishSummary'), publishDestination: $('#publishDestination'), publishBadge: $('#publishBadge'), publishSubtitle: $('#publishSubtitle'), cloneDialog: $('#cloneDialog'), cloneUrl: $('#cloneUrl'), cloneParent: $('#cloneParent'), cloneName: $('#cloneName'), cloneBranch: $('#cloneBranch'), cloneRecurseSubmodules: $('#cloneRecurseSubmodules'), confirmClone: $('#confirmClone'), submoduleDialog: $('#submoduleDialog'), submoduleUrl: $('#submoduleUrl'), submoduleParent: $('#submoduleParent'), submoduleName: $('#submoduleName'), submoduleUsername: $('#submoduleUsername'), submoduleToken: $('#submoduleToken'), submoduleAddStatus: $('#submoduleAddStatus'), confirmAddSubmodule: $('#confirmAddSubmodule'), operationToast: $('#operationToast'), drawerScopeTitle: $('#drawerScopeTitle'),
   mergeBranchDialog: $('#mergeBranchDialog'), mergeBranchSubtitle: $('#mergeBranchSubtitle'), mergeBranchCurrent: $('#mergeBranchCurrent'), mergeBranchSource: $('#mergeBranchSource'), mergeBranchStatus: $('#mergeBranchStatus'), confirmMergeBranch: $('#confirmMergeBranch'),
   stashesDialog: $('#stashesDialog'), stashesList: $('#stashesList'),
@@ -964,6 +986,13 @@ function renderSubmoduleCompare() {
   refs.subCompareExact.textContent = compare?.leftRevision && compare?.rightRevision
     ? `Comparing ${revisionDisplay(compare.leftRevision)} → ${revisionDisplay(compare.rightRevision)}. These are exact Git revisions; no checkout is performed.`
     : compare ? 'Choose left and right revisions, then Compare.' : 'Select a submodule and choose Compare submodule.';
+  if (refs.subCompareDownload) {
+    const ready = Boolean(compare?.submodulePath && compare?.leftRevision && compare?.rightRevision);
+    refs.subCompareDownload.disabled = !ready;
+    refs.subCompareDownload.title = ready
+      ? `Export ${revisionDisplay(compare.leftRevision)} and ${revisionDisplay(compare.rightRevision)} to folders on disk`
+      : 'Compare two submodule revisions first';
+  }
   renderSubmoduleCompareCommitList(compare);
   const rowsSource = compare?.rows || [];
   const query = refs.search.value.trim().toLowerCase(); const rows = rowsSource.filter(row => !query || row.name.toLowerCase().includes(query));
@@ -1040,6 +1069,40 @@ async function openSubmoduleCompareDirectory(path = state.commanderPath || '') {
     status(`Compared ${compare.name}: ${revisionDisplay(compare.leftRevision)} → ${revisionDisplay(compare.rightRevision)}`);
   } catch (error) {
     if (stillCurrent()) { status(String(error), 'error'); refs.subCompareRows.innerHTML = `<div class="loading-row">${esc(String(error))}</div>`; }
+  }
+}
+
+async function exportSubmoduleCompareSnapshots() {
+  const compare = state.submoduleCompare;
+  if (!compare?.submodulePath) return status('Select a submodule first.', 'error');
+  const leftRef = compare.leftRevision || compare.leftRef;
+  const rightRef = compare.rightRevision || compare.rightRef;
+  if (!leftRef || !rightRef) return status('Compare two submodule revisions before downloading snapshots.', 'error');
+  if (!invoke) return status(`Preview: export ${compare.name} snapshots`);
+  status(`Choose where to export ${compare.name} snapshots…`, 'busy');
+  const destinationPath = await invoke('choose_folder');
+  if (!destinationPath) return status('Snapshot export cancelled.');
+  const finish = beginButtonOperation(refs.subCompareDownload, 'Exporting…');
+  try {
+    status(`Exporting ${compare.name} snapshots…`, 'busy');
+    const result = await invoke('export_submodule_compare_snapshots', {
+      repositoryPath: state.repository.path,
+      submodulePath: compare.submodulePath,
+      leftRef,
+      rightRef,
+      destinationPath,
+    });
+    const root = result.root_path || result.rootPath || destinationPath;
+    const left = result.left_path || result.leftPath || '';
+    const right = result.right_path || result.rightPath || '';
+    const message = `Exported ${compare.name} snapshots to ${root}`;
+    status(message);
+    showOperationToast(`${message}${left && right ? `\nLeft: ${left}\nRight: ${right}` : ''}`, 'success');
+  } catch (error) {
+    const message = handleError(error);
+    showOperationToast(`Could not export snapshots: ${message}`, 'error');
+  } finally {
+    finish();
   }
 }
 
@@ -2208,9 +2271,13 @@ async function loadFolderRestoreCommits() {
     if (state.folderRestore !== model) return;
     model.commits = commits || [];
     if (!model.selectedCommit && model.commits[0]) model.selectedCommit = model.commits[0].id;
+    model.loadingCommits = false;
     renderFolderRestoreCommits();
   } catch (error) {
-    refs.folderRestoreCommitList.innerHTML = `<div class="folder-restore-empty error">${esc(String(error))}</div>`;
+    if (state.folderRestore === model) {
+      model.loadingCommits = false;
+      refs.folderRestoreCommitList.innerHTML = `<div class="folder-restore-empty error">${esc(String(error))}</div>`;
+    }
   } finally {
     if (state.folderRestore === model) model.loadingCommits = false;
     updateFolderRestoreActionState();
@@ -4039,10 +4106,11 @@ function renderGraph() {
     ${graphHeadBannerHtml(g, currentBranch, headVisible)}
     ${query ? `<span class="search-match-count">${matchCount} match${matchCount === 1 ? '' : 'es'} — rest shown as context</span>` : ''}
     <div class="ref-filter-group" role="group" aria-label="Filter by ref kind">${filterOptions.map(([value, label]) => `<button type="button" class="ref-filter-btn ${refFilter === value ? 'active' : ''}" data-ref-filter="${value}">${label}</button>`).join('')}</div>
+    <button type="button" class="graph-current-jump" data-jump-head ${headVisible ? '' : 'disabled'} title="${headVisible ? 'Jump to current HEAD in this graph' : 'Current HEAD is not loaded in this graph'}">⌖</button>
     ${pickerOptions.length > 1 ? `<label class="primary-branch-picker"><span>Primary</span><select id="graphPrimaryBranch">${pickerOptions.map(opt => `<option value="${esc(opt.value)}" ${opt.value === selectedPickerValue ? 'selected' : ''}>${esc(opt.label)}</option>`).join('')}</select></label>` : ''}
     <span class="lane-header"><span>GRAPH</span><span>COMMIT</span></span>`;
   $('#graphPrimaryBranch')?.addEventListener('change', event => { setActiveGraphPrimaryBranch(event.target.value); renderGraph(); });
-  refs.laneLegend.querySelector('[data-jump-head]')?.addEventListener('click', jumpToGraphHead);
+  refs.laneLegend.querySelectorAll('[data-jump-head]').forEach(button => button.addEventListener('click', jumpToGraphHead));
   refs.laneLegend.querySelectorAll('[data-ref-filter]').forEach(button => button.addEventListener('click', () => { setActiveGraphRefFilter(button.dataset.refFilter); renderGraph(); }));
 
   // Stash entries are informational pointers, not real DAG commits. Rendering
@@ -5264,6 +5332,7 @@ refs.subCompareRefresh.addEventListener('click', () => {
   if (!applySubmoduleCompareRevisionInputs()) return status('Choose both submodule revisions first.', 'error');
   openSubmoduleCompareDirectory(state.commanderPath || '');
 });
+refs.subCompareDownload.addEventListener('click', () => exportSubmoduleCompareSnapshots().catch(error => handleError(error)));
 refs.subCompareSwap.addEventListener('click', () => {
   if (!state.submoduleCompare) return;
   const left = refs.subCompareLeftRef.value.trim();

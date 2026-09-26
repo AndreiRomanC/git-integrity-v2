@@ -818,6 +818,15 @@ pub struct RevisionCompareDirectory {
     right_only_commits: Vec<RevisionCompareCommit>,
 }
 
+#[derive(Serialize)]
+pub struct SubmoduleCompareSnapshotExport {
+    root_path: String,
+    left_path: String,
+    right_path: String,
+    left_revision: String,
+    right_revision: String,
+}
+
 #[derive(Clone)]
 struct GitTreeEntry {
     entry: CommanderEntry,
@@ -2866,7 +2875,21 @@ fn set_pr_check_details_url_from(entry: &mut serde_json::Value, url: &str, sourc
     }
 }
 
-fn collect_rest_check_detail_urls(status_payload: Option<&serde_json::Value>, check_runs_payload: Option<&serde_json::Value>) -> HashMap<String, String> {
+fn pr_check_run_url(pr_url: &str, check_run_id: &str) -> Option<String> {
+    let id = check_run_id.trim();
+    if id.is_empty() || !id.chars().all(|value| value.is_ascii_digit()) { return None; }
+    let base = pr_url.trim().split(['?', '#']).next().unwrap_or("").trim_end_matches('/');
+    if base.is_empty() || !base.contains("/pull/") { return None; }
+    Some(format!("{base}/checks?check_run_id={id}"))
+}
+
+fn pr_checks_page_url(pr_url: &str) -> Option<String> {
+    let base = pr_url.trim().split(['?', '#']).next().unwrap_or("").trim_end_matches('/');
+    if base.is_empty() || !base.contains("/pull/") { return None; }
+    Some(format!("{base}/checks"))
+}
+
+fn collect_rest_check_detail_urls(status_payload: Option<&serde_json::Value>, check_runs_payload: Option<&serde_json::Value>, pr_url: Option<&str>) -> HashMap<String, String> {
     let mut urls = HashMap::new();
     if let Some(statuses) = status_payload.and_then(|payload| payload.get("statuses")).and_then(|value| value.as_array()) {
         for status in statuses {
@@ -2878,7 +2901,11 @@ fn collect_rest_check_detail_urls(status_payload: Option<&serde_json::Value>, ch
     if let Some(check_runs) = check_runs_payload.and_then(|payload| payload.get("check_runs")).and_then(|value| value.as_array()) {
         for check_run in check_runs {
             let Some(name) = check_run.get("name").and_then(|value| value.as_str()).map(str::trim).filter(|value| !value.is_empty()) else { continue };
-            let Some(url) = check_run.get("details_url").and_then(|value| value.as_str())
+            let check_run_id = check_run.get("id")
+                .and_then(|value| value.as_u64().map(|id| id.to_string()).or_else(|| value.as_str().map(str::to_string)));
+            let check_run_url = pr_url.and_then(|url| check_run_id.as_deref().and_then(|id| pr_check_run_url(url, id)));
+            let Some(url) = check_run_url.as_deref()
+                .or_else(|| check_run.get("details_url").and_then(|value| value.as_str()))
                 .or_else(|| check_run.get("html_url").and_then(|value| value.as_str()))
                 .map(str::trim).filter(|value| !value.is_empty()) else { continue };
             urls.entry(normalized_pr_check_name(name)).or_insert_with(|| url.to_string());
@@ -3388,10 +3415,12 @@ impl GitHubGraphqlClient {
 
     fn fill_missing_check_details(&self, repo: &GitHubRepo, pr: &mut serde_json::Value) {
         let missing = count_missing_pr_check_details(pr);
+        let should_refresh_from_page = should_refresh_pr_check_details_from_html(pr);
         let short_sha = pr.get("headSha").and_then(|value| value.as_str()).map(str::trim).filter(|value| !value.is_empty())
             .map(|head_sha| head_sha.chars().take(8).collect::<String>())
             .unwrap_or_else(|| "unknown".into());
-        if missing > 0 {
+        let pr_url = pr.get("url").and_then(|value| value.as_str()).map(str::trim).filter(|value| !value.is_empty()).map(str::to_string);
+        if missing > 0 || should_refresh_from_page {
             if let Some(head_sha) = pr.get("headSha").and_then(|value| value.as_str()).map(str::trim).filter(|value| !value.is_empty()) {
                 let status_payload = match self.rest_get_json(repo, &format!("commits/{head_sha}/status")) {
                     Ok(payload) => Some(payload),
@@ -3407,9 +3436,14 @@ impl GitHubGraphqlClient {
                         None
                     }
                 };
-                let urls = collect_rest_check_detail_urls(status_payload.as_ref(), check_runs_payload.as_ref());
-                let filled = apply_pr_check_details_from_urls(pr, &urls, false, "rest");
-                perf_log(&format!("pr_check_details_rest_fallback: sha={short_sha} missing={missing} found={} filled={filled}", urls.len()), Duration::ZERO);
+                let urls = collect_rest_check_detail_urls(status_payload.as_ref(), check_runs_payload.as_ref(), pr_url.as_deref());
+                let filled = apply_pr_check_details_from_urls(pr, &urls, should_refresh_from_page, "rest");
+                perf_log(&format!(
+                    "pr_check_details_rest_fallback: sha={short_sha} missing={missing} refresh={} found={} changed={filled} overwrite_existing={}",
+                    should_refresh_from_page,
+                    urls.len(),
+                    should_refresh_from_page,
+                ), Duration::ZERO);
             } else {
                 perf_log(&format!("pr_check_details_rest_fallback: missing={missing} skipped=no_head_sha"), Duration::ZERO);
             }
@@ -3417,16 +3451,17 @@ impl GitHubGraphqlClient {
         let missing_after_rest = count_missing_pr_check_details(pr);
         let wants_html_details = missing_after_rest > 0 || should_refresh_pr_check_details_from_html(pr);
         if !wants_html_details { return; }
-        let Some(pr_url) = pr.get("url").and_then(|value| value.as_str()).map(str::trim).filter(|value| !value.is_empty()) else {
+        let Some(pr_url) = pr_url.as_deref() else {
             perf_log(&format!("pr_check_details_html_fallback: sha={short_sha} missing={missing_after_rest} skipped=no_pr_url"), Duration::ZERO);
             return;
         };
-        match self.get_text(pr_url) {
+        let html_url = pr_checks_page_url(pr_url).unwrap_or_else(|| pr_url.to_string());
+        match self.get_text(&html_url).or_else(|_| if html_url != pr_url { self.get_text(pr_url) } else { Err("GitHub HTML request failed".into()) }) {
             Ok(html) => {
                 let html_urls = collect_pr_check_detail_urls_from_html(pr_url, &html);
                 let found = html_urls.len();
                 let changed = apply_pr_check_details_from_urls(pr, &html_urls, true, "html");
-                perf_log(&format!("pr_check_details_html_fallback: sha={short_sha} missing={missing_after_rest} found={found} changed={changed} overwrite_existing=true"), Duration::ZERO);
+                perf_log(&format!("pr_check_details_html_fallback: sha={short_sha} missing={missing_after_rest} url_kind=checks_or_pr found={found} changed={changed} overwrite_existing=true"), Duration::ZERO);
             }
             Err(_) => {
                 perf_log(&format!("pr_check_details_html_fallback: sha={short_sha} missing={missing_after_rest} html_failed=true"), Duration::ZERO);
@@ -6685,6 +6720,123 @@ fn compare_submodule_revision_file_inner(repository_path: String, submodule_path
     compare_git_tree_file(&submodule_repository, &relative_path, &left_ref, &right_ref)
 }
 
+fn safe_export_component(value: &str, fallback: &str) -> String {
+    let mut cleaned = value
+        .chars()
+        .map(|character| if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') { character } else { '-' })
+        .collect::<String>();
+    while cleaned.contains("--") {
+        cleaned = cleaned.replace("--", "-");
+    }
+    let cleaned = cleaned.trim_matches(['-', '.', ' ']).chars().take(80).collect::<String>();
+    if cleaned.is_empty() { fallback.into() } else { cleaned }
+}
+
+fn short_revision(value: &str) -> String {
+    value.chars().take(8).collect::<String>()
+}
+
+fn unique_submodule_snapshot_root(destination: &Path, submodule_path: &str, left_revision: &str, right_revision: &str) -> Result<PathBuf, String> {
+    let name = Path::new(submodule_path)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("submodule");
+    let base = format!(
+        "GitDrillDown-{}-{}-vs-{}",
+        safe_export_component(name, "submodule"),
+        safe_export_component(&short_revision(left_revision), "left"),
+        safe_export_component(&short_revision(right_revision), "right"),
+    );
+    for attempt in 0..100 {
+        let folder = if attempt == 0 { base.clone() } else { format!("{base}-{attempt}") };
+        let candidate = destination.join(folder);
+        match fs::create_dir(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("Could not create snapshot folder: {error}")),
+        }
+    }
+    Err("Could not create a unique snapshot folder in the selected destination".into())
+}
+
+// A tree entry name becomes one path component under the export folder. Git's
+// own checkout refuses "." / ".." / ".git", but a hand-built tree object can
+// still carry them, and a ".." entry would write outside the chosen folder.
+// On Windows a ':' would address an NTFS alternate data stream.
+fn is_safe_export_entry_name(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.eq_ignore_ascii_case(".git")
+        && !name.contains(['/', '\\', '\0'])
+        && !(cfg!(windows) && name.contains(':'))
+}
+
+fn export_tree_to_directory(repo: &Repository, tree: &git2::Tree<'_>, destination: &Path) -> Result<(), String> {
+    fs::create_dir_all(destination).map_err(|error| format!("Could not create export folder {}: {error}", destination.display()))?;
+    for entry in tree.iter() {
+        let name = entry.name().ok_or_else(|| "Cannot export a tree entry with a non-UTF-8 name".to_string())?;
+        if !is_safe_export_entry_name(name) {
+            return Err(format!("Refusing to export unsafe tree entry name: {name}"));
+        }
+        let target = destination.join(name);
+        match entry.kind() {
+            Some(ObjectType::Tree) => {
+                let subtree = repo.find_tree(entry.id()).map_err(|error| error.message().to_string())?;
+                export_tree_to_directory(repo, &subtree, &target)?;
+            }
+            Some(ObjectType::Blob) => {
+                if let Some(parent) = target.parent() {
+                    fs::create_dir_all(parent).map_err(|error| format!("Could not create export folder {}: {error}", parent.display()))?;
+                }
+                let blob = repo.find_blob(entry.id()).map_err(|error| error.message().to_string())?;
+                fs::write(&target, blob.content()).map_err(|error| format!("Could not write {}: {error}", target.display()))?;
+            }
+            Some(ObjectType::Commit) if entry.filemode() == 0o160000 => {
+                fs::create_dir_all(&target).map_err(|error| format!("Could not create gitlink folder {}: {error}", target.display()))?;
+                fs::write(target.join(".gitdrilldown-gitlink"), format!("{}\n", entry.id()))
+                    .map_err(|error| format!("Could not write gitlink marker for {}: {error}", target.display()))?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn export_submodule_compare_snapshots(repository_path: String, submodule_path: String, left_ref: String, right_ref: String, destination_path: String) -> Result<SubmoduleCompareSnapshotExport, String> {
+    off_main_thread(move || export_submodule_compare_snapshots_inner(repository_path, submodule_path, left_ref, right_ref, destination_path)).await
+}
+
+fn export_submodule_compare_snapshots_inner(repository_path: String, submodule_path: String, left_ref: String, right_ref: String, destination_path: String) -> Result<SubmoduleCompareSnapshotExport, String> {
+    validate_path(&repository_path)?;
+    let destination = PathBuf::from(destination_path);
+    if !destination.is_dir() {
+        return Err("Choose an existing folder where the snapshots should be exported".into());
+    }
+    let absolute = validate_submodule(&repository_path, &submodule_path)?;
+    let submodule_repository = absolute.to_string_lossy().into_owned();
+    let repo = internal_repository(&submodule_repository)?;
+    let left_revision = resolve_commit(&submodule_repository, &left_ref)?;
+    let right_revision = resolve_commit(&submodule_repository, &right_ref)?;
+    let left_oid = git2::Oid::from_str(&left_revision).map_err(|error| error.message().to_string())?;
+    let right_oid = git2::Oid::from_str(&right_revision).map_err(|error| error.message().to_string())?;
+    let left_tree = repo.find_commit(left_oid).and_then(|commit| commit.tree()).map_err(|error| error.message().to_string())?;
+    let right_tree = repo.find_commit(right_oid).and_then(|commit| commit.tree()).map_err(|error| error.message().to_string())?;
+    let root = unique_submodule_snapshot_root(&destination, &submodule_path, &left_revision, &right_revision)?;
+    let left_path = root.join(format!("left-{}", short_revision(&left_revision)));
+    let right_path = root.join(format!("right-{}", short_revision(&right_revision)));
+    export_tree_to_directory(&repo, &left_tree, &left_path)?;
+    export_tree_to_directory(&repo, &right_tree, &right_path)?;
+    Ok(SubmoduleCompareSnapshotExport {
+        root_path: root.to_string_lossy().into_owned(),
+        left_path: left_path.to_string_lossy().into_owned(),
+        right_path: right_path.to_string_lossy().into_owned(),
+        left_revision,
+        right_revision,
+    })
+}
+
 // The submodule-publish-safety report's point 1: this used to also call
 // record_pushed_submodule_in_parent right here, unconditionally — an actual
 // commit_selected_internal call into the *parent* — whether or not anything
@@ -9405,17 +9557,51 @@ mod tests {
         });
         let check_runs = serde_json::json!({
             "check_runs": [
-                { "name": "Submodule status", "details_url": "https://github.vitesco.io/eng/repo/actions/runs/123" },
+                { "id": 123, "name": "Submodule status", "details_url": "https://github.vitesco.io/eng/repo/actions/runs/123" },
                 { "name": "build-status", "details_url": "https://github.vitesco.io/eng/repo/actions/runs/should-not-overwrite" }
             ]
         });
-        let urls = collect_rest_check_detail_urls(Some(&statuses), Some(&check_runs));
+        let urls = collect_rest_check_detail_urls(Some(&statuses), Some(&check_runs), Some("https://github.vitesco.io/eng/sw-prj-VWAQ4_000U0/pull/282"));
         assert_eq!(apply_pr_check_details_from_urls(&mut pr, &urls, false, "rest"), 3);
         let checks = pr.get("statusCheckRollup").and_then(|value| value.as_array()).unwrap();
         assert_eq!(checks[0].get("detailsUrl").and_then(|value| value.as_str()), Some("https://existing.example/build"));
         assert_eq!(checks[1].get("targetUrl").and_then(|value| value.as_str()), Some("https://github.vitesco.io/eng/repo/status/collaborator"));
         assert_eq!(checks[2].get("targetUrl").and_then(|value| value.as_str()), Some("https://github.vitesco.io/eng/repo/status/polarion"));
-        assert_eq!(checks[3].get("detailsUrl").and_then(|value| value.as_str()), Some("https://github.vitesco.io/eng/repo/actions/runs/123"));
+        assert_eq!(checks[3].get("detailsUrl").and_then(|value| value.as_str()), Some("https://github.vitesco.io/eng/sw-prj-VWAQ4_000U0/pull/282/checks?check_run_id=123"));
+    }
+
+    #[test]
+    fn snapshot_export_refuses_tree_entry_names_that_could_escape_the_destination() {
+        for unsafe_name in ["", ".", "..", ".git", ".GIT", ".Git", "a/b", "a\\b", "a\0b"] {
+            assert!(!is_safe_export_entry_name(unsafe_name), "{unsafe_name:?} must not be exportable");
+        }
+        for safe_name in ["module.txt", ".gitignore", ".gitattributes", "src", "a b", "..hidden", "file.", "café.txt"] {
+            assert!(is_safe_export_entry_name(safe_name), "{safe_name:?} is an ordinary name and must stay exportable");
+        }
+    }
+
+    #[test]
+    fn pr_check_details_rest_fallback_prefers_pull_request_check_run_pages() {
+        let mut pr = serde_json::json!({
+            "url": "https://github.vitesco.io/eng/sw-prj-VWAQ4_000U0/pull/320",
+            "statusCheckRollup": [
+                { "name": "Polarion Link", "status": "COMPLETED", "conclusion": "SUCCESS", "detailsUrl": "https://external.example/polarion" },
+                { "name": "Submodule status", "status": "COMPLETED", "conclusion": "SUCCESS", "detailsUrl": "https://external.example/submodule" }
+            ]
+        });
+        let check_runs = serde_json::json!({
+            "check_runs": [
+                { "id": 2785800, "name": "Polarion Link", "details_url": "https://external.example/wrong-polarion" },
+                { "id": "2785801", "name": "Submodule status", "html_url": "https://external.example/wrong-submodule" }
+            ]
+        });
+        let urls = collect_rest_check_detail_urls(None, Some(&check_runs), pr.get("url").and_then(|value| value.as_str()));
+        assert_eq!(urls.get("polarion link").map(String::as_str), Some("https://github.vitesco.io/eng/sw-prj-VWAQ4_000U0/pull/320/checks?check_run_id=2785800"));
+        assert_eq!(urls.get("submodule status").map(String::as_str), Some("https://github.vitesco.io/eng/sw-prj-VWAQ4_000U0/pull/320/checks?check_run_id=2785801"));
+        assert_eq!(apply_pr_check_details_from_urls(&mut pr, &urls, true, "rest"), 2);
+        let checks = pr.get("statusCheckRollup").and_then(|value| value.as_array()).unwrap();
+        assert_eq!(checks[0].get("detailsUrl").and_then(|value| value.as_str()), Some("https://github.vitesco.io/eng/sw-prj-VWAQ4_000U0/pull/320/checks?check_run_id=2785800"));
+        assert_eq!(checks[1].get("detailsUrl").and_then(|value| value.as_str()), Some("https://github.vitesco.io/eng/sw-prj-VWAQ4_000U0/pull/320/checks?check_run_id=2785801"));
     }
 
     #[test]
@@ -12552,10 +12738,25 @@ mod tests {
         let added_row = comparison.rows.iter().find(|row| row.name == "added.txt").expect("added.txt row");
         assert_eq!(added_row.status, "remote-only");
 
-        let file_comparison = compare_submodule_revision_file_inner(repo_path, "vendor/dep".into(), "module.txt".into(), comparison.left_revision, comparison.right_revision).unwrap();
+        let file_comparison = compare_submodule_revision_file_inner(repo_path.clone(), "vendor/dep".into(), "module.txt".into(), comparison.left_revision.clone(), comparison.right_revision.clone()).unwrap();
         assert_eq!(file_comparison.local_content, "v1\n");
         assert_eq!(file_comparison.remote_content, "v2\n");
         assert_eq!(run_git_capture(&sub_path, &["rev-parse", "HEAD"]), run_git_capture(&dependency, &["rev-parse", "HEAD~1"]), "comparison must not move the checked-out submodule");
+
+        let export_destination = base.join("exports");
+        fs::create_dir_all(&export_destination).unwrap();
+        let exported = export_submodule_compare_snapshots_inner(repo_path, "vendor/dep".into(), first.clone(), second.clone(), export_destination.to_string_lossy().into_owned()).unwrap();
+        assert_eq!(exported.left_revision, first);
+        assert_eq!(exported.right_revision, second);
+        assert_eq!(fs::read_to_string(Path::new(&exported.left_path).join("module.txt")).unwrap(), "v1\n");
+        assert_eq!(fs::read_to_string(Path::new(&exported.right_path).join("module.txt")).unwrap(), "v2\n");
+        assert_eq!(fs::read_to_string(Path::new(&exported.right_path).join("added.txt")).unwrap(), "new\n");
+        assert!(!Path::new(&exported.left_path).join("added.txt").exists());
+        assert_eq!(
+            run_git_capture(&sub_path, &["rev-parse", "HEAD"]),
+            run_git_capture(&dependency, &["rev-parse", "HEAD~1"]),
+            "export must not move the checked-out submodule"
+        );
 
         fs::remove_dir_all(base).unwrap();
     }

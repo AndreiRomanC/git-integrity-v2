@@ -33,6 +33,7 @@ delete_local_path
 drop_stash
 entry_details
 entry_last_commit
+export_submodule_compare_snapshots
 fetch_all_remotes
 fetch_project
 fetch_remote

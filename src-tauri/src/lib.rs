@@ -63,6 +63,7 @@ pub fn run() {
             repository::compare_file_contents,
             repository::compare_submodule_revisions_directory,
             repository::compare_submodule_revision_file,
+            repository::export_submodule_compare_snapshots,
             repository::read_text_file,
             repository::write_text_file,
             repository::remotes::list_remotes,
