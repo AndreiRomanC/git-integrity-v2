@@ -45,7 +45,7 @@
     <main class="main-layout">
       <aside class="sidebar">
         <button class="nav-item active" id="navExplorer"><span class="nav-icon">▰</span><span>Project Explorer</span></button>
-        <button class="nav-item" id="navCommander"><span class="nav-icon">⇄</span><span>Folder Sync</span></button>
+        <button class="nav-item" id="navCommander"><span class="nav-icon">⇄</span><span>Compare & Sync</span></button>
         <button class="nav-item" id="navGraph"><span class="nav-icon">⑂</span><span>Branch Map</span></button>
         <button class="nav-item" id="navRemotes"><span class="nav-icon">◎</span><span>Remotes</span></button>
 
@@ -117,9 +117,10 @@
         </div>
 
         <div id="commanderView" class="commander-view" hidden>
-          <div class="compare-mode-tabs" role="tablist" aria-label="Folder Sync mode">
+          <div class="compare-mode-tabs" role="tablist" aria-label="Compare and Sync mode">
             <button id="compareModeDrive" class="active" type="button" role="tab">Local Drive</button>
             <button id="compareModeGit" type="button" role="tab">Git Compare</button>
+            <button id="compareModeSubmodule" type="button" role="tab">Submodule Compare</button>
           </div>
           <div id="gitComparePanel" class="compare-panel" hidden>
             <div class="commander-toolbar">
@@ -129,6 +130,24 @@
             <div class="commander-head commander-grid"><span>LOCAL WORKSPACE</span><span>STATE</span><span>REMOTE BRANCH</span></div>
             <div id="commanderRows" class="commander-rows"></div>
             <div class="commander-legend"><span><i class="same"></i>Same</span><span><i class="modified"></i>Modified</span><span><i class="local-only"></i>Only local</span><span><i class="remote-only"></i>Only remote</span></div>
+          </div>
+          <div id="submoduleComparePanel" class="compare-panel submodule-compare-panel" hidden>
+            <div class="submodule-compare-toolbar">
+              <label class="submodule-compare-picker"><span>SUBMODULE</span><input id="subCompareSubmodule" list="subCompareSubmoduleOptions" placeholder="Type or pick a submodule…" autocomplete="off" spellcheck="false"></label>
+              <label><span>LEFT REVISION</span><div class="revision-input-row"><input id="subCompareLeftRef" placeholder="branch, tag or SHA…" autocomplete="off" spellcheck="false"><button type="button" id="subComparePickLeft" title="Pick or search left revision">⌕</button></div></label>
+              <button type="button" id="subCompareSwap" title="Swap left and right revisions">⇄</button>
+              <label><span>RIGHT REVISION</span><div class="revision-input-row"><input id="subCompareRightRef" placeholder="branch, tag or SHA…" autocomplete="off" spellcheck="false"><button type="button" id="subComparePickRight" title="Pick or search right revision">⌕</button></div></label>
+              <button type="button" id="subCompareRefresh" title="Re-run comparison for these revisions">Compare</button>
+              <datalist id="subCompareSubmoduleOptions"></datalist>
+            </div>
+            <div class="submodule-compare-exact" id="subCompareExact">Choose a submodule and two revisions.</div>
+            <div class="submodule-compare-commits" id="subCompareCommits" hidden></div>
+            <div class="commander-toolbar">
+              <nav id="subCompareBreadcrumbs" class="commander-breadcrumbs"></nav>
+            </div>
+            <div class="commander-head commander-grid"><span>LEFT REVISION</span><span>STATE</span><span>RIGHT REVISION</span></div>
+            <div id="subCompareRows" class="commander-rows"></div>
+            <div class="commander-legend"><span><i class="same"></i>Same</span><span><i class="modified"></i>Modified</span><span><i class="local-only"></i>Only left</span><span><i class="remote-only"></i>Only right</span></div>
           </div>
           <div id="localDrivePanel" class="local-drive-panel">
             <div class="local-drive-note"><strong>TWO INDEPENDENT LOCAL SIDES.</strong> F9 compares complete folder structures without writing; F10 opens a guided, confirmed merge in either direction.</div>
@@ -213,6 +232,19 @@
       <div id="submoduleVersions" class="version-list"></div>
       <footer id="submoduleVersionHelp" class="version-help">Use Checkout to change version. “Replace with remote…” is a destructive recovery action shown only for a branch that differs from origin.</footer>
     </section>
+
+    <dialog id="subCompareRevisionDialog" class="submodule-revision-dialog">
+      <header>
+        <div><span id="subRevisionDialogSide">REVISION</span><strong id="subRevisionDialogTitle">Choose revision</strong></div>
+        <button id="closeSubRevisionDialog" type="button">×</button>
+      </header>
+      <div class="submodule-revision-search">
+        <label><span>Search loaded refs/history</span><input id="subRevisionSearch" type="text" placeholder="branch, tag, SHA, message or author…" autocomplete="off" spellcheck="false"></label>
+        <button id="subRevisionSearchAll" type="button" title="Search all reachable submodule history once, only when requested">Search all history</button>
+      </div>
+      <div id="subRevisionResults" class="submodule-revision-results"></div>
+      <footer id="subRevisionHelp">Loaded suggestions are instant. “Search all history” may walk more commits, but only when you ask.</footer>
+    </dialog>
 
     <footer id="statusFooter" title="Double-click for recent command history">
       <span id="statusDot" class="status-dot"></span><span id="statusText">Ready</span>
@@ -560,8 +592,8 @@
           <p>Shows local commits not yet on the server, for the main project only (not submodules — use "Push submodule" for those). Every commit listed here is checked by default; unchecking one also unchecks everything newer than it (Git can only push a continuous range, so that's the only valid way to "leave some out"). Click "Publish branch" to send what's checked.</p>
         </details>
         <details>
-          <summary>Folder Sync</summary>
-          <p><b>Git Compare</b> compares your working copy against a chosen remote snapshot without checking anything out. <b>Local Drive</b> is a separate two-pane local file workspace for safe copying, creating folders, and moving items to Trash/Recycle Bin.</p>
+          <summary>Compare & Sync</summary>
+          <p><b>Git Compare</b> compares your working copy against a chosen remote snapshot without checking anything out. <b>Submodule Compare</b> compares two exact submodule revisions side by side. <b>Local Drive</b> is a separate two-pane local file workspace for safe copying, creating folders, and moving items to Trash/Recycle Bin.</p>
         </details>
         <details>
           <summary>Stash</summary>

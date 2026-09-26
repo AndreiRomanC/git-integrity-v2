@@ -40,28 +40,12 @@ fn normalized_folder_path(path: &str) -> Result<String, String> {
     Ok(parts.join("/"))
 }
 
-fn first_remote_url(repo: &Repository) -> Option<String> {
-    repo.find_remote("origin")
-        .ok()
-        .or_else(|| {
-            repo.remotes().ok().and_then(|names| {
-                names
-                    .iter()
-                    .flatten()
-                    .next()
-                    .and_then(|name| repo.find_remote(name).ok())
-            })
-        })
-        .and_then(|remote| remote.url().map(str::to_string))
-}
-
-fn repository_identity(repository_path: &str) -> Result<String, String> {
+fn repository_workdir(repository_path: &str) -> Result<PathBuf, String> {
     let repo = Repository::open(repository_path).map_err(|error| error.message().to_string())?;
-    if let Some(remote) = first_remote_url(&repo).filter(|url| !url.trim().is_empty()) {
-        return Ok(format!("remote:{}", remote.trim()));
-    }
-    let canonical = fs::canonicalize(repository_path).map_err(|error| error.to_string())?;
-    Ok(format!("path:{}", canonical.to_string_lossy()))
+    let workdir = repo
+        .workdir()
+        .ok_or("Personal notes are only available for repositories with a working tree")?;
+    fs::canonicalize(workdir).map_err(|error| error.to_string())
 }
 
 // FNV-1a 64-bit. The notes file name is derived from this, so it must never
@@ -76,47 +60,41 @@ fn stable_hash(value: &str) -> String {
     format!("{hash:016x}")
 }
 
-fn app_data_root() -> PathBuf {
+fn override_notes_root() -> Option<PathBuf> {
     if let Some(override_path) = std::env::var_os("GIT_DRILLDOWN_NOTES_DIR") {
-        return PathBuf::from(override_path);
+        return Some(PathBuf::from(override_path));
     }
-    #[cfg(target_os = "windows")]
-    {
-        if let Some(appdata) = std::env::var_os("APPDATA") {
-            return PathBuf::from(appdata).join("Git DrillDown").join("notes");
+    None
+}
+
+fn safe_file_stem(value: &str) -> String {
+    let mut output = String::new();
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+            output.push(ch);
+        } else {
+            output.push('_');
         }
     }
-    #[cfg(target_os = "macos")]
-    {
-        if let Some(home) = std::env::var_os("HOME") {
-            return PathBuf::from(home)
-                .join("Library")
-                .join("Application Support")
-                .join("Git DrillDown")
-                .join("notes");
-        }
-    }
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    {
-        if let Some(data_home) = std::env::var_os("XDG_DATA_HOME") {
-            return PathBuf::from(data_home).join("Git DrillDown").join("notes");
-        }
-        if let Some(home) = std::env::var_os("HOME") {
-            return PathBuf::from(home)
-                .join(".local")
-                .join("share")
-                .join("Git DrillDown")
-                .join("notes");
-        }
-    }
-    std::env::temp_dir().join("Git DrillDown").join("notes")
+    let trimmed = output.trim_matches('_');
+    if trimmed.is_empty() { "repository".into() } else { trimmed.to_string() }
 }
 
 fn notes_path_for_repository(repository_path: &str) -> Result<PathBuf, String> {
-    let identity = repository_identity(repository_path)?;
-    Ok(app_data_root().join(format!(
-        "{}.drill-down-notes.json",
-        stable_hash(&identity)
+    let repo_root = repository_workdir(repository_path)?;
+    let parent = repo_root
+        .parent()
+        .ok_or("Cannot find a parent folder outside this repository for personal notes")?;
+    let notes_root = override_notes_root().unwrap_or_else(|| parent.join(".git-drilldown"));
+    let repo_name = repo_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(safe_file_stem)
+        .unwrap_or_else(|| "repository".into());
+    Ok(notes_root.join(format!(
+        "{}-{}.drill-down-notes.json",
+        repo_name,
+        stable_hash(&format!("path:{}", repo_root.to_string_lossy()))
     )))
 }
 
@@ -166,7 +144,7 @@ fn write_notes_file(path: &Path, notes: &HashMap<String, String>) -> Result<(), 
 
 fn ensure_existing_folder(repository_path: &str, relative_path: &str) -> Result<String, String> {
     let normalized = normalized_folder_path(relative_path)?;
-    let absolute = Path::new(repository_path).join(&normalized);
+    let absolute = repository_workdir(repository_path)?.join(&normalized);
     let metadata = fs::symlink_metadata(&absolute).map_err(|error| error.to_string())?;
     if !metadata.is_dir() {
         return Err("Personal notes are available for folders and submodules only".into());
@@ -251,7 +229,7 @@ mod tests {
     }
 
     fn with_notes_dir<T>(label: &str, run: impl FnOnce(PathBuf) -> T) -> T {
-        let _guard = NOTES_TEST_ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _guard = NOTES_TEST_ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let root = temp_root(label);
         std::env::set_var("GIT_DRILLDOWN_NOTES_DIR", &root);
         let value = run(root.clone());
@@ -273,10 +251,12 @@ mod tests {
 
     #[test]
     fn add_edit_delete_and_multiple_folder_notes_round_trip() {
-        with_notes_dir("roundtrip", |_| {
+        with_notes_dir("roundtrip", |notes_root| {
             let root = temp_root("roundtrip-repo");
             let repo = repo_at(&root, "repo", Some("https://example.test/org/repo.git"));
             let repo_string = repo.to_string_lossy().into_owned();
+            let notes_path = notes_path_for_repository(&repo_string).unwrap();
+            assert!(notes_path.starts_with(&notes_root), "test override keeps note writes outside the repository");
             let added = set_drill_down_note(repo_string.clone(), "work/a".into(), "First".into()).unwrap();
             assert_eq!(added.notes.get("work/a").map(String::as_str), Some("First"));
             let edited = set_drill_down_note(repo_string.clone(), "work\\a\\".into(), "Second".into()).unwrap();
@@ -322,15 +302,29 @@ mod tests {
     }
 
     #[test]
-    fn repository_identity_can_follow_a_moved_clone_when_remote_matches() {
+    fn notes_are_local_to_each_clone_even_when_remote_matches() {
         with_notes_dir("moved", |_| {
             let root = temp_root("moved-repo");
             let first = repo_at(&root, "first", Some("https://example.test/org/repo.git"));
             let second = repo_at(&root, "second", Some("https://example.test/org/repo.git"));
             set_drill_down_note(first.to_string_lossy().into_owned(), "work/a".into(), "Shared by remote".into()).unwrap();
             let loaded = load_drill_down_notes(second.to_string_lossy().into_owned()).unwrap();
-            assert_eq!(loaded.notes.get("work/a").map(String::as_str), Some("Shared by remote"));
+            assert!(loaded.notes.is_empty(), "notes must not bleed from another local clone just because the remote URL matches");
         });
+    }
+
+    #[test]
+    fn default_notes_file_lives_in_the_first_parent_outside_the_repository() {
+        let _guard = NOTES_TEST_ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::env::remove_var("GIT_DRILLDOWN_NOTES_DIR");
+        let root = temp_root("sidecar-root");
+        let repo = repo_at(&root, "repo", Some("https://example.test/org/repo.git"));
+        let repo_string = repo.to_string_lossy().into_owned();
+        let path = notes_path_for_repository(&repo_string).unwrap();
+        let canonical_root = fs::canonicalize(&root).unwrap();
+        assert!(path.starts_with(canonical_root.join(".git-drilldown")));
+        assert!(!path.starts_with(&repo), "notes must never be stored inside the Git repository tree");
+        assert!(path.file_name().unwrap().to_string_lossy().starts_with("repo-"));
     }
 
     #[test]

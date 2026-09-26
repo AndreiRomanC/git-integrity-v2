@@ -117,20 +117,34 @@ pub(in crate::repository) fn run_terminal_command_inner(repository_path: String,
     validate_path(&repository_path)?;
     let command_text = command_text.trim();
     if command_text.is_empty() { return Err("Type a command, e.g. \"git status\", \"pwd\", or \"gh pr status\"".into()); }
-
-    // Lock the actual repository root while retaining the selected directory
-    // as the process cwd. This keeps subfolder scope useful without allowing
-    // concurrent mutations of the same index under different lock keys.
-    let repository = internal_repository(&repository_path)?;
-    let repository_root = repository.workdir()
-        .ok_or("Bare repositories are not supported by the embedded Terminal")?
-        .to_string_lossy().into_owned();
-    drop(repository);
-    let queue_started = Instant::now();
-    let lock_handle = repo_write_lock(&repository_root);
-    let _lock = lock_handle.lock().unwrap();
-    log_repo_write_lock_acquired(&repository_root, "run_terminal_command", queue_started.elapsed());
     let read_only = is_definitely_read_only_terminal_command(command_text);
+
+    // Mutating commands still lock the actual repository root while retaining
+    // the selected directory as the process cwd. Clearly read-only terminal
+    // commands (status/log/diff/show/ls/dir/...) deliberately skip the write
+    // lock so a slow inspection command cannot make commit/publish/status feel
+    // blocked for no reason.
+    let repository_root = if read_only {
+        repository_path.clone()
+    } else {
+        let repository = internal_repository(&repository_path)?;
+        repository.workdir()
+            .ok_or("Bare repositories are not supported by the embedded Terminal")?
+            .to_string_lossy().into_owned()
+    };
+    let lock_handle = if read_only { None } else { Some(repo_write_lock(&repository_root)) };
+    let queue_started = Instant::now();
+    let _lock = match &lock_handle {
+        Some(lock_handle) => {
+            let guard = lock_handle.lock().unwrap();
+            log_repo_write_lock_acquired(&repository_root, "run_terminal_command", queue_started.elapsed());
+            Some(guard)
+        }
+        None => {
+            perf_log(&format!("repo_write_lock: [run_terminal_command] skipped read_only (repo={})", anonymized_repository_id(&repository_root)), Duration::ZERO);
+            None
+        }
+    };
     let repo_id = anonymized_repository_id(&repository_root);
     let terminal_git_args = tokenize_git_args(command_text)
         .ok()

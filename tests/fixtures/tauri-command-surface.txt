@@ -14,6 +14,8 @@ commit_submodule
 compare_file_contents
 compare_local_directories
 compare_remote_directory
+compare_submodule_revision_file
+compare_submodule_revisions_directory
 complete_merge
 conflict_sides
 copy_local_item
@@ -91,6 +93,7 @@ restore_stash_paths
 run_git_command
 run_terminal_command
 run_utrud
+search_submodule_revisions
 set_drill_down_note
 stage_all
 stage_files

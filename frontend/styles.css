@@ -300,6 +300,43 @@ button.pr-reviewer:hover { border-color: #59758e; background: #1b2b38; color: #e
 .compare-state.same, .commander-legend .same { color: #6f8394; }.compare-state.modified, .commander-legend .modified { color: var(--amber); }.compare-state.local-only, .commander-legend .local-only { color: var(--blue); }.compare-state.remote-only, .commander-legend .remote-only { color: var(--purple); }.compare-state.type-changed { color: var(--red); }
 .commander-legend { min-height: 32px; display: flex; align-items: center; gap: 18px; padding: 0 16px; border-top: 1px solid var(--border); background: #111820; color: #778899; font-size: 10px; }
 .commander-legend span { display: flex; align-items: center; gap: 6px; }.commander-legend i { display: inline-block; width: 7px; height: 7px; }
+.submodule-compare-toolbar { min-height: 58px; display: grid; grid-template-columns: minmax(220px, 1.2fr) minmax(160px, .9fr) 34px minmax(160px, .9fr) auto; align-items: end; gap: 8px; padding: 8px 16px; background: #131b23; border-bottom: 1px solid var(--border); }
+.submodule-compare-toolbar label, .submodule-compare-title { min-width: 0; display: flex; flex-direction: column; gap: 4px; color: #718496; font-size: 9px; font-weight: 700; letter-spacing: .8px; }
+.submodule-compare-title strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #d7e4ef; font-size: 12px; letter-spacing: 0; }
+.submodule-compare-toolbar input { min-width: 0; height: 30px; border: 1px solid #3c4a57; border-radius: 7px; padding: 0 9px; background: #0e151b; color: #d6e2ec; font: 12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.submodule-compare-toolbar input:focus { outline: none; border-color: #4f8bc1; box-shadow: 0 0 0 2px rgba(88, 166, 255, .12); }
+.submodule-compare-toolbar button { height: 30px; border: 1px solid #3f5264; border-radius: 7px; padding: 0 10px; background: #172838; color: #c9d7e4; font-weight: 700; }
+.submodule-compare-toolbar button:hover { border-color: #5681aa; background: #1d3851; }
+.revision-input-row { min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr) 34px; gap: 6px; }
+.revision-input-row button { padding: 0; font-size: 14px; }
+.submodule-compare-exact { min-height: 28px; display: flex; align-items: center; padding: 5px 16px; border-bottom: 1px solid var(--border-soft); background: #101820; color: #8da0b2; font-size: 10px; }
+.submodule-compare-commits { max-height: 118px; overflow: auto; padding: 7px 16px; border-bottom: 1px solid var(--border); background: #0f171f; color: #a9bac8; font-size: 10px; }
+.submodule-compare-commits details { margin: 2px 0; }
+.submodule-compare-commits summary { cursor: pointer; color: #d6e4f0; font-weight: 700; }
+.submodule-compare-commits div { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 2px 0; }
+.submodule-compare-commits code { margin-right: 6px; color: #82bdf3; }
+.submodule-compare-commits small { color: #718394; }
+.submodule-revision-dialog { width: min(860px, 92vw); max-width: 860px; }
+.submodule-revision-dialog header { min-height: 58px; display: flex; align-items: center; padding: 10px 14px 10px 16px; border-bottom: 1px solid var(--border); background: #1b2530; }
+.submodule-revision-dialog header div { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.submodule-revision-dialog header span { color: #7f92a4; font-size: 9px; font-weight: 700; letter-spacing: .9px; }
+.submodule-revision-dialog header strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.submodule-revision-dialog header button { width: 30px; height: 30px; margin: 0 0 0 auto; border: 0; border-radius: 6px; background: transparent; color: #9babb9; font-size: 20px; }
+.submodule-revision-dialog header button:hover { background: #2a3642; }
+.submodule-revision-search { display: grid; grid-template-columns: minmax(0, 1fr) 150px; align-items: end; gap: 9px; padding: 12px 14px; border-bottom: 1px solid var(--border-soft); background: #141e27; }
+.submodule-revision-search label { min-width: 0; display: flex; flex-direction: column; gap: 5px; color: #7f92a4; font-size: 9px; font-weight: 700; letter-spacing: .8px; }
+.submodule-revision-search input { height: 34px; border: 1px solid #405263; border-radius: 7px; outline: 0; padding: 0 10px; background: #0d151c; color: #d4e0ea; font: 12px ui-monospace, SFMono-Regular, Consolas, monospace; }
+.submodule-revision-search input:focus { border-color: #58a6ff; box-shadow: 0 0 0 2px rgba(88,166,255,.12); }
+.submodule-revision-search button { width: auto; height: 34px; margin: 0; border: 1px solid #4a789f; border-radius: 7px; background: #1f3a51; color: #d2eaff; font-size: 10px; font-weight: 800; }
+.submodule-revision-search button:disabled { opacity: .55; }
+.submodule-revision-results { max-height: min(520px, 58vh); overflow: auto; padding: 7px; }
+.submodule-revision-result { width: 100%; min-height: 54px; display: grid; grid-template-columns: 84px minmax(150px, 240px) minmax(0, 1fr) 96px; align-items: center; gap: 10px; margin: 0; padding: 6px 9px; border: 1px solid transparent; border-radius: 8px; background: transparent; color: #c9d6e1; text-align: left; }
+.submodule-revision-result:hover { border-color: #3d5f7d; background: #1b2c3b; }
+.submodule-revision-result .revision-kind { padding: 2px 7px; border-radius: 11px; background: #263847; color: #98bbdc; font-size: 8px; font-weight: 800; letter-spacing: .5px; text-transform: uppercase; text-align: center; }
+.submodule-revision-result strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 12px ui-monospace, SFMono-Regular, Consolas, monospace; }
+.submodule-revision-result small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #7d8f9f; font-size: 10px; }
+.submodule-revision-result code { color: #81bdf3; font-size: 10px; text-align: right; }
+.submodule-revision-dialog footer { min-height: 34px; padding: 9px 14px; border-top: 1px solid var(--border); background: #131a21; color: #758697; font-size: 10px; }
 .local-drive-panel { flex: 1; min-height: 0; display: flex; flex-direction: column; }
 .local-drive-note { min-height: 28px; padding: 6px 10px; border-bottom: 1px solid var(--border-soft); background: #111820; color: #7f91a1; font-size: 9px; }
 .local-drive-note strong { color: #b7c8d8; }

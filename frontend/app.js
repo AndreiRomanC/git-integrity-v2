@@ -121,7 +121,7 @@ const state = { repository: null, branches: [], commits: [], allCommits: [], cha
   // submodule" costs nothing extra on ordinary (non-submodule) folder
   // clicks. See submoduleBoundaryFor.
   submodule_paths: [],
-  drillDownNotes: {}, drillDownNotesRepositoryPath: '', drillDownNotesError: '',
+  drillDownNotes: {}, drillDownNotesRepositoryPath: '', drillDownNotesError: '', submoduleCompare: null, submoduleCompareAnchor: null, submoduleRevisionPicker: null,
   statusReady: true, consoleCommandRunning: false, activeSubmodule: null, localDriveGitRefreshPending: false };
 const previewData = {
   repository: { name: 'vehicle-control', path: '/projects/vehicle-control', current_branch: 'feature/diagnostics' },
@@ -167,7 +167,7 @@ const refs = {
   submoduleMenu: $('#submoduleMenu'), submoduleVersions: $('#submoduleVersions'), submoduleMenuName: $('#submoduleMenuName'), currentSubmoduleVersion: $('#currentSubmoduleVersion'), submoduleVersionSearch: $('#submoduleVersionSearch'), submoduleOpenGraph: $('#submoduleOpenGraph'),
   commitScope: $('#commitScope'), showPathHistory: $('#showPathHistory'), commitScopeDialog: $('#commitScopeDialog'), commitScopeName: $('#commitScopeName'), scopeCommitMessage: $('#scopeCommitMessage'), confirmScopeCommit: $('#confirmScopeCommit'),
   folderRestoreDialog: $('#folderRestoreDialog'), folderRestorePath: $('#folderRestorePath'), folderRestoreSubtitle: $('#folderRestoreSubtitle'), folderRestoreModeHead: $('#folderRestoreModeHead'), folderRestoreModeCommit: $('#folderRestoreModeCommit'), folderRestoreCommitPicker: $('#folderRestoreCommitPicker'), folderRestoreCommitList: $('#folderRestoreCommitList'), refreshFolderRestoreCommits: $('#refreshFolderRestoreCommits'), folderRestoreClean: $('#folderRestoreClean'), folderRestorePreview: $('#folderRestorePreview'), folderRestoreStatus: $('#folderRestoreStatus'), previewFolderRestore: $('#previewFolderRestore'), confirmFolderRestore: $('#confirmFolderRestore'),
-  commanderView: $('#commanderView'), commanderRows: $('#commanderRows'), commanderBreadcrumbs: $('#commanderBreadcrumbs'), remoteRef: $('#remoteRef'), gitComparePanel: $('#gitComparePanel'), localDrivePanel: $('#localDrivePanel'), compareModeGit: $('#compareModeGit'), compareModeDrive: $('#compareModeDrive'), compareDialog: $('#compareDialog'), compareTitle: $('#compareTitle'), compareSubtitle: $('#compareSubtitle'), localCompare: $('#localCompare'), remoteCompare: $('#remoteCompare'),
+  commanderView: $('#commanderView'), commanderRows: $('#commanderRows'), commanderBreadcrumbs: $('#commanderBreadcrumbs'), remoteRef: $('#remoteRef'), gitComparePanel: $('#gitComparePanel'), localDrivePanel: $('#localDrivePanel'), compareModeGit: $('#compareModeGit'), compareModeDrive: $('#compareModeDrive'), compareModeSubmodule: $('#compareModeSubmodule'), submoduleComparePanel: $('#submoduleComparePanel'), subCompareSubmodule: $('#subCompareSubmodule'), subCompareSubmoduleOptions: $('#subCompareSubmoduleOptions'), subCompareLeftRef: $('#subCompareLeftRef'), subCompareRightRef: $('#subCompareRightRef'), subComparePickLeft: $('#subComparePickLeft'), subComparePickRight: $('#subComparePickRight'), subCompareSwap: $('#subCompareSwap'), subCompareRefresh: $('#subCompareRefresh'), subCompareExact: $('#subCompareExact'), subCompareCommits: $('#subCompareCommits'), subCompareBreadcrumbs: $('#subCompareBreadcrumbs'), subCompareRows: $('#subCompareRows'), subRevisionDialog: $('#subCompareRevisionDialog'), subRevisionDialogSide: $('#subRevisionDialogSide'), subRevisionDialogTitle: $('#subRevisionDialogTitle'), subRevisionSearch: $('#subRevisionSearch'), subRevisionSearchAll: $('#subRevisionSearchAll'), subRevisionResults: $('#subRevisionResults'), subRevisionHelp: $('#subRevisionHelp'), compareDialog: $('#compareDialog'), compareTitle: $('#compareTitle'), compareSubtitle: $('#compareSubtitle'), localCompare: $('#localCompare'), remoteCompare: $('#remoteCompare'),
   remotesView: $('#remotesView'), remoteCards: $('#remoteCards'), editorDialog: $('#editorDialog'), editorTitle: $('#editorTitle'), editorPath: $('#editorPath'), editorContent: $('#editorContent'), locationRepository: $('#locationRepository'), locationBranch: $('#locationBranch'), locationPath: $('#locationPath'), leaveSubmoduleGraph: $('#leaveSubmoduleGraph'), publishDialog: $('#publishDialog'), publishBranch: $('#publishBranch'), publishRemote: $('#publishRemote'), publishCommits: $('#publishCommits'), publishSummary: $('#publishSummary'), publishDestination: $('#publishDestination'), publishBadge: $('#publishBadge'), publishSubtitle: $('#publishSubtitle'), cloneDialog: $('#cloneDialog'), cloneUrl: $('#cloneUrl'), cloneParent: $('#cloneParent'), cloneName: $('#cloneName'), cloneBranch: $('#cloneBranch'), cloneRecurseSubmodules: $('#cloneRecurseSubmodules'), confirmClone: $('#confirmClone'), submoduleDialog: $('#submoduleDialog'), submoduleUrl: $('#submoduleUrl'), submoduleParent: $('#submoduleParent'), submoduleName: $('#submoduleName'), submoduleUsername: $('#submoduleUsername'), submoduleToken: $('#submoduleToken'), submoduleAddStatus: $('#submoduleAddStatus'), confirmAddSubmodule: $('#confirmAddSubmodule'), operationToast: $('#operationToast'), drawerScopeTitle: $('#drawerScopeTitle'),
   mergeBranchDialog: $('#mergeBranchDialog'), mergeBranchSubtitle: $('#mergeBranchSubtitle'), mergeBranchCurrent: $('#mergeBranchCurrent'), mergeBranchSource: $('#mergeBranchSource'), mergeBranchStatus: $('#mergeBranchStatus'), confirmMergeBranch: $('#confirmMergeBranch'),
   stashesDialog: $('#stashesDialog'), stashesList: $('#stashesList'),
@@ -778,9 +778,9 @@ function render() {
   // History · <name>" (the submodule's own Branch Map) — the whole point
   // of Message C's point 1 is that a user must never be unsure which of
   // these three they're looking at.
-  refs.viewTitle.textContent = state.view === 'explorer' ? 'Project Explorer' : state.view === 'commander' ? 'Folder Sync' : state.view === 'remotes' ? 'Remotes' : state.submoduleGraph ? `Submodule History · ${state.submoduleGraph.relativePath}` : state.historyKind === 'submodule-refs' ? `Submodule Reference Changes · ${state.historyScope}` : state.historyScope ? `History · ${state.historyScope}` : 'Repository History';
-  refs.graphSubtitle.textContent = !loaded ? 'Navigate folders and inspect every item in your repository.' : state.view === 'explorer' ? `${state.entries.length} items in ${state.currentPath || state.repository.name}` : state.view === 'commander' ? (state.compareMode === 'local-drive' ? 'Two independent local folders. Copy safely without overwriting; delete through Trash/Recycle Bin.' : 'Compare the workspace with a cached remote snapshot—no second checkout.') : state.view === 'remotes' ? 'Configured server locations and explicit fetch controls.' : state.historyKind === 'submodule-refs' ? `Parent-repository commits that changed this submodule's recorded version — not ${state.historyScope}'s own history` : state.historyScope ? `Commits touching ${state.historyScope}` : state.submoduleGraph ? 'Commits, branches and release tags for this submodule' : 'Commits, branches and release tags';
-  refs.search.placeholder = state.view === 'explorer' ? 'Filter this folder' : state.view === 'commander' ? (state.compareMode === 'local-drive' ? 'Filter both local folders' : 'Filter comparison') : 'Find commit or author';
+  refs.viewTitle.textContent = state.view === 'explorer' ? 'Project Explorer' : state.view === 'commander' ? 'Compare & Sync' : state.view === 'remotes' ? 'Remotes' : state.submoduleGraph ? `Submodule History · ${state.submoduleGraph.relativePath}` : state.historyKind === 'submodule-refs' ? `Submodule Reference Changes · ${state.historyScope}` : state.historyScope ? `History · ${state.historyScope}` : 'Repository History';
+  refs.graphSubtitle.textContent = !loaded ? 'Navigate folders and inspect every item in your repository.' : state.view === 'explorer' ? `${state.entries.length} items in ${state.currentPath || state.repository.name}` : state.view === 'commander' ? (state.compareMode === 'local-drive' ? 'Two independent local folders. Copy safely without overwriting; delete through Trash/Recycle Bin.' : state.compareMode === 'submodule' ? 'Compare two exact revisions of the same submodule without checking anything out.' : 'Compare the workspace with a cached remote snapshot—no second checkout.') : state.view === 'remotes' ? 'Configured server locations and explicit fetch controls.' : state.historyKind === 'submodule-refs' ? `Parent-repository commits that changed this submodule's recorded version — not ${state.historyScope}'s own history` : state.historyScope ? `Commits touching ${state.historyScope}` : state.submoduleGraph ? 'Commits, branches and release tags for this submodule' : 'Commits, branches and release tags';
+  refs.search.placeholder = state.view === 'explorer' ? 'Filter this folder' : state.view === 'commander' ? (state.compareMode === 'local-drive' ? 'Filter both local folders' : state.compareMode === 'submodule' ? 'Filter changed folders/files' : 'Filter comparison') : 'Find commit or author';
   refs.search.closest('label').hidden = state.view === 'remotes';
   const localDriveMode = state.view === 'commander' && state.compareMode === 'local-drive';
   if (!localDriveMode) localDriveWorkspace?.deactivate();
@@ -808,7 +808,7 @@ function render() {
   $('#navExplorer').classList.toggle('active', state.view === 'explorer'); $('#navGraph').classList.toggle('active', state.view === 'graph');
   $('#navCommander').classList.toggle('active', state.view === 'commander');
   $('#navRemotes').classList.toggle('active', state.view === 'remotes');
-  refs.locationRepository.textContent = state.submoduleGraph?.name || state.repository?.name || '—'; refs.locationBranch.textContent = describeBranch(state.submoduleGraph ? state.submoduleGraph.repository : state.repository); refs.locationPath.textContent = state.view === 'commander' ? (state.compareMode === 'local-drive' ? 'Local Drive' : `/${state.commanderPath}`) : state.view === 'explorer' ? `/${state.currentPath}` : state.view === 'graph' ? 'commit history' : 'remote configuration';
+  refs.locationRepository.textContent = state.submoduleGraph?.name || state.repository?.name || '—'; refs.locationBranch.textContent = describeBranch(state.submoduleGraph ? state.submoduleGraph.repository : state.repository); refs.locationPath.textContent = state.view === 'commander' ? (state.compareMode === 'local-drive' ? 'Local Drive' : state.compareMode === 'submodule' ? `Submodule compare /${state.commanderPath}` : `/${state.commanderPath}`) : state.view === 'explorer' ? `/${state.currentPath}` : state.view === 'graph' ? 'commit history' : 'remote configuration';
   refs.leaveSubmoduleGraph.hidden = !state.submoduleGraph;
   // Every view used to be rebuilt on every render() call regardless of which
   // one was actually visible — navigating folders in Explorer also rebuilt
@@ -834,11 +834,13 @@ function render() {
 }
 
 function renderCommanderBreadcrumbs() {
+  const target = state.compareMode === 'submodule' ? refs.subCompareBreadcrumbs : refs.commanderBreadcrumbs;
+  const rootName = state.compareMode === 'submodule' ? (state.submoduleCompare?.name || 'Submodule') : (state.repository?.name || 'Repository');
   const parts = state.commanderPath ? state.commanderPath.split('/') : []; let accumulated = '';
-  refs.commanderBreadcrumbs.innerHTML = `<button class="crumb root" data-commander-path="">▰ ${esc(state.repository?.name || 'Repository')}</button>` + parts.map(part => {
+  target.innerHTML = `<button class="crumb root" data-commander-path="">▰ ${esc(rootName)}</button>` + parts.map(part => {
     accumulated = accumulated ? `${accumulated}/${part}` : part; return `<span class="crumb-separator">›</span><button class="crumb" data-commander-path="${esc(accumulated)}">${esc(part)}</button>`;
   }).join('');
-  refs.commanderBreadcrumbs.querySelectorAll('[data-commander-path]').forEach(button => button.addEventListener('click', () => openCommanderDirectory(button.dataset.commanderPath)));
+  target.querySelectorAll('[data-commander-path]').forEach(button => button.addEventListener('click', () => state.compareMode === 'submodule' ? openSubmoduleCompareDirectory(button.dataset.commanderPath) : openCommanderDirectory(button.dataset.commanderPath)));
 }
 
 function commanderSide(entry, side) {
@@ -849,17 +851,26 @@ function commanderSide(entry, side) {
 function renderCommander() {
   if (!state.repository) return;
   const localDrive = state.compareMode === 'local-drive';
-  refs.compareModeGit.classList.toggle('active', !localDrive);
-  refs.compareModeGit.setAttribute('aria-selected', String(!localDrive));
+  const submoduleMode = state.compareMode === 'submodule';
+  const gitMode = !localDrive && !submoduleMode;
+  refs.compareModeGit.classList.toggle('active', gitMode);
+  refs.compareModeGit.setAttribute('aria-selected', String(gitMode));
   refs.compareModeDrive.classList.toggle('active', localDrive);
   refs.compareModeDrive.setAttribute('aria-selected', String(localDrive));
-  refs.gitComparePanel.hidden = localDrive;
+  refs.compareModeSubmodule.classList.toggle('active', submoduleMode);
+  refs.compareModeSubmodule.setAttribute('aria-selected', String(submoduleMode));
+  refs.gitComparePanel.hidden = !gitMode;
   refs.localDrivePanel.hidden = !localDrive;
+  refs.submoduleComparePanel.hidden = !submoduleMode;
   if (localDrive) {
     localDriveWorkspace?.activate(state.repository.path);
     return;
   }
   localDriveWorkspace?.deactivate();
+  if (submoduleMode) {
+    renderSubmoduleCompare();
+    return;
+  }
   renderCommanderBreadcrumbs();
   const remoteBranches = state.branches.filter(branch => branch.remote);
   refs.remoteRef.innerHTML = remoteBranches.map(branch => `<option value="${esc(branch.name)}" ${branch.name === state.remoteRef ? 'selected' : ''}>${esc(branch.name)}</option>`).join('') || '<option value="">No remote refs</option>';
@@ -878,6 +889,106 @@ function renderCommander() {
   const focused = refs.commanderRows.querySelector('.commander-row.focused'); if (focused) requestAnimationFrame(() => focused.scrollIntoView({ block: 'center' }));
 }
 
+function revisionDisplay(value = '') { return value ? value.slice(0, 8) : '—'; }
+function compactRevisionValue(value = '') {
+  const text = String(value || '').trim();
+  return /^[0-9a-f]{16,40}$/i.test(text) ? text.slice(0, 12) : text;
+}
+function compareStatusText(status = '', mode = state.compareMode) {
+  if (mode === 'submodule') {
+    if (status === 'local-only') return 'left only';
+    if (status === 'remote-only') return 'right only';
+  }
+  return String(status).replace('-', ' ');
+}
+function submoduleRevisionOptionLabel(item = {}) {
+  const kind = item.kind === 'parent-current' ? 'parent + current' : item.kind === 'remote' ? 'remote branch' : item.kind || 'revision';
+  const subject = item.subject ? ` · ${item.subject}` : '';
+  const name = item.name && item.kind !== 'commit' ? `${item.name} · ` : '';
+  return `${kind} · ${name}${revisionDisplay(item.revision)}${subject}`;
+}
+function submoduleRevisionOptionValue(item = {}) {
+  return item.kind === 'commit' || item.kind === 'parent' || item.kind === 'current' || item.kind === 'parent-current'
+    ? compactRevisionValue(item.revision || item.name || '')
+    : item.name || compactRevisionValue(item.revision || '');
+}
+function submoduleRevisionOptionsFromVersions(versions = [], seenCommitRevisions = new Set()) {
+  const seenKeys = new Set();
+  const options = [];
+  versions.forEach(item => {
+    if (!item?.revision) return;
+    if (item.kind === 'commit' && seenCommitRevisions.has(item.revision)) return;
+    const value = submoduleRevisionOptionValue(item);
+    const key = `${item.kind || 'revision'}|${value}|${item.revision}`;
+    if (!value || seenKeys.has(key)) return;
+    seenKeys.add(key);
+    options.push({ value, label: submoduleRevisionOptionLabel(item), kind: item.kind || 'revision', revision: item.revision, subject: item.subject || '', name: item.name || '', author: item.author || '', date: item.date || '' });
+  });
+  return options;
+}
+function buildSubmoduleCompareOptions(data) {
+  if (!data) return [];
+  const options = [];
+  const seenCommitRevisions = new Set();
+  const parent = data.parent_revision || '';
+  const current = data.current_revision || '';
+  if (parent && current && parent === current) {
+    options.push({ value: compactRevisionValue(parent), label: submoduleRevisionOptionLabel({ kind: 'parent-current', revision: parent }), kind: 'parent-current', revision: parent, subject: '' });
+    seenCommitRevisions.add(parent);
+  } else {
+    if (parent) { options.push({ value: compactRevisionValue(parent), label: submoduleRevisionOptionLabel({ kind: 'parent', revision: parent }), kind: 'parent', revision: parent, subject: '' }); seenCommitRevisions.add(parent); }
+    if (current) { options.push({ value: compactRevisionValue(current), label: submoduleRevisionOptionLabel({ kind: 'current', revision: current }), kind: 'current', revision: current, subject: '' }); seenCommitRevisions.add(current); }
+  }
+  return options.concat(submoduleRevisionOptionsFromVersions(data.versions || [], seenCommitRevisions));
+}
+function renderSubmoduleCompareOptions() {
+  refs.subCompareSubmoduleOptions.innerHTML = submoduleCompareCandidates()
+    .map(option => `<option value="${esc(option.path)}" label="${esc(option.label)}"></option>`)
+    .join('');
+}
+function renderSubmoduleCompareCommitList(compare) {
+  // The folder/file comparison is the primary task here. The commit-between
+  // list made the pane visually noisy on real submodules; keep the data in
+  // state for later use, but do not spend screen space on it here.
+  refs.subCompareCommits.hidden = true;
+  refs.subCompareCommits.innerHTML = '';
+}
+function renderSubmoduleCompare() {
+  const compare = state.submoduleCompare;
+  refs.subCompareSubmodule.value = compare?.submodulePath || '';
+  refs.subCompareSubmodule.title = compare ? `${compare.name} · ${compare.submodulePath}` : 'Type a submodule name or path';
+  refs.subCompareLeftRef.value = compare?.leftRef || '';
+  refs.subCompareRightRef.value = compare?.rightRef || '';
+  renderSubmoduleCompareOptions();
+  renderCommanderBreadcrumbs();
+  refs.subCompareExact.textContent = compare?.leftRevision && compare?.rightRevision
+    ? `Comparing ${revisionDisplay(compare.leftRevision)} → ${revisionDisplay(compare.rightRevision)}. These are exact Git revisions; no checkout is performed.`
+    : compare ? 'Choose left and right revisions, then Compare.' : 'Select a submodule and choose Compare submodule.';
+  renderSubmoduleCompareCommitList(compare);
+  const rowsSource = compare?.rows || [];
+  const query = refs.search.value.trim().toLowerCase(); const rows = rowsSource.filter(row => !query || row.name.toLowerCase().includes(query));
+  const upRow = state.commanderPath ? `<button class="commander-row commander-grid up-row" data-commander-up="1">
+    <span class="commander-side local">${iconFor({kind:'folder'})}<span class="commander-file-copy"><strong>..</strong><small>Parent folder</small></span></span><span class="compare-state"><i></i></span><span class="commander-side remote">${iconFor({kind:'folder'})}<span class="commander-file-copy"><strong>..</strong><small>Parent folder</small></span></span>
+  </button>` : '';
+  refs.subCompareRows.innerHTML = upRow + rows.map(row => `<button class="commander-row commander-grid ${row.relative_path === state.commanderFocus ? 'focused' : ''}" data-sub-compare-entry="${esc(row.relative_path)}">
+    ${commanderSide(row.local, 'local')}<span class="compare-state ${esc(row.status)}"><i></i>${esc(compareStatusText(row.status, 'submodule'))}</span>${commanderSide(row.remote, 'remote')}</button>`).join('') || (state.commanderPath ? '' : '<div class="loading-row">No differences in this folder</div>');
+  refs.subCompareRows.querySelector('[data-commander-up]')?.addEventListener('click', () => { const parent = state.commanderPath.split('/').slice(0, -1).join('/'); openSubmoduleCompareDirectory(parent); });
+  refs.subCompareRows.querySelectorAll('[data-sub-compare-entry]').forEach(rowNode => {
+    const row = rowsSource.find(item => item.relative_path === rowNode.dataset.subCompareEntry);
+    rowNode.addEventListener('dblclick', () => {
+      const left = row?.local, right = row?.remote;
+      if (left?.kind === 'folder' || right?.kind === 'folder') openSubmoduleCompareDirectory(row.relative_path);
+      else if ((left?.kind === 'file' || right?.kind === 'file') && (!left || left.kind === 'file') && (!right || right.kind === 'file')) openSubmoduleRevisionFileCompare(row);
+    });
+    rowNode.addEventListener('click', () => {
+      const left = row?.local, right = row?.remote;
+      const eitherIsFile = left?.kind === 'file' || right?.kind === 'file';
+      if (eitherIsFile && (!left || left.kind === 'file') && (!right || right.kind === 'file')) openSubmoduleRevisionFileCompare(row);
+    });
+  });
+  const focused = refs.subCompareRows.querySelector('.commander-row.focused'); if (focused) requestAnimationFrame(() => focused.scrollIntoView({ block: 'center' }));
+}
+
 const openCommanderDirectoryGuard = createRequestGuard();
 async function openCommanderDirectory(path) {
   if (!state.remoteRef) { status('No remote-tracking branch is available. Fetch the repository first.', 'error'); return; }
@@ -893,6 +1004,124 @@ async function openCommanderDirectory(path) {
   } catch (error) { if (stillCurrent()) { status(String(error), 'error'); refs.commanderRows.innerHTML = `<div class="loading-row">${esc(String(error))}</div>`; } }
 }
 
+const openSubmoduleCompareDirectoryGuard = createRequestGuard();
+async function openSubmoduleCompareDirectory(path = state.commanderPath || '') {
+  const compare = state.submoduleCompare;
+  if (!compare?.submodulePath) { refs.subCompareRows.innerHTML = '<div class="loading-row">Select a submodule first.</div>'; return; }
+  if (!compare.leftRef || !compare.rightRef) { refs.subCompareRows.innerHTML = '<div class="loading-row">Choose both revisions first.</div>'; return; }
+  state.commanderPath = path;
+  refs.subCompareRows.innerHTML = '<div class="loading-row"><i class="spinner"></i>Comparing submodule revisions…</div>';
+  const stillCurrent = openSubmoduleCompareDirectoryGuard();
+  if (!invoke) {
+    compare.rows = previewCommanderRows();
+    compare.leftRevision = compare.leftRef;
+    compare.rightRevision = compare.rightRef;
+    render();
+    return;
+  }
+  try {
+    const result = await invoke('compare_submodule_revisions_directory', {
+      repositoryPath: state.repository.path,
+      submodulePath: compare.submodulePath,
+      relativePath: path,
+      leftRef: compare.leftRef,
+      rightRef: compare.rightRef,
+    });
+    if (!stillCurrent()) return;
+    Object.assign(compare, {
+      rows: result.rows || [],
+      leftRevision: result.left_revision || result.leftRevision || '',
+      rightRevision: result.right_revision || result.rightRevision || '',
+      leftOnlyCommits: result.left_only_commits || result.leftOnlyCommits || [],
+      rightOnlyCommits: result.right_only_commits || result.rightOnlyCommits || [],
+    });
+    state.commanderPath = result.relative_path || path;
+    render();
+    status(`Compared ${compare.name}: ${revisionDisplay(compare.leftRevision)} → ${revisionDisplay(compare.rightRevision)}`);
+  } catch (error) {
+    if (stillCurrent()) { status(String(error), 'error'); refs.subCompareRows.innerHTML = `<div class="loading-row">${esc(String(error))}</div>`; }
+  }
+}
+
+async function openSubmoduleCompareFromEntry(entry, overrides = {}) {
+  if (!entry || entry.kind !== 'submodule') return;
+  const { innerPath = '', ...revisionOverrides } = overrides;
+  state.compareMode = 'submodule';
+  state.view = 'commander';
+  refs.search.value = '';
+  state.commanderPath = normalizeRepositoryRelativePath(innerPath);
+  const existing = state.submoduleCompare?.submodulePath === entry.relative_path ? state.submoduleCompare : null;
+  state.submoduleCompare = existing || {
+    name: entry.name,
+    submodulePath: entry.relative_path,
+    leftRef: '',
+    rightRef: '',
+    leftRevision: '',
+    rightRevision: '',
+    revisionOptions: [],
+    rows: [],
+    leftOnlyCommits: [],
+    rightOnlyCommits: [],
+  };
+  Object.assign(state.submoduleCompare, { name: entry.name, submodulePath: entry.relative_path }, revisionOverrides);
+  render();
+  if (!invoke) {
+    const preview = {
+      path: entry.relative_path,
+      current_revision: revisionOverrides.rightRef || 'current-preview',
+      current_branch: 'main',
+      parent_revision: revisionOverrides.leftRef || 'parent-preview',
+      versions: previewData.branches.map(branch => ({ name: branch.name, revision: branch.name === 'main' ? 'current-preview' : 'other-preview', kind: branch.remote ? 'remote' : 'branch', subject: 'Preview revision' })),
+    };
+    state.submoduleCompare.revisionOptions = buildSubmoduleCompareOptions(preview);
+    state.submoduleCompare.leftRef ||= preview.parent_revision;
+    state.submoduleCompare.rightRef ||= preview.current_revision;
+    await openSubmoduleCompareDirectory(state.commanderPath);
+    return;
+  }
+  try {
+    status(`Loading revisions for ${entry.name}…`, 'busy');
+    const data = await invoke('submodule_versions', { repositoryPath: state.repository.path, relativePath: entry.relative_path });
+    if (!state.submoduleCompare || state.submoduleCompare.submodulePath !== entry.relative_path) return;
+    state.submoduleCompare.revisionOptions = buildSubmoduleCompareOptions(data);
+    state.submoduleCompare.leftRef = revisionOverrides.leftRef || state.submoduleCompare.leftRef || data.parent_revision || data.current_revision || 'HEAD';
+    state.submoduleCompare.rightRef = revisionOverrides.rightRef || state.submoduleCompare.rightRef || data.current_revision || data.parent_revision || 'HEAD';
+    render();
+    await openSubmoduleCompareDirectory(state.commanderPath);
+  } catch (error) { handleError(error); }
+}
+
+async function openSubmoduleCompareFromGraphCommit(commitId, rightRef = '') {
+  if (!state.submoduleGraph) return;
+  const entry = { kind: 'submodule', name: state.submoduleGraph.name, relative_path: state.submoduleGraph.relativePath };
+  await openSubmoduleCompareFromEntry(entry, { leftRef: commitId, rightRef: rightRef || state.submoduleGraph.repository.head_oid || 'HEAD' });
+}
+
+async function openSubmoduleRevisionFileCompare(row) {
+  const compare = state.submoduleCompare;
+  if (!compare) return;
+  state.comparingRow = row;
+  const stillCurrent = openFileCompareGuard();
+  const leftMissing = !row.local; const rightMissing = !row.remote;
+  refs.compareTitle.textContent = row.name;
+  refs.compareSubtitle.textContent = `${compare.name}: ${revisionDisplay(compare.leftRevision || compare.leftRef)} compared with ${revisionDisplay(compare.rightRevision || compare.rightRef)} · read-only`;
+  refs.localCompare.textContent = refs.remoteCompare.textContent = 'Loading…';
+  setCompareReadOnly(true, 'Read-only compare between two Git revisions. No file, index or checkout is changed.');
+  refs.compareDialog.showModal();
+  if (!invoke) { renderComparisonContents(leftMissing ? '' : 'left preview\n', rightMissing ? '' : 'right preview\n'); return; }
+  try {
+    const comparison = await invoke('compare_submodule_revision_file', {
+      repositoryPath: state.repository.path,
+      submodulePath: compare.submodulePath,
+      relativePath: row.relative_path,
+      leftRef: compare.leftRevision || compare.leftRef,
+      rightRef: compare.rightRevision || compare.rightRef,
+    });
+    if (!stillCurrent() || state.comparingRow !== row) return;
+    renderComparisonContents(comparison.local_content || (leftMissing ? '(file does not exist on left revision)' : ''), comparison.remote_content || (rightMissing ? '(file does not exist on right revision)' : ''));
+  } catch (error) { if (stillCurrent() && state.comparingRow === row) { refs.localCompare.textContent = String(error); refs.remoteCompare.textContent = ''; } }
+}
+
 function previewCommanderRows() {
   return previewData.entries.map((entry, index) => ({ name: entry.name, relative_path: entry.relative_path, local: index === 2 ? null : entry, remote: index === 5 ? null : { ...entry, size: index === 3 ? 1720 : entry.size }, status: index === 5 ? 'local-only' : index === 3 ? 'modified' : index === 2 ? 'remote-only' : 'same' }));
 }
@@ -905,6 +1134,7 @@ async function openFileCompare(row) {
   refs.compareTitle.textContent = row.name;
   refs.compareSubtitle.textContent = localMissing ? `Only exists on ${state.remoteRef} — not fetched locally yet` : remoteMissing ? `Only exists locally — not on ${state.remoteRef}` : `Local workspace compared with ${state.remoteRef}`;
   refs.localCompare.textContent = refs.remoteCompare.textContent = 'Loading…';
+  setCompareReadOnly(false);
   setCompareActionStatus('Ready — choose one action for this file.');
   // Stage/Unstage/Discard need a local file; Restore-from-remote needs a remote file.
   $('#compareStage').disabled = localMissing; $('#compareUnstage').disabled = localMissing; $('#compareRestoreHead').disabled = localMissing; $('#compareRestoreRemote').disabled = remoteMissing;
@@ -918,6 +1148,17 @@ async function openFileCompare(row) {
 }
 
 function setCompareActionStatus(message, kind = '') { const node = $('#compareActionStatus'); node.textContent = message; node.className = `compare-status-line ${kind}`.trim(); }
+function setCompareHeadLabels(left = 'LOCAL', right = 'REMOTE') {
+  const labels = document.querySelectorAll('.compare-head span');
+  if (labels[0]) labels[0].textContent = left;
+  if (labels[1]) labels[1].textContent = right;
+}
+function setCompareReadOnly(readOnly, message = '') {
+  document.querySelector('.compare-actionbar').hidden = !!readOnly;
+  $('#recoveryHelp').hidden = !!readOnly;
+  setCompareHeadLabels(readOnly ? 'LEFT REVISION' : 'LOCAL', readOnly ? 'RIGHT REVISION' : 'REMOTE');
+  if (readOnly) setCompareActionStatus(message || 'Read-only comparison.', 'busy');
+}
 function setCompareActionsDisabled(disabled) {
   if (disabled) { ['#compareRestoreRemote','#compareRestoreHead','#compareStage','#compareUnstage'].forEach(selector => { $(selector).disabled = true; }); return; }
   // Re-enabling must respect which side of the comparison actually exists.
@@ -1320,8 +1561,55 @@ let explorerRequestSeq = 0;
 // load_repository/open_repository_fast's own index read, so this costs
 // nothing beyond an array scan — every ordinary (non-submodule) folder click
 // resolves to null here without ever reaching the backend for the question.
+function normalizeRepositoryRelativePath(path = '') {
+  return String(path || '').trim().replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
+}
+function parentPathOf(relativePath = '') {
+  return normalizeRepositoryRelativePath(relativePath).split('/').slice(0, -1).join('/');
+}
+function submoduleNameFromPath(path = '') {
+  const parts = normalizeRepositoryRelativePath(path).split('/').filter(Boolean);
+  return parts.at(-1) || 'Submodule';
+}
+function knownSubmodulePaths({ longestFirst = true } = {}) {
+  const paths = new Set((state.submodule_paths || []).map(normalizeRepositoryRelativePath).filter(Boolean));
+  (state.entries || []).forEach(entry => { if (entry.kind === 'submodule') paths.add(normalizeRepositoryRelativePath(entry.relative_path)); });
+  const sorted = [...paths].sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
+  return longestFirst ? sorted.sort((a, b) => b.length - a.length || a.localeCompare(b, undefined, { sensitivity: 'base' })) : sorted;
+}
 function submoduleBoundaryFor(path) {
-  return state.submodule_paths.find(sub => path === sub || path.startsWith(`${sub}/`)) || null;
+  const normalizedPath = normalizeRepositoryRelativePath(path);
+  return knownSubmodulePaths().find(sub => normalizedPath === sub || normalizedPath.startsWith(`${sub}/`)) || null;
+}
+function innerPathForSubmodule(submodulePath, path) {
+  const sub = normalizeRepositoryRelativePath(submodulePath);
+  const normalizedPath = normalizeRepositoryRelativePath(path);
+  if (!sub || normalizedPath === sub || !normalizedPath.startsWith(`${sub}/`)) return '';
+  return normalizedPath.slice(sub.length + 1);
+}
+function submoduleEntryForPath(path) {
+  const submodulePath = normalizeRepositoryRelativePath(path);
+  const existing = state.selectedEntry?.kind === 'submodule' && normalizeRepositoryRelativePath(state.selectedEntry.relative_path) === submodulePath
+    ? state.selectedEntry
+    : (state.entries || []).find(entry => entry.kind === 'submodule' && normalizeRepositoryRelativePath(entry.relative_path) === submodulePath);
+  return existing || { kind: 'submodule', name: submoduleNameFromPath(submodulePath), relative_path: submodulePath };
+}
+function submoduleCompareCandidates() {
+  return knownSubmodulePaths({ longestFirst: false }).map(path => ({ path, name: submoduleNameFromPath(path), label: `${submoduleNameFromPath(path)} · ${path}` }));
+}
+function currentSubmoduleCompareContext() {
+  if (state.submoduleGraph?.relativePath) {
+    return { entry: { kind: 'submodule', name: state.submoduleGraph.name || submoduleNameFromPath(state.submoduleGraph.relativePath), relative_path: state.submoduleGraph.relativePath }, innerPath: '' };
+  }
+  const selected = state.selectedEntry;
+  const selectedPath = normalizeRepositoryRelativePath(selected?.relative_path || '');
+  let submodulePath = selected?.kind === 'submodule' ? selectedPath : '';
+  const folderPath = selected?.kind === 'file' ? parentPathOf(selectedPath) : selectedPath;
+  if (!submodulePath && folderPath) submodulePath = submoduleBoundaryFor(folderPath);
+  if (!submodulePath) submodulePath = submoduleBoundaryFor(state.currentPath);
+  if (!submodulePath) return null;
+  const openPath = folderPath && (folderPath === submodulePath || folderPath.startsWith(`${submodulePath}/`)) ? folderPath : state.currentPath;
+  return { entry: submoduleEntryForPath(submodulePath), innerPath: innerPathForSubmodule(submodulePath, openPath) };
 }
 
 // The actual load_directory round-trip + render. Keep this as one coherent
@@ -1835,7 +2123,7 @@ function renderEntryDetails(entry) {
     <h2>${esc(entry.name)}</h2><div class="entry-path">${esc(entry.relative_path)}</div>${entry.kind === 'submodule' ? `<div class="submodule-badges"><span class="submodule-badge">◇ Git submodule</span>${submoduleCheckoutBadgeHtml(entry)}</div>` : ''}
     ${changeBanner}
     ${detachedDirtyBanner}
-    <div class="context-actions">${deletedEntry ? '' : entry.kind === 'file' ? '<button data-detail-action="edit">Edit local file</button>' : ''}${entry.kind === 'submodule' ? '' : '<button data-detail-action="server">Open on server ↗</button>'}${entry.kind === 'submodule' ? '' : '<button data-detail-action="history">View history</button>'}${entry.kind === 'folder' ? '<button data-detail-action="restorefolder" class="danger-action-soft" data-tooltip="Restore only this folder from HEAD or a selected commit. Does not move HEAD or switch branch.">↶ Restore folder…</button><button data-detail-action="stashwork" data-tooltip="Stash uncommitted changes in the current repository. This is repository-scoped, not only this folder. If there is nothing local to save, Git Drill Down will refuse and explain why.">Stash repository changes</button>' : ''}${entry.status || !entry.tracked ? '<button data-detail-action="commit">Commit this item</button>' : ''}${entry.kind === 'deleted' ? '<button data-detail-action="head" data-tooltip="Restore this deleted file from your last local commit (HEAD)">↶ Restore from last commit (HEAD)</button>' : ''}${['folder','submodule'].includes(entry.kind) ? '<button data-detail-action="utrud" data-tooltip="Launches UTRUD with this folder path. UTRUD decides whether the selected folder is valid. Windows only.">▶ Run UTRUD</button>' : ''}${entry.kind === 'file' && (entry.status || !entry.tracked) ? `<button data-detail-action="stage" data-tooltip="git add — add this file's current content to staging">＋ Stage this file</button><button data-detail-action="unstage" data-tooltip="Unstage — git restore --staged. Removes only the staging entry; your edits on disk are kept exactly as they are.">− Unstage</button><button data-detail-action="stashfile" data-tooltip="Sets this file aside in this repository's own stash. Parent projects and submodules have separate stash lists.">⇕ Stash this file</button><button data-detail-action="head" class="danger-action-soft" data-tooltip="Restore from your last local commit (HEAD) — git checkout HEAD -- file. Permanently discards ALL edits; the file on disk becomes identical to what you last committed. Cannot be undone.">↶ Restore from last commit (HEAD)</button><button data-detail-action="compare" data-tooltip="Open side-by-side compare with restore options">⇄ Compare with remote</button>` : ''}${entry.kind === 'submodule' ? `${submoduleInitButton}<button data-detail-action="subserver">Open submodule repository ↗</button><button data-detail-action="subgraph" data-tooltip="Open this submodule's own branch/commit history — never the parent project's">Submodule Branch Map</button><button data-detail-action="subrefchanges" data-tooltip="A different, narrower question: which commits in the PARENT project changed this submodule's recorded version. Not the submodule's own history.">Submodule Reference Changes</button><button data-detail-action="subnewbranch" data-tooltip="Create a new local branch in this submodule, starting from its current commit, and switch to it">＋ New branch…</button><button data-detail-action="versions">Change version</button><button data-detail-action="substash" ${canStashInsideSubmodule ? '' : 'disabled'} data-tooltip="${canStashInsideSubmodule ? 'Set aside uncommitted files inside this submodule only. The parent project is untouched.' : 'No uncommitted local files inside this submodule to stash.'}">Stash submodule changes</button><button data-detail-action="substashes" data-tooltip="View and restore this submodule's own stashes. The parent project's stash list is separate.">Submodule stashes</button><button data-detail-action="subcommit" ${canCommitInsideSubmodule ? '' : 'disabled'} data-tooltip="${esc(submoduleCommitTooltip)}">Commit submodule</button><button data-detail-action="subreset" class="danger-action-soft" ${entry.status ? '' : 'disabled'} data-tooltip="${entry.status ? 'Discard local changes and restore the exact submodule commit recorded by the parent project. This leaves detached HEAD, like git submodule update.' : 'The submodule already uses the version recorded by the parent project'}">↺ Restore project version…</button><button data-detail-action="subpull" data-tooltip="Fast-forward pull — brings in new commits from the submodule's remote. Refuses if it would require a manual merge.">Pull submodule</button><button data-detail-action="submerge" data-tooltip="Merge a branch into this submodule's current branch, with conflict resolution if needed">Merge branch…</button><button data-detail-action="subpush" ${canPushSubmodule ? '' : 'disabled'} data-tooltip="${esc(submodulePushTooltip)}">Push submodule</button><button data-detail-action="subforcepush" ${canPushSubmodule ? '' : 'disabled'} class="danger-action-soft" data-tooltip="${canPushSubmodule ? '⚠️ Overwrites the remote branch with your local history, discarding any commits there are not in yours. Only safe if nobody else uses that remote.' : esc(submodulePushTooltip)}">Force push submodule…</button><button data-detail-action="subfetch">Fetch submodule</button><button data-detail-action="location">Replace repository URL</button>` : ''}${deletedEntry ? '' : '<button class="danger-action" data-detail-action="delete">Delete…</button>'}</div>
+    <div class="context-actions">${deletedEntry ? '' : entry.kind === 'file' ? '<button data-detail-action="edit">Edit local file</button>' : ''}${entry.kind === 'submodule' ? '' : '<button data-detail-action="server">Open on server ↗</button>'}${entry.kind === 'submodule' ? '' : '<button data-detail-action="history">View history</button>'}${entry.kind === 'folder' ? '<button data-detail-action="restorefolder" class="danger-action-soft" data-tooltip="Restore only this folder from HEAD or a selected commit. Does not move HEAD or switch branch.">↶ Restore folder…</button><button data-detail-action="stashwork" data-tooltip="Stash uncommitted changes in the current repository. This is repository-scoped, not only this folder. If there is nothing local to save, Git Drill Down will refuse and explain why.">Stash repository changes</button>' : ''}${entry.status || !entry.tracked ? '<button data-detail-action="commit">Commit this item</button>' : ''}${entry.kind === 'deleted' ? '<button data-detail-action="head" data-tooltip="Restore this deleted file from your last local commit (HEAD)">↶ Restore from last commit (HEAD)</button>' : ''}${['folder','submodule'].includes(entry.kind) ? '<button data-detail-action="utrud" data-tooltip="Launches UTRUD with this folder path. UTRUD decides whether the selected folder is valid. Windows only.">▶ Run UTRUD</button>' : ''}${entry.kind === 'file' && (entry.status || !entry.tracked) ? `<button data-detail-action="stage" data-tooltip="git add — add this file's current content to staging">＋ Stage this file</button><button data-detail-action="unstage" data-tooltip="Unstage — git restore --staged. Removes only the staging entry; your edits on disk are kept exactly as they are.">− Unstage</button><button data-detail-action="stashfile" data-tooltip="Sets this file aside in this repository's own stash. Parent projects and submodules have separate stash lists.">⇕ Stash this file</button><button data-detail-action="head" class="danger-action-soft" data-tooltip="Restore from your last local commit (HEAD) — git checkout HEAD -- file. Permanently discards ALL edits; the file on disk becomes identical to what you last committed. Cannot be undone.">↶ Restore from last commit (HEAD)</button><button data-detail-action="compare" data-tooltip="Open side-by-side compare with restore options">⇄ Compare with remote</button>` : ''}${entry.kind === 'submodule' ? `${submoduleInitButton}<button data-detail-action="subserver">Open submodule repository ↗</button><button data-detail-action="subcompare" data-tooltip="Compare two exact revisions of this submodule without checkout">Compare submodule…</button><button data-detail-action="subgraph" data-tooltip="Open this submodule's own branch/commit history — never the parent project's">Submodule Branch Map</button><button data-detail-action="subrefchanges" data-tooltip="A different, narrower question: which commits in the PARENT project changed this submodule's recorded version. Not the submodule's own history.">Submodule Reference Changes</button><button data-detail-action="subnewbranch" data-tooltip="Create a new local branch in this submodule, starting from its current commit, and switch to it">＋ New branch…</button><button data-detail-action="versions">Change version</button><button data-detail-action="substash" ${canStashInsideSubmodule ? '' : 'disabled'} data-tooltip="${canStashInsideSubmodule ? 'Set aside uncommitted files inside this submodule only. The parent project is untouched.' : 'No uncommitted local files inside this submodule to stash.'}">Stash submodule changes</button><button data-detail-action="substashes" data-tooltip="View and restore this submodule's own stashes. The parent project's stash list is separate.">Submodule stashes</button><button data-detail-action="subcommit" ${canCommitInsideSubmodule ? '' : 'disabled'} data-tooltip="${esc(submoduleCommitTooltip)}">Commit submodule</button><button data-detail-action="subreset" class="danger-action-soft" ${entry.status ? '' : 'disabled'} data-tooltip="${entry.status ? 'Discard local changes and restore the exact submodule commit recorded by the parent project. This leaves detached HEAD, like git submodule update.' : 'The submodule already uses the version recorded by the parent project'}">↺ Restore project version…</button><button data-detail-action="subpull" data-tooltip="Fast-forward pull — brings in new commits from the submodule's remote. Refuses if it would require a manual merge.">Pull submodule</button><button data-detail-action="submerge" data-tooltip="Merge a branch into this submodule's current branch, with conflict resolution if needed">Merge branch…</button><button data-detail-action="subpush" ${canPushSubmodule ? '' : 'disabled'} data-tooltip="${esc(submodulePushTooltip)}">Push submodule</button><button data-detail-action="subforcepush" ${canPushSubmodule ? '' : 'disabled'} class="danger-action-soft" data-tooltip="${canPushSubmodule ? '⚠️ Overwrites the remote branch with your local history, discarding any commits there are not in yours. Only safe if nobody else uses that remote.' : esc(submodulePushTooltip)}">Force push submodule…</button><button data-detail-action="subfetch">Fetch submodule</button><button data-detail-action="location">Replace repository URL</button>` : ''}${deletedEntry ? '' : '<button class="danger-action" data-detail-action="delete">Delete…</button>'}</div>
     <div class="detail-section"><h3>GENERAL</h3><div class="detail-grid"><span>Type</span><strong>${kindLabel}</strong><span>Git</span><strong>${esc(entryGitSummary(entry))}</strong>
     ${entry.item_count != null ? `<span>Items</span><strong>${entry.item_count}</strong>` : `<span>Size</span><strong>${formatSize(entry.size)}</strong>`}<span>Modified</span><strong>${formatModified(entry.modified)}</strong></div></div>
     ${renderPersonalNoteSection(entry)}
@@ -2055,6 +2343,7 @@ async function handleDetailAction(action, entry, button) {
   if (action === 'commit') return openScopeCommit();
   if (action === 'restorefolder') return openFolderRestoreDialog(entry);
   if (action === 'versions') return await openSubmoduleMenu(entry, innerWidth - 480, 110);
+  if (action === 'subcompare') return openSubmoduleCompareFromEntry(entry);
   if (action === 'subgraph') return openSubmoduleGraph(entry);
   if (action === 'subrefchanges') return showSubmoduleReferenceChanges(entry);
   // A submodule isn't a folder inside the parent — "Open on server" on one
@@ -2618,10 +2907,10 @@ async function deleteEntry(entry, button) {
 }
 
 async function compareEntryWithRemote(entry) {
-  // Folder Sync now opens on the Local Drive tab by default. Without
+  // Compare & Sync now opens on the Local Drive tab by default. Without
   // forcing Git mode here too, this landed the user on that unrelated
   // two-independent-folders panel while the actual git-compare data it
-  // had just fetched sat hidden behind it — "took me to Folder Sync and
+  // had just fetched sat hidden behind it — "took me to Compare & Sync and
   // didn't compare the file" from the outside, even though the row
   // lookup below did succeed.
   state.commanderFocus = entry.relative_path; state.commanderPath = entry.relative_path.split('/').slice(0, -1).join('/'); state.view = 'commander'; state.compareMode = 'git'; state.commanderRows = []; render();
@@ -2779,7 +3068,7 @@ async function openSubmoduleGraph(entry) {
 function leaveSubmoduleGraph() { if (!state.submoduleGraph) return; state.submoduleGraph = null; state.view = 'explorer'; render(); openDirectory(state.currentPath, { force: true }); }
 
 // Any navigation away from the graph view that ISN'T the explicit "Back to
-// parent repository" button above — Project Explorer, Folder Sync,
+// parent repository" button above — Project Explorer, Compare & Sync,
 // Remotes, or opening a different repository entirely — must still safely
 // close the submodule context so it can never be silently combined with
 // whatever's navigated to next (a stale "Back to parent" later restoring a
@@ -3159,7 +3448,7 @@ function updateStashUI() {
   // Same rule as every other button in that row (Commit folder, Add
   // submodule, History, Changes in folder) — without this it was the one
   // button left stranded alone in an otherwise-empty toolbar the moment you
-  // left Explorer for Graph/Folder Sync/Remotes. The Ctrl+Shift+S shortcut
+  // left Explorer for Graph/Compare & Sync/Remotes. The Ctrl+Shift+S shortcut
   // still works everywhere regardless — that's calling stashWork() directly,
   // never gated on this element's visibility.
   // Stashing is exposed from the selected item/details panel and the
@@ -3619,7 +3908,20 @@ async function restoreExactCheckpointFromGraphCommit(commitId) {
 function showGraphCommitContextMenu(event, commitId) {
   const branchRefs = graphBranchRefsForCommit(commitId).slice(0, 6);
   const mergeItems = branchRefs.map((ref, index) => graphMergeMenuItem(ref.name, `merge-${index}`));
+  const submoduleCompareItems = [];
+  if (state.submoduleGraph) {
+    const anchor = state.submoduleCompareAnchor;
+    const sameSubmoduleAnchor = anchor?.parentPath === state.submoduleGraph.parentRepositoryPath && anchor?.relativePath === state.submoduleGraph.relativePath;
+    submoduleCompareItems.push(
+      { id: 'compare-head', label: 'Compare with current HEAD', detail: `${commitId.slice(0, 8)} ↔ ${(state.submoduleGraph.repository.head_oid || 'HEAD').slice(0, 8)}`, run: () => openSubmoduleCompareFromGraphCommit(commitId) },
+      { id: 'compare-start', label: 'Set as compare start', detail: commitId.slice(0, 8), run: () => { state.submoduleCompareAnchor = { parentPath: state.submoduleGraph.parentRepositoryPath, relativePath: state.submoduleGraph.relativePath, name: state.submoduleGraph.name, revision: commitId }; status(`Compare start set to ${commitId.slice(0, 8)}. Right-click another commit and choose Compare with start.`); } },
+    );
+    if (sameSubmoduleAnchor && anchor.revision !== commitId) {
+      submoduleCompareItems.push({ id: 'compare-anchor', label: 'Compare with start', detail: `${anchor.revision.slice(0, 8)} → ${commitId.slice(0, 8)}`, run: () => openSubmoduleCompareFromGraphCommit(anchor.revision, commitId) });
+    }
+  }
   showFloatingMenu(event, [
+    ...submoduleCompareItems,
     ...mergeItems,
     { id: 'branch', label: 'Create branch from this commit', detail: commitId.slice(0, 8), run: () => createBranchFromGraphCommit(commitId) },
     { id: 'checkout', label: 'Checkout this commit', detail: 'Detached HEAD', run: () => checkoutGraphCommit(commitId) },
@@ -4715,9 +5017,37 @@ function syncLocalDriveToCommanderPath() {
     localDriveWorkspace?.openRepositoryLocation(state.repository.path, state.commanderPath || '');
   }
 }
-$('#navCommander').addEventListener('click', () => { closeSubmoduleGraph(); const selected = state.selectedEntry; state.commanderFocus = selected?.kind === 'file' ? selected.relative_path : ''; state.commanderPath = selected?.kind === 'file' ? selected.relative_path.split('/').slice(0, -1).join('/') : selected?.kind === 'folder' ? selected.relative_path : state.currentPath; state.commanderRows = []; state.view = 'commander'; refs.search.value = ''; render(); if (state.compareMode === 'git') openCommanderDirectory(state.commanderPath); else syncLocalDriveToCommanderPath(); });
+$('#navCommander').addEventListener('click', () => {
+  const submoduleContext = currentSubmoduleCompareContext();
+  closeSubmoduleGraph();
+  const selected = state.selectedEntry;
+  const nextCommanderPath = selected?.kind === 'file' ? parentPathOf(selected.relative_path) : selected?.kind === 'folder' ? selected.relative_path : state.currentPath;
+  state.commanderFocus = selected?.kind === 'file' ? selected.relative_path : '';
+  state.commanderRows = [];
+  refs.search.value = '';
+  if (submoduleContext) {
+    state.compareMode = 'submodule';
+    return openSubmoduleCompareFromEntry(submoduleContext.entry, { innerPath: submoduleContext.innerPath });
+  }
+  if (state.compareMode !== 'submodule') state.commanderPath = nextCommanderPath;
+  state.view = 'commander';
+  render();
+  if (state.compareMode === 'git') openCommanderDirectory(state.commanderPath);
+  else if (state.compareMode === 'submodule') openSubmoduleCompareDirectory(state.commanderPath);
+  else syncLocalDriveToCommanderPath();
+});
 refs.compareModeGit.addEventListener('click', () => { if (state.compareMode === 'git') return; state.compareMode = 'git'; refs.search.value = ''; render(); openCommanderDirectory(state.commanderPath); });
 refs.compareModeDrive.addEventListener('click', () => { if (state.compareMode === 'local-drive') return; state.compareMode = 'local-drive'; refs.search.value = ''; render(); syncLocalDriveToCommanderPath(); });
+refs.compareModeSubmodule.addEventListener('click', () => {
+  if (state.compareMode === 'submodule') return;
+  state.compareMode = 'submodule';
+  refs.search.value = '';
+  const submoduleContext = currentSubmoduleCompareContext();
+  if (submoduleContext) return openSubmoduleCompareFromEntry(submoduleContext.entry, { innerPath: submoduleContext.innerPath });
+  state.commanderPath = state.submoduleCompare?.submodulePath ? state.commanderPath : '';
+  render();
+  if (state.submoduleCompare?.submodulePath) openSubmoduleCompareDirectory(state.commanderPath);
+});
 $('#navGraph').addEventListener('click', () => { closeSubmoduleGraph(); state.commits = state.allCommits.length ? state.allCommits : state.commits; state.historyScope = ''; state.historyKind = ''; state.selectedEntry = null; state.selectedCommit = null; state.view = 'graph'; refs.search.value = ''; clearDetails('Select a commit'); render(); });
 $('#navRemotes').addEventListener('click', () => { closeSubmoduleGraph(); loadRemotes(); });
 refs.leaveSubmoduleGraph.addEventListener('click', leaveSubmoduleGraph);
@@ -4795,9 +5125,10 @@ document.addEventListener('click', event => {
   if (!invoke) return status(`Preview: open commit ${commitId.slice(0, 8)} on server`);
   invoke('open_commit_on_server', { repositoryPath, commitId, submodulePath }).catch(error => handleError(error));
 });
-refs.goUp.addEventListener('click', () => { const commander = state.view === 'commander'; const parts = (commander ? state.commanderPath : state.currentPath).split('/').filter(Boolean); parts.pop(); commander ? openCommanderDirectory(parts.join('/')) : openDirectory(parts.join('/')); });
+refs.goUp.addEventListener('click', () => { const commander = state.view === 'commander'; const parts = (commander ? state.commanderPath : state.currentPath).split('/').filter(Boolean); parts.pop(); if (!commander) return openDirectory(parts.join('/')); return state.compareMode === 'submodule' ? openSubmoduleCompareDirectory(parts.join('/')) : openCommanderDirectory(parts.join('/')); });
 refs.reloadFolder.addEventListener('click', () => {
   if (state.view === 'commander' && state.compareMode === 'local-drive') return localDriveWorkspace?.reload();
+  if (state.view === 'commander' && state.compareMode === 'submodule') return openSubmoduleCompareDirectory(state.commanderPath);
   if (state.view === 'commander') return openCommanderDirectory(state.commanderPath);
   return openDirectory(state.currentPath, { force: true, invalidateGit: true });
 });
@@ -4808,6 +5139,149 @@ refs.runCurrentUtrud.addEventListener('click', () => {
 });
 document.addEventListener('keydown', event => { if (event.key !== 'Escape' || state.view !== 'commander' || document.querySelector('dialog[open]')) return; event.preventDefault(); returnToProjectNavigator(); });
 refs.remoteRef.addEventListener('change', () => { state.remoteRef = refs.remoteRef.value; if (state.compareMode === 'git') openCommanderDirectory(state.commanderPath); });
+function applySubmoduleCompareRevisionInputs() {
+  if (!state.submoduleCompare) return false;
+  state.submoduleCompare.leftRef = refs.subCompareLeftRef.value.trim();
+  state.submoduleCompare.rightRef = refs.subCompareRightRef.value.trim();
+  return !!state.submoduleCompare.leftRef && !!state.submoduleCompare.rightRef;
+}
+function resolveSubmoduleCompareInput(value) {
+  const query = normalizeRepositoryRelativePath(value);
+  const candidates = submoduleCompareCandidates();
+  if (!query) return { matches: candidates };
+  const queryLower = query.toLowerCase();
+  const exact = candidates.find(candidate => candidate.path.toLowerCase() === queryLower || candidate.name.toLowerCase() === queryLower);
+  if (exact) return { candidate: exact };
+  const matches = candidates.filter(candidate => candidate.path.toLowerCase().includes(queryLower) || candidate.name.toLowerCase().includes(queryLower));
+  return matches.length === 1 ? { candidate: matches[0] } : { matches };
+}
+async function openSubmoduleCompareFromInput() {
+  const result = resolveSubmoduleCompareInput(refs.subCompareSubmodule.value);
+  if (result.candidate) return openSubmoduleCompareFromEntry(submoduleEntryForPath(result.candidate.path));
+  const query = refs.subCompareSubmodule.value.trim();
+  if (!query) return status('Type or choose a submodule first.', 'error');
+  if (!result.matches.length) return status(`No submodule matched "${query}".`, 'error');
+  return status(`${result.matches.length} submodules match "${query}". Keep typing or choose one from the dropdown.`, 'busy');
+}
+function submoduleRevisionOptionMatches(option, query) {
+  if (!query) return true;
+  const haystack = [option.value, option.label, option.kind, option.name, option.revision, option.subject, option.author, option.date]
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase();
+  return haystack.includes(query);
+}
+function renderSubmoduleRevisionPickerResults(results = null, note = '') {
+  const picker = state.submoduleRevisionPicker;
+  if (!picker) return;
+  const query = refs.subRevisionSearch.value.trim().toLowerCase();
+  const source = results || state.submoduleCompare?.revisionOptions || [];
+  const visible = (results ? source : source.filter(option => submoduleRevisionOptionMatches(option, query))).slice(0, 160);
+  refs.subRevisionHelp.textContent = note || (results
+    ? `${visible.length} result${visible.length === 1 ? '' : 's'} from explicit history search.`
+    : 'Loaded suggestions are instant. Use “Search all history” only when you need older commits.');
+  refs.subRevisionResults.innerHTML = visible.map((option, index) => {
+    const kind = option.kind === 'parent-current' ? 'parent/current' : option.kind === 'remote' ? 'remote' : option.kind || 'revision';
+    const title = option.name || option.value;
+    const detail = [revisionDisplay(option.revision), option.subject, option.author, option.date].filter(Boolean).join(' · ');
+    return `<button type="button" class="submodule-revision-result" data-revision-index="${index}">
+      <span class="revision-kind">${esc(kind)}</span>
+      <strong>${esc(title)}</strong>
+      <small>${esc(detail || option.label || '')}</small>
+      <code>${esc(option.value)}</code>
+    </button>`;
+  }).join('') || '<div class="version-loading">No matches. Try “Search all history” for older commits.</div>';
+  refs.subRevisionResults.querySelectorAll('[data-revision-index]').forEach(button => button.addEventListener('click', () => {
+    const option = visible[Number(button.dataset.revisionIndex)];
+    if (option) selectSubmoduleRevisionOption(option);
+  }));
+}
+function openSubmoduleRevisionPicker(side) {
+  const compare = state.submoduleCompare;
+  if (!compare?.submodulePath) return status('Select a submodule first.', 'error');
+  state.submoduleRevisionPicker = { side };
+  refs.subRevisionDialogSide.textContent = side === 'left' ? 'LEFT REVISION' : 'RIGHT REVISION';
+  refs.subRevisionDialogTitle.textContent = `${compare.name} · ${compare.submodulePath}`;
+  refs.subRevisionSearch.value = side === 'left' ? refs.subCompareLeftRef.value.trim() : refs.subCompareRightRef.value.trim();
+  renderSubmoduleRevisionPickerResults();
+  refs.subRevisionDialog.showModal();
+  refs.subRevisionSearch.focus();
+  refs.subRevisionSearch.select();
+}
+function selectSubmoduleRevisionOption(option) {
+  const picker = state.submoduleRevisionPicker;
+  if (!picker || !state.submoduleCompare) return;
+  const input = picker.side === 'left' ? refs.subCompareLeftRef : refs.subCompareRightRef;
+  input.value = option.value;
+  if (picker.side === 'left') state.submoduleCompare.leftRef = option.value;
+  else state.submoduleCompare.rightRef = option.value;
+  refs.subRevisionDialog.close();
+  state.submoduleRevisionPicker = null;
+  if (applySubmoduleCompareRevisionInputs()) openSubmoduleCompareDirectory(state.commanderPath || '');
+}
+async function searchAllSubmoduleRevisions() {
+  const compare = state.submoduleCompare;
+  if (!compare?.submodulePath || !invoke) return;
+  const query = refs.subRevisionSearch.value.trim();
+  if (query.length < 2) {
+    refs.subRevisionHelp.textContent = 'Type at least 2 characters before searching all history.';
+    return;
+  }
+  const original = refs.subRevisionSearchAll.textContent;
+  refs.subRevisionSearchAll.disabled = true;
+  refs.subRevisionSearchAll.textContent = 'Searching…';
+  refs.subRevisionResults.innerHTML = '<div class="version-loading"><i class="spinner"></i>Searching all reachable submodule history…</div>';
+  try {
+    const versions = await invoke('search_submodule_revisions', { repositoryPath: state.repository.path, relativePath: compare.submodulePath, query, limit: 160 });
+    const options = submoduleRevisionOptionsFromVersions(versions || []);
+    renderSubmoduleRevisionPickerResults(options, `Searched all reachable history for “${query}” · ${options.length} result${options.length === 1 ? '' : 's'}.`);
+  } catch (error) {
+    refs.subRevisionResults.innerHTML = `<div class="version-loading">${esc(String(error))}</div>`;
+    handleError(error);
+  } finally {
+    refs.subRevisionSearchAll.disabled = false;
+    refs.subRevisionSearchAll.textContent = original;
+  }
+}
+refs.subCompareSubmodule.addEventListener('change', () => { openSubmoduleCompareFromInput().catch(error => handleError(error)); });
+refs.subCompareSubmodule.addEventListener('keydown', event => {
+  if (event.key !== 'Enter') return;
+  event.preventDefault();
+  openSubmoduleCompareFromInput().catch(error => handleError(error));
+});
+refs.subComparePickLeft.addEventListener('click', () => openSubmoduleRevisionPicker('left'));
+refs.subComparePickRight.addEventListener('click', () => openSubmoduleRevisionPicker('right'));
+$('#closeSubRevisionDialog').addEventListener('click', () => { refs.subRevisionDialog.close(); state.submoduleRevisionPicker = null; });
+refs.subRevisionDialog.addEventListener('close', () => { state.submoduleRevisionPicker = null; });
+refs.subRevisionSearch.addEventListener('input', () => renderSubmoduleRevisionPickerResults());
+refs.subRevisionSearch.addEventListener('keydown', event => {
+  if (event.key !== 'Enter') return;
+  event.preventDefault();
+  searchAllSubmoduleRevisions().catch(error => handleError(error));
+});
+refs.subRevisionSearchAll.addEventListener('click', () => searchAllSubmoduleRevisions().catch(error => handleError(error)));
+refs.subCompareRefresh.addEventListener('click', () => {
+  if (!applySubmoduleCompareRevisionInputs()) return status('Choose both submodule revisions first.', 'error');
+  openSubmoduleCompareDirectory(state.commanderPath || '');
+});
+refs.subCompareSwap.addEventListener('click', () => {
+  if (!state.submoduleCompare) return;
+  const left = refs.subCompareLeftRef.value.trim();
+  const right = refs.subCompareRightRef.value.trim();
+  state.submoduleCompare.leftRef = right;
+  state.submoduleCompare.rightRef = left;
+  refs.subCompareLeftRef.value = right;
+  refs.subCompareRightRef.value = left;
+  openSubmoduleCompareDirectory(state.commanderPath || '');
+});
+[refs.subCompareLeftRef, refs.subCompareRightRef].forEach(input => {
+  input.addEventListener('change', () => { if (applySubmoduleCompareRevisionInputs()) openSubmoduleCompareDirectory(state.commanderPath || ''); });
+  input.addEventListener('keydown', event => {
+    if (event.key !== 'Enter') return;
+    event.preventDefault();
+    if (applySubmoduleCompareRevisionInputs()) openSubmoduleCompareDirectory(state.commanderPath || '');
+  });
+});
 $('#closeSubmoduleMenu').addEventListener('click', closeSubmoduleMenu);
 $('#refreshSubmoduleMenu').addEventListener('click', event => refreshSubmoduleMenu(event.currentTarget));
 // Uses submoduleMenuEntry (the entry the popup was actually opened for), not
@@ -5012,7 +5486,7 @@ function currentConsoleContext() {
   // "Submodule Branch Map" console context, exactly the kind of mix-up this
   // whole area is about not letting happen.
   if (state.view === 'graph') { const g = activeGraphData(); return state.submoduleGraph ? { label: `Submodule Branch Map · ${state.submoduleGraph.name} · ${g.headDetached ? 'detached' : (g.currentBranch || 'detached')}`, tags: ['graph', 'submodule'] } : { label: `Branch Map · ${g.headDetached ? 'detached' : (g.currentBranch || 'detached')}`, tags: ['graph'] }; }
-  if (state.view === 'commander') return { label: state.compareMode === 'local-drive' ? 'Folder Sync · Local Drive' : 'Folder Sync · Git', tags: ['commander'] };
+  if (state.view === 'commander') return { label: state.compareMode === 'local-drive' ? 'Compare & Sync · Local Drive' : state.compareMode === 'submodule' ? 'Compare & Sync · Submodule' : 'Compare & Sync · Git', tags: ['commander'] };
   return { label: `${state.currentPath || state.repository.name} · branch ${state.repository.current_branch || 'detached'}`, tags: ['explorer'] };
 }
 
@@ -5077,7 +5551,7 @@ function buildCommands() {
     { id: 'conflicts', name: 'Resolve Merge Conflicts', description: 'Open the conflict resolution dialog for a merge in progress', keys: '', keywords: 'merge conflict resolve', tags: state.pendingMainConflicts?.length ? ['explorer', 'graph', 'relevant'] : [], fn: () => openConflictsDialog(mergeTargetForMain(), state.pendingMainConflicts || []) },
     { id: 'search', name: 'Search Repository', description: 'Filter the current view by name, author or commit id', keys: 'Ctrl+F', tags: ['explorer', 'graph', 'commander'], fn: () => refs.search.focus() },
     { id: 'explorer', name: 'Go to Project Explorer', description: 'Browse files, folders and submodules', keys: '', keywords: 'files browse', tags: [], fn: () => $('#navExplorer').click() },
-    { id: 'commander', name: 'Go to Folder Sync', description: 'Compare Git snapshots or sync/copy between two local folders', keys: 'Ctrl+Shift+L', keywords: 'diff compare folder sync local drive remote', tags: [], fn: () => $('#navCommander').click() },
+    { id: 'commander', name: 'Go to Compare & Sync', description: 'Compare Git snapshots, submodule revisions, or sync/copy between two local folders', keys: 'Ctrl+Shift+L', keywords: 'diff compare folder sync local drive remote submodule', tags: [], fn: () => $('#navCommander').click() },
     { id: 'graph', name: 'Go to Branch Map', description: 'See commit history and branches as a graph', keys: 'Ctrl+Shift+G', keywords: 'log history commits', tags: [], fn: () => $('#navGraph').click() },
     { id: 'remotes', name: 'Go to Remotes', description: 'View and fetch configured server locations', keys: '', tags: [], fn: () => $('#navRemotes').click() },
     { id: 'refresh', name: 'Refresh Repository', description: 'Re-read branches, commits and status from disk (e.g. after external Git commands)', keys: '', keywords: 'reload', tags: [], fn: () => $('#refresh').click() },
@@ -5092,6 +5566,7 @@ function buildCommands() {
       { id: 'sub-merge', name: `Merge Branch into Submodule (${entry.name})`, description: 'Bring another branch into this submodule\'s current branch', tags: ['submodule', 'relevant'], keywords: 'merge combine', fn: () => openMergeBranchDialog(mergeTargetForSubmodule(entry)) },
       { id: 'sub-commit', name: `Commit Submodule (${entry.name})`, description: 'Commit uncommitted changes inside this submodule', tags: ['submodule', 'relevant'], fn: () => commitSubmoduleChanges(entry) },
       { id: 'sub-version', name: `Change Submodule Version (${entry.name})`, description: 'Switch this submodule to a different branch, tag or commit', tags: ['submodule', 'relevant'], keywords: 'checkout switch branch', fn: () => openSubmoduleMenu(entry, innerWidth - 480, 110) },
+      { id: 'sub-compare', name: `Compare Submodule Revisions (${entry.name})`, description: 'Compare two exact branches, tags or commits of this submodule side by side', tags: ['submodule', 'relevant'], keywords: 'diff compare revision tag branch', fn: () => openSubmoduleCompareFromEntry(entry) },
       { id: 'sub-fetch', name: `Fetch Submodule (${entry.name})`, description: 'Download new commits for this submodule without changing its checkout', tags: ['submodule'], fn: () => fetchSubmodule(entry) },
       { id: 'sub-new-branch', name: `New Branch in Submodule (${entry.name})`, description: 'Create and switch to a new branch in this submodule, from its current commit', tags: ['submodule', 'relevant'], keywords: 'checkout create', fn: () => createSubmoduleBranch(entry) },
     );
@@ -5497,12 +5972,14 @@ async function runTerminalFromConsole(input) {
   state.consoleTranscript.push(entry);
   renderConsoleTranscript();
   state.consoleCommandRunning = true;
+  jsPerfLog(`frontend: runTerminal START (${target.label})`, 0);
   consoleRunningTicker = setInterval(renderConsoleTranscript, 200);
   try {
     const result = await invoke('run_terminal_command', { repositoryPath: target.path, commandText: command });
     entry.status = result.success ? 'SUCCESS' : 'FAILED';
     entry.result = result;
     entry.elapsedMs = performance.now() - entry.startedAt;
+    jsPerfLog(`frontend: runTerminal ${entry.status} (read_only=${!!result.read_only})`, entry.elapsedMs);
     clearInterval(consoleRunningTicker); consoleRunningTicker = null;
     state.consoleCommandRunning = false;
     renderConsoleTranscript();
@@ -5524,6 +6001,7 @@ async function runTerminalFromConsole(input) {
     entry.status = message.toLowerCase().includes('timed out') ? 'TIMED_OUT' : 'FAILED';
     entry.result = { success: false, stdout: '', stderr: message, exit_code: null };
     entry.elapsedMs = performance.now() - entry.startedAt;
+    jsPerfLog(`frontend: runTerminal ${entry.status}`, entry.elapsedMs);
     clearInterval(consoleRunningTicker); consoleRunningTicker = null;
     state.consoleCommandRunning = false;
     renderConsoleTranscript();

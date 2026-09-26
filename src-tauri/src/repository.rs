@@ -799,6 +799,33 @@ pub struct FileComparison {
 }
 
 #[derive(Serialize)]
+pub struct RevisionCompareCommit {
+    id: String,
+    subject: String,
+    author: String,
+    date: String,
+}
+
+#[derive(Serialize)]
+pub struct RevisionCompareDirectory {
+    left_ref: String,
+    right_ref: String,
+    left_revision: String,
+    right_revision: String,
+    relative_path: String,
+    rows: Vec<CommanderRow>,
+    left_only_commits: Vec<RevisionCompareCommit>,
+    right_only_commits: Vec<RevisionCompareCommit>,
+}
+
+#[derive(Clone)]
+struct GitTreeEntry {
+    entry: CommanderEntry,
+    oid: git2::Oid,
+    filemode: i32,
+}
+
+#[derive(Serialize)]
 pub struct TextFile { relative_path: String, content: String }
 
 #[derive(Serialize, Debug)]
@@ -2779,12 +2806,14 @@ fn pr_checks_from_json(rollup: &[serde_json::Value]) -> Vec<PullRequestCheckSumm
         let name = pr_check_name(entry).unwrap_or_default();
         if name.is_empty() { return None; }
         let details_url = pr_check_details_url(entry).unwrap_or("").to_string();
-        // Temporary diagnostic: never log the URL itself (could point at an
-        // internal build server) or anything else from the entry — just
-        // whether this check's rollup entry actually carried a details_url/
-        // targetUrl at all, to tell apart "the API never gave us one" from
-        // a parsing bug on our side.
-        perf_log(&format!("pr_checks_from_json: check='{name}' has_details_url={}", !details_url.is_empty()), Duration::ZERO);
+        // Diagnostic without exposing internal URLs: tell which field/source
+        // supplied the Details link and roughly what kind of target it is.
+        perf_log(&format!(
+            "pr_checks_from_json: check='{name}' has_details_url={} source={} target_kind={}",
+            !details_url.is_empty(),
+            pr_check_details_source(entry),
+            classify_pr_details_url(&details_url),
+        ), Duration::ZERO);
         Some(PullRequestCheckSummary { name: name.into(), status: map_check_status(entry), details_url })
     }).collect()
 }
@@ -2804,14 +2833,36 @@ fn pr_check_details_url(entry: &serde_json::Value) -> Option<&str> {
         .filter(|value| !value.is_empty())
 }
 
+fn pr_check_details_source(entry: &serde_json::Value) -> &'static str {
+    if entry.get("_detailsSource").and_then(|value| value.as_str()) == Some("html") { return "html"; }
+    if entry.get("_detailsSource").and_then(|value| value.as_str()) == Some("rest") { return "rest"; }
+    if entry.get("detailsUrl").and_then(|value| value.as_str()).map(str::trim).is_some_and(|value| !value.is_empty()) { "graphql.detailsUrl" }
+    else if entry.get("targetUrl").and_then(|value| value.as_str()).map(str::trim).is_some_and(|value| !value.is_empty()) { "graphql.targetUrl" }
+    else { "none" }
+}
+
+fn classify_pr_details_url(url: &str) -> &'static str {
+    let normalized = normalize_html_href(url);
+    let lower = normalized.to_ascii_lowercase();
+    if lower.trim().is_empty() { "none" }
+    else if lower.contains("collaborator") { "collaborator" }
+    else if lower.contains("jenkins") || lower.contains("build") { "build" }
+    else if lower.contains("/pull/") && lower.contains("/checks") { "github-pr-checks" }
+    else if lower.contains("/actions/runs/") { "github-actions" }
+    else if lower.contains("github.") || lower.contains("github/") { "github" }
+    else if lower.starts_with("http://") || lower.starts_with("https://") { "external" }
+    else { "relative" }
+}
+
 fn normalized_pr_check_name(name: &str) -> String {
     name.trim().to_ascii_lowercase()
 }
 
-fn set_pr_check_details_url(entry: &mut serde_json::Value, url: &str) {
+fn set_pr_check_details_url_from(entry: &mut serde_json::Value, url: &str, source: &'static str) {
     let field = if entry.get("context").is_some() { "targetUrl" } else { "detailsUrl" };
     if let Some(object) = entry.as_object_mut() {
         object.insert(field.into(), serde_json::Value::String(url.to_string()));
+        object.insert("_detailsSource".into(), serde_json::Value::String(source.into()));
     }
 }
 
@@ -2836,23 +2887,35 @@ fn collect_rest_check_detail_urls(status_payload: Option<&serde_json::Value>, ch
     urls
 }
 
-fn fill_missing_pr_check_details_from_urls(pr: &mut serde_json::Value, urls: &HashMap<String, String>) -> usize {
+fn apply_pr_check_details_from_urls(pr: &mut serde_json::Value, urls: &HashMap<String, String>, overwrite_existing: bool, source: &'static str) -> usize {
     let Some(entries) = pr.get_mut("statusCheckRollup").and_then(|value| value.as_array_mut()) else { return 0 };
-    let mut filled = 0usize;
+    let mut changed = 0usize;
     for entry in entries {
-        if pr_check_details_url(entry).is_some() { continue; }
         let Some(name) = pr_check_name(entry) else { continue };
         let Some(url) = urls.get(&normalized_pr_check_name(&name)) else { continue };
-        set_pr_check_details_url(entry, url);
-        filled += 1;
+        if let Some(current) = pr_check_details_url(entry) {
+            if current == url { continue; }
+            if !overwrite_existing { continue; }
+        }
+        set_pr_check_details_url_from(entry, url, source);
+        changed += 1;
     }
-    filled
+    changed
 }
 
 fn count_missing_pr_check_details(pr: &serde_json::Value) -> usize {
     pr.get("statusCheckRollup").and_then(|value| value.as_array())
         .map(|entries| entries.iter().filter(|entry| pr_check_name(entry).is_some() && pr_check_details_url(entry).is_none()).count())
         .unwrap_or(0)
+}
+
+fn should_refresh_pr_check_details_from_html(pr: &serde_json::Value) -> bool {
+    pr.get("statusCheckRollup").and_then(|value| value.as_array())
+        .map(|entries| entries.iter().filter_map(pr_check_name).any(|name| {
+            let name = normalized_pr_check_name(&name);
+            name.contains("collaborator") || name.contains("polarion") || name.contains("submodule") || name.contains("build log")
+        }))
+        .unwrap_or(false)
 }
 
 fn decode_html_attr_minimal(value: &str) -> String {
@@ -3325,31 +3388,35 @@ impl GitHubGraphqlClient {
 
     fn fill_missing_check_details(&self, repo: &GitHubRepo, pr: &mut serde_json::Value) {
         let missing = count_missing_pr_check_details(pr);
-        if missing == 0 { return; }
-        let Some(head_sha) = pr.get("headSha").and_then(|value| value.as_str()).map(str::trim).filter(|value| !value.is_empty()) else {
-            perf_log(&format!("pr_check_details_rest_fallback: missing={missing} skipped=no_head_sha"), Duration::ZERO);
-            return;
-        };
-        let short_sha: String = head_sha.chars().take(8).collect();
-        let status_payload = match self.rest_get_json(repo, &format!("commits/{head_sha}/status")) {
-            Ok(payload) => Some(payload),
-            Err(_) => {
-                perf_log(&format!("pr_check_details_rest_fallback: sha={short_sha} status_api_failed=true"), Duration::ZERO);
-                None
+        let short_sha = pr.get("headSha").and_then(|value| value.as_str()).map(str::trim).filter(|value| !value.is_empty())
+            .map(|head_sha| head_sha.chars().take(8).collect::<String>())
+            .unwrap_or_else(|| "unknown".into());
+        if missing > 0 {
+            if let Some(head_sha) = pr.get("headSha").and_then(|value| value.as_str()).map(str::trim).filter(|value| !value.is_empty()) {
+                let status_payload = match self.rest_get_json(repo, &format!("commits/{head_sha}/status")) {
+                    Ok(payload) => Some(payload),
+                    Err(_) => {
+                        perf_log(&format!("pr_check_details_rest_fallback: sha={short_sha} status_api_failed=true"), Duration::ZERO);
+                        None
+                    }
+                };
+                let check_runs_payload = match self.rest_get_json(repo, &format!("commits/{head_sha}/check-runs?per_page=100")) {
+                    Ok(payload) => Some(payload),
+                    Err(_) => {
+                        perf_log(&format!("pr_check_details_rest_fallback: sha={short_sha} check_runs_api_failed=true"), Duration::ZERO);
+                        None
+                    }
+                };
+                let urls = collect_rest_check_detail_urls(status_payload.as_ref(), check_runs_payload.as_ref());
+                let filled = apply_pr_check_details_from_urls(pr, &urls, false, "rest");
+                perf_log(&format!("pr_check_details_rest_fallback: sha={short_sha} missing={missing} found={} filled={filled}", urls.len()), Duration::ZERO);
+            } else {
+                perf_log(&format!("pr_check_details_rest_fallback: missing={missing} skipped=no_head_sha"), Duration::ZERO);
             }
-        };
-        let check_runs_payload = match self.rest_get_json(repo, &format!("commits/{head_sha}/check-runs?per_page=100")) {
-            Ok(payload) => Some(payload),
-            Err(_) => {
-                perf_log(&format!("pr_check_details_rest_fallback: sha={short_sha} check_runs_api_failed=true"), Duration::ZERO);
-                None
-            }
-        };
-        let urls = collect_rest_check_detail_urls(status_payload.as_ref(), check_runs_payload.as_ref());
-        let filled = fill_missing_pr_check_details_from_urls(pr, &urls);
-        perf_log(&format!("pr_check_details_rest_fallback: sha={short_sha} missing={missing} filled={filled}"), Duration::ZERO);
+        }
         let missing_after_rest = count_missing_pr_check_details(pr);
-        if missing_after_rest == 0 { return; }
+        let wants_html_details = missing_after_rest > 0 || should_refresh_pr_check_details_from_html(pr);
+        if !wants_html_details { return; }
         let Some(pr_url) = pr.get("url").and_then(|value| value.as_str()).map(str::trim).filter(|value| !value.is_empty()) else {
             perf_log(&format!("pr_check_details_html_fallback: sha={short_sha} missing={missing_after_rest} skipped=no_pr_url"), Duration::ZERO);
             return;
@@ -3358,8 +3425,8 @@ impl GitHubGraphqlClient {
             Ok(html) => {
                 let html_urls = collect_pr_check_detail_urls_from_html(pr_url, &html);
                 let found = html_urls.len();
-                let html_filled = fill_missing_pr_check_details_from_urls(pr, &html_urls);
-                perf_log(&format!("pr_check_details_html_fallback: sha={short_sha} missing={missing_after_rest} found={found} filled={html_filled}"), Duration::ZERO);
+                let changed = apply_pr_check_details_from_urls(pr, &html_urls, true, "html");
+                perf_log(&format!("pr_check_details_html_fallback: sha={short_sha} missing={missing_after_rest} found={found} changed={changed} overwrite_existing=true"), Duration::ZERO);
             }
             Err(_) => {
                 perf_log(&format!("pr_check_details_html_fallback: sha={short_sha} missing={missing_after_rest} html_failed=true"), Duration::ZERO);
@@ -5079,6 +5146,135 @@ fn submodule_versions_inner(repository_path: String, relative_path: String) -> R
     Ok(SubmoduleVersions { path: relative_path, current_revision, current_branch, parent_revision, current_containing_branches, history_context_branch, history_limit: HISTORY_LIMIT, versions })
 }
 
+fn submodule_revision_matches(query: &str, name: &str, kind: &str, revision: &str, subject: &str, author: &str, date: &str) -> bool {
+    if query.is_empty() { return true; }
+    let query = query.to_lowercase();
+    [name, kind, revision, &revision[..revision.len().min(12)], subject, author, date]
+        .iter()
+        .any(|value| value.to_lowercase().contains(&query))
+}
+
+fn looks_like_commit_query(query: &str) -> bool {
+    let trimmed = query.trim();
+    (4..=40).contains(&trimmed.len()) && trimmed.chars().all(|ch| ch.is_ascii_hexdigit())
+}
+
+fn push_submodule_revision_result(
+    results: &mut Vec<SubmoduleVersion>,
+    seen: &mut HashSet<String>,
+    limit: usize,
+    name: String,
+    kind: &str,
+    commit: &git2::Commit<'_>,
+    current_revision: &str,
+) -> bool {
+    let revision = commit.id().to_string();
+    let key = format!("{kind}|{name}|{revision}");
+    if !seen.insert(key) { return results.len() >= limit; }
+    results.push(SubmoduleVersion {
+        name,
+        revision: revision.clone(),
+        kind: kind.into(),
+        current: revision == current_revision,
+        subject: commit.summary().unwrap_or("").into(),
+        author: commit.author().name().unwrap_or("Unknown").into(),
+        date: short_date(commit.time().seconds()),
+        attached_branch: None,
+        upstream: None,
+        ahead: None,
+        behind: None,
+        contains_current: false,
+        commits_after_current: None,
+        containing_branches: Vec::new(),
+    });
+    results.len() >= limit
+}
+
+#[tauri::command]
+pub async fn search_submodule_revisions(repository_path: String, relative_path: String, query: String, limit: Option<usize>) -> Result<Vec<SubmoduleVersion>, String> {
+    off_main_thread(move || search_submodule_revisions_inner(repository_path, relative_path, query, limit)).await
+}
+
+fn search_submodule_revisions_inner(repository_path: String, relative_path: String, query: String, limit: Option<usize>) -> Result<Vec<SubmoduleVersion>, String> {
+    let started = Instant::now();
+    validate_path(&repository_path)?;
+    let absolute = validate_submodule(&repository_path, &relative_path)?;
+    let repo = internal_submodule_repository(&absolute)?;
+    let query = query.trim().to_string();
+    if query.chars().count() < 2 {
+        return Err("Type at least 2 characters before searching all submodule history.".into());
+    }
+    let limit = limit.unwrap_or(160).clamp(1, 300);
+    let current_revision = repo.head().ok().and_then(|head| head.target()).map(|id| id.to_string()).unwrap_or_default();
+    let mut results = Vec::new();
+    let mut seen = HashSet::new();
+
+    if looks_like_commit_query(&query) {
+        if let Ok(object) = repo.revparse_single(&query) {
+            if let Ok(commit) = object.peel_to_commit() {
+                if push_submodule_revision_result(&mut results, &mut seen, limit, commit.id().to_string()[..12].into(), "commit", &commit, &current_revision) {
+                    return Ok(results);
+                }
+            }
+        }
+    }
+
+    for branch_type in [BranchType::Local, BranchType::Remote] {
+        let Ok(iterator) = repo.branches(Some(branch_type)) else { continue };
+        for item in iterator.flatten() {
+            let name = item.0.name().ok().flatten().unwrap_or("").to_string();
+            if name.ends_with("/HEAD") { continue; }
+            let Some(oid) = item.0.get().target() else { continue };
+            let Ok(commit) = repo.find_commit(oid) else { continue };
+            let kind = if branch_type == BranchType::Local { "branch" } else { "remote" };
+            let revision = oid.to_string();
+            let subject = commit.summary().unwrap_or("");
+            let author = commit.author().name().unwrap_or("Unknown").to_string();
+            let date = short_date(commit.time().seconds());
+            if submodule_revision_matches(&query, &name, kind, &revision, subject, &author, &date)
+                && push_submodule_revision_result(&mut results, &mut seen, limit, name, kind, &commit, &current_revision) {
+                return Ok(results);
+            }
+        }
+    }
+
+    if let Ok(tag_names) = repo.tag_names(None) {
+        for name in tag_names.iter().flatten() {
+            let reference = match repo.find_reference(&format!("refs/tags/{name}")) { Ok(reference) => reference, Err(_) => continue };
+            let target = match reference.target() { Some(target) => target, None => continue };
+            let object = match repo.find_object(target, None) { Ok(object) => object, Err(_) => continue };
+            let commit = match object.peel_to_commit() { Ok(commit) => commit, Err(_) => continue };
+            let revision = commit.id().to_string();
+            let subject = commit.summary().unwrap_or("");
+            let author = commit.author().name().unwrap_or("Unknown").to_string();
+            let date = short_date(commit.time().seconds());
+            if submodule_revision_matches(&query, name, "tag", &revision, subject, &author, &date)
+                && push_submodule_revision_result(&mut results, &mut seen, limit, name.to_string(), "tag", &commit, &current_revision) {
+                return Ok(results);
+            }
+        }
+    }
+
+    let (seed_oids, _) = collect_ref_seeds_and_badges(&repo);
+    let mut walk = repo.revwalk().map_err(|error| error.message().to_string())?;
+    walk.set_sorting(Sort::TOPOLOGICAL | Sort::TIME).map_err(|error| error.message().to_string())?;
+    for oid in seed_oids { let _ = walk.push(oid); }
+    for oid in walk.flatten() {
+        let Ok(commit) = repo.find_commit(oid) else { continue };
+        let revision = oid.to_string();
+        let name = revision[..12].to_string();
+        let subject = commit.summary().unwrap_or("");
+        let author = commit.author().name().unwrap_or("Unknown").to_string();
+        let date = short_date(commit.time().seconds());
+        if submodule_revision_matches(&query, &name, "commit", &revision, subject, &author, &date)
+            && push_submodule_revision_result(&mut results, &mut seen, limit, name, "commit", &commit, &current_revision) {
+            break;
+        }
+    }
+    perf_log(&format!("search_submodule_revisions: TOTAL ({} results)", results.len()), started.elapsed());
+    Ok(results)
+}
+
 #[tauri::command]
 pub async fn add_submodule(repository_path: String, parent_path: String, url: String, folder_name: String, username: String, access_token: String) -> Result<String, String> {
     off_main_thread(move || add_submodule_inner(repository_path, parent_path, url, folder_name, username, access_token)).await
@@ -6213,6 +6409,123 @@ fn remote_directory_entries(repository: &str, commit: &str, relative_path: &str)
     Ok(entries)
 }
 
+fn tree_directory_entries(repository: &str, commit: &str, relative_path: &str) -> Result<HashMap<String, GitTreeEntry>, String> {
+    let repo = internal_repository(repository)?;
+    let oid = git2::Oid::from_str(commit).map_err(|error| error.message().to_string())?;
+    let commit = repo.find_commit(oid).map_err(|error| error.message().to_string())?;
+    let root = commit.tree().map_err(|error| error.message().to_string())?;
+    let tree = if relative_path.is_empty() {
+        root
+    } else {
+        let entry = match root.get_path(Path::new(relative_path)) {
+            Ok(entry) => entry,
+            Err(_) => return Ok(HashMap::new()),
+        };
+        if entry.kind() != Some(ObjectType::Tree) {
+            return Err(format!("{relative_path} is not a folder in {}", commit.id()));
+        }
+        repo.find_tree(entry.id()).map_err(|error| error.message().to_string())?
+    };
+    let mut entries = HashMap::new();
+    for entry in tree.iter() {
+        let name = entry.name().unwrap_or("").to_string();
+        let path = if relative_path.is_empty() { name.clone() } else { format!("{relative_path}/{name}") };
+        let kind = if entry.filemode() == 0o160000 { "submodule" } else if entry.kind() == Some(ObjectType::Tree) { "folder" } else { "file" };
+        let size = if entry.kind() == Some(ObjectType::Blob) { repo.find_blob(entry.id()).map(|blob| blob.size() as u64).unwrap_or(0) } else { 0 };
+        let commander_entry = CommanderEntry { name: name.clone(), relative_path: path, kind: kind.into(), size };
+        entries.insert(name, GitTreeEntry { entry: commander_entry, oid: entry.id(), filemode: entry.filemode() });
+    }
+    Ok(entries)
+}
+
+fn revision_commits_between(repository: &str, from_commit: &str, to_commit: &str, limit: usize) -> Vec<RevisionCompareCommit> {
+    (|| -> Option<Vec<RevisionCompareCommit>> {
+        let repo = internal_repository(repository).ok()?;
+        let from = git2::Oid::from_str(from_commit).ok()?;
+        let to = git2::Oid::from_str(to_commit).ok()?;
+        if from == to { return Some(Vec::new()); }
+        let mut walk = repo.revwalk().ok()?;
+        let _ = walk.set_sorting(Sort::TOPOLOGICAL | Sort::TIME);
+        walk.push(to).ok()?;
+        let _ = walk.hide(from);
+        let mut commits: Vec<RevisionCompareCommit> = walk.take(limit).flatten().filter_map(|oid| repo.find_commit(oid).ok().map(|commit| RevisionCompareCommit {
+            id: oid.to_string(),
+            subject: commit.summary().unwrap_or("No message").into(),
+            author: commit.author().name().unwrap_or("Unknown").into(),
+            date: short_date(commit.time().seconds()),
+        })).collect();
+        commits.reverse();
+        Some(commits)
+    })().unwrap_or_default()
+}
+
+fn compare_git_tree_directory(repository_path: &str, relative_path: &str, left_ref: &str, right_ref: &str) -> Result<RevisionCompareDirectory, String> {
+    let relative = safe_relative_path(relative_path)?;
+    let relative_path = normalized(&relative);
+    let left_revision = resolve_commit(repository_path, left_ref)?;
+    let right_revision = resolve_commit(repository_path, right_ref)?;
+    let mut right_entries = tree_directory_entries(repository_path, &right_revision, &relative_path)?;
+    let left_entries = tree_directory_entries(repository_path, &left_revision, &relative_path)?;
+    let mut rows = Vec::new();
+    for (name, left_entry) in left_entries {
+        let right_entry = right_entries.remove(&name);
+        let status = match &right_entry {
+            None => "local-only",
+            Some(right_entry) if right_entry.entry.kind != left_entry.entry.kind => "type-changed",
+            Some(right_entry) if right_entry.oid != left_entry.oid || right_entry.filemode != left_entry.filemode => "modified",
+            Some(_) => "same",
+        }.to_string();
+        let relative_path = left_entry.entry.relative_path.clone();
+        rows.push(CommanderRow { name, relative_path, local: Some(left_entry.entry), remote: right_entry.map(|item| item.entry), status });
+    }
+    for (name, right_entry) in right_entries {
+        rows.push(CommanderRow { relative_path: right_entry.entry.relative_path.clone(), name, local: None, remote: Some(right_entry.entry), status: "remote-only".into() });
+    }
+    rows.sort_by(|a, b| {
+        let a_folder = a.local.as_ref().or(a.remote.as_ref()).map(|entry| entry.kind.as_str() == "folder").unwrap_or(false);
+        let b_folder = b.local.as_ref().or(b.remote.as_ref()).map(|entry| entry.kind.as_str() == "folder").unwrap_or(false);
+        b_folder.cmp(&a_folder).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+    Ok(RevisionCompareDirectory {
+        left_ref: left_ref.into(),
+        right_ref: right_ref.into(),
+        left_revision: left_revision.clone(),
+        right_revision: right_revision.clone(),
+        relative_path,
+        rows,
+        left_only_commits: revision_commits_between(repository_path, &right_revision, &left_revision, 100),
+        right_only_commits: revision_commits_between(repository_path, &left_revision, &right_revision, 100),
+    })
+}
+
+fn tree_file_content(repository_path: &str, revision: &str, relative_path: &str) -> Result<Option<Vec<u8>>, String> {
+    let repo = internal_repository(repository_path)?;
+    let oid = git2::Oid::from_str(revision).map_err(|error| error.message().to_string())?;
+    let tree = repo.find_commit(oid).and_then(|commit| commit.tree()).map_err(|error| error.message().to_string())?;
+    let entry = match tree.get_path(Path::new(relative_path)) {
+        Ok(entry) => entry,
+        Err(_) => return Ok(None),
+    };
+    if entry.kind() != Some(ObjectType::Blob) {
+        return Err(format!("{relative_path} is not a text file in {revision}"));
+    }
+    let blob = repo.find_blob(entry.id()).map_err(|error| error.message().to_string())?;
+    Ok(Some(blob.content().to_vec()))
+}
+
+fn compare_git_tree_file(repository_path: &str, relative_path: &str, left_ref: &str, right_ref: &str) -> Result<FileComparison, String> {
+    let relative = safe_relative_path(relative_path)?;
+    let relative_path = normalized(&relative);
+    let left_revision = resolve_commit(repository_path, left_ref)?;
+    let right_revision = resolve_commit(repository_path, right_ref)?;
+    let left = tree_file_content(repository_path, &left_revision, &relative_path)?.unwrap_or_default();
+    let right = tree_file_content(repository_path, &right_revision, &relative_path)?.unwrap_or_default();
+    if left.len() > 1_000_000 || right.len() > 1_000_000 || left.contains(&0) || right.contains(&0) {
+        return Err("Binary files and files over 1 MB are not shown in the text compare view".into());
+    }
+    Ok(FileComparison { relative_path, remote_ref: right_ref.into(), local_content: String::from_utf8_lossy(&left).into_owned(), remote_content: String::from_utf8_lossy(&right).into_owned() })
+}
+
 fn changed_paths_against(repository: &str, commit: &str, relative_path: &str) -> HashSet<String> {
     let Ok(repo) = internal_repository(repository) else { return HashSet::new() }; let Ok(oid) = git2::Oid::from_str(commit) else { return HashSet::new() }; let Ok(tree) = repo.find_commit(oid).and_then(|commit| commit.tree()) else { return HashSet::new() }; let mut options = git2::DiffOptions::new(); if !relative_path.is_empty() { options.pathspec(relative_path); } let Ok(diff) = repo.diff_tree_to_workdir_with_index(Some(&tree), Some(&mut options)) else { return HashSet::new() }; diff.deltas().filter_map(|delta| delta.new_file().path().or_else(|| delta.old_file().path()).map(normalized)).collect()
 }
@@ -6343,6 +6656,33 @@ pub fn compare_file_contents(repository_path: String, relative_path: String, rem
     let commit = resolve_commit(&repository_path, &remote_ref)?; let repo = internal_repository(&repository_path)?; let oid = git2::Oid::from_str(&commit).map_err(|error| error.message().to_string())?; let tree = repo.find_commit(oid).and_then(|commit| commit.tree()).map_err(|error| error.message().to_string())?; let entry = tree.get_path(&relative).map_err(|_| "The file does not exist in the selected remote revision".to_string())?; let remote = repo.find_blob(entry.id()).map_err(|error| error.message().to_string())?.content().to_vec();
     if remote.len() > 1_000_000 || remote.contains(&0) { return Err("Binary files and files over 1 MB are not shown in the text compare view".into()); }
     Ok(FileComparison { relative_path, remote_ref, local_content: String::from_utf8_lossy(&local).into_owned(), remote_content: String::from_utf8_lossy(&remote).into_owned() })
+}
+
+// Reads one blob header per directory entry plus two bounded revwalks — on a
+// large submodule folder that is real work, so it must not run on the webview
+// UI thread.
+#[tauri::command]
+pub async fn compare_submodule_revisions_directory(repository_path: String, submodule_path: String, relative_path: String, left_ref: String, right_ref: String) -> Result<RevisionCompareDirectory, String> {
+    off_main_thread(move || compare_submodule_revisions_directory_inner(repository_path, submodule_path, relative_path, left_ref, right_ref)).await
+}
+
+fn compare_submodule_revisions_directory_inner(repository_path: String, submodule_path: String, relative_path: String, left_ref: String, right_ref: String) -> Result<RevisionCompareDirectory, String> {
+    validate_path(&repository_path)?;
+    let absolute = validate_submodule(&repository_path, &submodule_path)?;
+    let submodule_repository = absolute.to_string_lossy().into_owned();
+    compare_git_tree_directory(&submodule_repository, &relative_path, &left_ref, &right_ref)
+}
+
+#[tauri::command]
+pub async fn compare_submodule_revision_file(repository_path: String, submodule_path: String, relative_path: String, left_ref: String, right_ref: String) -> Result<FileComparison, String> {
+    off_main_thread(move || compare_submodule_revision_file_inner(repository_path, submodule_path, relative_path, left_ref, right_ref)).await
+}
+
+fn compare_submodule_revision_file_inner(repository_path: String, submodule_path: String, relative_path: String, left_ref: String, right_ref: String) -> Result<FileComparison, String> {
+    validate_path(&repository_path)?;
+    let absolute = validate_submodule(&repository_path, &submodule_path)?;
+    let submodule_repository = absolute.to_string_lossy().into_owned();
+    compare_git_tree_file(&submodule_repository, &relative_path, &left_ref, &right_ref)
 }
 
 // The submodule-publish-safety report's point 1: this used to also call
@@ -9070,7 +9410,7 @@ mod tests {
             ]
         });
         let urls = collect_rest_check_detail_urls(Some(&statuses), Some(&check_runs));
-        assert_eq!(fill_missing_pr_check_details_from_urls(&mut pr, &urls), 3);
+        assert_eq!(apply_pr_check_details_from_urls(&mut pr, &urls, false, "rest"), 3);
         let checks = pr.get("statusCheckRollup").and_then(|value| value.as_array()).unwrap();
         assert_eq!(checks[0].get("detailsUrl").and_then(|value| value.as_str()), Some("https://existing.example/build"));
         assert_eq!(checks[1].get("targetUrl").and_then(|value| value.as_str()), Some("https://github.vitesco.io/eng/repo/status/collaborator"));
@@ -9144,6 +9484,31 @@ mod tests {
         assert_eq!(urls.get("collaborator").map(String::as_str), Some("https://collaborator.vitesco.io/ui#review:id=603480"));
         assert_eq!(urls.get("polarion link").map(String::as_str), Some("https://github.vitesco.io/eng/sw-prj-VWAQ4_000U0/pull/282/checks?check_run_id=2781386"));
         assert_eq!(urls.get("submodule status").map(String::as_str), Some("https://github.vitesco.io/eng/sw-prj-VWAQ4_000U0/pull/282/checks?check_run_id=2781387"));
+    }
+
+    #[test]
+    fn pr_check_details_html_fallback_can_replace_existing_api_links_with_page_details_links() {
+        let html = r#"
+          <div class="merge-status-item d-flex flex-items-baseline">
+            <div class="color-fg-muted col-10 css-truncate css-truncate-target">
+              <strong class="text-emphasized mr-2">Collaborator</strong>
+              <span class="text-italic">Pending</span>
+            </div>
+            <div class="d-flex col-2 flex-shrink-0">
+              <a class="status-actions" href="https://collaborator.vitesco.io/ui#review:id=603480" aria-label="Details for Collaborator.">Details</a>
+            </div>
+          </div>
+        "#;
+        let urls = collect_pr_check_detail_urls_from_html("https://github.vitesco.io/eng/sw-prj-VWAQ4_000U0/pull/282", html);
+        let mut pr = serde_json::json!({
+            "statusCheckRollup": [
+                { "context": "Collaborator", "state": "PENDING", "targetUrl": "https://github.vitesco.io/eng/sw-prj-VWAQ4_000U0/statuses/collaborator" }
+            ]
+        });
+        assert_eq!(apply_pr_check_details_from_urls(&mut pr, &urls, true, "html"), 1);
+        let check = pr.get("statusCheckRollup").and_then(|value| value.as_array()).and_then(|items| items.first()).unwrap();
+        assert_eq!(check.get("targetUrl").and_then(|value| value.as_str()), Some("https://collaborator.vitesco.io/ui#review:id=603480"));
+        assert_eq!(check.get("_detailsSource").and_then(|value| value.as_str()), Some("html"));
     }
 
     #[test]
@@ -12141,6 +12506,56 @@ mod tests {
         let file_comparison = compare_file_contents(repo_path, "vendor/dep/module.txt".into(), "origin/main".into()).unwrap();
         assert_eq!(file_comparison.local_content, file_comparison.remote_content, "local and remote content should match after push");
         assert_eq!(file_comparison.local_content, "v2");
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn submodule_revision_compare_reads_two_git_trees_without_checkout() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-submodule-revision-compare-{suffix}"));
+        let repository = base.join("main");
+        let dependency = base.join("dependency");
+        fs::create_dir_all(&repository).unwrap();
+        fs::create_dir_all(dependency.join("src")).unwrap();
+        fs::write(repository.join("README.md"), "root").unwrap();
+        fs::write(dependency.join("module.txt"), "v1\n").unwrap();
+        fs::write(dependency.join("src/lib.txt"), "lib v1\n").unwrap();
+
+        for path in [&repository, &dependency] {
+            run_git(path, &["init", "-b", "main"]);
+            run_git(path, &["config", "user.email", "test@example.com"]);
+            run_git(path, &["config", "user.name", "Test User"]);
+            run_git(path, &["add", "."]);
+            run_git(path, &["commit", "-m", "Initial"]);
+        }
+        let first = run_git_capture(&dependency, &["rev-parse", "HEAD"]);
+        fs::write(dependency.join("module.txt"), "v2\n").unwrap();
+        fs::write(dependency.join("added.txt"), "new\n").unwrap();
+        run_git(&dependency, &["add", "."]);
+        run_git(&dependency, &["commit", "-m", "Update dependency"]);
+        let second = run_git_capture(&dependency, &["rev-parse", "HEAD"]);
+
+        run_git(&repository, &["-c", "protocol.file.allow=always", "submodule", "add", dependency.to_str().unwrap(), "vendor/dep"]);
+        run_git(&repository, &["commit", "-am", "Add dep submodule"]);
+        let sub_path = repository.join("vendor/dep");
+        run_git(&sub_path, &["checkout", "--detach", &first]);
+        assert_eq!(run_git_capture(&sub_path, &["rev-parse", "HEAD"]), first, "test setup must leave the submodule checkout on the older commit");
+
+        let repo_path = repository.to_string_lossy().into_owned();
+        let comparison = compare_submodule_revisions_directory_inner(repo_path.clone(), "vendor/dep".into(), "".into(), first.clone(), second.clone()).unwrap();
+        assert_eq!(comparison.left_revision, first);
+        assert_eq!(comparison.right_revision, second);
+        assert!(comparison.right_only_commits.iter().any(|commit| commit.subject == "Update dependency"));
+        let module_row = comparison.rows.iter().find(|row| row.name == "module.txt").expect("module.txt row");
+        assert_eq!(module_row.status, "modified");
+        let added_row = comparison.rows.iter().find(|row| row.name == "added.txt").expect("added.txt row");
+        assert_eq!(added_row.status, "remote-only");
+
+        let file_comparison = compare_submodule_revision_file_inner(repo_path, "vendor/dep".into(), "module.txt".into(), comparison.left_revision, comparison.right_revision).unwrap();
+        assert_eq!(file_comparison.local_content, "v1\n");
+        assert_eq!(file_comparison.remote_content, "v2\n");
+        assert_eq!(run_git_capture(&sub_path, &["rev-parse", "HEAD"]), run_git_capture(&dependency, &["rev-parse", "HEAD~1"]), "comparison must not move the checked-out submodule");
 
         fs::remove_dir_all(base).unwrap();
     }
