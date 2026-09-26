@@ -2845,6 +2845,7 @@ fn pr_check_details_url(entry: &serde_json::Value) -> Option<&str> {
 fn pr_check_details_source(entry: &serde_json::Value) -> &'static str {
     if entry.get("_detailsSource").and_then(|value| value.as_str()) == Some("html") { return "html"; }
     if entry.get("_detailsSource").and_then(|value| value.as_str()) == Some("rest") { return "rest"; }
+    if entry.get("_detailsSource").and_then(|value| value.as_str()) == Some("graphql.checkRunId") { return "graphql.checkRunId"; }
     if entry.get("detailsUrl").and_then(|value| value.as_str()).map(str::trim).is_some_and(|value| !value.is_empty()) { "graphql.detailsUrl" }
     else if entry.get("targetUrl").and_then(|value| value.as_str()).map(str::trim).is_some_and(|value| !value.is_empty()) { "graphql.targetUrl" }
     else { "none" }
@@ -2904,14 +2905,37 @@ fn collect_rest_check_detail_urls(status_payload: Option<&serde_json::Value>, ch
             let check_run_id = check_run.get("id")
                 .and_then(|value| value.as_u64().map(|id| id.to_string()).or_else(|| value.as_str().map(str::to_string)));
             let check_run_url = pr_url.and_then(|url| check_run_id.as_deref().and_then(|id| pr_check_run_url(url, id)));
-            let Some(url) = check_run_url.as_deref()
-                .or_else(|| check_run.get("details_url").and_then(|value| value.as_str()))
+            let key = normalized_pr_check_name(name);
+            if let Some(url) = check_run_url.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+                urls.insert(key, url.to_string());
+                continue;
+            }
+            let Some(url) = check_run.get("details_url").and_then(|value| value.as_str())
                 .or_else(|| check_run.get("html_url").and_then(|value| value.as_str()))
                 .map(str::trim).filter(|value| !value.is_empty()) else { continue };
-            urls.entry(normalized_pr_check_name(name)).or_insert_with(|| url.to_string());
+            urls.entry(key).or_insert_with(|| url.to_string());
         }
     }
     urls
+}
+
+fn collect_graphql_check_run_detail_urls(pr: &serde_json::Value) -> HashMap<String, String> {
+    let mut urls = HashMap::new();
+    let Some(pr_url) = pr.get("url").and_then(|value| value.as_str()).map(str::trim).filter(|value| !value.is_empty()) else { return urls };
+    let Some(entries) = pr.get("statusCheckRollup").and_then(|value| value.as_array()) else { return urls };
+    for entry in entries {
+        let Some(name) = pr_check_name(entry) else { continue };
+        let check_run_id = entry.get("databaseId")
+            .and_then(|value| value.as_u64().map(|id| id.to_string()).or_else(|| value.as_str().map(str::to_string)));
+        let Some(url) = check_run_id.as_deref().and_then(|id| pr_check_run_url(pr_url, id)) else { continue };
+        urls.entry(normalized_pr_check_name(&name)).or_insert(url);
+    }
+    urls
+}
+
+// The exact PR page of one check-run (".../pull/N/checks?check_run_id=<id>").
+fn is_pr_check_run_page_url(url: &str) -> bool {
+    url.contains("/pull/") && url.contains("/checks?check_run_id=")
 }
 
 fn apply_pr_check_details_from_urls(pr: &mut serde_json::Value, urls: &HashMap<String, String>, overwrite_existing: bool, source: &'static str) -> usize {
@@ -2923,6 +2947,12 @@ fn apply_pr_check_details_from_urls(pr: &mut serde_json::Value, urls: &HashMap<S
         if let Some(current) = pr_check_details_url(entry) {
             if current == url { continue; }
             if !overwrite_existing { continue; }
+            // A link scraped from the PR page is the check-run's own details_url,
+            // which for a third-party check is exactly the wrong external link this
+            // whole lookup exists to replace. Once the id-based PR check-run page
+            // is in place (GraphQL databaseId / REST id), the scrape must not put
+            // the external link back.
+            if source == "html" && is_pr_check_run_page_url(current) { continue; }
         }
         set_pr_check_details_url_from(entry, url, source);
         changed += 1;
@@ -2993,6 +3023,21 @@ fn normalize_html_href(href: &str) -> String {
         }
     }
     trimmed.to_string()
+}
+
+// Short, single-line error for the diagnostics log. HTTP client errors embed the
+// full request URL (internal host, org, repo, PR number), which the other PR
+// diagnostics deliberately never write, so URLs are replaced by a placeholder.
+fn compact_log_error(error: &str) -> String {
+    error
+        .split_whitespace()
+        .map(|word| {
+            let bare = word.trim_matches(|c: char| matches!(c, '(' | ')' | '"' | '\'' | '<' | '>' | ',' | ';'));
+            if bare.starts_with("http://") || bare.starts_with("https://") { "<url>" } else { word }
+        })
+        .take(24)
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn html_text_content_minimal(fragment: &str) -> String {
@@ -3349,9 +3394,32 @@ impl GitHubGraphqlClient {
             PrQueryDirection::Head => GITHUB_PRS_BY_HEAD_QUERY,
             PrQueryDirection::Base => GITHUB_PRS_BY_BASE_QUERY,
         };
+        let nodes = match self.request_pr_nodes(&repo, query, query_text) {
+            Ok(nodes) => nodes,
+            Err(error) if error.contains("databaseId") => {
+                // `databaseId` lets us build the exact PR Checks URL for each
+                // check-run, but do not make PR discovery depend on that field
+                // in case an older/self-hosted GitHub schema omits it.
+                let legacy_query = legacy_pr_query_without_check_run_id(query_text);
+                perf_log("pr_status: retry_without_check_run_database_id=true", Duration::ZERO);
+                match self.request_pr_nodes(&repo, query, &legacy_query) {
+                    Ok(nodes) => nodes,
+                    Err(error) => return GhOutcome::Failure { stderr: error },
+                }
+            }
+            Err(error) => return GhOutcome::Failure { stderr: error },
+        };
+        GhOutcome::Prs(nodes.iter().map(|node| {
+            let mut pr = normalize_graphql_pr(node);
+            self.fill_missing_check_details(&repo, &mut pr);
+            pr
+        }).collect())
+    }
+
+    fn request_pr_nodes(&self, repo: &GitHubRepo, query: &PrGhQuery, query_text: &str) -> Result<Vec<serde_json::Value>, String> {
         let variables = serde_json::json!({
-            "owner": repo.owner,
-            "name": repo.repo,
+            "owner": &repo.owner,
+            "name": &repo.repo,
             "branch": &query.branch,
         });
         let mut request = self.http.post(&self.endpoint).json(&serde_json::json!({
@@ -3361,31 +3429,27 @@ impl GitHubGraphqlClient {
         if let Some(token) = &self.token { request = request.bearer_auth(token); }
         let response = match request.send() {
             Ok(response) => response,
-            Err(error) => return GhOutcome::Failure { stderr: format!("GitHub API request failed: {error}") },
+            Err(error) => return Err(format!("GitHub API request failed: {error}")),
         };
         let status = response.status();
         let payload = match response.json::<serde_json::Value>() {
             Ok(payload) => payload,
-            Err(error) => return GhOutcome::Failure { stderr: format!("GitHub API returned HTTP {status} with an unreadable response: {error}") },
+            Err(error) => return Err(format!("GitHub API returned HTTP {status} with an unreadable response: {error}")),
         };
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-            return GhOutcome::Failure { stderr: format!("GitHub API authentication failed (HTTP {status}). The saved credential may be expired or may not have read access to this repository.") };
+            return Err(format!("GitHub API authentication failed (HTTP {status}). The saved credential may be expired or may not have read access to this repository."));
         }
         if !status.is_success() {
-            return GhOutcome::Failure { stderr: format!("GitHub API request failed with HTTP {status}.") };
+            return Err(format!("GitHub API request failed with HTTP {status}."));
         }
         if let Some(errors) = payload.get("errors").and_then(|value| value.as_array()).filter(|errors| !errors.is_empty()) {
             let message = errors.iter().filter_map(|error| error.get("message").and_then(|value| value.as_str())).take(3).collect::<Vec<_>>().join("; ");
-            return GhOutcome::Failure { stderr: if message.is_empty() { "GitHub API returned an error.".into() } else { format!("GitHub API error: {message}") } };
+            return Err(if message.is_empty() { "GitHub API returned an error.".into() } else { format!("GitHub API error: {message}") });
         }
         let Some(nodes) = payload.pointer("/data/repository/pullRequests/nodes").and_then(|value| value.as_array()) else {
-            return GhOutcome::Failure { stderr: "GitHub API response did not contain a pull-request list.".into() };
+            return Err("GitHub API response did not contain a pull-request list.".into());
         };
-        GhOutcome::Prs(nodes.iter().map(|node| {
-            let mut pr = normalize_graphql_pr(node);
-            self.fill_missing_check_details(&repo, &mut pr);
-            pr
-        }).collect())
+        Ok(nodes.clone())
     }
 
     fn rest_get_json(&self, repo: &GitHubRepo, suffix: &str) -> Result<serde_json::Value, String> {
@@ -3414,6 +3478,14 @@ impl GitHubGraphqlClient {
     }
 
     fn fill_missing_check_details(&self, repo: &GitHubRepo, pr: &mut serde_json::Value) {
+        let graphql_check_run_urls = collect_graphql_check_run_detail_urls(pr);
+        let changed = apply_pr_check_details_from_urls(pr, &graphql_check_run_urls, true, "graphql.checkRunId");
+        // Logged even when nothing was found: found=0 is the case to diagnose
+        // (older schema without databaseId, or no CheckRun entries at all).
+        perf_log(&format!(
+            "pr_check_details_graphql_ids: found={} changed={changed}",
+            graphql_check_run_urls.len(),
+        ), Duration::ZERO);
         let missing = count_missing_pr_check_details(pr);
         let should_refresh_from_page = should_refresh_pr_check_details_from_html(pr);
         let short_sha = pr.get("headSha").and_then(|value| value.as_str()).map(str::trim).filter(|value| !value.is_empty())
@@ -3424,15 +3496,15 @@ impl GitHubGraphqlClient {
             if let Some(head_sha) = pr.get("headSha").and_then(|value| value.as_str()).map(str::trim).filter(|value| !value.is_empty()) {
                 let status_payload = match self.rest_get_json(repo, &format!("commits/{head_sha}/status")) {
                     Ok(payload) => Some(payload),
-                    Err(_) => {
-                        perf_log(&format!("pr_check_details_rest_fallback: sha={short_sha} status_api_failed=true"), Duration::ZERO);
+                    Err(error) => {
+                        perf_log(&format!("pr_check_details_rest_fallback: sha={short_sha} status_api_failed=true error={}", compact_log_error(&error)), Duration::ZERO);
                         None
                     }
                 };
                 let check_runs_payload = match self.rest_get_json(repo, &format!("commits/{head_sha}/check-runs?per_page=100")) {
                     Ok(payload) => Some(payload),
-                    Err(_) => {
-                        perf_log(&format!("pr_check_details_rest_fallback: sha={short_sha} check_runs_api_failed=true"), Duration::ZERO);
+                    Err(error) => {
+                        perf_log(&format!("pr_check_details_rest_fallback: sha={short_sha} check_runs_api_failed=true error={}", compact_log_error(&error)), Duration::ZERO);
                         None
                     }
                 };
@@ -3463,8 +3535,8 @@ impl GitHubGraphqlClient {
                 let changed = apply_pr_check_details_from_urls(pr, &html_urls, true, "html");
                 perf_log(&format!("pr_check_details_html_fallback: sha={short_sha} missing={missing_after_rest} url_kind=checks_or_pr found={found} changed={changed} overwrite_existing=true"), Duration::ZERO);
             }
-            Err(_) => {
-                perf_log(&format!("pr_check_details_html_fallback: sha={short_sha} missing={missing_after_rest} html_failed=true"), Duration::ZERO);
+            Err(error) => {
+                perf_log(&format!("pr_check_details_html_fallback: sha={short_sha} missing={missing_after_rest} html_failed=true error={}", compact_log_error(&error)), Duration::ZERO);
             }
         }
     }
@@ -3497,7 +3569,7 @@ query PullRequestsByHead($owner: String!, $name: String!, $branch: String!) {
         commits(last: 1) { nodes { commit { oid statusCheckRollup {
           state
           contexts(first: 100) { nodes {
-            ... on CheckRun { name status conclusion detailsUrl }
+            ... on CheckRun { name status conclusion databaseId detailsUrl }
             ... on StatusContext { context state targetUrl }
           } }
         } } } }
@@ -3521,7 +3593,7 @@ query PullRequestsByBase($owner: String!, $name: String!, $branch: String!) {
         commits(last: 1) { nodes { commit { oid statusCheckRollup {
           state
           contexts(first: 100) { nodes {
-            ... on CheckRun { name status conclusion detailsUrl }
+            ... on CheckRun { name status conclusion databaseId detailsUrl }
             ... on StatusContext { context state targetUrl }
           } }
         } } } }
@@ -3530,6 +3602,16 @@ query PullRequestsByBase($owner: String!, $name: String!, $branch: String!) {
   }
 }
 "#;
+
+const GITHUB_CHECK_RUN_FIELDS_WITH_ID: &str = "name status conclusion databaseId detailsUrl";
+const GITHUB_CHECK_RUN_FIELDS_LEGACY: &str = "name status conclusion detailsUrl";
+
+// The same PR query without CheckRun.databaseId, for a GitHub Enterprise schema
+// that does not expose it. Plain text substitution, so the queries above must
+// keep the exact GITHUB_CHECK_RUN_FIELDS_WITH_ID text (a test enforces that).
+fn legacy_pr_query_without_check_run_id(query_text: &str) -> String {
+    query_text.replace(GITHUB_CHECK_RUN_FIELDS_WITH_ID, GITHUB_CHECK_RUN_FIELDS_LEGACY)
+}
 
 fn normalize_graphql_pr(item: &serde_json::Value) -> serde_json::Value {
     let head_sha = item.pointer("/commits/nodes/0/commit/oid").cloned().unwrap_or(serde_json::Value::Null);
@@ -9602,6 +9684,80 @@ mod tests {
         let checks = pr.get("statusCheckRollup").and_then(|value| value.as_array()).unwrap();
         assert_eq!(checks[0].get("detailsUrl").and_then(|value| value.as_str()), Some("https://github.vitesco.io/eng/sw-prj-VWAQ4_000U0/pull/320/checks?check_run_id=2785800"));
         assert_eq!(checks[1].get("detailsUrl").and_then(|value| value.as_str()), Some("https://github.vitesco.io/eng/sw-prj-VWAQ4_000U0/pull/320/checks?check_run_id=2785801"));
+    }
+
+    #[test]
+    fn pr_check_details_graphql_check_run_ids_replace_external_details_links() {
+        let mut pr = serde_json::json!({
+            "url": "https://github.vitesco.io/eng/sw-prj-VWAQ4_000U0/pull/320",
+            "statusCheckRollup": [
+                { "name": "Polarion Link", "status": "COMPLETED", "conclusion": "SUCCESS", "databaseId": 2785800, "detailsUrl": "https://polarion.example/wrong" },
+                { "name": "Submodule status", "status": "COMPLETED", "conclusion": "SUCCESS", "databaseId": "2785801", "detailsUrl": "https://submodule.example/wrong" },
+                { "context": "build-status", "state": "SUCCESS", "targetUrl": "https://builds.example/job/1" }
+            ]
+        });
+        let urls = collect_graphql_check_run_detail_urls(&pr);
+        assert_eq!(urls.get("polarion link").map(String::as_str), Some("https://github.vitesco.io/eng/sw-prj-VWAQ4_000U0/pull/320/checks?check_run_id=2785800"));
+        assert_eq!(urls.get("submodule status").map(String::as_str), Some("https://github.vitesco.io/eng/sw-prj-VWAQ4_000U0/pull/320/checks?check_run_id=2785801"));
+        assert_eq!(urls.get("build-status"), None);
+        assert_eq!(apply_pr_check_details_from_urls(&mut pr, &urls, true, "graphql.checkRunId"), 2);
+        let checks = pr.get("statusCheckRollup").and_then(|value| value.as_array()).unwrap();
+        assert_eq!(checks[0].get("detailsUrl").and_then(|value| value.as_str()), Some("https://github.vitesco.io/eng/sw-prj-VWAQ4_000U0/pull/320/checks?check_run_id=2785800"));
+        assert_eq!(checks[1].get("detailsUrl").and_then(|value| value.as_str()), Some("https://github.vitesco.io/eng/sw-prj-VWAQ4_000U0/pull/320/checks?check_run_id=2785801"));
+        assert_eq!(checks[2].get("targetUrl").and_then(|value| value.as_str()), Some("https://builds.example/job/1"));
+    }
+
+    #[test]
+    fn pr_check_details_html_scrape_never_puts_an_external_link_back_over_a_check_run_page() {
+        // Third-party check-runs list their own external details_url as the
+        // "Details" link on the PR page. The id-based PR check-run page set by
+        // GraphQL/REST must survive the final HTML step, while a commit status
+        // (Collaborator) that has no id still gets the page's real link.
+        let pr_url = "https://github.vitesco.io/eng/sw-prj-VWAQ4_000U0/pull/320";
+        let mut pr = serde_json::json!({
+            "url": pr_url,
+            "statusCheckRollup": [
+                { "name": "Polarion Link", "status": "COMPLETED", "conclusion": "SUCCESS", "databaseId": 2785800, "detailsUrl": "https://polarion.example/wrong" },
+                { "context": "Collaborator", "state": "PENDING", "targetUrl": "https://github.vitesco.io/eng/sw-prj-VWAQ4_000U0/statuses/collaborator" }
+            ]
+        });
+        let ids = collect_graphql_check_run_detail_urls(&pr);
+        assert_eq!(apply_pr_check_details_from_urls(&mut pr, &ids, true, "graphql.checkRunId"), 1);
+
+        let html = r#"
+          <div class="merge-status-item"><strong>Polarion Link</strong>
+            <a class="status-actions" href="https://polarion.example/wrong" aria-label="Details for Polarion Link.">Details</a></div>
+          <div class="merge-status-item"><strong>Collaborator</strong>
+            <a class="status-actions" href="https://collaborator.vitesco.io/ui#review:id=603480" aria-label="Details for Collaborator.">Details</a></div>
+        "#;
+        let html_urls = collect_pr_check_detail_urls_from_html(pr_url, html);
+        assert_eq!(html_urls.get("polarion link").map(String::as_str), Some("https://polarion.example/wrong"), "fixture must really offer the external link");
+        assert_eq!(apply_pr_check_details_from_urls(&mut pr, &html_urls, true, "html"), 1, "only the id-less Collaborator status may be replaced");
+
+        let checks = pr.get("statusCheckRollup").and_then(|value| value.as_array()).unwrap();
+        assert_eq!(checks[0].get("detailsUrl").and_then(|value| value.as_str()), Some("https://github.vitesco.io/eng/sw-prj-VWAQ4_000U0/pull/320/checks?check_run_id=2785800"));
+        assert_eq!(checks[1].get("targetUrl").and_then(|value| value.as_str()), Some("https://collaborator.vitesco.io/ui#review:id=603480"));
+    }
+
+    #[test]
+    fn pr_queries_can_drop_check_run_database_id_for_older_github_schemas() {
+        for query in [GITHUB_PRS_BY_HEAD_QUERY, GITHUB_PRS_BY_BASE_QUERY] {
+            assert!(query.contains(GITHUB_CHECK_RUN_FIELDS_WITH_ID), "both PR queries must request CheckRun.databaseId");
+            let legacy = legacy_pr_query_without_check_run_id(query);
+            assert!(!legacy.contains("databaseId"), "the retry query must not mention databaseId at all");
+            assert!(legacy.contains(GITHUB_CHECK_RUN_FIELDS_LEGACY), "the retry query keeps every other CheckRun field");
+            assert_eq!(legacy.len() + " databaseId".len(), query.len(), "only databaseId may differ between the two queries");
+        }
+    }
+
+    #[test]
+    fn diagnostic_error_text_never_carries_a_url() {
+        let error = "GitHub REST API request failed: error sending request for url (https://github.vitesco.io/api/v3/repos/eng/sw-prj-VWAQ4_000U0/commits/abcdef/status): operation timed out";
+        let compact = compact_log_error(error);
+        assert!(!compact.contains("vitesco") && !compact.contains("sw-prj") && !compact.contains("http"), "URL leaked into the log: {compact}");
+        assert!(compact.contains("<url>") && compact.contains("timed out"), "keeps the useful part: {compact}");
+        let long = (0..100).map(|n| format!("w{n}")).collect::<Vec<_>>().join(" ");
+        assert_eq!(compact_log_error(&long).split_whitespace().count(), 24, "stays short");
     }
 
     #[test]
