@@ -94,10 +94,10 @@ test('details panel extracts spec ids from loaded commit text and shows compact 
   assert.match(app, /specDetailRows\(entry\.submodule_commit_subject, \.\.\.\(entry\.submodule_commit_tags \|\| \[\]\)\)/);
   assert.match(app, /entry\.submodule_commit_tags\?\.length/);
   assert.match(app, /function tagListHtml\(tags = \[\]\)/);
-  assert.match(app, /function compactRepositoryLabel\(url = ''\)/);
   assert.match(app, /function submoduleRepositoryLinkHtml\(entry\)/);
   assert.match(app, /function submoduleRepositoryRowsHtml\(entry\)/);
-  assert.match(app, /entry\.submodule_web_url \? `<span>GitHub<\/span>/);
+  assert.match(app, /return `<span>Remote<\/span><strong>\$\{remote\}<\/strong>`/);
+  assert.doesNotMatch(app, /<span>GitHub<\/span>/);
   assert.match(app, /class="submodule-repository-link"/);
   assert.match(app, /entry\.submodule_web_url/);
   assert.match(app, /event\.target\.closest\('\.submodule-repository-link'\)/);
@@ -105,7 +105,7 @@ test('details panel extracts spec ids from loaded commit text and shows compact 
   assert.match(css, /\.submodule-repository-link/);
 });
 
-test('folder and submodule personal notes stay outside Git and are rendered from an in-memory map', () => {
+test('folder and submodule notes stay outside Git and are rendered from an in-memory map', () => {
   assert.match(app, /drillDownNotes: \{\}/);
   assert.match(app, /function ensureDrillDownNotesLoaded\(repositoryPath, force = false\)/);
   assert.match(app, /if \(!force && state\.drillDownNotesRepositoryPath === repositoryPath\) return;/);
@@ -115,11 +115,13 @@ test('folder and submodule personal notes stay outside Git and are rendered from
   assert.match(app, /\['folder', 'submodule'\]\.includes\(entry\.kind\)/);
   assert.match(app, /function entryHasPersonalNote\(entry\)/);
   assert.match(app, /function renderPersonalNoteSection\(entry\)/);
-  assert.match(app, /PERSONAL NOTE/);
+  assert.match(app, /NOTES/);
+  assert.doesNotMatch(app, /PERSONAL NOTE/);
   assert.match(app, /invoke\('set_drill_down_note', \{ repositoryPath: state\.repository\.path, relativePath: entry\.relative_path, note: text \}\)/);
   assert.match(app, /invoke\('delete_drill_down_note', \{ repositoryPath: state\.repository\.path, relativePath: entry\.relative_path \}\)/);
   assert.match(app, /class="personal-note-dot"/);
   assert.match(css, /\.personal-note-section/);
+  assert.match(css, /\.personal-note-header \{ display: flex;/);
 });
 
 test('deleted tracked paths render without trying to stat a path that no longer exists', () => {
@@ -209,6 +211,22 @@ test('a submodule row does not show a generic action next to its identically-beh
   assert.match(app, /entry\.kind === 'submodule' \? '' : '<button data-detail-action="history">View history<\/button>'/);
 });
 
+test('a selected submodule can be promoted to the normal full repository context', () => {
+  assert.match(app, /function openSubmoduleAsFullRepository\(entry, button = null\)/);
+  assert.match(app, /invoke\('resolve_submodule_repository', \{ repositoryPath: parentRepository\.path, relativePath: entry\.relative_path \}\)/);
+  assert.match(app, /openRepositoryFast\(target\.path, \{[\s\S]*?origin:/);
+  assert.match(app, /The parent gitlink was not changed/);
+  assert.match(app, /data-detail-action="subopenfull"[\s\S]*?Open as Full Repository/);
+  assert.match(html, /id="parentRepositoryButton"/);
+  assert.match(app, /refs\.parentRepositoryButton\.addEventListener\('click'/);
+  assert.match(app, /openRepositoryFast\(origin\.parentPath, \{ reopenPath: parentPathOf\(origin\.submodulePath\) \}\)/);
+  assert.match(app, /Submodule of \$\{origin\.parentName\}/);
+  assert.match(css, /\.parent-repository-button/);
+  assert.match(css, /\.recent-repo-btn\.submodule-recent/);
+  assert.match(css, /button\[data-detail-action="subopenfull"\] \{ flex: 1 1 100%;/);
+  assert.doesNotMatch(css, /button\[data-detail-action="subopenfull"\]::before/);
+});
+
 test('the status bar quietly shows the last real git command, and the footer opens its full history on double-click', () => {
   // 'busy' means the action is still in flight — the command that will
   // explain it hasn't been recorded on the backend yet, so refreshing then
@@ -290,10 +308,20 @@ test('Saved actions are a separate persistent command tab and appear in App acti
   assert.match(html, /Save action/);
   assert.match(app, /SAVED_ACTIONS_KEY/);
   assert.match(app, /DEFAULT_SAVED_ACTIONS/);
+  assert.match(app, /git-drilldown-seeded-saved-actions-v2/);
+  assert.match(app, /Submodule update --init --recursive/);
+  assert.match(app, /git submodule sync --recursive/);
+  assert.match(app, /git submodule update --init --recursive/);
+  assert.match(app, /git submodule status --recursive/);
   assert.match(app, /Compare branch with origin\/main/);
   assert.match(app, /git diff --stat origin\/main\.\.\.HEAD/);
   assert.match(app, /git diff --name-status origin\/main\.\.\.HEAD/);
   assert.match(app, /git log --oneline --decorate --left-right origin\/main\.\.\.HEAD/);
+  assert.match(app, /Pre-merge check: origin\/main into current branch/);
+  assert.match(app, /git fetch --all --prune/);
+  assert.match(app, /git log --oneline --decorate --left-right --cherry-pick origin\/main\.\.\.HEAD/);
+  assert.match(app, /git diff --submodule=log origin\/main\.\.\.HEAD/);
+  assert.match(app, /git merge-tree --write-tree HEAD origin\/main/);
   assert.match(app, /function renderSavedActions/);
   assert.match(app, /function addOrEditSavedAction/);
   assert.match(app, /function runSavedAction/);
@@ -301,6 +329,9 @@ test('Saved actions are a separate persistent command tab and appear in App acti
   assert.match(app, /state\.savedActions\.forEach/);
   assert.match(app, /Saved action: \$\{action\.name\}/);
   assert.match(app, /data-saved-run/);
+  assert.match(app, /saved-run-primary/);
+  assert.match(app, /Saved action selected\. Press Run to execute it\./);
+  assert.match(css, /\.saved-command-actions \.saved-run-primary/);
 });
 
 test('publish indicator surfaces ahead and behind, not only outgoing commit count', () => {
@@ -345,7 +376,7 @@ test('folder restore gives visible progress and rechecks the restored folder aft
 
 test('graph exposes branch and commit context actions without relying on lane identity', () => {
   assert.match(app, /data-graph-ref-name="\$\{esc\(badge\.name\)\}"/);
-  assert.match(app, /showGraphBranchContextMenu\(event, pill\.dataset\.graphRefName\)/);
+  assert.match(app, /showGraphBranchContextMenu\(event, pill\.dataset\.graphRefName, pill\.dataset\.graphRefKind\)/);
   assert.match(app, /function graphBranchRefsForCommit\(commitId\)/);
   assert.match(app, /function graphMergeUnavailableReason\(branchName\)/);
   assert.match(app, /Checkout or switch to a branch first — HEAD is detached\./);
@@ -367,8 +398,20 @@ test('graph exposes branch and commit context actions without relying on lane id
   assert.match(app, /refs\.mergeBranchSource\.addEventListener\('change', updateMergeDirectionPreview\)/);
   assert.match(app, /Resolve with Git mergetool/);
   assert.match(app, /invoke\('open_merge_tool', \{ repositoryPath: conflictRepositoryPath\(target\), targetPath: target\.targetPath, relativePath: path \}\)/);
+  assert.match(html, /id="refreshConflicts"/);
+  assert.match(app, /data-resolve="manualmark"/);
+  assert.match(app, /markConflictResolvedAfterExternalTool/);
+  assert.match(app, /Save the resolved file in the merge tool, then use “Mark resolved” or “Recheck conflicts”/);
+  assert.match(app, /All conflicts are resolved and staged\. Complete the merge commit now\?/);
+  assert.match(app, /await refreshConflictsDialog\(target, \{ focusNext: true \}\)/);
   assert.match(app, /Configured Git merge\.tool = \$\{tool\.trim\(\)\}\. Retrying…/);
+  assert.match(app, /Recommended for Beyond Compare: bc/);
+  assert.match(app, /Common names:[\s\S]*bc = Beyond Compare[\s\S]*winmerge[\s\S]*meld[\s\S]*kdiff3/);
+  assert.doesNotMatch(app, /'bcomp'|"bcomp"/);
+  assert.match(app, /function updateConflictSession\(target, conflicts = \[\]\)/);
   assert.match(app, /UNRESOLVED/);
+  assert.match(app, /DONE/);
+  assert.match(app, /Resolved and staged for the merge result\./);
   assert.match(app, /Resolved\/staged — ready to complete the merge/);
   assert.match(app, /invoke\('graph_head_main_merge_base', \{ repositoryPath: g\.path \}\)/);
   assert.match(app, /commonAncestorRows/);
@@ -397,6 +440,46 @@ test('submodule compare can export both exact compared revisions as snapshots', 
   assert.match(app, /invoke\('choose_folder'\)/);
   assert.match(app, /invoke\('export_submodule_compare_snapshots', \{/);
   assert.match(app, /leftRef: compare\.leftRevision \|\| compare\.leftRef|const leftRef = compare\.leftRevision \|\| compare\.leftRef/);
+  assert.match(app, /function defaultSubmoduleCompareRightRef\(data = \{\}\)/);
+  assert.match(app, /if \(action === 'subcompare'\) return openSubmoduleCompareFromEntry\(entry, \{ presetCurrentRight: true \}\)/);
+  assert.match(app, /if \(presetCurrentRight\) \{[\s\S]*?state\.submoduleCompare\.leftRef = hasExplicitLeftRef \? \(revisionOverrides\.leftRef \|\| ''\) : '';/);
+  assert.match(app, /state\.submoduleCompare\.rightRef = hasExplicitRightRef \? \(revisionOverrides\.rightRef \|\| ''\) : defaultSubmoduleCompareRightRef\(data\)/);
+  assert.match(app, /const shouldAutoCompare = Boolean\(state\.submoduleCompare\.leftRef && state\.submoduleCompare\.rightRef\)/);
+  assert.match(app, /refs\.subRevisionSearch\.value = ''/);
+  assert.match(app, /function optionMatchesSubmoduleRevisionRef\(option = \{\}, ref = ''\)/);
+  assert.match(app, /const otherRef = picker\.side === 'left' \? state\.submoduleCompare\?\.rightRef : state\.submoduleCompare\?\.leftRef/);
+  assert.match(app, /filter\(option => !optionMatchesSubmoduleRevisionRef\(option, otherRef\)\)/);
+  assert.doesNotMatch(app, /state\.submoduleCompare\.leftRef = revisionOverrides\.leftRef \|\| state\.submoduleCompare\.leftRef \|\| data\.parent_revision/);
+});
+
+test('main project merges ask before updating submodule working trees', () => {
+  assert.match(app, /function parseChangedSubmodulePaths\(rawDiff = ''\)/);
+  assert.match(app, /160000/);
+  assert.match(app, /function maybeOfferSubmoduleUpdateAfterMerge\(target, beforeHead = ''\)/);
+  assert.match(app, /target\?\.isSubmodule\) return/);
+  assert.match(app, /Update submodules after merge\?/);
+  assert.match(app, /git submodule update --init --recursive/);
+  assert.match(app, /await maybeOfferSubmoduleUpdateAfterMerge\(target, beforeHead\)/);
+  assert.match(app, /await maybeOfferSubmoduleUpdateAfterMerge\(target\)/);
+  assert.match(app, /await initAndUpdateSubmodulesFromActions\(\)/);
+});
+
+test('main project merge pauses for one consolidated submodule pointer review', () => {
+  assert.match(html, /id="submoduleMergeReviewDialog"/);
+  assert.match(html, /Submodule merge review/);
+  assert.match(html, /id="submoduleMergeReviewList"/);
+  assert.match(app, /submoduleMergeReview: null/);
+  assert.match(app, /invoke\('submodule_merge_review'/);
+  assert.match(app, /invoke\('apply_submodule_merge_revision'/);
+  assert.match(app, /outcome\.status === 'submodule_review'/);
+  assert.match(app, /function openSubmoduleMergeReviewDialog\(target, message = ''\)/);
+  assert.match(app, /Keep Merge Result/);
+  assert.match(app, /Use Current Branch/);
+  assert.match(app, /Use Incoming\/origin/);
+  assert.match(app, /Choose another commit/);
+  assert.match(app, /Ready for submodule review \/ merge commit/);
+  assert.match(css, /\.submodule-merge-review-dialog/);
+  assert.match(css, /\.submodule-review-pointers/);
 });
 
 test('every local frontend script and stylesheet carries the same cache-busting version', () => {
@@ -435,8 +518,35 @@ test('checkbox stage flush waits only for index writes, not for the slow visual 
 
 test('detached dirty submodules ask for a branch before commit or push', () => {
   assert.match(app, /const detachedDirtySubmodule = entry\.kind === 'submodule' && entry\.submodule_initialized !== false && !submoduleBranchName && entry\.submodule_is_dirty;/);
-  assert.match(app, /Detached HEAD with local changes/);
+  assert.match(app, /Detached HEAD/);
+  assert.match(app, /Commit\/Push needs a local branch/);
   assert.match(app, /data-detail-action="subnewbranch">Create branch here…/);
+  assert.match(css, /\.detached-work-banner \{ display: grid; grid-template-columns: 10px minmax\(0, 1fr\)/);
+  assert.match(css, /\.detached-work-banner button \{ grid-column: 2;/);
   assert.match(app, /Commit requires an attached local branch/);
   assert.match(app, /Push requires an attached local branch/);
+});
+
+test('graph branch context menus can attach detached HEAD to a local branch', () => {
+  assert.match(app, /function graphCheckoutBranchMenuItem\(branchName, kind = 'local_branch', id = 'checkout-branch'\)/);
+  assert.match(app, /Remote-tracking refs cannot be checked out directly here/);
+  assert.match(app, /Attach detached HEAD to this local branch/);
+  assert.match(app, /showFloatingMenu\(event, \[\s*graphCheckoutBranchMenuItem\(branchName, kind\),\s*\{ separator: true \},\s*graphMergeMenuItem\(branchName\),\s*\]\);/);
+  assert.match(app, /const checkoutItems = branchRefs[\s\S]*?filter\(ref => ref\.kind === 'local_branch'\)[\s\S]*?graphCheckoutBranchMenuItem\(ref\.name, ref\.kind, `checkout-\$\{index\}`\)/);
+  assert.match(app, /menuItems\.push\(\.\.\.checkoutItems, \{ separator: true \}\)/);
+  assert.match(app, /item\.separator[\s\S]*?floating-menu-separator/);
+  assert.match(css, /\.floating-menu-separator/);
+  assert.match(css, /\.floating-action-menu strong \{ display: block; font-size: 11px;/);
+  assert.match(app, /showGraphBranchContextMenu\(event, pill\.dataset\.graphRefName, pill\.dataset\.graphRefKind\)/);
+});
+
+test('a submodule opened as a full repository cannot commit or publish from detached HEAD', () => {
+  assert.match(app, /function detachedHeadWorkMessage\(action = 'publish'\)/);
+  assert.match(app, /Detached commits are easy to lose and cannot be shown as normal Unpublished branch commits/);
+  assert.match(app, /function blockDetachedHeadWork\(action = 'publish'\)/);
+  assert.match(app, /if \(state\.repository\.head_detached\) \{/);
+  assert.match(app, /Detached HEAD — create\/switch to a branch before publishing/);
+  assert.match(app, /refs\.commitButton\.disabled = !staged \|\| !refs\.commitMessage\.value\.trim\(\) \|\| detached/);
+  assert.match(app, /if \(blockDetachedHeadWork\('publish'\)\) return;/);
+  assert.match(app, /if \(blockDetachedHeadWork\('commit'\)\) return;/);
 });

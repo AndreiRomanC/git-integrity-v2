@@ -61,7 +61,7 @@ pub(in crate::repository) fn tokenize_git_args(input: &str) -> Result<Vec<String
 // Deliberately conservative: an unnecessary refresh is safer than stale UI
 // after a command that was incorrectly classified as read-only.
 pub(in crate::repository) fn is_read_only_git_subcommand(subcommand: &str) -> bool {
-    matches!(subcommand, "status" | "log" | "diff" | "show" | "blame" | "ls-files")
+    matches!(subcommand, "status" | "log" | "diff" | "show" | "blame" | "ls-files" | "merge-tree")
 }
 
 #[tauri::command]

@@ -1,6 +1,7 @@
 abort_merge
 abort_stash_conflict
 add_submodule
+apply_submodule_merge_revision
 branch_creation_context
 build_info
 change_submodule_url
@@ -86,6 +87,7 @@ replace_local_merge_file
 reset_submodule
 reset_submodule_branch_to_upstream
 resolve_conflict
+resolve_submodule_repository
 restore_file
 restore_exact_checkpoint
 restore_folder
@@ -102,6 +104,7 @@ stash_changes
 stash_entry_files
 stash_file
 submodule_folder_status
+submodule_merge_review
 submodule_navigation_status
 submodule_publish_risks
 submodule_repository

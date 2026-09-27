@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Git DrillDown</title>
   <link rel="icon" type="image/png" href="assets/git-drilldown-mark.png">
-  <link rel="stylesheet" href="styles.css?v=20260926-submodule-compare-export">
+  <link rel="stylesheet" href="styles.css?v=20260927-submodule-full-repo">
 </head>
 <body>
   <div class="app-shell">
@@ -79,7 +79,7 @@
         <span>Recent:</span>
         <div id="recentReposList" class="recent-repos-list"></div>
       </div>
-      <div class="location-strip" id="locationStrip"><span>REPOSITORY</span><strong id="locationRepository">—</strong><i>›</i><span>BRANCH</span><strong id="locationBranch">—</strong><i>›</i><span>PATH</span><strong id="locationPath">/</strong></div>
+      <div class="location-strip" id="locationStrip"><span>REPOSITORY</span><strong id="locationRepository">—</strong><i>›</i><span>BRANCH</span><strong id="locationBranch">—</strong><i>›</i><span>PATH</span><strong id="locationPath">/</strong><button id="parentRepositoryButton" class="parent-repository-button" hidden title="Return to the repository that contains this submodule">← Parent Repository · <strong id="parentRepositoryName">—</strong></button></div>
         <div class="content-head" id="contentHead">
           <div>
             <h1 id="viewTitle">Project Explorer</h1>
@@ -138,7 +138,7 @@
               <button type="button" id="subCompareSwap" title="Swap left and right revisions">⇄</button>
               <label><span>RIGHT REVISION</span><div class="revision-input-row"><input id="subCompareRightRef" placeholder="branch, tag or SHA…" autocomplete="off" spellcheck="false"><button type="button" id="subComparePickRight" title="Pick or search right revision">⌕</button></div></label>
               <button type="button" id="subCompareRefresh" title="Re-run comparison for these revisions">Compare</button>
-              <button type="button" id="subCompareDownload" title="Compare two submodule revisions first" disabled>Download</button>
+              <button type="button" id="subCompareDownload" class="submodule-export-button" aria-label="Export compared revisions" title="Compare two submodule revisions first" disabled>⇩</button>
               <datalist id="subCompareSubmoduleOptions"></datalist>
             </div>
             <div class="submodule-compare-exact" id="subCompareExact">Choose a submodule and two revisions.</div>
@@ -540,7 +540,16 @@
       <label class="commit-scope-label" id="conflictsCommitMessageLabel"><span>MERGE COMMIT MESSAGE</span><input id="conflictsCommitMessage" placeholder="Merge branch …"></label>
       <p class="conflicts-local-note" id="conflictsLocalNote">This only affects your local repository. Push and continue through your normal PR process once complete.</p>
       <p id="conflictsStatus" class="submodule-operation-status" role="status"></p>
-      <footer><button type="button" id="abortMerge" class="danger-action-soft">Abort merge</button><span style="flex:1"></span><button value="cancel">Close</button><button type="button" value="default" id="confirmCompleteMerge" class="confirm">Complete merge</button></footer>
+      <footer><button type="button" id="abortMerge" class="danger-action-soft">Abort merge</button><span style="flex:1"></span><button type="button" id="refreshConflicts">Recheck conflicts</button><button value="cancel">Close</button><button type="button" value="default" id="confirmCompleteMerge" class="confirm">Complete merge</button></footer>
+    </form>
+  </dialog>
+  <dialog id="submoduleMergeReviewDialog" class="publish-dialog submodule-merge-review-dialog">
+    <form method="dialog"><header><div><h2>Submodule merge review</h2><p id="submoduleMergeReviewSubtitle">Review submodule pointers before the merge commit is created.</p></div><button value="cancel">×</button></header>
+      <div class="submodule-review-principle">Git already prepared the merge. These rows are submodule <b>commit pointers</b>, not personal file edits. Nothing is pushed automatically.</div>
+      <div id="submoduleMergeReviewList" class="submodule-merge-review-list"></div>
+      <label class="commit-scope-label"><span>MERGE COMMIT MESSAGE</span><input id="submoduleMergeCommitMessage" placeholder="Merge branch …"></label>
+      <p id="submoduleMergeReviewStatus" class="submodule-operation-status" role="status"></p>
+      <footer><button type="button" id="abortSubmoduleMergeReview" class="danger-action-soft">Abort merge</button><span id="submoduleMergeReviewSummary">Checking…</span><span style="flex:1"></span><button value="cancel">Review later</button><button type="button" id="confirmSubmoduleMergeReview" class="confirm">Create merge commit</button></footer>
     </form>
   </dialog>
   <dialog id="helpDialog" class="help-dialog">
@@ -585,7 +594,7 @@
         </details>
         <details>
           <summary>Merge branch &amp; conflicts</summary>
-          <p>"Merge branch…" brings another branch's commits into your current one — entirely local, nothing is pushed automatically. If it can fast-forward, it just does. If it merges cleanly, it commits automatically. If there are real conflicts, a dialog lists each file — "Keep mine", "Keep theirs", or "Edit manually" (opens the file with the standard conflict markers) — then "Complete merge" once everything's resolved. "Abort merge" cancels and restores exactly how things were before.</p>
+          <p>"Merge branch…" brings another branch's commits into your current one — entirely local, nothing is pushed automatically. If it can fast-forward, it just does. If submodule pointers changed, Git DrillDown pauses before the merge commit and shows a consolidated submodule review. If there are real conflicts, a dialog lists each file — "Keep mine", "Keep theirs", or "Edit manually" (opens the file with the standard conflict markers) — then "Complete merge" once everything's resolved. "Abort merge" cancels and restores exactly how things were before.</p>
           <p>The same conflict dialog opens automatically if popping a stash couldn't apply cleanly (see Stash below) — there it says "Stash conflicts" instead, and finishing just says "Done" (no merge commit needed; the resolved files become your regular working-tree changes).</p>
         </details>
         <details>
@@ -660,13 +669,13 @@
       <footer><button value="cancel">Cancel</button><button type="button" value="default" id="confirmNewTag" class="confirm">Create tag</button></footer>
     </form>
   </dialog>
-  <script src="console-context.js?v=20260926-submodule-compare-export"></script>
-  <script src="graph-model.js?v=20260926-submodule-compare-export"></script>
-  <script src="submodule-state.js?v=20260926-submodule-compare-export"></script>
-  <script src="submodule-versions.js?v=20260926-submodule-compare-export"></script>
-  <script src="local-diff.js?v=20260926-submodule-compare-export"></script>
-  <script src="local-drive.js?v=20260926-submodule-compare-export"></script>
-  <script src="pr-status.js?v=20260926-submodule-compare-export"></script>
-  <script src="app.js?v=20260926-submodule-compare-export"></script>
+  <script src="console-context.js?v=20260927-submodule-full-repo"></script>
+  <script src="graph-model.js?v=20260927-submodule-full-repo"></script>
+  <script src="submodule-state.js?v=20260927-submodule-full-repo"></script>
+  <script src="submodule-versions.js?v=20260927-submodule-full-repo"></script>
+  <script src="local-diff.js?v=20260927-submodule-full-repo"></script>
+  <script src="local-drive.js?v=20260927-submodule-full-repo"></script>
+  <script src="pr-status.js?v=20260927-submodule-full-repo"></script>
+  <script src="app.js?v=20260927-submodule-full-repo"></script>
 </body>
 </html>
