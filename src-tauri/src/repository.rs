@@ -988,6 +988,10 @@ pub fn recent_git_commands() -> Vec<RecentGitCommand> {
 }
 
 fn git(path: &str, args: &[&str]) -> Result<String, String> {
+    git_with_timeout(path, args, GIT_COMMAND_TIMEOUT, "10 minutes")
+}
+
+fn git_with_timeout(path: &str, args: &[&str], timeout: Duration, timeout_label: &str) -> Result<String, String> {
     let mut command = Command::new("git");
     // `-c` overrides must come before the subcommand to be recognized as
     // global git config, not passed through to it — configure_git_command's
@@ -1001,7 +1005,7 @@ fn git(path: &str, args: &[&str]) -> Result<String, String> {
     // case below, so a hung command (the exact failure mode that motivated
     // this log in the first place) never leaves a silent gap right when it
     // would matter most.
-    let output = match run_with_timeout(command) {
+    let output = match run_with_timeout_labeled(command, timeout, "Git", timeout_label) {
         Ok(output) => output,
         Err(error) => { record_git_command(path, args, false); return Err(error); }
     };

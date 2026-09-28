@@ -29,6 +29,9 @@ pub struct GraphBranchStart {
     pub(super) oid: String,
 }
 
+const RESTORE_SUBMODULE_UPDATE_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+const RESTORE_SUBMODULE_UPDATE_TIMEOUT_LABEL: &str = "60 minutes";
+
 // Computes OID-based divergence independently of the graph renderer.
 #[tauri::command]
 pub fn graph_branch_divergence(repository_path: String, primary_branch: String) -> Result<Vec<BranchDivergence>, String> {
@@ -214,11 +217,30 @@ pub(super) fn restore_exact_checkpoint_inner(repository_path: String, commit_id:
     let _ = restore_checkpoint_optional_step(&repository_path, "sync submodule urls", &["submodule", "sync", "--recursive"]);
     restore_checkpoint_step(&repository_path, "post-checkout clean parent leftovers", &["clean", "-fd"])
         .map_err(|detail| format!("Checkpoint restored, but parent clean failed: {detail}"))?;
-    restore_checkpoint_step(&repository_path, "init/update submodules", &["submodule", "update", "--init", "--recursive", "--force"])
-        .map_err(|detail| format!("Checkpoint restored, but submodule update failed: {detail}"))?;
+    if let Err(detail) = restore_checkpoint_step_with_timeout(
+        &repository_path,
+        "init/update submodules",
+        &["submodule", "update", "--init", "--recursive", "--force"],
+        RESTORE_SUBMODULE_UPDATE_TIMEOUT,
+        RESTORE_SUBMODULE_UPDATE_TIMEOUT_LABEL,
+    ) {
+        // The parent checkpoint is already checked out at this point. Try to
+        // make every initialized submodule internally clean before returning
+        // the failure so the user is not left with hundreds of dirty files
+        // merely because the long network/update step timed out part-way
+        // through. These are best-effort only; the final error remains the
+        // failed update, with enough wording to make the incomplete restore
+        // obvious in the UI.
+        let _ = restore_checkpoint_optional_step(&repository_path, "cleanup after failed submodule update: reset initialized submodules", &["submodule", "foreach", "--recursive", "git reset --hard"]);
+        let _ = restore_checkpoint_optional_step(&repository_path, "cleanup after failed submodule update: clean initialized submodules", &["submodule", "foreach", "--recursive", "git clean -fd"]);
+        let verification = restore_checkpoint_verify(&repository_path).err().map(|error| format!(" Remaining state: {error}")).unwrap_or_default();
+        return Err(format!("Checkpoint {oid} was checked out, but submodule update did not finish after {RESTORE_SUBMODULE_UPDATE_TIMEOUT_LABEL}. The restore is incomplete; retry the exact checkpoint restore or run Submodule update --init --recursive after checking the network/VPN. Git said: {detail}{verification}"));
+    }
     let _ = restore_checkpoint_optional_step(&repository_path, "reset submodules hard", &["submodule", "foreach", "--recursive", "git reset --hard"]);
     restore_checkpoint_step(&repository_path, "clean submodule leftovers", &["submodule", "foreach", "--recursive", "git clean -fd"])
         .map_err(|detail| format!("Checkpoint restored, but submodule clean failed: {detail}"))?;
+    restore_checkpoint_verify(&repository_path)
+        .map_err(|detail| format!("Checkpoint {oid} restore finished, but verification found the workspace is not exact yet: {detail}. Retry exact checkpoint restore or run Submodule update --init --recursive before trusting this checkout."))?;
     invalidate_git_metadata(&repository_path);
     invalidate_submodule_sync(&repository_path);
     Ok(())
@@ -231,11 +253,82 @@ fn restore_checkpoint_step(repository_path: &str, label: &str, args: &[&str]) ->
     result
 }
 
+fn restore_checkpoint_step_with_timeout(repository_path: &str, label: &str, args: &[&str], timeout: Duration, timeout_label: &str) -> Result<String, String> {
+    let started = Instant::now();
+    let result = git_with_timeout(repository_path, args, timeout, timeout_label);
+    perf_log(&format!("restore_exact_checkpoint: {label} {}", if result.is_ok() { "ok" } else { "ERROR" }), started.elapsed());
+    result
+}
+
 fn restore_checkpoint_optional_step(repository_path: &str, label: &str, args: &[&str]) -> Result<String, String> {
     let started = Instant::now();
     let result = git(repository_path, args);
     perf_log(&format!("restore_exact_checkpoint: {label} {}", if result.is_ok() { "ok" } else { "ignored ERROR" }), started.elapsed());
     result
+}
+
+fn restore_checkpoint_verify(repository_path: &str) -> Result<(), String> {
+    let submodule_status = restore_checkpoint_step(repository_path, "verify submodule status", &["submodule", "status", "--recursive"])?;
+    let bad_submodules = restore_checkpoint_bad_submodule_lines(&submodule_status);
+    if !bad_submodules.is_empty() {
+        return Err(format!("submodules not at recorded commits: {}", restore_checkpoint_summarize_lines(&bad_submodules)));
+    }
+    let status = restore_checkpoint_step(repository_path, "verify workspace status", &["status", "--short"])?;
+    let remaining = restore_checkpoint_nonempty_lines(&status);
+    if !remaining.is_empty() {
+        return Err(format!("Git still reports changes: {}", restore_checkpoint_summarize_lines(&remaining)));
+    }
+    Ok(())
+}
+
+fn restore_checkpoint_bad_submodule_lines(output: &str) -> Vec<String> {
+    output.lines()
+        .filter_map(|line| {
+            let line = line.trim_end();
+            if line.is_empty() { return None; }
+            let marker = line.chars().next().unwrap_or(' ');
+            if marker == ' ' { None } else { Some(line.to_string()) }
+        })
+        .collect()
+}
+
+fn restore_checkpoint_nonempty_lines(output: &str) -> Vec<String> {
+    output.lines().map(str::trim_end).filter(|line| !line.is_empty()).map(str::to_string).collect()
+}
+
+fn restore_checkpoint_summarize_lines(lines: &[String]) -> String {
+    const LIMIT: usize = 8;
+    let shown = lines.iter().take(LIMIT).cloned().collect::<Vec<_>>().join("; ");
+    if lines.len() > LIMIT { format!("{shown}; … and {} more", lines.len() - LIMIT) } else { shown }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exact_checkpoint_verification_flags_non_exact_submodule_states() {
+        let status = concat!(
+            " 1111111111111111111111111111111111111111 modules/clean (heads/main)\n",
+            "-2222222222222222222222222222222222222222 modules/missing\n",
+            "+3333333333333333333333333333333333333333 modules/moved (heads/dev)\n",
+            "U4444444444444444444444444444444444444444 modules/conflict\n",
+        );
+        let bad = restore_checkpoint_bad_submodule_lines(status);
+        assert_eq!(bad.len(), 3);
+        assert!(bad[0].starts_with('-'));
+        assert!(bad[1].starts_with('+'));
+        assert!(bad[2].starts_with('U'));
+    }
+
+    #[test]
+    fn exact_checkpoint_summary_stays_short_for_large_dirty_sets() {
+        let lines = (0..12).map(|index| format!(" M file-{index}.txt")).collect::<Vec<_>>();
+        let summary = restore_checkpoint_summarize_lines(&lines);
+        assert!(summary.contains("file-0.txt"));
+        assert!(summary.contains("and 4 more"));
+        assert!(!summary.contains("file-11.txt"));
+    }
 }
 
 // Resolves the target to the submodule's own repository, then refreshes only

@@ -1086,11 +1086,18 @@ dialog form { padding: 28px; text-align: center; }dialog h2 { margin: 0 0 10px; 
 .raw-git-action:hover { border-color: #5794c7; color: #d8ebfb; }
 .saved-command-item { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 12px; min-height: 48px; }
 .saved-command-main { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.danger-command-item,
+.saved-command-item.danger-saved-action { border-color: #7c3c44; background: linear-gradient(90deg, rgba(124,60,68,.26), rgba(23,36,50,.82)); }
+.danger-command-item .command-name,
+.saved-command-item.danger-saved-action .command-name { color: #ffb0b8; }
+.saved-command-warning { color: #ffb0b8; font-size: 10px; line-height: 1.35; }
 .saved-command-actions { display: flex; flex: 0 0 auto; gap: 6px; align-items: center; }
 .saved-command-actions button { width: auto; height: 26px; margin: 0; padding: 0 9px; border: 1px solid #304458; border-radius: 5px; background: #172432; color: #9db3c8; font-size: 9px; }
 .saved-command-actions button:hover { border-color: #5794c7; color: #e2f1ff; }
 .saved-command-actions .saved-run-primary { min-width: 54px; border-color: #5ba6ec; background: #215f92; color: #e6f5ff; font-weight: 800; }
 .saved-command-actions .saved-run-primary:hover { border-color: #83c5ff; background: #2b75b1; color: #fff; }
+.saved-command-actions .danger-run-primary { border-color: #d45c69; background: #7c3c44; color: #fff2f4; }
+.saved-command-actions .danger-run-primary:hover { border-color: #ff9da8; background: #9b4f5a; color: #fff; }
 .saved-command-actions button.danger { border-color: #59404a; color: #d9949d; }
 .saved-command-actions button.danger:hover { border-color: #9b4f5a; color: #ffb0b8; }
 .raw-git-stdout, .raw-git-stderr { max-height: 280px; overflow: auto; margin: 0 0 8px; padding: 10px 12px; border-radius: 6px; background: #0b1116; color: #c5d1db; font: 11px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace; white-space: pre-wrap; word-break: break-word; }

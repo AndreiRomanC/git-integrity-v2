@@ -308,11 +308,18 @@ test('Saved actions are a separate persistent command tab and appear in App acti
   assert.match(html, /Save action/);
   assert.match(app, /SAVED_ACTIONS_KEY/);
   assert.match(app, /DEFAULT_SAVED_ACTIONS/);
-  assert.match(app, /git-drilldown-seeded-saved-actions-v2/);
+  assert.match(app, /git-drilldown-seeded-saved-actions-v3/);
   assert.match(app, /Submodule update --init --recursive/);
   assert.match(app, /git submodule sync --recursive/);
   assert.match(app, /git submodule update --init --recursive/);
   assert.match(app, /git submodule status --recursive/);
+  assert.match(app, /DANGER: clean workspace to current HEAD\/checkpoint/);
+  assert.match(app, /git reset --hard HEAD/);
+  assert.match(app, /git clean -fd -- :\//);
+  assert.match(app, /git submodule update --init --recursive --force/);
+  assert.match(app, /git submodule foreach --recursive "git reset --hard HEAD"/);
+  assert.match(app, /Dangerous saved action/);
+  assert.match(app, /skipDestructiveConfirm/);
   assert.match(app, /Compare branch with origin\/main/);
   assert.match(app, /git diff --stat origin\/main\.\.\.HEAD/);
   assert.match(app, /git diff --name-status origin\/main\.\.\.HEAD/);
@@ -330,6 +337,8 @@ test('Saved actions are a separate persistent command tab and appear in App acti
   assert.match(app, /Saved action: \$\{action\.name\}/);
   assert.match(app, /data-saved-run/);
   assert.match(app, /saved-run-primary/);
+  assert.match(css, /danger-saved-action/);
+  assert.match(css, /danger-run-primary/);
   assert.match(app, /Saved action selected\. Press Run to execute it\./);
   assert.match(css, /\.saved-command-actions \.saved-run-primary/);
 });

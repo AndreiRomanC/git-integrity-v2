@@ -71,13 +71,29 @@ const REPOSITORY_ORIGINS_KEY = 'git-drilldown-repository-origins-v1';
 let repositoryOrigins = loadRepositoryOrigins();
 const SAVED_TERMINAL_COMMANDS_KEY = 'git-drilldown-saved-terminal-commands';
 const SAVED_ACTIONS_KEY = 'git-drilldown-saved-actions';
-const SEEDED_SAVED_ACTIONS_KEY = 'git-drilldown-seeded-saved-actions-v2';
+const SEEDED_SAVED_ACTIONS_KEY = 'git-drilldown-seeded-saved-actions-v3';
 const DEFAULT_SAVED_ACTIONS = [
   {
     name: 'Submodule update --init --recursive',
     commands: [
       'git submodule sync --recursive',
       'git submodule update --init --recursive',
+      'git submodule status --recursive',
+    ],
+  },
+  {
+    name: 'DANGER: clean workspace to current HEAD/checkpoint',
+    danger: true,
+    warning: 'This discards local edits, staged changes and untracked files in the current repository and all recursive submodules. It does not switch branch, pull, push or commit.',
+    commands: [
+      'git status --short --branch',
+      'git submodule sync --recursive',
+      'git reset --hard HEAD',
+      'git clean -fd -- :/',
+      'git submodule update --init --recursive --force',
+      'git submodule foreach --recursive "git reset --hard HEAD"',
+      'git submodule foreach --recursive "git clean -fd"',
+      'git status --short',
       'git submodule status --recursive',
     ],
   },
@@ -106,7 +122,11 @@ function normalizeSavedAction(item) {
   if (!item || typeof item.name !== 'string') return null;
   const commands = Array.isArray(item.commands) ? item.commands : typeof item.command === 'string' ? [item.command] : [];
   const cleaned = commands.map(command => String(command).trim()).filter(Boolean);
-  return cleaned.length ? { name: item.name.trim() || 'Untitled action', commands: cleaned } : null;
+  if (!cleaned.length) return null;
+  const normalized = { name: item.name.trim() || 'Untitled action', commands: cleaned };
+  if (item.danger === true) normalized.danger = true;
+  if (typeof item.warning === 'string' && item.warning.trim()) normalized.warning = item.warning.trim();
+  return normalized;
 }
 function loadSavedActions() {
   try {
@@ -4449,7 +4469,7 @@ async function restoreExactCheckpointFromGraphCommit(commitId) {
   if (!ok) return;
   if (!invoke) { status(`Preview: restore exact checkpoint ${shortId}`); return; }
   try {
-    status(`Restoring exact checkpoint ${shortId} and cleaning leftovers…`, 'busy');
+    status(`Restoring exact checkpoint ${shortId}; updating submodules can take many minutes on large repositories…`, 'busy');
     await invoke('restore_exact_checkpoint', { repositoryPath: context.path, commitId });
     await refreshAfterGraphCommitAction(context.path);
     const message = `Workspace restored exactly to checkpoint ${shortId}.`;
@@ -6168,6 +6188,7 @@ function buildCommands() {
       keywords: `custom saved preset macro ${commands.join(' ')}`,
       tags: ['explorer', 'graph', 'commander'],
       keepOpen: true,
+      danger: action.danger === true,
       fn: () => runSavedAction(action),
     });
   });
@@ -6312,7 +6333,7 @@ function renderCommandList(query) {
     <div class="command-item-head"><span class="command-name">▸ Run as git command: git ${esc(gitArgsText)}</span><span class="command-keys">Enter</span></div>
     <span class="command-desc">Looks like a git subcommand — run it directly and see real output</span>
   </div>` : '';
-  list.innerHTML = gitHint + (scored.map(({ cmd, score }, i) => `<div class="command-item ${i === 0 && !gitHint ? 'selected' : ''} ${score >= 10 ? 'relevant' : ''}" data-cmd-id="${esc(cmd.id)}">
+  list.innerHTML = gitHint + (scored.map(({ cmd, score }, i) => `<div class="command-item ${i === 0 && !gitHint ? 'selected' : ''} ${score >= 10 ? 'relevant' : ''} ${cmd.danger ? 'danger-command-item' : ''}" data-cmd-id="${esc(cmd.id)}">
     <div class="command-item-head"><span class="command-name">${esc(cmd.name)}</span>${cmd.keys ? `<span class="command-keys">${esc(cmd.keys)}</span>` : ''}</div>
     <span class="command-desc">${esc(cmd.description || '')}</span>
   </div>`).join('') || (gitHint ? '' : '<div class="command-item" style="text-align:center;color:#6b7f96;">No matching commands</div>'));
@@ -6327,10 +6348,16 @@ function splitSavedActionCommandText(text) {
 async function runSavedAction(action) {
   const normalized = normalizeSavedAction(action);
   if (!normalized) return status('Saved action has no commands to run.', 'error');
+  if (normalized.danger) {
+    const scope = consoleGitTarget();
+    const warning = normalized.warning || 'This saved action may overwrite or delete data.';
+    const ok = await customConfirm(`${warning}\n\nRun "${normalized.name}" in:\n${scope.label}\n${scope.displayPath || scope.path}\n\nCommands:\n${normalized.commands.map(command => `• ${command}`).join('\n')}`, { title: 'Dangerous saved action', danger: true, okLabel: 'Run dangerous action' });
+    if (!ok) return { success: false, stdout: '', stderr: 'Cancelled.' };
+  }
   setConsoleMode('console');
   status(`Running saved action: ${normalized.name}`, 'busy');
   for (const command of normalized.commands) {
-    const result = await runTerminalFromConsole(command);
+    const result = await runTerminalFromConsole(command, { skipDestructiveConfirm: normalized.danger === true });
     if (!result?.success) {
       status(`Saved action stopped at failed command: ${command}`, 'error');
       return result;
@@ -6346,11 +6373,12 @@ function renderSavedActions(query = '') {
   const rows = state.savedActions
     .map((item, index) => ({ item, index }))
     .filter(({ item }) => !q || `${item.name} ${savedActionCommands(item).join(' ')}`.toLowerCase().includes(q));
-  list.innerHTML = rows.map(({ item, index }, rowIndex) => `<div class="command-item saved-command-item ${rowIndex === 0 ? 'selected' : ''}" data-saved-index="${index}" title="Select this saved action. Use Run to execute it.">
+  list.innerHTML = rows.map(({ item, index }, rowIndex) => `<div class="command-item saved-command-item ${item.danger ? 'danger-saved-action' : ''} ${rowIndex === 0 ? 'selected' : ''}" data-saved-index="${index}" title="Select this saved action. Use Run to execute it.">
     <div class="saved-command-main"><span class="command-name">${esc(item.name)}</span>
       <span class="command-desc">${esc(savedActionCommands(item).length === 1 ? savedActionCommands(item)[0] : `${savedActionCommands(item).length} commands · ${savedActionCommands(item).join('  →  ')}`)}</span>
+      ${item.danger ? `<span class="saved-command-warning">${esc(item.warning || 'Dangerous action — review before running.')}</span>` : ''}
     </div>
-    <span class="saved-command-actions"><button type="button" class="saved-run-primary" data-saved-run="${index}" title="Run this saved action in the selected scope">Run</button><button type="button" data-saved-edit="${index}">Edit</button><button type="button" class="danger" data-saved-delete="${index}">Delete</button></span>
+    <span class="saved-command-actions"><button type="button" class="saved-run-primary ${item.danger ? 'danger-run-primary' : ''}" data-saved-run="${index}" title="Run this saved action in the selected scope">Run</button><button type="button" data-saved-edit="${index}">Edit</button><button type="button" class="danger" data-saved-delete="${index}">Delete</button></span>
   </div>`).join('') || '<div class="command-item" style="text-align:center;color:#6b7f96;">No saved actions yet. Press ＋ Save to add a named command group.</div>';
 }
 
@@ -6367,6 +6395,8 @@ async function addOrEditSavedAction(index = -1) {
   const commands = splitSavedActionCommandText(commandText);
   if (!commands.length) return status('Saved action needs at least one command.', 'error');
   const item = { name: trimmedName, commands };
+  if (existing?.danger) item.danger = true;
+  if (existing?.warning) item.warning = existing.warning;
   if (existing) state.savedActions.splice(index, 1, item); else state.savedActions.push(item);
   saveSavedActions();
   setConsoleMode('saved');
@@ -6524,7 +6554,7 @@ function recallConsoleHistory(direction) {
 
 let consoleRunningTicker = null;
 
-async function runTerminalFromConsole(input) {
+async function runTerminalFromConsole(input, options = {}) {
   if (!input) return;
   setConsoleMode('console');
   const command = normalizeTerminalCommand(input);
@@ -6536,7 +6566,7 @@ async function runTerminalFromConsole(input) {
   // centralized invoke wrapper enforces this the same way for every other
   // mutation too, not just another console command.
   if (state.consoleCommandRunning) { status('A Terminal command is already running — wait for it to finish.', 'error'); return { success: false, stdout: '', stderr: 'A Terminal command is already running.' }; }
-  if (looksDestructiveTerminalCommand(command)) {
+  if (!options.skipDestructiveConfirm && looksDestructiveTerminalCommand(command)) {
     const target = consoleGitTarget();
     const ok = await customConfirm(`This command may overwrite or delete data: "${command}" in ${target.label}. Continue?`, { title: 'Potentially destructive command', danger: true, okLabel: 'Run it anyway' });
     if (!ok) return { success: false, stdout: '', stderr: 'Cancelled.' };
