@@ -28,6 +28,17 @@ test('Add submodule starts at the Vitesco engineering namespace', () => {
   assert.match(html, /Use <code>\.\.\/\.\.\/ORG\/REPO<\/code>/);
 });
 
+test('Add submodule can browse GitHub Enterprise modules without changing the manual flow', () => {
+  assert.match(html, /id="browseSubmoduleRepository"[^>]*>Browse…<\/button>/);
+  assert.match(html, /id="submoduleBrowserDialog"/);
+  assert.match(html, /GITHUB ENTERPRISE · ENG/);
+  assert.match(app, /invoke\('search_github_modules', \{ repositoryPath: state\.repository\.path, query, limit: 25 \}\)/);
+  assert.match(app, /invoke\('github_module_refs', \{ repositoryPath: state\.repository\.path, owner: repo\.owner \|\| 'eng', repositoryName: repo\.name, query, limit: 180 \}\)/);
+  assert.match(app, /refs\.submoduleUrl\.value = repo\.portable_url/);
+  assert.match(app, /initialRevision: selected\.revision \|\| null/);
+  assert.match(app, /resetSubmoduleBrowseSelection\(\); if \(!refs\.submoduleName\.dataset\.edited\)/);
+});
+
 test('Vitesco browser URLs are suggested as portable gitmodules URLs', () => {
   assert.match(app, /function portableSubmoduleUrl\(url\)/);
   assert.match(app, /return `\.\.\/\.\.\/\$\{match\[1\]\}\/\$\{match\[2\]\}`/);

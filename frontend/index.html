@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Git DrillDown</title>
   <link rel="icon" type="image/png" href="assets/git-drilldown-mark.png">
-  <link rel="stylesheet" href="styles.css?v=20260928-danger-saved-actions">
+  <link rel="stylesheet" href="styles.css?v=20260928b-submodule-browser">
 </head>
 <body>
   <div class="app-shell">
@@ -516,14 +516,44 @@
   </dialog>
   <dialog id="submoduleDialog" class="clone-dialog submodule-dialog">
     <form method="dialog"><div class="dialog-symbol">◇</div><h2>Add Git submodule</h2><p>The repository will be cloned inside the folder currently open in Project Navigator. Git links and staging are handled automatically.</p>
-      <label><span>PORTABLE REPOSITORY URL</span><input id="submoduleUrl" placeholder="../../eng/module.git" autocomplete="off" autocapitalize="off" spellcheck="false"></label>
+      <div class="clone-location submodule-url-row"><label><span>PORTABLE REPOSITORY URL</span><input id="submoduleUrl" placeholder="../../eng/module.git" autocomplete="off" autocapitalize="off" spellcheck="false"></label><button type="button" id="browseSubmoduleRepository">Browse…</button></div>
       <label><span>ADD INSIDE CURRENT FOLDER</span><input id="submoduleParent" readonly></label>
       <label><span>SUBMODULE FOLDER NAME</span><input id="submoduleName" placeholder="module" autocomplete="off" autocapitalize="off" spellcheck="false"></label>
       <details class="submodule-auth"><summary>Private repository credentials</summary><label><span>USERNAME (OPTIONAL)</span><input id="submoduleUsername" autocomplete="username" placeholder="Git server username"></label><label><span>PERSONAL ACCESS TOKEN</span><input id="submoduleToken" type="password" autocomplete="off" placeholder="Used once; never saved"></label></details>
       <div class="submodule-add-result">Use <code>../../ORG/REPO</code>. Git DrillDown resolves it through the parent remote for clone/fetch, while <code>.gitmodules</code> stays portable.</div>
+      <div id="submoduleBrowseSelection" class="submodule-add-result submodule-browse-selection" hidden></div>
       <div id="submoduleAddStatus" class="submodule-operation-status" role="status">Ready — destination will be shown here before anything changes.</div>
       <div class="commit-dialog-actions"><button value="cancel">Cancel</button><button type="button" id="confirmAddSubmodule" class="confirm" disabled>Add submodule</button></div>
     </form>
+  </dialog>
+  <dialog id="submoduleBrowserDialog" class="submodule-browser-dialog">
+    <header>
+      <div><span>GITHUB ENTERPRISE · ENG</span><strong>Browse submodule repository</strong></div>
+      <button id="closeSubmoduleBrowser" type="button" aria-label="Close submodule browser">×</button>
+    </header>
+    <div class="submodule-browser-search">
+      <label><span>Repository search</span><input id="submoduleRepoSearch" type="text" placeholder="errm, dem, compiler…" autocomplete="off" autocapitalize="off" spellcheck="false"></label>
+      <button id="runSubmoduleRepoSearch" type="button">Search</button>
+    </div>
+    <div class="submodule-browser-body">
+      <section>
+        <h3>Repositories</h3>
+        <div id="submoduleRepoResults" class="submodule-browser-list"><div class="version-loading">Search in github.vitesco.io/eng.</div></div>
+      </section>
+      <section>
+        <div class="submodule-ref-heading"><h3>Branches, tags, commit</h3><small id="submoduleRefHint">Select a repository first.</small></div>
+        <div class="submodule-browser-search compact">
+          <label><span>Filter loaded refs or type SHA</span><input id="submoduleRefSearch" type="text" placeholder="branch, tag or SHA…" autocomplete="off" autocapitalize="off" spellcheck="false"></label>
+          <button id="runSubmoduleRefSearch" type="button">Find</button>
+        </div>
+        <div id="submoduleRefResults" class="submodule-browser-list"><div class="version-loading">No repository selected.</div></div>
+      </section>
+    </div>
+    <footer>
+      <span id="submoduleBrowserStatus">Nothing selected yet.</span>
+      <button id="cancelSubmoduleBrowser" type="button">Cancel</button>
+      <button id="applySubmoduleBrowser" type="button" class="confirm" disabled>Use selected module</button>
+    </footer>
   </dialog>
   <dialog id="mergeBranchDialog" class="clone-dialog">
     <form method="dialog"><div class="dialog-symbol">⑂</div><h2>Merge branch</h2><p id="mergeBranchSubtitle">Bring another branch's commits into the current one.</p>
@@ -669,13 +699,13 @@
       <footer><button value="cancel">Cancel</button><button type="button" value="default" id="confirmNewTag" class="confirm">Create tag</button></footer>
     </form>
   </dialog>
-  <script src="console-context.js?v=20260928-danger-saved-actions"></script>
-  <script src="graph-model.js?v=20260928-danger-saved-actions"></script>
-  <script src="submodule-state.js?v=20260928-danger-saved-actions"></script>
-  <script src="submodule-versions.js?v=20260928-danger-saved-actions"></script>
-  <script src="local-diff.js?v=20260928-danger-saved-actions"></script>
-  <script src="local-drive.js?v=20260928-danger-saved-actions"></script>
-  <script src="pr-status.js?v=20260928-danger-saved-actions"></script>
-  <script src="app.js?v=20260928-danger-saved-actions"></script>
+  <script src="console-context.js?v=20260928b-submodule-browser"></script>
+  <script src="graph-model.js?v=20260928b-submodule-browser"></script>
+  <script src="submodule-state.js?v=20260928b-submodule-browser"></script>
+  <script src="submodule-versions.js?v=20260928b-submodule-browser"></script>
+  <script src="local-diff.js?v=20260928b-submodule-browser"></script>
+  <script src="local-drive.js?v=20260928b-submodule-browser"></script>
+  <script src="pr-status.js?v=20260928b-submodule-browser"></script>
+  <script src="app.js?v=20260928b-submodule-browser"></script>
 </body>
 </html>

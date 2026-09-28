@@ -66,6 +66,7 @@ const directoryCache = new Map();
 let submoduleMenuData = null;
 let submoduleMenuEntry = null;
 let versionFilter = 'branch';
+let submoduleBrowserState = { repositories: [], selectedRepository: null, refs: [], selectedRef: null };
 const recentRepos = JSON.parse(localStorage.getItem('recentRepos') || '[]');
 const REPOSITORY_ORIGINS_KEY = 'git-drilldown-repository-origins-v1';
 let repositoryOrigins = loadRepositoryOrigins();
@@ -278,7 +279,7 @@ const refs = {
   commitScope: $('#commitScope'), showPathHistory: $('#showPathHistory'), commitScopeDialog: $('#commitScopeDialog'), commitScopeName: $('#commitScopeName'), scopeCommitMessage: $('#scopeCommitMessage'), confirmScopeCommit: $('#confirmScopeCommit'),
   folderRestoreDialog: $('#folderRestoreDialog'), folderRestorePath: $('#folderRestorePath'), folderRestoreSubtitle: $('#folderRestoreSubtitle'), folderRestoreModeHead: $('#folderRestoreModeHead'), folderRestoreModeCommit: $('#folderRestoreModeCommit'), folderRestoreCommitPicker: $('#folderRestoreCommitPicker'), folderRestoreCommitList: $('#folderRestoreCommitList'), refreshFolderRestoreCommits: $('#refreshFolderRestoreCommits'), folderRestoreClean: $('#folderRestoreClean'), folderRestorePreview: $('#folderRestorePreview'), folderRestoreStatus: $('#folderRestoreStatus'), previewFolderRestore: $('#previewFolderRestore'), confirmFolderRestore: $('#confirmFolderRestore'),
   commanderView: $('#commanderView'), commanderRows: $('#commanderRows'), commanderBreadcrumbs: $('#commanderBreadcrumbs'), remoteRef: $('#remoteRef'), gitComparePanel: $('#gitComparePanel'), localDrivePanel: $('#localDrivePanel'), compareModeGit: $('#compareModeGit'), compareModeDrive: $('#compareModeDrive'), compareModeSubmodule: $('#compareModeSubmodule'), submoduleComparePanel: $('#submoduleComparePanel'), subCompareSubmodule: $('#subCompareSubmodule'), subCompareSubmoduleOptions: $('#subCompareSubmoduleOptions'), subCompareLeftRef: $('#subCompareLeftRef'), subCompareRightRef: $('#subCompareRightRef'), subComparePickLeft: $('#subComparePickLeft'), subComparePickRight: $('#subComparePickRight'), subCompareSwap: $('#subCompareSwap'), subCompareRefresh: $('#subCompareRefresh'), subCompareDownload: $('#subCompareDownload'), subCompareExact: $('#subCompareExact'), subCompareCommits: $('#subCompareCommits'), subCompareBreadcrumbs: $('#subCompareBreadcrumbs'), subCompareRows: $('#subCompareRows'), subRevisionDialog: $('#subCompareRevisionDialog'), subRevisionDialogSide: $('#subRevisionDialogSide'), subRevisionDialogTitle: $('#subRevisionDialogTitle'), subRevisionSearch: $('#subRevisionSearch'), subRevisionSearchAll: $('#subRevisionSearchAll'), subRevisionResults: $('#subRevisionResults'), subRevisionHelp: $('#subRevisionHelp'), compareDialog: $('#compareDialog'), compareTitle: $('#compareTitle'), compareSubtitle: $('#compareSubtitle'), localCompare: $('#localCompare'), remoteCompare: $('#remoteCompare'),
-  remotesView: $('#remotesView'), remoteCards: $('#remoteCards'), editorDialog: $('#editorDialog'), editorTitle: $('#editorTitle'), editorPath: $('#editorPath'), editorContent: $('#editorContent'), locationRepository: $('#locationRepository'), locationBranch: $('#locationBranch'), locationPath: $('#locationPath'), parentRepositoryButton: $('#parentRepositoryButton'), parentRepositoryName: $('#parentRepositoryName'), leaveSubmoduleGraph: $('#leaveSubmoduleGraph'), publishDialog: $('#publishDialog'), publishBranch: $('#publishBranch'), publishRemote: $('#publishRemote'), publishCommits: $('#publishCommits'), publishSummary: $('#publishSummary'), publishDestination: $('#publishDestination'), publishBadge: $('#publishBadge'), publishSubtitle: $('#publishSubtitle'), cloneDialog: $('#cloneDialog'), cloneUrl: $('#cloneUrl'), cloneParent: $('#cloneParent'), cloneName: $('#cloneName'), cloneBranch: $('#cloneBranch'), cloneRecurseSubmodules: $('#cloneRecurseSubmodules'), confirmClone: $('#confirmClone'), submoduleDialog: $('#submoduleDialog'), submoduleUrl: $('#submoduleUrl'), submoduleParent: $('#submoduleParent'), submoduleName: $('#submoduleName'), submoduleUsername: $('#submoduleUsername'), submoduleToken: $('#submoduleToken'), submoduleAddStatus: $('#submoduleAddStatus'), confirmAddSubmodule: $('#confirmAddSubmodule'), operationToast: $('#operationToast'), drawerScopeTitle: $('#drawerScopeTitle'),
+  remotesView: $('#remotesView'), remoteCards: $('#remoteCards'), editorDialog: $('#editorDialog'), editorTitle: $('#editorTitle'), editorPath: $('#editorPath'), editorContent: $('#editorContent'), locationRepository: $('#locationRepository'), locationBranch: $('#locationBranch'), locationPath: $('#locationPath'), parentRepositoryButton: $('#parentRepositoryButton'), parentRepositoryName: $('#parentRepositoryName'), leaveSubmoduleGraph: $('#leaveSubmoduleGraph'), publishDialog: $('#publishDialog'), publishBranch: $('#publishBranch'), publishRemote: $('#publishRemote'), publishCommits: $('#publishCommits'), publishSummary: $('#publishSummary'), publishDestination: $('#publishDestination'), publishBadge: $('#publishBadge'), publishSubtitle: $('#publishSubtitle'), cloneDialog: $('#cloneDialog'), cloneUrl: $('#cloneUrl'), cloneParent: $('#cloneParent'), cloneName: $('#cloneName'), cloneBranch: $('#cloneBranch'), cloneRecurseSubmodules: $('#cloneRecurseSubmodules'), confirmClone: $('#confirmClone'), submoduleDialog: $('#submoduleDialog'), submoduleUrl: $('#submoduleUrl'), submoduleParent: $('#submoduleParent'), submoduleName: $('#submoduleName'), submoduleUsername: $('#submoduleUsername'), submoduleToken: $('#submoduleToken'), submoduleAddStatus: $('#submoduleAddStatus'), submoduleBrowseSelection: $('#submoduleBrowseSelection'), browseSubmoduleRepository: $('#browseSubmoduleRepository'), submoduleBrowserDialog: $('#submoduleBrowserDialog'), submoduleRepoSearch: $('#submoduleRepoSearch'), runSubmoduleRepoSearch: $('#runSubmoduleRepoSearch'), submoduleRepoResults: $('#submoduleRepoResults'), submoduleRefHint: $('#submoduleRefHint'), submoduleRefSearch: $('#submoduleRefSearch'), runSubmoduleRefSearch: $('#runSubmoduleRefSearch'), submoduleRefResults: $('#submoduleRefResults'), submoduleBrowserStatus: $('#submoduleBrowserStatus'), applySubmoduleBrowser: $('#applySubmoduleBrowser'), confirmAddSubmodule: $('#confirmAddSubmodule'), operationToast: $('#operationToast'), drawerScopeTitle: $('#drawerScopeTitle'),
   mergeBranchDialog: $('#mergeBranchDialog'), mergeBranchSubtitle: $('#mergeBranchSubtitle'), mergeBranchCurrent: $('#mergeBranchCurrent'), mergeBranchSource: $('#mergeBranchSource'), mergeBranchStatus: $('#mergeBranchStatus'), confirmMergeBranch: $('#confirmMergeBranch'),
   stashesDialog: $('#stashesDialog'), stashesList: $('#stashesList'),
   togglePrStatus: $('#togglePrStatus'), prStatusArrow: $('#prStatusArrow'), prStatusPanel: $('#prStatusPanel'),
@@ -605,11 +606,25 @@ async function confirmClone(event) {
 }
 
 function suggestedRepositoryName(url) { return url.trim().replace(/\/$/, '').split(/[/:]/).pop()?.replace(/\.git$/i, '') || ''; }
-function validateSubmoduleForm() { refs.confirmAddSubmodule.disabled = !refs.submoduleUrl.value.trim() || !refs.submoduleName.value.trim(); if (refs.submoduleDialog.open && refs.submoduleName.value.trim()) { refs.submoduleAddStatus.textContent = `Will add at /${state.currentPath ? `${state.currentPath}/` : ''}${refs.submoduleName.value.trim()}`; refs.submoduleAddStatus.className = 'submodule-operation-status'; } }
+function resetSubmoduleBrowseSelection() {
+  if (!refs.submoduleBrowseSelection) return;
+  refs.submoduleBrowseSelection.hidden = true;
+  refs.submoduleBrowseSelection.textContent = '';
+  refs.submoduleBrowseSelection.dataset.revision = '';
+  refs.submoduleBrowseSelection.dataset.kind = '';
+  refs.submoduleBrowseSelection.dataset.name = '';
+}
+function selectedSubmoduleBrowseRevision() {
+  const node = refs.submoduleBrowseSelection;
+  if (!node || node.hidden || !node.dataset.revision) return { revision: '', kind: '', name: '' };
+  return { revision: node.dataset.revision || '', kind: node.dataset.kind || '', name: node.dataset.name || '' };
+}
+function validateSubmoduleForm() { refs.confirmAddSubmodule.disabled = !refs.submoduleUrl.value.trim() || !refs.submoduleName.value.trim(); if (refs.submoduleDialog.open && refs.submoduleName.value.trim()) { const selected = selectedSubmoduleBrowseRevision(); const revisionNote = selected.revision ? ` · initial ${selected.kind || 'revision'} ${selected.name || revisionDisplay(selected.revision)}` : ''; refs.submoduleAddStatus.textContent = `Will add at /${state.currentPath ? `${state.currentPath}/` : ''}${refs.submoduleName.value.trim()}${revisionNote}`; refs.submoduleAddStatus.className = 'submodule-operation-status'; } }
 function openAddSubmoduleDialog() {
   if (!state.repository || state.view !== 'explorer') return;
   const defaultSubmoduleUrl = '../../eng/';
   refs.submoduleUrl.value = defaultSubmoduleUrl; refs.submoduleName.value = ''; refs.submoduleUsername.value = ''; refs.submoduleToken.value = ''; refs.submoduleName.dataset.edited = '';
+  resetSubmoduleBrowseSelection();
   refs.submoduleParent.value = state.currentPath ? `/${state.currentPath}` : '/ (repository root)';
   refs.submoduleAddStatus.textContent = `Destination: /${state.currentPath ? `${state.currentPath}/` : ''}…`; refs.submoduleAddStatus.className = 'submodule-operation-status';
   validateSubmoduleForm(); refs.submoduleDialog.showModal(); refs.submoduleUrl.focus(); refs.submoduleUrl.setSelectionRange(defaultSubmoduleUrl.length, defaultSubmoduleUrl.length);
@@ -621,13 +636,133 @@ function portableSubmoduleUrl(url) {
   if (!match) return value;
   return `../../${match[1]}/${match[2]}`;
 }
+
+function submoduleBrowserRefLabel(ref = {}) {
+  const kind = (ref.kind || 'revision').toUpperCase();
+  const name = ref.name || revisionDisplay(ref.revision || '');
+  const sha = ref.revision ? revisionDisplay(ref.revision) : '';
+  return `${kind} ${name}${sha ? ` @ ${sha}` : ''}`;
+}
+function resetSubmoduleBrowser() {
+  submoduleBrowserState = { repositories: [], selectedRepository: null, refs: [], selectedRef: null };
+  refs.submoduleRepoResults.innerHTML = '<div class="version-loading">Search in github.vitesco.io/eng.</div>';
+  refs.submoduleRefResults.innerHTML = '<div class="version-loading">No repository selected.</div>';
+  refs.submoduleRefHint.textContent = 'Select a repository first.';
+  refs.submoduleBrowserStatus.textContent = 'Nothing selected yet.';
+  refs.applySubmoduleBrowser.disabled = true;
+  refs.submoduleRefSearch.value = '';
+}
+function openSubmoduleBrowser() {
+  if (!state.repository) return;
+  resetSubmoduleBrowser();
+  const current = refs.submoduleUrl.value.trim();
+  const seed = current.replace(/^(\.\.\/\.\.\/eng\/|https:\/\/github\.vitesco\.io\/eng\/)/, '').replace(/\.git$/i, '').replace(/[^\w.-].*$/, '');
+  refs.submoduleRepoSearch.value = seed && seed !== '../../eng/' ? seed : '';
+  refs.submoduleBrowserDialog.showModal();
+  refs.submoduleRepoSearch.focus();
+  if (refs.submoduleRepoSearch.value.trim().length >= 2) searchSubmoduleRepositories();
+}
+function renderSubmoduleRepositoryResults() {
+  const selected = submoduleBrowserState.selectedRepository;
+  refs.submoduleRepoResults.innerHTML = submoduleBrowserState.repositories.map(repo => `<button type="button" class="submodule-browser-row ${selected?.full_name === repo.full_name ? 'selected' : ''}" data-submodule-repo="${esc(repo.full_name)}">
+    <span><strong>${esc(repo.name)}</strong><small>${esc(repo.description || repo.full_name)}${repo.default_branch ? ` · default ${esc(repo.default_branch)}` : ''}</small></span><code>${esc(repo.portable_url)}</code>
+  </button>`).join('') || '<div class="version-loading">No repositories found.</div>';
+  refs.submoduleRepoResults.querySelectorAll('[data-submodule-repo]').forEach(button => button.addEventListener('click', () => {
+    const repo = submoduleBrowserState.repositories.find(item => item.full_name === button.dataset.submoduleRepo);
+    if (repo) selectSubmoduleRepository(repo);
+  }));
+}
+function renderSubmoduleRefResults() {
+  const selected = submoduleBrowserState.selectedRef;
+  refs.submoduleRefResults.innerHTML = submoduleBrowserState.refs.map(ref => `<button type="button" class="submodule-browser-row ${selected?.kind === ref.kind && selected?.name === ref.name && selected?.revision === ref.revision ? 'selected' : ''}" data-submodule-ref="${esc(`${ref.kind}|${ref.name}|${ref.revision}`)}">
+    <span><strong>${esc(ref.name || revisionDisplay(ref.revision))}</strong><small>${esc(ref.subject || (ref.kind === 'commit' ? 'Commit SHA' : `${ref.kind} tip`))}${ref.date ? ` · ${esc(ref.date)}` : ''}</small></span><span class="submodule-browser-kind ${esc(ref.kind)}">${esc(ref.kind)}</span><code>${esc(revisionDisplay(ref.revision))}</code>
+  </button>`).join('') || '<div class="version-loading">No refs found. Type a branch, tag or SHA and press Find.</div>';
+  refs.submoduleRefResults.querySelectorAll('[data-submodule-ref]').forEach(button => button.addEventListener('click', () => {
+    const [kind, name, revision] = button.dataset.submoduleRef.split('|');
+    const ref = submoduleBrowserState.refs.find(item => item.kind === kind && item.name === name && item.revision === revision);
+    if (ref) {
+      submoduleBrowserState.selectedRef = ref;
+      refs.submoduleBrowserStatus.textContent = `${submoduleBrowserState.selectedRepository?.full_name || ''} · ${submoduleBrowserRefLabel(ref)}`;
+      refs.applySubmoduleBrowser.disabled = false;
+      renderSubmoduleRefResults();
+    }
+  }));
+}
+async function searchSubmoduleRepositories() {
+  const query = refs.submoduleRepoSearch.value.trim();
+  if (query.length < 2) { refs.submoduleRepoResults.innerHTML = '<div class="version-loading">Type at least 2 characters.</div>'; return; }
+  const finish = beginButtonOperation(refs.runSubmoduleRepoSearch, 'Searching…');
+  refs.submoduleRepoResults.innerHTML = '<div class="version-loading"><i class="spinner"></i>Searching github.vitesco.io/eng…</div>';
+  refs.submoduleRefResults.innerHTML = '<div class="version-loading">Select a repository first.</div>';
+  submoduleBrowserState.selectedRepository = null; submoduleBrowserState.refs = []; submoduleBrowserState.selectedRef = null; refs.applySubmoduleBrowser.disabled = true;
+  try {
+    const results = invoke ? await invoke('search_github_modules', { repositoryPath: state.repository.path, query, limit: 25 }) : [
+      { name: `sw-pkg-0G-${query}_demo`, full_name: `eng/sw-pkg-0G-${query}_demo`, owner: 'eng', portable_url: `../../eng/sw-pkg-0G-${query}_demo.git`, description: 'Preview repository', default_branch: 'main' }
+    ];
+    submoduleBrowserState.repositories = results || [];
+    refs.submoduleBrowserStatus.textContent = `${submoduleBrowserState.repositories.length} repositories found.`;
+    renderSubmoduleRepositoryResults();
+  } catch (error) {
+    refs.submoduleRepoResults.innerHTML = `<div class="version-loading">${esc(String(error))}</div>`;
+    refs.submoduleBrowserStatus.textContent = String(error);
+  } finally { finish(); }
+}
+async function selectSubmoduleRepository(repo) {
+  submoduleBrowserState.selectedRepository = repo;
+  submoduleBrowserState.selectedRef = null;
+  refs.applySubmoduleBrowser.disabled = false;
+  refs.submoduleRefHint.textContent = repo.full_name;
+  refs.submoduleRefSearch.value = '';
+  refs.submoduleBrowserStatus.textContent = `${repo.full_name} selected. Pick a branch/tag/commit, or use its default checkout.`;
+  renderSubmoduleRepositoryResults();
+  await searchSubmoduleRefs('');
+}
+async function searchSubmoduleRefs(query = refs.submoduleRefSearch.value.trim()) {
+  const repo = submoduleBrowserState.selectedRepository;
+  if (!repo) { refs.submoduleRefResults.innerHTML = '<div class="version-loading">Select a repository first.</div>'; return; }
+  const finish = beginButtonOperation(refs.runSubmoduleRefSearch, 'Finding…');
+  refs.submoduleRefResults.innerHTML = '<div class="version-loading"><i class="spinner"></i>Reading branches and tags…</div>';
+  try {
+    const refsList = invoke ? await invoke('github_module_refs', { repositoryPath: state.repository.path, owner: repo.owner || 'eng', repositoryName: repo.name, query, limit: 180 }) : [
+      { name: 'main', revision: '1111111111111111111111111111111111111111', kind: 'branch', subject: '', date: '' },
+      { name: 'v1.0.0', revision: '2222222222222222222222222222222222222222', kind: 'tag', subject: '', date: '' }
+    ];
+    submoduleBrowserState.refs = refsList || [];
+    submoduleBrowserState.selectedRef = null;
+    refs.submoduleBrowserStatus.textContent = `${repo.full_name}: ${submoduleBrowserState.refs.length} matching refs.`;
+    renderSubmoduleRefResults();
+  } catch (error) {
+    refs.submoduleRefResults.innerHTML = `<div class="version-loading">${esc(String(error))}</div>`;
+    refs.submoduleBrowserStatus.textContent = String(error);
+  } finally { finish(); }
+}
+function applySubmoduleBrowserSelection() {
+  const repo = submoduleBrowserState.selectedRepository;
+  if (!repo) return;
+  refs.submoduleUrl.value = repo.portable_url || `../../${repo.owner || 'eng'}/${repo.name}.git`;
+  if (!refs.submoduleName.dataset.edited) refs.submoduleName.value = suggestedRepositoryName(repo.name || refs.submoduleUrl.value);
+  const ref = submoduleBrowserState.selectedRef;
+  if (ref?.revision) {
+    refs.submoduleBrowseSelection.hidden = false;
+    refs.submoduleBrowseSelection.dataset.revision = ref.revision;
+    refs.submoduleBrowseSelection.dataset.kind = ref.kind || 'commit';
+    refs.submoduleBrowseSelection.dataset.name = ref.name || '';
+    refs.submoduleBrowseSelection.textContent = `Initial checkout: ${submoduleBrowserRefLabel(ref)}. The .gitmodules URL stays portable: ${refs.submoduleUrl.value}`;
+  } else {
+    resetSubmoduleBrowseSelection();
+  }
+  refs.submoduleBrowserDialog.close();
+  validateSubmoduleForm();
+  refs.submoduleName.focus();
+}
 async function confirmAddSubmodule() {
   const url = refs.submoduleUrl.value.trim(), folderName = refs.submoduleName.value.trim(), parentPath = state.currentPath, username = refs.submoduleUsername.value.trim(), accessToken = refs.submoduleToken.value;
   if (!url || !folderName || !state.repository) return;
   if (!invoke) { refs.submoduleDialog.close(); return status(`Preview: added ${folderName} in /${parentPath}`); }
   refs.confirmAddSubmodule.disabled = true; refs.confirmAddSubmodule.textContent = 'Adding…'; refs.submoduleAddStatus.textContent = `Cloning into /${parentPath ? `${parentPath}/` : ''}${folderName}…`; refs.submoduleAddStatus.className = 'submodule-operation-status busy'; status(`Cloning submodule ${folderName}…`, 'busy');
   try {
-    const addedPath = await invoke('add_submodule', { repositoryPath: state.repository.path, parentPath, url, folderName, username, accessToken });
+    const selected = selectedSubmoduleBrowseRevision();
+    const addedPath = await invoke('add_submodule', { repositoryPath: state.repository.path, parentPath, url, folderName, username, accessToken, initialRevision: selected.revision || null, initialRevisionKind: selected.kind || null, initialRevisionName: selected.name || null });
     refs.submoduleDialog.close(); directoryCache.clear(); await loadRepository(state.repository.path, { reopenPath: parentPath }); selectEntry(addedPath);
     state.changesScope = 'global'; refs.changesDrawer.classList.add('open');
     const message = `${addedPath} added. Commit .gitmodules + the submodule link, then Publish/Push that commit to the server.`; status(message); showOperationToast(message);
@@ -5370,7 +5505,15 @@ $('#emptyOpen').addEventListener('click', openRepository);
 $('#cloneRepo').addEventListener('click', openCloneDialog); $('#chooseCloneParent').addEventListener('click', () => chooseCloneParent().catch(error => status(String(error), 'error'))); refs.confirmClone.addEventListener('click', confirmClone);
 refs.cloneUrl.addEventListener('input', () => { if (!refs.cloneName.dataset.edited) { const inferred = refs.cloneUrl.value.trim().split(/[\\/]/).pop()?.replace(/\.git$/, '') || ''; refs.cloneName.value = inferred; } validateCloneForm(); }); refs.cloneParent.addEventListener('input', validateCloneForm); refs.cloneName.addEventListener('input', () => { refs.cloneName.dataset.edited = refs.cloneName.value ? '1' : ''; validateCloneForm(); });
 $('#addSubmodule').addEventListener('click', openAddSubmoduleDialog); refs.confirmAddSubmodule.addEventListener('click', confirmAddSubmodule);
-refs.submoduleUrl.addEventListener('input', () => { if (!refs.submoduleName.dataset.edited) refs.submoduleName.value = suggestedRepositoryName(refs.submoduleUrl.value); validateSubmoduleForm(); });
+refs.browseSubmoduleRepository.addEventListener('click', openSubmoduleBrowser);
+$('#closeSubmoduleBrowser').addEventListener('click', () => refs.submoduleBrowserDialog.close());
+$('#cancelSubmoduleBrowser').addEventListener('click', () => refs.submoduleBrowserDialog.close());
+refs.runSubmoduleRepoSearch.addEventListener('click', () => searchSubmoduleRepositories());
+refs.submoduleRepoSearch.addEventListener('keydown', event => { if (event.key === 'Enter') { event.preventDefault(); searchSubmoduleRepositories(); } });
+refs.runSubmoduleRefSearch.addEventListener('click', () => searchSubmoduleRefs());
+refs.submoduleRefSearch.addEventListener('keydown', event => { if (event.key === 'Enter') { event.preventDefault(); searchSubmoduleRefs(); } });
+refs.applySubmoduleBrowser.addEventListener('click', applySubmoduleBrowserSelection);
+refs.submoduleUrl.addEventListener('input', () => { resetSubmoduleBrowseSelection(); if (!refs.submoduleName.dataset.edited) refs.submoduleName.value = suggestedRepositoryName(refs.submoduleUrl.value); validateSubmoduleForm(); });
 refs.submoduleName.addEventListener('input', () => { refs.submoduleName.dataset.edited = refs.submoduleName.value ? '1' : ''; validateSubmoduleForm(); });
 $('#refresh').addEventListener('click', event => refreshRepository(event.currentTarget));
 // Opening the drawer with everything already selected (staged) is what most

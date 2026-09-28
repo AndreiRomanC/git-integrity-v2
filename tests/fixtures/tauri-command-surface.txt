@@ -44,6 +44,7 @@ force_push_submodule
 frontend_perf_log
 graph_branch_divergence
 graph_head_main_merge_base
+github_module_refs
 init_repository
 init_submodule
 list_conflicts
@@ -96,6 +97,7 @@ restore_stash_paths
 run_git_command
 run_terminal_command
 run_utrud
+search_github_modules
 search_submodule_revisions
 set_drill_down_note
 stage_all

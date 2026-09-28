@@ -43,6 +43,8 @@ pub fn run() {
             repository::entry_last_commit,
             repository::submodule_versions,
             repository::search_submodule_revisions,
+            repository::search_github_modules,
+            repository::github_module_refs,
             repository::add_submodule,
             repository::init_submodule,
             repository::switch_submodule_version,

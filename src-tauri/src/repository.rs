@@ -776,6 +776,27 @@ pub struct SubmoduleVersions {
 }
 
 #[derive(Serialize, Clone)]
+pub struct GitHubModuleSearchResult {
+    name: String,
+    full_name: String,
+    owner: String,
+    html_url: String,
+    clone_url: String,
+    portable_url: String,
+    description: String,
+    default_branch: String,
+}
+
+#[derive(Serialize, Clone)]
+pub struct GitHubModuleRef {
+    name: String,
+    revision: String,
+    kind: String,
+    subject: String,
+    date: String,
+}
+
+#[derive(Serialize, Clone)]
 pub struct CommanderEntry {
     name: String,
     relative_path: String,
@@ -2882,6 +2903,31 @@ fn normalized_pr_check_name(name: &str) -> String {
     name.trim().to_ascii_lowercase()
 }
 
+fn normalized_pr_check_name_aliases(name: &str) -> Vec<String> {
+    let full = normalized_pr_check_name(name);
+    let mut aliases = vec![full.clone()];
+    // GitHub REST/check-runs often names a check as "App / Check name"
+    // while GraphQL's PR rollup or the visible PR page can show only
+    // "Check name". Keep both keys so "Polarion Connector / Submodule status"
+    // can repair the visible "Submodule status" Details button.
+    for separator in [" / ", "/"] {
+        if let Some((_, tail)) = name.rsplit_once(separator) {
+            let alias = normalized_pr_check_name(tail);
+            if !alias.is_empty() && !aliases.iter().any(|existing| existing == &alias) {
+                aliases.push(alias);
+            }
+        }
+    }
+    aliases
+}
+
+fn insert_pr_detail_url_aliases(urls: &mut HashMap<String, String>, name: &str, url: &str, overwrite: bool) {
+    for key in normalized_pr_check_name_aliases(name) {
+        if overwrite { urls.insert(key, url.to_string()); }
+        else { urls.entry(key).or_insert_with(|| url.to_string()); }
+    }
+}
+
 fn set_pr_check_details_url_from(entry: &mut serde_json::Value, url: &str, source: &'static str) {
     let field = if entry.get("context").is_some() { "targetUrl" } else { "detailsUrl" };
     if let Some(object) = entry.as_object_mut() {
@@ -2910,7 +2956,7 @@ fn collect_rest_check_detail_urls(status_payload: Option<&serde_json::Value>, ch
         for status in statuses {
             let Some(name) = status.get("context").and_then(|value| value.as_str()).map(str::trim).filter(|value| !value.is_empty()) else { continue };
             let Some(url) = status.get("target_url").and_then(|value| value.as_str()).map(str::trim).filter(|value| !value.is_empty()) else { continue };
-            urls.entry(normalized_pr_check_name(name)).or_insert_with(|| url.to_string());
+            insert_pr_detail_url_aliases(&mut urls, name, url, false);
         }
     }
     if let Some(check_runs) = check_runs_payload.and_then(|payload| payload.get("check_runs")).and_then(|value| value.as_array()) {
@@ -2919,18 +2965,97 @@ fn collect_rest_check_detail_urls(status_payload: Option<&serde_json::Value>, ch
             let check_run_id = check_run.get("id")
                 .and_then(|value| value.as_u64().map(|id| id.to_string()).or_else(|| value.as_str().map(str::to_string)));
             let check_run_url = pr_url.and_then(|url| check_run_id.as_deref().and_then(|id| pr_check_run_url(url, id)));
-            let key = normalized_pr_check_name(name);
             if let Some(url) = check_run_url.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
-                urls.insert(key, url.to_string());
+                insert_pr_detail_url_aliases(&mut urls, name, url, true);
                 continue;
             }
             let Some(url) = check_run.get("details_url").and_then(|value| value.as_str())
                 .or_else(|| check_run.get("html_url").and_then(|value| value.as_str()))
                 .map(str::trim).filter(|value| !value.is_empty()) else { continue };
-            urls.entry(key).or_insert_with(|| url.to_string());
+            insert_pr_detail_url_aliases(&mut urls, name, url, false);
         }
     }
     urls
+}
+
+fn rest_status_count(payload: Option<&serde_json::Value>) -> usize {
+    payload.and_then(|payload| payload.get("statuses")).and_then(|value| value.as_array()).map(Vec::len).unwrap_or(0)
+}
+
+fn rest_check_run_count(payload: Option<&serde_json::Value>) -> usize {
+    payload.and_then(|payload| payload.get("check_runs")).and_then(|value| value.as_array()).map(Vec::len).unwrap_or(0)
+}
+
+fn check_name_aliases_overlap(left: &str, right: &str) -> bool {
+    let left_aliases = normalized_pr_check_name_aliases(left);
+    let right_aliases = normalized_pr_check_name_aliases(right);
+    left_aliases.iter().any(|left| right_aliases.iter().any(|right| left == right))
+}
+
+fn rest_status_to_rollup_entry(status: &serde_json::Value) -> Option<serde_json::Value> {
+    let name = status.get("context").and_then(|value| value.as_str()).map(str::trim).filter(|value| !value.is_empty())?;
+    let mut entry = serde_json::json!({
+        "context": name,
+        "state": status.get("state").cloned().unwrap_or(serde_json::Value::Null),
+    });
+    if let Some(url) = status.get("target_url").and_then(|value| value.as_str()).map(str::trim).filter(|value| !value.is_empty()) {
+        entry["targetUrl"] = serde_json::Value::String(url.to_string());
+        entry["_detailsSource"] = serde_json::Value::String("rest".into());
+    }
+    Some(entry)
+}
+
+fn rest_check_run_to_rollup_entry(check_run: &serde_json::Value, pr_url: Option<&str>) -> Option<serde_json::Value> {
+    let name = check_run.get("name").and_then(|value| value.as_str()).map(str::trim).filter(|value| !value.is_empty())?;
+    let check_run_id = check_run.get("id")
+        .and_then(|value| value.as_u64().map(|id| id.to_string()).or_else(|| value.as_str().map(str::to_string)));
+    let details_url = pr_url
+        .and_then(|url| check_run_id.as_deref().and_then(|id| pr_check_run_url(url, id)))
+        .or_else(|| check_run.get("details_url").and_then(|value| value.as_str()).map(str::trim).filter(|value| !value.is_empty()).map(str::to_string))
+        .or_else(|| check_run.get("html_url").and_then(|value| value.as_str()).map(str::trim).filter(|value| !value.is_empty()).map(str::to_string));
+    let mut entry = serde_json::json!({
+        "name": name,
+        "status": check_run.get("status").cloned().unwrap_or(serde_json::Value::Null),
+        "conclusion": check_run.get("conclusion").cloned().unwrap_or(serde_json::Value::Null),
+    });
+    if let Some(id) = check_run_id {
+        entry["databaseId"] = serde_json::Value::String(id);
+    }
+    if let Some(url) = details_url {
+        entry["detailsUrl"] = serde_json::Value::String(url);
+        entry["_detailsSource"] = serde_json::Value::String("rest".into());
+    }
+    Some(entry)
+}
+
+fn append_missing_pr_checks_from_rest(pr: &mut serde_json::Value, status_payload: Option<&serde_json::Value>, check_runs_payload: Option<&serde_json::Value>, pr_url: Option<&str>) -> usize {
+    let Some(entries) = pr.get_mut("statusCheckRollup").and_then(|value| value.as_array_mut()) else { return 0 };
+    let mut added = 0usize;
+    let mut push_if_missing = |candidate: serde_json::Value| {
+        let Some(name) = pr_check_name(&candidate) else { return };
+        if entries.iter().filter_map(pr_check_name).any(|existing| check_name_aliases_overlap(&existing, &name)) {
+            return;
+        }
+        entries.push(candidate);
+        added += 1;
+    };
+    if let Some(statuses) = status_payload.and_then(|payload| payload.get("statuses")).and_then(|value| value.as_array()) {
+        for status in statuses {
+            if let Some(entry) = rest_status_to_rollup_entry(status) { push_if_missing(entry); }
+        }
+    }
+    if let Some(check_runs) = check_runs_payload.and_then(|payload| payload.get("check_runs")).and_then(|value| value.as_array()) {
+        for check_run in check_runs {
+            if let Some(entry) = rest_check_run_to_rollup_entry(check_run, pr_url) { push_if_missing(entry); }
+        }
+    }
+    added
+}
+
+fn insert_all_pr_detail_urls(target: &mut HashMap<String, String>, source: HashMap<String, String>) {
+    for (key, value) in source {
+        target.insert(key, value);
+    }
 }
 
 fn collect_graphql_check_run_detail_urls(pr: &serde_json::Value) -> HashMap<String, String> {
@@ -2982,11 +3107,46 @@ fn count_missing_pr_check_details(pr: &serde_json::Value) -> usize {
 
 fn should_refresh_pr_check_details_from_html(pr: &serde_json::Value) -> bool {
     pr.get("statusCheckRollup").and_then(|value| value.as_array())
-        .map(|entries| entries.iter().filter_map(pr_check_name).any(|name| {
-            let name = normalized_pr_check_name(&name);
-            name.contains("collaborator") || name.contains("polarion") || name.contains("submodule") || name.contains("build log")
-        }))
+        .map(|entries| entries.iter().any(pr_check_details_should_refresh))
         .unwrap_or(false)
+}
+
+fn pr_check_details_should_refresh(entry: &serde_json::Value) -> bool {
+    let Some(name) = pr_check_name(entry) else { return false };
+    let name = normalized_pr_check_name(&name);
+    if name.contains("collaborator") || name.contains("polarion") || name.contains("submodule") || name.contains("build log") {
+        let url_kind = pr_check_details_url(entry).map(classify_pr_details_url).unwrap_or("none");
+        return matches!(url_kind, "none" | "relative" | "external" | "github" | "github-actions");
+    }
+    // For CheckRun objects, GitHub's `detailsUrl` is often the external
+    // integration page. The UI needs the PR Checks page when an id is
+    // available, so let REST/HTML fallback try to replace external CheckRun
+    // URLs even when the original URL is technically non-empty.
+    if entry.get("name").is_some() && entry.get("context").is_none() {
+        if let Some(url) = pr_check_details_url(entry) {
+            return classify_pr_details_url(url) == "external";
+        }
+    }
+    false
+}
+
+fn pr_details_check_run_id_for_log(url: &str) -> &'static str {
+    if is_pr_check_run_page_url(url) { "present" } else { "none" }
+}
+
+fn log_pr_check_details_final(pr: &serde_json::Value, short_sha: &str) {
+    let Some(entries) = pr.get("statusCheckRollup").and_then(|value| value.as_array()) else { return };
+    for entry in entries {
+        let Some(name) = pr_check_name(entry) else { continue };
+        let details_url = pr_check_details_url(entry).unwrap_or("");
+        perf_log(&format!(
+            "pr_check_details_final: sha={short_sha} check='{name}' source={} target_kind={} check_run_id={} has_database_id={}",
+            pr_check_details_source(entry),
+            classify_pr_details_url(details_url),
+            pr_details_check_run_id_for_log(details_url),
+            entry.get("databaseId").is_some(),
+        ), Duration::ZERO);
+    }
 }
 
 fn decode_html_attr_minimal(value: &str) -> String {
@@ -3113,7 +3273,7 @@ fn collect_pr_check_detail_urls_from_html(pr_url: &str, html: &str) -> HashMap<S
         if name.is_empty() { continue; }
         let Some(href) = html_tag_attr(tag, "href") else { continue };
         if href.trim().is_empty() { continue; }
-        urls.entry(normalized_pr_check_name(name)).or_insert_with(|| absolute_github_html_url(pr_url, &href));
+        insert_pr_detail_url_aliases(&mut urls, name, &absolute_github_html_url(pr_url, &href), false);
     }
     // GitHub Enterprise has changed this markup several times. The strict
     // `aria-label="Details for X"` parser above is ideal when available,
@@ -3131,7 +3291,7 @@ fn collect_pr_check_detail_urls_from_html(pr_url: &str, html: &str) -> HashMap<S
             .unwrap_or(block_search.len());
         let block = &block_search[block_start..block_end];
         if let (Some(name), Some(href)) = (first_status_item_name(block), first_status_action_href(block)) {
-            urls.entry(normalized_pr_check_name(&name)).or_insert_with(|| absolute_github_html_url(pr_url, &href));
+            insert_pr_detail_url_aliases(&mut urls, &name, &absolute_github_html_url(pr_url, &href), false);
         }
         block_search = &block_search[block_end..];
     }
@@ -3507,52 +3667,91 @@ impl GitHubGraphqlClient {
             .unwrap_or_else(|| "unknown".into());
         let pr_url = pr.get("url").and_then(|value| value.as_str()).map(str::trim).filter(|value| !value.is_empty()).map(str::to_string);
         if missing > 0 || should_refresh_from_page {
+            let mut candidate_shas = Vec::<(&'static str, String)>::new();
             if let Some(head_sha) = pr.get("headSha").and_then(|value| value.as_str()).map(str::trim).filter(|value| !value.is_empty()) {
-                let status_payload = match self.rest_get_json(repo, &format!("commits/{head_sha}/status")) {
-                    Ok(payload) => Some(payload),
-                    Err(error) => {
-                        perf_log(&format!("pr_check_details_rest_fallback: sha={short_sha} status_api_failed=true error={}", compact_log_error(&error)), Duration::ZERO);
-                        None
+                candidate_shas.push(("head", head_sha.to_string()));
+            }
+            if let Some(pr_url) = pr_url.as_deref() {
+                if let Some((_, number)) = parse_pull_request_target(pr_url) {
+                    match self.rest_get_json(repo, &format!("pulls/{number}")) {
+                        Ok(payload) => {
+                            if let Some(merge_sha) = payload.get("merge_commit_sha").and_then(|value| value.as_str()).map(str::trim).filter(|value| !value.is_empty()) {
+                                if !candidate_shas.iter().any(|(_, sha)| sha == merge_sha) {
+                                    candidate_shas.push(("merge", merge_sha.to_string()));
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            perf_log(&format!("pr_check_details_rest_fallback: sha={short_sha} pull_api_failed=true error={}", compact_log_error(&error)), Duration::ZERO);
+                        }
                     }
-                };
-                let check_runs_payload = match self.rest_get_json(repo, &format!("commits/{head_sha}/check-runs?per_page=100")) {
-                    Ok(payload) => Some(payload),
-                    Err(error) => {
-                        perf_log(&format!("pr_check_details_rest_fallback: sha={short_sha} check_runs_api_failed=true error={}", compact_log_error(&error)), Duration::ZERO);
-                        None
-                    }
-                };
-                let urls = collect_rest_check_detail_urls(status_payload.as_ref(), check_runs_payload.as_ref(), pr_url.as_deref());
-                let filled = apply_pr_check_details_from_urls(pr, &urls, should_refresh_from_page, "rest");
-                perf_log(&format!(
-                    "pr_check_details_rest_fallback: sha={short_sha} missing={missing} refresh={} found={} changed={filled} overwrite_existing={}",
-                    should_refresh_from_page,
-                    urls.len(),
-                    should_refresh_from_page,
-                ), Duration::ZERO);
+                }
+            }
+
+            if candidate_shas.is_empty() {
+                perf_log(&format!("pr_check_details_rest_fallback: missing={missing} skipped=no_candidate_sha"), Duration::ZERO);
             } else {
-                perf_log(&format!("pr_check_details_rest_fallback: missing={missing} skipped=no_head_sha"), Duration::ZERO);
+                let mut urls = HashMap::new();
+                let mut total_statuses = 0usize;
+                let mut total_check_runs = 0usize;
+                let mut added_checks = 0usize;
+                let mut refs = Vec::new();
+                for (label, sha) in candidate_shas {
+                    refs.push(label);
+                    let short_candidate = sha.chars().take(8).collect::<String>();
+                    let status_payload = match self.rest_get_json(repo, &format!("commits/{sha}/status")) {
+                    Ok(payload) => Some(payload),
+                    Err(error) => {
+                            perf_log(&format!("pr_check_details_rest_fallback: ref={label} sha={short_candidate} status_api_failed=true error={}", compact_log_error(&error)), Duration::ZERO);
+                        None
+                    }
+                };
+                    let check_runs_payload = match self.rest_get_json(repo, &format!("commits/{sha}/check-runs?per_page=100&filter=all")) {
+                    Ok(payload) => Some(payload),
+                    Err(error) => {
+                            perf_log(&format!("pr_check_details_rest_fallback: ref={label} sha={short_candidate} check_runs_api_failed=true error={}", compact_log_error(&error)), Duration::ZERO);
+                        None
+                    }
+                };
+                    total_statuses += rest_status_count(status_payload.as_ref());
+                    total_check_runs += rest_check_run_count(check_runs_payload.as_ref());
+                    added_checks += append_missing_pr_checks_from_rest(pr, status_payload.as_ref(), check_runs_payload.as_ref(), pr_url.as_deref());
+                    insert_all_pr_detail_urls(&mut urls, collect_rest_check_detail_urls(status_payload.as_ref(), check_runs_payload.as_ref(), pr_url.as_deref()));
+                }
+                let filled = apply_pr_check_details_from_urls(pr, &urls, true, "rest");
+                perf_log(&format!(
+                    "pr_check_details_rest_fallback: sha={short_sha} missing={missing} refresh={} refs={} statuses={} check_runs={} found={} added_checks={} changed={filled} overwrite_existing={}",
+                    should_refresh_from_page,
+                    refs.join(","),
+                    total_statuses,
+                    total_check_runs,
+                    urls.len(),
+                    added_checks,
+                    true,
+                ), Duration::ZERO);
             }
         }
         let missing_after_rest = count_missing_pr_check_details(pr);
         let wants_html_details = missing_after_rest > 0 || should_refresh_pr_check_details_from_html(pr);
-        if !wants_html_details { return; }
-        let Some(pr_url) = pr_url.as_deref() else {
-            perf_log(&format!("pr_check_details_html_fallback: sha={short_sha} missing={missing_after_rest} skipped=no_pr_url"), Duration::ZERO);
-            return;
-        };
-        let html_url = pr_checks_page_url(pr_url).unwrap_or_else(|| pr_url.to_string());
-        match self.get_text(&html_url).or_else(|_| if html_url != pr_url { self.get_text(pr_url) } else { Err("GitHub HTML request failed".into()) }) {
-            Ok(html) => {
-                let html_urls = collect_pr_check_detail_urls_from_html(pr_url, &html);
-                let found = html_urls.len();
-                let changed = apply_pr_check_details_from_urls(pr, &html_urls, true, "html");
-                perf_log(&format!("pr_check_details_html_fallback: sha={short_sha} missing={missing_after_rest} url_kind=checks_or_pr found={found} changed={changed} overwrite_existing=true"), Duration::ZERO);
-            }
-            Err(error) => {
-                perf_log(&format!("pr_check_details_html_fallback: sha={short_sha} missing={missing_after_rest} html_failed=true error={}", compact_log_error(&error)), Duration::ZERO);
+        if wants_html_details {
+            if let Some(pr_url) = pr_url.as_deref() {
+                let html_url = pr_checks_page_url(pr_url).unwrap_or_else(|| pr_url.to_string());
+                match self.get_text(&html_url).or_else(|_| if html_url != pr_url { self.get_text(pr_url) } else { Err("GitHub HTML request failed".into()) }) {
+                    Ok(html) => {
+                        let html_urls = collect_pr_check_detail_urls_from_html(pr_url, &html);
+                        let found = html_urls.len();
+                        let changed = apply_pr_check_details_from_urls(pr, &html_urls, true, "html");
+                        perf_log(&format!("pr_check_details_html_fallback: sha={short_sha} missing={missing_after_rest} url_kind=checks_or_pr found={found} changed={changed} overwrite_existing=true"), Duration::ZERO);
+                    }
+                    Err(error) => {
+                        perf_log(&format!("pr_check_details_html_fallback: sha={short_sha} missing={missing_after_rest} html_failed=true error={}", compact_log_error(&error)), Duration::ZERO);
+                    }
+                }
+            } else {
+                perf_log(&format!("pr_check_details_html_fallback: sha={short_sha} missing={missing_after_rest} skipped=no_pr_url"), Duration::ZERO);
             }
         }
+        log_pr_check_details_final(pr, &short_sha);
     }
 }
 
@@ -5432,12 +5631,204 @@ fn search_submodule_revisions_inner(repository_path: String, relative_path: Stri
     Ok(results)
 }
 
-#[tauri::command]
-pub async fn add_submodule(repository_path: String, parent_path: String, url: String, folder_name: String, username: String, access_token: String) -> Result<String, String> {
-    off_main_thread(move || add_submodule_inner(repository_path, parent_path, url, folder_name, username, access_token)).await
+fn github_module_browser_context(repository_path: &str) -> GitHubRepo {
+    internal_repository(repository_path).ok()
+        .and_then(|repo| first_remote_url(&repo))
+        .and_then(|url| parse_github_repo(&url))
+        .filter(|repo| repo.host.eq_ignore_ascii_case("github.vitesco.io"))
+        .unwrap_or_else(|| GitHubRepo { host: "github.vitesco.io".into(), owner: "eng".into(), repo: "sw-prj-placeholder".into() })
 }
 
+fn github_module_clone_url(owner: &str, name: &str) -> String {
+    format!("https://github.vitesco.io/{owner}/{name}.git")
+}
+
+fn github_module_portable_url(owner: &str, name: &str) -> String {
+    format!("../../{owner}/{name}.git")
+}
+
+fn github_api_error_message(payload: &serde_json::Value) -> String {
+    payload.get("message").and_then(|value| value.as_str()).unwrap_or("GitHub API returned an error.").to_string()
+}
+
+#[tauri::command]
+pub async fn search_github_modules(repository_path: String, query: String, limit: Option<usize>) -> Result<Vec<GitHubModuleSearchResult>, String> {
+    off_main_thread(move || search_github_modules_inner(repository_path, query, limit)).await
+}
+
+fn search_github_modules_inner(repository_path: String, query: String, limit: Option<usize>) -> Result<Vec<GitHubModuleSearchResult>, String> {
+    let started = Instant::now();
+    validate_path(&repository_path)?;
+    let query = query.trim();
+    if query.chars().count() < 2 {
+        return Err("Type at least 2 characters to search GitHub Enterprise modules.".into());
+    }
+    let limit = limit.unwrap_or(25).clamp(1, 50);
+    let credential_repo = github_module_browser_context(&repository_path);
+    let client = GitHubGraphqlClient::discover(&repository_path, &credential_repo)?;
+    let endpoint = "https://github.vitesco.io/api/v3/search/repositories";
+    let search_query = format!("{query} org:eng");
+    let mut request = client.http.get(endpoint)
+        .query(&[("q", search_query), ("per_page", limit.to_string())])
+        .header("Accept", "application/vnd.github+json");
+    if let Some(token) = &client.token { request = request.bearer_auth(token); }
+    let response = request.send().map_err(|error| format!("GitHub repository search failed: {error}"))?;
+    let status = response.status();
+    let payload = response.json::<serde_json::Value>()
+        .map_err(|error| format!("GitHub repository search returned HTTP {status} with an unreadable response: {error}"))?;
+    if !status.is_success() {
+        return Err(format!("GitHub repository search failed with HTTP {status}: {}", github_api_error_message(&payload)));
+    }
+    let items = payload.get("items").and_then(|value| value.as_array()).cloned().unwrap_or_default();
+    let mut results = Vec::new();
+    for item in items {
+        let Some(name) = item.get("name").and_then(|value| value.as_str()).map(str::trim).filter(|value| !value.is_empty()) else { continue };
+        let owner = item.pointer("/owner/login").and_then(|value| value.as_str()).unwrap_or("eng").trim();
+        if !owner.eq_ignore_ascii_case("eng") { continue; }
+        results.push(GitHubModuleSearchResult {
+            name: name.to_string(),
+            full_name: item.get("full_name").and_then(|value| value.as_str()).unwrap_or(&format!("{owner}/{name}")).to_string(),
+            owner: owner.to_string(),
+            html_url: item.get("html_url").and_then(|value| value.as_str()).unwrap_or("").to_string(),
+            clone_url: item.get("clone_url").and_then(|value| value.as_str()).filter(|value| !value.trim().is_empty()).map(str::to_string).unwrap_or_else(|| github_module_clone_url(owner, name)),
+            portable_url: github_module_portable_url(owner, name),
+            description: item.get("description").and_then(|value| value.as_str()).unwrap_or("").to_string(),
+            default_branch: item.get("default_branch").and_then(|value| value.as_str()).unwrap_or("").to_string(),
+        });
+    }
+    perf_log(&format!("search_github_modules: query_len={} results={}", query.len(), results.len()), started.elapsed());
+    Ok(results)
+}
+
+#[tauri::command]
+pub async fn github_module_refs(repository_path: String, owner: String, repository_name: String, query: String, limit: Option<usize>) -> Result<Vec<GitHubModuleRef>, String> {
+    off_main_thread(move || github_module_refs_inner(repository_path, owner, repository_name, query, limit)).await
+}
+
+fn push_github_module_ref(results: &mut Vec<GitHubModuleRef>, seen: &mut HashSet<String>, limit: usize, name: String, revision: String, kind: &str, subject: String, date: String) -> bool {
+    let key = format!("{kind}|{name}|{revision}");
+    if !seen.insert(key) { return results.len() >= limit; }
+    results.push(GitHubModuleRef { name, revision, kind: kind.into(), subject, date });
+    results.len() >= limit
+}
+
+fn github_module_refs_inner(repository_path: String, owner: String, repository_name: String, query: String, limit: Option<usize>) -> Result<Vec<GitHubModuleRef>, String> {
+    let started = Instant::now();
+    validate_path(&repository_path)?;
+    let owner = owner.trim();
+    let repository_name = repository_name.trim().trim_end_matches(".git");
+    if owner.is_empty() || repository_name.is_empty() || owner.contains('/') || repository_name.contains('/') {
+        return Err("Choose a valid GitHub repository first.".into());
+    }
+    let query = query.trim().to_lowercase();
+    let limit = limit.unwrap_or(160).clamp(1, 300);
+    let url = github_module_clone_url(owner, repository_name);
+    let raw = git_with_timeout(&repository_path, &["ls-remote", "--heads", "--tags", &url], Duration::from_secs(60), "60 seconds")
+        .map_err(|detail| format!("Could not read branch/tag list from {owner}/{repository_name}: {detail}"))?;
+    let mut branches = Vec::new();
+    let mut tags: HashMap<String, String> = HashMap::new();
+    for line in raw.lines() {
+        let Some((sha, reference)) = line.split_once('\t') else { continue };
+        let sha = sha.trim();
+        if sha.len() < 7 { continue; }
+        if let Some(name) = reference.strip_prefix("refs/heads/") {
+            branches.push((name.to_string(), sha.to_string()));
+        } else if let Some(name) = reference.strip_prefix("refs/tags/") {
+            if let Some(peeled) = name.strip_suffix("^{}") {
+                tags.insert(peeled.to_string(), sha.to_string());
+            } else {
+                tags.entry(name.to_string()).or_insert_with(|| sha.to_string());
+            }
+        }
+    }
+    branches.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut tag_items = tags.into_iter().collect::<Vec<_>>();
+    tag_items.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut results = Vec::new();
+    let mut seen = HashSet::new();
+    let matches = |name: &str, sha: &str, kind: &str| query.is_empty() || name.to_lowercase().contains(&query) || sha.to_lowercase().contains(&query) || kind.contains(&query);
+    for (name, sha) in branches {
+        if matches(&name, &sha, "branch") && push_github_module_ref(&mut results, &mut seen, limit, name, sha, "branch", String::new(), String::new()) { return Ok(results); }
+    }
+    for (name, sha) in tag_items {
+        if matches(&name, &sha, "tag") && push_github_module_ref(&mut results, &mut seen, limit, name, sha, "tag", String::new(), String::new()) { return Ok(results); }
+    }
+    if looks_like_commit_query(&query) {
+        let credential_repo = github_module_browser_context(&repository_path);
+        if let Ok(client) = GitHubGraphqlClient::discover(&repository_path, &credential_repo) {
+            let repo = GitHubRepo { host: "github.vitesco.io".into(), owner: owner.into(), repo: repository_name.into() };
+            if let Ok(payload) = client.rest_get_json(&repo, &format!("commits/{query}")) {
+                if let Some(sha) = payload.get("sha").and_then(|value| value.as_str()) {
+                    let subject = payload.pointer("/commit/message").and_then(|value| value.as_str()).unwrap_or("").lines().next().unwrap_or("").to_string();
+                    let date = payload.pointer("/commit/committer/date").and_then(|value| value.as_str()).unwrap_or("").chars().take(10).collect::<String>();
+                    push_github_module_ref(&mut results, &mut seen, limit, sha.chars().take(12).collect(), sha.to_string(), "commit", subject, date);
+                }
+            } else if query.len() >= 7 {
+                push_github_module_ref(&mut results, &mut seen, limit, query.chars().take(12).collect(), query.clone(), "commit", "Manual SHA — verified during add".into(), String::new());
+            }
+        } else if query.len() >= 7 {
+            push_github_module_ref(&mut results, &mut seen, limit, query.chars().take(12).collect(), query.clone(), "commit", "Manual SHA — verified during add".into(), String::new());
+        }
+    }
+    perf_log(&format!("github_module_refs: {owner}/{repository_name} query_len={} results={}", query.len(), results.len()), started.elapsed());
+    Ok(results)
+}
+
+#[tauri::command]
+pub async fn add_submodule(repository_path: String, parent_path: String, url: String, folder_name: String, username: String, access_token: String, initial_revision: Option<String>, initial_revision_kind: Option<String>, initial_revision_name: Option<String>) -> Result<String, String> {
+    off_main_thread(move || add_submodule_inner_with_revision(repository_path, parent_path, url, folder_name, username, access_token, initial_revision, initial_revision_kind, initial_revision_name)).await
+}
+
+#[cfg(test)]
 fn add_submodule_inner(repository_path: String, parent_path: String, url: String, folder_name: String, username: String, access_token: String) -> Result<String, String> {
+    add_submodule_inner_with_revision(repository_path, parent_path, url, folder_name, username, access_token, None, None, None)
+}
+
+fn selected_submodule_revision(initial_revision: Option<String>, initial_revision_kind: Option<String>, initial_revision_name: Option<String>) -> Option<(String, String, String)> {
+    let revision = initial_revision.unwrap_or_default().trim().to_string();
+    if revision.is_empty() { return None; }
+    let kind = initial_revision_kind.unwrap_or_default().trim().to_lowercase();
+    let name = initial_revision_name.unwrap_or_default().trim().to_string();
+    Some((revision, kind, name))
+}
+
+fn checkout_added_submodule_revision(destination: &Path, revision: &str, kind: &str, name: &str) -> Result<(), String> {
+    let Some(destination) = destination.to_str() else { return Err("The submodule destination path is not valid UTF-8".into()); };
+    let target_name = if name.trim().is_empty() { revision.trim() } else { name.trim() };
+    let mut errors = Vec::new();
+    let mut attempt = |args: &[&str]| -> bool {
+        match git(destination, args) {
+            Ok(_) => true,
+            Err(error) => { errors.push(format!("git {}: {error}", args.join(" "))); false }
+        }
+    };
+    match kind {
+        "branch" => {
+            if attempt(&["switch", target_name]) { return Ok(()); }
+            let remote = format!("origin/{target_name}");
+            if attempt(&["switch", "--track", &remote]) { return Ok(()); }
+            if attempt(&["checkout", revision]) { return Ok(()); }
+        }
+        "remote" => {
+            let remote = if target_name.starts_with("origin/") { target_name.to_string() } else { format!("origin/{target_name}") };
+            let local = remote.strip_prefix("origin/").unwrap_or(&remote);
+            if attempt(&["switch", "--track", &remote]) { return Ok(()); }
+            if attempt(&["switch", local]) { return Ok(()); }
+            if attempt(&["checkout", revision]) { return Ok(()); }
+        }
+        "tag" => {
+            let tag_ref = format!("refs/tags/{target_name}");
+            if attempt(&["checkout", &tag_ref]) { return Ok(()); }
+            if attempt(&["checkout", revision]) { return Ok(()); }
+        }
+        _ => {
+            if attempt(&["checkout", revision]) { return Ok(()); }
+        }
+    }
+    Err(errors.into_iter().last().unwrap_or_else(|| "Git could not check out the selected revision.".into()))
+}
+
+fn add_submodule_inner_with_revision(repository_path: String, parent_path: String, url: String, folder_name: String, username: String, access_token: String, initial_revision: Option<String>, initial_revision_kind: Option<String>, initial_revision_name: Option<String>) -> Result<String, String> {
     validate_path(&repository_path)?;
     let parent = safe_relative_path(parent_path.trim())?;
     let folder_name = folder_name.trim();
@@ -5495,6 +5886,11 @@ fn add_submodule_inner(repository_path: String, parent_path: String, url: String
     if cloned.head().ok().and_then(|head| head.target()).is_none() { return rollback("The server repository has no default commit to check out".into()); }
     let mut checkout = git2::build::CheckoutBuilder::new(); checkout.safe();
     if let Err(error) = cloned.checkout_head(Some(&mut checkout)) { return rollback(format!("Cannot check out submodule files: {}", error.message())); }
+    if let Some((revision, kind, name)) = selected_submodule_revision(initial_revision, initial_revision_kind, initial_revision_name) {
+        if let Err(error) = checkout_added_submodule_revision(&destination, &revision, &kind, &name) {
+            return rollback(format!("Cannot check out the selected submodule revision: {error}"));
+        }
+    }
     if let Err(error) = submodule.add_finalize() { return rollback(format!("Cannot stage submodule: {}", error.message())); }
     if let Err(error) = submodule.add_to_index(true) { return rollback(format!("Cannot add the submodule link to the parent index: {}", error.message())); }
     drop(submodule);
@@ -9884,6 +10280,60 @@ mod tests {
     }
 
     #[test]
+    fn pr_check_details_rest_fallback_matches_app_prefixed_check_run_names() {
+        let mut pr = serde_json::json!({
+            "url": "https://github.vitesco.io/eng/sw-prj-VWAQ4_000U0/pull/320",
+            "statusCheckRollup": [
+                { "name": "Polarion Link", "status": "COMPLETED", "conclusion": "SUCCESS", "detailsUrl": "https://external.example/polarion" },
+                { "name": "Submodule status", "status": "COMPLETED", "conclusion": "SUCCESS", "detailsUrl": "https://external.example/submodule" }
+            ]
+        });
+        let check_runs = serde_json::json!({
+            "check_runs": [
+                { "id": 2785800, "name": "Polarion Connector / Polarion Link", "details_url": "https://external.example/wrong-polarion" },
+                { "id": 2785801, "name": "Polarion Connector / Submodule status", "details_url": "https://external.example/wrong-submodule" }
+            ]
+        });
+        let urls = collect_rest_check_detail_urls(None, Some(&check_runs), pr.get("url").and_then(|value| value.as_str()));
+        assert_eq!(urls.get("polarion connector / polarion link").map(String::as_str), Some("https://github.vitesco.io/eng/sw-prj-VWAQ4_000U0/pull/320/checks?check_run_id=2785800"));
+        assert_eq!(urls.get("polarion link").map(String::as_str), Some("https://github.vitesco.io/eng/sw-prj-VWAQ4_000U0/pull/320/checks?check_run_id=2785800"));
+        assert_eq!(urls.get("submodule status").map(String::as_str), Some("https://github.vitesco.io/eng/sw-prj-VWAQ4_000U0/pull/320/checks?check_run_id=2785801"));
+        assert_eq!(apply_pr_check_details_from_urls(&mut pr, &urls, true, "rest"), 2);
+        let checks = pr.get("statusCheckRollup").and_then(|value| value.as_array()).unwrap();
+        assert_eq!(checks[0].get("detailsUrl").and_then(|value| value.as_str()), Some("https://github.vitesco.io/eng/sw-prj-VWAQ4_000U0/pull/320/checks?check_run_id=2785800"));
+        assert_eq!(checks[1].get("detailsUrl").and_then(|value| value.as_str()), Some("https://github.vitesco.io/eng/sw-prj-VWAQ4_000U0/pull/320/checks?check_run_id=2785801"));
+    }
+
+    #[test]
+    fn pr_check_details_rest_fallback_adds_check_runs_missing_from_graphql_rollup() {
+        let mut pr = serde_json::json!({
+            "url": "https://github.vitesco.io/eng/sw-prj-VWAQ4_000U0/pull/320",
+            "statusCheckRollup": [
+                { "name": "Polarion Link", "status": "COMPLETED", "conclusion": "SUCCESS", "databaseId": 100, "detailsUrl": "https://github.vitesco.io/eng/sw-prj-VWAQ4_000U0/pull/320/checks?check_run_id=100" },
+                { "name": "Submodule status", "status": "COMPLETED", "conclusion": "SUCCESS", "databaseId": 101, "detailsUrl": "https://github.vitesco.io/eng/sw-prj-VWAQ4_000U0/pull/320/checks?check_run_id=101" }
+            ]
+        });
+        let merge_check_runs = serde_json::json!({
+            "check_runs": [
+                { "id": 2785799, "name": "Build Log Compare", "status": "completed", "conclusion": "failure", "details_url": "https://external.example/build" },
+                { "id": 2785800, "name": "Polarion Connector / Polarion Link", "status": "completed", "conclusion": "success", "details_url": "https://external.example/polarion" },
+                { "id": 2785801, "name": "Polarion Connector / Submodule status", "status": "completed", "conclusion": "success", "details_url": "https://external.example/submodule" }
+            ]
+        });
+        let pr_url = pr.get("url").and_then(|value| value.as_str()).unwrap().to_string();
+        assert_eq!(append_missing_pr_checks_from_rest(&mut pr, None, Some(&merge_check_runs), Some(&pr_url)), 1);
+        let urls = collect_rest_check_detail_urls(None, Some(&merge_check_runs), Some(&pr_url));
+        assert_eq!(apply_pr_check_details_from_urls(&mut pr, &urls, true, "rest"), 2);
+        let checks = pr.get("statusCheckRollup").and_then(|value| value.as_array()).unwrap();
+        assert_eq!(checks.len(), 3, "the UI should regain the check that GraphQL omitted");
+        assert_eq!(checks[0].get("detailsUrl").and_then(|value| value.as_str()), Some("https://github.vitesco.io/eng/sw-prj-VWAQ4_000U0/pull/320/checks?check_run_id=2785800"));
+        assert_eq!(checks[1].get("detailsUrl").and_then(|value| value.as_str()), Some("https://github.vitesco.io/eng/sw-prj-VWAQ4_000U0/pull/320/checks?check_run_id=2785801"));
+        assert_eq!(checks[2].get("name").and_then(|value| value.as_str()), Some("Build Log Compare"));
+        assert_eq!(checks[2].get("detailsUrl").and_then(|value| value.as_str()), Some("https://github.vitesco.io/eng/sw-prj-VWAQ4_000U0/pull/320/checks?check_run_id=2785799"));
+        assert_eq!(map_checks_status(checks), "failing");
+    }
+
+    #[test]
     fn pr_check_details_graphql_check_run_ids_replace_external_details_links() {
         let mut pr = serde_json::json!({
             "url": "https://github.vitesco.io/eng/sw-prj-VWAQ4_000U0/pull/320",
@@ -13989,6 +14439,43 @@ mod tests {
         assert_eq!(portable_submodule_configured_url("git@github.vitesco.io:eng/sw-pkg-0G-errm_common.git"), "../../eng/sw-pkg-0G-errm_common.git");
         assert_eq!(portable_submodule_configured_url("../../eng/sw-pkg-0G-errm_common.git"), "../../eng/sw-pkg-0G-errm_common.git");
         assert_eq!(portable_submodule_configured_url("https://github.com/example/public.git"), "https://github.com/example/public.git", "other Git hosts must keep their chosen URL");
+    }
+
+    #[test]
+    fn add_submodule_can_checkout_the_browsed_initial_branch_before_staging_gitlink() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-add-submodule-picked-branch-{suffix}"));
+        let parent = base.join("parent");
+        let dependency = base.join("dependency");
+        create_libgit2_repository(&parent, "README.md");
+        create_libgit2_repository(&dependency, "module.txt");
+        run_git(&dependency, &["config", "user.email", "test@example.com"]);
+        run_git(&dependency, &["config", "user.name", "Test User"]);
+        let default_branch = run_git_capture(&dependency, &["branch", "--show-current"]);
+        let default_oid = run_git_capture(&dependency, &["rev-parse", "HEAD"]);
+        run_git(&dependency, &["switch", "-c", "feature/picked"]);
+        fs::write(dependency.join("module.txt"), "picked branch").unwrap();
+        run_git(&dependency, &["commit", "-am", "Picked branch version"]);
+        let picked_oid = run_git_capture(&dependency, &["rev-parse", "HEAD"]);
+        assert_ne!(picked_oid, default_oid);
+        run_git(&dependency, &["switch", &default_branch]);
+
+        let parent_string = parent.to_string_lossy().into_owned();
+        let added = add_submodule_inner_with_revision(
+            parent_string.clone(),
+            "".into(),
+            dependency.to_string_lossy().into_owned(),
+            "dep".into(),
+            String::new(),
+            String::new(),
+            Some(picked_oid.clone()),
+            Some("branch".into()),
+            Some("feature/picked".into()),
+        ).unwrap();
+
+        assert_eq!(run_git_capture(&parent.join(&added), &["rev-parse", "HEAD"]), picked_oid);
+        assert_eq!(run_git_capture(&parent, &["rev-parse", ":dep"]), picked_oid, "the parent index must record the selected branch tip, not the source repository's default branch");
+        fs::remove_dir_all(base).unwrap();
     }
 
     #[test]
