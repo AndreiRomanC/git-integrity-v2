@@ -3019,6 +3019,23 @@ async function maybeOfferSubmoduleUpdateAfterMerge(target, beforeHead = '') {
   if (ok) await initAndUpdateSubmodulesFromActions();
   else status('Merge completed. Submodule folders were not updated; run “Init / Update Submodules” when you want to align them.');
 }
+async function maybeOfferSubmoduleUpdateBeforeMergeCommit(review) {
+  if (!state.repository || review?.target?.isSubmodule) return;
+  const items = review?.items || [];
+  if (!items.length) return;
+  const shown = items.slice(0, 6).map(item => `- ${item.path}`).join('\n');
+  const more = items.length > 6 ? `\n- …and ${items.length - 6} more` : '';
+  const ok = await customConfirm(
+    `The merge result is applied locally, but the merge commit has not been created yet.\n\nSubmodule folders may still be empty or checked out at old commits:\n${shown}${more}\n\nUpdate/init submodule folders now before running the build?\n\nThis runs:\ngit submodule update --init --recursive`,
+    { title: 'Update submodules before build?', okLabel: 'Update submodules' }
+  );
+  if (ok) {
+    await initAndUpdateSubmodulesFromActions();
+    status('Submodules updated. Merge is still pending — run the build, then create the merge commit if it passes.');
+  } else {
+    status('Merge is still pending. Submodule folders were not updated; run “Submodule update --init --recursive” before build if they are empty.');
+  }
+}
 
 function shortRevision(value) {
   return value ? String(value).slice(0, 8) : '—';
@@ -3034,10 +3051,19 @@ function pointerRevisionLabel(value) {
   const revision = normalizeReviewRevision(value);
   return revision ? revision.slice(0, 8) : 'No submodule';
 }
+function submoduleReviewResultSource(item, revision = item?.result) {
+  const selected = normalizeReviewRevision(revision);
+  const current = normalizeReviewRevision(item?.current);
+  const incoming = normalizeReviewRevision(item?.incoming);
+  if (sameReviewRevision(selected, current) && sameReviewRevision(selected, incoming)) return selected ? 'same on both sides' : 'no submodule on both sides';
+  if (sameReviewRevision(selected, current)) return selected ? 'Current Branch' : 'Current Branch removes it';
+  if (sameReviewRevision(selected, incoming)) return selected ? 'Incoming/origin' : 'Incoming removes it';
+  return selected ? 'custom commit' : 'No submodule';
+}
 
 function submoduleReviewChoiceLabel(item) {
   if (!item || !Object.prototype.hasOwnProperty.call(item, 'selectedRevision')) return 'No choice yet';
-  if (item.selectedSource === 'result') return 'Merge Result';
+  if (item.selectedSource === 'result') return `Result: ${submoduleReviewResultSource(item, item.result)}`;
   if (item.selectedSource === 'current') return 'Current Branch';
   if (item.selectedSource === 'incoming') return 'Incoming/origin';
   return normalizeReviewRevision(item.selectedRevision) ? 'Custom Commit' : 'No submodule';
@@ -3059,15 +3085,15 @@ function submoduleReviewRowHtml(item) {
   return `<article class="submodule-review-item ${item.suspicious ? 'warning' : 'ok'}" data-path="${esc(item.path)}">
     <header><div><strong>${esc(item.path)}</strong><span>${esc(item.status)}</span></div><b>${esc(submoduleReviewChoiceLabel(item))} · ${esc(pointerRevisionLabel(selected))}</b></header>
     <div class="submodule-review-pointers">
-      ${pointerRow('Merge Base', item.base)}
-      ${pointerRow('Current Branch', item.current)}
-      ${pointerRow('Incoming/origin', item.incoming)}
-      ${pointerRow('Merge Result', item.result)}
-      ${pointerRow('Local Checkout', item.local_checkout)}
+      ${pointerRow('Base', item.base)}
+      ${pointerRow('Current', item.current)}
+      ${pointerRow('Incoming', item.incoming)}
+      ${pointerRow('Result', item.result)}
+      ${pointerRow('Local', item.local_checkout)}
     </div>
     <p>${esc(item.reason)}</p>
     <div class="submodule-review-actions">
-      ${actionButton('result', 'Keep Merge Result', item.result, 'Use the gitlink Git already prepared in the merge index')}
+      ${actionButton('result', 'Keep prepared result', item.result, `Keep prepared result: ${submoduleReviewResultSource(item, item.result)}`)}
       ${actionButton('current', 'Use Current Branch', item.current, 'Record the submodule pointer from this branch before the merge')}
       ${actionButton('incoming', 'Use Incoming/origin', item.incoming, 'Record the submodule pointer from the branch being merged')}
       <button type="button" data-review-action="choose">Choose another commit…</button>
@@ -3181,6 +3207,7 @@ async function applySubmoduleMergeReviewOnly() {
       : `Merge result left as prepared. Merge is still pending — review/test, then create the merge commit.`;
     status(msg); showOperationToast(msg, 'success');
     await refreshAfterMerge();
+    await maybeOfferSubmoduleUpdateBeforeMergeCommit(review);
   } catch (error) {
     refs.submoduleMergeReviewStatus.textContent = String(error);
     handleError(error);

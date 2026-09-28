@@ -499,10 +499,13 @@ test('main project merge pauses for one consolidated submodule pointer review', 
   assert.match(app, /invoke\('apply_submodule_merge_revision'/);
   assert.match(app, /outcome\.status === 'submodule_review'/);
   assert.match(app, /function openSubmoduleMergeReviewDialog\(target, message = ''\)/);
-  assert.match(app, /Keep Merge Result/);
+  assert.match(app, /Keep prepared result/);
+  assert.match(app, /function maybeOfferSubmoduleUpdateBeforeMergeCommit/);
+  assert.match(app, /Update submodules before build\?/);
   assert.match(app, /Use Current Branch/);
   assert.match(app, /Use Incoming\/origin/);
   assert.match(app, /pointerRevisionLabel/);
+  assert.match(app, /submoduleReviewResultSource/);
   assert.match(app, /No submodule/);
   assert.match(app, /selectedSource/);
   assert.match(app, /applySubmoduleMergeReviewOnly/);
