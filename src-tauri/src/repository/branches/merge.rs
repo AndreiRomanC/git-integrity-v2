@@ -72,6 +72,10 @@ fn short_oid(oid: Option<git2::Oid>) -> String {
     oid.map(|oid| oid.to_string()[..8].to_string()).unwrap_or_else(|| "none".into())
 }
 
+fn pointer_label(oid: Option<git2::Oid>) -> String {
+    oid.map(|oid| oid.to_string()[..8].to_string()).unwrap_or_else(|| "no submodule".into())
+}
+
 fn oid_string(oid: Option<git2::Oid>) -> Option<String> { oid.map(|oid| oid.to_string()) }
 
 fn tree_gitlink_map(tree: &git2::Tree<'_>) -> HashMap<String, git2::Oid> {
@@ -162,14 +166,44 @@ fn classify_submodule_merge_item(
         _ => None,
     }).unwrap_or(false);
 
-    if result == incoming && result.is_some() {
-        let mut reason = format!("Merge result follows incoming/origin version {}.", short_oid(incoming));
+    if result == current && base == incoming && current != incoming {
+        let mut reason = format!(
+            "Incoming/origin did not change this submodule since the merge base. Merge result keeps Current Branch: {}.",
+            pointer_label(current),
+        );
+        if local_mismatch {
+            reason.push_str(&format!(" Local checkout is {}, while the selected pointer is {}.", local_checkout.as_deref().unwrap_or("unknown"), pointer_label(result)));
+        }
+        if current.is_none() && incoming.is_some() {
+            reason.push_str(&format!(" Use Incoming/origin only if you want to restore {}.", pointer_label(incoming)));
+        }
+        return ("Kept current".into(), reason, local_mismatch, local_checkout);
+    }
+    if result == incoming && base == current && current != incoming {
+        let mut reason = format!(
+            "Current Branch did not change this submodule since the merge base. Merge result follows Incoming/origin: {}.",
+            pointer_label(incoming),
+        );
         if local_mismatch {
             reason.push_str(&format!(" Local checkout is still at {}, so run submodule update when ready.", local_checkout.as_deref().unwrap_or("unknown")));
         }
-        return ("OK".into(), reason, local_mismatch, local_checkout);
+        if incoming.is_none() && current.is_some() {
+            reason.push_str(" The incoming side removes the submodule pointer.");
+        }
+        return ("Incoming applied".into(), reason, local_mismatch, local_checkout);
     }
-    if result == current && result.is_some() {
+    if result == incoming {
+        let mut reason = format!("Merge result follows Incoming/origin: {}.", pointer_label(incoming));
+        if base == incoming && current != incoming {
+            reason.push_str(&format!(" Current Branch was {}, so review this if you expected to keep your branch state.", pointer_label(current)));
+            return ("Review recommended".into(), reason, true, local_checkout);
+        }
+        if local_mismatch {
+            reason.push_str(&format!(" Local checkout is still at {}, so run submodule update when ready.", local_checkout.as_deref().unwrap_or("unknown")));
+        }
+        return ("Incoming applied".into(), reason, local_mismatch, local_checkout);
+    }
+    if result == current {
         if incoming_ahead_current {
             return (
                 "Review recommended".into(),
@@ -186,11 +220,15 @@ fn classify_submodule_merge_item(
                 local_checkout,
             );
         }
-        let mut reason = "Merge result keeps the current branch submodule pointer.".to_string();
+        let mut reason = format!("Merge result keeps Current Branch: {}.", pointer_label(current));
+        if base == current && incoming != current {
+            reason.push_str(&format!(" Incoming/origin changed this pointer to {}, so review before committing.", pointer_label(incoming)));
+            return ("Review recommended".into(), reason, true, local_checkout);
+        }
         if local_mismatch {
             reason.push_str(&format!(" Local checkout is {}, while the selected pointer is {}.", local_checkout.as_deref().unwrap_or("unknown"), short_oid(result)));
         }
-        return ("OK".into(), reason, local_mismatch, local_checkout);
+        return ("Kept current".into(), reason, local_mismatch, local_checkout);
     }
     if result.is_some() && result != current && result != incoming {
         return (
@@ -226,7 +264,7 @@ fn classify_submodule_merge_item(
     }
     (
         "Review recommended".into(),
-        format!("Submodule pointer changed across the merge: base {}, current {}, incoming {}, result {}.", short_oid(base), short_oid(current), short_oid(incoming), short_oid(result)),
+        format!("Submodule pointer changed across the merge: base {}, Current Branch {}, Incoming/origin {}, Merge Result {}.", pointer_label(base), pointer_label(current), pointer_label(incoming), pointer_label(result)),
         true,
         local_checkout,
     )
@@ -282,7 +320,7 @@ fn submodule_merge_review_inner(repo: &mut Repository, repository_path: &str) ->
     let summary = if items.is_empty() {
         "No submodule pointer changes were detected in this merge.".into()
     } else {
-        format!("{} submodule pointer{} to review · {} warning{}", items.len(), if items.len() == 1 { "" } else { "s" }, warnings, if warnings == 1 { "" } else { "s" })
+        format!("{} submodule pointer change{} · {} need review", items.len(), if items.len() == 1 { "" } else { "s" }, warnings)
     };
     Ok(SubmoduleMergeReview { items, warnings, summary })
 }
@@ -422,8 +460,6 @@ pub fn apply_submodule_merge_revision(repository_path: String, target_path: Stri
     let relative = safe_relative_path(&relative_path)?;
     let relative_string = normalized(&relative);
     let revision = revision.trim();
-    if revision.is_empty() { return Err("Choose a concrete submodule commit SHA first.".into()); }
-    let oid = git2::Oid::from_str(revision).map_err(|_| format!("Invalid submodule revision \"{revision}\""))?;
     let queue_started = Instant::now();
     let lock_handle = repo_write_lock(&repository_path);
     let _lock = lock_handle.lock().unwrap();
@@ -432,6 +468,17 @@ pub fn apply_submodule_merge_revision(repository_path: String, target_path: Stri
     if repo.state() != git2::RepositoryState::Merge {
         return Err("There is no merge in progress here.".into());
     }
+    if revision.is_empty() || revision == "__none__" {
+        let mut index = repo.index().map_err(|error| error.message().to_string())?;
+        let _ = index.conflict_remove(&relative);
+        if index.get_path(&relative, 0).is_some() {
+            index.remove_path(&relative).map_err(|error| error.message().to_string())?;
+        }
+        index.write().map_err(|error| error.message().to_string())?;
+        invalidate_git_metadata(&repository_path);
+        return Ok(());
+    }
+    let oid = git2::Oid::from_str(revision).map_err(|_| format!("Invalid submodule revision \"{revision}\""))?;
     let submodule_path = Path::new(&repository_path).join(&relative);
     if let Ok(sub_repo) = internal_submodule_repository(&submodule_path) {
         if sub_repo.find_commit(oid).is_err() {

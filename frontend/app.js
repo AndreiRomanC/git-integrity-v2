@@ -66,7 +66,8 @@ const directoryCache = new Map();
 let submoduleMenuData = null;
 let submoduleMenuEntry = null;
 let versionFilter = 'branch';
-let submoduleBrowserState = { repositories: [], selectedRepository: null, refs: [], selectedRef: null };
+let submoduleBrowserState = { repositories: [], selectedRepository: null, allRefs: [], refs: [], selectedRef: null };
+const submoduleBrowserRefCache = new Map();
 const recentRepos = JSON.parse(localStorage.getItem('recentRepos') || '[]');
 const REPOSITORY_ORIGINS_KEY = 'git-drilldown-repository-origins-v1';
 let repositoryOrigins = loadRepositoryOrigins();
@@ -286,7 +287,7 @@ const refs = {
   toggleSubmodulePrStatus: $('#toggleSubmodulePrStatus'), submodulePrStatusArrow: $('#submodulePrStatusArrow'), submodulePrStatusPanel: $('#submodulePrStatusPanel'), submodulePrStatusLabel: $('#submodulePrStatusLabel'),
   newBranchDialog: $('#newBranchDialog'), newBranchFrom: $('#newBranchFrom'), newBranchOriginStatus: $('#newBranchOriginStatus'), newBranchName: $('#newBranchName'), newBranchStatus: $('#newBranchStatus'), confirmNewBranch: $('#confirmNewBranch'),
   conflictsDialog: $('#conflictsDialog'), conflictsTitle: $('#conflictsTitle'), conflictsSubtitle: $('#conflictsSubtitle'), conflictsList: $('#conflictsList'), conflictsCommitMessage: $('#conflictsCommitMessage'), conflictsCommitMessageLabel: $('#conflictsCommitMessageLabel'), conflictsLocalNote: $('#conflictsLocalNote'), conflictsStatus: $('#conflictsStatus'), confirmCompleteMerge: $('#confirmCompleteMerge'), abortMergeButton: $('#abortMerge'), refreshConflictsButton: $('#refreshConflicts'),
-  submoduleMergeReviewDialog: $('#submoduleMergeReviewDialog'), submoduleMergeReviewSubtitle: $('#submoduleMergeReviewSubtitle'), submoduleMergeReviewList: $('#submoduleMergeReviewList'), submoduleMergeCommitMessage: $('#submoduleMergeCommitMessage'), submoduleMergeReviewStatus: $('#submoduleMergeReviewStatus'), submoduleMergeReviewSummary: $('#submoduleMergeReviewSummary'), confirmSubmoduleMergeReview: $('#confirmSubmoduleMergeReview'), abortSubmoduleMergeReview: $('#abortSubmoduleMergeReview'),
+  submoduleMergeReviewDialog: $('#submoduleMergeReviewDialog'), submoduleMergeReviewSubtitle: $('#submoduleMergeReviewSubtitle'), submoduleMergeReviewList: $('#submoduleMergeReviewList'), submoduleMergeCommitMessage: $('#submoduleMergeCommitMessage'), submoduleMergeReviewStatus: $('#submoduleMergeReviewStatus'), submoduleMergeReviewSummary: $('#submoduleMergeReviewSummary'), applySubmoduleMergeReviewOnly: $('#applySubmoduleMergeReviewOnly'), confirmSubmoduleMergeReview: $('#confirmSubmoduleMergeReview'), abortSubmoduleMergeReview: $('#abortSubmoduleMergeReview'),
   mergeConflictsBanner: $('#mergeConflictsBanner'), mergeConflictsSubtitle: $('#mergeConflictsSubtitle')
 };
 
@@ -643,8 +644,28 @@ function submoduleBrowserRefLabel(ref = {}) {
   const sha = ref.revision ? revisionDisplay(ref.revision) : '';
   return `${kind} ${name}${sha ? ` @ ${sha}` : ''}`;
 }
+function submoduleRepoCacheKey(repo = {}) {
+  return `${repo.owner || 'eng'}/${repo.name || ''}`.toLowerCase();
+}
+function cacheSubmoduleRefs(repo, refsList = []) {
+  if (!repo?.name) return;
+  submoduleBrowserRefCache.set(submoduleRepoCacheKey(repo), refsList);
+}
+function cachedSubmoduleRefs(repo) {
+  return repo?.name ? submoduleBrowserRefCache.get(submoduleRepoCacheKey(repo)) || null : null;
+}
+function submoduleRefQueryLooksLikeSha(query = '') {
+  return /^[0-9a-f]{7,40}$/i.test(String(query).trim());
+}
+function submoduleRefMatches(ref = {}, query = '') {
+  const needle = String(query || '').trim().toLowerCase();
+  if (!needle) return true;
+  return [ref.name, ref.kind, ref.revision, ref.subject, ref.date]
+    .filter(Boolean)
+    .some(value => String(value).toLowerCase().includes(needle));
+}
 function resetSubmoduleBrowser() {
-  submoduleBrowserState = { repositories: [], selectedRepository: null, refs: [], selectedRef: null };
+  submoduleBrowserState = { repositories: [], selectedRepository: null, allRefs: [], refs: [], selectedRef: null };
   refs.submoduleRepoResults.innerHTML = '<div class="version-loading">Search in github.vitesco.io/eng.</div>';
   refs.submoduleRefResults.innerHTML = '<div class="version-loading">No repository selected.</div>';
   refs.submoduleRefHint.textContent = 'Select a repository first.';
@@ -688,6 +709,23 @@ function renderSubmoduleRefResults() {
     }
   }));
 }
+function filterLoadedSubmoduleRefs(query = refs.submoduleRefSearch.value.trim()) {
+  const repo = submoduleBrowserState.selectedRepository;
+  if (!repo) { refs.submoduleRefResults.innerHTML = '<div class="version-loading">Select a repository first.</div>'; return 0; }
+  if (!submoduleBrowserState.allRefs.length) {
+    refs.submoduleRefResults.innerHTML = '<div class="version-loading">Refs are not loaded yet. Press Find once.</div>';
+    return 0;
+  }
+  const filtered = submoduleBrowserState.allRefs.filter(ref => submoduleRefMatches(ref, query));
+  submoduleBrowserState.refs = filtered;
+  submoduleBrowserState.selectedRef = filtered.some(ref => ref === submoduleBrowserState.selectedRef) ? submoduleBrowserState.selectedRef : null;
+  refs.applySubmoduleBrowser.disabled = !submoduleBrowserState.selectedRepository || false;
+  refs.submoduleBrowserStatus.textContent = query
+    ? `${repo.full_name}: ${filtered.length} local match${filtered.length === 1 ? '' : 'es'} from ${submoduleBrowserState.allRefs.length} loaded refs.`
+    : `${repo.full_name}: ${submoduleBrowserState.allRefs.length} refs loaded. Filtering is local.`;
+  renderSubmoduleRefResults();
+  return filtered.length;
+}
 async function searchSubmoduleRepositories() {
   const query = refs.submoduleRepoSearch.value.trim();
   if (query.length < 2) { refs.submoduleRepoResults.innerHTML = '<div class="version-loading">Type at least 2 characters.</div>'; return; }
@@ -710,26 +748,49 @@ async function searchSubmoduleRepositories() {
 async function selectSubmoduleRepository(repo) {
   submoduleBrowserState.selectedRepository = repo;
   submoduleBrowserState.selectedRef = null;
+  submoduleBrowserState.allRefs = cachedSubmoduleRefs(repo) || [];
+  submoduleBrowserState.refs = [];
   refs.applySubmoduleBrowser.disabled = false;
   refs.submoduleRefHint.textContent = repo.full_name;
   refs.submoduleRefSearch.value = '';
   refs.submoduleBrowserStatus.textContent = `${repo.full_name} selected. Pick a branch/tag/commit, or use its default checkout.`;
   renderSubmoduleRepositoryResults();
-  await searchSubmoduleRefs('');
+  if (submoduleBrowserState.allRefs.length) {
+    filterLoadedSubmoduleRefs('');
+  } else {
+    await searchSubmoduleRefs('', { forceRemote: true });
+  }
 }
-async function searchSubmoduleRefs(query = refs.submoduleRefSearch.value.trim()) {
+async function searchSubmoduleRefs(query = refs.submoduleRefSearch.value.trim(), options = {}) {
   const repo = submoduleBrowserState.selectedRepository;
   if (!repo) { refs.submoduleRefResults.innerHTML = '<div class="version-loading">Select a repository first.</div>'; return; }
+  const trimmedQuery = String(query || '').trim();
+  if (!options.forceRemote && submoduleBrowserState.allRefs.length) {
+    const matches = filterLoadedSubmoduleRefs(trimmedQuery);
+    if (matches || !submoduleRefQueryLooksLikeSha(trimmedQuery)) return;
+  }
   const finish = beginButtonOperation(refs.runSubmoduleRefSearch, 'Finding…');
-  refs.submoduleRefResults.innerHTML = '<div class="version-loading"><i class="spinner"></i>Reading branches and tags…</div>';
+  refs.submoduleRefResults.innerHTML = `<div class="version-loading"><i class="spinner"></i>${trimmedQuery ? 'Looking up exact revision…' : 'Reading branches and tags…'}</div>`;
   try {
-    const refsList = invoke ? await invoke('github_module_refs', { repositoryPath: state.repository.path, owner: repo.owner || 'eng', repositoryName: repo.name, query, limit: 180 }) : [
+    const refsList = invoke ? await invoke('github_module_refs', { repositoryPath: state.repository.path, owner: repo.owner || 'eng', repositoryName: repo.name, query: trimmedQuery, limit: 180 }) : [
       { name: 'main', revision: '1111111111111111111111111111111111111111', kind: 'branch', subject: '', date: '' },
       { name: 'v1.0.0', revision: '2222222222222222222222222222222222222222', kind: 'tag', subject: '', date: '' }
     ];
-    submoduleBrowserState.refs = refsList || [];
+    if (!trimmedQuery || options.forceRemote) {
+      submoduleBrowserState.allRefs = refsList || [];
+      cacheSubmoduleRefs(repo, submoduleBrowserState.allRefs);
+      submoduleBrowserState.refs = submoduleBrowserState.allRefs;
+    } else {
+      const known = new Map(submoduleBrowserState.allRefs.map(ref => [`${ref.kind}|${ref.name}|${ref.revision}`, ref]));
+      for (const ref of refsList || []) known.set(`${ref.kind}|${ref.name}|${ref.revision}`, ref);
+      submoduleBrowserState.allRefs = [...known.values()];
+      cacheSubmoduleRefs(repo, submoduleBrowserState.allRefs);
+      submoduleBrowserState.refs = (refsList || []).length ? refsList : submoduleBrowserState.allRefs.filter(ref => submoduleRefMatches(ref, trimmedQuery));
+    }
     submoduleBrowserState.selectedRef = null;
-    refs.submoduleBrowserStatus.textContent = `${repo.full_name}: ${submoduleBrowserState.refs.length} matching refs.`;
+    refs.submoduleBrowserStatus.textContent = trimmedQuery
+      ? `${repo.full_name}: ${submoduleBrowserState.refs.length} server match${submoduleBrowserState.refs.length === 1 ? '' : 'es'}; refs kept in memory for local filtering.`
+      : `${repo.full_name}: ${submoduleBrowserState.refs.length} refs loaded. Filtering is local.`;
     renderSubmoduleRefResults();
   } catch (error) {
     refs.submoduleRefResults.innerHTML = `<div class="version-loading">${esc(String(error))}</div>`;
@@ -2962,21 +3023,41 @@ async function maybeOfferSubmoduleUpdateAfterMerge(target, beforeHead = '') {
 function shortRevision(value) {
   return value ? String(value).slice(0, 8) : '—';
 }
+function normalizeReviewRevision(value) {
+  const text = value === undefined || value === null ? '' : String(value).trim();
+  return text || null;
+}
+function sameReviewRevision(left, right) {
+  return normalizeReviewRevision(left) === normalizeReviewRevision(right);
+}
+function pointerRevisionLabel(value) {
+  const revision = normalizeReviewRevision(value);
+  return revision ? revision.slice(0, 8) : 'No submodule';
+}
 
 function submoduleReviewChoiceLabel(item) {
-  if (!item?.selectedRevision) return 'No revision selected';
-  if (item.selectedRevision === item.result) return 'Merge Result';
-  if (item.selectedRevision === item.current) return 'Current Branch';
-  if (item.selectedRevision === item.incoming) return 'Incoming/origin';
-  return 'Custom Commit';
+  if (!item || !Object.prototype.hasOwnProperty.call(item, 'selectedRevision')) return 'No choice yet';
+  if (item.selectedSource === 'result') return 'Merge Result';
+  if (item.selectedSource === 'current') return 'Current Branch';
+  if (item.selectedSource === 'incoming') return 'Incoming/origin';
+  return normalizeReviewRevision(item.selectedRevision) ? 'Custom Commit' : 'No submodule';
 }
 
 function submoduleReviewRowHtml(item) {
-  const selected = item.selectedRevision || item.result || '';
-  const pointerRow = (label, value) => `<div><span>${label}</span><code>${esc(shortRevision(value))}</code></div>`;
-  const actionButton = (action, label, revision, title = '') => `<button type="button" data-review-action="${action}" ${revision ? `data-revision="${esc(revision)}"` : 'disabled'} class="${selected && revision === selected ? 'active' : ''}" title="${esc(title || label)}">${label}</button>`;
+  const selected = normalizeReviewRevision(item.selectedRevision);
+  const pointerRow = (label, value) => {
+    const revision = normalizeReviewRevision(value);
+    return `<div class="${revision ? '' : 'absent'}"><span>${label}</span><code>${esc(pointerRevisionLabel(value))}</code></div>`;
+  };
+  const actionButton = (action, label, revision, title = '') => {
+    const normalized = normalizeReviewRevision(revision);
+    const revisionAttr = normalized ? `data-revision="${esc(normalized)}"` : 'data-revision-none="true"';
+    const active = item.selectedSource === action ? 'active' : '';
+    const removeHint = normalized ? '' : ' · no submodule';
+    return `<button type="button" data-review-action="${action}" ${revisionAttr} class="${active}" title="${esc(`${title || label}${removeHint}`)}">${label}</button>`;
+  };
   return `<article class="submodule-review-item ${item.suspicious ? 'warning' : 'ok'}" data-path="${esc(item.path)}">
-    <header><div><strong>${esc(item.path)}</strong><span>${esc(item.status)}</span></div><b>${esc(submoduleReviewChoiceLabel(item))} · ${esc(shortRevision(selected))}</b></header>
+    <header><div><strong>${esc(item.path)}</strong><span>${esc(item.status)}</span></div><b>${esc(submoduleReviewChoiceLabel(item))} · ${esc(pointerRevisionLabel(selected))}</b></header>
     <div class="submodule-review-pointers">
       ${pointerRow('Merge Base', item.base)}
       ${pointerRow('Current Branch', item.current)}
@@ -2999,9 +3080,9 @@ function renderSubmoduleMergeReview() {
   const review = state.submoduleMergeReview;
   const items = review?.items || [];
   refs.submoduleMergeReviewList.innerHTML = items.map(submoduleReviewRowHtml).join('') || '<div class="empty-change">No submodule pointer changes need review.</div>';
-  const changed = items.filter(item => item.selectedRevision && item.selectedRevision !== item.result).length;
+  const changed = items.filter(item => !sameReviewRevision(item.selectedRevision, item.result)).length;
   const warnings = items.filter(item => item.suspicious).length;
-  refs.submoduleMergeReviewSummary.textContent = `${items.length} reviewed · ${changed} changed · ${warnings} warning${warnings === 1 ? '' : 's'}`;
+  refs.submoduleMergeReviewSummary.textContent = `${items.length} rows · ${changed} changed · ${warnings} review`;
   refs.submoduleMergeReviewStatus.textContent = review?.summary || '';
   refs.submoduleMergeReviewList.querySelectorAll('[data-review-action]').forEach(button => button.addEventListener('click', async () => {
     const row = button.closest('.submodule-review-item');
@@ -3017,8 +3098,10 @@ function renderSubmoduleMergeReview() {
       const value = await customPrompt(`Choose a commit SHA for ${item.path}:\n\nThis only changes the main repository gitlink. It does not push or rewrite the submodule.`, item.selectedRevision || item.result || item.incoming || item.current || '', { title: 'Choose submodule revision', okLabel: 'Use revision' });
       if (!value?.trim()) return;
       item.selectedRevision = value.trim();
+      item.selectedSource = 'custom';
     } else {
-      item.selectedRevision = button.dataset.revision || '';
+      item.selectedRevision = button.hasAttribute('data-revision-none') ? null : normalizeReviewRevision(button.dataset.revision);
+      item.selectedSource = action;
     }
     renderSubmoduleMergeReview();
   }));
@@ -3033,7 +3116,7 @@ async function openSubmoduleMergeReviewDialog(target, message = '') {
   state.submoduleMergeReview = {
     target,
     summary: review.summary,
-    items: items.map(item => ({ ...item, selectedRevision: item.result || item.current || item.incoming || '' })),
+    items: items.map(item => ({ ...item, selectedRevision: normalizeReviewRevision(item.result), selectedSource: 'result' })),
   };
   refs.submoduleMergeReviewSubtitle.textContent = review.summary || 'Review submodule pointers before the merge commit is created.';
   refs.submoduleMergeCommitMessage.value = message || `Merge into ${state.repository.current_branch || 'current branch'}`;
@@ -3051,10 +3134,7 @@ async function completeMergeAfterSubmoduleReview() {
   if (!message) { refs.submoduleMergeReviewStatus.textContent = 'A merge commit message is required.'; return; }
   refs.confirmSubmoduleMergeReview.disabled = true; refs.confirmSubmoduleMergeReview.textContent = 'Creating…';
   try {
-    const changed = review.items.filter(item => item.selectedRevision && item.selectedRevision !== item.result);
-    for (const item of changed) {
-      await invoke('apply_submodule_merge_revision', { repositoryPath: state.repository.path, targetPath: review.target.targetPath || '', relativePath: item.path, revision: item.selectedRevision });
-    }
+    await applySubmoduleMergeReviewChoices(review);
     const oid = await invoke('complete_merge', { repositoryPath: state.repository.path, targetPath: review.target.targetPath || '', message });
     refs.submoduleMergeReviewDialog.close();
     state.submoduleMergeReview = null;
@@ -3066,7 +3146,47 @@ async function completeMergeAfterSubmoduleReview() {
     refs.submoduleMergeReviewStatus.textContent = String(error);
     handleError(error);
   } finally {
-    refs.confirmSubmoduleMergeReview.disabled = false; refs.confirmSubmoduleMergeReview.textContent = 'Create merge commit';
+    refs.confirmSubmoduleMergeReview.disabled = false; refs.confirmSubmoduleMergeReview.textContent = 'Merge and commit';
+  }
+}
+
+async function applySubmoduleMergeReviewChoices(review = state.submoduleMergeReview) {
+  if (!review?.target) return 0;
+  const changed = review.items.filter(item => !sameReviewRevision(item.selectedRevision, item.result));
+  for (const item of changed) {
+    await invoke('apply_submodule_merge_revision', {
+      repositoryPath: state.repository.path,
+      targetPath: review.target.targetPath || '',
+      relativePath: item.path,
+      revision: normalizeReviewRevision(item.selectedRevision) || '',
+    });
+    item.result = normalizeReviewRevision(item.selectedRevision);
+    item.selectedSource = 'result';
+  }
+  return changed.length;
+}
+
+async function applySubmoduleMergeReviewOnly() {
+  const review = state.submoduleMergeReview;
+  if (!review?.target) return;
+  refs.applySubmoduleMergeReviewOnly.disabled = true;
+  refs.confirmSubmoduleMergeReview.disabled = true;
+  refs.submoduleMergeReviewStatus.textContent = 'Applying selected submodule pointers…';
+  try {
+    const changed = await applySubmoduleMergeReviewChoices(review);
+    refs.submoduleMergeReviewDialog.close();
+    state.submoduleMergeReview = null;
+    const msg = changed
+      ? `Submodule choices applied. Merge is still pending — review/test, then create the merge commit.`
+      : `Merge result left as prepared. Merge is still pending — review/test, then create the merge commit.`;
+    status(msg); showOperationToast(msg, 'success');
+    await refreshAfterMerge();
+  } catch (error) {
+    refs.submoduleMergeReviewStatus.textContent = String(error);
+    handleError(error);
+  } finally {
+    refs.applySubmoduleMergeReviewOnly.disabled = false;
+    refs.confirmSubmoduleMergeReview.disabled = false;
   }
 }
 
@@ -3376,6 +3496,7 @@ refs.confirmCompleteMerge.addEventListener('click', async () => {
 });
 
 refs.confirmSubmoduleMergeReview.addEventListener('click', () => completeMergeAfterSubmoduleReview());
+refs.applySubmoduleMergeReviewOnly.addEventListener('click', () => applySubmoduleMergeReviewOnly());
 refs.abortSubmoduleMergeReview.addEventListener('click', async () => {
   const target = state.submoduleMergeReview?.target || mergeTargetForMain();
   if (!await customConfirm('Abort this merge? The prepared merge result and submodule selections will be discarded.', { title: 'Abort merge', danger: true, okLabel: 'Abort merge' })) return;
@@ -5512,6 +5633,7 @@ refs.runSubmoduleRepoSearch.addEventListener('click', () => searchSubmoduleRepos
 refs.submoduleRepoSearch.addEventListener('keydown', event => { if (event.key === 'Enter') { event.preventDefault(); searchSubmoduleRepositories(); } });
 refs.runSubmoduleRefSearch.addEventListener('click', () => searchSubmoduleRefs());
 refs.submoduleRefSearch.addEventListener('keydown', event => { if (event.key === 'Enter') { event.preventDefault(); searchSubmoduleRefs(); } });
+refs.submoduleRefSearch.addEventListener('input', () => filterLoadedSubmoduleRefs());
 refs.applySubmoduleBrowser.addEventListener('click', applySubmoduleBrowserSelection);
 refs.submoduleUrl.addEventListener('input', () => { resetSubmoduleBrowseSelection(); if (!refs.submoduleName.dataset.edited) refs.submoduleName.value = suggestedRepositoryName(refs.submoduleUrl.value); validateSubmoduleForm(); });
 refs.submoduleName.addEventListener('input', () => { refs.submoduleName.dataset.edited = refs.submoduleName.value ? '1' : ''; validateSubmoduleForm(); });

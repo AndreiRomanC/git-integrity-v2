@@ -33,7 +33,11 @@ test('Add submodule can browse GitHub Enterprise modules without changing the ma
   assert.match(html, /id="submoduleBrowserDialog"/);
   assert.match(html, /GITHUB ENTERPRISE · ENG/);
   assert.match(app, /invoke\('search_github_modules', \{ repositoryPath: state\.repository\.path, query, limit: 25 \}\)/);
-  assert.match(app, /invoke\('github_module_refs', \{ repositoryPath: state\.repository\.path, owner: repo\.owner \|\| 'eng', repositoryName: repo\.name, query, limit: 180 \}\)/);
+  assert.match(app, /const submoduleBrowserRefCache = new Map\(\)/);
+  assert.match(app, /function filterLoadedSubmoduleRefs/);
+  assert.match(app, /cachedSubmoduleRefs\(repo\)/);
+  assert.match(app, /submoduleRefQueryLooksLikeSha/);
+  assert.match(app, /invoke\('github_module_refs', \{ repositoryPath: state\.repository\.path, owner: repo\.owner \|\| 'eng', repositoryName: repo\.name, query: trimmedQuery, limit: 180 \}\)/);
   assert.match(app, /refs\.submoduleUrl\.value = repo\.portable_url/);
   assert.match(app, /initialRevision: selected\.revision \|\| null/);
   assert.match(app, /resetSubmoduleBrowseSelection\(\); if \(!refs\.submoduleName\.dataset\.edited\)/);
@@ -234,6 +238,8 @@ test('a selected submodule can be promoted to the normal full repository context
   assert.match(app, /Submodule of \$\{origin\.parentName\}/);
   assert.match(css, /\.parent-repository-button/);
   assert.match(css, /\.recent-repo-btn\.submodule-recent/);
+  assert.match(css, /\.recent-repos-bar \{[^}]*height: 27px/);
+  assert.match(css, /\.recent-repo-btn \{[^}]*max-width: 118px/);
   assert.match(css, /button\[data-detail-action="subopenfull"\] \{ flex: 1 1 100%;/);
   assert.doesNotMatch(css, /button\[data-detail-action="subopenfull"\]::before/);
 });
@@ -496,10 +502,17 @@ test('main project merge pauses for one consolidated submodule pointer review', 
   assert.match(app, /Keep Merge Result/);
   assert.match(app, /Use Current Branch/);
   assert.match(app, /Use Incoming\/origin/);
+  assert.match(app, /pointerRevisionLabel/);
+  assert.match(app, /No submodule/);
+  assert.match(app, /selectedSource/);
+  assert.match(app, /applySubmoduleMergeReviewOnly/);
+  assert.match(html, /Apply choices only/);
+  assert.match(html, /Merge and commit/);
   assert.match(app, /Choose another commit/);
   assert.match(app, /Ready for submodule review \/ merge commit/);
   assert.match(css, /\.submodule-merge-review-dialog/);
   assert.match(css, /\.submodule-review-pointers/);
+  assert.match(css, /\.submodule-review-pointers div\.absent/);
 });
 
 test('every local frontend script and stylesheet carries the same cache-busting version', () => {

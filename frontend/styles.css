@@ -1037,28 +1037,31 @@ dialog form { padding: 28px; text-align: center; }dialog h2 { margin: 0 0 10px; 
 .conflict-actions button:hover { border-color: #5794c7; background: #20384c; }
 .conflict-resolved-note { color: #8fe8b7; font-size: 10px; }
 .conflicts-local-note { margin: 0 18px 10px; color: #8497a7; font-size: 10px; }
-.submodule-merge-review-dialog { width: min(1080px, 94vw); max-width: 1080px; }
+.submodule-merge-review-dialog { width: min(1160px, 96vw); max-width: 1160px; }
 .submodule-review-principle { margin: 12px 18px; border-left: 3px solid #5aa9e6; padding: 9px 12px; background: #142333; color: #9fb2c2; font-size: 11px; line-height: 1.45; }
-.submodule-merge-review-list { max-height: min(430px, 50vh); overflow: auto; margin: 0 18px 12px; display: flex; flex-direction: column; gap: 9px; }
-.submodule-review-item { border: 1px solid #304658; border-radius: 8px; padding: 11px 12px; background: #101a23; }
-.submodule-review-item.warning { border-color: #8b632d; background: linear-gradient(90deg, #2a1e0e 0, #101a23 18%); }
+.submodule-merge-review-list { max-height: min(460px, 52vh); overflow: auto; margin: 0 18px 12px; display: flex; flex-direction: column; gap: 8px; }
+.submodule-review-item { border: 1px solid #304658; border-radius: 8px; padding: 9px 10px; background: #101a23; }
+.submodule-review-item.warning { border-color: #8b632d; background: linear-gradient(90deg, #2a1e0e 0, #101a23 12%); }
 .submodule-review-item.ok { border-color: #315f48; }
-.submodule-review-item header { display: flex; gap: 12px; align-items: flex-start; padding: 0 0 8px; border: 0; }
+.submodule-review-item header { display: flex; gap: 12px; align-items: flex-start; padding: 0 0 7px; border: 0; }
 .submodule-review-item header div { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 3px; }
 .submodule-review-item header strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #d7e5f0; font: 13px ui-monospace, SFMono-Regular, Consolas, monospace; }
 .submodule-review-item header span { color: #ffcc82; font-size: 10px; font-weight: 700; letter-spacing: .6px; text-transform: uppercase; }
 .submodule-review-item header b { flex: 0 0 auto; border: 1px solid #45627a; border-radius: 999px; padding: 3px 8px; color: #b8dbff; background: #16293a; font: 10px ui-monospace, SFMono-Regular, Consolas, monospace; }
 .submodule-review-pointers { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 6px; }
-.submodule-review-pointers div { min-width: 0; border: 1px solid #25394a; border-radius: 6px; padding: 6px 7px; background: #0c141b; }
+.submodule-review-pointers div { min-width: 0; border: 1px solid #25394a; border-radius: 6px; padding: 5px 7px; background: #0c141b; }
+.submodule-review-pointers div.absent { border-style: dashed; background: #15191e; }
 .submodule-review-pointers span { display: block; color: #748899; font-size: 8px; font-weight: 800; letter-spacing: .7px; text-transform: uppercase; }
 .submodule-review-pointers code { display: block; margin-top: 3px; color: #bfe0ff; font: 12px ui-monospace, SFMono-Regular, Consolas, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.submodule-review-pointers div.absent code { color: #8d9aa6; font-style: italic; }
 .submodule-review-item p { margin: 8px 0; color: #9cadaf; font-size: 11px; line-height: 1.45; }
 .submodule-review-actions { display: flex; flex-wrap: wrap; gap: 6px; }
-.submodule-review-actions button { width: auto; min-width: 0; min-height: 28px; margin: 0; border: 1px solid #3b5267; border-radius: 6px; padding: 0 9px; background: #182635; color: #c6d9e9; font-size: 10px; }
+.submodule-review-actions button { width: auto; min-width: 0; min-height: 26px; margin: 0; border: 1px solid #3b5267; border-radius: 6px; padding: 0 8px; background: #182635; color: #c6d9e9; font-size: 10px; }
 .submodule-review-actions button.active { border-color: #62b5ff; background: #244667; color: #eef8ff; }
 .submodule-review-actions button:disabled { opacity: .45; }
 .submodule-merge-review-dialog .commit-scope-label { margin: 0 18px 10px; }
 .submodule-merge-review-dialog footer #submoduleMergeReviewSummary { flex: 0 1 auto; min-width: 220px; }
+.submodule-merge-review-dialog footer button { white-space: nowrap; }
 .clone-dialog form { text-align: left; }.clone-dialog .dialog-symbol { margin-left: 0; text-align: center; }.clone-dialog p { margin-bottom: 18px; }.clone-dialog label { display: flex; flex-direction: column; gap: 6px; margin: 12px 0; color: #8497a8; font-size: 9px; letter-spacing: .8px; }.clone-dialog input { height: 37px; outline: 0; border: 1px solid #405263; border-radius: 6px; padding: 0 10px; background: #0d151c; color: #d4e0ea; font: 12px ui-monospace, monospace; }.clone-dialog input:focus { border-color: var(--blue); }.clone-dialog select { height: 37px; outline: 0; border: 1px solid #405263; border-radius: 6px; padding: 0 10px; background: #0d151c; color: #d4e0ea; font: 12px ui-monospace, monospace; }.clone-location { display: grid; grid-template-columns: minmax(0, 1fr) 110px; align-items: end; gap: 10px; margin: 12px 0; }.clone-location label { margin: 0; }.clone-location button { width: 110px; height: 37px; margin: 0; padding: 0 13px; border-color: #465b6e; background: #24323e; }.clone-options { margin-top: 8px; border-top: 1px solid #263848; padding-top: 10px; }.clone-options summary { cursor: pointer; color: #8fb2d2; font-size: 10px; font-weight: 700; letter-spacing: .7px; }.clone-dialog label.inline-check { flex-direction: row; align-items: center; gap: 9px; letter-spacing: 0; font-size: 11px; text-transform: none; }.clone-dialog label.inline-check input { width: 16px; height: 16px; padding: 0; }.clone-dialog .commit-dialog-actions { align-items: center; margin-top: 22px; }.clone-dialog .commit-dialog-actions button { height: 38px; margin-top: 0; }
 .submodule-add-result { margin-top: 15px; border-left: 3px solid var(--purple); padding: 9px 11px; background: #211d31; color: #aebac6; font-size: 10px; line-height: 1.5; }.submodule-add-result code { color: #d8caff; }
 .submodule-auth { margin-top: 12px; border: 1px solid #344557; border-radius: 6px; padding: 9px 11px; background: #111a23; }.submodule-auth summary { cursor: pointer; color: #9bb1c4; font-size: 10px; }.submodule-operation-status { min-height: 34px; margin-top: 10px; border-radius: 5px; padding: 9px 10px; background: #111a23; color: #8fa2b4; font-size: 10px; line-height: 1.4; }.submodule-operation-status.busy { color: #8dc9ff; }.submodule-operation-status.success { border: 1px solid #36785b; color: #79d6a4; }.submodule-operation-status.error { border: 1px solid #934d55; color: #ff9ba5; }
@@ -1161,13 +1164,18 @@ dialog form { padding: 28px; text-align: center; }dialog h2 { margin: 0 0 10px; 
 [data-tooltip]:hover::after { content: attr(data-tooltip); position: absolute; z-index: 100; bottom: 100%; left: 50%; transform: translateX(-50%); white-space: nowrap; padding: 6px 10px; margin-bottom: 6px; border-radius: 5px; background: #2a3844; color: #d8e5f0; font-size: 11px; font-weight: 400; border: 1px solid #3d4f61; box-shadow: 0 6px 20px #0008; }
 [data-tooltip]:hover::before { content: ""; position: absolute; z-index: 100; bottom: 100%; left: 50%; transform: translateX(-50%); width: 0; height: 0; border-left: 5px solid transparent; border-right: 5px solid transparent; border-top: 5px solid #2a3844; margin-bottom: -1px; }
 
-.recent-repos-bar { display: flex; align-items: center; gap: 12px; height: 40px; padding: 0 12px; background: #141c24; border-bottom: 1px solid var(--border); color: #8fa0b0; font-size: 11px; }
-.recent-repos-list { display: flex; gap: 8px; overflow: auto; flex: 1; }
-.recent-repo-btn { min-height: 30px; padding: 5px 10px; border: 1px solid #465563; border-radius: 5px; background: #1a2530; color: #d8e5f0; font-size: 11px; white-space: nowrap; cursor: pointer; }
-.recent-repo-btn strong, .recent-repo-btn small { display: block; max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.recent-repo-btn small { margin-top: 1px; color: #87a2b9; font-size: 9px; }
-.recent-repo-btn.submodule-recent { border-color: #4a6680; background: #172736; }
-.recent-repo-btn:hover { border-color: #58a6ff; background: #1f3847; }
+.recent-repos-bar { display: flex; align-items: center; gap: 7px; height: 27px; padding: 0 8px; background: #101820cc; border-bottom: 1px solid #21314199; color: #708395; font-size: 9px; opacity: .78; }
+.recent-repos-bar:hover { opacity: 1; }
+.recent-repos-bar > span { text-transform: uppercase; letter-spacing: .08em; font-weight: 800; }
+.recent-close { width: 18px; height: 18px; padding: 0; border: 0; border-radius: 999px; background: transparent; color: #66798a; font-size: 13px; line-height: 18px; cursor: pointer; }
+.recent-close:hover { background: #1b2a38; color: #c1d1df; }
+.recent-repos-list { display: flex; gap: 5px; overflow: auto; flex: 1; scrollbar-width: none; }
+.recent-repos-list::-webkit-scrollbar { display: none; }
+.recent-repo-btn { min-height: 20px; max-width: 118px; padding: 2px 7px; border: 1px solid #31435499; border-radius: 999px; background: #14202aaa; color: #9fb0bf; font-size: 10px; white-space: nowrap; cursor: pointer; opacity: .82; }
+.recent-repo-btn strong, .recent-repo-btn small { display: block; max-width: 104px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.recent-repo-btn small { display: none; }
+.recent-repo-btn.submodule-recent { border-color: #3a506799; background: #132231aa; }
+.recent-repo-btn:hover { opacity: 1; border-color: #4f8fc0; background: #1a3040; color: #d7e7f4; }
 
 @media (max-width: 1180px) { .main-layout { grid-template-columns: 220px 1fr; }.details-panel-wrap { display: none; }.changes-drawer { left: 220px; }.commit-card { grid-template-columns: minmax(180px, 1fr) auto auto minmax(90px, 140px); }.commit-date { display: none; } }
 @media (max-width: 1280px) { .local-drive-merge-key { display: none; }.local-drive-difference-tools select { width: 128px; } }

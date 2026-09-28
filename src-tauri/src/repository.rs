@@ -8528,6 +8528,61 @@ mod tests {
     }
 
     #[test]
+    fn submodule_merge_review_can_apply_no_submodule_to_remove_the_gitlink() {
+        // The review's "no submodule" choice (empty/"__none__" revision) must
+        // actually remove the gitlink entry from the index — not merely fail
+        // to write one, and not leave a stale entry from whichever side Git
+        // picked as the merge result.
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-submodule-merge-review-remove-{suffix}"));
+        let parent = base.join("parent");
+        let dependency = base.join("dependency");
+        create_libgit2_repository(&parent, "README.md");
+        create_libgit2_repository(&dependency, "module.txt");
+        run_git(&parent, &["-c", "protocol.file.allow=always", "submodule", "add", dependency.to_str().unwrap(), "vendor/dep"]);
+        run_git(&parent, &["commit", "-am", "Add dep"]);
+        assert!(parent_gitlink_oid(&Repository::open(&parent).unwrap(), "vendor/dep", false).is_some());
+        let default_branch = Repository::open(&parent).unwrap().head().unwrap().shorthand().unwrap().to_string();
+
+        run_git(&parent, &["switch", "-c", "conflict-a"]);
+        fs::write(parent.join("conflict.txt"), "a\n").unwrap();
+        run_git(&parent, &["add", "conflict.txt"]);
+        run_git(&parent, &["commit", "-m", "A"]);
+        run_git(&parent, &["switch", "-c", "conflict-b", &default_branch]);
+        fs::write(parent.join("conflict.txt"), "b\n").unwrap();
+        run_git(&parent, &["add", "conflict.txt"]);
+        run_git(&parent, &["commit", "-m", "B"]);
+
+        let parent_string = parent.to_string_lossy().into_owned();
+        let merge_outcome = merge_branch(parent_string.clone(), "".into(), "conflict-a".into()).unwrap();
+        assert_eq!(merge_outcome.status, "conflicts");
+        let repo = Repository::open(&parent).unwrap();
+        assert_eq!(repo.state(), git2::RepositoryState::Merge);
+        assert!(parent_gitlink_oid(&repo, "vendor/dep", true).is_some(), "sanity check: dep's gitlink is still staged going into this merge");
+
+        apply_submodule_merge_revision(parent_string.clone(), "".into(), "vendor/dep".into(), String::new()).unwrap();
+        let repo = Repository::open(&parent).unwrap();
+        assert_eq!(parent_gitlink_oid(&repo, "vendor/dep", true), None, "an empty revision must remove the gitlink from the merge index, not leave it or error");
+
+        apply_submodule_merge_revision(parent_string.clone(), "".into(), "vendor/dep".into(), String::new()).unwrap();
+        let repo = Repository::open(&parent).unwrap();
+        assert_eq!(parent_gitlink_oid(&repo, "vendor/dep", true), None, "applying the same removal twice must stay a no-op, not error");
+
+        resolve_conflict(parent_string.clone(), "".into(), "conflict.txt".into(), "ours".into()).unwrap();
+        let oid = complete_merge(parent_string.clone(), "".into(), "Merge with dep removed".into()).unwrap();
+        assert!(!oid.is_empty());
+        let repo = Repository::open(&parent).unwrap();
+        assert_eq!(repo.state(), git2::RepositoryState::Clean);
+        assert_eq!(parent_gitlink_oid(&repo, "vendor/dep", false), None, "the committed merge result must not record vendor/dep at all");
+        assert!(repo.head().unwrap().peel_to_tree().unwrap().get_path(Path::new("vendor/dep")).is_err(), "vendor/dep must be entirely absent from the merge commit's tree, not merely re-typed");
+        // Git does not delete an untracked leftover submodule working
+        // directory on its own (a well-known Git behavior, unrelated to this
+        // command) — the tracked gitlink being gone is what this test proves.
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
     fn parent_merge_reports_dirty_initialized_submodules_before_starting() {
         let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let base = std::env::temp_dir().join(format!("git-integrity-dirty-submodule-merge-check-{suffix}"));
