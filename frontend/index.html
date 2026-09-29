@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Git DrillDown</title>
   <link rel="icon" type="image/png" href="assets/git-drilldown-mark.png">
-  <link rel="stylesheet" href="styles.css?v=20260929-branch-compare">
+  <link rel="stylesheet" href="styles.css?v=20260929b-flat-compare">
 </head>
 <body>
   <div class="app-shell">
@@ -135,6 +135,10 @@
                 <button type="button" id="branchCompareRefresh" title="Re-run comparison for these refs">Compare</button>
               </div>
             </div>
+            <div id="gitCompareFlatControls" class="compare-flat-controls" hidden>
+              <button type="button" id="gitCompareFlatToggle" title="Show a flat list with all changed files">Flat file list</button>
+              <label><span>FILTER</span><select id="gitCompareFlatFilter"><option value="all">All differences</option><option value="modified">Modified</option><option value="local-only">Only left</option><option value="remote-only">Only right</option><option value="type-changed">Type changed</option></select></label>
+            </div>
             <div class="commander-head commander-grid"><span id="gitCompareLeftLabel">LOCAL WORKSPACE</span><span>STATE</span><span id="gitCompareRightLabel">REMOTE BRANCH</span></div>
             <div id="commanderRows" class="commander-rows"></div>
             <div class="commander-legend"><span><i class="same"></i>Same</span><span><i class="modified"></i>Modified</span><span><i class="local-only"></i>Only local</span><span><i class="remote-only"></i>Only remote</span></div>
@@ -151,6 +155,10 @@
             </div>
             <div class="submodule-compare-exact" id="subCompareExact">Choose a submodule and two revisions.</div>
             <div class="submodule-compare-commits" id="subCompareCommits" hidden></div>
+            <div id="subCompareFlatControls" class="compare-flat-controls">
+              <button type="button" id="subCompareFlatToggle" title="Show a flat list with all changed files">Flat file list</button>
+              <label><span>FILTER</span><select id="subCompareFlatFilter"><option value="all">All differences</option><option value="modified">Modified</option><option value="local-only">Only left</option><option value="remote-only">Only right</option><option value="type-changed">Type changed</option></select></label>
+            </div>
             <div class="commander-toolbar">
               <nav id="subCompareBreadcrumbs" class="commander-breadcrumbs"></nav>
             </div>
@@ -707,13 +715,13 @@
       <footer><button value="cancel">Cancel</button><button type="button" value="default" id="confirmNewTag" class="confirm">Create tag</button></footer>
     </form>
   </dialog>
-  <script src="console-context.js?v=20260929-branch-compare"></script>
-  <script src="graph-model.js?v=20260929-branch-compare"></script>
-  <script src="submodule-state.js?v=20260929-branch-compare"></script>
-  <script src="submodule-versions.js?v=20260929-branch-compare"></script>
-  <script src="local-diff.js?v=20260929-branch-compare"></script>
-  <script src="local-drive.js?v=20260929-branch-compare"></script>
-  <script src="pr-status.js?v=20260929-branch-compare"></script>
-  <script src="app.js?v=20260929-branch-compare"></script>
+  <script src="console-context.js?v=20260929b-flat-compare"></script>
+  <script src="graph-model.js?v=20260929b-flat-compare"></script>
+  <script src="submodule-state.js?v=20260929b-flat-compare"></script>
+  <script src="submodule-versions.js?v=20260929b-flat-compare"></script>
+  <script src="local-diff.js?v=20260929b-flat-compare"></script>
+  <script src="local-drive.js?v=20260929b-flat-compare"></script>
+  <script src="pr-status.js?v=20260929b-flat-compare"></script>
+  <script src="app.js?v=20260929b-flat-compare"></script>
 </body>
 </html>

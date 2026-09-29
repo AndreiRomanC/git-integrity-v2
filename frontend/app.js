@@ -206,7 +206,7 @@ function addRecentRepo(path, name) {
   renderRecentRepos();
 }
 
-const state = { repository: null, branches: [], commits: [], allCommits: [], changes: [], selectedCommit: null, view: 'explorer', currentPath: '', entries: [], selectedEntry: null, historyScope: '', historyKind: '', commanderPath: '', commanderRows: [], remoteRef: '', compareMode: 'local-drive', gitCompareMode: 'workspace', branchCompareLeftRef: '', branchCompareRightRef: '', branchCompareLeftRevision: '', branchCompareRightRevision: '', remotes: [], editingPath: '', editorOriginal: '', publish: null, changesScope: 'global', commanderFocus: '', comparingRow: null, hasStash: false, stashes: [], editingConflict: null, mergeTarget: null,
+const state = { repository: null, branches: [], commits: [], allCommits: [], changes: [], selectedCommit: null, view: 'explorer', currentPath: '', entries: [], selectedEntry: null, historyScope: '', historyKind: '', commanderPath: '', commanderRows: [], remoteRef: '', compareMode: 'local-drive', gitCompareMode: 'workspace', branchCompareLeftRef: '', branchCompareRightRef: '', branchCompareLeftRevision: '', branchCompareRightRevision: '', compareFlatMode: false, compareFlatFilter: 'all', subCompareFlatMode: false, subCompareFlatFilter: 'all', remotes: [], editingPath: '', editorOriginal: '', publish: null, changesScope: 'global', commanderFocus: '', comparingRow: null, hasStash: false, stashes: [], editingConflict: null, mergeTarget: null,
   // Set only while viewing a submodule's Submodule Map — holds *its own*
   // repository/branches/commits/changes/stashes/primaryBranch entirely
   // separately from the fields above, which always stay the parent
@@ -214,7 +214,7 @@ const state = { repository: null, branches: [], commits: [], allCommits: [], cha
   // the fields above, never this — see activeGraphData(), openSubmoduleGraph
   // and leaveSubmoduleGraph.
   submoduleGraph: null, repositoryOrigin: null,
-  consoleMode: 'console', consoleTranscript: [], consoleCmdHistory: [], consoleDrafts: { commands: '', console: '', saved: '' }, consoleScopeOverride: null, graphPrimaryBranch: null, graphOnlySearchMatches: false, publishUpto: null, branchStartMarker: null, savedActions: loadSavedActions(), folderRestore: null,
+  consoleMode: 'console', consoleTranscript: [], consoleCmdHistory: [], consoleDrafts: { commands: '', console: '', saved: '' }, consoleScopeOverride: null, graphPrimaryBranch: null, graphOnlySearchMatches: false, graphBranchCompareAnchor: null, graphCommitCompareAnchor: null, publishUpto: null, branchStartMarker: null, savedActions: loadSavedActions(), folderRestore: null,
   // False only right after openRepositoryFast, until its background
   // refresh_status completes — mutations (stage/unstage, delete, commit,
   // switching branch) are refused while this is false, since they'd act on
@@ -279,7 +279,7 @@ const refs = {
   submoduleMenu: $('#submoduleMenu'), submoduleVersions: $('#submoduleVersions'), submoduleMenuName: $('#submoduleMenuName'), currentSubmoduleVersion: $('#currentSubmoduleVersion'), submoduleVersionSearch: $('#submoduleVersionSearch'), submoduleOpenGraph: $('#submoduleOpenGraph'),
   commitScope: $('#commitScope'), showPathHistory: $('#showPathHistory'), commitScopeDialog: $('#commitScopeDialog'), commitScopeName: $('#commitScopeName'), scopeCommitMessage: $('#scopeCommitMessage'), confirmScopeCommit: $('#confirmScopeCommit'),
   folderRestoreDialog: $('#folderRestoreDialog'), folderRestorePath: $('#folderRestorePath'), folderRestoreSubtitle: $('#folderRestoreSubtitle'), folderRestoreModeHead: $('#folderRestoreModeHead'), folderRestoreModeCommit: $('#folderRestoreModeCommit'), folderRestoreCommitPicker: $('#folderRestoreCommitPicker'), folderRestoreCommitList: $('#folderRestoreCommitList'), refreshFolderRestoreCommits: $('#refreshFolderRestoreCommits'), folderRestoreClean: $('#folderRestoreClean'), folderRestorePreview: $('#folderRestorePreview'), folderRestoreStatus: $('#folderRestoreStatus'), previewFolderRestore: $('#previewFolderRestore'), confirmFolderRestore: $('#confirmFolderRestore'),
-  commanderView: $('#commanderView'), commanderRows: $('#commanderRows'), commanderBreadcrumbs: $('#commanderBreadcrumbs'), remoteRef: $('#remoteRef'), gitWorkspaceCompareControls: $('#gitWorkspaceCompareControls'), gitBranchCompareControls: $('#gitBranchCompareControls'), branchCompareLeftRef: $('#branchCompareLeftRef'), branchCompareRightRef: $('#branchCompareRightRef'), branchCompareSwap: $('#branchCompareSwap'), branchCompareRefresh: $('#branchCompareRefresh'), gitCompareLeftLabel: $('#gitCompareLeftLabel'), gitCompareRightLabel: $('#gitCompareRightLabel'), gitComparePanel: $('#gitComparePanel'), localDrivePanel: $('#localDrivePanel'), compareModeGit: $('#compareModeGit'), compareModeDrive: $('#compareModeDrive'), compareModeSubmodule: $('#compareModeSubmodule'), submoduleComparePanel: $('#submoduleComparePanel'), subCompareSubmodule: $('#subCompareSubmodule'), subCompareSubmoduleOptions: $('#subCompareSubmoduleOptions'), subCompareLeftRef: $('#subCompareLeftRef'), subCompareRightRef: $('#subCompareRightRef'), subComparePickLeft: $('#subComparePickLeft'), subComparePickRight: $('#subComparePickRight'), subCompareSwap: $('#subCompareSwap'), subCompareRefresh: $('#subCompareRefresh'), subCompareDownload: $('#subCompareDownload'), subCompareExact: $('#subCompareExact'), subCompareCommits: $('#subCompareCommits'), subCompareBreadcrumbs: $('#subCompareBreadcrumbs'), subCompareRows: $('#subCompareRows'), subRevisionDialog: $('#subCompareRevisionDialog'), subRevisionDialogSide: $('#subRevisionDialogSide'), subRevisionDialogTitle: $('#subRevisionDialogTitle'), subRevisionSearch: $('#subRevisionSearch'), subRevisionSearchAll: $('#subRevisionSearchAll'), subRevisionResults: $('#subRevisionResults'), subRevisionHelp: $('#subRevisionHelp'), compareDialog: $('#compareDialog'), compareTitle: $('#compareTitle'), compareSubtitle: $('#compareSubtitle'), localCompare: $('#localCompare'), remoteCompare: $('#remoteCompare'),
+  commanderView: $('#commanderView'), commanderRows: $('#commanderRows'), commanderBreadcrumbs: $('#commanderBreadcrumbs'), remoteRef: $('#remoteRef'), gitWorkspaceCompareControls: $('#gitWorkspaceCompareControls'), gitBranchCompareControls: $('#gitBranchCompareControls'), branchCompareLeftRef: $('#branchCompareLeftRef'), branchCompareRightRef: $('#branchCompareRightRef'), branchCompareSwap: $('#branchCompareSwap'), branchCompareRefresh: $('#branchCompareRefresh'), gitCompareFlatControls: $('#gitCompareFlatControls'), gitCompareFlatToggle: $('#gitCompareFlatToggle'), gitCompareFlatFilter: $('#gitCompareFlatFilter'), gitCompareLeftLabel: $('#gitCompareLeftLabel'), gitCompareRightLabel: $('#gitCompareRightLabel'), gitComparePanel: $('#gitComparePanel'), localDrivePanel: $('#localDrivePanel'), compareModeGit: $('#compareModeGit'), compareModeDrive: $('#compareModeDrive'), compareModeSubmodule: $('#compareModeSubmodule'), submoduleComparePanel: $('#submoduleComparePanel'), subCompareSubmodule: $('#subCompareSubmodule'), subCompareSubmoduleOptions: $('#subCompareSubmoduleOptions'), subCompareLeftRef: $('#subCompareLeftRef'), subCompareRightRef: $('#subCompareRightRef'), subComparePickLeft: $('#subComparePickLeft'), subComparePickRight: $('#subComparePickRight'), subCompareSwap: $('#subCompareSwap'), subCompareRefresh: $('#subCompareRefresh'), subCompareDownload: $('#subCompareDownload'), subCompareFlatControls: $('#subCompareFlatControls'), subCompareFlatToggle: $('#subCompareFlatToggle'), subCompareFlatFilter: $('#subCompareFlatFilter'), subCompareExact: $('#subCompareExact'), subCompareCommits: $('#subCompareCommits'), subCompareBreadcrumbs: $('#subCompareBreadcrumbs'), subCompareRows: $('#subCompareRows'), subRevisionDialog: $('#subCompareRevisionDialog'), subRevisionDialogSide: $('#subRevisionDialogSide'), subRevisionDialogTitle: $('#subRevisionDialogTitle'), subRevisionSearch: $('#subRevisionSearch'), subRevisionSearchAll: $('#subRevisionSearchAll'), subRevisionResults: $('#subRevisionResults'), subRevisionHelp: $('#subRevisionHelp'), compareDialog: $('#compareDialog'), compareTitle: $('#compareTitle'), compareSubtitle: $('#compareSubtitle'), localCompare: $('#localCompare'), remoteCompare: $('#remoteCompare'),
   remotesView: $('#remotesView'), remoteCards: $('#remoteCards'), editorDialog: $('#editorDialog'), editorTitle: $('#editorTitle'), editorPath: $('#editorPath'), editorContent: $('#editorContent'), locationRepository: $('#locationRepository'), locationBranch: $('#locationBranch'), locationPath: $('#locationPath'), parentRepositoryButton: $('#parentRepositoryButton'), parentRepositoryName: $('#parentRepositoryName'), leaveSubmoduleGraph: $('#leaveSubmoduleGraph'), publishDialog: $('#publishDialog'), publishBranch: $('#publishBranch'), publishRemote: $('#publishRemote'), publishCommits: $('#publishCommits'), publishSummary: $('#publishSummary'), publishDestination: $('#publishDestination'), publishBadge: $('#publishBadge'), publishSubtitle: $('#publishSubtitle'), cloneDialog: $('#cloneDialog'), cloneUrl: $('#cloneUrl'), cloneParent: $('#cloneParent'), cloneName: $('#cloneName'), cloneBranch: $('#cloneBranch'), cloneRecurseSubmodules: $('#cloneRecurseSubmodules'), confirmClone: $('#confirmClone'), submoduleDialog: $('#submoduleDialog'), submoduleUrl: $('#submoduleUrl'), submoduleParent: $('#submoduleParent'), submoduleName: $('#submoduleName'), submoduleUsername: $('#submoduleUsername'), submoduleToken: $('#submoduleToken'), submoduleAddStatus: $('#submoduleAddStatus'), submoduleBrowseSelection: $('#submoduleBrowseSelection'), browseSubmoduleRepository: $('#browseSubmoduleRepository'), submoduleBrowserDialog: $('#submoduleBrowserDialog'), submoduleRepoSearch: $('#submoduleRepoSearch'), runSubmoduleRepoSearch: $('#runSubmoduleRepoSearch'), submoduleRepoResults: $('#submoduleRepoResults'), submoduleRefHint: $('#submoduleRefHint'), submoduleRefSearch: $('#submoduleRefSearch'), runSubmoduleRefSearch: $('#runSubmoduleRefSearch'), submoduleRefResults: $('#submoduleRefResults'), submoduleBrowserStatus: $('#submoduleBrowserStatus'), applySubmoduleBrowser: $('#applySubmoduleBrowser'), confirmAddSubmodule: $('#confirmAddSubmodule'), operationToast: $('#operationToast'), drawerScopeTitle: $('#drawerScopeTitle'),
   mergeBranchDialog: $('#mergeBranchDialog'), mergeBranchSubtitle: $('#mergeBranchSubtitle'), mergeBranchCurrent: $('#mergeBranchCurrent'), mergeBranchSource: $('#mergeBranchSource'), mergeBranchStatus: $('#mergeBranchStatus'), confirmMergeBranch: $('#confirmMergeBranch'),
   stashesDialog: $('#stashesDialog'), stashesList: $('#stashesList'),
@@ -1204,6 +1204,7 @@ function branchCompareRefOptions() {
   };
   if (state.repository?.head_oid) add('HEAD', 'current');
   (state.branches || []).forEach(branch => add(branch.name, branch.remote ? 'remote' : 'branch'));
+  [state.branchCompareLeftRef, state.branchCompareRightRef].forEach(ref => add(ref, 'revision'));
   return options;
 }
 
@@ -1228,8 +1229,9 @@ function ensureBranchCompareRefs() {
 function renderBranchCompareSelectors() {
   ensureBranchCompareRefs();
   const options = branchCompareRefOptions();
+  const kindLabel = option => option.kind === 'remote' ? ' (remote)' : option.kind === 'current' ? ' (current)' : option.kind === 'revision' ? ' (revision)' : '';
   const html = (selected) => options
-    .map(option => `<option value="${esc(option.value)}" ${option.value === selected ? 'selected' : ''}>${esc(option.label)}${option.kind === 'remote' ? ' (remote)' : option.kind === 'current' ? ' (current)' : ''}</option>`)
+    .map(option => `<option value="${esc(option.value)}" ${option.value === selected ? 'selected' : ''}>${esc(option.label)}${kindLabel(option)}</option>`)
     .join('');
   refs.branchCompareLeftRef.innerHTML = html(state.branchCompareLeftRef);
   refs.branchCompareRightRef.innerHTML = html(state.branchCompareRightRef);
@@ -1238,6 +1240,24 @@ function renderBranchCompareSelectors() {
 function commanderSide(entry, side) {
   if (!entry) return `<span class="commander-side empty ${side}">— not present —</span>`;
   return `<span class="commander-side ${side}">${iconFor(entry)}<span class="commander-file-copy"><strong>${esc(entry.name)}</strong><small>${entry.kind}${entry.kind === 'file' ? ` · ${formatSize(entry.size)}` : ''}</small></span></span>`;
+}
+function flatCompareSide(entry, side, fallbackPath = '') {
+  const sideLabel = side === 'local' ? 'left' : 'right';
+  if (!entry) {
+    return `<span class="flat-compare-cell ${side} missing"><span class="flat-file-path">—</span><small>not on ${esc(sideLabel)}</small></span>`;
+  }
+  const path = entry.relative_path || fallbackPath || entry.name || '';
+  const meta = entry.kind === 'file' ? `file · ${formatSize(entry.size)}` : entry.kind || 'item';
+  return `<span class="flat-compare-cell ${side}"><span class="flat-file-path" title="${esc(path)}">${esc(path)}</span><small>${esc(meta)}</small></span>`;
+}
+function flatCompareRowHtml(row, datasetName) {
+  const path = row.relative_path || row.name || '';
+  const status = compareStatusText(row.status, state.compareMode === 'submodule' ? 'submodule' : 'branch');
+  return `<button class="flat-compare-row ${row.relative_path === state.commanderFocus ? 'focused' : ''} ${esc(row.status)}" ${datasetName}="${esc(path)}" title="Open diff for ${esc(path)}">
+    ${flatCompareSide(row.local, 'local', path)}
+    <span class="flat-compare-status compare-state ${esc(row.status)}"><i></i>${esc(status)}</span>
+    ${flatCompareSide(row.remote, 'remote', path)}
+  </button>`;
 }
 
 function renderCommander() {
@@ -1267,27 +1287,47 @@ function renderCommander() {
   const branchCompareMode = state.gitCompareMode === 'refs';
   refs.gitWorkspaceCompareControls.hidden = branchCompareMode;
   refs.gitBranchCompareControls.hidden = !branchCompareMode;
+  if (refs.gitCompareFlatControls) refs.gitCompareFlatControls.hidden = false;
+  if (refs.gitCompareFlatToggle) {
+    refs.gitCompareFlatToggle.classList.toggle('active', state.compareFlatMode);
+    refs.gitCompareFlatToggle.textContent = state.compareFlatMode ? 'Folder tree' : 'Flat file list';
+  }
+  if (refs.gitCompareFlatFilter) {
+    refs.gitCompareFlatFilter.hidden = !state.compareFlatMode;
+    refs.gitCompareFlatFilter.value = state.compareFlatFilter;
+  }
   refs.gitCompareLeftLabel.textContent = branchCompareMode ? 'START REF' : 'LOCAL WORKSPACE';
   refs.gitCompareRightLabel.textContent = branchCompareMode ? 'COMPARE WITH' : 'REMOTE BRANCH';
   if (branchCompareMode) renderBranchCompareSelectors();
   const remoteBranches = state.branches.filter(branch => branch.remote);
   refs.remoteRef.innerHTML = remoteBranches.map(branch => `<option value="${esc(branch.name)}" ${branch.name === state.remoteRef ? 'selected' : ''}>${esc(branch.name)}</option>`).join('') || '<option value="">No remote refs</option>';
-  const query = refs.search.value.trim().toLowerCase(); const rows = state.commanderRows.filter(row => !query || row.name.toLowerCase().includes(query));
-  const upRow = state.commanderPath ? `<button class="commander-row commander-grid up-row" data-commander-up="1">
+  const flatMode = state.compareFlatMode;
+  const query = refs.search.value.trim().toLowerCase(); const rows = state.commanderRows.filter(row => compareRowVisible(row, query, flatMode ? state.compareFlatFilter : 'all'));
+  const upRow = state.commanderPath && !flatMode ? `<button class="commander-row commander-grid up-row" data-commander-up="1">
     <span class="commander-side local">${iconFor({kind:'folder'})}<span class="commander-file-copy"><strong>..</strong><small>Parent folder</small></span></span><span class="compare-state"><i></i></span><span class="commander-side remote">${iconFor({kind:'folder'})}<span class="commander-file-copy"><strong>..</strong><small>Parent folder</small></span></span>
   </button>` : '';
-  refs.commanderRows.innerHTML = upRow + rows.map(row => `<button class="commander-row commander-grid ${row.relative_path === state.commanderFocus ? 'focused' : ''}" data-commander-entry="${esc(row.relative_path)}">
-    ${commanderSide(row.local, 'local')}<span class="compare-state ${esc(row.status)}"><i></i>${esc(compareStatusText(row.status, branchCompareMode ? 'branch' : state.compareMode))}</span>${commanderSide(row.remote, 'remote')}</button>`).join('') || (state.commanderPath ? '' : '<div class="loading-row">No items to compare</div>');
+  const rowsHtml = flatMode
+    ? rows.map(row => flatCompareRowHtml(row, 'data-commander-entry')).join('')
+    : rows.map(row => `<button class="commander-row commander-grid ${row.relative_path === state.commanderFocus ? 'focused' : ''}" data-commander-entry="${esc(row.relative_path)}">
+    ${commanderSide(row.local, 'local')}<span class="compare-state ${esc(row.status)}"><i></i>${esc(compareStatusText(row.status, branchCompareMode ? 'branch' : state.compareMode))}</span>${commanderSide(row.remote, 'remote')}</button>`).join('');
+  refs.commanderRows.innerHTML = upRow + rowsHtml || `<div class="loading-row">${flatMode ? 'No changed files match this filter' : 'No items to compare'}</div>`;
   refs.commanderRows.querySelector('[data-commander-up]')?.addEventListener('click', () => { const parent = state.commanderPath.split('/').slice(0, -1).join('/'); openCommanderDirectory(parent); });
   refs.commanderRows.querySelectorAll('[data-commander-entry]').forEach(rowNode => {
     const row = state.commanderRows.find(item => item.relative_path === rowNode.dataset.commanderEntry);
     rowNode.addEventListener('dblclick', () => { const entry = row?.local || row?.remote; if (entry?.kind === 'folder') openCommanderDirectory(row.relative_path); });
     rowNode.addEventListener('click', () => { const localIsFile = !row?.local || row.local.kind === 'file'; const remoteIsFile = !row?.remote || row.remote.kind === 'file'; const eitherIsFile = row?.local?.kind === 'file' || row?.remote?.kind === 'file'; if (eitherIsFile && localIsFile && remoteIsFile) branchCompareMode ? openGitRevisionFileCompare(row) : openFileCompare(row); });
   });
-  const focused = refs.commanderRows.querySelector('.commander-row.focused'); if (focused) requestAnimationFrame(() => focused.scrollIntoView({ block: 'center' }));
+  const focused = refs.commanderRows.querySelector('.commander-row.focused, .flat-compare-row.focused'); if (focused) requestAnimationFrame(() => focused.scrollIntoView({ block: 'center' }));
 }
 
 function revisionDisplay(value = '') { return value ? value.slice(0, 8) : '—'; }
+function compareRowVisible(row, query = '', filter = 'all') {
+  const matchesFilter = filter === 'all' || row.status === filter;
+  if (!matchesFilter) return false;
+  if (!query) return true;
+  const haystack = [row.name, row.relative_path, row.local?.relative_path, row.remote?.relative_path].filter(Boolean).join(' ').toLowerCase();
+  return haystack.includes(query);
+}
 function compactRevisionValue(value = '') {
   const text = String(value || '').trim();
   return /^[0-9a-f]{16,40}$/i.test(text) ? text.slice(0, 12) : text;
@@ -1374,13 +1414,24 @@ function renderSubmoduleCompare() {
     refs.subCompareDownload.setAttribute('aria-label', ready ? 'Export compared submodule revisions to disk' : 'Compare two submodule revisions first');
   }
   renderSubmoduleCompareCommitList(compare);
+  if (refs.subCompareFlatToggle) {
+    refs.subCompareFlatToggle.classList.toggle('active', state.subCompareFlatMode);
+    refs.subCompareFlatToggle.textContent = state.subCompareFlatMode ? 'Folder tree' : 'Flat file list';
+  }
+  if (refs.subCompareFlatFilter) {
+    refs.subCompareFlatFilter.hidden = !state.subCompareFlatMode;
+    refs.subCompareFlatFilter.value = state.subCompareFlatFilter;
+  }
   const rowsSource = compare?.rows || [];
-  const query = refs.search.value.trim().toLowerCase(); const rows = rowsSource.filter(row => !query || row.name.toLowerCase().includes(query));
-  const upRow = state.commanderPath ? `<button class="commander-row commander-grid up-row" data-commander-up="1">
+  const query = refs.search.value.trim().toLowerCase(); const rows = rowsSource.filter(row => compareRowVisible(row, query, state.subCompareFlatMode ? state.subCompareFlatFilter : 'all'));
+  const upRow = state.commanderPath && !state.subCompareFlatMode ? `<button class="commander-row commander-grid up-row" data-commander-up="1">
     <span class="commander-side local">${iconFor({kind:'folder'})}<span class="commander-file-copy"><strong>..</strong><small>Parent folder</small></span></span><span class="compare-state"><i></i></span><span class="commander-side remote">${iconFor({kind:'folder'})}<span class="commander-file-copy"><strong>..</strong><small>Parent folder</small></span></span>
   </button>` : '';
-  refs.subCompareRows.innerHTML = upRow + rows.map(row => `<button class="commander-row commander-grid ${row.relative_path === state.commanderFocus ? 'focused' : ''}" data-sub-compare-entry="${esc(row.relative_path)}">
-    ${commanderSide(row.local, 'local')}<span class="compare-state ${esc(row.status)}"><i></i>${esc(compareStatusText(row.status, 'submodule'))}</span>${commanderSide(row.remote, 'remote')}</button>`).join('') || (state.commanderPath ? '' : '<div class="loading-row">No differences in this folder</div>');
+  const rowsHtml = state.subCompareFlatMode
+    ? rows.map(row => flatCompareRowHtml(row, 'data-sub-compare-entry')).join('')
+    : rows.map(row => `<button class="commander-row commander-grid ${row.relative_path === state.commanderFocus ? 'focused' : ''}" data-sub-compare-entry="${esc(row.relative_path)}">
+    ${commanderSide(row.local, 'local')}<span class="compare-state ${esc(row.status)}"><i></i>${esc(compareStatusText(row.status, 'submodule'))}</span>${commanderSide(row.remote, 'remote')}</button>`).join('');
+  refs.subCompareRows.innerHTML = upRow + rowsHtml || `<div class="loading-row">${state.subCompareFlatMode ? 'No changed files match this filter' : 'No differences in this folder'}</div>`;
   refs.subCompareRows.querySelector('[data-commander-up]')?.addEventListener('click', () => { const parent = state.commanderPath.split('/').slice(0, -1).join('/'); openSubmoduleCompareDirectory(parent); });
   refs.subCompareRows.querySelectorAll('[data-sub-compare-entry]').forEach(rowNode => {
     const row = rowsSource.find(item => item.relative_path === rowNode.dataset.subCompareEntry);
@@ -1395,7 +1446,7 @@ function renderSubmoduleCompare() {
       if (eitherIsFile && (!left || left.kind === 'file') && (!right || right.kind === 'file')) openSubmoduleRevisionFileCompare(row);
     });
   });
-  const focused = refs.subCompareRows.querySelector('.commander-row.focused'); if (focused) requestAnimationFrame(() => focused.scrollIntoView({ block: 'center' }));
+  const focused = refs.subCompareRows.querySelector('.commander-row.focused, .flat-compare-row.focused'); if (focused) requestAnimationFrame(() => focused.scrollIntoView({ block: 'center' }));
 }
 
 const openCommanderDirectoryGuard = createRequestGuard();
@@ -1412,8 +1463,8 @@ async function openCommanderDirectory(path) {
   if (!invoke) { state.commanderRows = previewCommanderRows(); render(); return; }
   try {
     const result = branchCompareMode
-      ? await invoke('compare_git_revisions_directory', { repositoryPath: state.repository.path, relativePath: path, leftRef: state.branchCompareLeftRef, rightRef: state.branchCompareRightRef })
-      : await invoke('compare_remote_directory', { repositoryPath: state.repository.path, relativePath: path, remoteRef: state.remoteRef });
+      ? await invoke(state.compareFlatMode ? 'compare_git_revisions_file_list' : 'compare_git_revisions_directory', { repositoryPath: state.repository.path, relativePath: path, leftRef: state.branchCompareLeftRef, rightRef: state.branchCompareRightRef })
+      : await invoke(state.compareFlatMode ? 'compare_remote_file_list' : 'compare_remote_directory', { repositoryPath: state.repository.path, relativePath: path, remoteRef: state.remoteRef });
     if (!stillCurrent()) return;
     state.commanderRows = result.rows;
     if (branchCompareMode) {
@@ -1440,7 +1491,7 @@ async function openSubmoduleCompareDirectory(path = state.commanderPath || '') {
     return;
   }
   try {
-    const result = await invoke('compare_submodule_revisions_directory', {
+    const result = await invoke(state.subCompareFlatMode ? 'compare_submodule_revisions_file_list' : 'compare_submodule_revisions_directory', {
       repositoryPath: state.repository.path,
       submodulePath: compare.submodulePath,
       relativePath: path,
@@ -1640,6 +1691,30 @@ async function openFileCompare(row) {
     if (!stillCurrent() || state.comparingRow !== row) return; // a newer file's compare (same guard) or the dialog moved on
     renderComparisonContents(comparison.local_content || (localMissing ? '(file does not exist locally)' : ''), comparison.remote_content);
   } catch (error) { if (stillCurrent() && state.comparingRow === row) { refs.localCompare.textContent = String(error); refs.remoteCompare.textContent = ''; } }
+}
+
+async function openIndexWorktreeCompare(change) {
+  if (!change?.path || !state.repository) return;
+  const row = { name: change.path.split('/').pop() || change.path, relative_path: change.path, local: { kind: 'file' }, remote: { kind: 'file' } };
+  state.comparingRow = row;
+  const stillCurrent = openFileCompareGuard();
+  refs.compareTitle.textContent = change.path;
+  refs.compareSubtitle.textContent = 'Working tree compared with the Git index · read-only';
+  refs.localCompare.textContent = refs.remoteCompare.textContent = 'Loading…';
+  setCompareReadOnly(true, 'Read-only compare between your working file and the staged/index version.');
+  setCompareHeadLabels('WORKING TREE', 'INDEX');
+  refs.compareDialog.showModal();
+  if (!invoke) { renderComparisonContents('working tree preview\n', 'index preview\n'); return; }
+  try {
+    const comparison = await invoke('compare_index_worktree_file', { repositoryPath: state.repository.path, relativePath: change.path });
+    if (!stillCurrent() || state.comparingRow !== row) return;
+    renderComparisonContents(comparison.local_content || '', comparison.remote_content || '');
+  } catch (error) {
+    if (stillCurrent() && state.comparingRow === row) {
+      refs.localCompare.textContent = String(error);
+      refs.remoteCompare.textContent = '';
+    }
+  }
 }
 
 function setCompareActionStatus(message, kind = '') { const node = $('#compareActionStatus'); node.textContent = message; node.className = `compare-status-line ${kind}`.trim(); }
@@ -4042,6 +4117,7 @@ function activeRepositoryContext() {
 function renderBranches() {
   const context = activeRepositoryContext();
   const { rows, detached, detachedAt } = selectBranchRows(context);
+  const compareAnchor = graphBranchCompareAnchorMatches(context) ? state.graphBranchCompareAnchor : null;
   // Point 2 of the report: a detached submodule (or parent) must show its
   // own explicit "Detached HEAD at <sha>" row/status — never leave the
   // sidebar merely *not* highlighting anything, which reads as "nothing is
@@ -4058,16 +4134,17 @@ function renderBranches() {
   // per-branch identity a sidebar row could legitimately mirror). Left
   // neutral (the bullet's plain CSS default) instead of inventing a mapping
   // that would just be a different false correspondence.
-  refs.branches.innerHTML = detachedRow + rows.map(branch => `<div class="branch-row ${branch.isHead ? 'active' : ''} ${branch.remote ? 'remote-branch' : 'local-branch'} ${branch.name === 'origin/main' ? 'primary-remote' : ''}" data-branch="${esc(branch.name)}" data-is-remote="${branch.remote ? 'true' : 'false'}">
+  refs.branches.innerHTML = detachedRow + rows.map(branch => `<div class="branch-row ${branch.isHead ? 'active' : ''} ${branch.remote ? 'remote-branch' : 'local-branch'} ${branch.name === 'origin/main' ? 'primary-remote' : ''} ${compareAnchor?.branch === branch.name ? 'compare-start' : ''}" data-branch="${esc(branch.name)}" data-is-remote="${branch.remote ? 'true' : 'false'}">
     <span class="branch-bullet"></span>
     <span class="branch-name">${esc(branch.name)}</span>
     <div style="display:flex;gap:6px;margin-left:auto;">
       ${branch.isHead ? '<small>HEAD</small>' : branch.remote ? `<small>${branch.name === 'origin/main' ? 'PRIMARY REMOTE' : 'REMOTE'}</small>` : `<button class="switch-branch" data-branch="${esc(branch.name)}" title="Switch to ${esc(branch.name)}">↔</button>`}
-      ${!branch.remote && !branch.isHead ? `<button class="branch-menu" data-branch="${esc(branch.name)}" title="Branch actions" style="width:20px;height:20px;padding:0;font-size:14px;border-radius:3px;">⋮</button>` : ''}
+      <button class="branch-menu" data-branch="${esc(branch.name)}" title="Branch actions" style="width:20px;height:20px;padding:0;font-size:14px;border-radius:3px;">⋮</button>
     </div>
   </div>`).join('') || (detached ? '' : '<div class="empty-change">No branches</div>');
   refs.branches.querySelectorAll('.switch-branch').forEach(button => button.addEventListener('click', event => { event.stopPropagation(); switchBranch(button.dataset.branch, button); }));
   refs.branches.querySelectorAll('.branch-menu').forEach(button => button.addEventListener('click', event => { event.stopPropagation(); showBranchMenu(button.dataset.branch, event); }));
+  refs.branches.querySelectorAll('.branch-row[data-branch]').forEach(row => row.addEventListener('contextmenu', event => showBranchMenu(row.dataset.branch, event)));
 }
 
 // Message D, point 5: the "SUBMODULE PULL REQUEST" section exists at all
@@ -4084,11 +4161,23 @@ function renderSubmodulePrHeading() {
 }
 
 function showBranchMenu(branchName, event) {
-  const menu = `<div style="position:fixed;top:${event.clientY}px;left:${event.clientX}px;z-index:100;background:#1a2530;border:1px solid #465563;border-radius:6px;box-shadow:0 8px 24px #0008;">
+  event.preventDefault();
+  event.stopPropagation();
+  document.querySelectorAll('.floating-action-menu, .branch-action-menu').forEach(menu => menu.remove());
+  const context = activeRepositoryContext();
+  const branch = (context.branches || []).find(item => item.name === branchName) || {};
+  const anchor = graphBranchCompareAnchorMatches(context) ? state.graphBranchCompareAnchor : null;
+  const compareWithStart = anchor && anchor.branch !== branchName
+    ? `<button style="display:block;width:100%;padding:8px 14px;text-align:left;border:0;background:transparent;color:#d8e5f0;cursor:pointer;font-size:12px;" data-action="compare-with-start">Compare with start · ${esc(anchor.branch)} → ${esc(branchName)}</button>`
+    : '';
+  const mutableLocal = !branch.remote && !branch.isHead;
+  const menu = `<div class="branch-action-menu" style="position:fixed;top:${event.clientY}px;left:${event.clientX}px;z-index:100;background:#1a2530;border:1px solid #465563;border-radius:6px;box-shadow:0 8px 24px #0008;">
     <button style="display:block;width:100%;padding:8px 14px;text-align:left;border:0;background:transparent;color:#d8e5f0;cursor:pointer;font-size:12px;" data-action="compare">Compare…</button>
+    <button style="display:block;width:100%;padding:8px 14px;text-align:left;border:0;background:transparent;color:#d8e5f0;cursor:pointer;font-size:12px;" data-action="compare-start">Set as compare start</button>
+    ${compareWithStart}
     <div style="height:1px;background:#465563;margin:2px 0;"></div>
-    <button style="display:block;width:100%;padding:8px 14px;text-align:left;border:0;background:transparent;color:#d8e5f0;cursor:pointer;font-size:12px;" data-action="rename">Rename</button>
-    <button style="display:block;width:100%;padding:8px 14px;text-align:left;border:0;background:transparent;color:#d8e5f0;cursor:pointer;font-size:12px;border-top:1px solid #465563;" data-action="delete">Delete</button>
+    ${mutableLocal ? `<button style="display:block;width:100%;padding:8px 14px;text-align:left;border:0;background:transparent;color:#d8e5f0;cursor:pointer;font-size:12px;" data-action="rename">Rename</button>
+    <button style="display:block;width:100%;padding:8px 14px;text-align:left;border:0;background:transparent;color:#d8e5f0;cursor:pointer;font-size:12px;border-top:1px solid #465563;" data-action="delete">Delete</button>` : '<div style="padding:7px 14px;color:#7f92a4;font-size:11px;">Remote/current branch: compare actions only</div>'}
   </div>`;
   const menuEl = document.createElement('div');
   menuEl.innerHTML = menu;
@@ -4099,6 +4188,8 @@ function showBranchMenu(branchName, event) {
       document.body.removeChild(menuContainer);
       const action = btn.dataset.action;
       if (action === 'compare') { await openGraphBranchCompare(branchName); }
+      else if (action === 'compare-start') { setGraphBranchCompareStart(branchName); renderBranches(); renderGraph(); }
+      else if (action === 'compare-with-start') { await openGraphBranchCompare(anchor.branch, branchName); state.graphBranchCompareAnchor = null; }
       else if (action === 'rename') { const newName = await customPrompt(`Rename branch "${branchName}" to:`, branchName, { title: 'Rename branch' }); if (newName && newName !== branchName) await renameBranch(branchName, newName); }
       else if (action === 'delete') { if (await customConfirm(`Delete branch "${branchName}"?`, { title: 'Delete branch', danger: true, okLabel: 'Delete' })) await deleteBranch(branchName); }
     });
@@ -4450,10 +4541,17 @@ const REF_BADGE_ICON = { tag: '◆ ' };
 function refsBadges(refList, isHead, currentBranchName) {
   const { badges, overflowTags, overflowBranches } = selectRefBadges(refList, { isHead, currentBranchName });
   if (!badges.length && !overflowTags.length && !overflowBranches.length) return '';
+  const branchCompareAnchor = graphBranchCompareAnchorMatches(activeRepositoryContext()) ? state.graphBranchCompareAnchor : null;
   const badgeHtml = badges.map(badge => {
     if (badge.kind === 'tag') return `<b class="ref-pill kind-tag" data-tag-name="${esc(badge.name)}" data-tooltip="Click for tag details">${REF_BADGE_ICON.tag}${esc(badge.name)}</b>`;
-    if (badge.kind === 'local_branch') return `<b class="ref-pill kind-local_branch branch-ref-pill" data-graph-ref-kind="local_branch" data-graph-ref-name="${esc(badge.name)}" data-tooltip="Local branch tip — right-click for actions"><i>⑂ BRANCH</i>${esc(badge.name)}</b>`;
-    if (badge.kind === 'remote_branch') return `<b class="ref-pill kind-remote_branch branch-ref-pill ${badge.name === 'origin/main' ? 'primary-remote' : ''}" data-graph-ref-kind="remote_branch" data-graph-ref-name="${esc(badge.name)}" data-tooltip="${badge.name === 'origin/main' ? 'Primary origin branch tip' : 'Remote-tracking branch tip'} — right-click for actions"><i>${badge.name === 'origin/main' ? 'PRIMARY REMOTE' : 'REMOTE'}</i>${esc(badge.name)}</b>`;
+    const compareSelected = branchCompareAnchor?.branch === badge.name ? ' compare-start' : '';
+    const compareTip = compareSelected
+      ? 'Compare start selected — click another branch to compare'
+      : branchCompareAnchor
+        ? `Click to compare ${branchCompareAnchor.branch} with this branch`
+        : 'Click to select as compare start; right-click for actions';
+    if (badge.kind === 'local_branch') return `<b class="ref-pill kind-local_branch branch-ref-pill${compareSelected}" data-graph-ref-kind="local_branch" data-graph-ref-name="${esc(badge.name)}" data-tooltip="${esc(compareTip)}"><i>⑂ BRANCH</i>${esc(badge.name)}</b>`;
+    if (badge.kind === 'remote_branch') return `<b class="ref-pill kind-remote_branch branch-ref-pill ${badge.name === 'origin/main' ? 'primary-remote' : ''}${compareSelected}" data-graph-ref-kind="remote_branch" data-graph-ref-name="${esc(badge.name)}" data-tooltip="${esc(compareTip)}"><i>${badge.name === 'origin/main' ? 'PRIMARY REMOTE' : 'REMOTE'}</i>${esc(badge.name)}</b>`;
     return `<b class="ref-pill kind-${badge.kind}">${esc(badge.name)}</b>`;
   }).join('');
   const tagOverflow = overflowTags.length ? `<b class="ref-pill kind-tag ref-pill-more" data-tooltip="${esc(overflowTags.map(t => t.name).join(', '))}">+${overflowTags.length} tags</b>` : '';
@@ -4666,6 +4764,7 @@ function buildCommitRowHtml(commit, index, ctx) {
   const hasRemoteBranchRef = refKinds.has('remote_branch');
   const hasPrimaryRemoteRef = (node.refs || []).some(ref => ref.kind === 'remote_branch' && ref.name === 'origin/main');
   const isCommandBranchStart = state.branchStartMarker?.repositoryPath === activeGraphData().path && state.branchStartMarker?.id === commit.id;
+  const isCommitCompareStart = graphCommitCompareAnchorMatches(activeRepositoryContext()) && state.graphCommitCompareAnchor?.commitId === commit.id;
   const matchesFilter = ctx.refFilter === 'all' || isBranchPoint || (ctx.refFilter === 'branches' ? (refKinds.has('local_branch') || refKinds.has('remote_branch')) : refKinds.has('tag'));
   const isFilterDimmed = !matchesFilter;
   const mergePresentation = mergeCommitPresentation(commit, ctx);
@@ -4677,9 +4776,10 @@ function buildCommitRowHtml(commit, index, ctx) {
     isCommonAncestorWithMain ? `<b class="branch-point-pill common-main-pill" data-tooltip="Real merge-base between HEAD and ${esc(commonAncestorBaseRef)} — where this checkout diverged from main">Branch start</b>` : '',
     !isCommonAncestorWithMain && isBranchPoint ? '<b class="branch-point-pill" data-tooltip="Common ancestor or lane transition — computed from commit parents, not lane color">⑂</b>' : '',
     isCommandBranchStart ? `<b class="branch-point-pill command-start-pill" data-tooltip="merge-base with ${esc(state.branchStartMarker.baseRef)} — where this branch split from the selected base">Command start</b>` : '',
+    isCommitCompareStart ? '<b class="branch-point-pill compare-start-pill" data-tooltip="Commit compare start — right-click another commit to compare">Compare start</b>' : '',
   ].join('');
 
-  return `<article class="commit-row ${node.isHead ? 'is-head' : ''} ${hasPrimaryRemoteRef ? 'has-primary-remote-tip' : hasLocalBranchRef ? 'has-local-branch-tip' : hasRemoteBranchRef ? 'has-remote-branch-tip' : ''} ${isBranchPoint ? 'is-branch-point' : ''} ${isCommonAncestorWithMain ? 'is-common-ancestor-main' : ''} ${isMergeCommit ? 'is-merge-commit' : ''} ${isCommandBranchStart ? 'is-command-branch-start' : ''} ${isMatch ? 'is-search-match' : ''} ${isSearchDimmed || isFilterDimmed ? 'is-search-dimmed' : ''}" data-id="${esc(commit.id)}" data-lane="${node.lane}">
+  return `<article class="commit-row ${node.isHead ? 'is-head' : ''} ${hasPrimaryRemoteRef ? 'has-primary-remote-tip' : hasLocalBranchRef ? 'has-local-branch-tip' : hasRemoteBranchRef ? 'has-remote-branch-tip' : ''} ${isBranchPoint ? 'is-branch-point' : ''} ${isCommonAncestorWithMain ? 'is-common-ancestor-main' : ''} ${isMergeCommit ? 'is-merge-commit' : ''} ${isCommandBranchStart ? 'is-command-branch-start' : ''} ${isCommitCompareStart ? 'is-commit-compare-start' : ''} ${isMatch ? 'is-search-match' : ''} ${isSearchDimmed || isFilterDimmed ? 'is-search-dimmed' : ''}" data-id="${esc(commit.id)}" data-lane="${node.lane}">
     <div class="graph-cell"></div>
     <div class="commit-body">
       <div class="commit-card"><div class="commit-main"><div class="commit-title-line">${structuralBadges}<span class="commit-title">${commitSubjectHtml(commit.subject)}</span></div><div class="commit-ref-line">${refsBadges(node.refs, node.isHead, ctx.currentBranch)}${stashPills}</div></div><span class="commit-id-wrap"><button type="button" class="commit-copy-sha" data-copy-commit-sha="${esc(commit.id)}" title="Copy full commit SHA">${esc(commit.id.slice(0, 8))} ⧉</button></span>
@@ -4800,12 +4900,97 @@ function graphCheckoutBranchMenuItem(branchName, kind = 'local_branch', id = 'ch
   };
 }
 
-async function openGraphBranchCompare(branchName) {
+function graphBranchCompareAnchorMatches(context, anchor = state.graphBranchCompareAnchor) {
+  return Boolean(anchor && context && anchor.path === context.path && anchor.isSubmodule === context.isSubmodule && anchor.relativePath === context.relativePath);
+}
+
+function graphCommitCompareAnchorMatches(context, anchor = state.graphCommitCompareAnchor) {
+  return Boolean(anchor && context && anchor.path === context.path && anchor.isSubmodule === context.isSubmodule && anchor.relativePath === context.relativePath);
+}
+
+function setGraphBranchCompareStart(branchName) {
+  const context = activeRepositoryContext();
+  if (!context.path || !branchName) return;
+  state.graphBranchCompareAnchor = {
+    branch: branchName,
+    path: context.path,
+    isSubmodule: context.isSubmodule,
+    parentPath: context.parentPath,
+    relativePath: context.relativePath,
+    name: context.name,
+  };
+  status(`Compare start set to ${branchName}. Right-click another branch and choose Compare with start.`);
+}
+
+async function handleGraphBranchCompareSelection(branchName) {
+  const context = activeRepositoryContext();
+  const anchor = graphBranchCompareAnchorMatches(context) ? state.graphBranchCompareAnchor : null;
+  if (!anchor || anchor.branch === branchName) {
+    setGraphBranchCompareStart(branchName);
+    renderGraph();
+    return;
+  }
+  const left = anchor.branch;
+  state.graphBranchCompareAnchor = null;
+  await openGraphBranchCompare(left, branchName);
+}
+
+function setGraphCommitCompareStart(commitId) {
+  const context = activeRepositoryContext();
+  if (!context.path || !commitId) return;
+  state.graphCommitCompareAnchor = {
+    commitId,
+    path: context.path,
+    isSubmodule: context.isSubmodule,
+    parentPath: context.parentPath,
+    relativePath: context.relativePath,
+    name: context.name,
+  };
+  status(`Compare start set to ${commitId.slice(0, 8)}. Right-click any other commit and choose Compare with start.`);
+}
+
+async function handleGraphCommitCompareSelection(commitId) {
+  const context = activeRepositoryContext();
+  const anchor = graphCommitCompareAnchorMatches(context) ? state.graphCommitCompareAnchor : null;
+  if (!anchor || anchor.commitId === commitId) {
+    setGraphCommitCompareStart(commitId);
+    renderGraph();
+    return;
+  }
+  const left = anchor.commitId;
+  state.graphCommitCompareAnchor = null;
+  await openGraphRevisionCompare(left, commitId);
+}
+
+async function openGraphRevisionCompare(leftRef, rightRef = '') {
+  const context = activeRepositoryContext();
+  if (!context.path || !leftRef || !rightRef) return;
+  if (context.isSubmodule) {
+    const entry = { kind: 'submodule', name: context.name, relative_path: context.relativePath };
+    return openSubmoduleCompareFromEntry(entry, { leftRef, rightRef });
+  }
+  closeSubmoduleGraph();
+  state.view = 'commander';
+  state.compareMode = 'git';
+  state.gitCompareMode = 'refs';
+  state.commanderPath = '';
+  state.commanderRows = [];
+  state.commanderFocus = '';
+  state.branchCompareLeftRef = leftRef;
+  state.branchCompareRightRef = rightRef;
+  state.branchCompareLeftRevision = '';
+  state.branchCompareRightRevision = '';
+  refs.search.value = '';
+  render();
+  await openCommanderDirectory('');
+}
+
+async function openGraphBranchCompare(branchName, rightRef = '') {
   const context = activeRepositoryContext();
   if (!context.path || !branchName) return;
   if (context.isSubmodule) {
     const entry = { kind: 'submodule', name: context.name, relative_path: context.relativePath };
-    return openSubmoduleCompareFromEntry(entry, { leftRef: branchName, rightRef: context.currentBranch || context.headOid || 'HEAD' });
+    return openSubmoduleCompareFromEntry(entry, { leftRef: branchName, rightRef: rightRef || context.currentBranch || context.headOid || 'HEAD' });
   }
   closeSubmoduleGraph();
   state.view = 'commander';
@@ -4815,7 +5000,7 @@ async function openGraphBranchCompare(branchName) {
   state.commanderRows = [];
   state.commanderFocus = '';
   state.branchCompareLeftRef = branchName;
-  state.branchCompareRightRef = defaultBranchCompareRightRef(branchName);
+  state.branchCompareRightRef = rightRef || defaultBranchCompareRightRef(branchName);
   state.branchCompareLeftRevision = '';
   state.branchCompareRightRevision = '';
   refs.search.value = '';
@@ -4824,8 +5009,17 @@ async function openGraphBranchCompare(branchName) {
 }
 
 function showGraphBranchContextMenu(event, branchName, kind = 'local_branch') {
-  showFloatingMenu(event, [
+  const context = activeRepositoryContext();
+  const anchor = graphBranchCompareAnchorMatches(context) ? state.graphBranchCompareAnchor : null;
+  const compareItems = [
     { id: 'compare-branch', label: 'Compare this branch…', detail: 'Open Compare & Sync with this as the start ref', run: () => openGraphBranchCompare(branchName) },
+    { id: 'compare-start', label: 'Set as compare start', detail: branchName, run: () => setGraphBranchCompareStart(branchName) },
+  ];
+  if (anchor && anchor.branch !== branchName) {
+    compareItems.push({ id: 'compare-with-start', label: 'Compare with start', detail: `${anchor.branch} → ${branchName}`, run: () => openGraphBranchCompare(anchor.branch, branchName) });
+  }
+  showFloatingMenu(event, [
+    ...compareItems,
     { separator: true },
     graphCheckoutBranchMenuItem(branchName, kind),
     { separator: true },
@@ -4895,25 +5089,37 @@ async function restoreExactCheckpointFromGraphCommit(commitId) {
 
 function showGraphCommitContextMenu(event, commitId) {
   const branchRefs = graphBranchRefsForCommit(commitId).slice(0, 6);
+  const context = activeRepositoryContext();
+  const commitAnchor = graphCommitCompareAnchorMatches(context) ? state.graphCommitCompareAnchor : null;
+  const commitCompareItems = [
+    {
+      id: 'compare-commit-head',
+      label: 'Compare this commit with HEAD',
+      detail: `${commitId.slice(0, 8)} ↔ HEAD`,
+      run: () => openGraphRevisionCompare(commitId, 'HEAD'),
+    },
+    {
+      id: 'compare-commit-start',
+      label: 'Set commit as compare start',
+      detail: commitId.slice(0, 8),
+      run: () => { setGraphCommitCompareStart(commitId); renderGraph(); },
+    },
+  ];
+  if (commitAnchor && commitAnchor.commitId !== commitId) {
+    commitCompareItems.unshift({
+      id: 'compare-commit-with-start',
+      label: 'Compare with start',
+      detail: `${commitAnchor.commitId.slice(0, 8)} → ${commitId.slice(0, 8)}`,
+      run: () => { const start = commitAnchor.commitId; state.graphCommitCompareAnchor = null; openGraphRevisionCompare(start, commitId); },
+    });
+  }
   const checkoutItems = branchRefs
     .filter(ref => ref.kind === 'local_branch')
     .slice(0, 3)
     .map((ref, index) => graphCheckoutBranchMenuItem(ref.name, ref.kind, `checkout-${index}`));
   const mergeItems = branchRefs.map((ref, index) => graphMergeMenuItem(ref.name, `merge-${index}`));
-  const submoduleCompareItems = [];
-  if (state.submoduleGraph) {
-    const anchor = state.submoduleCompareAnchor;
-    const sameSubmoduleAnchor = anchor?.parentPath === state.submoduleGraph.parentRepositoryPath && anchor?.relativePath === state.submoduleGraph.relativePath;
-    submoduleCompareItems.push(
-      { id: 'compare-head', label: 'Compare with current HEAD', detail: `${commitId.slice(0, 8)} ↔ ${(state.submoduleGraph.repository.head_oid || 'HEAD').slice(0, 8)}`, run: () => openSubmoduleCompareFromGraphCommit(commitId) },
-      { id: 'compare-start', label: 'Set as compare start', detail: commitId.slice(0, 8), run: () => { state.submoduleCompareAnchor = { parentPath: state.submoduleGraph.parentRepositoryPath, relativePath: state.submoduleGraph.relativePath, name: state.submoduleGraph.name, revision: commitId }; status(`Compare start set to ${commitId.slice(0, 8)}. Right-click another commit and choose Compare with start.`); } },
-    );
-    if (sameSubmoduleAnchor && anchor.revision !== commitId) {
-      submoduleCompareItems.push({ id: 'compare-anchor', label: 'Compare with start', detail: `${anchor.revision.slice(0, 8)} → ${commitId.slice(0, 8)}`, run: () => openSubmoduleCompareFromGraphCommit(anchor.revision, commitId) });
-    }
-  }
   const menuItems = [];
-  if (submoduleCompareItems.length) menuItems.push(...submoduleCompareItems, { separator: true });
+  menuItems.push(...commitCompareItems, { separator: true });
   if (checkoutItems.length) menuItems.push(...checkoutItems, { separator: true });
   if (mergeItems.length) menuItems.push(...mergeItems, { separator: true });
   menuItems.push(
@@ -4940,6 +5146,10 @@ function wireGraphRowInteractions(rowElements) {
     copyText(button.dataset.copyCommitSha || '', 'Commit SHA copied.');
   })));
   rowElements.forEach(row => row.querySelectorAll('[data-graph-ref-name]').forEach(pill => pill.addEventListener('contextmenu', event => showGraphBranchContextMenu(event, pill.dataset.graphRefName, pill.dataset.graphRefKind))));
+  rowElements.forEach(row => row.querySelectorAll('[data-graph-ref-name]').forEach(pill => pill.addEventListener('click', event => {
+    event.stopPropagation();
+    handleGraphBranchCompareSelection(pill.dataset.graphRefName).catch(error => handleError(error));
+  })));
   rowElements.forEach(row => row.querySelectorAll('[data-tag-name]').forEach(pill => pill.addEventListener('click', event => { event.stopPropagation(); showTagDetails(pill.dataset.tagName); })));
   rowElements.forEach(row => row.querySelectorAll('[data-toggle-stash]').forEach(pill => pill.addEventListener('click', event => {
     event.stopPropagation();
@@ -5388,10 +5598,15 @@ function renderChanges() {
   refs.changesSummary.textContent = scopedChanges.length ? `${scopedChanges.length} file${scopedChanges.length === 1 ? '' : 's'} available for staging` : `No changes in ${scope ? `/${scope}` : 'the repository'}`;
   $('#stageAllButton').disabled = scopedChanges.length === 0;
   $('#unstageAllButton').disabled = !scopedChanges.some(change => change.staged);
-  refs.changes.innerHTML = scopedChanges.map(change => `<div class="change-row-wrap"><label class="change-row"><input type="checkbox" data-change-path="${esc(change.path)}" ${change.staged ? 'checked' : ''}>
+  refs.changes.innerHTML = scopedChanges.map(change => `<div class="change-row-wrap diffable" data-change-compare-path="${esc(change.path)}" title="Double-click to compare working tree with the Git index"><label class="change-row"><input type="checkbox" data-change-path="${esc(change.path)}" ${change.staged ? 'checked' : ''}>
     <span class="status-code">${esc(change.status)}</span><span class="change-path">${esc(change.path)}</span><span class="change-state">${esc(changeDisplayState(change))}</span></label>
     <button class="stash-file-btn" data-stash-path="${esc(change.path)}" title="Set aside just this file in its own repository's stash. Parent projects and submodules have separate stash lists.">⇕ Stash</button></div>`).join('') || `<div class="empty-change">No changes inside /${esc(scope)}</div>`;
   refs.changes.querySelectorAll('[data-stash-path]').forEach(button => button.addEventListener('click', () => stashOneFile(button.dataset.stashPath)));
+  refs.changes.querySelectorAll('[data-change-compare-path]').forEach(row => row.addEventListener('dblclick', event => {
+    if (event.target.closest('input,button')) return;
+    const change = scopedChanges.find(item => item.path === row.dataset.changeComparePath);
+    openIndexWorktreeCompare(change).catch(error => handleError(error));
+  }));
   refs.changes.querySelectorAll('[data-change-path]').forEach(input => {
     // Belt-and-suspenders against a real Chromium/WebView2 quirk: a checkbox
     // just toggled by the user can have its *rendered* `checked` attribute
@@ -6168,6 +6383,11 @@ refs.branchCompareSwap?.addEventListener('click', () => {
   if (state.compareMode === 'git' && state.gitCompareMode === 'refs') openCommanderDirectory(state.commanderPath);
 });
 refs.branchCompareRefresh?.addEventListener('click', () => openCommanderDirectory(state.commanderPath));
+refs.gitCompareFlatToggle?.addEventListener('click', () => {
+  state.compareFlatMode = !state.compareFlatMode;
+  openCommanderDirectory(state.commanderPath);
+});
+refs.gitCompareFlatFilter?.addEventListener('change', () => { state.compareFlatFilter = refs.gitCompareFlatFilter.value || 'all'; renderCommander(); });
 function applySubmoduleCompareRevisionInputs() {
   if (!state.submoduleCompare) return false;
   state.submoduleCompare.leftRef = refs.subCompareLeftRef.value.trim();
@@ -6309,6 +6529,11 @@ refs.subCompareRefresh.addEventListener('click', () => {
   openSubmoduleCompareDirectory(state.commanderPath || '');
 });
 refs.subCompareDownload.addEventListener('click', () => exportSubmoduleCompareSnapshots().catch(error => handleError(error)));
+refs.subCompareFlatToggle?.addEventListener('click', () => {
+  state.subCompareFlatMode = !state.subCompareFlatMode;
+  openSubmoduleCompareDirectory(state.commanderPath || '');
+});
+refs.subCompareFlatFilter?.addEventListener('change', () => { state.subCompareFlatFilter = refs.subCompareFlatFilter.value || 'all'; renderSubmoduleCompare(); });
 refs.subCompareSwap.addEventListener('click', () => {
   if (!state.submoduleCompare) return;
   const left = refs.subCompareLeftRef.value.trim();

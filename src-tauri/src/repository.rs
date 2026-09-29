@@ -7051,6 +7051,112 @@ fn compare_git_tree_directory(repository_path: &str, relative_path: &str, left_r
     })
 }
 
+fn revision_compare_result(repository_path: &str, relative_path: String, left_ref: &str, right_ref: &str, left_revision: String, right_revision: String, rows: Vec<CommanderRow>) -> RevisionCompareDirectory {
+    RevisionCompareDirectory {
+        left_ref: left_ref.into(),
+        right_ref: right_ref.into(),
+        left_revision: left_revision.clone(),
+        right_revision: right_revision.clone(),
+        relative_path,
+        rows,
+        left_only_commits: revision_commits_between(repository_path, &right_revision, &left_revision, 100),
+        right_only_commits: revision_commits_between(repository_path, &left_revision, &right_revision, 100),
+    }
+}
+
+fn diff_file_entry(repo: &Repository, path: Option<&Path>, oid: Oid) -> Option<CommanderEntry> {
+    let path = path?;
+    let relative_path = normalized(path);
+    if relative_path.is_empty() || repo.find_blob(oid).is_err() { return None; }
+    let name = path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_else(|| relative_path.clone());
+    let size = repo.find_blob(oid).map(|blob| blob.size() as u64).unwrap_or(0);
+    Some(CommanderEntry { name, relative_path, kind: "file".into(), size })
+}
+
+fn workdir_diff_file_entry(repository_path: &str, path: Option<&Path>) -> Option<CommanderEntry> {
+    let path = path?;
+    let relative_path = normalized(path);
+    if relative_path.is_empty() { return None; }
+    let absolute = Path::new(repository_path).join(path);
+    let metadata = fs::metadata(&absolute).ok()?;
+    if !metadata.is_file() { return None; }
+    let name = path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_else(|| relative_path.clone());
+    Some(CommanderEntry { name, relative_path, kind: "file".into(), size: metadata.len() })
+}
+
+fn compare_git_tree_file_list(repository_path: &str, relative_path: &str, left_ref: &str, right_ref: &str) -> Result<RevisionCompareDirectory, String> {
+    let relative = safe_relative_path(relative_path)?;
+    let relative_path = normalized(&relative);
+    let left_revision = resolve_commit(repository_path, left_ref)?;
+    let right_revision = resolve_commit(repository_path, right_ref)?;
+    let repo = internal_repository(repository_path)?;
+    let left_oid = git2::Oid::from_str(&left_revision).map_err(|error| error.message().to_string())?;
+    let right_oid = git2::Oid::from_str(&right_revision).map_err(|error| error.message().to_string())?;
+    let left_tree = repo.find_commit(left_oid).and_then(|commit| commit.tree()).map_err(|error| error.message().to_string())?;
+    let right_tree = repo.find_commit(right_oid).and_then(|commit| commit.tree()).map_err(|error| error.message().to_string())?;
+    let mut options = git2::DiffOptions::new();
+    if !relative_path.is_empty() { options.pathspec(&relative_path); }
+    let diff = repo.diff_tree_to_tree(Some(&left_tree), Some(&right_tree), Some(&mut options)).map_err(|error| error.message().to_string())?;
+    let mut rows = Vec::new();
+    for delta in diff.deltas() {
+        let old_file = delta.old_file();
+        let new_file = delta.new_file();
+        let local = diff_file_entry(&repo, old_file.path(), old_file.id());
+        let remote = diff_file_entry(&repo, new_file.path(), new_file.id());
+        if local.is_none() && remote.is_none() { continue; }
+        let status = match delta.status() {
+            git2::Delta::Added => "remote-only",
+            git2::Delta::Deleted => "local-only",
+            git2::Delta::Typechange => "type-changed",
+            _ => "modified",
+        }.to_string();
+        let relative_path = local.as_ref().or(remote.as_ref()).map(|entry| entry.relative_path.clone()).unwrap_or_default();
+        let name = relative_path.clone();
+        rows.push(CommanderRow { name, relative_path, local, remote, status });
+    }
+    rows.sort_by(|a, b| a.relative_path.to_lowercase().cmp(&b.relative_path.to_lowercase()));
+    Ok(revision_compare_result(repository_path, relative_path, left_ref, right_ref, left_revision, right_revision, rows))
+}
+
+fn compare_remote_file_list_inner(repository_path: &str, relative_path: &str, remote_ref: &str) -> Result<CommanderDirectory, String> {
+    if let Some((sub_path, inner_relative)) = resolve_submodule_boundary(repository_path, relative_path) {
+        let sub_remote_ref = default_remote_ref(&sub_path).ok_or("This submodule has no remote-tracking branch. Fetch the submodule first.")?;
+        return compare_remote_file_list_inner(&sub_path, &inner_relative, &sub_remote_ref);
+    }
+    let relative = safe_relative_path(relative_path)?;
+    let relative_path = normalized(&relative);
+    let commit = resolve_commit(repository_path, remote_ref)?;
+    let repo = internal_repository(repository_path)?;
+    let oid = git2::Oid::from_str(&commit).map_err(|error| error.message().to_string())?;
+    let tree = repo.find_commit(oid).and_then(|commit| commit.tree()).map_err(|error| error.message().to_string())?;
+    let mut options = git2::DiffOptions::new();
+    if !relative_path.is_empty() { options.pathspec(&relative_path); }
+    options
+        .include_untracked(true)
+        .recurse_untracked_dirs(true)
+        .include_typechange(true)
+        .include_unmodified(false);
+    let diff = repo.diff_tree_to_workdir_with_index(Some(&tree), Some(&mut options)).map_err(|error| error.message().to_string())?;
+    let mut rows = Vec::new();
+    for delta in diff.deltas() {
+        let old_file = delta.old_file();
+        let new_file = delta.new_file();
+        let local = workdir_diff_file_entry(repository_path, new_file.path());
+        let remote = diff_file_entry(&repo, old_file.path(), old_file.id());
+        if local.is_none() && remote.is_none() { continue; }
+        let status = match delta.status() {
+            git2::Delta::Added | git2::Delta::Untracked => "local-only",
+            git2::Delta::Deleted => "remote-only",
+            git2::Delta::Typechange => "type-changed",
+            _ => "modified",
+        }.to_string();
+        let relative_path = local.as_ref().or(remote.as_ref()).map(|entry| entry.relative_path.clone()).unwrap_or_default();
+        rows.push(CommanderRow { name: relative_path.clone(), relative_path, local, remote, status });
+    }
+    rows.sort_by(|a, b| a.relative_path.to_lowercase().cmp(&b.relative_path.to_lowercase()));
+    Ok(CommanderDirectory { remote_ref: remote_ref.into(), remote_revision: commit, relative_path, rows })
+}
+
 fn tree_file_content(repository_path: &str, revision: &str, relative_path: &str) -> Result<Option<Vec<u8>>, String> {
     let repo = internal_repository(repository_path)?;
     let oid = git2::Oid::from_str(revision).map_err(|error| error.message().to_string())?;
@@ -7190,6 +7296,14 @@ pub fn compare_remote_directory(repository_path: String, relative_path: String, 
 }
 
 #[tauri::command]
+pub async fn compare_remote_file_list(repository_path: String, relative_path: String, remote_ref: String) -> Result<CommanderDirectory, String> {
+    off_main_thread(move || {
+        validate_path(&repository_path)?;
+        compare_remote_file_list_inner(&repository_path, &relative_path, &remote_ref)
+    }).await
+}
+
+#[tauri::command]
 pub fn compare_file_contents(repository_path: String, relative_path: String, remote_ref: String) -> Result<FileComparison, String> {
     validate_path(&repository_path)?;
     if let Some((sub_path, inner_relative)) = resolve_submodule_boundary(&repository_path, &relative_path) {
@@ -7211,6 +7325,42 @@ pub fn compare_file_contents(repository_path: String, relative_path: String, rem
     Ok(FileComparison { relative_path, remote_ref, local_content: String::from_utf8_lossy(&local).into_owned(), remote_content: String::from_utf8_lossy(&remote).into_owned() })
 }
 
+fn compare_index_worktree_file_inner(repository_path: String, relative_path: String) -> Result<FileComparison, String> {
+    validate_path(&repository_path)?;
+    if let Some((sub_path, inner_relative)) = resolve_submodule_boundary(&repository_path, &relative_path) {
+        if inner_relative.is_empty() { return Err("Choose a file inside the submodule to compare with its index".into()); }
+        return compare_index_worktree_file_inner(sub_path, inner_relative);
+    }
+    let relative = safe_relative_path(&relative_path)?;
+    let relative_path = normalized(&relative);
+    let absolute = Path::new(&repository_path).join(&relative);
+    let worktree = match fs::read(&absolute) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(format!("Cannot read working-tree file: {error}")),
+    };
+    let repo = internal_repository(&repository_path)?;
+    let index = repo.index().map_err(|error| error.message().to_string())?;
+    let indexed = match index.get_path(&relative, 0) {
+        Some(entry) => repo.find_blob(entry.id).map_err(|error| error.message().to_string())?.content().to_vec(),
+        None => Vec::new(),
+    };
+    if worktree.len() > 1_000_000 || indexed.len() > 1_000_000 || worktree.contains(&0) || indexed.contains(&0) {
+        return Err("Binary files and files over 1 MB are not shown in the text compare view".into());
+    }
+    Ok(FileComparison {
+        relative_path,
+        remote_ref: "index".into(),
+        local_content: String::from_utf8_lossy(&worktree).into_owned(),
+        remote_content: String::from_utf8_lossy(&indexed).into_owned(),
+    })
+}
+
+#[tauri::command]
+pub async fn compare_index_worktree_file(repository_path: String, relative_path: String) -> Result<FileComparison, String> {
+    off_main_thread(move || compare_index_worktree_file_inner(repository_path, relative_path)).await
+}
+
 // Reads one blob header per directory entry plus two bounded revwalks — on a
 // large submodule folder that is real work, so it must not run on the webview
 // UI thread.
@@ -7227,11 +7377,29 @@ pub async fn compare_git_revisions_directory(repository_path: String, relative_p
     }).await
 }
 
+#[tauri::command]
+pub async fn compare_git_revisions_file_list(repository_path: String, relative_path: String, left_ref: String, right_ref: String) -> Result<RevisionCompareDirectory, String> {
+    off_main_thread(move || {
+        validate_path(&repository_path)?;
+        compare_git_tree_file_list(&repository_path, &relative_path, &left_ref, &right_ref)
+    }).await
+}
+
 fn compare_submodule_revisions_directory_inner(repository_path: String, submodule_path: String, relative_path: String, left_ref: String, right_ref: String) -> Result<RevisionCompareDirectory, String> {
     validate_path(&repository_path)?;
     let absolute = validate_submodule(&repository_path, &submodule_path)?;
     let submodule_repository = absolute.to_string_lossy().into_owned();
     compare_git_tree_directory(&submodule_repository, &relative_path, &left_ref, &right_ref)
+}
+
+#[tauri::command]
+pub async fn compare_submodule_revisions_file_list(repository_path: String, submodule_path: String, relative_path: String, left_ref: String, right_ref: String) -> Result<RevisionCompareDirectory, String> {
+    off_main_thread(move || {
+        validate_path(&repository_path)?;
+        let absolute = validate_submodule(&repository_path, &submodule_path)?;
+        let submodule_repository = absolute.to_string_lossy().into_owned();
+        compare_git_tree_file_list(&submodule_repository, &relative_path, &left_ref, &right_ref)
+    }).await
 }
 
 #[tauri::command]
@@ -13631,6 +13799,81 @@ mod tests {
             run_git_capture(&dependency, &["rev-parse", "HEAD~1"]),
             "export must not move the checked-out submodule"
         );
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn git_revision_file_list_finds_changes_at_any_depth_unlike_the_one_level_directory_view() {
+        // The whole point of the "flat file list" compare mode is to surface a
+        // file several folders deep without the user having to click into each
+        // intermediate folder — prove the flat listing actually reaches it,
+        // while the one-level directory view at the root only reports the
+        // top-level folder as "modified".
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let repository = std::env::temp_dir().join(format!("git-integrity-flat-file-list-{suffix}"));
+        fs::create_dir_all(repository.join("a/b/c")).unwrap();
+        fs::write(repository.join("a/b/c/deep.txt"), "v1\n").unwrap();
+        fs::write(repository.join("top.txt"), "v1\n").unwrap();
+        create_libgit2_repository(&repository, "README.md");
+        run_git(&repository, &["add", "."]);
+        run_git(&repository, &["commit", "-m", "Add nested and top-level files"]);
+        let base_commit = run_git_capture(&repository, &["rev-parse", "HEAD"]);
+
+        fs::write(repository.join("a/b/c/deep.txt"), "v2\n").unwrap();
+        fs::write(repository.join("a/b/new.txt"), "new\n").unwrap();
+        fs::remove_file(repository.join("top.txt")).unwrap();
+        run_git(&repository, &["add", "-A"]);
+        run_git(&repository, &["commit", "-m", "Change nested files, remove top-level file"]);
+        let head_commit = run_git_capture(&repository, &["rev-parse", "HEAD"]);
+
+        let repo_path = repository.to_string_lossy().into_owned();
+        let flat = compare_git_tree_file_list(&repo_path, "", &base_commit, &head_commit).unwrap();
+        let deep_row = flat.rows.iter().find(|row| row.relative_path == "a/b/c/deep.txt").expect("nested file must appear in the flat list");
+        assert_eq!(deep_row.status, "modified");
+        let new_row = flat.rows.iter().find(|row| row.relative_path == "a/b/new.txt").expect("nested new file must appear in the flat list");
+        assert_eq!(new_row.status, "remote-only");
+        let top_row = flat.rows.iter().find(|row| row.relative_path == "top.txt").expect("deleted top-level file must appear in the flat list");
+        assert_eq!(top_row.status, "local-only");
+        assert!(!flat.rows.iter().any(|row| row.relative_path == "a" || row.relative_path == "a/b"), "the flat list must never report an intermediate folder as a row");
+
+        let one_level = compare_git_tree_directory(&repo_path, "", &base_commit, &head_commit).unwrap();
+        let a_row = one_level.rows.iter().find(|row| row.name == "a").expect("one-level view stops at the top folder");
+        assert_eq!(a_row.status, "modified", "the one-level view cannot see past the top folder, unlike the flat list");
+        assert!(!one_level.rows.iter().any(|row| row.relative_path.contains('/')), "the one-level view must not itself return nested paths");
+
+        fs::remove_dir_all(repository).unwrap();
+    }
+
+    #[test]
+    fn remote_file_list_and_index_worktree_compare_redirect_into_a_submodule() {
+        // Both commands accept a path from the parent's point of view; a path
+        // inside a submodule must be resolved against the submodule's own
+        // repository (its own remote-tracking ref / its own index), never the
+        // parent's, exactly like every other path-taking command in this file.
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-remote-file-list-submodule-{suffix}"));
+        let parent = base.join("parent");
+        let dependency = base.join("dependency");
+        create_libgit2_repository(&parent, "README.md");
+        create_libgit2_repository(&dependency, "module.txt");
+        run_git(&parent, &["-c", "protocol.file.allow=always", "submodule", "add", dependency.to_str().unwrap(), "vendor/dep"]);
+        run_git(&parent, &["commit", "-am", "Add dep submodule"]);
+        let sub_path = parent.join("vendor/dep");
+        let sub_branch = Repository::open(&sub_path).unwrap().head().unwrap().shorthand().unwrap().to_string();
+        run_git(&sub_path, &["-c", "protocol.file.allow=always", "fetch", "origin"]);
+        run_git(&sub_path, &["branch", &format!("--set-upstream-to=origin/{sub_branch}")]);
+
+        fs::write(sub_path.join("module.txt"), "changed inside the submodule\n").unwrap();
+        let parent_path = parent.to_string_lossy().into_owned();
+
+        let remote_list = compare_remote_file_list_inner(&parent_path, "vendor/dep/module.txt", &format!("origin/{sub_branch}")).unwrap();
+        let row = remote_list.rows.iter().find(|row| row.relative_path == "module.txt").expect("the submodule's own module.txt must be reported, not a parent-relative path");
+        assert_eq!(row.status, "modified", "the parent's own remote lookup would have failed since the parent has no such ref; only the submodule's own origin/<branch> makes this a real, resolvable comparison");
+
+        let index_worktree = compare_index_worktree_file_inner(parent_path, "vendor/dep/module.txt".into()).unwrap();
+        assert_eq!(index_worktree.local_content, "changed inside the submodule\n", "working-tree content must come from the submodule, not an empty/missing parent-relative read");
+        assert_eq!(index_worktree.remote_content, "content", "the submodule's own indexed content (unstaged edit) must be used, not the parent's index, which only has a gitlink entry for vendor/dep");
 
         fs::remove_dir_all(base).unwrap();
     }

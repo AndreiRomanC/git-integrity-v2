@@ -492,10 +492,71 @@ test('repository branch compare reuses the Compare and Sync ref-diff flow', () =
   assert.match(html, /id="branchCompareLeftRef"/);
   assert.match(html, /id="branchCompareRightRef"/);
   assert.match(app, /gitCompareMode: 'workspace'/);
-  assert.match(app, /invoke\('compare_git_revisions_directory', \{ repositoryPath: state\.repository\.path, relativePath: path, leftRef: state\.branchCompareLeftRef, rightRef: state\.branchCompareRightRef \}\)/);
+  assert.match(app, /compare_git_revisions_directory/);
   assert.match(app, /invoke\('compare_git_revision_file', \{/);
   assert.match(app, /id: 'compare-branch'[\s\S]*?openGraphBranchCompare\(branchName\)/);
   assert.match(app, /state\.gitCompareMode = 'refs'/);
+});
+
+test('graph branch menu can compare two explicitly selected branches', () => {
+  assert.match(app, /graphBranchCompareAnchor: null/);
+  assert.match(app, /function setGraphBranchCompareStart\(branchName\)/);
+  assert.match(app, /Right-click another branch and choose Compare with start/);
+  assert.match(app, /function openGraphBranchCompare\(branchName, rightRef = ''\)/);
+  assert.match(app, /state\.branchCompareRightRef = rightRef \|\| defaultBranchCompareRightRef\(branchName\)/);
+  assert.match(app, /function handleGraphBranchCompareSelection\(branchName\)/);
+  assert.match(app, /handleGraphBranchCompareSelection\(pill\.dataset\.graphRefName\)/);
+  assert.match(app, /querySelectorAll\('\.branch-row\[data-branch\]'\)[\s\S]*?addEventListener\('contextmenu'/);
+  assert.match(app, /data-action="compare-start"/);
+  assert.match(app, /data-action="compare-with-start"/);
+  assert.doesNotMatch(app, /Compare branches…/);
+  assert.doesNotMatch(app, /compare-branch-from-commit/);
+  assert.match(app, /compare-start/);
+  assert.match(app, /label: 'Set as compare start'/);
+  assert.match(app, /label: 'Compare with start'[\s\S]*?openGraphBranchCompare\(anchor\.branch, branchName\)/);
+  assert.match(css, /\.branch-ref-pill\.compare-start/);
+  assert.match(css, /\.branch-row\.compare-start/);
+});
+
+test('graph commit menu can compare any two exact commits', () => {
+  assert.match(app, /graphCommitCompareAnchor: null/);
+  assert.match(app, /function graphCommitCompareAnchorMatches\(context, anchor = state\.graphCommitCompareAnchor\)/);
+  assert.match(app, /function setGraphCommitCompareStart\(commitId\)/);
+  assert.match(app, /Right-click any other commit and choose Compare with start/);
+  assert.match(app, /function openGraphRevisionCompare\(leftRef, rightRef = ''\)/);
+  assert.match(app, /state\.branchCompareLeftRef = leftRef/);
+  assert.match(app, /state\.branchCompareRightRef = rightRef/);
+  assert.match(app, /openSubmoduleCompareFromEntry\(entry, \{ leftRef, rightRef \}\)/);
+  assert.match(app, /label: 'Set commit as compare start'/);
+  assert.match(app, /label: 'Compare this commit with HEAD'/);
+  assert.match(app, /label: 'Compare with start'[\s\S]*?openGraphRevisionCompare\(start, commitId\)/);
+  assert.match(app, /\[state\.branchCompareLeftRef, state\.branchCompareRightRef\]\.forEach\(ref => add\(ref, 'revision'\)\)/);
+  assert.match(app, /is-commit-compare-start/);
+  assert.match(css, /\.commit-row\.is-commit-compare-start \.commit-card/);
+});
+
+test('compare views can switch to a filtered flat changed-file overview', () => {
+  assert.match(html, /id="gitCompareFlatToggle"/);
+  assert.match(html, /id="subCompareFlatToggle"/);
+  assert.match(html, /id="gitCompareFlatFilter"/);
+  assert.match(html, /id="subCompareFlatFilter"/);
+  assert.match(app, /compareFlatMode: false/);
+  assert.match(app, /subCompareFlatMode: false/);
+  assert.match(app, /function compareRowVisible\(row, query = '', filter = 'all'\)/);
+  assert.match(app, /compare_remote_file_list/);
+  assert.match(app, /compare_git_revisions_file_list/);
+  assert.match(app, /compare_submodule_revisions_file_list/);
+  assert.match(app, /function flatCompareRowHtml\(row, datasetName\)/);
+  assert.match(app, /flat-compare-row/);
+  assert.match(css, /\.flat-compare-row/);
+});
+
+test('working tree drawer opens a working-tree versus index diff on double-click', () => {
+  assert.match(app, /function openIndexWorktreeCompare\(change\)/);
+  assert.match(app, /invoke\('compare_index_worktree_file'/);
+  assert.match(app, /data-change-compare-path/);
+  assert.match(app, /Double-click to compare working tree with the Git index/);
+  assert.match(app, /setCompareHeadLabels\('WORKING TREE', 'INDEX'\)/);
 });
 
 test('main project merges ask before updating submodule working trees', () => {
