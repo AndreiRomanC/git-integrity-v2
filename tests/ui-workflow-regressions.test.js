@@ -376,7 +376,7 @@ test('folder restore is an explicit right-panel action with preview and scoped b
   assert.match(html, /Restore to HEAD/);
   assert.match(html, /Restore from commit/);
   assert.match(html, /id="folderRestoreClean" checked/);
-  assert.match(app, /entry\.kind === 'folder' \? '<button data-detail-action="restorefolder"/);
+  assert.match(app, /const folderActions = entry\.kind === 'folder'[\s\S]*?data-detail-action="restorefolder"/);
   assert.match(app, /if \(action === 'restorefolder'\) return openFolderRestoreDialog\(entry\)/);
   assert.match(app, /invoke\('preview_folder_restore', \{ repositoryPath: state\.repository\.path, relativePath: model\.entry\.relative_path, sourceRevision, cleanUntracked: refs\.folderRestoreClean\.checked \}\)/);
   assert.match(app, /invoke\('restore_folder', \{ repositoryPath: state\.repository\.path, relativePath: restoredPath, sourceRevision: model\.preview\.source_id, cleanPaths \}\)/);
@@ -459,6 +459,16 @@ test('graph exposes branch and commit context actions without relying on lane id
   assert.match(css, /\.graph-overlay \.graph-edge-underlay/);
 });
 
+test('graph search can optionally show only matches as a disconnected result list', () => {
+  assert.match(app, /graphOnlySearchMatches: false/);
+  assert.match(app, /data-graph-only-matches/);
+  assert.match(app, /Only matches/);
+  assert.match(app, /if \(onlySearchMatches\) model\.forEach\(node => \{ node\.lane = 0; node\.before = \[\]; node\.after = \[\]; node\.parents = \[\]; \}\)/);
+  assert.match(app, /drawGraphOverlay\(model, lanesWidth, \{ disconnected: onlySearchMatches \}\)/);
+  assert.match(app, /if \(!options\.disconnected\) \{/);
+  assert.match(css, /\.graph-search-toggle/);
+});
+
 test('submodule compare can export both exact compared revisions as snapshots', () => {
   assert.match(html, /id="subCompareDownload"/);
   assert.match(app, /subCompareDownload: \$\('#subCompareDownload'\)/);
@@ -476,6 +486,16 @@ test('submodule compare can export both exact compared revisions as snapshots', 
   assert.match(app, /const otherRef = picker\.side === 'left' \? state\.submoduleCompare\?\.rightRef : state\.submoduleCompare\?\.leftRef/);
   assert.match(app, /filter\(option => !optionMatchesSubmoduleRevisionRef\(option, otherRef\)\)/);
   assert.doesNotMatch(app, /state\.submoduleCompare\.leftRef = revisionOverrides\.leftRef \|\| state\.submoduleCompare\.leftRef \|\| data\.parent_revision/);
+});
+
+test('repository branch compare reuses the Compare and Sync ref-diff flow', () => {
+  assert.match(html, /id="branchCompareLeftRef"/);
+  assert.match(html, /id="branchCompareRightRef"/);
+  assert.match(app, /gitCompareMode: 'workspace'/);
+  assert.match(app, /invoke\('compare_git_revisions_directory', \{ repositoryPath: state\.repository\.path, relativePath: path, leftRef: state\.branchCompareLeftRef, rightRef: state\.branchCompareRightRef \}\)/);
+  assert.match(app, /invoke\('compare_git_revision_file', \{/);
+  assert.match(app, /id: 'compare-branch'[\s\S]*?openGraphBranchCompare\(branchName\)/);
+  assert.match(app, /state\.gitCompareMode = 'refs'/);
 });
 
 test('main project merges ask before updating submodule working trees', () => {
@@ -567,7 +587,8 @@ test('graph branch context menus can attach detached HEAD to a local branch', ()
   assert.match(app, /function graphCheckoutBranchMenuItem\(branchName, kind = 'local_branch', id = 'checkout-branch'\)/);
   assert.match(app, /Remote-tracking refs cannot be checked out directly here/);
   assert.match(app, /Attach detached HEAD to this local branch/);
-  assert.match(app, /showFloatingMenu\(event, \[\s*graphCheckoutBranchMenuItem\(branchName, kind\),\s*\{ separator: true \},\s*graphMergeMenuItem\(branchName\),\s*\]\);/);
+  assert.match(app, /openGraphBranchCompare\(branchName\)/);
+  assert.match(app, /id: 'compare-branch'[\s\S]*?graphCheckoutBranchMenuItem\(branchName, kind\)[\s\S]*?graphMergeMenuItem\(branchName\)/);
   assert.match(app, /const checkoutItems = branchRefs[\s\S]*?filter\(ref => ref\.kind === 'local_branch'\)[\s\S]*?graphCheckoutBranchMenuItem\(ref\.name, ref\.kind, `checkout-\$\{index\}`\)/);
   assert.match(app, /menuItems\.push\(\.\.\.checkoutItems, \{ separator: true \}\)/);
   assert.match(app, /item\.separator[\s\S]*?floating-menu-separator/);

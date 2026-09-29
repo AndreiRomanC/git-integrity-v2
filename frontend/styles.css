@@ -283,6 +283,11 @@ button.pr-reviewer:hover { border-color: #59758e; background: #1b2b38; color: #e
 .commander-breadcrumbs { min-width: 0; flex: 1; display: flex; align-items: center; overflow: hidden; }
 .commander-toolbar > label { display: flex; flex-direction: column; gap: 3px; color: #718496; font-size: 9px; font-weight: 700; letter-spacing: .8px; }
 .commander-toolbar select { min-width: 190px; height: 29px; border: 1px solid #3c4a57; border-radius: 6px; padding: 0 8px; background: #0e151b; color: #cbd7e2; }
+.git-compare-controls { display: flex; align-items: end; gap: 8px; flex: none; }
+.git-compare-controls label { display: flex; flex-direction: column; gap: 3px; color: #718496; font-size: 9px; font-weight: 700; letter-spacing: .8px; }
+.git-compare-controls button { height: 29px; border: 1px solid #3f5264; border-radius: 6px; padding: 0 10px; background: #172838; color: #c9d7e4; font-weight: 800; }
+.git-compare-controls button:hover { border-color: #5681aa; background: #1d3851; }
+.branch-ref-compare select { min-width: 160px; max-width: 260px; }
 .commander-grid { display: grid; grid-template-columns: minmax(270px, 1fr) 118px minmax(270px, 1fr); }
 .commander-head { min-height: 34px; align-items: center; padding: 0 14px; background: #19222c; border-bottom: 1px solid var(--border); color: #77899a; font-size: 10px; font-weight: 700; letter-spacing: .8px; }
 .commander-head span:last-child { padding-left: 13px; border-left: 1px solid #35414d; }
@@ -673,6 +678,9 @@ button.pr-reviewer:hover { border-color: #59758e; background: #1b2b38; color: #e
 .commit-row.is-search-dimmed .commit-card { opacity: .38; }
 .commit-row.is-search-dimmed:hover .commit-card { opacity: .7; }
 .search-match-count { color: #d9a25c; font-size: 10px; font-weight: 700; }
+.graph-search-toggle { height: 23px; padding: 0 8px; border: 1px solid #5b4630; border-radius: 6px; background: #1c1711; color: #d9a25c; font-size: 10px; font-weight: 800; }
+.graph-search-toggle:hover { border-color: #d9a25c; background: #2a2014; color: #ffd79b; }
+.graph-search-toggle.active { border-color: #d9a25c; background: #4a3214; color: #ffe4b3; box-shadow: 0 0 0 1px #d9a25c33; }
 /* Driven by the same --lanes-width custom property the header's own
    .lane-header column reads (set on #graphView, an ancestor of both) —
    never each row's own inline style. This is what keeps every row's graph
@@ -796,7 +804,10 @@ button.pr-reviewer:hover { border-color: #59758e; background: #1b2b38; color: #e
 .submodule-checkout-pill.attached { border-color: #2f7b65; background: #112c27; color: #8fd7bd; }
 .submodule-checkout-pill.detached { border-color: #916833; background: #32230f; color: #ffd08a; }
 .submodule-checkout-pill.not-initialized { border-color: #725a7e; background: #271d31; color: #d5b5e9; }
-.context-actions { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 14px; }.context-actions button { flex: 1 1 calc(33.33% - 4px); min-width: 100px; min-height: 26px; padding: 0 6px; border: 1px solid #3a5267; border-radius: 5px; background: #192a39; color: #bfd5e6; font-size: 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }.context-actions button:hover { border-color: #5794c7; background: #20384c; }
+.context-action-section { margin-top: 12px; padding-top: 10px; border-top: 1px solid #243546; }
+.context-action-section:first-of-type { border-top: 0; padding-top: 0; }
+.context-action-section-title { margin: 0 0 6px; color: #7f94a8; font-size: 8px; font-weight: 800; letter-spacing: .11em; text-transform: uppercase; }
+.context-actions { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 0; }.context-actions button { flex: 1 1 calc(50% - 4px); min-width: 102px; min-height: 26px; padding: 0 6px; border: 1px solid #3a5267; border-radius: 5px; background: #192a39; color: #bfd5e6; font-size: 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }.context-actions button:hover { border-color: #5794c7; background: #20384c; }
 .context-actions button[data-detail-action="subopenfull"] { flex: 1 1 100%; min-height: 31px; border-color: #7468d8; background: linear-gradient(135deg, #282452, #173d57); color: #e3ddff; font-weight: 800; letter-spacing: .01em; box-shadow: inset 3px 0 0 #9f8cff, 0 0 0 1px #0003; }
 .context-actions button[data-detail-action="subopenfull"]:hover { border-color: #9f8cff; background: linear-gradient(135deg, #332b70, #1e5375); color: #ffffff; }
 .context-actions .danger-action { border-color: #7c3c44; color: #ff9da8; background: #25171b; }.context-actions .danger-action:hover { background: #3a1d23; border-color: #d45c69; }

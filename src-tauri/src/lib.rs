@@ -63,6 +63,8 @@ pub fn run() {
             repository::path_history,
             repository::compare_remote_directory,
             repository::compare_file_contents,
+            repository::compare_git_revisions_directory,
+            repository::compare_git_revision_file,
             repository::compare_submodule_revisions_directory,
             repository::compare_submodule_revision_file,
             repository::export_submodule_compare_snapshots,

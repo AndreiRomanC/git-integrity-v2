@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Git DrillDown</title>
   <link rel="icon" type="image/png" href="assets/git-drilldown-mark.png">
-  <link rel="stylesheet" href="styles.css?v=20260928d-review-labels">
+  <link rel="stylesheet" href="styles.css?v=20260929-branch-compare">
 </head>
 <body>
   <div class="app-shell">
@@ -125,9 +125,17 @@
           <div id="gitComparePanel" class="compare-panel" hidden>
             <div class="commander-toolbar">
               <nav id="commanderBreadcrumbs" class="commander-breadcrumbs"></nav>
-              <label><span>REMOTE SNAPSHOT</span><select id="remoteRef"></select></label>
+              <div id="gitWorkspaceCompareControls" class="git-compare-controls">
+                <label><span>REMOTE SNAPSHOT</span><select id="remoteRef"></select></label>
+              </div>
+              <div id="gitBranchCompareControls" class="git-compare-controls branch-ref-compare" hidden>
+                <label><span>START REF</span><select id="branchCompareLeftRef"></select></label>
+                <button type="button" id="branchCompareSwap" title="Swap start and compare refs">⇄</button>
+                <label><span>COMPARE WITH</span><select id="branchCompareRightRef"></select></label>
+                <button type="button" id="branchCompareRefresh" title="Re-run comparison for these refs">Compare</button>
+              </div>
             </div>
-            <div class="commander-head commander-grid"><span>LOCAL WORKSPACE</span><span>STATE</span><span>REMOTE BRANCH</span></div>
+            <div class="commander-head commander-grid"><span id="gitCompareLeftLabel">LOCAL WORKSPACE</span><span>STATE</span><span id="gitCompareRightLabel">REMOTE BRANCH</span></div>
             <div id="commanderRows" class="commander-rows"></div>
             <div class="commander-legend"><span><i class="same"></i>Same</span><span><i class="modified"></i>Modified</span><span><i class="local-only"></i>Only local</span><span><i class="remote-only"></i>Only remote</span></div>
           </div>
@@ -699,13 +707,13 @@
       <footer><button value="cancel">Cancel</button><button type="button" value="default" id="confirmNewTag" class="confirm">Create tag</button></footer>
     </form>
   </dialog>
-  <script src="console-context.js?v=20260928d-review-labels"></script>
-  <script src="graph-model.js?v=20260928d-review-labels"></script>
-  <script src="submodule-state.js?v=20260928d-review-labels"></script>
-  <script src="submodule-versions.js?v=20260928d-review-labels"></script>
-  <script src="local-diff.js?v=20260928d-review-labels"></script>
-  <script src="local-drive.js?v=20260928d-review-labels"></script>
-  <script src="pr-status.js?v=20260928d-review-labels"></script>
-  <script src="app.js?v=20260928d-review-labels"></script>
+  <script src="console-context.js?v=20260929-branch-compare"></script>
+  <script src="graph-model.js?v=20260929-branch-compare"></script>
+  <script src="submodule-state.js?v=20260929-branch-compare"></script>
+  <script src="submodule-versions.js?v=20260929-branch-compare"></script>
+  <script src="local-diff.js?v=20260929-branch-compare"></script>
+  <script src="local-drive.js?v=20260929-branch-compare"></script>
+  <script src="pr-status.js?v=20260929-branch-compare"></script>
+  <script src="app.js?v=20260929-branch-compare"></script>
 </body>
 </html>

@@ -7219,6 +7219,14 @@ pub async fn compare_submodule_revisions_directory(repository_path: String, subm
     off_main_thread(move || compare_submodule_revisions_directory_inner(repository_path, submodule_path, relative_path, left_ref, right_ref)).await
 }
 
+#[tauri::command]
+pub async fn compare_git_revisions_directory(repository_path: String, relative_path: String, left_ref: String, right_ref: String) -> Result<RevisionCompareDirectory, String> {
+    off_main_thread(move || {
+        validate_path(&repository_path)?;
+        compare_git_tree_directory(&repository_path, &relative_path, &left_ref, &right_ref)
+    }).await
+}
+
 fn compare_submodule_revisions_directory_inner(repository_path: String, submodule_path: String, relative_path: String, left_ref: String, right_ref: String) -> Result<RevisionCompareDirectory, String> {
     validate_path(&repository_path)?;
     let absolute = validate_submodule(&repository_path, &submodule_path)?;
@@ -7229,6 +7237,14 @@ fn compare_submodule_revisions_directory_inner(repository_path: String, submodul
 #[tauri::command]
 pub async fn compare_submodule_revision_file(repository_path: String, submodule_path: String, relative_path: String, left_ref: String, right_ref: String) -> Result<FileComparison, String> {
     off_main_thread(move || compare_submodule_revision_file_inner(repository_path, submodule_path, relative_path, left_ref, right_ref)).await
+}
+
+#[tauri::command]
+pub async fn compare_git_revision_file(repository_path: String, relative_path: String, left_ref: String, right_ref: String) -> Result<FileComparison, String> {
+    off_main_thread(move || {
+        validate_path(&repository_path)?;
+        compare_git_tree_file(&repository_path, &relative_path, &left_ref, &right_ref)
+    }).await
 }
 
 fn compare_submodule_revision_file_inner(repository_path: String, submodule_path: String, relative_path: String, left_ref: String, right_ref: String) -> Result<FileComparison, String> {
