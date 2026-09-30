@@ -649,13 +649,34 @@ test('graph branch context menus can attach detached HEAD to a local branch', ()
   assert.match(app, /Remote-tracking refs cannot be checked out directly here/);
   assert.match(app, /Attach detached HEAD to this local branch/);
   assert.match(app, /openGraphBranchCompare\(branchName\)/);
-  assert.match(app, /id: 'compare-branch'[\s\S]*?graphCheckoutBranchMenuItem\(branchName, kind\)[\s\S]*?graphMergeMenuItem\(branchName\)/);
+  assert.match(app, /showFloatingMenu\(event, \[[\s\S]*?\{ header: 'Branch actions' \}[\s\S]*?graphCheckoutBranchMenuItem\(branchName, kind\)[\s\S]*?graphMergeMenuItem\(branchName\)[\s\S]*?\{ header: 'Compare' \}[\s\S]*?\.\.\.compareItems/);
   assert.match(app, /const checkoutItems = branchRefs[\s\S]*?filter\(ref => ref\.kind === 'local_branch'\)[\s\S]*?graphCheckoutBranchMenuItem\(ref\.name, ref\.kind, `checkout-\$\{index\}`\)/);
-  assert.match(app, /menuItems\.push\(\.\.\.checkoutItems, \{ separator: true \}\)/);
+  assert.match(app, /menuItems\.push\(\{ header: 'Checkout' \}, \.\.\.checkoutItems, \{ separator: true \}\)/);
+  assert.match(app, /menuItems\.push\([\s\S]*?\{ header: 'Compare' \},[\s\S]*?\.\.\.commitCompareItems/);
   assert.match(app, /item\.separator[\s\S]*?floating-menu-separator/);
+  assert.match(app, /if \(item\.header\) return `<div class="floating-menu-section">/);
   assert.match(css, /\.floating-menu-separator/);
+  assert.match(css, /\.floating-menu-section/);
+  assert.match(css, /\.floating-action-menu \.menu-compare strong/);
+  assert.match(css, /\.floating-action-menu \.menu-danger strong/);
   assert.match(css, /\.floating-action-menu strong \{ display: block; font-size: 11px;/);
   assert.match(app, /showGraphBranchContextMenu\(event, pill\.dataset\.graphRefName, pill\.dataset\.graphRefKind\)/);
+});
+
+test('Remotes page shows a useful fetch-only overview without extra Git scans', () => {
+  assert.match(app, /function remoteUrlKind\(url = ''\)/);
+  assert.match(app, /function remoteTrackingBranches\(remoteName = ''\)/);
+  assert.match(app, /function remoteCurrentBranchCandidate\(remoteName = ''\)/);
+  assert.match(app, /Remote overview/);
+  assert.match(app, /Fetch downloads new refs only\. It does not merge, checkout, stage, commit or push\./);
+  assert.match(app, /data-fetch-all-remotes/);
+  assert.match(app, /fetchAllRemotes\(event\.currentTarget\)/);
+  assert.match(app, /data-copy-remote-url/);
+  assert.match(app, /copyText\(button\.dataset\.copyRemoteUrl \|\| '', 'Remote URL copied\.'\)/);
+  assert.match(app, /FETCH \+ PUSH URL/);
+  assert.match(css, /\.remote-overview/);
+  assert.match(css, /\.remote-url-row/);
+  assert.match(css, /\.remote-branch-strip/);
 });
 
 test('a submodule opened as a full repository cannot commit or publish from detached HEAD', () => {

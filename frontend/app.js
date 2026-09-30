@@ -2694,12 +2694,13 @@ function renderEntryDetails(entry) {
   const deletedRestoreAction = entry.kind === 'deleted' ? '<button data-detail-action="head" data-tooltip="Restore this deleted file from your last local commit (HEAD)">↶ Restore from last commit (HEAD)</button>' : '';
   const fileGitActions = entry.kind === 'file' && (entry.status || !entry.tracked) ? `<button data-detail-action="stage" data-tooltip="git add — add this file's current content to staging">＋ Stage this file</button><button data-detail-action="unstage" data-tooltip="Unstage — git restore --staged. Removes only the staging entry; your edits on disk are kept exactly as they are.">− Unstage</button><button data-detail-action="stashfile" data-tooltip="Sets this file aside in this repository's own stash. Parent projects and submodules have separate stash lists.">⇕ Stash this file</button><button data-detail-action="head" class="danger-action-soft" data-tooltip="Restore from your last local commit (HEAD) — git checkout HEAD -- file. Permanently discards ALL edits; the file on disk becomes identical to what you last committed. Cannot be undone.">↶ Restore from last commit (HEAD)</button><button data-detail-action="compare" data-tooltip="Open side-by-side compare with restore options">⇄ Compare with remote</button>` : '';
   const deleteAction = deletedEntry ? '' : '<button class="danger-action" data-detail-action="delete">Delete…</button>';
-  const submoduleOpenActions = entry.kind === 'submodule' ? `${submoduleInitButton}<button data-detail-action="subopenfull" ${entry.submodule_initialized === false ? 'disabled' : ''} data-tooltip="${entry.submodule_initialized === false ? 'Initialize this submodule before opening it as a full repository.' : 'Open this submodule as a normal Git Drill Down repository. This does not modify the parent gitlink or push anything.'}">Open as Full Repository</button><button data-detail-action="subserver">Open submodule repository ↗</button><button data-detail-action="subcompare" data-tooltip="Compare two exact revisions of this submodule without checkout">Compare submodule…</button><button data-detail-action="utrud" data-tooltip="Launches UTRUD with this folder path. UTRUD decides whether the selected folder is valid. Windows only.">▶ Run UTRUD</button>` : '';
-  const submoduleHistoryActions = entry.kind === 'submodule' ? `<button data-detail-action="subgraph" data-tooltip="Open this submodule's own branch/commit history — never the parent project's">Submodule Branch Map</button><button data-detail-action="subrefchanges" data-tooltip="A different, narrower question: which commits in the PARENT project changed this submodule's recorded version. Not the submodule's own history.">Submodule Reference Changes</button><button data-detail-action="subnewbranch" data-tooltip="Create a new local branch in this submodule, starting from its current commit, and switch to it">＋ New branch…</button><button data-detail-action="versions">Change version</button>` : '';
-  const submoduleWorkActions = entry.kind === 'submodule' ? `<button data-detail-action="substash" ${canStashInsideSubmodule ? '' : 'disabled'} data-tooltip="${canStashInsideSubmodule ? 'Set aside uncommitted files inside this submodule only. The parent project is untouched.' : 'No uncommitted local files inside this submodule to stash.'}">Stash submodule changes</button><button data-detail-action="substashes" data-tooltip="View and restore this submodule's own stashes. The parent project's stash list is separate.">Submodule stashes</button><button data-detail-action="subcommit" ${canCommitInsideSubmodule ? '' : 'disabled'} data-tooltip="${esc(submoduleCommitTooltip)}">Commit submodule</button><button data-detail-action="subreset" class="danger-action-soft" ${entry.status ? '' : 'disabled'} data-tooltip="${entry.status ? 'Discard local changes and restore the exact submodule commit recorded by the parent project. This leaves detached HEAD, like git submodule update.' : 'The submodule already uses the version recorded by the parent project'}">↺ Restore project version…</button>` : '';
-  const submoduleSyncActions = entry.kind === 'submodule' ? `<button data-detail-action="subpull" data-tooltip="Fast-forward pull — brings in new commits from the submodule's remote. Refuses if it would require a manual merge.">Pull submodule</button><button data-detail-action="submerge" data-tooltip="Merge a branch into this submodule's current branch, with conflict resolution if needed">Merge branch…</button><button data-detail-action="subpush" ${canPushSubmodule ? '' : 'disabled'} data-tooltip="${esc(submodulePushTooltip)}">Push submodule</button><button data-detail-action="subforcepush" ${canPushSubmodule ? '' : 'disabled'} class="danger-action-soft" data-tooltip="${canPushSubmodule ? '⚠️ Overwrites the remote branch with your local history, discarding any commits there are not in yours. Only safe if nobody else uses that remote.' : esc(submodulePushTooltip)}">Force push submodule…</button><button data-detail-action="subfetch">Fetch submodule</button><button data-detail-action="location">Replace repository URL</button>` : '';
+  const submoduleOpenActions = entry.kind === 'submodule' ? `${submoduleInitButton}<button data-detail-action="subopenfull" ${entry.submodule_initialized === false ? 'disabled' : ''} data-tooltip="${entry.submodule_initialized === false ? 'Initialize this submodule before opening it as a full repository.' : 'Open this submodule as a normal Git Drill Down repository. This does not modify the parent gitlink or push anything.'}">Open as Full Repository</button><button data-detail-action="subserver">Repository link ↗</button><button data-detail-action="subcompare" data-tooltip="Compare two exact revisions of this submodule without checkout">Compare submodule…</button><button data-detail-action="utrud" data-tooltip="Launches UTRUD with this folder path. UTRUD decides whether the selected folder is valid. Windows only.">▶ Run UTRUD</button>` : '';
+  const submoduleHistoryActions = entry.kind === 'submodule' ? `<button data-detail-action="subgraph" data-tooltip="Open this submodule's own branch/commit history — never the parent project's">Submodule Branch Map</button><button data-detail-action="subrefchanges" data-tooltip="A different, narrower question: which commits in the PARENT project changed this submodule's recorded version. Not the submodule's own history.">Reference changes</button><button data-detail-action="versions">Change version</button><button data-detail-action="subnewbranch" data-tooltip="Create a new local branch in this submodule, starting from its current commit, and switch to it">＋ New branch…</button>` : '';
+  const submoduleWorkActions = entry.kind === 'submodule' ? `<button data-detail-action="subcommit" ${canCommitInsideSubmodule ? '' : 'disabled'} data-tooltip="${esc(submoduleCommitTooltip)}">Commit submodule</button><button data-detail-action="substash" ${canStashInsideSubmodule ? '' : 'disabled'} data-tooltip="${canStashInsideSubmodule ? 'Set aside uncommitted files inside this submodule only. The parent project is untouched.' : 'No uncommitted local files inside this submodule to stash.'}">Stash changes</button><button data-detail-action="substashes" data-tooltip="View and restore this submodule's own stashes. The parent project's stash list is separate.">View stashes</button>` : '';
+  const submoduleSyncActions = entry.kind === 'submodule' ? `<button data-detail-action="subfetch">Fetch submodule</button><button data-detail-action="subpull" data-tooltip="Fast-forward pull — brings in new commits from the submodule's remote. Refuses if it would require a manual merge.">Pull submodule</button><button data-detail-action="subpush" ${canPushSubmodule ? '' : 'disabled'} data-tooltip="${esc(submodulePushTooltip)}">Push submodule</button><button data-detail-action="submerge" data-tooltip="Merge a branch into this submodule's current branch, with conflict resolution if needed">Merge branch…</button>` : '';
+  const submoduleDangerActions = entry.kind === 'submodule' ? `<button data-detail-action="subreset" class="danger-action-soft" ${entry.status ? '' : 'disabled'} data-tooltip="${entry.status ? 'Discard local changes and restore the exact submodule commit recorded by the parent project. This leaves detached HEAD, like git submodule update.' : 'The submodule already uses the version recorded by the parent project'}">↺ Restore project version…</button><button data-detail-action="subforcepush" ${canPushSubmodule ? '' : 'disabled'} class="danger-action-soft" data-tooltip="${canPushSubmodule ? '⚠️ Overwrites the remote branch with your local history, discarding any commits there are not in yours. Only safe if nobody else uses that remote.' : esc(submodulePushTooltip)}">Force push submodule…</button><button data-detail-action="location">Replace repository URL</button>${deleteAction}` : '';
   const detailActions = entry.kind === 'submodule'
-    ? `${contextActionSectionHtml('Open / compare', submoduleOpenActions)}${contextActionSectionHtml('History / version', submoduleHistoryActions)}${contextActionSectionHtml('Local changes', submoduleWorkActions)}${contextActionSectionHtml('Sync', submoduleSyncActions)}${contextActionSectionHtml('Danger', deleteAction, 'danger-section')}`
+    ? `${contextActionSectionHtml('Open / inspect', submoduleOpenActions, 'open-section')}${contextActionSectionHtml('History / version', submoduleHistoryActions)}${contextActionSectionHtml('Local work', submoduleWorkActions)}${contextActionSectionHtml('Remote sync', submoduleSyncActions)}${contextActionSectionHtml('Recovery / danger', submoduleDangerActions, 'danger-section')}`
     : `${contextActionSectionHtml('', `${editAction}${navigationActions}${folderActions}${commitAction}${deletedRestoreAction}${fileGitActions}${deleteAction}`)}`;
   refs.details.innerHTML = `<div class="entry-details"><div class="entry-preview ${esc(entry.kind)}">${entry.kind === 'submodule' ? '◇' : entry.kind === 'folder' ? '▰' : '▤'}</div>
     <h2>${esc(entry.name)}</h2><div class="entry-path">${esc(entry.relative_path)}</div>${entry.kind === 'submodule' ? `<div class="submodule-badges"><span class="submodule-badge">◇ Git submodule</span>${submoduleCheckoutBadgeHtml(entry)}</div>` : ''}
@@ -4229,9 +4230,72 @@ async function deleteBranch(branchName) {
   catch (error) { handleError(error); }
 }
 
+function remoteUrlKind(url = '') {
+  const value = String(url || '').trim();
+  if (!value) return 'not configured';
+  if (value.startsWith('http://') || value.startsWith('https://')) return 'HTTPS';
+  if (value.startsWith('git@') || value.startsWith('ssh://')) return 'SSH';
+  if (value.startsWith('file://') || value.startsWith('/') || /^[A-Za-z]:[\\/]/.test(value) || value.startsWith('../') || value.startsWith('./')) return 'local path';
+  return 'custom';
+}
+
+function remoteTrackingBranches(remoteName = '') {
+  const prefix = `${remoteName}/`;
+  return (state.branches || []).filter(branch => branch.remote && branch.name?.startsWith(prefix) && !branch.name.endsWith('/HEAD'));
+}
+
+function remoteCurrentBranchCandidate(remoteName = '') {
+  const current = state.repository?.current_branch || '';
+  if (!current) return '';
+  const candidate = `${remoteName}/${current}`;
+  return (state.branches || []).some(branch => branch.remote && branch.name === candidate) ? candidate : '';
+}
+
+function renderRemoteUrlRow(label, url) {
+  if (!url) return '';
+  return `<div class="remote-url-row"><span>${esc(label)}</span><code>${esc(url)}</code><button type="button" data-copy-remote-url="${esc(url)}">Copy</button></div>`;
+}
+
 function renderRemotes() {
-  refs.remoteCards.innerHTML = state.remotes.map(remote => `<article class="remote-card"><div class="remote-symbol">◎</div><div><h2>${esc(remote.name)}</h2><span>FETCH URL</span><code>${esc(remote.fetch_url)}</code><span>PUSH URL</span><code>${esc(remote.push_url)}</code></div><button data-fetch-remote="${esc(remote.name)}">Fetch now</button></article>`).join('') || '<div class="remote-empty">No remote is configured for this repository.</div>';
+  if (!state.remotes.length) {
+    refs.remoteCards.innerHTML = '<div class="remote-empty">No remote is configured for this repository.</div>';
+    return;
+  }
+  const currentBranch = state.repository?.current_branch || (state.repository?.head_detached ? `Detached HEAD ${(state.repository?.head_oid || '').slice(0, 8)}` : 'No branch');
+  const totalRemoteBranches = (state.branches || []).filter(branch => branch.remote && !branch.name.endsWith('/HEAD')).length;
+  const overview = `<article class="remote-overview">
+    <div><h2>Remote overview</h2><p>Fetch downloads new refs only. It does not merge, checkout, stage, commit or push.</p></div>
+    <div class="remote-overview-grid">
+      <span>Current checkout</span><strong>${esc(currentBranch)}</strong>
+      <span>Configured remotes</span><strong>${state.remotes.length}</strong>
+      <span>Remote branches known locally</span><strong>${totalRemoteBranches}</strong>
+    </div>
+    <button type="button" data-fetch-all-remotes>Fetch all remotes</button>
+  </article>`;
+  refs.remoteCards.innerHTML = overview + state.remotes.map(remote => {
+    const trackingBranches = remoteTrackingBranches(remote.name);
+    const currentCandidate = remoteCurrentBranchCandidate(remote.name);
+    const urlRows = renderRemoteUrlRow(remote.fetch_url === remote.push_url ? 'FETCH + PUSH URL' : 'FETCH URL', remote.fetch_url)
+      + (remote.push_url && remote.push_url !== remote.fetch_url ? renderRemoteUrlRow('PUSH URL', remote.push_url) : '');
+    const sampleBranches = trackingBranches.slice(0, 4).map(branch => `<code>${esc(branch.name)}</code>`).join('');
+    const moreBranches = trackingBranches.length > 4 ? `<small>+${trackingBranches.length - 4} more</small>` : '';
+    return `<article class="remote-card">
+      <div class="remote-symbol">◎</div>
+      <div class="remote-card-main">
+        <div class="remote-card-head"><h2>${esc(remote.name)}</h2><span>${esc(remoteUrlKind(remote.fetch_url))}</span></div>
+        <div class="remote-facts">
+          <span>${trackingBranches.length} remote branch${trackingBranches.length === 1 ? '' : 'es'}</span>
+          <span>${currentCandidate ? `tracks current branch candidate: ${currentCandidate}` : 'no matching branch for current checkout'}</span>
+        </div>
+        <div class="remote-branch-strip">${sampleBranches}${moreBranches}</div>
+        <div class="remote-url-list">${urlRows}</div>
+      </div>
+      <button type="button" class="remote-fetch-button" data-fetch-remote="${esc(remote.name)}">Fetch now</button>
+    </article>`;
+  }).join('');
   refs.remoteCards.querySelectorAll('[data-fetch-remote]').forEach(button => button.addEventListener('click', () => fetchRemote(button.dataset.fetchRemote, button)));
+  refs.remoteCards.querySelector('[data-fetch-all-remotes]')?.addEventListener('click', event => fetchAllRemotes(event.currentTarget));
+  refs.remoteCards.querySelectorAll('[data-copy-remote-url]').forEach(button => button.addEventListener('click', () => copyText(button.dataset.copyRemoteUrl || '', 'Remote URL copied.')));
 }
 
 const loadRemotesGuard = createRequestGuard();
@@ -4550,8 +4614,8 @@ function refsBadges(refList, isHead, currentBranchName) {
       : branchCompareAnchor
         ? `Click to compare ${branchCompareAnchor.branch} with this branch`
         : 'Click to select as compare start; right-click for actions';
-    if (badge.kind === 'local_branch') return `<b class="ref-pill kind-local_branch branch-ref-pill${compareSelected}" data-graph-ref-kind="local_branch" data-graph-ref-name="${esc(badge.name)}" data-tooltip="${esc(compareTip)}"><i>⑂ BRANCH</i>${esc(badge.name)}</b>`;
-    if (badge.kind === 'remote_branch') return `<b class="ref-pill kind-remote_branch branch-ref-pill ${badge.name === 'origin/main' ? 'primary-remote' : ''}${compareSelected}" data-graph-ref-kind="remote_branch" data-graph-ref-name="${esc(badge.name)}" data-tooltip="${esc(compareTip)}"><i>${badge.name === 'origin/main' ? 'PRIMARY REMOTE' : 'REMOTE'}</i>${esc(badge.name)}</b>`;
+    if (badge.kind === 'local_branch') return `<b class="ref-pill kind-local_branch branch-ref-pill${compareSelected}" data-graph-ref-kind="local_branch" data-graph-ref-name="${esc(badge.name)}" data-tooltip="${esc(compareTip)}"><i>LOCAL</i>${esc(badge.name)}</b>`;
+    if (badge.kind === 'remote_branch') return `<b class="ref-pill kind-remote_branch branch-ref-pill ${badge.name === 'origin/main' ? 'primary-remote' : ''}${compareSelected}" data-graph-ref-kind="remote_branch" data-graph-ref-name="${esc(badge.name)}" data-tooltip="${esc(compareTip)}"><i>${badge.name === 'origin/main' ? 'ORIGIN MAIN' : 'REMOTE'}</i>${esc(badge.name)}</b>`;
     return `<b class="ref-pill kind-${badge.kind}">${esc(badge.name)}</b>`;
   }).join('');
   const tagOverflow = overflowTags.length ? `<b class="ref-pill kind-tag ref-pill-more" data-tooltip="${esc(overflowTags.map(t => t.name).join(', '))}">+${overflowTags.length} tags</b>` : '';
@@ -4828,10 +4892,12 @@ function showFloatingMenu(event, items) {
   menu.className = 'floating-action-menu';
   menu.style.left = `${Math.min(event.clientX, innerWidth - 280)}px`;
   menu.style.top = `${Math.min(event.clientY, innerHeight - 180)}px`;
-  menu.innerHTML = items.map(item => item.separator
-    ? '<div class="floating-menu-separator" role="separator"></div>'
-    : `<button type="button" data-action="${esc(item.id)}" ${item.disabled ? 'disabled' : ''}><strong>${esc(item.label)}</strong>${item.detail ? `<small>${esc(item.detail)}</small>` : ''}</button>`
-  ).join('');
+  menu.innerHTML = items.map(item => {
+    if (item.separator) return '<div class="floating-menu-separator" role="separator"></div>';
+    if (item.header) return `<div class="floating-menu-section">${esc(item.header)}</div>`;
+    const classes = ['floating-menu-button', item.kind ? `menu-${item.kind}` : '', item.danger ? 'menu-danger' : ''].filter(Boolean).join(' ');
+    return `<button type="button" class="${esc(classes)}" data-action="${esc(item.id)}" ${item.disabled ? 'disabled' : ''}><strong>${esc(item.label)}</strong>${item.detail ? `<small>${esc(item.detail)}</small>` : ''}</button>`;
+  }).join('');
   document.body.appendChild(menu);
   menu.querySelectorAll('[data-action]').forEach(button => button.addEventListener('click', () => {
     const item = items.find(candidate => candidate.id === button.dataset.action);
@@ -4878,6 +4944,7 @@ function graphMergeMenuItem(branchName, id = 'merge') {
     id,
     label: `Merge ${branchName} into current branch`,
     detail: unavailable || `${branchName} → ${current}. Current branch is the only branch changed.`,
+    kind: 'primary',
     disabled: !!unavailable,
     run: () => openMergeBranchDialog(activeGraphMergeTarget(), branchName),
   };
@@ -4895,6 +4962,7 @@ function graphCheckoutBranchMenuItem(branchName, kind = 'local_branch', id = 'ch
     id,
     label: `Checkout branch ${branchName}`,
     detail: unavailable || (g.headDetached ? 'Attach detached HEAD to this local branch.' : `Switch current checkout to ${branchName}.`),
+    kind: 'primary',
     disabled: !!unavailable,
     run: () => switchBranch(branchName),
   };
@@ -5012,18 +5080,20 @@ function showGraphBranchContextMenu(event, branchName, kind = 'local_branch') {
   const context = activeRepositoryContext();
   const anchor = graphBranchCompareAnchorMatches(context) ? state.graphBranchCompareAnchor : null;
   const compareItems = [
-    { id: 'compare-branch', label: 'Compare this branch…', detail: 'Open Compare & Sync with this as the start ref', run: () => openGraphBranchCompare(branchName) },
-    { id: 'compare-start', label: 'Set as compare start', detail: branchName, run: () => setGraphBranchCompareStart(branchName) },
+    { id: 'compare-branch', label: 'Compare this branch…', detail: 'Open Compare & Sync with this as the start ref', kind: 'compare', run: () => openGraphBranchCompare(branchName) },
+    { id: 'compare-start', label: 'Set as compare start', detail: branchName, kind: 'compare', run: () => setGraphBranchCompareStart(branchName) },
   ];
   if (anchor && anchor.branch !== branchName) {
-    compareItems.push({ id: 'compare-with-start', label: 'Compare with start', detail: `${anchor.branch} → ${branchName}`, run: () => openGraphBranchCompare(anchor.branch, branchName) });
+    compareItems.push({ id: 'compare-with-start', label: 'Compare with start', detail: `${anchor.branch} → ${branchName}`, kind: 'compare', run: () => openGraphBranchCompare(anchor.branch, branchName) });
   }
   showFloatingMenu(event, [
-    ...compareItems,
-    { separator: true },
+    { header: 'Branch actions' },
     graphCheckoutBranchMenuItem(branchName, kind),
     { separator: true },
     graphMergeMenuItem(branchName),
+    { separator: true },
+    { header: 'Compare' },
+    ...compareItems,
   ]);
 }
 
@@ -5096,12 +5166,14 @@ function showGraphCommitContextMenu(event, commitId) {
       id: 'compare-commit-head',
       label: 'Compare this commit with HEAD',
       detail: `${commitId.slice(0, 8)} ↔ HEAD`,
+      kind: 'compare',
       run: () => openGraphRevisionCompare(commitId, 'HEAD'),
     },
     {
       id: 'compare-commit-start',
       label: 'Set commit as compare start',
       detail: commitId.slice(0, 8),
+      kind: 'compare',
       run: () => { setGraphCommitCompareStart(commitId); renderGraph(); },
     },
   ];
@@ -5110,6 +5182,7 @@ function showGraphCommitContextMenu(event, commitId) {
       id: 'compare-commit-with-start',
       label: 'Compare with start',
       detail: `${commitAnchor.commitId.slice(0, 8)} → ${commitId.slice(0, 8)}`,
+      kind: 'compare',
       run: () => { const start = commitAnchor.commitId; state.graphCommitCompareAnchor = null; openGraphRevisionCompare(start, commitId); },
     });
   }
@@ -5119,14 +5192,17 @@ function showGraphCommitContextMenu(event, commitId) {
     .map((ref, index) => graphCheckoutBranchMenuItem(ref.name, ref.kind, `checkout-${index}`));
   const mergeItems = branchRefs.map((ref, index) => graphMergeMenuItem(ref.name, `merge-${index}`));
   const menuItems = [];
-  menuItems.push(...commitCompareItems, { separator: true });
-  if (checkoutItems.length) menuItems.push(...checkoutItems, { separator: true });
-  if (mergeItems.length) menuItems.push(...mergeItems, { separator: true });
+  if (checkoutItems.length) menuItems.push({ header: 'Checkout' }, ...checkoutItems, { separator: true });
+  if (mergeItems.length) menuItems.push({ header: 'Merge' }, ...mergeItems, { separator: true });
   menuItems.push(
-    { id: 'branch', label: 'Create branch from this commit', detail: commitId.slice(0, 8), run: () => createBranchFromGraphCommit(commitId) },
-    { id: 'checkout', label: 'Checkout this commit', detail: 'Detached HEAD', run: () => checkoutGraphCommit(commitId) },
+    { header: 'Commit actions' },
+    { id: 'branch', label: 'Create branch from this commit', detail: commitId.slice(0, 8), kind: 'primary', run: () => createBranchFromGraphCommit(commitId) },
+    { id: 'checkout', label: 'Checkout this commit', detail: 'Detached HEAD', kind: 'primary', run: () => checkoutGraphCommit(commitId) },
     { separator: true },
     { id: 'restore-exact', label: 'Restore exact checkpoint…', detail: 'Clean workspace to this commit', danger: true, run: () => restoreExactCheckpointFromGraphCommit(commitId) },
+    { separator: true },
+    { header: 'Compare' },
+    ...commitCompareItems,
   );
   showFloatingMenu(event, menuItems);
 }

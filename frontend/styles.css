@@ -709,17 +709,17 @@ button.pr-reviewer:hover { border-color: #59758e; background: #1b2b38; color: #e
    never touches: updating the one shared variable re-cascades to all of
    them live, with no need to touch their own DOM nodes at all. */
 .graph-cell { width: var(--lanes-width, 90px); flex-shrink: 0; }
-.ref-pills { display: flex; flex-wrap: nowrap; gap: 4px; flex-shrink: 0; }
+.ref-pills { min-width: 0; display: flex; flex-wrap: nowrap; gap: 4px; flex-shrink: 1; overflow: hidden; }
 /* Color is by ref *kind* now, not by lane (History & Branch Map rework,
    point 1/3) — a lane's color is exclusively about that commit's position
    in the graph and must never be read as meaning anything about a
    specific branch; a badge's color is the opposite: a fixed, stable
    signal for what kind of ref it is, unrelated to which lane it's on. */
-.ref-pill { max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 3px 8px; border-radius: 5px; background: #1b2a36; color: #d6e5f0; font-size: 10px; font-weight: 700; }
-.ref-pill i { margin-right: 5px; font-size: 7px; font-style: normal; letter-spacing: .45px; opacity: .78; }
-.ref-pill.kind-local_branch { border: 1px solid #3299a2; border-left: 4px solid #4bd3dc; background: #123139; color: #d2f8fb; box-shadow: 0 0 0 1px #39c5cf18; }
-.ref-pill.kind-remote_branch { border: 1px dashed #667f9d; border-left: 4px solid #8298b8; border-radius: 999px; background: #202b3a; color: #d7e1ef; }
-.ref-pill.kind-remote_branch.primary-remote { border: 1px solid #ff7a83; border-left: 5px solid #ff626d; border-radius: 999px; background: linear-gradient(90deg, #4a2028, #302029); color: #fff0f1; box-shadow: 0 0 0 1px #ff626d3d, 0 0 11px #ff626d35; }
+.ref-pill { max-width: 154px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 2px 7px; border-radius: 5px; background: #1b2a36; color: #d6e5f0; font-size: 9.5px; font-weight: 700; }
+.ref-pill i { margin-right: 5px; font-size: 6.5px; font-style: normal; letter-spacing: .45px; opacity: .72; }
+.ref-pill.kind-local_branch { border: 1px solid #2d838d; border-left: 4px solid #4bd3dc; background: #123139; color: #d2f8fb; box-shadow: 0 0 0 1px #39c5cf18; }
+.ref-pill.kind-remote_branch { border: 1px dashed #607891; border-left: 4px solid #8298b8; border-radius: 999px; background: #202b3a; color: #d7e1ef; }
+.ref-pill.kind-remote_branch.primary-remote { max-width: 190px; border: 1px solid #ff7a83; border-left: 5px solid #ff626d; border-radius: 999px; background: linear-gradient(90deg, #4a2028, #302029); color: #fff0f1; box-shadow: 0 0 0 1px #ff626d3d, 0 0 11px #ff626d35; }
 .ref-pill.kind-tag { border: 1px solid #a4842e; background: #3a2c12; color: #ffe3a3; font-weight: 800; cursor: pointer; }
 .ref-pill.kind-tag:hover { border-color: var(--amber); background: #4a3818; }
 .ref-pill.kind-head { border: 1px solid #e8eef5; background: transparent; color: #e8eef5; font-weight: 800; letter-spacing: .4px; }
@@ -728,7 +728,7 @@ button.pr-reviewer:hover { border-color: #59758e; background: #1b2b38; color: #e
 .commit-row.has-local-branch-tip:hover .commit-card, .commit-row.has-local-branch-tip.selected .commit-card { border-left: 4px solid #4bd3dc; background: linear-gradient(90deg, #173844 0, #18232e 17%); }
 .commit-row.has-remote-branch-tip:hover .commit-card, .commit-row.has-remote-branch-tip.selected .commit-card { border-left: 4px solid #8298b8; background: linear-gradient(90deg, #263448 0, #18232e 17%); }
 .commit-main { min-width: 0; display: flex; flex-direction: column; align-items: stretch; gap: 4px; }
-.commit-title-line, .commit-ref-line { min-width: 0; display: flex; align-items: center; gap: 7px; }
+.commit-title-line, .commit-ref-line { min-width: 0; display: flex; align-items: center; gap: 7px; overflow: hidden; }
 .commit-ref-line:empty { display: none; }
 .commit-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; font-size: 13px; flex-shrink: 1; }
 .commit-id-wrap { display: flex; justify-content: flex-end; }
@@ -749,20 +749,28 @@ button.pr-reviewer:hover { border-color: #59758e; background: #1b2b38; color: #e
 .stash-drop-icon { flex: none; width: 20px; height: 20px; margin-left: auto; padding: 0; border: 1px solid transparent; border-radius: 5px; background: transparent; color: #6b7c8c; font-size: 11px; line-height: 1; }.stash-drop-icon:hover { border-color: #a34b53; background: #2a1618; color: #ff9aa2; }
 .ahead-annotation { margin-left: 12px; color: #6f8daa; font-size: 10px; }
 .ref-pill-more { border-left: 0; background: #202b36; color: #8fa2b4; cursor: default; }
-.branch-point-pill { flex-shrink: 0; display: inline-flex; align-items: center; justify-content: center; min-width: 16px; max-width: 92px; height: 16px; padding: 0 5px; border-radius: 999px; border: 1px dashed #6f8daa; color: #9db3c8; font-size: 9px; line-height: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.branch-point-pill { flex-shrink: 0; display: inline-flex; align-items: center; justify-content: center; min-width: 16px; max-width: 86px; height: 15px; padding: 0 5px; border-radius: 999px; border: 1px dashed #6f8daa; color: #9db3c8; font-size: 8px; line-height: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .commit-row.is-branch-point .commit-card { border-style: dashed; }
 .common-main-pill { color: #ffd79a; border-color: #b47a2f; background: #2e2110; }
 .command-start-pill { color: #ffdfaa; border-color: #c58a39; background: #312313; }
-.head-location-pill { flex-shrink: 0; display: inline-flex; align-items: center; height: 18px; padding: 0 8px; border: 1px solid #7ed3ff; border-radius: 999px; background: linear-gradient(90deg, #18547d, #12324b); color: #e8f7ff; font-size: 9px; font-weight: 900; letter-spacing: .55px; box-shadow: 0 0 0 1px #7ed3ff22, 0 0 12px #7ed3ff24; }
+.head-location-pill { flex-shrink: 0; display: inline-flex; align-items: center; height: 17px; padding: 0 7px; border: 1px solid #7ed3ff; border-radius: 999px; background: linear-gradient(90deg, #18547d, #12324b); color: #e8f7ff; font-size: 8px; font-weight: 900; letter-spacing: .55px; box-shadow: 0 0 0 1px #7ed3ff22, 0 0 12px #7ed3ff24; }
 .branch-ref-pill { cursor: pointer; }
 .branch-ref-pill.compare-start { outline: 2px solid #58a6ff; outline-offset: 2px; box-shadow: 0 0 0 1px #58a6ff66, 0 0 12px #58a6ff40; }
-.floating-action-menu { position: fixed; z-index: 120; min-width: 210px; max-width: 320px; overflow: hidden; border: 1px solid #465563; border-radius: 8px; background: #1a2530; box-shadow: 0 14px 34px #0009; }
+.floating-action-menu { position: fixed; z-index: 120; min-width: 230px; max-width: 340px; overflow: hidden; border: 1px solid #465563; border-radius: 9px; background: #17222d; box-shadow: 0 14px 34px #0009; }
+.floating-menu-section { padding: 7px 10px 4px; color: #75899b; font-size: 7.5px; font-weight: 900; letter-spacing: .9px; text-transform: uppercase; background: #121b24; border-top: 1px solid #24313d; }
+.floating-menu-section:first-child { border-top: 0; }
 .floating-action-menu button { display: block; width: 100%; padding: 7px 10px; text-align: left; border: 0; background: transparent; color: #d8e5f0; cursor: pointer; }
 .floating-action-menu button + button { border-top: 1px solid #293947; }
 .floating-menu-separator { height: 1px; margin: 4px 0; background: #354757; }
 .floating-menu-separator + button { border-top: 0; }
 .floating-action-menu button:hover:not(:disabled) { background: #213448; }
 .floating-action-menu button:disabled { opacity: .45; cursor: not-allowed; }
+.floating-action-menu .menu-primary { background: #192939; }
+.floating-action-menu .menu-primary strong { color: #dff1ff; }
+.floating-action-menu .menu-compare { background: #141f2e; box-shadow: inset 3px 0 0 #4c85bd; }
+.floating-action-menu .menu-compare strong { color: #9fcbff; }
+.floating-action-menu .menu-danger strong { color: #ff9aa2; }
+.floating-action-menu .menu-danger:hover:not(:disabled) { background: #321a20; }
 .floating-action-menu strong { display: block; font-size: 11px; line-height: 1.25; }
 .floating-action-menu small { display: block; margin-top: 1px; color: #8fa3b4; font-size: 9px; line-height: 1.25; }
 
@@ -826,14 +834,17 @@ button.pr-reviewer:hover { border-color: #59758e; background: #1b2b38; color: #e
 .submodule-checkout-pill.attached { border-color: #2f7b65; background: #112c27; color: #8fd7bd; }
 .submodule-checkout-pill.detached { border-color: #916833; background: #32230f; color: #ffd08a; }
 .submodule-checkout-pill.not-initialized { border-color: #725a7e; background: #271d31; color: #d5b5e9; }
-.context-action-section { margin-top: 12px; padding-top: 10px; border-top: 1px solid #243546; }
+.context-action-section { margin-top: 11px; padding-top: 9px; border-top: 1px solid #243546; }
 .context-action-section:first-of-type { border-top: 0; padding-top: 0; }
-.context-action-section-title { margin: 0 0 6px; color: #7f94a8; font-size: 8px; font-weight: 800; letter-spacing: .11em; text-transform: uppercase; }
-.context-actions { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 0; }.context-actions button { flex: 1 1 calc(50% - 4px); min-width: 102px; min-height: 26px; padding: 0 6px; border: 1px solid #3a5267; border-radius: 5px; background: #192a39; color: #bfd5e6; font-size: 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }.context-actions button:hover { border-color: #5794c7; background: #20384c; }
-.context-actions button[data-detail-action="subopenfull"] { flex: 1 1 100%; min-height: 31px; border-color: #7468d8; background: linear-gradient(135deg, #282452, #173d57); color: #e3ddff; font-weight: 800; letter-spacing: .01em; box-shadow: inset 3px 0 0 #9f8cff, 0 0 0 1px #0003; }
-.context-actions button[data-detail-action="subopenfull"]:hover { border-color: #9f8cff; background: linear-gradient(135deg, #332b70, #1e5375); color: #ffffff; }
+.context-action-section-title { margin: 0 0 6px; color: #7a8fa2; font-size: 7.5px; font-weight: 850; letter-spacing: .12em; text-transform: uppercase; }
+.context-actions { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 0; }.context-actions button { flex: 1 1 calc(50% - 4px); min-width: 98px; min-height: 25px; padding: 0 7px; border: 1px solid #34495d; border-radius: 5px; background: #172634; color: #bcd2e4; font-size: 9.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }.context-actions button:hover { border-color: #5794c7; background: #20384c; }
+.context-actions button[data-detail-action="subopenfull"] { flex: 1 1 100%; min-height: 29px; border-color: #5f76ad; background: linear-gradient(135deg, #1e334a, #173243); color: #dbefff; font-weight: 800; letter-spacing: .01em; box-shadow: inset 3px 0 0 #77b8f7, 0 0 0 1px #0003; }
+.context-actions button[data-detail-action="subopenfull"]:hover { border-color: #8cc8ff; background: linear-gradient(135deg, #254866, #1f4d66); color: #ffffff; }
 .context-actions .danger-action { border-color: #7c3c44; color: #ff9da8; background: #25171b; }.context-actions .danger-action:hover { background: #3a1d23; border-color: #d45c69; }
 .context-actions .danger-action-soft { border-color: #a9722e; color: #ffcd8f; background: #241a0d; }.context-actions .danger-action-soft:hover { background: #392710; border-color: #c98c3f; }
+.danger-section { padding: 9px; border: 1px solid #4b3321; border-radius: 7px; background: #1a1510; }
+.danger-section .context-action-section-title { color: #c3945f; }
+.danger-section .context-actions button { flex-basis: 100%; }
 .local-change-banner { display: flex; align-items: center; gap: 9px; margin-top: 15px; padding: 10px; border: 1px solid #765b27; border-radius: 6px; background: #332814; }.local-change-banner > i { width: 10px; height: 10px; flex: none; border-radius: 50%; background: var(--amber); box-shadow: 0 0 9px #f0b65a77; }.local-change-banner div { display: flex; flex-direction: column; gap: 2px; }.local-change-banner strong { color: #ffe2a8; font-size: 11px; }.local-change-banner span { color: #a8916a; font-size: 9px; }
 .detached-work-banner { display: grid; grid-template-columns: 10px minmax(0, 1fr); align-items: start; gap: 8px 10px; margin-top: 10px; padding: 10px; border: 1px solid #8a6a2a; border-radius: 7px; background: #2b2214; }
 .detached-work-banner > i { width: 10px; height: 10px; margin-top: 4px; border-radius: 50%; background: #f0b65a; box-shadow: 0 0 9px #f0b65a77; }
@@ -848,7 +859,18 @@ button.pr-reviewer:hover { border-color: #59758e; background: #1b2b38; color: #e
 .submodule-unpushed-commit strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; color: #f0dcae; font-weight: 500; }
 .submodule-unpushed-commit small { color: #b3966a; font-size: 10px; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
 
-.remotes-view { flex: 1; overflow: auto; padding: 22px; }.remote-cards { display: grid; gap: 12px; max-width: 900px; }.remote-card { display: grid; grid-template-columns: 48px 1fr auto; gap: 15px; align-items: center; padding: 18px; border: 1px solid #30404e; border-radius: 9px; background: #141d25; }.remote-symbol { display: grid; place-items: center; width: 42px; height: 42px; border: 3px solid var(--blue); border-radius: 50%; color: var(--blue); font-size: 20px; }.remote-card h2 { margin: 0 0 10px; font-size: 16px; }.remote-card span { display: block; margin-top: 6px; color: #738697; font-size: 9px; letter-spacing: .7px; }.remote-card code { color: #b8c9d8; font-size: 11px; overflow-wrap: anywhere; }.remote-card button { height: 35px; padding: 0 13px; border: 1px solid #5193cd; border-radius: 6px; background: #24689f; color: white; }.remote-empty { padding: 45px; text-align: center; color: var(--muted); }
+.remotes-view { flex: 1; overflow: auto; padding: 18px 20px; }.remote-cards { display: grid; gap: 10px; max-width: 1040px; }
+.remote-overview { display: grid; grid-template-columns: minmax(0, 1fr) minmax(245px, 340px) auto; gap: 14px; align-items: center; padding: 13px 15px; border: 1px solid #2d3e4d; border-radius: 9px; background: linear-gradient(135deg, #142331, #111920); }
+.remote-overview h2 { margin: 0 0 4px; font-size: 15px; }.remote-overview p { margin: 0; color: #8fa4b7; font-size: 11px; line-height: 1.35; }
+.remote-overview-grid { display: grid; grid-template-columns: auto 1fr; gap: 4px 10px; align-items: baseline; }.remote-overview-grid span { color: #718597; font-size: 8px; font-weight: 850; letter-spacing: .7px; text-transform: uppercase; }.remote-overview-grid strong { min-width: 0; color: #d7e5f0; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.remote-overview button, .remote-fetch-button { height: 32px; padding: 0 12px; border: 1px solid #4c86b8; border-radius: 6px; background: #205d8d; color: white; font-size: 11px; font-weight: 700; }
+.remote-card { display: grid; grid-template-columns: 38px minmax(0, 1fr) auto; gap: 13px; align-items: start; padding: 14px; border: 1px solid #2f4050; border-radius: 8px; background: #131c24; }
+.remote-symbol { display: grid; place-items: center; width: 34px; height: 34px; border: 2px solid var(--blue); border-radius: 50%; color: var(--blue); font-size: 17px; }.remote-card h2 { margin: 0; font-size: 15px; }
+.remote-card-main { min-width: 0; display: grid; gap: 8px; }.remote-card-head { display: flex; align-items: center; gap: 9px; }.remote-card-head > span { padding: 2px 7px; border: 1px solid #35516a; border-radius: 999px; background: #102131; color: #a8c8e3; font-size: 8px; font-weight: 800; letter-spacing: .6px; text-transform: uppercase; }
+.remote-facts { display: flex; flex-wrap: wrap; gap: 7px; }.remote-facts span { padding: 4px 8px; border: 1px solid #2d4152; border-radius: 999px; background: #101922; color: #95a9b9; font-size: 10px; }
+.remote-branch-strip { display: flex; flex-wrap: wrap; gap: 6px; min-height: 18px; }.remote-branch-strip code { padding: 2px 6px; border-radius: 5px; background: #101922; color: #9ccfff; font-size: 10px; }.remote-branch-strip small { color: #778b9b; }
+.remote-url-list { display: grid; gap: 6px; }.remote-url-row { display: grid; grid-template-columns: 110px minmax(0, 1fr) auto; gap: 8px; align-items: center; }.remote-url-row span { color: #738697; font-size: 9px; font-weight: 800; letter-spacing: .7px; }.remote-url-row code { min-width: 0; color: #b8c9d8; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.remote-url-row button { height: 25px; padding: 0 9px; border: 1px solid #3a5267; border-radius: 5px; background: #162637; color: #bad4e8; }
+.remote-empty { padding: 45px; text-align: center; color: var(--muted); }
 
 .changes-drawer { position: absolute; z-index: 10; left: 244px; right: 0; bottom: 28px; height: 280px; display: none; background: #131a22; border-top: 1px solid #425363; box-shadow: 0 -18px 50px #0008; }
 .changes-drawer.open { display: block; }
