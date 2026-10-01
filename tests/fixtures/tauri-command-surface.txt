@@ -18,6 +18,9 @@ compare_index_worktree_file
 compare_git_revision_file
 compare_git_revisions_directory
 compare_git_revisions_file_list
+compare_github_module_revision_file
+compare_github_module_revisions_directory
+compare_github_module_revisions_file_list
 compare_local_directories
 compare_remote_directory
 compare_remote_file_list
@@ -41,6 +44,8 @@ delete_local_path
 drop_stash
 entry_details
 entry_last_commit
+export_github_module_compare_snapshots
+export_github_module_revision_snapshot
 export_submodule_compare_snapshots
 fetch_all_remotes
 fetch_project

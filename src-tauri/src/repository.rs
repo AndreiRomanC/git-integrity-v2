@@ -858,6 +858,12 @@ pub struct SubmoduleCompareSnapshotExport {
     right_revision: String,
 }
 
+#[derive(Serialize)]
+pub struct RevisionSnapshotExport {
+    path: String,
+    revision: String,
+}
+
 #[derive(Clone)]
 struct GitTreeEntry {
     entry: CommanderEntry,
@@ -1041,7 +1047,9 @@ fn git_owned(path: &str, args: Vec<String>) -> Result<String, String> {
 }
 
 fn internal_repository(path: &str) -> Result<Repository, String> {
-    Repository::discover(path).map_err(|error| format!("Cannot open Git repository: {error}"))
+    Repository::discover(path)
+        .or_else(|_| Repository::open_bare(path))
+        .map_err(|error| format!("Cannot open Git repository: {error}"))
 }
 
 // Repository::discover (what internal_repository above uses — correct there,
@@ -5774,6 +5782,49 @@ fn github_module_refs_inner(repository_path: String, owner: String, repository_n
     Ok(results)
 }
 
+fn validate_github_module_identity(owner: &str, repository_name: &str) -> Result<(String, String), String> {
+    let owner = owner.trim();
+    let repository_name = repository_name.trim().trim_end_matches(".git");
+    if owner.is_empty() || repository_name.is_empty() || owner.contains('/') || repository_name.contains('/') {
+        return Err("Choose a valid GitHub repository first.".into());
+    }
+    Ok((owner.to_string(), repository_name.to_string()))
+}
+
+fn github_module_cache_path(owner: &str, repository_name: &str) -> PathBuf {
+    std::env::temp_dir()
+        .join("GitDrillDown")
+        .join("github-module-cache")
+        .join(format!(
+            "{}__{}.git",
+            safe_export_component(owner, "owner"),
+            safe_export_component(repository_name, "repository")
+        ))
+}
+
+fn ensure_github_module_cache(repository_path: &str, owner: &str, repository_name: &str) -> Result<PathBuf, String> {
+    validate_path(repository_path)?;
+    let (owner, repository_name) = validate_github_module_identity(owner, repository_name)?;
+    let cache_path = github_module_cache_path(&owner, &repository_name);
+    let cache_parent = cache_path.parent().ok_or_else(|| "Could not resolve the module cache folder".to_string())?;
+    fs::create_dir_all(cache_parent).map_err(|error| format!("Could not create module cache folder: {error}"))?;
+    let url = github_module_clone_url(&owner, &repository_name);
+    let cache_text = cache_path.to_string_lossy().into_owned();
+    let started = Instant::now();
+    if cache_path.join("HEAD").is_file() {
+        git_with_timeout(&cache_text, &["fetch", "--prune", "origin", "+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"], Duration::from_secs(300), "5 minutes")
+            .map_err(|error| format!("Could not update cached module {owner}/{repository_name}: {error}"))?;
+        perf_log(&format!("github_module_cache: fetch {owner}/{repository_name}"), started.elapsed());
+    } else if cache_path.exists() {
+        return Err(format!("Module cache path exists but is not a Git repository: {}", cache_path.display()));
+    } else {
+        git_with_timeout(repository_path, &["clone", "--bare", &url, &cache_text], Duration::from_secs(600), "10 minutes")
+            .map_err(|error| format!("Could not cache module {owner}/{repository_name}: {error}"))?;
+        perf_log(&format!("github_module_cache: clone {owner}/{repository_name}"), started.elapsed());
+    }
+    Ok(cache_path)
+}
+
 #[tauri::command]
 pub async fn add_submodule(repository_path: String, parent_path: String, url: String, folder_name: String, username: String, access_token: String, initial_revision: Option<String>, initial_revision_kind: Option<String>, initial_revision_name: Option<String>) -> Result<String, String> {
     off_main_thread(move || add_submodule_inner_with_revision(repository_path, parent_path, url, folder_name, username, access_token, initial_revision, initial_revision_kind, initial_revision_name)).await
@@ -7403,6 +7454,24 @@ pub async fn compare_submodule_revisions_file_list(repository_path: String, subm
 }
 
 #[tauri::command]
+pub async fn compare_github_module_revisions_directory(repository_path: String, owner: String, repository_name: String, relative_path: String, left_ref: String, right_ref: String) -> Result<RevisionCompareDirectory, String> {
+    off_main_thread(move || {
+        let cache = ensure_github_module_cache(&repository_path, &owner, &repository_name)?;
+        let cache_path = cache.to_string_lossy().into_owned();
+        compare_git_tree_directory(&cache_path, &relative_path, &left_ref, &right_ref)
+    }).await
+}
+
+#[tauri::command]
+pub async fn compare_github_module_revisions_file_list(repository_path: String, owner: String, repository_name: String, relative_path: String, left_ref: String, right_ref: String) -> Result<RevisionCompareDirectory, String> {
+    off_main_thread(move || {
+        let cache = ensure_github_module_cache(&repository_path, &owner, &repository_name)?;
+        let cache_path = cache.to_string_lossy().into_owned();
+        compare_git_tree_file_list(&cache_path, &relative_path, &left_ref, &right_ref)
+    }).await
+}
+
+#[tauri::command]
 pub async fn compare_submodule_revision_file(repository_path: String, submodule_path: String, relative_path: String, left_ref: String, right_ref: String) -> Result<FileComparison, String> {
     off_main_thread(move || compare_submodule_revision_file_inner(repository_path, submodule_path, relative_path, left_ref, right_ref)).await
 }
@@ -7420,6 +7489,15 @@ fn compare_submodule_revision_file_inner(repository_path: String, submodule_path
     let absolute = validate_submodule(&repository_path, &submodule_path)?;
     let submodule_repository = absolute.to_string_lossy().into_owned();
     compare_git_tree_file(&submodule_repository, &relative_path, &left_ref, &right_ref)
+}
+
+#[tauri::command]
+pub async fn compare_github_module_revision_file(repository_path: String, owner: String, repository_name: String, relative_path: String, left_ref: String, right_ref: String) -> Result<FileComparison, String> {
+    off_main_thread(move || {
+        let cache = ensure_github_module_cache(&repository_path, &owner, &repository_name)?;
+        let cache_path = cache.to_string_lossy().into_owned();
+        compare_git_tree_file(&cache_path, &relative_path, &left_ref, &right_ref)
+    }).await
 }
 
 fn safe_export_component(value: &str, fallback: &str) -> String {
@@ -7537,6 +7615,72 @@ fn export_submodule_compare_snapshots_inner(repository_path: String, submodule_p
         left_revision,
         right_revision,
     })
+}
+
+#[tauri::command]
+pub async fn export_github_module_compare_snapshots(repository_path: String, owner: String, repository_name: String, left_ref: String, right_ref: String, destination_path: String) -> Result<SubmoduleCompareSnapshotExport, String> {
+    off_main_thread(move || {
+        let cache = ensure_github_module_cache(&repository_path, &owner, &repository_name)?;
+        let (_, repository_name) = validate_github_module_identity(&owner, &repository_name)?;
+        export_revision_pair_from_repository(&cache, &repository_name, &left_ref, &right_ref, &destination_path)
+    }).await
+}
+
+fn export_revision_pair_from_repository(repository_path: &Path, display_name: &str, left_ref: &str, right_ref: &str, destination_path: &str) -> Result<SubmoduleCompareSnapshotExport, String> {
+    let destination = PathBuf::from(destination_path);
+    if !destination.is_dir() {
+        return Err("Choose an existing folder where the snapshots should be exported".into());
+    }
+    let repository = repository_path.to_string_lossy().into_owned();
+    let repo = internal_repository(&repository)?;
+    let left_revision = resolve_commit(&repository, left_ref)?;
+    let right_revision = resolve_commit(&repository, right_ref)?;
+    let left_oid = git2::Oid::from_str(&left_revision).map_err(|error| error.message().to_string())?;
+    let right_oid = git2::Oid::from_str(&right_revision).map_err(|error| error.message().to_string())?;
+    let left_tree = repo.find_commit(left_oid).and_then(|commit| commit.tree()).map_err(|error| error.message().to_string())?;
+    let right_tree = repo.find_commit(right_oid).and_then(|commit| commit.tree()).map_err(|error| error.message().to_string())?;
+    let root = unique_submodule_snapshot_root(&destination, display_name, &left_revision, &right_revision)?;
+    let left_path = root.join(format!("left-{}", short_revision(&left_revision)));
+    let right_path = root.join(format!("right-{}", short_revision(&right_revision)));
+    export_tree_to_directory(&repo, &left_tree, &left_path)?;
+    export_tree_to_directory(&repo, &right_tree, &right_path)?;
+    Ok(SubmoduleCompareSnapshotExport {
+        root_path: root.to_string_lossy().into_owned(),
+        left_path: left_path.to_string_lossy().into_owned(),
+        right_path: right_path.to_string_lossy().into_owned(),
+        left_revision,
+        right_revision,
+    })
+}
+
+#[tauri::command]
+pub async fn export_github_module_revision_snapshot(repository_path: String, owner: String, repository_name: String, revision: String, destination_path: String) -> Result<RevisionSnapshotExport, String> {
+    off_main_thread(move || {
+        let cache = ensure_github_module_cache(&repository_path, &owner, &repository_name)?;
+        let (_, repository_name) = validate_github_module_identity(&owner, &repository_name)?;
+        let destination = PathBuf::from(destination_path);
+        if !destination.is_dir() {
+            return Err("Choose an existing folder where the snapshot should be exported".into());
+        }
+        let repository = cache.to_string_lossy().into_owned();
+        let repo = internal_repository(&repository)?;
+        let resolved = resolve_commit(&repository, &revision)?;
+        let oid = git2::Oid::from_str(&resolved).map_err(|error| error.message().to_string())?;
+        let tree = repo.find_commit(oid).and_then(|commit| commit.tree()).map_err(|error| error.message().to_string())?;
+        let base_name = format!("GitDrillDown-{}-{}", safe_export_component(&repository_name, "module"), safe_export_component(&short_revision(&resolved), "revision"));
+        let mut export_path = None;
+        for attempt in 0..100 {
+            let candidate = destination.join(if attempt == 0 { base_name.clone() } else { format!("{base_name}-{attempt}") });
+            match fs::create_dir(&candidate) {
+                Ok(()) => { export_path = Some(candidate); break; }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(format!("Could not create snapshot folder: {error}")),
+            }
+        }
+        let export_path = export_path.ok_or_else(|| "Could not create a unique snapshot folder in the selected destination".to_string())?;
+        export_tree_to_directory(&repo, &tree, &export_path)?;
+        Ok(RevisionSnapshotExport { path: export_path.to_string_lossy().into_owned(), revision: resolved })
+    }).await
 }
 
 // The submodule-publish-safety report's point 1: this used to also call
@@ -13902,6 +14046,50 @@ mod tests {
             run_git_capture(&dependency, &["rev-parse", "HEAD~1"]),
             "export must not move the checked-out submodule"
         );
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn github_module_compare_export_reads_two_revisions_directly_from_a_bare_clone() {
+        // The GitHub-module compare/export feature never checks out the module
+        // repository — it bare-clones it into a shared cache once, then reads
+        // both revisions straight from that bare clone's objects. This exercises
+        // the actual end-to-end path (sans the network clone step, replaced by
+        // a local bare clone of a throwaway "upstream") against
+        // export_revision_pair_from_repository. Also confirms internal_repository
+        // can open a bare repo at all — empirically, Repository::discover already
+        // does this on its own, so the recently-added
+        // `.or_else(Repository::open_bare)` fallback in internal_repository is
+        // not load-bearing for this (verified by removing it and re-running this
+        // test, which still passed) — harmless, but not the reason this works.
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-github-module-cache-{suffix}"));
+        let upstream = base.join("upstream");
+        let bare_cache = base.join("bare-cache.git");
+        create_libgit2_repository(&upstream, "README.md");
+        let first = run_git_capture(&upstream, &["rev-parse", "HEAD"]);
+        fs::write(upstream.join("module.txt"), "v2\n").unwrap();
+        run_git(&upstream, &["add", "module.txt"]);
+        run_git(&upstream, &["commit", "-m", "v2"]);
+        let second = run_git_capture(&upstream, &["rev-parse", "HEAD"]);
+        run_git(&base, &["clone", "--bare", upstream.to_str().unwrap(), bare_cache.to_str().unwrap()]);
+
+        // internal_repository must be able to open the bare clone at all —
+        // the whole feature depends on this, since every helper it reuses
+        // (resolve_commit, compare_git_tree_*, export_tree_to_directory) opens
+        // the repository through internal_repository, never a bare-aware path
+        // of its own.
+        assert!(internal_repository(&bare_cache.to_string_lossy()).is_ok(), "internal_repository must be able to open a bare clone directly");
+
+        let export_destination = base.join("exports");
+        fs::create_dir_all(&export_destination).unwrap();
+        let exported = export_revision_pair_from_repository(&bare_cache, "module", &first, &second, &export_destination.to_string_lossy()).unwrap();
+        assert_eq!(exported.left_revision, first);
+        assert_eq!(exported.right_revision, second);
+        assert!(!Path::new(&exported.left_path).join("module.txt").exists(), "module.txt did not exist yet at the first revision");
+        assert_eq!(fs::read_to_string(Path::new(&exported.right_path).join("module.txt")).unwrap(), "v2\n");
+        assert_eq!(fs::read_to_string(Path::new(&exported.left_path).join("README.md")).unwrap(), "content");
 
         fs::remove_dir_all(base).unwrap();
     }

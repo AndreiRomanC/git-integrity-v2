@@ -396,6 +396,12 @@ button.pr-reviewer:hover { border-color: #59758e; background: #1b2b38; color: #e
 .submodule-browser-row { width: 100%; min-height: 50px; display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; gap: 10px; margin: 0; padding: 8px 10px; border: 1px solid #223444; border-radius: 8px; background: #101922; color: #cddae5; text-align: left; }
 .submodule-browser-row:hover { border-color: #456985; background: #172839; }
 .submodule-browser-row.selected { border-color: #58a6ff; background: #183650; }
+.submodule-browser-row.compare-selected { box-shadow: inset 3px 0 #9f7aea; border-color: #7f65bf; }
+.submodule-ref-row { grid-template-columns: minmax(0, 1fr) 30px 30px; padding: 0; gap: 0; overflow: hidden; }
+.submodule-ref-main { min-width: 0; min-height: 50px; display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; gap: 10px; padding: 8px 10px; border: 0; background: transparent; color: inherit; text-align: left; }
+.submodule-ref-main:hover { background: #ffffff08; }
+.submodule-ref-action { width: 30px; height: 100%; min-height: 50px; margin: 0; border: 0; border-left: 1px solid #223444; border-radius: 0; background: #122131; color: #9dc9ef; font-size: 13px; font-weight: 900; }
+.submodule-ref-action:hover { background: #1d3b55; color: white; }
 .submodule-browser-row strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 12px ui-monospace, SFMono-Regular, Consolas, monospace; }
 .submodule-browser-row small { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-top: 3px; color: #76899a; font-size: 10px; }
 .submodule-browser-row code { color: #84c3fa; font-size: 10px; }
@@ -633,8 +639,13 @@ button.pr-reviewer:hover { border-color: #59758e; background: #1b2b38; color: #e
 .compare-status-line.busy { color: #70baff; }
 .compare-status-line.success { color: #67d990; }
 .compare-status-line.error { color: #ff858f; }
+.compare-diff-nav { min-height: 34px; display: flex; align-items: center; justify-content: flex-end; gap: 8px; padding: 6px 16px; border-top: 1px solid #1e2c38; border-bottom: 1px solid var(--border-soft); background: #111a22; }
+.compare-diff-nav span { flex: 1; min-width: 0; color: #8296a7; font-size: 10px; }
+.compare-diff-nav button { width: auto; height: 24px; margin: 0; padding: 0 9px; border: 1px solid #3d5367; border-radius: 6px; background: #172838; color: #c9d7e4; font-size: 9px; font-weight: 800; }
+.compare-diff-nav button:hover:not(:disabled) { border-color: #5a8db8; background: #1f3b54; }
+.compare-diff-nav button:disabled { opacity: .45; cursor: not-allowed; }
 .compare-content { display: grid; grid-template-columns: 1fr 1fr; height: min(62vh, 600px); overflow-y: auto; }.compare-content pre { min-height: 100%; height: max-content; margin: 0; overflow-x: auto; overflow-y: hidden; padding: 14px; background: #0b1116; color: #c5d1db; font: 11px/1.55 ui-monospace, SFMono-Regular, Consolas, monospace; white-space: pre; }.compare-content pre:last-child { border-left: 1px solid var(--border); background: #0e151b; }
-.diff-line { display: block; min-height: 1.55em; margin: 0 -14px; padding: 0 14px; background: #7a541fa8; box-shadow: inset 4px 0 var(--amber); font-weight: 600; }.diff-line.remote-line { background: #2c5487a8; box-shadow: inset 4px 0 var(--blue); }.same-line { display: block; min-height: 1.55em; }.filler-line { display: block; min-height: 1.55em; margin: 0 -14px; padding: 0 14px; background: repeating-linear-gradient(135deg, #ffffff08 0 6px, transparent 6px 12px); }.line-number { display: inline-block; width: 34px; margin-right: 10px; color: #526474; text-align: right; user-select: none; }
+.diff-line { display: block; min-height: 1.55em; margin: 0 -14px; padding: 0 14px; background: #7a541fa8; box-shadow: inset 4px 0 var(--amber); font-weight: 600; }.diff-line.remote-line { background: #2c5487a8; box-shadow: inset 4px 0 var(--blue); }.same-line { display: block; min-height: 1.55em; }.filler-line { display: block; min-height: 1.55em; margin: 0 -14px; padding: 0 14px; background: repeating-linear-gradient(135deg, #ffffff08 0 6px, transparent 6px 12px); }.active-compare-difference { outline: 1px solid #94d2ff; outline-offset: -1px; filter: brightness(1.22); }.line-number { display: inline-block; width: 34px; margin-right: 10px; color: #526474; text-align: right; user-select: none; }
 
 .graph-view { flex: 1; min-height: 0; overflow: auto; }
 .lane-legend { position: sticky; z-index: 3; top: 0; min-height: 40px; display: flex; flex-wrap: wrap; align-items: center; gap: 10px 15px; padding: 8px 22px; background: #111820; border-bottom: 1px solid var(--border); }
