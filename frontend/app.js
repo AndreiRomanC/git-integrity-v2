@@ -10,7 +10,7 @@
 // without relying on each new mutating action to add its own copy.
 const MUTATING_COMMANDS = new Set([
   'stage_files', 'unstage_files', 'stage_all', 'commit_files', 'commit_staged', 'commit_path',
-  'remove_git_path', 'delete_local_path', 'switch_branch', 'create_branch', 'create_branch_at_commit', 'checkout_commit', 'rename_branch', 'delete_branch',
+  'remove_git_path', 'delete_local_path', 'switch_branch', 'checkout_remote_tracking_branch', 'create_branch', 'create_branch_at_commit', 'checkout_commit', 'rename_branch', 'delete_branch',
   'stash_changes', 'stash_file', 'pop_stash', 'drop_stash', 'restore_stash_paths', 'abort_stash_conflict',
   'restore_file', 'restore_remote_file', 'restore_folder', 'restore_exact_checkpoint', 'add_submodule', 'init_submodule', 'switch_submodule_version', 'reset_submodule', 'reset_submodule_branch_to_upstream', 'change_submodule_url',
   'commit_submodule', 'push_submodule', 'pull_submodule', 'force_push_submodule', 'fetch_submodule',
@@ -3242,19 +3242,45 @@ function submoduleReviewResultSource(item, revision = item?.result) {
   return selected ? 'custom commit' : 'No submodule';
 }
 
-function submoduleReviewChoiceLabel(item) {
+function submoduleReviewChoiceSource(item) {
   if (!item || !Object.prototype.hasOwnProperty.call(item, 'selectedRevision')) return 'No choice yet';
-  if (item.selectedSource === 'result') return `Result: ${submoduleReviewResultSource(item, item.result)}`;
+  if (item.selectedSource === 'result') return submoduleReviewResultSource(item, item.result);
   if (item.selectedSource === 'current') return 'Current Branch';
   if (item.selectedSource === 'incoming') return 'Incoming/origin';
   return normalizeReviewRevision(item.selectedRevision) ? 'Custom Commit' : 'No submodule';
 }
 
+function submoduleReviewChoiceLabel(item) {
+  const prefix = item?.selectedSource === 'result' ? 'Prepared result' : 'Selected';
+  return `${prefix}: ${submoduleReviewChoiceSource(item)}`;
+}
+
+function submoduleReviewChoiceClass(item) {
+  const source = item?.selectedSource === 'result' ? submoduleReviewResultSource(item, item.result) : submoduleReviewChoiceSource(item);
+  if (/Incoming/.test(source)) return 'incoming';
+  if (/Current/.test(source)) return 'current';
+  if (/Custom/.test(source)) return 'custom';
+  return 'neutral';
+}
+
+function submoduleReviewLocalNotice(item, selected) {
+  const local = normalizeReviewRevision(item?.local_checkout);
+  if (!local || sameReviewRevision(local, selected)) return '';
+  return `<div class="submodule-review-local-note">Folder on disk is at <code>${esc(shortRevision(local))}</code>. The merge commit will record <code>${esc(pointerRevisionLabel(selected))}</code>. Run submodule update when you want the folder to match the chosen pointer.</div>`;
+}
+
 function submoduleReviewRowHtml(item) {
   const selected = normalizeReviewRevision(item.selectedRevision);
-  const pointerRow = (label, value) => {
+  const choiceLabel = submoduleReviewChoiceLabel(item);
+  const pointerRow = (label, value, extra = {}) => {
     const revision = normalizeReviewRevision(value);
-    return `<div class="${revision ? '' : 'absent'}"><span>${label}</span><code>${esc(pointerRevisionLabel(value))}</code></div>`;
+    const classes = [
+      revision ? '' : 'absent',
+      extra.result ? 'prepared-result' : '',
+      extra.source && item.selectedSource === extra.source ? 'selected-choice' : '',
+    ].filter(Boolean).join(' ');
+    const badge = extra.badge ? `<em>${esc(extra.badge)}</em>` : '';
+    return `<div class="${classes}"><span>${label}</span><code>${esc(pointerRevisionLabel(value))}</code>${badge}</div>`;
   };
   const actionButton = (action, label, revision, title = '') => {
     const normalized = normalizeReviewRevision(revision);
@@ -3264,17 +3290,17 @@ function submoduleReviewRowHtml(item) {
     return `<button type="button" data-review-action="${action}" ${revisionAttr} class="${active}" title="${esc(`${title || label}${removeHint}`)}">${label}</button>`;
   };
   return `<article class="submodule-review-item ${item.suspicious ? 'warning' : 'ok'}" data-path="${esc(item.path)}">
-    <header><div><strong>${esc(item.path)}</strong><span>${esc(item.status)}</span></div><b>${esc(submoduleReviewChoiceLabel(item))} · ${esc(pointerRevisionLabel(selected))}</b></header>
+    <header><div><strong>${esc(item.path)}</strong><span>${esc(item.status)}</span></div><b class="${esc(submoduleReviewChoiceClass(item))}">${esc(choiceLabel)} · ${esc(pointerRevisionLabel(selected))}</b></header>
     <div class="submodule-review-pointers">
-      ${pointerRow('Base', item.base)}
-      ${pointerRow('Current', item.current)}
-      ${pointerRow('Incoming', item.incoming)}
-      ${pointerRow('Result', item.result)}
-      ${pointerRow('Local', item.local_checkout)}
+      ${pointerRow('Merge base', item.base)}
+      ${pointerRow('Current Branch', item.current, { source: 'current' })}
+      ${pointerRow('Incoming/origin', item.incoming, { source: 'incoming' })}
+      ${pointerRow('Prepared result', item.result, { source: 'result', result: true, badge: submoduleReviewResultSource(item, item.result) })}
     </div>
+    ${submoduleReviewLocalNotice(item, selected)}
     <p>${esc(item.reason)}</p>
     <div class="submodule-review-actions">
-      ${actionButton('result', 'Keep prepared result', item.result, `Keep prepared result: ${submoduleReviewResultSource(item, item.result)}`)}
+      ${actionButton('result', `Keep prepared result (${submoduleReviewResultSource(item, item.result)})`, item.result, `Keep prepared result: ${submoduleReviewResultSource(item, item.result)}`)}
       ${actionButton('current', 'Use Current Branch', item.current, 'Record the submodule pointer from this branch before the merge')}
       ${actionButton('incoming', 'Use Incoming/origin', item.incoming, 'Record the submodule pointer from the branch being merged')}
       <button type="button" data-review-action="choose">Choose another commit…</button>
@@ -4251,6 +4277,23 @@ function remoteCurrentBranchCandidate(remoteName = '') {
   return (state.branches || []).some(branch => branch.remote && branch.name === candidate) ? candidate : '';
 }
 
+function remoteBranchShortName(remoteBranch = '') {
+  const parts = String(remoteBranch || '').split('/');
+  return parts.length > 1 ? parts.slice(1).join('/') : remoteBranch;
+}
+
+function remoteTrackingSummary(remoteName = '') {
+  const current = state.repository?.current_branch || '';
+  if (state.repository?.head_detached) return { label: 'Current checkout', value: `Detached HEAD ${(state.repository?.head_oid || '').slice(0, 8)}`, detail: 'Detached HEAD does not track a remote branch.' };
+  if (!current) return { label: 'Current checkout', value: 'No branch', detail: 'No local branch is checked out.' };
+  const candidate = remoteCurrentBranchCandidate(remoteName);
+  return {
+    label: 'Current local branch',
+    value: current,
+    detail: candidate ? `${current} can track ${candidate}` : `${current} has no ${remoteName}/${current} remote branch known locally`,
+  };
+}
+
 function renderRemoteUrlRow(label, url) {
   if (!url) return '';
   return `<div class="remote-url-row"><span>${esc(label)}</span><code>${esc(url)}</code><button type="button" data-copy-remote-url="${esc(url)}">Copy</button></div>`;
@@ -4261,12 +4304,14 @@ function renderRemotes() {
     refs.remoteCards.innerHTML = '<div class="remote-empty">No remote is configured for this repository.</div>';
     return;
   }
-  const currentBranch = state.repository?.current_branch || (state.repository?.head_detached ? `Detached HEAD ${(state.repository?.head_oid || '').slice(0, 8)}` : 'No branch');
   const totalRemoteBranches = (state.branches || []).filter(branch => branch.remote && !branch.name.endsWith('/HEAD')).length;
+  const mainRemote = state.remotes[0]?.name || 'origin';
+  const currentSummary = remoteTrackingSummary(mainRemote);
   const overview = `<article class="remote-overview">
-    <div><h2>Remote overview</h2><p>Fetch downloads new refs only. It does not merge, checkout, stage, commit or push.</p></div>
+    <div><h2>Remote overview</h2><p>Fetch downloads refs only. It never switches branch, merges, stages, commits or pushes.</p></div>
     <div class="remote-overview-grid">
-      <span>Current checkout</span><strong>${esc(currentBranch)}</strong>
+      <span>${esc(currentSummary.label)}</span><strong>${esc(currentSummary.value)}</strong>
+      <span>Tracking/upstream clue</span><strong>${esc(currentSummary.detail)}</strong>
       <span>Configured remotes</span><strong>${state.remotes.length}</strong>
       <span>Remote branches known locally</span><strong>${totalRemoteBranches}</strong>
     </div>
@@ -4277,15 +4322,19 @@ function renderRemotes() {
     const currentCandidate = remoteCurrentBranchCandidate(remote.name);
     const urlRows = renderRemoteUrlRow(remote.fetch_url === remote.push_url ? 'FETCH + PUSH URL' : 'FETCH URL', remote.fetch_url)
       + (remote.push_url && remote.push_url !== remote.fetch_url ? renderRemoteUrlRow('PUSH URL', remote.push_url) : '');
-    const sampleBranches = trackingBranches.slice(0, 4).map(branch => `<code>${esc(branch.name)}</code>`).join('');
+    const orderedBranches = currentCandidate
+      ? [currentCandidate, ...trackingBranches.map(branch => branch.name).filter(name => name !== currentCandidate)]
+      : trackingBranches.map(branch => branch.name);
+    const sampleBranches = orderedBranches.slice(0, 4).map(name => `<code class="${name === currentCandidate ? 'current-remote-candidate' : ''}">${esc(name)}</code>`).join('');
     const moreBranches = trackingBranches.length > 4 ? `<small>+${trackingBranches.length - 4} more</small>` : '';
+    const remoteSummary = remoteTrackingSummary(remote.name);
     return `<article class="remote-card">
       <div class="remote-symbol">◎</div>
       <div class="remote-card-main">
         <div class="remote-card-head"><h2>${esc(remote.name)}</h2><span>${esc(remoteUrlKind(remote.fetch_url))}</span></div>
         <div class="remote-facts">
-          <span>${trackingBranches.length} remote branch${trackingBranches.length === 1 ? '' : 'es'}</span>
-          <span>${currentCandidate ? `tracks current branch candidate: ${currentCandidate}` : 'no matching branch for current checkout'}</span>
+          <span>${esc(remoteSummary.value)} → ${currentCandidate ? esc(currentCandidate) : 'no matching remote branch'}</span>
+          <span>${trackingBranches.length} available remote branch${trackingBranches.length === 1 ? '' : 'es'}; checkout one to create a local tracking branch</span>
         </div>
         <div class="remote-branch-strip">${sampleBranches}${moreBranches}</div>
         <div class="remote-url-list">${urlRows}</div>
@@ -4515,7 +4564,7 @@ async function restoreOneStashFile(index, path) {
     // The entry intentionally remains visible: the immutable stash is retained
     // as a backup until the user explicitly drops it.
     await refreshStashesList();
-    const msg = `${path} restored; the stash was kept as a backup.`;
+    const msg = `${path} restored. The stash is still kept as a backup — use ✕ on the stash entry when you want to remove that backup.`;
     status(msg); showOperationToast(msg, 'success');
   } catch (error) { handleError(error); if (button) { button.disabled = false; button.textContent = '⇈'; } }
 }
@@ -4953,18 +5002,19 @@ function graphMergeMenuItem(branchName, id = 'merge') {
 function graphCheckoutBranchMenuItem(branchName, kind = 'local_branch', id = 'checkout-branch') {
   const g = activeGraphData();
   const isRemote = kind === 'remote_branch';
-  const unavailable = isRemote
-    ? 'Remote-tracking refs cannot be checked out directly here. Use a local branch row, or create a branch from this commit.'
-    : branchName === g.currentBranch
+  const localName = isRemote ? remoteBranchShortName(branchName) : branchName;
+  const unavailable = !isRemote && branchName === g.currentBranch
       ? 'Already on this branch.'
       : '';
   return {
     id,
-    label: `Checkout branch ${branchName}`,
-    detail: unavailable || (g.headDetached ? 'Attach detached HEAD to this local branch.' : `Switch current checkout to ${branchName}.`),
+    label: isRemote ? `Create/switch local branch ${localName}` : `Checkout branch ${branchName}`,
+    detail: unavailable || (isRemote
+      ? `Create local "${localName}" tracking ${branchName}, or switch to it if it already exists.`
+      : (g.headDetached ? 'Attach detached HEAD to this local branch.' : `Switch current checkout to ${branchName}.`)),
     kind: 'primary',
     disabled: !!unavailable,
-    run: () => switchBranch(branchName),
+    run: () => isRemote ? switchRemoteTrackingBranch(branchName) : switchBranch(branchName),
   };
 }
 
@@ -6071,6 +6121,34 @@ async function switchBranch(branch, button = null) {
     } else {
       await invoke('switch_branch', { path: context.path, branch });
       await loadRepository(context.path);
+    }
+  }
+  catch (error) { handleError(error); }
+  finally { finishButton(); }
+}
+
+async function switchRemoteTrackingBranch(remoteBranch, button = null) {
+  const context = activeRepositoryContext();
+  if (!invoke || !context.path) return;
+  const localName = remoteBranchShortName(remoteBranch);
+  const finishButton = beginButtonOperation(button, 'Switching…');
+  try {
+    await flushPendingTogglesNow({}, 'the Stage operation');
+    status(`Creating/switching local branch ${localName} tracking ${remoteBranch}…`, 'busy');
+    if (context.isSubmodule) {
+      await invoke('switch_submodule_version', {
+        repositoryPath: context.parentPath,
+        relativePath: context.relativePath,
+        revision: remoteBranch,
+        versionKind: 'remote',
+        name: remoteBranch,
+      });
+      await openSubmoduleGraph({ relative_path: context.relativePath, name: context.name });
+    } else {
+      const result = await invoke('checkout_remote_tracking_branch', { repositoryPath: context.path, remoteBranch });
+      await loadRepository(context.path);
+      const verb = result?.created ? 'Created and switched to' : 'Switched to';
+      showOperationToast(`${verb} ${result?.branch || localName} tracking ${result?.upstream || remoteBranch}.`, 'success');
     }
   }
   catch (error) { handleError(error); }

@@ -9,7 +9,7 @@ pub mod remotes;
 #[cfg(test)]
 use stash::{abort_stash_conflict, drop_stash, list_stashes, list_submodule_stashes, pop_stash, restore_stash_paths, stash_changes, stash_entry_files, stash_file};
 #[cfg(test)]
-use branches::{branch_creation_context, checkout_commit, create_branch, create_branch_at_commit, create_submodule_branch, delete_branch, graph_branch_divergence, rename_branch, restore_exact_checkpoint_inner, switch_branch};
+use branches::{branch_creation_context, checkout_commit, checkout_remote_tracking_branch, create_branch, create_branch_at_commit, create_submodule_branch, delete_branch, graph_branch_divergence, rename_branch, restore_exact_checkpoint_inner, switch_branch};
 #[cfg(test)]
 use branches::merge::{abort_merge, apply_submodule_merge_revision, complete_merge, conflict_sides, list_conflicts, merge_branch, merge_in_progress, resolve_conflict, submodule_merge_review};
 #[cfg(test)]
@@ -9544,6 +9544,40 @@ mod tests {
     }
 
     #[test]
+    fn stash_is_refused_while_merge_is_in_progress() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let repository = std::env::temp_dir().join(format!("git-integrity-stash-during-merge-{suffix}"));
+        fs::create_dir_all(&repository).unwrap();
+        fs::write(repository.join("a.txt"), "base\n").unwrap();
+        run_git(&repository, &["init", "-b", "main"]);
+        run_git(&repository, &["config", "user.email", "test@example.com"]);
+        run_git(&repository, &["config", "user.name", "Test User"]);
+        run_git(&repository, &["add", "."]);
+        run_git(&repository, &["commit", "-m", "Initial commit"]);
+
+        run_git(&repository, &["checkout", "-b", "feature"]);
+        fs::write(repository.join("a.txt"), "feature\n").unwrap();
+        run_git(&repository, &["commit", "-am", "Feature edit"]);
+
+        run_git(&repository, &["checkout", "main"]);
+        fs::write(repository.join("a.txt"), "main\n").unwrap();
+        run_git(&repository, &["commit", "-am", "Main edit"]);
+
+        let merge = Command::new("git").arg("-C").arg(&repository).args(["merge", "feature"]).output().unwrap();
+        assert!(!merge.status.success(), "merge should stop with a conflict");
+        assert_eq!(Repository::open(&repository).unwrap().state(), git2::RepositoryState::Merge);
+
+        let path = repository.to_string_lossy().into_owned();
+        let error = stash_changes(path.clone()).expect_err("creating a full stash during an unresolved merge must be blocked");
+        assert!(error.contains("Cannot stash changes while a merge"), "unexpected full-stash error: {error}");
+        let error = stash_file(path.clone(), "a.txt".into()).expect_err("creating a scoped stash during an unresolved merge must be blocked");
+        assert!(error.contains("Cannot stash this file or folder while a merge"), "unexpected scoped-stash error: {error}");
+        assert!(list_stashes(path).unwrap().stashes.is_empty(), "blocked stash commands must not create a stash that cannot be restored during the merge");
+
+        fs::remove_dir_all(repository).unwrap();
+    }
+
+    #[test]
     fn popping_a_conflicting_stash_keeps_the_entry_until_resolved_and_finished() {
         // Reported: "Conflicts while restoring stash. Resolve manually." with
         // no way to see what the stash contained or actually resolve it.
@@ -9783,6 +9817,11 @@ mod tests {
         restore_stash_paths(path.clone(), 0, vec!["README.md".into()]).unwrap();
         assert_eq!(fs::read_to_string(repository.join("README.md")).unwrap(), "changed");
         assert_eq!(load_repository_inner(path.clone(), Some(true)).unwrap().stashes.len(), 1, "only an explicit Drop may delete the backup stash");
+        assert!(load_directory_inner(path.clone(), String::new(), Some(true)).unwrap().iter().find(|entry| entry.name == "README.md").unwrap().stashed, "the Explorer badge should stay while the backup stash still exists");
+
+        drop_stash(path.clone(), 0).unwrap();
+        assert!(load_repository_inner(path.clone(), Some(true)).unwrap().stashes.is_empty(), "dropping the backup should remove it from the stash list");
+        assert!(!load_directory_inner(path.clone(), String::new(), Some(true)).unwrap().iter().find(|entry| entry.name == "README.md").unwrap().stashed, "the Explorer badge must disappear after the backup stash is dropped");
 
         fs::remove_dir_all(repository).unwrap();
     }
@@ -12725,6 +12764,70 @@ mod tests {
         let sub_repo = Repository::open(&sub_path).unwrap();
         assert!(!sub_repo.head_detached().unwrap());
         assert_eq!(sub_repo.head().unwrap().shorthand(), Some("main"));
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn checkout_remote_tracking_branch_creates_attaches_and_refuses_to_rewrite_a_conflicting_local_branch() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-checkout-remote-tracking-{suffix}"));
+        let upstream = base.join("upstream");
+        let repository = base.join("clone");
+        create_libgit2_repository(&upstream, "README.md");
+        run_git(&upstream, &["switch", "-c", "feature"]);
+        fs::write(upstream.join("feature.txt"), "v1\n").unwrap();
+        run_git(&upstream, &["add", "feature.txt"]);
+        run_git(&upstream, &["commit", "-m", "Feature work"]);
+        let feature_oid = run_git_capture(&upstream, &["rev-parse", "HEAD"]);
+        run_git(&upstream, &["switch", "-"]);
+
+        run_git(&base, &["-c", "protocol.file.allow=always", "clone", upstream.to_str().unwrap(), "clone"]);
+        run_git(&repository, &["config", "user.email", "test@example.com"]);
+        run_git(&repository, &["config", "user.name", "Test User"]);
+        let repo_path = repository.to_string_lossy().into_owned();
+
+        // Case 1: no local "feature" branch exists yet — must be created,
+        // tracking origin/feature, and checked out attached (not detached).
+        let created = checkout_remote_tracking_branch(repo_path.clone(), "origin/feature".into()).unwrap();
+        assert_eq!(created.branch, "feature");
+        assert_eq!(created.upstream, "origin/feature");
+        assert_eq!(created.revision, feature_oid);
+        assert!(created.created, "no local feature branch existed yet");
+        let repo = Repository::open(&repository).unwrap();
+        assert!(!repo.head_detached().unwrap(), "checking out a remote-tracking branch must attach HEAD to a local branch, not detach it");
+        assert_eq!(repo.head().unwrap().shorthand(), Some("feature"));
+        assert_eq!(repo.find_branch("feature", BranchType::Local).unwrap().upstream().unwrap().name().unwrap(), Some("origin/feature"));
+        assert_eq!(fs::read_to_string(repository.join("feature.txt")).unwrap(), "v1\n");
+        drop(repo);
+
+        // Case 2: switch away, then select origin/feature again — the existing
+        // local branch (already correctly tracking) must be reused, not
+        // recreated, and the result must say so.
+        let default_branch = Repository::open(&repository).unwrap().branches(None).unwrap()
+            .filter_map(|item| item.ok()).find(|(branch, _)| branch.name().unwrap() != Some("feature"))
+            .and_then(|(branch, _)| branch.name().unwrap().map(str::to_string)).expect("the clone's default branch");
+        run_git(&repository, &["switch", &default_branch]);
+        let reused = checkout_remote_tracking_branch(repo_path.clone(), "origin/feature".into()).unwrap();
+        assert!(!reused.created, "an existing, already-tracking local branch must be reused, not recreated");
+        assert_eq!(Repository::open(&repository).unwrap().head().unwrap().shorthand(), Some("feature"));
+
+        // Case 3: a local branch named exactly like the remote's short name
+        // already exists but tracks a *different* upstream — must be refused
+        // outright, and left completely untouched (never silently repointed).
+        run_git(&upstream, &["switch", "-c", "other"]);
+        fs::write(upstream.join("other.txt"), "v1\n").unwrap();
+        run_git(&upstream, &["add", "other.txt"]);
+        run_git(&upstream, &["commit", "-m", "Other work"]);
+        run_git(&repository, &["fetch", "origin"]);
+        run_git(&repository, &["branch", "other", "feature"]);
+        run_git(&repository, &["branch", "--set-upstream-to=origin/feature", "other"]);
+        let before_oid = run_git_capture(&repository, &["rev-parse", "other"]);
+        let error = checkout_remote_tracking_branch(repo_path, "origin/other".into())
+            .expect_err("a local branch with a different, real upstream must never be silently repointed");
+        assert!(error.contains("other") && error.contains("already tracks"), "error should name the conflicting local branch and its real upstream: {error}");
+        assert_eq!(run_git_capture(&repository, &["rev-parse", "other"]), before_oid, "the conflicting local branch must not move");
+        assert_eq!(Repository::open(&repository).unwrap().find_branch("other", BranchType::Local).unwrap().upstream().unwrap().name().unwrap(), Some("origin/feature"), "the conflicting local branch's upstream must stay exactly as it was");
 
         fs::remove_dir_all(base).unwrap();
     }

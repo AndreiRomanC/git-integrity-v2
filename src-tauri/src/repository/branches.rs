@@ -29,6 +29,14 @@ pub struct GraphBranchStart {
     pub(super) oid: String,
 }
 
+#[derive(Serialize, Debug)]
+pub struct RemoteTrackingCheckoutResult {
+    pub(super) branch: String,
+    pub(super) upstream: String,
+    pub(super) revision: String,
+    pub(super) created: bool,
+}
+
 const RESTORE_SUBMODULE_UPDATE_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 const RESTORE_SUBMODULE_UPDATE_TIMEOUT_LABEL: &str = "60 minutes";
 
@@ -374,6 +382,83 @@ pub fn switch_branch(path: String, branch: String) -> Result<(), String> {
     repo.set_head(&reference).map_err(|error| error.message().to_string())?;
     invalidate_git_metadata(&path);
     Ok(())
+}
+
+// Turns a remote-tracking branch such as origin/feature into a normal local
+// branch feature that tracks it, then checks that local branch out. This is
+// the safe GUI equivalent of:
+//   git switch --track origin/feature
+// with two deliberate guardrails:
+// - an existing same-name local branch is never reset or moved;
+// - if that local branch already tracks a different upstream, the user gets a
+//   clear error instead of silently rewriting branch configuration.
+#[tauri::command]
+pub fn checkout_remote_tracking_branch(repository_path: String, remote_branch: String) -> Result<RemoteTrackingCheckoutResult, String> {
+    validate_path(&repository_path)?;
+    let remote_branch = remote_branch.trim();
+    if remote_branch.is_empty() { return Err("Remote branch cannot be empty".into()); }
+    if remote_branch.ends_with("/HEAD") { return Err("origin/HEAD is only a pointer, not a branch to check out.".into()); }
+    let Some((remote_name, local_name)) = remote_branch.split_once('/') else {
+        return Err("Select a remote branch such as origin/feature-name.".into());
+    };
+    if remote_name.trim().is_empty() || local_name.trim().is_empty() {
+        return Err("Select a remote branch such as origin/feature-name.".into());
+    }
+
+    let queue_started = Instant::now();
+    let lock_handle = repo_write_lock(&repository_path);
+    let _lock = lock_handle.lock().unwrap();
+    log_repo_write_lock_acquired(&repository_path, "checkout_remote_tracking_branch", queue_started.elapsed());
+
+    let repo = internal_repository(&repository_path)?;
+    let remote_ref = format!("refs/remotes/{remote_branch}");
+    let remote_commit = repo.find_reference(&remote_ref)
+        .map_err(|_| format!("Remote branch \"{remote_branch}\" is not known locally. Fetch first, then try again."))?
+        .peel_to_commit()
+        .map_err(|error| format!("Cannot resolve {remote_branch}: {}", error.message()))?;
+    let revision = remote_commit.id().to_string();
+
+    let mut created = false;
+    match repo.find_branch(local_name, BranchType::Local) {
+        Ok(mut local_branch) => {
+            let existing_upstream = local_branch.upstream()
+                .ok()
+                .and_then(|upstream| upstream.get().shorthand().map(str::to_string));
+            if let Some(existing) = existing_upstream {
+                if existing != remote_branch {
+                    return Err(format!(
+                        "Local branch \"{local_name}\" already tracks {existing}. It was not changed. Create a different local branch name if you want to track {remote_branch}."
+                    ));
+                }
+            } else {
+                local_branch.set_upstream(Some(remote_branch))
+                    .map_err(|error| format!("Could not set {remote_branch} as upstream for {local_name}: {}", error.message()))?;
+            }
+        }
+        Err(_) => {
+            let mut branch = repo.branch(local_name, &remote_commit, false)
+                .map_err(|error| format!("Could not create local branch \"{local_name}\" from {remote_branch}: {}", error.message()))?;
+            branch.set_upstream(Some(remote_branch))
+                .map_err(|error| format!("Created {local_name}, but could not set upstream {remote_branch}: {}", error.message()))?;
+            created = true;
+        }
+    }
+
+    let reference = format!("refs/heads/{local_name}");
+    let target_oid = repo.find_reference(&reference)
+        .map_err(|error| error.message().to_string())?
+        .peel_to_commit()
+        .map_err(|error| error.message().to_string())?
+        .id();
+    let target = repo.find_object(target_oid, Some(ObjectType::Commit)).map_err(|error| error.message().to_string())?;
+    let mut checkout = git2::build::CheckoutBuilder::new();
+    checkout.safe();
+    repo.checkout_tree(&target, Some(&mut checkout))
+        .map_err(|error| format!("Cannot switch to local branch \"{local_name}\": {}", error.message()))?;
+    drop(target);
+    repo.set_head(&reference).map_err(|error| error.message().to_string())?;
+    invalidate_git_metadata(&repository_path);
+    Ok(RemoteTrackingCheckoutResult { branch: local_name.to_string(), upstream: remote_branch.to_string(), revision, created })
 }
 
 #[tauri::command]

@@ -868,7 +868,7 @@ button.pr-reviewer:hover { border-color: #59758e; background: #1b2b38; color: #e
 .remote-symbol { display: grid; place-items: center; width: 34px; height: 34px; border: 2px solid var(--blue); border-radius: 50%; color: var(--blue); font-size: 17px; }.remote-card h2 { margin: 0; font-size: 15px; }
 .remote-card-main { min-width: 0; display: grid; gap: 8px; }.remote-card-head { display: flex; align-items: center; gap: 9px; }.remote-card-head > span { padding: 2px 7px; border: 1px solid #35516a; border-radius: 999px; background: #102131; color: #a8c8e3; font-size: 8px; font-weight: 800; letter-spacing: .6px; text-transform: uppercase; }
 .remote-facts { display: flex; flex-wrap: wrap; gap: 7px; }.remote-facts span { padding: 4px 8px; border: 1px solid #2d4152; border-radius: 999px; background: #101922; color: #95a9b9; font-size: 10px; }
-.remote-branch-strip { display: flex; flex-wrap: wrap; gap: 6px; min-height: 18px; }.remote-branch-strip code { padding: 2px 6px; border-radius: 5px; background: #101922; color: #9ccfff; font-size: 10px; }.remote-branch-strip small { color: #778b9b; }
+.remote-branch-strip { display: flex; flex-wrap: wrap; gap: 6px; min-height: 18px; }.remote-branch-strip code { padding: 2px 6px; border-radius: 5px; background: #101922; color: #9ccfff; font-size: 10px; }.remote-branch-strip code.current-remote-candidate { border: 1px solid #59c7ff; background: #12314a; color: #d8f2ff; }.remote-branch-strip small { color: #778b9b; }
 .remote-url-list { display: grid; gap: 6px; }.remote-url-row { display: grid; grid-template-columns: 110px minmax(0, 1fr) auto; gap: 8px; align-items: center; }.remote-url-row span { color: #738697; font-size: 9px; font-weight: 800; letter-spacing: .7px; }.remote-url-row code { min-width: 0; color: #b8c9d8; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.remote-url-row button { height: 25px; padding: 0 9px; border: 1px solid #3a5267; border-radius: 5px; background: #162637; color: #bad4e8; }
 .remote-empty { padding: 45px; text-align: center; color: var(--muted); }
 
@@ -1105,12 +1105,17 @@ dialog form { padding: 28px; text-align: center; }dialog h2 { margin: 0 0 10px; 
 .submodule-review-item header strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #d7e5f0; font: 13px ui-monospace, SFMono-Regular, Consolas, monospace; }
 .submodule-review-item header span { color: #ffcc82; font-size: 10px; font-weight: 700; letter-spacing: .6px; text-transform: uppercase; }
 .submodule-review-item header b { flex: 0 0 auto; border: 1px solid #45627a; border-radius: 999px; padding: 3px 8px; color: #b8dbff; background: #16293a; font: 10px ui-monospace, SFMono-Regular, Consolas, monospace; }
-.submodule-review-pointers { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 6px; }
+.submodule-review-item header b.current { border-color: #48c7bb; background: #123631; color: #bdf7eb; }.submodule-review-item header b.incoming { border-color: #5aa8ff; background: #122c4a; color: #d5ecff; }.submodule-review-item header b.custom { border-color: #be8dff; background: #281d3d; color: #eadcff; }
+.submodule-review-pointers { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px; }
 .submodule-review-pointers div { min-width: 0; border: 1px solid #25394a; border-radius: 6px; padding: 5px 7px; background: #0c141b; }
+.submodule-review-pointers div.selected-choice { border-color: #62b5ff; background: #142c43; box-shadow: inset 3px 0 0 #62b5ff; }
+.submodule-review-pointers div.prepared-result { border-color: #4a657a; }
 .submodule-review-pointers div.absent { border-style: dashed; background: #15191e; }
 .submodule-review-pointers span { display: block; color: #748899; font-size: 8px; font-weight: 800; letter-spacing: .7px; text-transform: uppercase; }
 .submodule-review-pointers code { display: block; margin-top: 3px; color: #bfe0ff; font: 12px ui-monospace, SFMono-Regular, Consolas, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.submodule-review-pointers em { display: block; margin-top: 3px; color: #91a8b9; font-size: 9px; font-style: normal; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .submodule-review-pointers div.absent code { color: #8d9aa6; font-style: italic; }
+.submodule-review-local-note { margin: 7px 0 0; border: 1px solid #6a5228; border-radius: 6px; padding: 6px 8px; background: #201a0e; color: #d9bf87; font-size: 10px; line-height: 1.4; }.submodule-review-local-note code { color: #ffe1a8; }
 .submodule-review-item p { margin: 8px 0; color: #9cadaf; font-size: 11px; line-height: 1.45; }
 .submodule-review-actions { display: flex; flex-wrap: wrap; gap: 6px; }
 .submodule-review-actions button { width: auto; min-width: 0; min-height: 26px; margin: 0; border: 1px solid #3b5267; border-radius: 6px; padding: 0 8px; background: #182635; color: #c6d9e9; font-size: 10px; }

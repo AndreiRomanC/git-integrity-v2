@@ -587,6 +587,11 @@ test('main project merge pauses for one consolidated submodule pointer review', 
   assert.match(app, /Use Incoming\/origin/);
   assert.match(app, /pointerRevisionLabel/);
   assert.match(app, /submoduleReviewResultSource/);
+  assert.match(app, /submoduleReviewChoiceSource/);
+  assert.match(app, /const prefix = item\?\.selectedSource === 'result' \? 'Prepared result' : 'Selected'/);
+  assert.match(app, /return `\$\{prefix\}: \$\{submoduleReviewChoiceSource\(item\)\}`/);
+  assert.match(app, /Folder on disk is at/);
+  assert.match(app, /Prepared result', item\.result/);
   assert.match(app, /No submodule/);
   assert.match(app, /selectedSource/);
   assert.match(app, /applySubmoduleMergeReviewOnly/);
@@ -597,6 +602,8 @@ test('main project merge pauses for one consolidated submodule pointer review', 
   assert.match(css, /\.submodule-merge-review-dialog/);
   assert.match(css, /\.submodule-review-pointers/);
   assert.match(css, /\.submodule-review-pointers div\.absent/);
+  assert.match(css, /\.submodule-review-pointers div\.selected-choice/);
+  assert.match(css, /\.submodule-review-local-note/);
 });
 
 test('every local frontend script and stylesheet carries the same cache-busting version', () => {
@@ -646,7 +653,9 @@ test('detached dirty submodules ask for a branch before commit or push', () => {
 
 test('graph branch context menus can attach detached HEAD to a local branch', () => {
   assert.match(app, /function graphCheckoutBranchMenuItem\(branchName, kind = 'local_branch', id = 'checkout-branch'\)/);
-  assert.match(app, /Remote-tracking refs cannot be checked out directly here/);
+  assert.match(app, /Create\/switch local branch \$\{localName\}/);
+  assert.match(app, /switchRemoteTrackingBranch\(remoteBranch, button = null\)/);
+  assert.match(app, /checkout_remote_tracking_branch/);
   assert.match(app, /Attach detached HEAD to this local branch/);
   assert.match(app, /openGraphBranchCompare\(branchName\)/);
   assert.match(app, /showFloatingMenu\(event, \[[\s\S]*?\{ header: 'Branch actions' \}[\s\S]*?graphCheckoutBranchMenuItem\(branchName, kind\)[\s\S]*?graphMergeMenuItem\(branchName\)[\s\S]*?\{ header: 'Compare' \}[\s\S]*?\.\.\.compareItems/);
@@ -667,8 +676,11 @@ test('Remotes page shows a useful fetch-only overview without extra Git scans', 
   assert.match(app, /function remoteUrlKind\(url = ''\)/);
   assert.match(app, /function remoteTrackingBranches\(remoteName = ''\)/);
   assert.match(app, /function remoteCurrentBranchCandidate\(remoteName = ''\)/);
+  assert.match(app, /function remoteTrackingSummary\(remoteName = ''\)/);
   assert.match(app, /Remote overview/);
-  assert.match(app, /Fetch downloads new refs only\. It does not merge, checkout, stage, commit or push\./);
+  assert.match(app, /Fetch downloads refs only\. It never switches branch, merges, stages, commits or pushes\./);
+  assert.match(app, /Tracking\/upstream clue/);
+  assert.match(app, /checkout one to create a local tracking branch/);
   assert.match(app, /data-fetch-all-remotes/);
   assert.match(app, /fetchAllRemotes\(event\.currentTarget\)/);
   assert.match(app, /data-copy-remote-url/);

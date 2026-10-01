@@ -35,6 +35,7 @@ pub fn run() {
             repository::branches::checkout_commit,
             repository::branches::restore_exact_checkpoint,
             repository::branches::switch_branch,
+            repository::branches::checkout_remote_tracking_branch,
             repository::load_directory,
             repository::list_directory_fast,
             repository::submodule_navigation_status,

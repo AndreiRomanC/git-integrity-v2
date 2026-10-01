@@ -1,5 +1,18 @@
 use super::*;
 
+fn ensure_stash_operation_safe(repo: &Repository, action: &str) -> Result<(), String> {
+    let has_conflicts = repo
+        .index()
+        .map(|index| index.has_conflicts())
+        .unwrap_or(true);
+    if repo.state() != git2::RepositoryState::Clean || has_conflicts {
+        return Err(format!(
+            "Cannot {action} while a merge, rebase, cherry-pick, or conflict resolution is in progress. Finish it or abort it first; otherwise the stash may be hard to restore safely."
+        ));
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub fn stash_changes(repository_path: String) -> Result<(), String> {
     validate_path(&repository_path)?;
@@ -8,11 +21,13 @@ pub fn stash_changes(repository_path: String) -> Result<(), String> {
     let _lock = lock_handle.lock().unwrap();
     log_repo_write_lock_acquired(&repository_path, "stash_changes", queue_started.elapsed());
     let mut repo = internal_repository(&repository_path)?;
+    ensure_stash_operation_safe(&repo, "stash changes")?;
     if internal_statuses(&repo, None)?.is_empty() {
         return Err("Nothing to stash — this repository has no uncommitted local changes.".into());
     }
     let signature = repo.signature().map_err(|_| "Configure user.name and user.email for this repository".to_string())?;
     repo.stash_save2(&signature, None, Some(git2::StashFlags::INCLUDE_UNTRACKED)).map_err(|error| format!("Cannot stash changes: {}", error.message()))?;
+    invalidate_stashed_paths_cache(&repository_path);
     invalidate_git_metadata(&repository_path);
     Ok(())
 }
@@ -64,7 +79,11 @@ pub fn stash_file(repository_path: String, relative_path: String) -> Result<(), 
     let lock_handle = repo_write_lock(&repository_path);
     let _lock = lock_handle.lock().unwrap();
     log_repo_write_lock_acquired(&repository_path, "stash_file", queue_started.elapsed());
+    let repo = internal_repository(&repository_path)?;
+    ensure_stash_operation_safe(&repo, "stash this file or folder")?;
+    drop(repo);
     git(&repository_path, &["stash", "push", "--include-untracked", "--", &relative_string])?;
+    invalidate_stashed_paths_cache(&repository_path);
     invalidate_git_metadata(&repository_path);
     Ok(())
 }
@@ -77,9 +96,7 @@ pub fn pop_stash(repository_path: String, stash_index: usize) -> Result<(), Stri
     let _lock = lock_handle.lock().unwrap();
     log_repo_write_lock_acquired(&repository_path, "pop_stash", queue_started.elapsed());
     let mut repo = internal_repository(&repository_path)?;
-    if repo.state() != git2::RepositoryState::Clean || repo.index().map(|index| index.has_conflicts()).unwrap_or(true) {
-        return Err("Cannot restore a stash while another Git operation or conflict resolution is in progress. Finish or abort it first.".into());
-    }
+    ensure_stash_operation_safe(&repo, "restore a stash")?;
     let dirty = internal_statuses(&repo, None)?;
     if !dirty.is_empty() {
         let files: Vec<String> = dirty.iter().take(5).map(|(path, status, _)| format!("{status} {path}")).collect();
@@ -90,7 +107,10 @@ pub fn pop_stash(repository_path: String, stash_index: usize) -> Result<(), Stri
     repo.stash_apply(stash_index, Some(&mut options)).map_err(|error| format!("Cannot restore stashed work: {}", error.message()))?;
     invalidate_git_metadata(&repository_path);
     let has_conflicts = repo.index().map(|index| index.has_conflicts()).unwrap_or(false);
-    if !has_conflicts { repo.stash_drop(stash_index).map_err(|error| format!("Restored, but could not drop the stash entry: {}", error.message()))?; }
+    if !has_conflicts {
+        repo.stash_drop(stash_index).map_err(|error| format!("Restored, but could not drop the stash entry: {}", error.message()))?;
+        invalidate_stashed_paths_cache(&repository_path);
+    }
     Ok(())
 }
 
@@ -103,6 +123,7 @@ pub fn drop_stash(repository_path: String, stash_index: usize) -> Result<(), Str
     log_repo_write_lock_acquired(&repository_path, "drop_stash", queue_started.elapsed());
     let mut repo = internal_repository(&repository_path)?;
     repo.stash_drop(stash_index).map_err(|error| format!("Cannot drop this stash: {}", error.message()))?;
+    invalidate_stashed_paths_cache(&repository_path);
     invalidate_git_metadata(&repository_path);
     Ok(())
 }
@@ -123,9 +144,7 @@ pub fn restore_stash_paths(repository_path: String, stash_index: usize, paths: V
     let _lock = lock_handle.lock().unwrap();
     log_repo_write_lock_acquired(&repository_path, "restore_stash_paths", queue_started.elapsed());
     let mut repo = internal_repository(&repository_path)?;
-    if repo.state() != git2::RepositoryState::Clean || repo.index().map(|index| index.has_conflicts()).unwrap_or(true) {
-        return Err("Cannot restore a stash file while another Git operation or conflict resolution is in progress.".into());
-    }
+    ensure_stash_operation_safe(&repo, "restore a stash file")?;
     let dirty_paths: HashSet<String> = internal_statuses(&repo, None)?.into_iter().map(|(path, _, _)| path).collect();
     let dirty_selected: Vec<&String> = selected.iter().filter(|path| dirty_paths.contains(*path)).collect();
     if !dirty_selected.is_empty() {
@@ -169,6 +188,9 @@ pub fn restore_stash_paths(repository_path: String, stash_index: usize, paths: V
         args.extend(untracked);
         git(&repository_path, &args).map_err(|error| format!("Cannot restore the selected untracked file(s): {error}"))?;
     }
+    // The stash is intentionally kept as a backup after a partial restore,
+    // but the Explorer should still repaint from fresh disk/status data.
+    invalidate_stashed_paths_cache(&repository_path);
     invalidate_git_metadata(&repository_path);
     Ok(())
 }
@@ -184,6 +206,7 @@ pub fn abort_stash_conflict(repository_path: String) -> Result<(), String> {
     let head_commit = repo.head().map_err(|error| error.message().to_string())?.peel_to_commit().map_err(|error| error.message().to_string())?;
     let mut checkout = git2::build::CheckoutBuilder::new(); checkout.force();
     repo.reset(head_commit.as_object(), git2::ResetType::Hard, Some(&mut checkout)).map_err(|error| error.message().to_string())?;
+    invalidate_stashed_paths_cache(&repository_path);
     invalidate_git_metadata(&repository_path);
     Ok(())
 }
@@ -219,6 +242,10 @@ static STASHED_PATHS_CACHE: OnceLock<Mutex<HashMap<String, StashedPathsCacheEntr
 
 fn stashed_paths_cache() -> &'static Mutex<HashMap<String, StashedPathsCacheEntry>> {
     STASHED_PATHS_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn invalidate_stashed_paths_cache(repository_path: &str) {
+    stashed_paths_cache().lock().unwrap().remove(repository_path);
 }
 
 // Explorer rows need one aggregate answer, not one Git walk per visible

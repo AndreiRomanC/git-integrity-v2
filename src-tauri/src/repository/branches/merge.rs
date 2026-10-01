@@ -168,11 +168,11 @@ fn classify_submodule_merge_item(
 
     if result == current && base == incoming && current != incoming {
         let mut reason = format!(
-            "Incoming/origin did not change this submodule since the merge base. Merge result keeps Current Branch: {}.",
+            "Incoming/origin did not change this submodule since the merge base. Prepared result chose Current Branch: {}.",
             pointer_label(current),
         );
         if local_mismatch {
-            reason.push_str(&format!(" Local checkout is {}, while the selected pointer is {}.", local_checkout.as_deref().unwrap_or("unknown"), pointer_label(result)));
+            reason.push_str(&format!(" Folder on disk is {}, while the selected pointer is {}.", local_checkout.as_deref().unwrap_or("unknown"), pointer_label(result)));
         }
         if current.is_none() && incoming.is_some() {
             reason.push_str(&format!(" Use Incoming/origin only if you want to restore {}.", pointer_label(incoming)));
@@ -181,11 +181,11 @@ fn classify_submodule_merge_item(
     }
     if result == incoming && base == current && current != incoming {
         let mut reason = format!(
-            "Current Branch did not change this submodule since the merge base. Merge result follows Incoming/origin: {}.",
+            "Current Branch did not change this submodule since the merge base. Prepared result chose Incoming/origin: {}.",
             pointer_label(incoming),
         );
         if local_mismatch {
-            reason.push_str(&format!(" Local checkout is still at {}, so run submodule update when ready.", local_checkout.as_deref().unwrap_or("unknown")));
+            reason.push_str(&format!(" Folder on disk is still at {}, so run submodule update when ready.", local_checkout.as_deref().unwrap_or("unknown")));
         }
         if incoming.is_none() && current.is_some() {
             reason.push_str(" The incoming side removes the submodule pointer.");
@@ -193,13 +193,13 @@ fn classify_submodule_merge_item(
         return ("Incoming applied".into(), reason, local_mismatch, local_checkout);
     }
     if result == incoming {
-        let mut reason = format!("Merge result follows Incoming/origin: {}.", pointer_label(incoming));
+        let mut reason = format!("Prepared result chose Incoming/origin: {}.", pointer_label(incoming));
         if base == incoming && current != incoming {
             reason.push_str(&format!(" Current Branch was {}, so review this if you expected to keep your branch state.", pointer_label(current)));
             return ("Review recommended".into(), reason, true, local_checkout);
         }
         if local_mismatch {
-            reason.push_str(&format!(" Local checkout is still at {}, so run submodule update when ready.", local_checkout.as_deref().unwrap_or("unknown")));
+            reason.push_str(&format!(" Folder on disk is still at {}, so run submodule update when ready.", local_checkout.as_deref().unwrap_or("unknown")));
         }
         return ("Incoming applied".into(), reason, local_mismatch, local_checkout);
     }
@@ -207,7 +207,7 @@ fn classify_submodule_merge_item(
         if incoming_ahead_current {
             return (
                 "Review recommended".into(),
-                format!("Incoming/origin is ahead in this submodule history ({} → {}), but Git kept the current branch pointer {}.", short_oid(current), short_oid(incoming), short_oid(result)),
+                format!("Incoming/origin is ahead in this submodule history ({} → {}), but the prepared result kept the Current Branch pointer {}.", short_oid(current), short_oid(incoming), short_oid(result)),
                 true,
                 local_checkout,
             );
@@ -220,20 +220,20 @@ fn classify_submodule_merge_item(
                 local_checkout,
             );
         }
-        let mut reason = format!("Merge result keeps Current Branch: {}.", pointer_label(current));
+        let mut reason = format!("Prepared result chose Current Branch: {}.", pointer_label(current));
         if base == current && incoming != current {
             reason.push_str(&format!(" Incoming/origin changed this pointer to {}, so review before committing.", pointer_label(incoming)));
             return ("Review recommended".into(), reason, true, local_checkout);
         }
         if local_mismatch {
-            reason.push_str(&format!(" Local checkout is {}, while the selected pointer is {}.", local_checkout.as_deref().unwrap_or("unknown"), short_oid(result)));
+            reason.push_str(&format!(" Folder on disk is {}, while the selected pointer is {}.", local_checkout.as_deref().unwrap_or("unknown"), short_oid(result)));
         }
         return ("Kept current".into(), reason, local_mismatch, local_checkout);
     }
     if result.is_some() && result != current && result != incoming {
         return (
             "Unexpected merge result".into(),
-            format!("Merge result {} differs from both current branch ({}) and incoming/origin ({}). Review before committing.", short_oid(result), short_oid(current), short_oid(incoming)),
+            format!("Prepared result {} differs from both Current Branch ({}) and Incoming/origin ({}). Review before committing.", short_oid(result), short_oid(current), short_oid(incoming)),
             true,
             local_checkout,
         );
@@ -241,7 +241,7 @@ fn classify_submodule_merge_item(
     if result_behind_incoming || result_behind_current {
         return (
             "Possible rollback".into(),
-            format!("Merge result {} appears to be an ancestor of another selected side (current {}, incoming {}).", short_oid(result), short_oid(current), short_oid(incoming)),
+            format!("Prepared result {} appears to be an ancestor of another selected side (Current Branch {}, Incoming/origin {}).", short_oid(result), short_oid(current), short_oid(incoming)),
             true,
             local_checkout,
         );
@@ -264,7 +264,7 @@ fn classify_submodule_merge_item(
     }
     (
         "Review recommended".into(),
-        format!("Submodule pointer changed across the merge: base {}, Current Branch {}, Incoming/origin {}, Merge Result {}.", pointer_label(base), pointer_label(current), pointer_label(incoming), pointer_label(result)),
+        format!("Submodule pointer changed across the merge: base {}, Current Branch {}, Incoming/origin {}, Prepared result {}.", pointer_label(base), pointer_label(current), pointer_label(incoming), pointer_label(result)),
         true,
         local_checkout,
     )
