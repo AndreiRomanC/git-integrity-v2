@@ -66,6 +66,7 @@ pub fn run() {
             repository::compare_remote_file_list,
             repository::compare_file_contents,
             repository::compare_index_worktree_file,
+            repository::compare_working_area_file,
             repository::compare_git_revisions_directory,
             repository::compare_git_revisions_file_list,
             repository::compare_git_revision_file,

@@ -27,6 +27,7 @@ compare_remote_file_list
 compare_submodule_revision_file
 compare_submodule_revisions_directory
 compare_submodule_revisions_file_list
+compare_working_area_file
 complete_merge
 conflict_sides
 copy_local_item

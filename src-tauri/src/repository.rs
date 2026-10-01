@@ -4500,7 +4500,7 @@ fn submodule_reference_risks(repository_path: &str, relative_path: &str, oids: &
         let result = git(&sub_path, &["fetch", "--no-tags", "--no-recurse-submodules", remote]);
         perf_log(&format!("publish_safety: submodule={} fetch {} ({})", relative_path, remote, if result.is_ok() { "ok" } else { "failed; using local refs" }), fetch_started.elapsed());
     } else {
-        perf_log(&format!("publish_safety: submodule={} reused freshly refreshed refs", relative_path), Duration::ZERO);
+        perf_log(&format!("publish_safety: submodule={} using local refs only (no network refresh)", relative_path), Duration::ZERO);
     }
     let remote_pattern = format!("refs/remotes/{remote}/*");
     let remote_tips: Vec<git2::Oid> = repo.references_glob(&remote_pattern).ok().into_iter().flat_map(|references| references.flatten())
@@ -4509,7 +4509,7 @@ fn submodule_reference_risks(repository_path: &str, relative_path: &str, oids: &
         let reachable = remote_tips.iter().copied().any(|tip| tip == oid || repo.graph_descendant_of(tip, oid).unwrap_or(false));
         (oid, if reachable { None } else { Some("unpushed") })
     }).collect();
-    perf_log(&format!("publish_safety: submodule={} checked {} revision{} after one fetch round", relative_path, oids.len(), if oids.len() == 1 { "" } else { "s" }), started.elapsed());
+    perf_log(&format!("publish_safety: submodule={} checked {} revision{} {}", relative_path, oids.len(), if oids.len() == 1 { "" } else { "s" }, if refresh_remote { "after one fetch round" } else { "from local refs" }), started.elapsed());
     (risks, configured_url, current_oid)
 }
 
@@ -4635,7 +4635,10 @@ const UNPUSHED_SUBMODULE_OVERRIDABLE_PREFIX: &str = "UNPUSHED_SUBMODULE_OVERRIDA
 fn submodule_publish_safety_check(repository_path: &str, branch: &str, remote: &str, upto: Option<git2::Oid>, override_unpushed_submodules: bool) -> Result<(), String> {
     let reuse_refresh = upto.is_some_and(|target| has_recent_publish_preflight(repository_path, branch, remote, target));
     let violations = unpushed_submodule_references(repository_path, branch, remote, upto, !reuse_refresh)?;
-    if reuse_refresh { perf_log("publish_safety: reused dialog network preflight; full local safety scan still ran", Duration::ZERO); }
+    if reuse_refresh { perf_log("publish_safety: reused recent network preflight; full local safety scan still ran", Duration::ZERO); }
+    if !reuse_refresh && !violations.iter().any(|violation| violation.risk == "unpushed") {
+        if let Some(target) = upto { remember_publish_preflight(repository_path, branch, remote, target); }
+    }
     if violations.is_empty() { return Ok(()); }
     let hard: Vec<&UnpushedSubmoduleReference> = violations.iter().filter(|v| v.risk == "unpushed").collect();
     if !hard.is_empty() {
@@ -4691,7 +4694,7 @@ fn submodule_publish_risks_inner(repository_path: String, branch: String, remote
     let branch = branch.trim(); let remote = remote.trim();
     if branch.is_empty() || remote.is_empty() { return Ok(Vec::new()); }
     let repo = internal_repository(&repository_path)?;
-    let (upto, target) = if upto_commit.trim().is_empty() {
+    let (upto, _target) = if upto_commit.trim().is_empty() {
         let target = repo.refname_to_id(&format!("refs/heads/{branch}")).map_err(|error| error.message().to_string())?;
         (None, target)
     } else {
@@ -4699,13 +4702,15 @@ fn submodule_publish_risks_inner(repository_path: String, branch: String, remote
         let commit = object.peel_to_commit().map_err(|error| error.message().to_string())?;
         (Some(commit.id()), commit.id())
     };
-    let risks = unpushed_submodule_references(&repository_path, branch, remote, upto, true)?;
-    // A hard "unpushed" result is deliberately not reusable: the common
-    // next action is to push that submodule and retry from the still-open
-    // dialog, in which case Publish must refresh it again.
-    if !risks.iter().any(|risk| risk.risk == "unpushed") {
-        remember_publish_preflight(&repository_path, branch, remote, target);
-    }
+    // This command feeds the Publish dialog preview. It must stay quick and
+    // non-blocking: on large corporate repositories a single outgoing merge
+    // can touch dozens of submodule gitlinks, and fetching every submodule's
+    // origin here made merely opening/refreshing the dialog look like a stuck
+    // push. The real publish path below still performs the authoritative
+    // network refresh immediately before `git push`; this preview only shows
+    // stable local-only/no-remote risks that can be detected without network.
+    let mut risks = unpushed_submodule_references(&repository_path, branch, remote, upto, false)?;
+    risks.retain(|risk| risk.risk != "unpushed" && risk.risk != "superseded_unpushed");
     Ok(risks)
 }
 
@@ -7410,6 +7415,61 @@ fn compare_index_worktree_file_inner(repository_path: String, relative_path: Str
 #[tauri::command]
 pub async fn compare_index_worktree_file(repository_path: String, relative_path: String) -> Result<FileComparison, String> {
     off_main_thread(move || compare_index_worktree_file_inner(repository_path, relative_path)).await
+}
+
+fn head_file_content(repository_path: &str, relative_path: &str) -> Result<Vec<u8>, String> {
+    let revision = match resolve_commit(repository_path, "HEAD") {
+        Ok(revision) => revision,
+        Err(_) => return Ok(Vec::new()),
+    };
+    tree_file_content(repository_path, &revision, relative_path).map(|content| content.unwrap_or_default())
+}
+
+fn index_file_content(repo: &Repository, relative: &Path) -> Result<Vec<u8>, String> {
+    let index = repo.index().map_err(|error| error.message().to_string())?;
+    match index.get_path(relative, 0) {
+        Some(entry) => repo.find_blob(entry.id).map(|blob| blob.content().to_vec()).map_err(|error| error.message().to_string()),
+        None => Ok(Vec::new()),
+    }
+}
+
+fn worktree_file_content(repository_path: &str, relative: &Path) -> Result<Vec<u8>, String> {
+    let absolute = Path::new(repository_path).join(relative);
+    match fs::read(&absolute) {
+        Ok(bytes) => Ok(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(format!("Cannot read working-tree file: {error}")),
+    }
+}
+
+fn compare_working_area_file_inner(repository_path: String, relative_path: String, staged: bool) -> Result<FileComparison, String> {
+    validate_path(&repository_path)?;
+    if let Some((sub_path, inner_relative)) = resolve_submodule_boundary(&repository_path, &relative_path) {
+        if inner_relative.is_empty() { return Err("Choose a file inside the submodule to compare its contents".into()); }
+        return compare_working_area_file_inner(sub_path, inner_relative, staged);
+    }
+    let relative = safe_relative_path(&relative_path)?;
+    let relative_path = normalized(&relative);
+    let repo = internal_repository(&repository_path)?;
+    let (left, right, right_label) = if staged {
+        (head_file_content(&repository_path, &relative_path)?, index_file_content(&repo, &relative)?, "index")
+    } else {
+        (index_file_content(&repo, &relative)?, worktree_file_content(&repository_path, &relative)?, "working-tree")
+    };
+    if left.len() > 1_000_000 || right.len() > 1_000_000 || left.contains(&0) || right.contains(&0) {
+        return Err("Binary files and files over 1 MB are not shown in the text compare view".into());
+    }
+    Ok(FileComparison {
+        relative_path,
+        remote_ref: right_label.into(),
+        local_content: String::from_utf8_lossy(&left).into_owned(),
+        remote_content: String::from_utf8_lossy(&right).into_owned(),
+    })
+}
+
+#[tauri::command]
+pub async fn compare_working_area_file(repository_path: String, relative_path: String, staged: bool) -> Result<FileComparison, String> {
+    off_main_thread(move || compare_working_area_file_inner(repository_path, relative_path, staged)).await
 }
 
 // Reads one blob header per directory entry plus two bounded revwalks — on a
@@ -14167,6 +14227,26 @@ mod tests {
         assert_eq!(index_worktree.remote_content, "content", "the submodule's own indexed content (unstaged edit) must be used, not the parent's index, which only has a gitlink entry for vendor/dep");
 
         fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn working_area_compare_shows_staged_changes_against_head() {
+        // Regression guard for the Working tree drawer: a staged-only change
+        // has identical index and working-tree content, so the old
+        // index-vs-working-tree compare showed no differences even though the
+        // row was genuinely changed relative to HEAD.
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let repository = std::env::temp_dir().join(format!("git-integrity-working-area-compare-{suffix}"));
+        create_libgit2_repository(&repository, "file.txt");
+        fs::write(repository.join("file.txt"), "staged version").unwrap();
+        run_git(&repository, &["add", "file.txt"]);
+
+        let repo_path = repository.to_string_lossy().into_owned();
+        let comparison = compare_working_area_file_inner(repo_path, "file.txt".into(), true).unwrap();
+        assert_eq!(comparison.local_content, "content");
+        assert_eq!(comparison.remote_content, "staged version");
+
+        fs::remove_dir_all(repository).unwrap();
     }
 
     #[test]

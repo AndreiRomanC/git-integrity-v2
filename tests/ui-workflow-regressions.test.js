@@ -551,12 +551,13 @@ test('compare views can switch to a filtered flat changed-file overview', () => 
   assert.match(css, /\.flat-compare-row/);
 });
 
-test('working tree drawer opens a working-tree versus index diff on double-click', () => {
+test('working tree drawer opens a staged-vs-HEAD or working-vs-index diff on double-click, depending on stage state', () => {
   assert.match(app, /function openIndexWorktreeCompare\(change\)/);
-  assert.match(app, /invoke\('compare_index_worktree_file'/);
+  assert.match(app, /const staged = Boolean\(change\.staged\)/);
+  assert.match(app, /invoke\('compare_working_area_file', \{ repositoryPath: state\.repository\.path, relativePath: change\.path, staged \}\)/);
   assert.match(app, /data-change-compare-path/);
   assert.match(app, /Double-click to compare working tree with the Git index/);
-  assert.match(app, /setCompareHeadLabels\('WORKING TREE', 'INDEX'\)/);
+  assert.match(app, /setCompareHeadLabels\(staged \? 'LAST COMMIT \(HEAD\)' : 'INDEX \/ LAST COMMIT', staged \? 'STAGED INDEX' : 'WORKING TREE'\)/);
 });
 
 test('main project merges ask before updating submodule working trees', () => {

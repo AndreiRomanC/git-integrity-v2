@@ -1865,16 +1865,21 @@ async function openIndexWorktreeCompare(change) {
   const row = { name: change.path.split('/').pop() || change.path, relative_path: change.path, local: { kind: 'file' }, remote: { kind: 'file' } };
   state.comparingRow = row;
   const stillCurrent = openFileCompareGuard();
+  const staged = Boolean(change.staged);
   refs.compareTitle.textContent = change.path;
-  refs.compareSubtitle.textContent = 'Working tree compared with the Git index · read-only';
+  refs.compareSubtitle.textContent = staged
+    ? 'Staged/index version compared with the last commit · read-only'
+    : 'Working file compared with the staged/index version · read-only';
   refs.localCompare.textContent = refs.remoteCompare.textContent = 'Loading…';
   resetCompareDiffNavigation();
-  setCompareReadOnly(true, 'Read-only compare between your working file and the staged/index version.');
-  setCompareHeadLabels('WORKING TREE', 'INDEX');
+  setCompareReadOnly(true, staged
+    ? 'Read-only compare between the last committed file and the staged/index version.'
+    : 'Read-only compare between the staged/index version and your working file.');
+  setCompareHeadLabels(staged ? 'LAST COMMIT (HEAD)' : 'INDEX / LAST COMMIT', staged ? 'STAGED INDEX' : 'WORKING TREE');
   refs.compareDialog.showModal();
   if (!invoke) { renderComparisonContents('working tree preview\n', 'index preview\n'); return; }
   try {
-    const comparison = await invoke('compare_index_worktree_file', { repositoryPath: state.repository.path, relativePath: change.path });
+    const comparison = await invoke('compare_working_area_file', { repositoryPath: state.repository.path, relativePath: change.path, staged });
     if (!stillCurrent() || state.comparingRow !== row) return;
     renderComparisonContents(comparison.local_content || '', comparison.remote_content || '');
   } catch (error) {
