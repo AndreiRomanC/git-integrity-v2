@@ -280,7 +280,7 @@ const refs = {
   commitScope: $('#commitScope'), showPathHistory: $('#showPathHistory'), commitScopeDialog: $('#commitScopeDialog'), commitScopeName: $('#commitScopeName'), scopeCommitMessage: $('#scopeCommitMessage'), confirmScopeCommit: $('#confirmScopeCommit'),
   folderRestoreDialog: $('#folderRestoreDialog'), folderRestorePath: $('#folderRestorePath'), folderRestoreSubtitle: $('#folderRestoreSubtitle'), folderRestoreModeHead: $('#folderRestoreModeHead'), folderRestoreModeCommit: $('#folderRestoreModeCommit'), folderRestoreCommitPicker: $('#folderRestoreCommitPicker'), folderRestoreCommitList: $('#folderRestoreCommitList'), refreshFolderRestoreCommits: $('#refreshFolderRestoreCommits'), folderRestoreClean: $('#folderRestoreClean'), folderRestorePreview: $('#folderRestorePreview'), folderRestoreStatus: $('#folderRestoreStatus'), previewFolderRestore: $('#previewFolderRestore'), confirmFolderRestore: $('#confirmFolderRestore'),
   commanderView: $('#commanderView'), commanderRows: $('#commanderRows'), commanderBreadcrumbs: $('#commanderBreadcrumbs'), remoteRef: $('#remoteRef'), gitWorkspaceCompareControls: $('#gitWorkspaceCompareControls'), gitBranchCompareControls: $('#gitBranchCompareControls'), branchCompareLeftRef: $('#branchCompareLeftRef'), branchCompareRightRef: $('#branchCompareRightRef'), branchCompareSwap: $('#branchCompareSwap'), branchCompareRefresh: $('#branchCompareRefresh'), gitCompareFlatControls: $('#gitCompareFlatControls'), gitCompareFlatToggle: $('#gitCompareFlatToggle'), gitCompareFlatFilter: $('#gitCompareFlatFilter'), gitCompareLeftLabel: $('#gitCompareLeftLabel'), gitCompareRightLabel: $('#gitCompareRightLabel'), gitComparePanel: $('#gitComparePanel'), localDrivePanel: $('#localDrivePanel'), compareModeGit: $('#compareModeGit'), compareModeDrive: $('#compareModeDrive'), compareModeSubmodule: $('#compareModeSubmodule'), submoduleComparePanel: $('#submoduleComparePanel'), subCompareSubmodule: $('#subCompareSubmodule'), subCompareSubmoduleOptions: $('#subCompareSubmoduleOptions'), subCompareLeftRef: $('#subCompareLeftRef'), subCompareRightRef: $('#subCompareRightRef'), subComparePickLeft: $('#subComparePickLeft'), subComparePickRight: $('#subComparePickRight'), subCompareSwap: $('#subCompareSwap'), subCompareRefresh: $('#subCompareRefresh'), subCompareDownload: $('#subCompareDownload'), subCompareFlatControls: $('#subCompareFlatControls'), subCompareFlatToggle: $('#subCompareFlatToggle'), subCompareFlatFilter: $('#subCompareFlatFilter'), subCompareExact: $('#subCompareExact'), subCompareCommits: $('#subCompareCommits'), subCompareBreadcrumbs: $('#subCompareBreadcrumbs'), subCompareRows: $('#subCompareRows'), subRevisionDialog: $('#subCompareRevisionDialog'), subRevisionDialogSide: $('#subRevisionDialogSide'), subRevisionDialogTitle: $('#subRevisionDialogTitle'), subRevisionSearch: $('#subRevisionSearch'), subRevisionSearchAll: $('#subRevisionSearchAll'), subRevisionResults: $('#subRevisionResults'), subRevisionHelp: $('#subRevisionHelp'), compareDialog: $('#compareDialog'), compareTitle: $('#compareTitle'), compareSubtitle: $('#compareSubtitle'), localCompare: $('#localCompare'), remoteCompare: $('#remoteCompare'), compareDiffStatus: $('#compareDiffStatus'), previousCompareDifference: $('#previousCompareDifference'), nextCompareDifference: $('#nextCompareDifference'),
-  remotesView: $('#remotesView'), remoteCards: $('#remoteCards'), editorDialog: $('#editorDialog'), editorTitle: $('#editorTitle'), editorPath: $('#editorPath'), editorContent: $('#editorContent'), locationRepository: $('#locationRepository'), locationBranch: $('#locationBranch'), locationPath: $('#locationPath'), parentRepositoryButton: $('#parentRepositoryButton'), parentRepositoryName: $('#parentRepositoryName'), leaveSubmoduleGraph: $('#leaveSubmoduleGraph'), publishDialog: $('#publishDialog'), publishBranch: $('#publishBranch'), publishRemote: $('#publishRemote'), publishCommits: $('#publishCommits'), publishSummary: $('#publishSummary'), publishDestination: $('#publishDestination'), publishBadge: $('#publishBadge'), publishSubtitle: $('#publishSubtitle'), cloneDialog: $('#cloneDialog'), cloneUrl: $('#cloneUrl'), cloneParent: $('#cloneParent'), cloneName: $('#cloneName'), cloneBranch: $('#cloneBranch'), cloneRecurseSubmodules: $('#cloneRecurseSubmodules'), confirmClone: $('#confirmClone'), submoduleDialog: $('#submoduleDialog'), submoduleUrl: $('#submoduleUrl'), submoduleParent: $('#submoduleParent'), submoduleName: $('#submoduleName'), submoduleUsername: $('#submoduleUsername'), submoduleToken: $('#submoduleToken'), submoduleAddStatus: $('#submoduleAddStatus'), submoduleBrowseSelection: $('#submoduleBrowseSelection'), browseSubmoduleRepository: $('#browseSubmoduleRepository'), submoduleBrowserDialog: $('#submoduleBrowserDialog'), submoduleRepoSearch: $('#submoduleRepoSearch'), runSubmoduleRepoSearch: $('#runSubmoduleRepoSearch'), submoduleRepoResults: $('#submoduleRepoResults'), submoduleRefHint: $('#submoduleRefHint'), submoduleRefSearch: $('#submoduleRefSearch'), runSubmoduleRefSearch: $('#runSubmoduleRefSearch'), submoduleRefResults: $('#submoduleRefResults'), submoduleBrowserStatus: $('#submoduleBrowserStatus'), compareSubmoduleBrowser: $('#compareSubmoduleBrowser'), applySubmoduleBrowser: $('#applySubmoduleBrowser'), confirmAddSubmodule: $('#confirmAddSubmodule'), operationToast: $('#operationToast'), drawerScopeTitle: $('#drawerScopeTitle'),
+  remotesView: $('#remotesView'), remoteCards: $('#remoteCards'), editorDialog: $('#editorDialog'), editorTitle: $('#editorTitle'), editorPath: $('#editorPath'), editorContent: $('#editorContent'), locationRepository: $('#locationRepository'), locationBranch: $('#locationBranch'), locationPath: $('#locationPath'), parentRepositoryButton: $('#parentRepositoryButton'), parentRepositoryName: $('#parentRepositoryName'), leaveSubmoduleGraph: $('#leaveSubmoduleGraph'), publishDialog: $('#publishDialog'), publishBranch: $('#publishBranch'), publishRemote: $('#publishRemote'), publishCommits: $('#publishCommits'), publishSummary: $('#publishSummary'), publishDestination: $('#publishDestination'), publishBadge: $('#publishBadge'), publishSubtitle: $('#publishSubtitle'), publishSafeMode: $('#publishSafeMode'), publishFastMode: $('#publishFastMode'), cloneDialog: $('#cloneDialog'), cloneUrl: $('#cloneUrl'), cloneParent: $('#cloneParent'), cloneName: $('#cloneName'), cloneBranch: $('#cloneBranch'), cloneRecurseSubmodules: $('#cloneRecurseSubmodules'), confirmClone: $('#confirmClone'), submoduleDialog: $('#submoduleDialog'), submoduleUrl: $('#submoduleUrl'), submoduleParent: $('#submoduleParent'), submoduleName: $('#submoduleName'), submoduleUsername: $('#submoduleUsername'), submoduleToken: $('#submoduleToken'), submoduleAddStatus: $('#submoduleAddStatus'), submoduleBrowseSelection: $('#submoduleBrowseSelection'), browseSubmoduleRepository: $('#browseSubmoduleRepository'), submoduleBrowserDialog: $('#submoduleBrowserDialog'), submoduleRepoSearch: $('#submoduleRepoSearch'), runSubmoduleRepoSearch: $('#runSubmoduleRepoSearch'), submoduleRepoResults: $('#submoduleRepoResults'), submoduleRefHint: $('#submoduleRefHint'), submoduleRefSearch: $('#submoduleRefSearch'), runSubmoduleRefSearch: $('#runSubmoduleRefSearch'), submoduleRefResults: $('#submoduleRefResults'), submoduleBrowserStatus: $('#submoduleBrowserStatus'), compareSubmoduleBrowser: $('#compareSubmoduleBrowser'), applySubmoduleBrowser: $('#applySubmoduleBrowser'), confirmAddSubmodule: $('#confirmAddSubmodule'), operationToast: $('#operationToast'), drawerScopeTitle: $('#drawerScopeTitle'),
   mergeBranchDialog: $('#mergeBranchDialog'), mergeBranchSubtitle: $('#mergeBranchSubtitle'), mergeBranchCurrent: $('#mergeBranchCurrent'), mergeBranchSource: $('#mergeBranchSource'), mergeBranchStatus: $('#mergeBranchStatus'), confirmMergeBranch: $('#confirmMergeBranch'),
   stashesDialog: $('#stashesDialog'), stashesList: $('#stashesList'),
   togglePrStatus: $('#togglePrStatus'), prStatusArrow: $('#prStatusArrow'), prStatusPanel: $('#prStatusPanel'),
@@ -5982,7 +5982,10 @@ async function openPublish() {
   if (!state.remotes.length && invoke) state.remotes = await invoke('list_remotes', { repositoryPath: state.repository.path });
   if (!invoke && !state.remotes.length) state.remotes = [{ name: 'origin', fetch_url: 'git@example.com:vehicle-control.git', push_url: 'git@example.com:vehicle-control.git' }];
   const locals = state.branches.filter(branch => !branch.remote); refs.publishBranch.innerHTML = locals.map(branch => `<option value="${esc(branch.name)}" ${branch.current ? 'selected' : ''}>${esc(branch.name)}${branch.current ? ' (current)' : ''}</option>`).join('');
-  refs.publishRemote.innerHTML = state.remotes.map(remote => `<option value="${esc(remote.name)}">${esc(remote.name)}</option>`).join(''); refs.publishDialog.showModal(); await refreshPublish();
+  refs.publishRemote.innerHTML = state.remotes.map(remote => `<option value="${esc(remote.name)}">${esc(remote.name)}</option>`).join('');
+  if (refs.publishSafeMode) refs.publishSafeMode.checked = true;
+  updatePublishModeUi();
+  refs.publishDialog.showModal(); await refreshPublish();
 }
 
 // Git can only push a contiguous range — there's no way to publish a newer
@@ -6061,6 +6064,13 @@ function updatePublishSummary() {
   const heldBack = commits.length - willPushCount;
   refs.publishSummary.textContent = `${willPushCount} commit${willPushCount === 1 ? '' : 's'} to publish${heldBack ? ` · ${heldBack} staying local for now` : ''}`;
   $('#confirmPublish').disabled = !willPushCount;
+  updatePublishModeUi();
+}
+
+function updatePublishModeUi() {
+  const fast = refs.publishFastMode?.checked;
+  const button = $('#confirmPublish');
+  if (button) button.textContent = fast ? 'Fast publish' : 'Publish safely';
 }
 
 const refreshPublishGuard = createRequestGuard();
@@ -6089,23 +6099,32 @@ async function refreshPublish() {
   updatePublishSummary();
 }
 
-// Submodule-publish-safety report, point 3: publish_branch now runs a
-// safety preflight itself (never bypassable by skipping some separate
-// advisory step) that can fail in two different ways — a submodule that DOES
-// have a remote but simply hasn't been pushed yet always hard-blocks (no
-// override exists: push it, there's no other safe option), while a submodule
-// with no remote at all (or one this app couldn't even open to check) is
-// override-eligible, marked with a fixed prefix this function looks for and
-// strips before showing anything.
+// Submodule-publish-safety report, point 3: Safe publish runs a backend
+// preflight immediately before pushing, so the check cannot be bypassed by
+// skipping the preview. Fast publish is the explicit advanced escape hatch:
+// it asks once, then passes skipSubmoduleSafety to the backend. In safe mode,
+// a submodule that DOES have a remote but simply hasn't been pushed yet
+// hard-blocks (no override exists: push it, there's no other safe option),
+// while a submodule with no remote at all (or one this app couldn't even open
+// to check) is override-eligible, marked with a fixed prefix this function
+// looks for and strips before showing anything.
 const UNPUSHED_SUBMODULE_OVERRIDABLE_PREFIX = 'UNPUSHED_SUBMODULE_OVERRIDABLE::';
 async function confirmPublish(event, overrideUnpushedSubmodules = false) {
   event.preventDefault(); if (!state.publish?.commits.length) return;
-  const operation = $('#publishOperationStatus'); operation.textContent = `Publishing ${state.publish.branch}…`; operation.className = 'submodule-operation-status busy';
+  const skipSubmoduleSafety = !!refs.publishFastMode?.checked;
+  if (skipSubmoduleSafety && !overrideUnpushedSubmodules) {
+    const proceed = await customConfirm(
+      'Fast publish skips the submodule safety check. If a parent commit references a submodule commit that exists only on your machine, another clone may fail to restore the project.\n\nUse this only when you already know the referenced submodule commits are pushed, or when this publish does not change submodule pointers.',
+      { title: 'Fast publish without submodule safety', danger: true, okLabel: 'Fast publish' }
+    );
+    if (!proceed) return;
+  }
+  const operation = $('#publishOperationStatus'); operation.textContent = `${skipSubmoduleSafety ? 'Fast publishing' : 'Publishing'} ${state.publish.branch}…`; operation.className = 'submodule-operation-status busy';
   try {
-    $('#confirmPublish').disabled = true; status(`Publishing ${state.publish.branch}…`, 'busy');
-    await invoke('publish_branch', { repositoryPath: state.repository.path, branch: state.publish.branch, remote: state.publish.remote, username: $('#publishUsername').value.trim(), accessToken: $('#publishToken').value, uptoCommit: state.publishUpto || '', overrideUnpushedSubmodules });
+    $('#confirmPublish').disabled = true; status(`${skipSubmoduleSafety ? 'Fast publishing' : 'Publishing'} ${state.publish.branch}…`, 'busy');
+    await invoke('publish_branch', { repositoryPath: state.repository.path, branch: state.publish.branch, remote: state.publish.remote, username: $('#publishUsername').value.trim(), accessToken: $('#publishToken').value, uptoCommit: state.publishUpto || '', overrideUnpushedSubmodules, skipSubmoduleSafety });
     $('#publishToken').value = ''; refs.publishDialog.close(); await loadRepository(state.repository.path, { keepPath: true });
-    const msg = state.publishUpto ? `Published part of ${state.publish.branch} to ${state.publish.remote} (up to your chosen commit).` : `Published ${state.publish.branch} to ${state.publish.remote}`;
+    const msg = state.publishUpto ? `Published part of ${state.publish.branch} to ${state.publish.remote} (up to your chosen commit)${skipSubmoduleSafety ? ' — fast publish' : ''}.` : `Published ${state.publish.branch} to ${state.publish.remote}${skipSubmoduleSafety ? ' (fast publish)' : ''}`;
     status(msg); showOperationToast(msg);
   } catch (error) {
     const message = String(error);
@@ -6700,7 +6719,7 @@ async function syncCurrent(action, button = null) {
   finally { finishButton(); }
 }
 $('#pullCurrent').addEventListener('click', event => syncCurrent('pull', event.currentTarget)); $('#pushCurrent').addEventListener('click', event => syncCurrent('push', event.currentTarget));
-refs.publishBranch.addEventListener('change', refreshPublish); refs.publishRemote.addEventListener('change', refreshPublish); $('#confirmPublish').addEventListener('click', confirmPublish);
+refs.publishBranch.addEventListener('change', refreshPublish); refs.publishRemote.addEventListener('change', refreshPublish); refs.publishSafeMode.addEventListener('change', updatePublishModeUi); refs.publishFastMode.addEventListener('change', updatePublishModeUi); $('#confirmPublish').addEventListener('click', confirmPublish);
 [['#compareRestoreRemote','remote'],['#compareRestoreHead','head'],['#compareStage','stage'],['#compareUnstage','unstage']].forEach(([selector, action]) => $(selector)?.addEventListener('click', event => { event.preventDefault(); updateRecoveryHelp(action); applyFileRecovery(action).catch(error => handleError(error)); }));
 refs.previousCompareDifference?.addEventListener('click', () => goToCompareDifference(-1));
 refs.nextCompareDifference?.addEventListener('click', () => goToCompareDifference(1));

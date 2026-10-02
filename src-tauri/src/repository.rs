@@ -4576,49 +4576,79 @@ fn unpushed_submodule_references(repository_path: &str, branch: &str, remote: &s
         if !by_path.contains_key(&path) { path_order.push(path.clone()); }
         by_path.entry(path).or_default().push((sub_oid, commit_oid));
     }
-    let mut violations = Vec::new();
-    for path in path_order {
+    let mut jobs = Vec::new();
+    for (order, path) in path_order.into_iter().enumerate() {
         let references = by_path.remove(&path).unwrap_or_default();
         let target_submodule_oid = repo.find_commit(target_parent_oid).ok()
             .and_then(|commit| commit.tree().ok())
             .and_then(|tree| tree.get_path(Path::new(&path)).ok())
             .filter(|entry| entry.filemode() == 0o160000)
             .map(|entry| entry.id());
-        let mut revision_seen = HashSet::new();
-        let mut revisions: Vec<git2::Oid> = references.iter()
-            .filter_map(|(sub_oid, _)| revision_seen.insert(*sub_oid).then_some(*sub_oid))
-            .collect();
-        if let Some(target_oid) = target_submodule_oid {
-            if revision_seen.insert(target_oid) { revisions.push(target_oid); }
-        }
-        let (mut risks, configured_url, current_oid) = submodule_reference_risks(repository_path, &path, &revisions, refresh_remotes);
-        let current_submodule_oid = current_oid.map(|oid| oid.to_string());
-        let target_is_known_safe = target_submodule_oid.and_then(|oid| risks.get(&oid).copied()).is_some_and(|risk| risk.is_none());
-        let target_submodule_oid_string = target_submodule_oid.map(|oid| oid.to_string());
-        let submodule_repo_for_graph = internal_submodule_repository(&Path::new(repository_path).join(&path)).ok();
-        for (sub_oid, commit_oid) in references {
-            let Some(risk) = risks.remove(&sub_oid).flatten() else { continue };
-            let target_contains_submodule_oid = target_submodule_oid.is_some_and(|target_oid| {
-                target_oid == sub_oid || submodule_repo_for_graph.as_ref()
-                    .is_some_and(|sub_repo| sub_repo.graph_descendant_of(target_oid, sub_oid).unwrap_or(false))
-            });
-            let risk = if risk == "unpushed" && target_submodule_oid.is_some_and(|target_oid| target_oid != sub_oid) && target_is_known_safe {
-                if target_contains_submodule_oid {
-                    // If the final, safely pushed submodule tip actually
-                    // contains this older commit, the older gitlink is safe
-                    // too: a normal push of the final branch carries its
-                    // ancestors. Keep this invariant explicit so we never
-                    // recreate the "two commits in order but first is missing"
-                    // false alarm.
-                    continue;
-                }
-                "superseded_unpushed"
-            } else {
-                risk
-            };
+        let references = references.into_iter().map(|(sub_oid, commit_oid)| {
             let commit_subject = repo.find_commit(commit_oid).ok().and_then(|commit| commit.summary().map(str::to_string)).unwrap_or_default();
-            violations.push(UnpushedSubmoduleReference { relative_path: path.clone(), submodule_oid: sub_oid.to_string(), commit_id: commit_oid.to_string(), commit_subject, risk: risk.into(), configured_url: configured_url.clone(), current_submodule_oid: current_submodule_oid.clone(), target_submodule_oid: target_submodule_oid_string.clone(), target_contains_submodule_oid });
-        }
+            (sub_oid, commit_oid, commit_subject)
+        }).collect::<Vec<_>>();
+        jobs.push((order, path, references, target_submodule_oid));
+    }
+    let job_count = jobs.len();
+    let step = Instant::now();
+    let mut grouped_violations: Vec<(usize, Vec<UnpushedSubmoduleReference>)> = Vec::new();
+    for chunk in jobs.chunks(PUBLISH_SAFETY_SUBMODULE_FETCH_JOBS.max(1)) {
+        std::thread::scope(|scope| -> Result<(), String> {
+            let mut handles = Vec::new();
+            for (order, path, references, target_submodule_oid) in chunk.iter().cloned() {
+                let repository_path = repository_path.to_string();
+                handles.push(scope.spawn(move || {
+                    let mut revision_seen = HashSet::new();
+                    let mut revisions: Vec<git2::Oid> = references.iter()
+                        .filter_map(|(sub_oid, _, _)| revision_seen.insert(*sub_oid).then_some(*sub_oid))
+                        .collect();
+                    if let Some(target_oid) = target_submodule_oid {
+                        if revision_seen.insert(target_oid) { revisions.push(target_oid); }
+                    }
+                    let (mut risks, configured_url, current_oid) = submodule_reference_risks(&repository_path, &path, &revisions, refresh_remotes);
+                    let current_submodule_oid = current_oid.map(|oid| oid.to_string());
+                    let target_is_known_safe = target_submodule_oid.and_then(|oid| risks.get(&oid).copied()).is_some_and(|risk| risk.is_none());
+                    let target_submodule_oid_string = target_submodule_oid.map(|oid| oid.to_string());
+                    let submodule_repo_for_graph = internal_submodule_repository(&Path::new(&repository_path).join(&path)).ok();
+                    let mut violations = Vec::new();
+                    for (sub_oid, commit_oid, commit_subject) in references {
+                        let Some(risk) = risks.remove(&sub_oid).flatten() else { continue };
+                        let target_contains_submodule_oid = target_submodule_oid.is_some_and(|target_oid| {
+                            target_oid == sub_oid || submodule_repo_for_graph.as_ref()
+                                .is_some_and(|sub_repo| sub_repo.graph_descendant_of(target_oid, sub_oid).unwrap_or(false))
+                        });
+                        let risk = if risk == "unpushed" && target_submodule_oid.is_some_and(|target_oid| target_oid != sub_oid) && target_is_known_safe {
+                            if target_contains_submodule_oid {
+                                // If the final, safely pushed submodule tip actually
+                                // contains this older commit, the older gitlink is safe
+                                // too: a normal push of the final branch carries its
+                                // ancestors. Keep this invariant explicit so we never
+                                // recreate the "two commits in order but first is missing"
+                                // false alarm.
+                                continue;
+                            }
+                            "superseded_unpushed"
+                        } else {
+                            risk
+                        };
+                        violations.push(UnpushedSubmoduleReference { relative_path: path.clone(), submodule_oid: sub_oid.to_string(), commit_id: commit_oid.to_string(), commit_subject, risk: risk.into(), configured_url: configured_url.clone(), current_submodule_oid: current_submodule_oid.clone(), target_submodule_oid: target_submodule_oid_string.clone(), target_contains_submodule_oid });
+                    }
+                    (order, violations)
+                }));
+            }
+            for handle in handles {
+                grouped_violations.push(handle.join().map_err(|_| "Internal error: submodule publish-safety worker panicked".to_string())?);
+            }
+            Ok(())
+        })?;
+    }
+    grouped_violations.sort_by_key(|(order, _)| *order);
+    let violations = grouped_violations.into_iter().flat_map(|(_, violations)| violations).collect::<Vec<_>>();
+    if refresh_remotes && job_count > 1 {
+        perf_log(&format!("publish_safety: checked {job_count} submodules with up to {PUBLISH_SAFETY_SUBMODULE_FETCH_JOBS} parallel fetches"), step.elapsed());
+    } else {
+        perf_log(&format!("publish_safety: checked {job_count} submodules"), step.elapsed());
     }
     perf_log(&format!("publish_safety: TOTAL ({} violation{})", violations.len(), if violations.len() == 1 { "" } else { "s" }), total_started.elapsed());
     Ok(violations)
@@ -4631,6 +4661,7 @@ fn unpushed_submodule_references(repository_path: &str, branch: &str, remote: &s
 // fixable by pushing and is never overridable. The frontend looks for this
 // exact prefix to offer that override; stripped before it's shown.
 const UNPUSHED_SUBMODULE_OVERRIDABLE_PREFIX: &str = "UNPUSHED_SUBMODULE_OVERRIDABLE::";
+const PUBLISH_SAFETY_SUBMODULE_FETCH_JOBS: usize = 4;
 
 fn submodule_publish_safety_check(repository_path: &str, branch: &str, remote: &str, upto: Option<git2::Oid>, override_unpushed_submodules: bool) -> Result<(), String> {
     let reuse_refresh = upto.is_some_and(|target| has_recent_publish_preflight(repository_path, branch, remote, target));
@@ -4715,11 +4746,16 @@ fn submodule_publish_risks_inner(repository_path: String, branch: String, remote
 }
 
 #[tauri::command]
-pub async fn publish_branch(repository_path: String, branch: String, remote: String, username: String, access_token: String, upto_commit: String, override_unpushed_submodules: bool) -> Result<(), String> {
-    off_main_thread(move || publish_branch_inner(repository_path, branch, remote, username, access_token, upto_commit, override_unpushed_submodules)).await
+pub async fn publish_branch(repository_path: String, branch: String, remote: String, username: String, access_token: String, upto_commit: String, override_unpushed_submodules: bool, skip_submodule_safety: Option<bool>) -> Result<(), String> {
+    off_main_thread(move || publish_branch_inner_with_options(repository_path, branch, remote, username, access_token, upto_commit, override_unpushed_submodules, skip_submodule_safety.unwrap_or(false))).await
 }
 
+#[cfg(test)]
 fn publish_branch_inner(repository_path: String, branch: String, remote: String, username: String, access_token: String, upto_commit: String, override_unpushed_submodules: bool) -> Result<(), String> {
+    publish_branch_inner_with_options(repository_path, branch, remote, username, access_token, upto_commit, override_unpushed_submodules, false)
+}
+
+fn publish_branch_inner_with_options(repository_path: String, branch: String, remote: String, username: String, access_token: String, upto_commit: String, override_unpushed_submodules: bool, skip_submodule_safety: bool) -> Result<(), String> {
     let total_started = Instant::now();
     perf_log("publish_branch: START", Duration::ZERO);
     let result = (|| {
@@ -4750,8 +4786,12 @@ fn publish_branch_inner(repository_path: String, branch: String, remote: String,
     // comment for why an older one matters too), and this runs before any
     // network push is attempted, whether or not an explicit token was given.
     let safety_started = Instant::now();
-    submodule_publish_safety_check(&repository_path, branch, remote_name, Some(push_oid), override_unpushed_submodules)?;
-    perf_log("publish_branch: safety preflight", safety_started.elapsed());
+    if skip_submodule_safety {
+        perf_log("publish_branch: safety preflight skipped by explicit Fast publish", safety_started.elapsed());
+    } else {
+        submodule_publish_safety_check(&repository_path, branch, remote_name, Some(push_oid), override_unpushed_submodules)?;
+        perf_log("publish_branch: safety preflight", safety_started.elapsed());
+    }
     let push_started = Instant::now();
     if access_token.trim().is_empty() {
         // No explicit token was entered — prefer the system `git` binary, which
@@ -14671,6 +14711,78 @@ mod tests {
 
         let overridden = publish_branch_inner(parent_string, branch, "origin".into(), String::new(), String::new(), String::new(), true);
         assert!(overridden.is_ok(), "an explicit override must be able to proceed: {overridden:?}");
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn fast_publish_skips_the_submodule_safety_check_even_for_a_hard_blocked_unpushed_gitlink() {
+        // Fast publish's whole point is to be an explicit escape hatch from
+        // the safety preflight — prove it actually bypasses the check, not
+        // just the override-eligible risks. The CURRENT tip referencing a
+        // submodule commit that was never pushed ("unpushed", not
+        // "superseded_unpushed") is the one risk that's a hard block even
+        // with override_unpushed_submodules=true — the strongest case to
+        // show skip_submodule_safety=true is a genuinely different code path,
+        // not merely an alias for the existing override flag.
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-fast-publish-{suffix}"));
+        let parent = base.join("main");
+        let parent_remote = base.join("main-remote.git");
+        let dep_remote = base.join("dep-remote.git");
+        let dep_seed = base.join("dep-seed");
+        fs::create_dir_all(&parent).unwrap();
+        fs::create_dir_all(&dep_seed).unwrap();
+        fs::create_dir_all(&dep_remote).unwrap();
+        fs::create_dir_all(&parent_remote).unwrap();
+        fs::write(parent.join("README.md"), "root").unwrap();
+        fs::write(dep_seed.join("module.txt"), "v0").unwrap();
+
+        run_git(&dep_remote, &["init", "--bare"]);
+        run_git(&parent_remote, &["init", "--bare"]);
+        for path in [&parent, &dep_seed] {
+            run_git(path, &["init"]);
+            run_git(path, &["config", "user.email", "test@example.com"]);
+            run_git(path, &["config", "user.name", "Test User"]);
+            run_git(path, &["add", "."]);
+            run_git(path, &["commit", "-m", "Initial"]);
+        }
+        run_git(&dep_seed, &["remote", "add", "origin", dep_remote.to_str().unwrap()]);
+        run_git(&dep_seed, &["-c", "protocol.file.allow=always", "push", "origin", "HEAD:main"]);
+        run_git(&parent, &["-c", "protocol.file.allow=always", "submodule", "add", dep_remote.to_str().unwrap(), "vendor/dep"]);
+        fake_https_gitmodules_url(&parent);
+        run_git(&parent, &["commit", "-am", "Add dep submodule"]);
+        run_git(&parent, &["remote", "add", "origin", parent_remote.to_str().unwrap()]);
+
+        let parent_path = parent.to_string_lossy().into_owned();
+        let sub_path = parent.join("vendor/dep");
+        run_git(&sub_path, &["config", "user.email", "test@example.com"]);
+        run_git(&sub_path, &["config", "user.name", "Test User"]);
+
+        // Bump the submodule to a commit that is deliberately never pushed,
+        // and record it directly with raw Git (bypassing
+        // commit_selected_internal's own guard, which would otherwise refuse
+        // this exact mistake at commit time — the fixture needs the bad
+        // gitlink to actually exist so publish_branch can be tested against
+        // it) so the CURRENT tip itself carries the hard-blocked risk.
+        fs::write(sub_path.join("module.txt"), "v1").unwrap();
+        run_git(&sub_path, &["commit", "-am", "V1"]);
+        run_git(&parent, &["add", "vendor/dep"]);
+        run_git(&parent, &["commit", "-m", "Bump to V1"]);
+
+        let violations = unpushed_submodule_references(&parent_path, "main", "origin", None, true).unwrap();
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert_eq!(violations[0].risk, "unpushed", "the current tip's own gitlink must be the hard-blocked risk, not a superseded one");
+
+        let blocked = publish_branch_inner_with_options(parent_path.clone(), "main".into(), "origin".into(), String::new(), String::new(), String::new(), false, false);
+        assert!(blocked.is_err(), "safe publish must block on an unpushed current gitlink");
+        assert!(blocked.unwrap_err().starts_with("Cannot publish"), "this risk is a hard block, never override-eligible");
+
+        let still_blocked = publish_branch_inner_with_options(parent_path.clone(), "main".into(), "origin".into(), String::new(), String::new(), String::new(), true, false);
+        assert!(still_blocked.is_err(), "override_unpushed_submodules must not be able to bypass a hard-blocked \"unpushed\" risk");
+
+        let fast_published = publish_branch_inner_with_options(parent_path, "main".into(), "origin".into(), String::new(), String::new(), String::new(), false, true);
+        assert!(fast_published.is_ok(), "skip_submodule_safety=true (Fast publish) must bypass the preflight entirely, including the hard block: {fast_published:?}");
 
         fs::remove_dir_all(base).unwrap();
     }

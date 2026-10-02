@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Git DrillDown</title>
   <link rel="icon" type="image/png" href="assets/git-drilldown-mark.png">
-  <link rel="stylesheet" href="styles.css?v=20261001c-staged-compare-fix">
+  <link rel="stylesheet" href="styles.css?v=20261002a-fast-publish-mode">
 </head>
 <body>
   <div class="app-shell">
@@ -510,6 +510,11 @@
     <form method="dialog"><header><div><h2>Publish to server</h2><p>A push publishes commits, not uncommitted files.</p></div><button value="cancel">×</button></header>
       <div class="publish-controls"><label><span>LOCAL BRANCH</span><select id="publishBranch"></select></label><span class="publish-arrow">→</span><label><span>REMOTE</span><select id="publishRemote"></select></label></div>
       <div class="publish-explain"><b id="publishDestination">—</b><span>All commits listed below will be published in order. Select files before Commit; select the destination here before Push.</span></div>
+      <fieldset class="publish-safety-mode">
+        <legend>Publish mode</legend>
+        <label><input type="radio" name="publishSafetyMode" id="publishSafeMode" checked><span><strong>Safe publish</strong><small>Checks that referenced submodule commits exist on each submodule remote. Slower, but prevents broken clones.</small></span></label>
+        <label><input type="radio" name="publishSafetyMode" id="publishFastMode"><span><strong>Fast publish</strong><small>Skips the submodule remote safety check. Use only when you already know the submodule commits are pushed or this publish does not depend on them.</small></span></label>
+      </fieldset>
       <div id="publishCommits" class="publish-commits"></div>
       <details class="submodule-auth"><summary>Private server credentials</summary><div><label><span>USERNAME</span><input id="publishUsername" autocomplete="username" placeholder="Git username"></label><label><span>PERSONAL ACCESS TOKEN</span><input id="publishToken" type="password" autocomplete="off" placeholder="Token (not account password)"></label></div><small>Used only for this push and never saved by Git DrillDown.</small></details>
       <p id="publishOperationStatus" class="submodule-operation-status" role="status"></p>
@@ -721,13 +726,13 @@
       <footer><button value="cancel">Cancel</button><button type="button" value="default" id="confirmNewTag" class="confirm">Create tag</button></footer>
     </form>
   </dialog>
-  <script src="console-context.js?v=20261001c-staged-compare-fix"></script>
-  <script src="graph-model.js?v=20261001c-staged-compare-fix"></script>
-  <script src="submodule-state.js?v=20261001c-staged-compare-fix"></script>
-  <script src="submodule-versions.js?v=20261001c-staged-compare-fix"></script>
-  <script src="local-diff.js?v=20261001c-staged-compare-fix"></script>
-  <script src="local-drive.js?v=20261001c-staged-compare-fix"></script>
-  <script src="pr-status.js?v=20261001c-staged-compare-fix"></script>
-  <script src="app.js?v=20261001c-staged-compare-fix"></script>
+  <script src="console-context.js?v=20261002a-fast-publish-mode"></script>
+  <script src="graph-model.js?v=20261002a-fast-publish-mode"></script>
+  <script src="submodule-state.js?v=20261002a-fast-publish-mode"></script>
+  <script src="submodule-versions.js?v=20261002a-fast-publish-mode"></script>
+  <script src="local-diff.js?v=20261002a-fast-publish-mode"></script>
+  <script src="local-drive.js?v=20261002a-fast-publish-mode"></script>
+  <script src="pr-status.js?v=20261002a-fast-publish-mode"></script>
+  <script src="app.js?v=20261002a-fast-publish-mode"></script>
 </body>
 </html>

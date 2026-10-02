@@ -371,6 +371,17 @@ test('publish indicator surfaces ahead and behind, not only outgoing commit coun
   assert.match(app, /publishRemoteAheadWarningHtml\(state\.publish\) \+ publishSubmoduleRisksHtml/);
 });
 
+test('Publish dialog defaults to Safe publish and Fast publish asks for confirmation before skipping the submodule safety check', () => {
+  assert.match(html, /id="publishSafeMode" checked/);
+  assert.match(html, /id="publishFastMode"[^>]*>/);
+  assert.doesNotMatch(html, /id="publishFastMode" checked/);
+  assert.match(app, /if \(refs\.publishSafeMode\) refs\.publishSafeMode\.checked = true;/);
+  assert.match(app, /const skipSubmoduleSafety = !!refs\.publishFastMode\?\.checked;/);
+  assert.match(app, /if \(skipSubmoduleSafety && !overrideUnpushedSubmodules\) \{/);
+  assert.match(app, /await customConfirm\(\s*\n\s*'Fast publish skips the submodule safety check\./);
+  assert.match(app, /invoke\('publish_branch', \{ repositoryPath: state\.repository\.path, branch: state\.publish\.branch, remote: state\.publish\.remote, username: \$\('#publishUsername'\)\.value\.trim\(\), accessToken: \$\('#publishToken'\)\.value, uptoCommit: state\.publishUpto \|\| '', overrideUnpushedSubmodules, skipSubmoduleSafety \}\)/);
+});
+
 test('folder restore is an explicit right-panel action with preview and scoped backend commands', () => {
   assert.match(html, /id="folderRestoreDialog"/);
   assert.match(html, /Restore to HEAD/);
