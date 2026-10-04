@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Git DrillDown</title>
   <link rel="icon" type="image/png" href="assets/git-drilldown-mark.png">
-  <link rel="stylesheet" href="styles.css?v=20261002a-fast-publish-mode">
+  <link rel="stylesheet" href="styles.css?v=20261003a-combine-branch-tags">
 </head>
 <body>
   <div class="app-shell">
@@ -49,7 +49,7 @@
         <button class="nav-item" id="navGraph"><span class="nav-icon">⑂</span><span>Branch Map</span></button>
         <button class="nav-item" id="navRemotes"><span class="nav-icon">◎</span><span>Remotes</span></button>
 
-        <div class="side-heading branch-list-heading" id="toggleBranchList"><span class="branch-heading-arrow">▸</span><span>BRANCHES</span><button id="newBranch" title="Create branch">＋</button></div>
+        <div class="side-heading branch-list-heading" id="toggleBranchList" title="Cmd-click on macOS or Ctrl-click on Windows to select two branches for comparison"><span class="branch-heading-arrow">▸</span><span>BRANCHES</span><button id="newBranch" title="Create branch">＋</button></div>
         <div id="branches" class="branch-list collapsed"></div>
 
         <div class="side-heading workspace-heading"><span>WORKSPACE</span></div>
@@ -510,12 +510,20 @@
     <form method="dialog"><header><div><h2>Publish to server</h2><p>A push publishes commits, not uncommitted files.</p></div><button value="cancel">×</button></header>
       <div class="publish-controls"><label><span>LOCAL BRANCH</span><select id="publishBranch"></select></label><span class="publish-arrow">→</span><label><span>REMOTE</span><select id="publishRemote"></select></label></div>
       <div class="publish-explain"><b id="publishDestination">—</b><span>All commits listed below will be published in order. Select files before Commit; select the destination here before Push.</span></div>
-      <fieldset class="publish-safety-mode">
+      <fieldset id="publishSafetyMode" class="publish-safety-mode">
         <legend>Publish mode</legend>
         <label><input type="radio" name="publishSafetyMode" id="publishSafeMode" checked><span><strong>Safe publish</strong><small>Checks that referenced submodule commits exist on each submodule remote. Slower, but prevents broken clones.</small></span></label>
         <label><input type="radio" name="publishSafetyMode" id="publishFastMode"><span><strong>Fast publish</strong><small>Skips the submodule remote safety check. Use only when you already know the submodule commits are pushed or this publish does not depend on them.</small></span></label>
       </fieldset>
       <div id="publishCommits" class="publish-commits"></div>
+      <fieldset id="publishCommitMode" class="publish-commit-mode" hidden>
+        <legend>Local commits</legend>
+        <label><input type="radio" name="publishCommitMode" value="all" checked><span>Push All<small>Publish each commit as it is.</small></span></label>
+        <label><input type="radio" name="publishCommitMode" value="combine_push"><span>Combine &amp; Push<small>Replace local-only commits with one commit, then publish it.</small></span></label>
+        <label><input type="radio" name="publishCommitMode" value="combine_only"><span>Combine Only<small>Keep the new single commit local.</small></span></label>
+        <label id="publishCombinedMessageLabel" hidden><span>Combined commit message</span><textarea id="publishCombinedMessage" rows="2" placeholder="Describe the combined change"></textarea></label>
+        <p id="publishCombineNotice"></p>
+      </fieldset>
       <details class="submodule-auth"><summary>Private server credentials</summary><div><label><span>USERNAME</span><input id="publishUsername" autocomplete="username" placeholder="Git username"></label><label><span>PERSONAL ACCESS TOKEN</span><input id="publishToken" type="password" autocomplete="off" placeholder="Token (not account password)"></label></div><small>Used only for this push and never saved by Git DrillDown.</small></details>
       <p id="publishOperationStatus" class="submodule-operation-status" role="status"></p>
       <footer><span id="publishSummary">Checking…</span><button value="cancel">Cancel</button><button value="default" id="confirmPublish">Publish branch</button></footer>
@@ -559,7 +567,7 @@
     </header>
     <div class="submodule-browser-search">
       <label><span>Repository search</span><input id="submoduleRepoSearch" type="text" placeholder="errm, dem, compiler…" autocomplete="off" autocapitalize="off" spellcheck="false"></label>
-      <button id="runSubmoduleRepoSearch" type="button">Search</button>
+      <button id="runSubmoduleRepoSearch" type="button">Search repos</button>
     </div>
     <div class="submodule-browser-body">
       <section>
@@ -567,19 +575,19 @@
         <div id="submoduleRepoResults" class="submodule-browser-list"><div class="version-loading">Search in github.vitesco.io/eng.</div></div>
       </section>
       <section>
-        <div class="submodule-ref-heading"><h3>Branches, tags, commit</h3><small id="submoduleRefHint">Select a repository first.</small></div>
+        <div class="submodule-ref-heading"><h3>Branches, tags, commits</h3><small id="submoduleRefHint">Select a repository first.</small></div>
         <div class="submodule-browser-search compact">
           <label><span>Filter loaded refs or type SHA</span><input id="submoduleRefSearch" type="text" placeholder="filter branch/tag locally, or paste SHA…" autocomplete="off" autocapitalize="off" spellcheck="false"></label>
-          <button id="runSubmoduleRefSearch" type="button" title="Filters locally after refs are loaded; asks the server only for an exact SHA not already loaded.">Find</button>
+          <button id="runSubmoduleRefSearch" type="button" title="Filters locally after refs are loaded; asks the server only for an exact SHA not already loaded.">Find refs</button>
         </div>
         <div id="submoduleRefResults" class="submodule-browser-list"><div class="version-loading">No repository selected.</div></div>
       </section>
     </div>
     <footer>
       <span id="submoduleBrowserStatus">Nothing selected yet.</span>
-      <button id="compareSubmoduleBrowser" type="button" disabled>Compare selected</button>
+      <button id="compareSubmoduleBrowser" type="button" disabled>Compare revisions</button>
       <button id="cancelSubmoduleBrowser" type="button">Cancel</button>
-      <button id="applySubmoduleBrowser" type="button" class="confirm" disabled>Use selected module</button>
+      <button id="applySubmoduleBrowser" type="button" class="confirm" disabled>Use repository</button>
     </footer>
   </dialog>
   <dialog id="mergeBranchDialog" class="clone-dialog">
@@ -726,13 +734,13 @@
       <footer><button value="cancel">Cancel</button><button type="button" value="default" id="confirmNewTag" class="confirm">Create tag</button></footer>
     </form>
   </dialog>
-  <script src="console-context.js?v=20261002a-fast-publish-mode"></script>
-  <script src="graph-model.js?v=20261002a-fast-publish-mode"></script>
-  <script src="submodule-state.js?v=20261002a-fast-publish-mode"></script>
-  <script src="submodule-versions.js?v=20261002a-fast-publish-mode"></script>
-  <script src="local-diff.js?v=20261002a-fast-publish-mode"></script>
-  <script src="local-drive.js?v=20261002a-fast-publish-mode"></script>
-  <script src="pr-status.js?v=20261002a-fast-publish-mode"></script>
-  <script src="app.js?v=20261002a-fast-publish-mode"></script>
+  <script src="console-context.js?v=20261003a-combine-branch-tags"></script>
+  <script src="graph-model.js?v=20261003a-combine-branch-tags"></script>
+  <script src="submodule-state.js?v=20261003a-combine-branch-tags"></script>
+  <script src="submodule-versions.js?v=20261003a-combine-branch-tags"></script>
+  <script src="local-diff.js?v=20261003a-combine-branch-tags"></script>
+  <script src="local-drive.js?v=20261003a-combine-branch-tags"></script>
+  <script src="pr-status.js?v=20261003a-combine-branch-tags"></script>
+  <script src="app.js?v=20261003a-combine-branch-tags"></script>
 </body>
 </html>

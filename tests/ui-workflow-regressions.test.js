@@ -78,7 +78,19 @@ test('top bar has a safe project fetch that updates parent and submodule refs wi
   assert.match(app, /id: 'fetch-project'/);
   assert.match(app, /id: 'init-update-submodules'/);
   assert.match(app, /git submodule update --init --recursive/);
-  assert.match(css, /\.repo-picker \{ flex: 0 1 360px;/);
+  assert.match(css, /\.repo-picker \{ flex: 0 1 350px;/);
+});
+
+test('sidebar branches support explicit Cmd/Ctrl multi-selection before comparison', () => {
+  assert.match(app, /branchCompareSelection: null/);
+  assert.match(app, /function toggleBranchCompareSelection\(branchName\)/);
+  assert.match(app, /event\.metaKey.*event\.ctrlKey/);
+  assert.match(app, /data-run-branch-compare/);
+  assert.match(app, /async function runSelectedBranchCompare\(\)/);
+  assert.match(app, /await openGraphBranchCompare\(leftRef, rightRef\)/);
+  assert.match(app, /must never checkout or run Git merely/);
+  assert.match(css, /\.branch-row\.compare-selected/);
+  assert.match(css, /\.branch-compare-selection/);
 });
 
 test('fast repository open keeps folder navigation filesystem-only until the first status scan completes', () => {
@@ -238,8 +250,8 @@ test('a selected submodule can be promoted to the normal full repository context
   assert.match(app, /Submodule of \$\{origin\.parentName\}/);
   assert.match(css, /\.parent-repository-button/);
   assert.match(css, /\.recent-repo-btn\.submodule-recent/);
-  assert.match(css, /\.recent-repos-bar \{[^}]*height: 27px/);
-  assert.match(css, /\.recent-repo-btn \{[^}]*max-width: 118px/);
+  assert.match(css, /\.recent-repos-bar \{[^}]*height: 24px/);
+  assert.match(css, /\.recent-repo-btn \{[^}]*max-width: 108px/);
   assert.match(css, /button\[data-detail-action="subopenfull"\] \{ flex: 1 1 100%;/);
   assert.doesNotMatch(css, /button\[data-detail-action="subopenfull"\]::before/);
 });
@@ -366,7 +378,7 @@ test('publish indicator surfaces ahead and behind, not only outgoing commit coun
   assert.match(app, /new remote branch/);
   assert.match(app, /\$\{ahead\} ahead \/ \$\{behind\} behind/);
   assert.match(app, /Everything is on the server · \$\{comparison\}/);
-  assert.match(app, /local commit\$\{state\.publish\.commits\.length === 1 \? '' : 's'\} to publish · \$\{comparison\}/);
+  assert.match(app, /local commit\$\{outgoingCount === 1 \? '' : 's'\} to publish · \$\{comparison\}/);
   assert.match(app, /has \$\{behind\} commit\$\{behind === 1 \? '' : 's'\} you do not have locally/);
   assert.match(app, /publishRemoteAheadWarningHtml\(state\.publish\) \+ publishSubmoduleRisksHtml/);
 });
@@ -377,9 +389,27 @@ test('Publish dialog defaults to Safe publish and Fast publish asks for confirma
   assert.doesNotMatch(html, /id="publishFastMode" checked/);
   assert.match(app, /if \(refs\.publishSafeMode\) refs\.publishSafeMode\.checked = true;/);
   assert.match(app, /const skipSubmoduleSafety = !!refs\.publishFastMode\?\.checked;/);
-  assert.match(app, /if \(skipSubmoduleSafety && !overrideUnpushedSubmodules\) \{/);
+  assert.match(app, /if \(commitMode !== 'combine_only' && skipSubmoduleSafety && !overrideUnpushedSubmodules\) \{/);
   assert.match(app, /await customConfirm\(\s*\n\s*'Fast publish skips the submodule safety check\./);
-  assert.match(app, /invoke\('publish_branch', \{ repositoryPath: state\.repository\.path, branch: state\.publish\.branch, remote: state\.publish\.remote, username: \$\('#publishUsername'\)\.value\.trim\(\), accessToken: \$\('#publishToken'\)\.value, uptoCommit: state\.publishUpto \|\| '', overrideUnpushedSubmodules, skipSubmoduleSafety \}\)/);
+  assert.match(app, /invoke\('publish_branch', \{ repositoryPath: state\.repository\.path, branch: state\.publish\.branch, remote: state\.publish\.remote, username: \$\('#publishUsername'\)\.value\.trim\(\), accessToken: \$\('#publishToken'\)\.value, uptoCommit: combined \? '' : state\.publishUpto \|\| '', overrideUnpushedSubmodules, skipSubmoduleSafety \}\)/);
+});
+
+test('Publish preview clears stale selection and disables Push while loading or after an error', () => {
+  const refresh = app.match(/async function refreshPublish\(\) \{([\s\S]*?)\n\}/)?.[1] || '';
+  assert.match(refresh, /state\.publish = null;/);
+  assert.match(refresh, /\$\('#confirmPublish'\)\.disabled = true;/);
+  assert.match(refresh, /try \{/);
+  assert.match(refresh, /catch \(error\) \{/);
+  assert.match(refresh, /Publish unavailable — retry or change selection/);
+  assert.match(refresh, /risksPromise\.then\(risks => \{/);
+  assert.doesNotMatch(refresh, /await Promise\.all\(/, 'slow submodule warnings must not block the basic Publish preview');
+});
+
+test('a capped Publish preview shows the full count and cannot offer a misleading partial cutoff', () => {
+  assert.match(app, /Showing \$\{commits\.length\} of \$\{outgoingCount\} pending commits/);
+  assert.match(app, /box\.disabled = mode !== 'all' \|\| incompleteList/);
+  assert.match(app, /const willPushCount = limited \? outgoingCount : uptoIndex \+ 1/);
+  assert.match(app, /invoke\('combine_local_commits',[^\n]*accessToken: \$\('#publishToken'\)\.value/);
 });
 
 test('folder restore is an explicit right-panel action with preview and scoped backend commands', () => {
@@ -421,14 +451,14 @@ test('graph exposes branch and commit context actions without relying on lane id
   assert.match(app, /\$\{branchName\} → \$\{current\}\. Current branch is the only branch changed\./);
   assert.match(app, /openMergeBranchDialog\(activeGraphMergeTarget\(\), branchName\)/);
   assert.match(app, /showGraphCommitContextMenu\(event, row\.dataset\.id\)/);
-  assert.match(app, /const mergeItems = branchRefs\.map\(\(ref, index\) => graphMergeMenuItem\(ref\.name, `merge-\$\{index\}`\)\)/);
+  assert.match(app, /const mergeItems = branchRefs\.slice\(0, 6\)\.map\(\(ref, index\) => graphMergeMenuItem\(ref\.name, `merge-\$\{index\}`\)\)/);
   assert.match(app, /Create branch from this commit/);
   assert.match(app, /Checkout this commit/);
   assert.match(app, /Restore exact checkpoint…/);
   assert.match(app, /Clean workspace to this commit/);
   assert.match(app, /invoke\('create_branch_at_commit', \{ repositoryPath: context\.path, branch: name\.trim\(\), commitId \}\)/);
   assert.match(app, /invoke\('checkout_commit', \{ repositoryPath: context\.path, commitId \}\)/);
-  assert.match(app, /invoke\('restore_exact_checkpoint', \{ repositoryPath: context\.path, commitId \}\)/);
+  assert.match(app, /invoke\(branch \? 'restore_exact_checkpoint_branch' : 'restore_exact_checkpoint', \{ repositoryPath: context\.path, commitId/);
   assert.match(app, /forces submodules to the versions recorded by this checkpoint/);
   assert.match(app, /function updateMergeDirectionPreview\(\)/);
   assert.match(app, /Direction: \$\{source\} → \$\{target\}/);
@@ -671,8 +701,8 @@ test('graph branch context menus can attach detached HEAD to a local branch', ()
   assert.match(app, /Attach detached HEAD to this local branch/);
   assert.match(app, /openGraphBranchCompare\(branchName\)/);
   assert.match(app, /showFloatingMenu\(event, \[[\s\S]*?\{ header: 'Branch actions' \}[\s\S]*?graphCheckoutBranchMenuItem\(branchName, kind\)[\s\S]*?graphMergeMenuItem\(branchName\)[\s\S]*?\{ header: 'Compare' \}[\s\S]*?\.\.\.compareItems/);
-  assert.match(app, /const checkoutItems = branchRefs[\s\S]*?filter\(ref => ref\.kind === 'local_branch'\)[\s\S]*?graphCheckoutBranchMenuItem\(ref\.name, ref\.kind, `checkout-\$\{index\}`\)/);
-  assert.match(app, /menuItems\.push\(\{ header: 'Checkout' \}, \.\.\.checkoutItems, \{ separator: true \}\)/);
+  assert.match(app, /localBranchesAtCommit = branchRefs\.filter\(ref => ref\.kind === 'local_branch'\)/);
+  assert.match(app, /Checkout this commit[\s\S]*?Checkout branch \$\{ref\.name\}[\s\S]*?Restore exact checkpoint[\s\S]*?Clean checkout branch \$\{ref\.name\}/);
   assert.match(app, /menuItems\.push\([\s\S]*?\{ header: 'Compare' \},[\s\S]*?\.\.\.commitCompareItems/);
   assert.match(app, /item\.separator[\s\S]*?floating-menu-separator/);
   assert.match(app, /if \(item\.header\) return `<div class="floating-menu-section">/);

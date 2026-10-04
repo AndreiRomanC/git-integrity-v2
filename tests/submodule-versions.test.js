@@ -6,10 +6,30 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { groupSubmoduleBranchVersions, submoduleCurrentPresentation, submoduleContainingBranchCandidates, submoduleCurrentContextHtml, matchesSubmoduleVersion, submoduleVersionRowHtml, submodulePushDialogState } = require('../frontend/submodule-versions.js');
+const { groupSubmoduleBranchVersions, submoduleCurrentPresentation, submoduleContainingBranchCandidates, submoduleCurrentContextHtml, matchesSubmoduleVersion, relatedSubmoduleVersionRefs, submoduleVersionRowHtml, submodulePushDialogState } = require('../frontend/submodule-versions.js');
 
 function branch(name, upstream, revision = '11111111aaaa') { return { name, kind: 'branch', upstream: upstream || null, revision }; }
 function remote(name, revision = '11111111aaaa') { return { name, kind: 'remote', revision }; }
+
+test('branch/tag cross-navigation uses exact tip equality, not mere ancestry', () => {
+  const refs = [branch('release', null, 'aaa'), { name: 'v1', kind: 'tag', revision: 'aaa' }, { name: 'old', kind: 'tag', revision: 'bbb' }, { name: 'old history', kind: 'commit', revision: 'bbb', containing_branches: ['release'] }];
+  assert.deepEqual(relatedSubmoduleVersionRefs(refs[0], refs), [{ kind: 'tag', name: 'v1' }]);
+  assert.deepEqual(relatedSubmoduleVersionRefs(refs[1], refs), [{ kind: 'branch', name: 'release' }]);
+  assert.deepEqual(relatedSubmoduleVersionRefs(refs[3], refs), [{ kind: 'tag', name: 'old' }]);
+});
+
+test('a divergent remote tip remains visible so its exact tag can navigate to it', () => {
+  const refs = [branch('release', 'origin/release', 'aaa'), remote('origin/release', 'bbb'), { name: 'v2', kind: 'tag', revision: 'bbb' }];
+  assert.deepEqual(groupSubmoduleBranchVersions(refs).remoteOnly.map(item => item.name), ['origin/release']);
+  assert.deepEqual(relatedSubmoduleVersionRefs(refs[2], refs), [{ kind: 'remote', name: 'origin/release' }]);
+});
+
+test('long related tag names remain one compact, escaped navigation control', () => {
+  const html = submoduleVersionRowHtml({ ...branch('release', null, 'aaa'), related_refs: [{ kind: 'tag', name: 'IMS.VITESCO.IO_HM_MHB01L04.00A"<tag>' }] });
+  assert.match(html, /data-related-kind="tag"/);
+  assert.match(html, /IMS\.VITESCO\.IO_HM_MHB01L04\.00A&quot;&lt;tag&gt;/);
+  assert.doesNotMatch(html, /<tag>/);
+});
 
 test('a local branch with a tracked upstream hides the matching remote-tracking entry', () => {
   const { local, remoteOnly } = groupSubmoduleBranchVersions([

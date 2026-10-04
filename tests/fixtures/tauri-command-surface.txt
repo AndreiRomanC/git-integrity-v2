@@ -6,6 +6,7 @@ branch_creation_context
 build_info
 change_submodule_url
 checkout_commit
+combine_local_commits
 checkout_remote_tracking_branch
 choose_folder
 clone_repository
@@ -104,6 +105,7 @@ resolve_conflict
 resolve_submodule_repository
 restore_file
 restore_exact_checkpoint
+restore_exact_checkpoint_branch
 restore_folder
 restore_remote_file
 restore_stash_paths

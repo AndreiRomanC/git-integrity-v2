@@ -894,10 +894,113 @@ pub struct PublishStatus {
     branch: String,
     remote: String,
     remote_branch: String,
+    local_tip: String,
     commits: Vec<PublishCommit>,
+    outgoing_count: usize,
     ahead: usize,
     behind: usize,
     remote_branch_exists: bool,
+}
+
+#[derive(Serialize)]
+pub struct CombinedLocalCommits {
+    count: usize,
+    revision: String,
+    backup_ref: String,
+}
+
+// This deliberately accepts only a clean, attached branch whose actual server
+// tip is the first parent of a *linear* local-only sequence. A merge commit or
+// a stale remote-tracking ref needs a more explicit history operation, not a
+// silent flattening during Push. The old tip remains reachable by backup_ref.
+#[tauri::command]
+pub async fn combine_local_commits(repository_path: String, branch: String, remote: String, expected_tip: String, message: String, username: String, access_token: String) -> Result<CombinedLocalCommits, String> {
+    off_main_thread(move || combine_local_commits_inner_with_auth(repository_path, branch, remote, expected_tip, message, username, access_token)).await
+}
+
+#[cfg(test)]
+fn combine_local_commits_inner(repository_path: String, branch: String, remote: String, expected_tip: String, message: String) -> Result<CombinedLocalCommits, String> {
+    combine_local_commits_inner_with_auth(repository_path, branch, remote, expected_tip, message, String::new(), String::new())
+}
+
+fn combine_local_commits_inner_with_auth(repository_path: String, branch: String, remote: String, expected_tip: String, message: String, username: String, access_token: String) -> Result<CombinedLocalCommits, String> {
+    validate_path(&repository_path)?;
+    let branch = branch.trim();
+    let remote = remote.trim();
+    let message = message.trim();
+    if branch.is_empty() || remote.is_empty() || message.is_empty() { return Err("Choose a branch, remote and combined commit message".into()); }
+    let queue_started = Instant::now();
+    let lock_handle = repo_write_lock(&repository_path);
+    let _lock = lock_handle.lock().unwrap();
+    log_repo_write_lock_acquired(&repository_path, "combine_local_commits", queue_started.elapsed());
+    let repo = internal_repository(&repository_path)?;
+    repo.find_remote(remote).map_err(|_| format!("Remote {remote} is not configured"))?;
+    if repo.state() != git2::RepositoryState::Clean { return Err("Finish or abort the current merge/rebase before combining commits".into()); }
+    let head = repo.head().map_err(|error| error.message().to_string())?;
+    if !head.is_branch() || head.shorthand() != Some(branch) { return Err(format!("Checkout local branch {branch} before combining its commits")); }
+    let old_oid = head.target().ok_or("HEAD has no commit")?;
+    if old_oid.to_string() != expected_tip { return Err("The local branch changed since the Push preview. Reopen Push before combining.".into()); }
+    let remote_ref = format!("refs/remotes/{remote}/{branch}");
+    let remote_oid = repo.refname_to_id(&remote_ref).map_err(|_| format!("No existing {remote}/{branch} tracking ref. Fetch this branch first."))?;
+    if old_oid == remote_oid || !repo.graph_descendant_of(old_oid, remote_oid).map_err(|error| error.message().to_string())? {
+        return Err(format!("Local {branch} is not strictly ahead of {remote}/{branch}. Fetch and resolve any divergence before combining."));
+    }
+    let server_ref = format!("refs/heads/{branch}");
+    let server_oid = if access_token.is_empty() {
+        let server_lines = git_with_timeout(&repository_path, &["ls-remote", "--heads", remote, &server_ref], Duration::from_secs(45), "45 seconds")
+            .map_err(|error| format!("Could not verify the server branch before combining: {error}"))?;
+        server_lines.lines().find_map(|line| {
+            let (oid, name) = line.split_once('\t')?;
+            (name.trim_end() == server_ref).then(|| Oid::from_str(oid).ok()).flatten()
+        })
+    } else {
+        // A token entered in Publish is also valid for the read-only preflight.
+        // Keep it in a libgit2 credential callback, never in a CLI argument or
+        // the command transcript. Use the PUSH URL: it is the server that will
+        // receive the rewritten commit, and it can differ from the fetch URL.
+        let configured = repo.find_remote(remote).map_err(|error| error.message().to_string())?;
+        let push_url = configured.pushurl().or_else(|| configured.url())
+            .ok_or_else(|| format!("Remote {remote} has no push URL"))?.to_string();
+        let mut lookup = repo.remote_anonymous(&push_url).map_err(|error| error.message().to_string())?;
+        let mut callbacks = git2::RemoteCallbacks::new();
+        callbacks.credentials(move |_url, remote_username, allowed| {
+            if allowed.contains(git2::CredentialType::USER_PASS_PLAINTEXT) {
+                git2::Cred::userpass_plaintext(if username.is_empty() { remote_username.unwrap_or("git") } else { &username }, &access_token)
+            } else if allowed.contains(git2::CredentialType::SSH_KEY) {
+                git2::Cred::ssh_key_from_agent(remote_username.unwrap_or("git"))
+            } else { git2::Cred::default() }
+        });
+        let connection = lookup.connect_auth(git2::Direction::Fetch, Some(callbacks), None)
+            .map_err(|error| format!("Could not verify the server branch before combining: {}", error.message()))?;
+        connection.list().map_err(|error| error.message().to_string())?
+            .iter().find(|head| head.name() == server_ref).map(|head| head.oid())
+    }.ok_or_else(|| format!("Server branch {remote}/{branch} is missing. Refresh/fetch before combining."))?;
+    if server_oid != remote_oid { return Err(format!("{remote}/{branch} changed on the server. Fetch it and review the new commits before combining.")); }
+    let dirty = git(&repository_path, &["status", "--porcelain=v1", "--untracked-files=normal"])?;
+    if !dirty.trim().is_empty() { return Err("Commit, stash or remove current staged, modified and untracked files before combining. No workspace changes were rewritten.".into()); }
+    let mut current = old_oid;
+    let mut count = 0usize;
+    while current != remote_oid {
+        let commit = repo.find_commit(current).map_err(|error| error.message().to_string())?;
+        if commit.parent_count() != 1 { return Err("The unpublished history contains a merge or is not based directly on the server branch. Combine is limited to a linear local-only sequence.".into()); }
+        current = commit.parent_id(0).map_err(|error| error.message().to_string())?;
+        count += 1;
+        if count > 100_000 { return Err("Too many commits to combine safely".into()); }
+    }
+    if count < 2 { return Err("At least two local-only commits are needed to combine. Use Push All for one commit.".into()); }
+    let old = repo.find_commit(old_oid).map_err(|error| error.message().to_string())?;
+    let base = repo.find_commit(remote_oid).map_err(|error| error.message().to_string())?;
+    let tree = old.tree().map_err(|error| error.message().to_string())?;
+    let signature = repo.signature().map_err(|error| format!("Configure a Git name and email before combining: {}", error.message()))?;
+    let new_oid = repo.commit(None, &signature, &signature, message, &tree, &[&base]).map_err(|error| error.message().to_string())?;
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|error| error.to_string())?.as_nanos();
+    let backup_ref = format!("refs/git-drilldown/backups/{stamp}-{}", &old_oid.to_string()[..8]);
+    repo.reference(&backup_ref, old_oid, false, "backup before combining local commits").map_err(|error| format!("Could not create a recovery reference; branch was not changed: {}", error.message()))?;
+    let local_ref = format!("refs/heads/{branch}");
+    git(&repository_path, &["update-ref", "-m", "Git DrillDown: combine local commits", &local_ref, &new_oid.to_string(), &old_oid.to_string()])
+        .map_err(|error| format!("Could not update the local branch. Original commits remain at {backup_ref}: {error}"))?;
+    invalidate_git_metadata(&repository_path);
+    Ok(CombinedLocalCommits { count, revision: new_oid.to_string(), backup_ref })
 }
 
 // `GIT_TERMINAL_PROMPT=0` + a null stdin are the real fix for the app
@@ -4325,7 +4428,7 @@ pub fn publish_status(repository_path: String, branch: String, remote: String) -
         }
         None => (commits.len(), 0, false),
     };
-    Ok(PublishStatus { branch: branch.into(), remote: remote.into(), remote_branch, commits, ahead, behind, remote_branch_exists })
+    Ok(PublishStatus { branch: branch.into(), remote: remote.into(), remote_branch, local_tip: local_oid.to_string(), commits, outgoing_count: outgoing.len(), ahead, behind, remote_branch_exists })
 }
 
 // One outgoing parent commit's gitlink that cannot be confirmed safe to
@@ -4802,15 +4905,25 @@ fn publish_branch_inner_with_options(repository_path: String, branch: String, re
         git(&repository_path, &["push", remote_name, &format!("{push_oid}:refs/heads/{branch}")])
             .map_err(|detail| if detail.to_lowercase().contains("authentication") || detail.contains("403") || detail.contains("could not read") { "Push authentication failed. Either make sure `git push` works for this repository from a terminal, or enter a Git username and Personal Access Token in Publish credentials.".to_string() } else if detail.to_lowercase().contains("non-fast-forward") || detail.to_lowercase().contains("fetch first") { "Push rejected because the server branch has newer commits. Pull/fetch those commits first, then publish again.".to_string() } else { format!("Push failed: {detail}") })?;
     } else {
-        // git2's push refspecs need the source side to resolve to a reference,
-        // not a bare commit id — point a scratch local ref at it, push that,
-        // then remove the scratch ref regardless of outcome.
-        let scratch_ref = "refs/heads/__git-integrity-partial-publish__";
-        repo.reference(scratch_ref, push_oid, true, "scratch ref for a partial publish").map_err(|error| error.message().to_string())?;
-        let mut remote = repo.find_remote(remote_name).map_err(|error| error.message().to_string())?; let mut options = authenticated_push_options(username, access_token);
-        let push_result = remote.push(&[&format!("{scratch_ref}:refs/heads/{branch}")], Some(&mut options));
-        let _ = repo.find_reference(scratch_ref).and_then(|mut reference| reference.delete());
-        push_result.map_err(|error| { let detail = error.message(); if detail.contains("username/password") || detail.contains("authentication") || detail.contains("401") || detail.contains("403") { "Push authentication failed. Check the username and Personal Access Token in Publish credentials (not your account password).".to_string() } else if detail.contains("non-fast-forward") { "Push rejected because the server branch has newer commits. Pull/fetch those commits first, then publish again.".to_string() } else { format!("Push failed: {detail}") } })?; drop(remote);
+        // libgit2 needs a source ref for this commit. A fixed refs/heads name
+        // with force=true could overwrite and then DELETE a real user branch.
+        // Use a unique private ref and refuse collisions instead.
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|error| error.to_string())?.as_nanos();
+        let scratch_ref = format!("refs/git-drilldown/tmp/publish-{}-{stamp}-{}", std::process::id(), &push_oid.to_string()[..8]);
+        repo.reference(&scratch_ref, push_oid, false, "temporary ref for an authenticated publish")
+            .map_err(|error| format!("Could not create a private publish ref without replacing existing data: {}", error.message()))?;
+        let push_result = (|| {
+            let mut remote = repo.find_remote(remote_name).map_err(|error| error.message().to_string())?;
+            let mut options = authenticated_push_options(username, access_token);
+            remote.push(&[&format!("{scratch_ref}:refs/heads/{branch}")], Some(&mut options))
+                .map_err(|error| { let detail = error.message(); if detail.contains("username/password") || detail.contains("authentication") || detail.contains("401") || detail.contains("403") { "Push authentication failed. Check the username and Personal Access Token in Publish credentials (not your account password).".to_string() } else if detail.contains("non-fast-forward") { "Push rejected because the server branch has newer commits. Pull/fetch those commits first, then publish again.".to_string() } else { format!("Push failed: {detail}") } })
+        })();
+        if let Err(error) = repo.find_reference(&scratch_ref).and_then(|mut reference| reference.delete()) {
+            // Never turn a successful server push into a false failure merely
+            // because cleanup of this private, recoverable ref failed.
+            perf_log(&format!("publish_branch: private ref cleanup warning: {}", error.message()), Duration::ZERO);
+        }
+        push_result?;
     }
     perf_log("publish_branch: network push", push_started.elapsed());
     let tracking_started = Instant::now();
@@ -9506,6 +9619,34 @@ mod tests {
     }
 
     #[test]
+    fn clean_checkout_branch_attaches_exact_matching_branch_and_refuses_stale_selection_before_cleaning() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let repository = std::env::temp_dir().join(format!("git-integrity-clean-branch-{suffix}"));
+        create_libgit2_repository(&repository, "a.txt");
+        run_git(&repository, &["branch", "-M", "main"]);
+        let first = run_git_capture(&repository, &["rev-parse", "HEAD"]);
+        run_git(&repository, &["branch", "topic"]);
+        fs::write(repository.join("a.txt"), "second\n").unwrap();
+        run_git(&repository, &["commit", "-am", "second"]);
+        let second = run_git_capture(&repository, &["rev-parse", "HEAD"]);
+        fs::write(repository.join("leftover.txt"), "local\n").unwrap();
+        let path = repository.to_string_lossy().into_owned();
+        assert!(branches::restore_exact_checkpoint_inner_with_branch(path.clone(), second, Some("topic".into())).is_err());
+        assert!(repository.join("leftover.txt").exists(), "a stale graph selection must not clean any files");
+        let other_worktree = std::env::temp_dir().join(format!("git-integrity-clean-branch-other-{suffix}"));
+        run_git(&repository, &["worktree", "add", other_worktree.to_str().unwrap(), "topic"]);
+        assert!(branches::restore_exact_checkpoint_inner_with_branch(path.clone(), first.clone(), Some("topic".into())).is_err());
+        assert!(repository.join("leftover.txt").exists(), "a branch checked out elsewhere must not clean this worktree");
+        run_git(&repository, &["worktree", "remove", "--force", other_worktree.to_str().unwrap()]);
+        branches::restore_exact_checkpoint_inner_with_branch(path, first.clone(), Some("topic".into())).unwrap();
+        assert_eq!(run_git_capture(&repository, &["branch", "--show-current"]), "topic");
+        assert_eq!(run_git_capture(&repository, &["rev-parse", "HEAD"]), first);
+        assert!(!repository.join("leftover.txt").exists());
+        assert_eq!(run_git_capture(&repository, &["status", "--porcelain"]), "");
+        fs::remove_dir_all(repository).unwrap();
+    }
+
+    #[test]
     fn restore_exact_checkpoint_cleans_parent_and_submodule_leftovers() {
         let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let base = std::env::temp_dir().join(format!("git-integrity-exact-checkpoint-{suffix}"));
@@ -13919,6 +14060,55 @@ mod tests {
     }
 
     #[test]
+    fn combine_local_commits_keeps_exact_tip_tree_and_recoverable_history_then_normal_publish_pushes_one_commit() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-combine-{suffix}"));
+        let repository = base.join("local");
+        let remote = base.join("origin.git");
+        fs::create_dir_all(&repository).unwrap();
+        fs::create_dir_all(&remote).unwrap();
+        run_git(&remote, &["init", "--bare"]);
+        run_git(&repository, &["init", "-b", "main"]);
+        run_git(&repository, &["config", "user.name", "Test User"]);
+        run_git(&repository, &["config", "user.email", "test@example.com"]);
+        fs::write(repository.join("a.txt"), "base\n").unwrap();
+        run_git(&repository, &["add", "."]);
+        run_git(&repository, &["commit", "-m", "Base"]);
+        run_git(&repository, &["remote", "add", "origin", remote.to_str().unwrap()]);
+        run_git(&repository, &["push", "-u", "origin", "main"]);
+        let original_base = run_git_capture(&repository, &["rev-parse", "HEAD"]);
+        fs::write(repository.join("a.txt"), "first\n").unwrap();
+        run_git(&repository, &["commit", "-am", "Checkpoint one"]);
+        fs::write(repository.join("b.txt"), "second\n").unwrap();
+        run_git(&repository, &["add", "."]);
+        run_git(&repository, &["commit", "-m", "Checkpoint two"]);
+        let old_tip = run_git_capture(&repository, &["rev-parse", "HEAD"]);
+        let old_tree = run_git_capture(&repository, &["rev-parse", "HEAD^{tree}"]);
+        let path = repository.to_string_lossy().into_owned();
+        fs::write(repository.join("uncommitted.txt"), "keep this\n").unwrap();
+        assert!(combine_local_commits_inner(path.clone(), "main".into(), "origin".into(), old_tip.clone(), "One combined change".into()).is_err());
+        assert_eq!(run_git_capture(&repository, &["rev-parse", "HEAD"]), old_tip);
+        fs::remove_file(repository.join("uncommitted.txt")).unwrap();
+        run_git(&repository, &["push", "origin", &format!("{old_tip}:refs/heads/other")]);
+        run_git(&remote, &["update-ref", "refs/heads/main", &old_tip]);
+        assert!(combine_local_commits_inner(path.clone(), "main".into(), "origin".into(), old_tip.clone(), "One combined change".into()).is_err(), "a server tip changed since the last fetch must block the rewrite");
+        assert_eq!(run_git_capture(&repository, &["rev-parse", "HEAD"]), old_tip);
+        run_git(&remote, &["update-ref", "refs/heads/main", &original_base]);
+        // A token entered in the dialog must also work for the read-only
+        // remote-tip check, even when no system credential helper is used.
+        let combined = combine_local_commits_inner_with_auth(path.clone(), "main".into(), "origin".into(), old_tip.clone(), "One combined change".into(), "test".into(), "test-token".into()).unwrap();
+        assert_eq!(combined.count, 2);
+        assert_eq!(run_git_capture(&repository, &["rev-parse", "HEAD^{tree}"]), old_tree);
+        assert_eq!(run_git_capture(&repository, &["rev-parse", "HEAD^"]), original_base);
+        assert_eq!(run_git_capture(&repository, &["rev-parse", &combined.backup_ref]), old_tip);
+        assert_eq!(run_git_capture(&repository, &["status", "--porcelain"]), "");
+        assert_eq!(run_git_capture(&remote, &["rev-parse", "refs/heads/main"]), original_base, "Combine Only must leave origin untouched");
+        publish_branch_inner(path, "main".into(), "origin".into(), String::new(), String::new(), String::new(), false).unwrap();
+        assert_eq!(run_git_capture(&remote, &["rev-parse", "refs/heads/main"]), combined.revision);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
     fn publish_branch_can_stop_at_an_earlier_commit_leaving_newer_ones_local() {
         // "Deselecting" a commit before publish can only validly mean "stop
         // pushing here" — publish_branch's `upto_commit` pushes the branch up
@@ -13943,7 +14133,22 @@ mod tests {
         run_git(&repository, &["remote", "add", "origin", remote.to_str().unwrap()]);
         let path = repository.to_string_lossy().into_owned();
 
-        publish_branch_inner(path.clone(), "main".into(), "origin".into(), String::new(), String::new(), commit1.clone(), false).unwrap();
+        // The old fixed scratch name is a perfectly valid user branch. An
+        // authenticated partial push must preserve it exactly.
+        run_git(&repository, &["branch", "__git-integrity-partial-publish__", &commit1]);
+        publish_branch_inner_with_options(path.clone(), "main".into(), "origin".into(), "test".into(), "test-token".into(), commit1.clone(), false, true).unwrap();
+        assert_eq!(run_git_capture(&repository, &["rev-parse", "refs/heads/__git-integrity-partial-publish__"]), commit1);
+        assert!(git(&path, &["for-each-ref", "--format=%(refname)", "refs/git-drilldown/tmp"]).unwrap().trim().is_empty());
+
+        // The private ref must also be cleaned after a rejected push, with
+        // the user's real branch still untouched.
+        let local_tip = run_git_capture(&repository, &["rev-parse", "HEAD"]);
+        run_git(&remote, &["fetch", repository.to_str().unwrap(), "HEAD"]);
+        run_git(&remote, &["update-ref", "refs/heads/main", &local_tip]);
+        assert!(publish_branch_inner_with_options(path.clone(), "main".into(), "origin".into(), "test".into(), "test-token".into(), commit1.clone(), false, true).is_err());
+        assert_eq!(run_git_capture(&repository, &["rev-parse", "refs/heads/__git-integrity-partial-publish__"]), commit1);
+        assert!(git(&path, &["for-each-ref", "--format=%(refname)", "refs/git-drilldown/tmp"]).unwrap().trim().is_empty());
+        run_git(&remote, &["update-ref", "refs/heads/main", &commit1]);
 
         let remote_head = git(&remote.to_string_lossy(), &["rev-parse", "refs/heads/main"]).unwrap().trim().to_string();
         assert_eq!(remote_head, commit1, "the server should be at exactly the chosen commit, not the branch tip");
@@ -13960,6 +14165,31 @@ mod tests {
 
         fs::remove_dir_all(repository).unwrap();
         fs::remove_dir_all(remote).unwrap();
+    }
+
+    #[test]
+    fn publish_status_reports_full_count_when_commit_preview_is_capped() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-publish-count-{suffix}"));
+        let repository = base.join("local");
+        let remote = base.join("origin.git");
+        fs::create_dir_all(&repository).unwrap();
+        fs::create_dir_all(&remote).unwrap();
+        run_git(&remote, &["init", "--bare"]);
+        run_git(&repository, &["init", "-b", "main"]);
+        run_git(&repository, &["config", "user.name", "Test User"]);
+        run_git(&repository, &["config", "user.email", "test@example.com"]);
+        run_git(&repository, &["commit", "--allow-empty", "-m", "Base"]);
+        run_git(&repository, &["remote", "add", "origin", remote.to_str().unwrap()]);
+        run_git(&repository, &["push", "-u", "origin", "main"]);
+        for index in 0..101 {
+            run_git(&repository, &["commit", "--allow-empty", "-m", &format!("Local {index}")]);
+        }
+        let status = publish_status(repository.to_string_lossy().into_owned(), "main".into(), "origin".into()).unwrap();
+        assert_eq!(status.outgoing_count, 101);
+        assert_eq!(status.commits.len(), 100, "only the visual preview should be capped");
+        assert_eq!(status.ahead, 101);
+        fs::remove_dir_all(base).unwrap();
     }
 
     #[test]

@@ -12,10 +12,10 @@ const MUTATING_COMMANDS = new Set([
   'stage_files', 'unstage_files', 'stage_all', 'commit_files', 'commit_staged', 'commit_path',
   'remove_git_path', 'delete_local_path', 'switch_branch', 'checkout_remote_tracking_branch', 'create_branch', 'create_branch_at_commit', 'checkout_commit', 'rename_branch', 'delete_branch',
   'stash_changes', 'stash_file', 'pop_stash', 'drop_stash', 'restore_stash_paths', 'abort_stash_conflict',
-  'restore_file', 'restore_remote_file', 'restore_folder', 'restore_exact_checkpoint', 'add_submodule', 'init_submodule', 'switch_submodule_version', 'reset_submodule', 'reset_submodule_branch_to_upstream', 'change_submodule_url',
+  'restore_file', 'restore_remote_file', 'restore_folder', 'restore_exact_checkpoint', 'restore_exact_checkpoint_branch', 'add_submodule', 'init_submodule', 'switch_submodule_version', 'reset_submodule', 'reset_submodule_branch_to_upstream', 'change_submodule_url',
   'commit_submodule', 'push_submodule', 'pull_submodule', 'force_push_submodule', 'fetch_submodule',
   'create_submodule_branch', 'merge_branch', 'open_merge_tool', 'resolve_conflict', 'complete_merge', 'abort_merge',
-  'sync_repository', 'publish_branch', 'fetch_remote', 'fetch_all_remotes', 'fetch_project', 'write_text_file', 'run_git_command', 'run_terminal_command',
+  'sync_repository', 'publish_branch', 'combine_local_commits', 'fetch_remote', 'fetch_all_remotes', 'fetch_project', 'write_text_file', 'run_git_command', 'run_terminal_command',
 ]);
 // While an embedded Terminal command is running, every mutation *and* switching to
 // a different repository (which would otherwise let that command's delayed
@@ -66,6 +66,7 @@ const directoryCache = new Map();
 let submoduleMenuData = null;
 let submoduleMenuEntry = null;
 let versionFilter = 'branch';
+let submoduleCrossSelected = null;
 let submoduleBrowserState = { repositories: [], selectedRepository: null, allRefs: [], refs: [], selectedRef: null, selectedRefs: [] };
 const submoduleBrowserRefCache = new Map();
 const recentRepos = JSON.parse(localStorage.getItem('recentRepos') || '[]');
@@ -214,7 +215,7 @@ const state = { repository: null, branches: [], commits: [], allCommits: [], cha
   // the fields above, never this — see activeGraphData(), openSubmoduleGraph
   // and leaveSubmoduleGraph.
   submoduleGraph: null, repositoryOrigin: null,
-  consoleMode: 'console', consoleTranscript: [], consoleCmdHistory: [], consoleDrafts: { commands: '', console: '', saved: '' }, consoleScopeOverride: null, graphPrimaryBranch: null, graphOnlySearchMatches: false, graphBranchCompareAnchor: null, graphCommitCompareAnchor: null, publishUpto: null, branchStartMarker: null, savedActions: loadSavedActions(), folderRestore: null,
+  consoleMode: 'console', consoleTranscript: [], consoleCmdHistory: [], consoleDrafts: { commands: '', console: '', saved: '' }, consoleScopeOverride: null, graphPrimaryBranch: null, graphOnlySearchMatches: false, graphBranchCompareAnchor: null, branchCompareSelection: null, graphCommitCompareAnchor: null, publishUpto: null, branchStartMarker: null, savedActions: loadSavedActions(), folderRestore: null,
   // False only right after openRepositoryFast, until its background
   // refresh_status completes — mutations (stage/unstage, delete, commit,
   // switching branch) are refused while this is false, since they'd act on
@@ -677,7 +678,7 @@ function updateSubmoduleBrowserActions() {
   const selected = submoduleBrowserSelectedCompareRefs();
   if (refs.compareSubmoduleBrowser) {
     refs.compareSubmoduleBrowser.disabled = !submoduleBrowserState.selectedRepository || !selected.length;
-    refs.compareSubmoduleBrowser.textContent = selected.length >= 2 ? 'Compare selected' : 'Compare with default';
+    refs.compareSubmoduleBrowser.textContent = selected.length >= 2 ? 'Compare selected revisions' : 'Compare with default';
     refs.compareSubmoduleBrowser.title = selected.length >= 2
       ? 'Compare the first two selected revisions'
       : 'Compare the selected revision with the repository default branch when available';
@@ -706,8 +707,10 @@ function openSubmoduleBrowser() {
 }
 function renderSubmoduleRepositoryResults() {
   const selected = submoduleBrowserState.selectedRepository;
-  refs.submoduleRepoResults.innerHTML = submoduleBrowserState.repositories.map(repo => `<button type="button" class="submodule-browser-row ${selected?.full_name === repo.full_name ? 'selected' : ''}" data-submodule-repo="${esc(repo.full_name)}">
-    <span><strong>${esc(repo.name)}</strong><small>${esc(repo.description || repo.full_name)}${repo.default_branch ? ` · default ${esc(repo.default_branch)}` : ''}</small></span><code>${esc(repo.portable_url)}</code>
+  refs.submoduleRepoResults.innerHTML = submoduleBrowserState.repositories.map(repo => `<button type="button" class="submodule-browser-row submodule-repo-row ${selected?.full_name === repo.full_name ? 'selected' : ''}" data-submodule-repo="${esc(repo.full_name)}">
+    <span class="submodule-repo-main"><strong>${esc(repo.name)}</strong><small>${esc(repo.description || repo.full_name)}${repo.default_branch ? ` · default ${esc(repo.default_branch)}` : ''}</small></span>
+    <code>${esc(repo.portable_url)}</code>
+    <span class="submodule-browser-row-action">Open refs</span>
   </button>`).join('') || '<div class="version-loading">No repositories found.</div>';
   refs.submoduleRepoResults.querySelectorAll('[data-submodule-repo]').forEach(button => button.addEventListener('click', () => {
     const repo = submoduleBrowserState.repositories.find(item => item.full_name === button.dataset.submoduleRepo);
@@ -720,14 +723,16 @@ function renderSubmoduleRefResults() {
   refs.submoduleRefResults.innerHTML = submoduleBrowserState.refs.map((ref, index) => {
     const isSelected = selected?.kind === ref.kind && selected?.name === ref.name && selected?.revision === ref.revision;
     const isCompareSelected = compareKeys.has(submoduleBrowserRefKey(ref));
+    const refKind = ref.kind || 'commit';
+    const subject = ref.subject || (refKind === 'commit' ? 'Exact commit SHA' : `${refKind} tip`);
     return `<div class="submodule-browser-row submodule-ref-row ${isSelected ? 'selected' : ''} ${isCompareSelected ? 'compare-selected' : ''}" data-submodule-ref-index="${index}">
       <button type="button" class="submodule-ref-main" title="Click to use this revision. Cmd/Ctrl-click to add it to Compare selected.">
-        <span><strong>${esc(ref.name || revisionDisplay(ref.revision))}</strong><small>${esc(ref.subject || (ref.kind === 'commit' ? 'Commit SHA' : `${ref.kind} tip`))}${ref.date ? ` · ${esc(ref.date)}` : ''}</small></span>
-        <span class="submodule-browser-kind ${esc(ref.kind)}">${esc(ref.kind)}</span>
-        <code>${esc(revisionDisplay(ref.revision))}</code>
+        <span class="submodule-browser-kind ${esc(refKind)}">${esc(refKind)}</span>
+        <span class="submodule-ref-title"><strong>${esc(ref.name || revisionDisplay(ref.revision))}</strong><small>${esc(subject)}</small></span>
+        <span class="submodule-ref-meta"><code>${esc(revisionDisplay(ref.revision))}</code>${ref.date ? `<small>${esc(ref.date)}</small>` : ''}</span>
       </button>
-      <button type="button" class="submodule-ref-action" data-submodule-ref-download="${index}" title="Download this exact revision to a local folder">⇩</button>
-      <button type="button" class="submodule-ref-action" data-submodule-ref-compare="${index}" title="Compare this revision with the repository default branch, or with another selected revision">⇄</button>
+      <button type="button" class="submodule-ref-action" data-submodule-ref-download="${index}" title="Download this exact revision to a local folder"><span>⇩</span><b>Export</b></button>
+      <button type="button" class="submodule-ref-action" data-submodule-ref-compare="${index}" title="Compare this revision with the repository default branch, or with another selected revision"><span>⇄</span><b>Compare</b></button>
     </div>`;
   }).join('') || '<div class="version-loading">No refs found. Type a branch, tag or SHA and press Find.</div>';
   refs.submoduleRefResults.querySelectorAll('.submodule-ref-main').forEach(button => button.addEventListener('click', event => {
@@ -2507,6 +2512,7 @@ async function refreshSubmoduleMenu(button = null) {
 }
 async function openSubmoduleMenu(entry, x, y) {
   submoduleMenuEntry = entry;
+  submoduleCrossSelected = null;
   openSubmoduleMenuGuard();
   refs.submoduleMenu.hidden = false;
   // Keep the wider, readable selector fully inside the viewport. Its old
@@ -2548,6 +2554,10 @@ function renderSubmoduleVersions() {
     ? 'Open the complete history map to search every branch and tag…'
     : versionFilter === 'commit' ? 'Search loaded history by SHA, message or author…' : versionFilter === 'tag' ? 'Search tags, SHAs or messages…' : 'Search branches, SHAs or messages…';
   const matches = item => matchesSubmoduleVersion(item, query);
+  const rowWithRelations = item => ({ ...item,
+    related_refs: relatedSubmoduleVersionRefs(item, submoduleMenuData.versions),
+    cross_selected: submoduleCrossSelected?.kind === item.kind && submoduleCrossSelected?.name === item.name,
+  });
   const currentContext = submoduleCurrentContextHtml(submoduleMenuData);
   const detached = !submoduleMenuData.current_branch;
   let html;
@@ -2563,9 +2573,9 @@ function renderSubmoduleVersions() {
     // (already computed for this exact row by load_directory, whenever there
     // was anything here to explain) is the same signal the Explorer's own
     // "Modified"/"New version" distinction already relies on.
-    const renderBranch = item => submoduleVersionRowHtml({ ...item, checkout_detached: detached, dirty: item.current && !!submoduleMenuEntry?.submodule_is_dirty });
+    const renderBranch = item => submoduleVersionRowHtml({ ...rowWithRelations(item), checkout_detached: detached, dirty: item.current && !!submoduleMenuEntry?.submodule_is_dirty });
     const rows = localRows.map(renderBranch).join('')
-      + (remoteRows.length ? `<div class="version-section-heading">REMOTE ONLY</div>${remoteRows.map(renderBranch).join('')}` : '');
+      + (remoteRows.length ? `<div class="version-section-heading">REMOTE TIPS NOT SHOWN ABOVE</div>${remoteRows.map(renderBranch).join('')}` : '');
     html = currentContext + (rows || `<div class="version-loading">${query ? 'No matches' : 'No branches found'}</div>`);
   } else if (versionFilter === 'complete') {
     html = `${currentContext}<div class="complete-history-card"><h3>Complete submodule history</h3><p>The current-history tab follows only the active branch context. Open the complete map to see commits, branch tips and tags across this submodule.</p><button type="button" data-open-complete-history>Open complete history map ↗</button></div>`;
@@ -2575,7 +2585,7 @@ function renderSubmoduleVersions() {
     const versions = submoduleMenuData.versions
       .filter(item => versionFilter === 'tag' ? item.kind === 'tag' : item.kind === 'commit')
       .filter(matches);
-    const rows = versions.map(submoduleVersionRowHtml).join('') || `<div class="version-loading">${query ? 'No matches' : versionFilter === 'tag' ? 'No tags in this submodule' : 'No versions found'}</div>`;
+    const rows = versions.map(item => submoduleVersionRowHtml(rowWithRelations(item))).join('') || `<div class="version-loading">${query ? 'No matches' : versionFilter === 'tag' ? 'No tags in this submodule' : 'No versions found'}</div>`;
     const historyContext = submoduleMenuData.history_context_branch
       ? `History of ${submoduleMenuData.history_context_branch}. The active checkout is marked CURRENT even when it is inside the branch rather than at its tip.`
       : 'No known branch contains this detached checkout. History starts at the active commit.';
@@ -2584,6 +2594,16 @@ function renderSubmoduleVersions() {
       : rows;
   }
   refs.submoduleVersions.innerHTML = html;
+  refs.submoduleVersions.querySelectorAll('[data-related-version]').forEach(button => button.addEventListener('click', event => {
+    event.stopPropagation();
+    submoduleCrossSelected = { kind: button.dataset.relatedKind, name: button.dataset.relatedName };
+    versionFilter = submoduleCrossSelected.kind === 'tag' ? 'tag' : 'branch';
+    refs.submoduleVersionSearch.value = '';
+    document.querySelectorAll('[data-version-filter]').forEach(tab => tab.classList.toggle('active', tab.dataset.versionFilter === versionFilter));
+    renderSubmoduleVersions();
+    const selected = [...refs.submoduleVersions.querySelectorAll('.version-cross-selected')][0];
+    selected?.scrollIntoView({ block: 'nearest' });
+  }));
   refs.submoduleVersions.querySelector('[data-open-complete-history]')?.addEventListener('click', () => {
     if (submoduleMenuEntry) { closeSubmoduleMenu(); openSubmoduleGraph(submoduleMenuEntry); }
   });
@@ -4357,6 +4377,9 @@ function renderBranches() {
   const context = activeRepositoryContext();
   const { rows, detached, detachedAt } = selectBranchRows(context);
   const compareAnchor = graphBranchCompareAnchorMatches(context) ? state.graphBranchCompareAnchor : null;
+  const compareSelection = branchCompareSelectionMatches(context) ? state.branchCompareSelection : null;
+  const selectedBranches = compareSelection?.branches || [];
+  const selectedBranchSet = new Set(selectedBranches);
   // Point 2 of the report: a detached submodule (or parent) must show its
   // own explicit "Detached HEAD at <sha>" row/status — never leave the
   // sidebar merely *not* highlighting anything, which reads as "nothing is
@@ -4373,17 +4396,31 @@ function renderBranches() {
   // per-branch identity a sidebar row could legitimately mirror). Left
   // neutral (the bullet's plain CSS default) instead of inventing a mapping
   // that would just be a different false correspondence.
-  refs.branches.innerHTML = detachedRow + rows.map(branch => `<div class="branch-row ${branch.isHead ? 'active' : ''} ${branch.remote ? 'remote-branch' : 'local-branch'} ${branch.name === 'origin/main' ? 'primary-remote' : ''} ${compareAnchor?.branch === branch.name ? 'compare-start' : ''}" data-branch="${esc(branch.name)}" data-is-remote="${branch.remote ? 'true' : 'false'}">
+  const compareSelectionBar = selectedBranches.length ? `<div class="branch-compare-selection" role="status">
+    <span><b>Compare branches · ${selectedBranches.length}/2</b><small>${selectedBranches.length === 1 ? `${esc(selectedBranches[0])} · Cmd/Ctrl-click one more` : `${esc(selectedBranches[0])} ↔ ${esc(selectedBranches[1])}`}</small></span>
+    <span class="branch-compare-selection-actions"><button type="button" data-clear-branch-compare title="Clear branch selection">×</button><button type="button" data-run-branch-compare ${selectedBranches.length !== 2 ? 'disabled' : ''}>Compare</button></span>
+  </div>` : '';
+  refs.branches.innerHTML = compareSelectionBar + detachedRow + rows.map(branch => `<div class="branch-row ${branch.isHead ? 'active' : ''} ${branch.remote ? 'remote-branch' : 'local-branch'} ${branch.name === 'origin/main' ? 'primary-remote' : ''} ${compareAnchor?.branch === branch.name ? 'compare-start' : ''} ${selectedBranchSet.has(branch.name) ? 'compare-selected' : ''}" data-branch="${esc(branch.name)}" data-is-remote="${branch.remote ? 'true' : 'false'}" ${selectedBranchSet.has(branch.name) ? `data-compare-order="${selectedBranches.indexOf(branch.name) + 1}" aria-selected="true"` : ''} title="Cmd/Ctrl-click to select this branch for comparison">
     <span class="branch-bullet"></span>
     <span class="branch-name">${esc(branch.name)}</span>
-    <div style="display:flex;gap:6px;margin-left:auto;">
+    <div class="branch-row-actions">
       ${branch.isHead ? '<small>HEAD</small>' : branch.remote ? `<small>${branch.name === 'origin/main' ? 'PRIMARY REMOTE' : 'REMOTE'}</small>` : `<button class="switch-branch" data-branch="${esc(branch.name)}" title="Switch to ${esc(branch.name)}">↔</button>`}
-      <button class="branch-menu" data-branch="${esc(branch.name)}" title="Branch actions" style="width:20px;height:20px;padding:0;font-size:14px;border-radius:3px;">⋮</button>
+      <button class="branch-menu" data-branch="${esc(branch.name)}" title="Branch actions">⋮</button>
     </div>
   </div>`).join('') || (detached ? '' : '<div class="empty-change">No branches</div>');
   refs.branches.querySelectorAll('.switch-branch').forEach(button => button.addEventListener('click', event => { event.stopPropagation(); switchBranch(button.dataset.branch, button); }));
   refs.branches.querySelectorAll('.branch-menu').forEach(button => button.addEventListener('click', event => { event.stopPropagation(); showBranchMenu(button.dataset.branch, event); }));
-  refs.branches.querySelectorAll('.branch-row[data-branch]').forEach(row => row.addEventListener('contextmenu', event => showBranchMenu(row.dataset.branch, event)));
+  refs.branches.querySelectorAll('.branch-row[data-branch]').forEach(row => {
+    row.addEventListener('contextmenu', event => showBranchMenu(row.dataset.branch, event));
+    row.addEventListener('click', event => {
+      if ((!event.metaKey && !event.ctrlKey) || event.target.closest('button')) return;
+      event.preventDefault();
+      event.stopPropagation();
+      toggleBranchCompareSelection(row.dataset.branch);
+    });
+  });
+  refs.branches.querySelector('[data-clear-branch-compare]')?.addEventListener('click', clearBranchCompareSelection);
+  refs.branches.querySelector('[data-run-branch-compare]')?.addEventListener('click', () => runSelectedBranchCompare().catch(error => handleError(error)));
 }
 
 // Message D, point 5: the "SUBMODULE PULL REQUEST" section exists at all
@@ -5160,6 +5197,8 @@ function showFloatingMenu(event, items) {
     return `<button type="button" class="${esc(classes)}" data-action="${esc(item.id)}" ${item.disabled ? 'disabled' : ''}><strong>${esc(item.label)}</strong>${item.detail ? `<small>${esc(item.detail)}</small>` : ''}</button>`;
   }).join('');
   document.body.appendChild(menu);
+  menu.style.left = `${Math.max(8, Math.min(event.clientX, innerWidth - menu.offsetWidth - 8))}px`;
+  menu.style.top = `${Math.max(8, Math.min(event.clientY, innerHeight - menu.offsetHeight - 8))}px`;
   menu.querySelectorAll('[data-action]').forEach(button => button.addEventListener('click', () => {
     const item = items.find(candidate => candidate.id === button.dataset.action);
     menu.remove();
@@ -5232,6 +5271,56 @@ function graphCheckoutBranchMenuItem(branchName, kind = 'local_branch', id = 'ch
 
 function graphBranchCompareAnchorMatches(context, anchor = state.graphBranchCompareAnchor) {
   return Boolean(anchor && context && anchor.path === context.path && anchor.isSubmodule === context.isSubmodule && anchor.relativePath === context.relativePath);
+}
+
+// Cmd-click on macOS and Ctrl-click on Windows use a separate, explicit
+// two-branch selection. This deliberately does not reuse the graph's
+// one-shot compare anchor: selecting two sidebar rows must remain visible
+// until the user presses Compare, and must never checkout or run Git merely
+// because the second row was clicked.
+function branchCompareSelectionMatches(context, selection = state.branchCompareSelection) {
+  return Boolean(selection && context && selection.path === context.path && selection.isSubmodule === context.isSubmodule && selection.relativePath === context.relativePath);
+}
+
+function toggleBranchCompareSelection(branchName) {
+  const context = activeRepositoryContext();
+  if (!context.path || !branchName) return;
+  const current = branchCompareSelectionMatches(context) ? [...state.branchCompareSelection.branches] : [];
+  const existingIndex = current.indexOf(branchName);
+  if (existingIndex >= 0) current.splice(existingIndex, 1);
+  else if (current.length < 2) current.push(branchName);
+  else {
+    showOperationToast('Two branches are already selected. Clear one before selecting another.', 'info');
+    return;
+  }
+  state.branchCompareSelection = current.length ? {
+    branches: current,
+    path: context.path,
+    isSubmodule: context.isSubmodule,
+    parentPath: context.parentPath,
+    relativePath: context.relativePath,
+    name: context.name,
+  } : null;
+  renderBranches();
+  status(current.length === 2
+    ? `${current[0]} and ${current[1]} selected. Press Compare to open a read-only comparison.`
+    : current.length === 1
+      ? `${current[0]} selected. Cmd/Ctrl-click one more branch.`
+      : 'Branch comparison selection cleared.');
+}
+
+function clearBranchCompareSelection() {
+  state.branchCompareSelection = null;
+  renderBranches();
+  status('Branch comparison selection cleared.');
+}
+
+async function runSelectedBranchCompare() {
+  const context = activeRepositoryContext();
+  if (!branchCompareSelectionMatches(context) || state.branchCompareSelection.branches.length !== 2) return;
+  const [leftRef, rightRef] = state.branchCompareSelection.branches;
+  state.branchCompareSelection = null;
+  await openGraphBranchCompare(leftRef, rightRef);
 }
 
 function graphCommitCompareAnchorMatches(context, anchor = state.graphCommitCompareAnchor) {
@@ -5400,27 +5489,27 @@ async function checkoutGraphCommit(commitId) {
   } catch (error) { handleError(error); }
 }
 
-async function restoreExactCheckpointFromGraphCommit(commitId) {
+async function restoreExactCheckpointFromGraphCommit(commitId, branch = '') {
   const context = activeRepositoryContext();
   if (!context.path) return;
   const shortId = commitId.slice(0, 8);
   const ok = await customConfirm(
-    `Restore exact checkpoint ${shortId} in ${context.name}?\n\nThis is stronger than Checkout:\n• detaches HEAD at this commit\n• discards tracked local edits\n• removes untracked, non-ignored leftovers\n• forces submodules to the versions recorded by this checkpoint\n\nIgnored build artifacts are not removed. This cannot be undone from the app.`,
-    { title: 'Restore exact checkpoint', danger: true, okLabel: 'Restore exact checkpoint' }
+    `Clean checkout ${branch ? `branch ${branch}` : `commit ${shortId}`} in ${context.name}?\n\nThis is stronger than Checkout:\n• ${branch ? `attaches HEAD to local branch ${branch} at ${shortId}` : 'detaches HEAD at this exact commit'}\n• discards tracked local edits\n• removes untracked, non-ignored leftovers\n• forces submodules to the versions recorded by this checkpoint\n\nIgnored build artifacts are not removed. This cannot be undone from the app.`,
+    { title: branch ? 'Clean checkout branch' : 'Restore exact checkpoint', danger: true, okLabel: branch ? 'Clean checkout branch' : 'Restore exact checkpoint' }
   );
   if (!ok) return;
   if (!invoke) { status(`Preview: restore exact checkpoint ${shortId}`); return; }
   try {
     status(`Restoring exact checkpoint ${shortId}; updating submodules can take many minutes on large repositories…`, 'busy');
-    await invoke('restore_exact_checkpoint', { repositoryPath: context.path, commitId });
+    await invoke(branch ? 'restore_exact_checkpoint_branch' : 'restore_exact_checkpoint', { repositoryPath: context.path, commitId, ...(branch ? { branch } : {}) });
     await refreshAfterGraphCommitAction(context.path);
-    const message = `Workspace restored exactly to checkpoint ${shortId}.`;
+    const message = branch ? `Workspace restored to ${shortId} on branch ${branch}.` : `Workspace restored exactly to checkpoint ${shortId} (detached HEAD).`;
     status(message); showOperationToast(message, 'success');
   } catch (error) { handleError(error); }
 }
 
 function showGraphCommitContextMenu(event, commitId) {
-  const branchRefs = graphBranchRefsForCommit(commitId).slice(0, 6);
+  const branchRefs = graphBranchRefsForCommit(commitId);
   const context = activeRepositoryContext();
   const commitAnchor = graphCommitCompareAnchorMatches(context) ? state.graphCommitCompareAnchor : null;
   const commitCompareItems = [
@@ -5448,20 +5537,18 @@ function showGraphCommitContextMenu(event, commitId) {
       run: () => { const start = commitAnchor.commitId; state.graphCommitCompareAnchor = null; openGraphRevisionCompare(start, commitId); },
     });
   }
-  const checkoutItems = branchRefs
-    .filter(ref => ref.kind === 'local_branch')
-    .slice(0, 3)
-    .map((ref, index) => graphCheckoutBranchMenuItem(ref.name, ref.kind, `checkout-${index}`));
-  const mergeItems = branchRefs.map((ref, index) => graphMergeMenuItem(ref.name, `merge-${index}`));
+  const mergeItems = branchRefs.slice(0, 6).map((ref, index) => graphMergeMenuItem(ref.name, `merge-${index}`));
+  const localBranchesAtCommit = branchRefs.filter(ref => ref.kind === 'local_branch');
   const menuItems = [];
-  if (checkoutItems.length) menuItems.push({ header: 'Checkout' }, ...checkoutItems, { separator: true });
   if (mergeItems.length) menuItems.push({ header: 'Merge' }, ...mergeItems, { separator: true });
   menuItems.push(
     { header: 'Commit actions' },
     { id: 'branch', label: 'Create branch from this commit', detail: commitId.slice(0, 8), kind: 'primary', run: () => createBranchFromGraphCommit(commitId) },
     { id: 'checkout', label: 'Checkout this commit', detail: 'Detached HEAD', kind: 'primary', run: () => checkoutGraphCommit(commitId) },
+    ...localBranchesAtCommit.map((ref, index) => ({ id: `commit-branch-${index}`, label: `Checkout branch ${ref.name}`, detail: 'Attached HEAD · same commit', kind: 'primary', run: () => switchBranch(ref.name) })),
     { separator: true },
     { id: 'restore-exact', label: 'Restore exact checkpoint…', detail: 'Clean workspace to this commit', danger: true, run: () => restoreExactCheckpointFromGraphCommit(commitId) },
+    ...localBranchesAtCommit.map((ref, index) => ({ id: `clean-branch-${index}`, label: `Clean checkout branch ${ref.name}…`, detail: 'Discard local edits · attached HEAD', danger: true, run: () => restoreExactCheckpointFromGraphCommit(commitId, ref.name) })),
     { separator: true },
     { header: 'Compare' },
     ...commitCompareItems,
@@ -5984,6 +6071,9 @@ async function openPublish() {
   const locals = state.branches.filter(branch => !branch.remote); refs.publishBranch.innerHTML = locals.map(branch => `<option value="${esc(branch.name)}" ${branch.current ? 'selected' : ''}>${esc(branch.name)}${branch.current ? ' (current)' : ''}</option>`).join('');
   refs.publishRemote.innerHTML = state.remotes.map(remote => `<option value="${esc(remote.name)}">${esc(remote.name)}</option>`).join('');
   if (refs.publishSafeMode) refs.publishSafeMode.checked = true;
+  document.querySelector('[name="publishCommitMode"][value="all"]').checked = true;
+  $('#publishCombinedMessage').value = '';
+  $('#publishOperationStatus').textContent = '';
   updatePublishModeUi();
   refs.publishDialog.showModal(); await refreshPublish();
 }
@@ -6034,15 +6124,20 @@ function publishRemoteAheadWarningHtml(publish) {
 
 function renderPublishCommits() {
   const commits = state.publish?.commits || [];
+  const outgoingCount = Number(state.publish?.outgoing_count) || commits.length;
+  const limited = outgoingCount > commits.length;
   const uptoIndex = state.publishUpto ? commits.findIndex(commit => commit.id === state.publishUpto) : commits.length - 1;
-  refs.publishCommits.innerHTML = publishRemoteAheadWarningHtml(state.publish) + publishSubmoduleRisksHtml + (commits.map((commit, index) => {
+  const limitNotice = limited ? `<div class="publish-remote-ahead-warning">Showing ${commits.length} of ${outgoingCount} pending commits. Push All publishes every commit. Choosing a partial cutoff is unavailable while the list is incomplete.</div>` : '';
+  refs.publishCommits.innerHTML = publishRemoteAheadWarningHtml(state.publish) + publishSubmoduleRisksHtml + limitNotice + (commits.map((commit, index) => {
     const willPush = index <= uptoIndex;
     return `<div class="publish-commit ${willPush ? '' : 'excluded'}" data-commit-id="${esc(commit.id)}">
-      <span>${index + 1}</span><input type="checkbox" class="publish-check" data-index="${index}" ${willPush ? 'checked' : ''}>
+      <span>${index + 1}</span><input type="checkbox" class="publish-check" data-index="${index}" ${willPush ? 'checked' : ''} ${limited ? 'disabled' : ''}>
       <div><strong>${esc(commit.subject)}</strong><small>${esc(commit.id.slice(0, 8))} · ${esc(commit.author)} · ${esc(commit.date)}</small></div>
       ${willPush ? (index === uptoIndex && index < commits.length - 1 ? '<b class="publish-cutoff-badge" data-tooltip="Everything above stays local for now">WILL PUSH · stop here</b>' : '<b>WILL PUSH</b>') : '<b class="publish-held-back">STAYS LOCAL</b>'}
     </div>`;
-  }).join('') || '<div class="publish-empty">This branch is already up to date on the server.</div>');
+  }).join('') || (Number(state.publish?.ahead) > 0
+    ? `<div class="publish-empty">${state.publish.ahead} commit${state.publish.ahead === 1 ? '' : 's'} ahead of ${esc(state.publish.remote_branch)}. These commits are already reachable through another remote ref; this branch pointer still needs publishing.</div>`
+    : '<div class="publish-empty">This branch is already up to date on the server.</div>'));
   // Git can only push a contiguous range from the oldest pending commit
   // forward — unchecking one always means "and everything newer than it
   // too" (they were built on top of it), checking one always means "and
@@ -6059,44 +6154,87 @@ function renderPublishCommits() {
 
 function updatePublishSummary() {
   const commits = state.publish?.commits || [];
+  const outgoingCount = Number(state.publish?.outgoing_count) || commits.length;
+  const limited = outgoingCount > commits.length;
   const uptoIndex = state.publishUpto ? commits.findIndex(commit => commit.id === state.publishUpto) : commits.length - 1;
-  const willPushCount = uptoIndex + 1;
-  const heldBack = commits.length - willPushCount;
-  refs.publishSummary.textContent = `${willPushCount} commit${willPushCount === 1 ? '' : 's'} to publish${heldBack ? ` · ${heldBack} staying local for now` : ''}`;
-  $('#confirmPublish').disabled = !willPushCount;
+  const willPushCount = limited ? outgoingCount : uptoIndex + 1;
+  const heldBack = limited ? 0 : commits.length - willPushCount;
+  const mode = document.querySelector('[name="publishCommitMode"]:checked')?.value || 'all';
+  refs.publishSummary.textContent = mode === 'all'
+    ? (!commits.length && Number(state.publish?.ahead) > 0 ? `Update ${state.publish.remote_branch} to include ${state.publish.ahead} existing commit${state.publish.ahead === 1 ? '' : 's'}` : `${willPushCount} commit${willPushCount === 1 ? '' : 's'} to publish${heldBack ? ` · ${heldBack} staying local for now` : ''}`)
+    : `${state.publish?.ahead || commits.length} local commits → 1 new commit${mode === 'combine_only' ? ' (stays local)' : ' to publish'}`;
+  $('#confirmPublish').disabled = mode === 'all' ? !willPushCount && !(Number(state.publish?.ahead) > 0 && !state.publishUpto) : !$('#publishCombinedMessage').value.trim();
   updatePublishModeUi();
 }
 
 function updatePublishModeUi() {
   const fast = refs.publishFastMode?.checked;
   const button = $('#confirmPublish');
-  if (button) button.textContent = fast ? 'Fast publish' : 'Publish safely';
+  const mode = document.querySelector('[name="publishCommitMode"]:checked')?.value || 'all';
+  if (button) button.textContent = mode === 'combine_only' ? 'Combine only' : mode === 'combine_push' ? 'Combine & push' : fast ? 'Fast publish' : 'Publish safely';
+  $('#publishSafetyMode').hidden = mode === 'combine_only';
+  $('#publishCombinedMessageLabel').hidden = mode === 'all';
+  $('#publishCombineNotice').textContent = mode === 'all' ? '' : 'All local-only commits are combined; partial publish selections do not apply. A recovery reference is created before the branch moves.';
+  const incompleteList = Number(state.publish?.outgoing_count) > (state.publish?.commits?.length || 0);
+  refs.publishCommits.querySelectorAll('.publish-check').forEach(box => { box.disabled = mode !== 'all' || incompleteList; });
 }
 
 const refreshPublishGuard = createRequestGuard();
 async function refreshPublish() {
   const branch = refs.publishBranch.value, remote = refs.publishRemote.value;
-  state.publishUpto = null;
-  if (!branch || !remote) { refs.publishCommits.innerHTML = '<div class="publish-empty">Configure a remote before publishing.</div>'; refs.publishSummary.textContent = 'Nothing to publish'; $('#confirmPublish').disabled = true; return; }
   const stillCurrent = refreshPublishGuard();
+  state.publish = null;
+  state.publishUpto = null;
+  publishSubmoduleRisksHtml = '';
+  $('#confirmPublish').disabled = true;
+  $('#publishCommitMode').hidden = true;
+  document.querySelector('[name="publishCommitMode"][value="all"]').checked = true;
+  $('#publishCombinedMessage').value = '';
+  if (!branch || !remote) { refs.publishCommits.innerHTML = '<div class="publish-empty">Configure a remote before publishing.</div>'; refs.publishSummary.textContent = 'Nothing to publish'; $('#confirmPublish').disabled = true; return; }
   refs.publishDestination.textContent = `${branch} → ${remote}/${branch}`; refs.publishCommits.innerHTML = '<div class="loading-row"><i class="spinner"></i>Checking server state…</div>';
-  const [publish, risks] = invoke
-    ? await Promise.all([
-        invoke('publish_status', { repositoryPath: state.repository.path, branch, remote }),
-        invoke('submodule_publish_risks', { repositoryPath: state.repository.path, branch, remote, uptoCommit: '' }).catch(() => []),
-      ])
-    : [{ branch, remote, commits: previewData.commits.slice(0, 2) }, []];
+  refs.publishSummary.textContent = 'Checking…';
+  let publish;
+  let risksPromise = Promise.resolve([]);
+  try {
+    if (invoke) {
+      // The safety preview can take much longer than reading the local
+      // commit list. Do not hold the Push dialog hostage to it: Safe publish
+      // repeats the authoritative check in the backend before the push.
+      risksPromise = invoke('submodule_publish_risks', { repositoryPath: state.repository.path, branch, remote, uptoCommit: '' }).catch(() => []);
+      publish = await invoke('publish_status', { repositoryPath: state.repository.path, branch, remote });
+    } else {
+      publish = { branch, remote, commits: previewData.commits.slice(0, 2) };
+    }
+  } catch (error) {
+    if (stillCurrent() && refs.publishBranch.value === branch && refs.publishRemote.value === remote) {
+      refs.publishCommits.innerHTML = `<div class="publish-empty">Could not check ${esc(remote)}/${esc(branch)}: ${esc(String(error))}</div>`;
+      refs.publishSummary.textContent = 'Publish unavailable — retry or change selection';
+      status(`Publish preview failed: ${error}`, 'error');
+    }
+    return;
+  }
   if (!stillCurrent() || refs.publishBranch.value !== branch || refs.publishRemote.value !== remote) return; // repository changed, or the dialog's own selection moved on
   state.publish = publish;
-  publishSubmoduleRisksHtml = submodulePublishRisksHtml(risks);
+  const combineEligible = publish.remote_branch_exists && Number(publish.ahead) >= 2 && Number(publish.behind) === 0
+    && state.repository.current_branch === branch && !state.repository.head_detached;
+  $('#publishCommitMode').hidden = !combineEligible;
+  if (!combineEligible) document.querySelector('[name="publishCommitMode"][value="all"]').checked = true;
+  if (combineEligible && !$('#publishCombinedMessage').value.trim()) $('#publishCombinedMessage').value = publish.commits.at(-1)?.subject || `Combine ${publish.ahead} local commits`;
   const comparison = publishAheadBehindText(publish);
   refs.publishDestination.textContent = `${branch} → ${remote}/${branch}${comparison ? ` · ${comparison}` : ''}`;
   renderPublishCommits();
-  refs.publishBadge.textContent = state.publish.commits.length;
-  refs.publishSubtitle.textContent = state.publish.commits.length
-    ? `${state.publish.commits.length} local commit${state.publish.commits.length === 1 ? '' : 's'} to publish · ${comparison}`
-    : `Everything is on the server · ${comparison}`;
+  const outgoingCount = Number(state.publish.outgoing_count) || state.publish.commits.length;
+  refs.publishBadge.textContent = Math.max(outgoingCount, Number(state.publish.ahead) || 0);
+  refs.publishSubtitle.textContent = outgoingCount
+    ? `${outgoingCount} local commit${outgoingCount === 1 ? '' : 's'} to publish · ${comparison}`
+    : Number(state.publish.ahead) > 0 ? `Branch update needed · ${comparison}` : `Everything is on the server · ${comparison}`;
   updatePublishSummary();
+  risksPromise.then(risks => {
+    if (!stillCurrent() || !refs.publishDialog.open || state.publish !== publish || refs.publishBranch.value !== branch || refs.publishRemote.value !== remote) return;
+    publishSubmoduleRisksHtml = submodulePublishRisksHtml(risks);
+    renderPublishCommits();
+    updatePublishModeUi();
+  });
 }
 
 // Submodule-publish-safety report, point 3: Safe publish runs a backend
@@ -6109,10 +6247,16 @@ async function refreshPublish() {
 // to check) is override-eligible, marked with a fixed prefix this function
 // looks for and strips before showing anything.
 const UNPUSHED_SUBMODULE_OVERRIDABLE_PREFIX = 'UNPUSHED_SUBMODULE_OVERRIDABLE::';
-async function confirmPublish(event, overrideUnpushedSubmodules = false) {
-  event.preventDefault(); if (!state.publish?.commits.length) return;
+async function confirmPublish(event, overrideUnpushedSubmodules = false, alreadyCombined = null) {
+  event.preventDefault(); if (!state.publish) return;
+  const commitMode = document.querySelector('[name="publishCommitMode"]:checked')?.value || 'all';
+  const combining = commitMode !== 'all';
+  if (combining && !alreadyCombined && !overrideUnpushedSubmodules) {
+    const proceed = await customConfirm(`Combine ${state.publish.ahead} local-only commits on ${state.publish.branch} into one new commit?\n\nTheir final committed files are preserved, but their commit IDs change. A recovery reference to the original tip will be kept. ${commitMode === 'combine_only' ? 'Nothing will be pushed.' : 'The new commit will then be pushed.'}`, { title: commitMode === 'combine_only' ? 'Combine local commits' : 'Combine and push', danger: true, okLabel: commitMode === 'combine_only' ? 'Combine only' : 'Combine & push' });
+    if (!proceed) return;
+  }
   const skipSubmoduleSafety = !!refs.publishFastMode?.checked;
-  if (skipSubmoduleSafety && !overrideUnpushedSubmodules) {
+  if (commitMode !== 'combine_only' && skipSubmoduleSafety && !overrideUnpushedSubmodules) {
     const proceed = await customConfirm(
       'Fast publish skips the submodule safety check. If a parent commit references a submodule commit that exists only on your machine, another clone may fail to restore the project.\n\nUse this only when you already know the referenced submodule commits are pushed, or when this publish does not change submodule pointers.',
       { title: 'Fast publish without submodule safety', danger: true, okLabel: 'Fast publish' }
@@ -6120,23 +6264,36 @@ async function confirmPublish(event, overrideUnpushedSubmodules = false) {
     if (!proceed) return;
   }
   const operation = $('#publishOperationStatus'); operation.textContent = `${skipSubmoduleSafety ? 'Fast publishing' : 'Publishing'} ${state.publish.branch}…`; operation.className = 'submodule-operation-status busy';
+  let combined = alreadyCombined;
   try {
     $('#confirmPublish').disabled = true; status(`${skipSubmoduleSafety ? 'Fast publishing' : 'Publishing'} ${state.publish.branch}…`, 'busy');
-    await invoke('publish_branch', { repositoryPath: state.repository.path, branch: state.publish.branch, remote: state.publish.remote, username: $('#publishUsername').value.trim(), accessToken: $('#publishToken').value, uptoCommit: state.publishUpto || '', overrideUnpushedSubmodules, skipSubmoduleSafety });
+    if (combining && !combined) {
+      combined = await invoke('combine_local_commits', { repositoryPath: state.repository.path, branch: state.publish.branch, remote: state.publish.remote, expectedTip: state.publish.local_tip, message: $('#publishCombinedMessage').value.trim(), username: $('#publishUsername').value.trim(), accessToken: $('#publishToken').value });
+      if (commitMode === 'combine_only') {
+        $('#publishToken').value = ''; refs.publishDialog.close(); await loadRepository(state.repository.path, { keepPath: true });
+        const message = `Combined ${combined.count} local commits into ${combined.revision.slice(0, 8)}. Nothing was pushed. Original commits: ${combined.backup_ref}`;
+        status(message); showOperationToast(message, 'success'); return;
+      }
+    }
+    await invoke('publish_branch', { repositoryPath: state.repository.path, branch: state.publish.branch, remote: state.publish.remote, username: $('#publishUsername').value.trim(), accessToken: $('#publishToken').value, uptoCommit: combined ? '' : state.publishUpto || '', overrideUnpushedSubmodules, skipSubmoduleSafety });
     $('#publishToken').value = ''; refs.publishDialog.close(); await loadRepository(state.repository.path, { keepPath: true });
-    const msg = state.publishUpto ? `Published part of ${state.publish.branch} to ${state.publish.remote} (up to your chosen commit)${skipSubmoduleSafety ? ' — fast publish' : ''}.` : `Published ${state.publish.branch} to ${state.publish.remote}${skipSubmoduleSafety ? ' (fast publish)' : ''}`;
+    const msg = combined ? `Combined ${combined.count} commits and published ${combined.revision.slice(0, 8)}. Original commits: ${combined.backup_ref}` : state.publishUpto ? `Published part of ${state.publish.branch} to ${state.publish.remote} (up to your chosen commit)${skipSubmoduleSafety ? ' — fast publish' : ''}.` : `Published ${state.publish.branch} to ${state.publish.remote}${skipSubmoduleSafety ? ' (fast publish)' : ''}`;
     status(msg); showOperationToast(msg);
   } catch (error) {
-    const message = String(error);
-    if (message.startsWith(UNPUSHED_SUBMODULE_OVERRIDABLE_PREFIX)) {
-      const detail = message.slice(UNPUSHED_SUBMODULE_OVERRIDABLE_PREFIX.length);
+    const rawMessage = String(error);
+    const message = combined ? `Commits were combined locally at ${combined.revision.slice(0, 8)}, but push did not finish. Original history is saved at ${combined.backup_ref}. ${rawMessage}` : rawMessage;
+    if (rawMessage.startsWith(UNPUSHED_SUBMODULE_OVERRIDABLE_PREFIX)) {
+      const detail = rawMessage.slice(UNPUSHED_SUBMODULE_OVERRIDABLE_PREFIX.length);
       $('#confirmPublish').disabled = false;
       const proceed = await customConfirm(`${detail}\n\nPublish anyway?`, { title: 'Local-only submodule commit', danger: true, okLabel: 'Publish anyway' });
-      if (proceed) return confirmPublish(event, true);
-      operation.textContent = 'Publish cancelled'; operation.className = 'submodule-operation-status'; status('Publish cancelled');
+      if (proceed) return confirmPublish(event, true, combined);
+      const cancelled = combined ? `Push cancelled. ${combined.count} commits remain combined locally at ${combined.revision.slice(0, 8)}; original history: ${combined.backup_ref}` : 'Publish cancelled';
+      operation.textContent = cancelled; operation.className = 'submodule-operation-status'; status(cancelled);
+      if (combined) await refreshPublish().catch(() => {});
       return;
     }
     operation.textContent = message; operation.className = 'submodule-operation-status error'; status(message, 'error'); $('#confirmPublish').disabled = false;
+    if (combined) await refreshPublish().catch(() => {});
   }
 }
 
@@ -6718,8 +6875,13 @@ async function syncCurrent(action, button = null) {
   }
   finally { finishButton(); }
 }
-$('#pullCurrent').addEventListener('click', event => syncCurrent('pull', event.currentTarget)); $('#pushCurrent').addEventListener('click', event => syncCurrent('push', event.currentTarget));
+$('#pullCurrent').addEventListener('click', event => syncCurrent('pull', event.currentTarget)); $('#pushCurrent').addEventListener('click', () => openPublish().catch(error => status(String(error), 'error')));
 refs.publishBranch.addEventListener('change', refreshPublish); refs.publishRemote.addEventListener('change', refreshPublish); refs.publishSafeMode.addEventListener('change', updatePublishModeUi); refs.publishFastMode.addEventListener('change', updatePublishModeUi); $('#confirmPublish').addEventListener('click', confirmPublish);
+document.querySelectorAll('[name="publishCommitMode"]').forEach(input => input.addEventListener('change', () => {
+  if (input.checked && input.value !== 'all') { state.publishUpto = null; renderPublishCommits(); }
+  updatePublishSummary();
+}));
+$('#publishCombinedMessage').addEventListener('input', updatePublishSummary);
 [['#compareRestoreRemote','remote'],['#compareRestoreHead','head'],['#compareStage','stage'],['#compareUnstage','unstage']].forEach(([selector, action]) => $(selector)?.addEventListener('click', event => { event.preventDefault(); updateRecoveryHelp(action); applyFileRecovery(action).catch(error => handleError(error)); }));
 refs.previousCompareDifference?.addEventListener('click', () => goToCompareDifference(-1));
 refs.nextCompareDifference?.addEventListener('click', () => goToCompareDifference(1));
@@ -6961,7 +7123,7 @@ $('#submoduleMenuNewBranch').addEventListener('click', () => {
   if (versionFilter === 'tag') openCreateSubmoduleTagDialog(entry); else createSubmoduleBranch(entry);
 });
 document.querySelectorAll('[data-version-filter]').forEach(button => button.addEventListener('click', () => {
-  versionFilter = button.dataset.versionFilter; document.querySelectorAll('[data-version-filter]').forEach(item => item.classList.toggle('active', item === button)); renderSubmoduleVersions();
+  versionFilter = button.dataset.versionFilter; submoduleCrossSelected = null; document.querySelectorAll('[data-version-filter]').forEach(item => item.classList.toggle('active', item === button)); renderSubmoduleVersions();
 }));
 refs.submoduleVersionSearch.addEventListener('input', renderSubmoduleVersions);
 refs.submoduleOpenGraph.addEventListener('click', () => { if (submoduleMenuEntry) { closeSubmoduleMenu(); openSubmoduleGraph(submoduleMenuEntry); } });

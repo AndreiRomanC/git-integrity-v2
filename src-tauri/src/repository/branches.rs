@@ -186,6 +186,15 @@ pub async fn restore_exact_checkpoint(repository_path: String, commit_id: String
 }
 
 pub(super) fn restore_exact_checkpoint_inner(repository_path: String, commit_id: String) -> Result<(), String> {
+    restore_exact_checkpoint_inner_with_branch(repository_path, commit_id, None)
+}
+
+#[tauri::command]
+pub async fn restore_exact_checkpoint_branch(repository_path: String, commit_id: String, branch: String) -> Result<(), String> {
+    off_main_thread(move || restore_exact_checkpoint_inner_with_branch(repository_path, commit_id, Some(branch))).await
+}
+
+pub(super) fn restore_exact_checkpoint_inner_with_branch(repository_path: String, commit_id: String, branch: Option<String>) -> Result<(), String> {
     validate_path(&repository_path)?;
     let trimmed = commit_id.trim();
     if trimmed.is_empty() { return Err("Select a commit/checkpoint to restore".into()); }
@@ -200,6 +209,23 @@ pub(super) fn restore_exact_checkpoint_inner(repository_path: String, commit_id:
         .map_err(|error| format!("Cannot resolve commit \"{commit_id}\": {}", error.message()))?;
     let commit = object.peel_to_commit().map_err(|_| format!("\"{commit_id}\" is not a commit"))?;
     let oid = commit.id().to_string();
+    let branch = branch.map(|name| name.trim().to_string());
+    if let Some(name) = branch.as_deref() {
+        if name.is_empty() { return Err("Choose a local branch".into()); }
+        let branch_oid = repo.find_branch(name, BranchType::Local)
+            .map_err(|_| format!("Local branch {name} no longer exists"))?
+            .get().target().ok_or("The selected branch has no commit")?;
+        if branch_oid != commit.id() { return Err(format!("Branch {name} no longer points to checkpoint {oid}. Refresh the graph before restoring.")); }
+        let current_worktree = repo.workdir().and_then(|path| fs::canonicalize(path).ok());
+        let occupied_elsewhere = git(&repository_path, &["worktree", "list", "--porcelain"])?
+            .split("\n\n")
+            .any(|record| {
+                let worktree = record.lines().find_map(|line| line.strip_prefix("worktree "));
+                let checked_out = record.lines().any(|line| line == format!("branch refs/heads/{name}"));
+                checked_out && worktree.is_some_and(|path| fs::canonicalize(path).ok() != current_worktree)
+            });
+        if occupied_elsewhere { return Err(format!("Branch {name} is checked out in another worktree. No files were cleaned.")); }
+    }
     drop(commit);
     drop(object);
     drop(repo);
@@ -220,8 +246,13 @@ pub(super) fn restore_exact_checkpoint_inner(repository_path: String, commit_id:
     let _ = restore_checkpoint_optional_step(&repository_path, "deinit current submodules", &["submodule", "deinit", "--all", "--force"]);
     restore_checkpoint_step(&repository_path, "pre-clean parent leftovers", &["clean", "-fd"])
         .map_err(|detail| format!("Could not prepare workspace for checkpoint {oid}: {detail}"))?;
-    restore_checkpoint_step(&repository_path, "checkout detached checkpoint", &["checkout", "--detach", "--force", &oid])
-        .map_err(|detail| format!("Could not restore checkpoint {oid}: {detail}"))?;
+    if let Some(name) = branch.as_deref() {
+        restore_checkpoint_step(&repository_path, "checkout branch checkpoint", &["checkout", "--force", name])
+            .map_err(|detail| format!("Could not restore branch {name} at checkpoint {oid}: {detail}"))?;
+    } else {
+        restore_checkpoint_step(&repository_path, "checkout detached checkpoint", &["checkout", "--detach", "--force", &oid])
+            .map_err(|detail| format!("Could not restore checkpoint {oid}: {detail}"))?;
+    }
     let _ = restore_checkpoint_optional_step(&repository_path, "sync submodule urls", &["submodule", "sync", "--recursive"]);
     restore_checkpoint_step(&repository_path, "post-checkout clean parent leftovers", &["clean", "-fd"])
         .map_err(|detail| format!("Checkpoint restored, but parent clean failed: {detail}"))?;

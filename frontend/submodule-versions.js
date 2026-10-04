@@ -42,10 +42,11 @@ function groupSubmoduleBranchVersions(versions) {
       same_name_remote_revision: sameNameRemote.revision,
     };
   });
+  const remoteByName = new Map(remote.map(version => [version.name, version]));
   const representedRemoteNames = new Set(groupedLocal.flatMap(version => [
     version.upstream,
     version.same_name_remote,
-  ].filter(Boolean)));
+  ].filter(name => name && remoteByName.get(name)?.revision === version.revision)));
   const remoteOnly = remote.filter(version => !representedRemoteNames.has(version.name));
   return { local: groupedLocal, remoteOnly };
 }
@@ -161,6 +162,22 @@ function matchesSubmoduleVersion(item = {}, query = '') {
     .filter(Boolean).join(' ').toLowerCase().includes(needle);
 }
 
+function relatedSubmoduleVersionRefs(item, versions = []) {
+  const revision = String(item?.revision || '');
+  if (!revision) return [];
+  if (item.kind === 'tag') {
+    const local = versions.filter(other => other.kind === 'branch' && other.revision === revision);
+    return (local.length ? local : versions.filter(other => other.kind === 'remote' && other.revision === revision))
+      .map(other => ({ kind: other.kind, name: other.name }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+  }
+  if (['branch', 'remote', 'commit'].includes(item.kind)) return versions
+    .filter(other => other.kind === 'tag' && other.revision === revision)
+    .map(other => ({ kind: 'tag', name: other.name }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+  return [];
+}
+
 function submoduleVersionRowHtml(item) {
   const esc = escapeSubmoduleVersionHtml;
   const kindLabel = { branch: 'BRANCH', remote: 'REMOTE BRANCH', tag: 'TAG', commit: 'COMMIT (detached)' };
@@ -195,8 +212,12 @@ function submoduleVersionRowHtml(item) {
     ? `<span class="version-attached-branch">${commitBranches.length ? `contained in ⑂ ${esc(commitBranches.slice(0, 2).join(', '))}${commitBranches.length > 2 ? ` +${commitBranches.length - 2}` : ''}` : 'no known branch contains this commit'}</span>`
     : '';
   const rowContext = item.kind === 'tag'
-    ? `<span class="version-attached-branch">${item.attached_branch ? `on ⑂ ${esc(item.attached_branch)}` : 'no branch here (detached)'}</span>`
+    ? ''
     : item.kind === 'commit' ? commitBranchContext : upstreamState;
+  const related = Array.isArray(item.related_refs) ? item.related_refs : [];
+  const relatedButton = ref => `<button type="button" class="version-related-link" data-related-version data-related-kind="${esc(ref.kind)}" data-related-name="${esc(ref.name)}" title="Show ${esc(ref.name)} in the ${ref.kind === 'tag' ? 'Tags' : 'Branches'} tab">${ref.kind === 'tag' ? '◆' : '⑂'} <span>${esc(ref.name)}</span></button>`;
+  const relatedHtml = related.length === 1 ? relatedButton(related[0]) : related.length > 1
+    ? `<details class="version-related-list"><summary>${item.kind === 'tag' ? 'Branches' : 'Tags'} · ${related.length}</summary><div>${related.map(relatedButton).join('')}</div></details>` : '';
   // Report: "matches upstream" next to a destructive "Discard local work…"
   // button reads as a contradiction — nothing here said *why* the button was
   // still offered. It's this: canResetToUpstream below also fires on a
@@ -230,10 +251,10 @@ function submoduleVersionRowHtml(item) {
     ${item.kind === 'branch' && item.checkout_detached ? '<span class="version-inactive-label">INACTIVE</span>' : ''}
     ${item.current ? '<span class="current-label">CURRENT</span>' : `<button type="button" class="version-checkout" data-switch-version>Checkout</button>`}
   </span>`;
-  return `<div class="version-row version-kind-${esc(item.kind)} ${item.name === 'origin/main' ? 'primary-remote' : ''} ${item.current ? 'current' : ''}" data-revision="${esc(revision)}" data-version-kind="${esc(item.kind)}" data-name="${esc(item.name)}">
+  return `<div class="version-row version-kind-${esc(item.kind)} ${item.name === 'origin/main' ? 'primary-remote' : ''} ${item.current ? 'current' : ''} ${item.cross_selected ? 'version-cross-selected' : ''}" data-revision="${esc(revision)}" data-version-kind="${esc(item.kind)}" data-name="${esc(item.name)}">
     <span class="version-symbol">${symbol[item.kind] || '⑂'}</span>
     <span class="version-sha"><code>${esc(revision.slice(0, 8))}</code><span class="version-copy-sha" role="button" tabindex="0" title="Copy full SHA" data-copy-sha="${esc(revision)}">⧉</span></span>
-    <span class="version-name">${esc(item.name)}<b class="version-kind-badge">${esc(kindLabel[item.kind] || item.kind)}</b>${rowContext}${dirtyNote}</span>
+    <span class="version-name"><span class="version-ref-name" title="${esc(item.name)}">${esc(item.name)}</span><b class="version-kind-badge">${esc(kindLabel[item.kind] || item.kind)}</b>${rowContext}${relatedHtml}${dirtyNote}</span>
     <span class="version-copy"><span class="version-subject">${esc(item.subject)}</span><span class="version-meta">${esc(item.author)} · ${esc(item.date)}</span></span>
     ${actions}
   </div>`;
@@ -258,5 +279,5 @@ function submodulePushDialogState(preview) {
 }
 
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { groupSubmoduleBranchVersions, submoduleCurrentPresentation, submoduleContainingBranchCandidates, submoduleCurrentContextHtml, matchesSubmoduleVersion, submoduleVersionRowHtml, submodulePushDialogState };
+  module.exports = { groupSubmoduleBranchVersions, submoduleCurrentPresentation, submoduleContainingBranchCandidates, submoduleCurrentContextHtml, matchesSubmoduleVersion, relatedSubmoduleVersionRefs, submoduleVersionRowHtml, submodulePushDialogState };
 }
