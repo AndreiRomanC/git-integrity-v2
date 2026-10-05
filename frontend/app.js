@@ -315,7 +315,11 @@ function commitSubjectHtml(subject = '') {
   parts.push(esc(subject.slice(cursor))); return parts.join('');
 }
 function status(message, kind = '') {
-  refs.statusText.textContent = message; refs.statusDot.className = `status-dot ${kind}`;
+  const fullMessage = String(message ?? '');
+  const compactMessage = fullMessage.replace(/\s+/g, ' ').trim();
+  refs.statusText.textContent = compactMessage;
+  refs.statusText.title = fullMessage !== compactMessage || compactMessage.length > 180 ? fullMessage : '';
+  refs.statusDot.className = `status-dot ${kind}`;
   // 'busy' means something is still in flight — the command that will
   // eventually explain it hasn't been recorded yet, so there is nothing
   // new to show until whatever comes after (success/error/plain) calls

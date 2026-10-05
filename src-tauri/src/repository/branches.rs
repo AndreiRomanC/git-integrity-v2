@@ -237,15 +237,21 @@ pub(super) fn restore_exact_checkpoint_inner_with_branch(repository_path: String
     // the selected parent commit. Do not use -x: ignored build artifacts stay
     // ignored instead of being deleted unexpectedly.
     //
+    // Clean ordinary parent leftovers before deinitializing anything. If
+    // Windows still refuses a path, the operation now stops while HEAD and
+    // the current submodule worktrees are still intact instead of leaving a
+    // partially deinitialized workspace behind.
+    restore_checkpoint_step(&repository_path, "pre-clean parent leftovers", &["clean", "-fd"])
+        .map_err(|detail| format!("Could not prepare workspace for checkpoint {oid}: {detail}"))?;
     // Important subtlety: jumping between checkpoints with different
     // submodule sets can leave old submodule worktrees behind unless the
     // currently-registered submodules are deinitialized first. A plain
     // checkout + submodule update only moves modules that still exist in the
     // target commit; it does not reliably remove modules that existed only in
-    // the previous checkpoint.
-    let _ = restore_checkpoint_optional_step(&repository_path, "deinit current submodules", &["submodule", "deinit", "--all", "--force"]);
-    restore_checkpoint_step(&repository_path, "pre-clean parent leftovers", &["clean", "-fd"])
-        .map_err(|detail| format!("Could not prepare workspace for checkpoint {oid}: {detail}"))?;
+    // the previous checkpoint. This step is required: ignoring a partial
+    // deinit used to let the restore continue into a mixed workspace.
+    restore_checkpoint_step(&repository_path, "deinit current submodules", &["submodule", "deinit", "--all", "--force"])
+        .map_err(|detail| format!("Could not deinitialize the current submodules before restoring checkpoint {oid}. HEAD was not changed, but the workspace may need Submodule update --init --recursive. Git said: {detail}"))?;
     if let Some(name) = branch.as_deref() {
         restore_checkpoint_step(&repository_path, "checkout branch checkpoint", &["checkout", "--force", name])
             .map_err(|detail| format!("Could not restore branch {name} at checkpoint {oid}: {detail}"))?;
@@ -287,21 +293,21 @@ pub(super) fn restore_exact_checkpoint_inner_with_branch(repository_path: String
 
 fn restore_checkpoint_step(repository_path: &str, label: &str, args: &[&str]) -> Result<String, String> {
     let started = Instant::now();
-    let result = git(repository_path, args);
+    let result = git(repository_path, args).map_err(|detail| restore_checkpoint_failure_detail(&detail));
     perf_log(&format!("restore_exact_checkpoint: {label} {}", if result.is_ok() { "ok" } else { "ERROR" }), started.elapsed());
     result
 }
 
 fn restore_checkpoint_step_with_timeout(repository_path: &str, label: &str, args: &[&str], timeout: Duration, timeout_label: &str) -> Result<String, String> {
     let started = Instant::now();
-    let result = git_with_timeout(repository_path, args, timeout, timeout_label);
+    let result = git_with_timeout(repository_path, args, timeout, timeout_label).map_err(|detail| restore_checkpoint_failure_detail(&detail));
     perf_log(&format!("restore_exact_checkpoint: {label} {}", if result.is_ok() { "ok" } else { "ERROR" }), started.elapsed());
     result
 }
 
 fn restore_checkpoint_optional_step(repository_path: &str, label: &str, args: &[&str]) -> Result<String, String> {
     let started = Instant::now();
-    let result = git(repository_path, args);
+    let result = git(repository_path, args).map_err(|detail| restore_checkpoint_failure_detail(&detail));
     perf_log(&format!("restore_exact_checkpoint: {label} {}", if result.is_ok() { "ok" } else { "ignored ERROR" }), started.elapsed());
     result
 }
@@ -333,6 +339,22 @@ fn restore_checkpoint_bad_submodule_lines(output: &str) -> Vec<String> {
 
 fn restore_checkpoint_nonempty_lines(output: &str) -> Vec<String> {
     output.lines().map(str::trim_end).filter(|line| !line.is_empty()).map(str::to_string).collect()
+}
+
+fn restore_checkpoint_failure_detail(detail: &str) -> String {
+    let lines = restore_checkpoint_nonempty_lines(detail);
+    let long_path_lines = lines.iter().filter(|line| line.to_ascii_lowercase().contains("filename too long")).collect::<Vec<_>>();
+    if !long_path_lines.is_empty() {
+        let mut examples = long_path_lines.iter().filter_map(|line| {
+            line.split_once("failed to remove ").map(|(_, tail)| {
+                tail.split_once(": Filename too long").map(|(path, _)| path).unwrap_or(tail).trim_matches(['\'', '"']).to_string()
+            })
+        }).filter(|path| !path.is_empty()).take(3).collect::<Vec<_>>();
+        examples.dedup();
+        let example = if examples.is_empty() { String::new() } else { format!(" First affected path{}: {}.", if examples.len() == 1 { "" } else { "s" }, examples.join("; ")) };
+        return format!("Windows refused {} path{} because the filename was too long, even though this operation enabled Git long-path support.{} The clean checkout is incomplete.", long_path_lines.len(), if long_path_lines.len() == 1 { "" } else { "s" }, example);
+    }
+    restore_checkpoint_summarize_lines(&lines)
 }
 
 fn restore_checkpoint_summarize_lines(lines: &[String]) -> String {
@@ -367,6 +389,21 @@ mod tests {
         assert!(summary.contains("file-0.txt"));
         assert!(summary.contains("and 4 more"));
         assert!(!summary.contains("file-11.txt"));
+    }
+
+    #[test]
+    fn exact_checkpoint_failure_collapses_repeated_windows_long_path_advice() {
+        let detail = concat!(
+            "warning: failed to remove 'one/very/deep/file.txt': Filename too long\n",
+            "hint: Setting `core.longPaths` may allow the deletion to succeed.\n",
+            "warning: failed to remove 'two/very/deep/file.txt': Filename too long\n",
+            "hint: Setting `core.longPaths` may allow the deletion to succeed.\n",
+        );
+        let message = restore_checkpoint_failure_detail(detail);
+        assert!(message.contains("Windows refused 2 paths"));
+        assert!(message.contains("one/very/deep/file.txt"));
+        assert!(message.contains("two/very/deep/file.txt"));
+        assert!(!message.contains("hint:"));
     }
 }
 

@@ -315,6 +315,14 @@ test('the status bar quietly shows the last real git command, and the footer ope
   assert.match(app, /function commandHistoryRowHtml\(entry\) \{[\s\S]*?class="command-history-row \$\{entry\.success \? '' : 'failed'\}"/);
 });
 
+test('large Git errors stay inside the status footer instead of covering the application', () => {
+  assert.match(app, /const compactMessage = fullMessage\.replace\(\/\\s\+\/g, ' '\)\.trim\(\)/);
+  assert.match(app, /refs\.statusText\.title = fullMessage !== compactMessage/);
+  assert.match(css, /#statusFooter \{[^}]*overflow: hidden/);
+  assert.match(css, /#statusText \{[^}]*text-overflow: ellipsis;[^}]*white-space: nowrap/);
+  assert.match(css, /\.operation-toast \{[^}]*max-height:[^}]*overflow: auto;[^}]*overflow-wrap: anywhere/);
+});
+
 test('stash and scoped commit are item-detail actions, not crowded toolbar actions', () => {
   // These actions depend on the selected file/folder/submodule. Keeping them
   // in the header made the scope unclear and pushed the toolbar outside the

@@ -1142,7 +1142,15 @@ fn git_with_timeout(path: &str, args: &[&str], timeout: Duration, timeout_label:
     // own `-c` flags need to land here, before `args` (which starts with the
     // subcommand), not after.
     configure_git_command(&mut command);
-    command.arg("-C").arg(path).arg("-c").arg("color.ui=false").args(args);
+    // Git for Windows still applies MAX_PATH handling to several worktree
+    // operations unless core.longPaths is enabled. Keep this process-local:
+    // clean/checkout/submodule update can then remove real repository paths
+    // longer than 260 characters without silently changing the user's local
+    // or global Git configuration. It is a harmless no-op on other hosts.
+    command.arg("-C").arg(path)
+        .arg("-c").arg("color.ui=false")
+        .arg("-c").arg("core.longPaths=true")
+        .args(args);
     // A spawn failure or a timeout (run_with_timeout's own Err cases) is
     // exactly the kind of event the command history most needs to explain —
     // record it as a failure here too, not only the "ran, exited non-zero"
@@ -16710,6 +16718,22 @@ mod tests {
         ] {
             assert!(!is_definitely_read_only_terminal_command(mutating_or_ambiguous), "{mutating_or_ambiguous} must trigger a refresh");
         }
+    }
+
+    #[test]
+    fn shell_git_helper_enables_long_paths_without_persisting_user_configuration() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let repo_path = std::env::temp_dir().join(format!("git-integrity-long-path-config-{suffix}"));
+        create_libgit2_repository(&repo_path, "README.md");
+        let repo_string = repo_path.to_string_lossy().into_owned();
+
+        assert_eq!(git(&repo_string, &["config", "--get", "core.longPaths"]).unwrap().trim(), "true");
+        let persisted = Command::new("git").arg("-C").arg(&repo_path)
+            .args(["config", "--local", "--get", "core.longPaths"])
+            .output().unwrap();
+        assert!(!persisted.status.success(), "the safety override must stay process-local, never rewrite repository configuration");
+
+        fs::remove_dir_all(repo_path).unwrap();
     }
 
     #[test]
