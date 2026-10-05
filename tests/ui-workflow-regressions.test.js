@@ -7,6 +7,7 @@ const root = path.resolve(__dirname, '..');
 const html = fs.readFileSync(path.join(root, 'frontend/index.html'), 'utf8');
 const app = fs.readFileSync(path.join(root, 'frontend/app.js'), 'utf8');
 const css = fs.readFileSync(path.join(root, 'frontend/styles.css'), 'utf8');
+const repository = fs.readFileSync(path.join(root, 'src-tauri/src/repository.rs'), 'utf8');
 
 test('Terminal is the first default command panel and has an explicit close button', () => {
   const terminalTab = html.indexOf('data-mode="console"');
@@ -50,6 +51,27 @@ test('GitHub module search offers an explicit GCM sign-in retry only after an au
   assert.match(app, /refs\.submoduleBrowserAuth\.hidden = !\(interactiveAuth \|\| submoduleBrowserNeedsAuthentication\(error\)\)/);
   assert.match(app, /refs\.connectSubmoduleBrowser\.addEventListener\('click', \(\) => searchSubmoduleRepositories\(true\)\)/);
   assert.match(css, /\.submodule-browser-auth\[hidden\] \{ display: none; \}/);
+});
+
+test('submodule browser keeps long repository URLs and revision names readable', () => {
+  assert.match(css, /\.submodule-repo-row \{[^}]*grid-template-areas: "identity action" "url url"/);
+  assert.match(css, /\.submodule-repo-row code \{[^}]*overflow-wrap: anywhere/);
+  assert.match(css, /\.submodule-browser-row \{[^}]*flex: 0 0 auto/);
+  assert.match(css, /\.submodule-ref-main \{[^}]*height: auto;[^}]*margin: 0/);
+  assert.match(css, /\.submodule-ref-row \.submodule-ref-title strong \{[^}]*overflow-wrap: anywhere/);
+  assert.doesNotMatch(app, /repo\.description \|\| repo\.full_name/);
+});
+
+test('dirty-only submodules cannot remain falsely staged in the parent project', () => {
+  const flush = app.match(/async function flushOneBatch\(options\) \{([\s\S]*?)\n\}\n\n\/\/ Call this before/)?.[1] || '';
+  assert.match(flush, /stageResult = await invoke\('stage_files'/);
+  assert.match(flush, /stageResult\?\.skipped_dirty_submodules \|\| \[\]/);
+  assert.match(flush, /if \(change\) change\.staged = false/);
+  assert.match(flush, /await invoke\('refresh_status', \{ repositoryPath \}\)/);
+  assert.match(flush, /commit the internal files there first/);
+  assert.match(app, /if \(!files\.length\) \{[\s\S]*?Nothing is staged[\s\S]*?return;/);
+  assert.match(app, /Submodule version staged/);
+  assert.match(app, /Submodule changed/);
 });
 
 test('Vitesco browser URLs are suggested as portable gitmodules URLs', () => {
@@ -248,7 +270,7 @@ test('a submodule row does not show a generic action next to its identically-beh
 });
 
 test('a selected submodule can be promoted to the normal full repository context', () => {
-  assert.match(app, /function openSubmoduleAsFullRepository\(entry, button = null\)/);
+  assert.match(app, /function openSubmoduleAsFullRepository\(entry, button = null, options = \{\}\)/);
   assert.match(app, /invoke\('resolve_submodule_repository', \{ repositoryPath: parentRepository\.path, relativePath: entry\.relative_path \}\)/);
   assert.match(app, /openRepositoryFast\(target\.path, \{[\s\S]*?origin:/);
   assert.match(app, /The parent gitlink was not changed/);
@@ -608,6 +630,18 @@ test('working tree drawer opens a staged-vs-HEAD or working-vs-index diff on dou
   assert.match(app, /data-change-compare-path/);
   assert.match(app, /Double-click to compare working tree with the Git index/);
   assert.match(app, /setCompareHeadLabels\(staged \? 'LAST COMMIT \(HEAD\)' : 'INDEX \/ LAST COMMIT', staged \? 'STAGED INDEX' : 'WORKING TREE'\)/);
+});
+
+test('working tree submodule rows route to a meaningful compare instead of an empty gitlink diff', () => {
+  assert.match(app, /async function openWorkingTreeChangeCompare\(change\)/);
+  assert.match(app, /normalizeRepositoryRelativePath\(change\.path\) === submodulePath/);
+  assert.match(app, /invoke\('refresh_status', \{ repositoryPath: target\.path \}\)/);
+  assert.match(app, /openSubmoduleAsFullRepository\(entry, null, \{ target, silent: true \}\)/);
+  assert.match(app, /versions\.parent_committed_revision \|\| versions\.parent_revision/);
+  assert.match(app, /openSubmoduleCompareFromEntry\(entry, \{ leftRef: before, rightRef: after, versionsData: versions \}\)/);
+  assert.match(app, /openWorkingTreeChangeCompare\(change\)\.catch/);
+  assert.match(repository, /parent_committed_revision: String/);
+  assert.match(repository, /parent_gitlink_oid\(&parent, &relative_path, false\)/);
 });
 
 test('main project merges ask before updating submodule working trees', () => {

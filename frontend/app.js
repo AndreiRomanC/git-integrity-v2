@@ -709,11 +709,14 @@ function openSubmoduleBrowser() {
 }
 function renderSubmoduleRepositoryResults() {
   const selected = submoduleBrowserState.selectedRepository;
-  refs.submoduleRepoResults.innerHTML = submoduleBrowserState.repositories.map(repo => `<button type="button" class="submodule-browser-row submodule-repo-row ${selected?.full_name === repo.full_name ? 'selected' : ''}" data-submodule-repo="${esc(repo.full_name)}">
-    <span class="submodule-repo-main"><strong>${esc(repo.name)}</strong><small>${esc(repo.description || repo.full_name)}${repo.default_branch ? ` · default ${esc(repo.default_branch)}` : ''}</small></span>
-    <code>${esc(repo.portable_url)}</code>
-    <span class="submodule-browser-row-action">Open refs</span>
-  </button>`).join('') || '<div class="version-loading">No repositories found.</div>';
+  refs.submoduleRepoResults.innerHTML = submoduleBrowserState.repositories.map(repo => {
+    const details = [repo.description, repo.default_branch ? `default ${repo.default_branch}` : ''].filter(Boolean).join(' · ');
+    return `<button type="button" class="submodule-browser-row submodule-repo-row ${selected?.full_name === repo.full_name ? 'selected' : ''}" data-submodule-repo="${esc(repo.full_name)}">
+      <span class="submodule-repo-main"><strong>${esc(repo.name)}</strong>${details ? `<small>${esc(details)}</small>` : ''}</span>
+      <code>${esc(repo.portable_url)}</code>
+      <span class="submodule-browser-row-action">Open refs</span>
+    </button>`;
+  }).join('') || '<div class="version-loading">No repositories found.</div>';
   refs.submoduleRepoResults.querySelectorAll('[data-submodule-repo]').forEach(button => button.addEventListener('click', () => {
     const repo = submoduleBrowserState.repositories.find(item => item.full_name === button.dataset.submoduleRepo);
     if (repo) selectSubmoduleRepository(repo);
@@ -1730,7 +1733,7 @@ async function exportSubmoduleCompareSnapshots() {
 
 async function openSubmoduleCompareFromEntry(entry, overrides = {}) {
   if (!entry || entry.kind !== 'submodule') return;
-  const { innerPath = '', presetCurrentRight = false, ...revisionOverrides } = overrides;
+  const { innerPath = '', presetCurrentRight = false, versionsData = null, ...revisionOverrides } = overrides;
   const hasExplicitLeftRef = Object.prototype.hasOwnProperty.call(revisionOverrides, 'leftRef');
   const hasExplicitRightRef = Object.prototype.hasOwnProperty.call(revisionOverrides, 'rightRef');
   state.compareMode = 'submodule';
@@ -1774,7 +1777,7 @@ async function openSubmoduleCompareFromEntry(entry, overrides = {}) {
   }
   try {
     status(`Loading revisions for ${entry.name}…`, 'busy');
-    const data = await invoke('submodule_versions', { repositoryPath: state.repository.path, relativePath: entry.relative_path });
+    const data = versionsData || await invoke('submodule_versions', { repositoryPath: state.repository.path, relativePath: entry.relative_path });
     if (!state.submoduleCompare || state.submoduleCompare.submodulePath !== entry.relative_path) return;
     state.submoduleCompare.revisionOptions = buildSubmoduleCompareOptions(data);
     if (presetCurrentRight) {
@@ -1914,6 +1917,46 @@ async function openIndexWorktreeCompare(change) {
       refs.remoteCompare.textContent = '';
     }
   }
+}
+
+// A submodule root is not an ordinary file. Its parent repository stores one
+// commit pointer, while any uncommitted files belong to the submodule's own
+// index/worktree. Route double-click to the view that can represent the real
+// difference instead of opening an empty text-file comparison for a gitlink.
+async function openWorkingTreeChangeCompare(change) {
+  if (!change?.path || !state.repository) return;
+  const submodulePath = submoduleBoundaryFor(change.path);
+  const isSubmoduleRoot = Boolean(submodulePath) && normalizeRepositoryRelativePath(change.path) === submodulePath;
+  if (!isSubmoduleRoot) return openIndexWorktreeCompare(change);
+  const entry = submoduleEntryForPath(submodulePath);
+  const parentRepository = state.repository;
+  status(`Inspecting ${entry.name}…`, 'busy');
+  const target = await invoke('resolve_submodule_repository', { repositoryPath: parentRepository.path, relativePath: submodulePath });
+  const [versions, internalChanges] = await Promise.all([
+    invoke('submodule_versions', { repositoryPath: parentRepository.path, relativePath: submodulePath }),
+    invoke('refresh_status', { repositoryPath: target.path }),
+  ]);
+  if (state.repository?.path !== parentRepository.path) return;
+  if (internalChanges.length) {
+    const opened = await openSubmoduleAsFullRepository(entry, null, { target, silent: true });
+    if (!opened) return;
+    state.changesScope = 'global'; applyDefaultCommitMessage(); renderChanges();
+    refs.changesDrawer.classList.add('open'); refreshChangesLightweight();
+    const message = `${entry.name} has uncommitted files inside it. Its own Working tree is open so you can inspect and commit those file differences; an exact-revision compare would omit them.`;
+    status(message); showOperationToast(message);
+    return;
+  }
+  const before = versions.parent_committed_revision || versions.parent_revision || '';
+  const current = versions.current_revision || '';
+  const indexed = versions.parent_revision || '';
+  const after = current && current !== before ? current : indexed;
+  if (!before || !after || before === after) {
+    const message = `${entry.name} no longer has a difference to compare. Refreshing Working tree will remove the stale row.`;
+    status(message); showOperationToast(message);
+    await refreshChangesLightweight();
+    return;
+  }
+  await openSubmoduleCompareFromEntry(entry, { leftRef: before, rightRef: after, versionsData: versions });
 }
 
 function setCompareActionStatus(message, kind = '') { const node = $('#compareActionStatus'); node.textContent = message; node.className = `compare-status-line ${kind}`.trim(); }
@@ -3165,7 +3208,7 @@ async function initializeSubmodule(entry, button = null) {
   }
 }
 
-async function openSubmoduleAsFullRepository(entry, button = null) {
+async function openSubmoduleAsFullRepository(entry, button = null, options = {}) {
   if (!state.repository || entry?.kind !== 'submodule') return;
   if (entry.submodule_initialized === false) {
     const message = `${entry.name} is not initialized yet. Initialize it first, then open it as a full repository.`;
@@ -3177,7 +3220,7 @@ async function openSubmoduleAsFullRepository(entry, button = null) {
   const finishButton = button ? beginButtonOperation(button, 'Opening…') : () => {};
   try {
     status(`Opening ${entry.name} as a full repository…`, 'busy');
-    const target = await invoke('resolve_submodule_repository', { repositoryPath: parentRepository.path, relativePath: entry.relative_path });
+    const target = options.target || await invoke('resolve_submodule_repository', { repositoryPath: parentRepository.path, relativePath: entry.relative_path });
     await openRepositoryFast(target.path, {
       origin: {
         repositoryPath: target.path,
@@ -3189,10 +3232,12 @@ async function openSubmoduleAsFullRepository(entry, button = null) {
       },
     });
     const message = `${target.name} is now open as a full repository. The parent gitlink was not changed.`;
-    status(message); showOperationToast(message, 'success');
+    if (!options.silent) { status(message); showOperationToast(message, 'success'); }
+    return true;
   } catch (error) {
     const message = handleError(error);
     showOperationToast(`Could not open submodule as repository: ${message}`, 'error');
+    return false;
   } finally {
     finishButton();
   }
@@ -6029,6 +6074,9 @@ function updateChangeBadge() {
 
 function changeDisplayState(change) {
   if (!change) return 'Modified';
+  const submodulePath = submoduleBoundaryFor(change.path);
+  const isSubmoduleRoot = Boolean(submodulePath) && normalizeRepositoryRelativePath(change.path) === submodulePath;
+  if (isSubmoduleRoot) return change.staged ? 'Submodule version staged' : 'Submodule changed';
   if (change.status === '??') return 'New file';
   if (change.status === 'A') return change.staged ? 'Staged new file' : 'New file';
   if (change.status === 'D') return change.staged ? 'Staged deletion' : 'Deleted locally';
@@ -6041,7 +6089,7 @@ function renderChanges() {
   updateChangeBadge();
   const scope = state.changesScope === 'folder' ? state.currentPath : ''; const scopedChanges = state.changes.filter(change => !scope || change.path === scope || change.path.startsWith(`${scope}/`));
   refs.drawerScopeTitle.textContent = state.changesScope === 'folder' ? `Changes in folder · /${scope}` : 'Working tree · entire repository';
-  refs.changesSummary.textContent = scopedChanges.length ? `${scopedChanges.length} file${scopedChanges.length === 1 ? '' : 's'} available for staging` : `No changes in ${scope ? `/${scope}` : 'the repository'}`;
+  refs.changesSummary.textContent = scopedChanges.length ? `${scopedChanges.length} changed item${scopedChanges.length === 1 ? '' : 's'}` : `No changes in ${scope ? `/${scope}` : 'the repository'}`;
   $('#stageAllButton').disabled = scopedChanges.length === 0;
   $('#unstageAllButton').disabled = !scopedChanges.some(change => change.staged);
   refs.changes.innerHTML = scopedChanges.map(change => `<div class="change-row-wrap diffable" data-change-compare-path="${esc(change.path)}" title="Double-click to compare working tree with the Git index"><div class="change-row"><input type="checkbox" data-change-path="${esc(change.path)}" aria-label="Stage ${esc(change.path)}" ${change.staged ? 'checked' : ''}>
@@ -6051,7 +6099,7 @@ function renderChanges() {
   refs.changes.querySelectorAll('[data-change-compare-path]').forEach(row => row.addEventListener('dblclick', event => {
     if (event.target.closest('input,button')) return;
     const change = scopedChanges.find(item => item.path === row.dataset.changeComparePath);
-    openIndexWorktreeCompare(change).catch(error => handleError(error));
+    openWorkingTreeChangeCompare(change).catch(error => handleError(error));
   }));
   refs.changes.querySelectorAll('[data-change-path]').forEach(input => {
     // Belt-and-suspenders against a real Chromium/WebView2 quirk: a checkbox
@@ -6428,8 +6476,9 @@ async function flushOneBatch(options) {
   const generation = ++pendingToggleGeneration;
   jsPerfLog(`flushOneBatch START (stage=${toStage.length}, unstage=${toUnstage.length}, generation=${generation})`, 0);
   const batchStarted = performance.now();
+  let stageResult = null;
   const run = (async () => {
-    if (toStage.length) await invoke('stage_files', { path: repositoryPath, files: toStage });
+    if (toStage.length) stageResult = await invoke('stage_files', { path: repositoryPath, files: toStage });
     if (toUnstage.length) await invoke('unstage_files', { path: repositoryPath, files: toUnstage });
   })();
   activeStagingOperation = run;
@@ -6437,6 +6486,32 @@ async function flushOneBatch(options) {
     await run;
     if (activeStagingOperation === run) activeStagingOperation = null;
     jsPerfLog(`flushOneBatch backend calls done (generation=${generation}, ${(performance.now() - batchStarted).toFixed(0)}ms)`, 0);
+    // A parent repository can stage only a submodule's commit pointer. If
+    // the submodule merely has uncommitted files inside it and HEAD has not
+    // moved, stage_files deliberately returns it as skipped. Do not leave
+    // the optimistic checkbox checked: that was the source of a misleading
+    // "Nothing to commit" after the user appeared to stage the row.
+    const skippedSubmodules = stageResult?.skipped_dirty_submodules || [];
+    if (skippedSubmodules.length && stillSameRepo()) {
+      skippedSubmodules.forEach(path => {
+        const change = state.changes.find(item => item.path === path);
+        if (change) change.staged = false;
+      });
+      renderChanges();
+      // This refresh is mandatory even when Commit requested skipReload:
+      // Commit reads state.changes immediately after this flush, so it must
+      // see Git's authoritative index rather than the optimistic click.
+      const changes = await invoke('refresh_status', { repositoryPath });
+      if (stillSameRepo()) {
+        state.changes = changes; state.statusReady = true; updateChangeBadge();
+        if (refs.changesDrawer.classList.contains('open')) renderChanges();
+        if (!options.skipReload && state.currentPath === folder) await openDirectory(folder, { force: true });
+      }
+      const names = skippedSubmodules.map(path => path.split('/').pop()).join(', ');
+      const message = `${skippedSubmodules.length === 1 ? 'This submodule' : 'These submodules'} (${names}) ${skippedSubmodules.length === 1 ? 'has' : 'have'} uncommitted files inside, but no new submodule commit to record in the parent project. Open ${skippedSubmodules.length === 1 ? 'it' : 'them'}, stage and commit the internal files there first; then stage the resulting submodule version here.`;
+      status(message, 'error'); showOperationToast(message, 'error');
+      jsPerfLog(`flushOneBatch skipped dirty submodules: ${skippedSubmodules.join(', ')}`, 0);
+    }
     // A newer batch already started (and will do its own reload) while this
     // one's backend calls were in flight — its reload covers this too.
     if (generation !== pendingToggleGeneration) { jsPerfLog(`flushOneBatch generation mismatch, skipping reload (was ${generation}, now ${pendingToggleGeneration})`, 0); return; }
@@ -6447,7 +6522,7 @@ async function flushOneBatch(options) {
     // flushPendingTogglesNow({ skipReload: true }) right before doing its
     // own commit-then-reload, so a checkbox ticked just before Commit was
     // clicked doesn't trigger two reloads back to back.
-    if (stillSameRepo() && !options.skipReload) {
+    if (stillSameRepo() && !options.skipReload && !skippedSubmodules.length) {
       refreshStatusAndFolderInBackground(repositoryPath, folder, `checkbox generation=${generation}`);
       jsPerfLog(`flushOneBatch scheduled background refresh (generation=${generation})`, 0);
     }
@@ -7296,6 +7371,11 @@ refs.commitButton.addEventListener('click', async () => {
     if (activeStagingOperation) { try { await activeStagingOperation; } catch { /* already reported by whichever button started it */ } }
     const folder = state.changesScope === 'folder' ? state.currentPath : '';
     const files = state.changes.filter(change => change.staged && (!folder || change.path === folder || change.path.startsWith(`${folder}/`))).map(change => change.path);
+    if (!files.length) {
+      const message = 'Nothing is staged. If the changed item is a submodule, open it and commit its internal files first; the parent project can record only the resulting submodule commit.';
+      status(message, 'error'); showOperationToast(message, 'error');
+      return;
+    }
     refs.commitButton.textContent = `Committing ${files.length} file${files.length === 1 ? '' : 's'}…`;
     status(refs.commitButton.textContent, 'busy');
     // Global scope (no folder filter) means `files` is already exactly

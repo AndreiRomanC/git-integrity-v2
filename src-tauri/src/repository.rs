@@ -765,6 +765,10 @@ pub struct SubmoduleVersions {
     // same response so the dialog can distinguish "restored project version"
     // from an arbitrary detached checkout without another backend request.
     parent_revision: String,
+    // The gitlink in the parent project's last commit. Unlike the index
+    // pointer above, this remains the actual "before" side after staging a
+    // new submodule version in the parent project.
+    parent_committed_revision: String,
     // Known refs whose history contains the active commit. This is context
     // for a detached checkout, never a claim that HEAD is attached to one.
     current_containing_branches: Vec<String>,
@@ -3591,11 +3595,69 @@ fn github_token_from_environment(host: &str) -> Option<String> {
     names.iter().find_map(|name| std::env::var(name).ok().map(|value| value.trim().to_string()).filter(|value| !value.is_empty()))
 }
 
-fn parse_git_credential_password(output: &[u8]) -> Option<String> {
-    String::from_utf8_lossy(output).lines().find_map(|line| {
-        let (key, value) = line.split_once('=')?;
-        (key == "password" && !value.is_empty()).then(|| value.to_string())
-    })
+#[derive(Clone)]
+struct GitHttpsCredential { username: Option<String>, password: String }
+
+fn parse_git_credential_response(output: &[u8]) -> Option<GitHttpsCredential> {
+    let mut username = None;
+    let mut password = None;
+    for line in String::from_utf8_lossy(output).lines() {
+        let Some((key, value)) = line.split_once('=') else { continue };
+        if key == "username" && !value.is_empty() { username = Some(value.to_string()); }
+        if key == "password" && !value.is_empty() { password = Some(value.to_string()); }
+    }
+    Some(GitHttpsCredential { username, password: password? })
+}
+
+// `git credential fill` only obtains a credential. A normal Git network
+// operation follows a successful request with `approve`, which tells the
+// configured helper it may persist the verified credential. Keep the secret
+// exclusively on stdin, and never include subprocess output in diagnostics.
+fn approve_git_credential(repository_path: &str, repo: &GitHubRepo, credential: &GitHttpsCredential) -> Result<(), String> {
+    use std::io::Write;
+    let Some(username) = credential.username.as_deref() else { return Err("Git credential helper returned no username".into()) };
+    let mut command = Command::new("git");
+    command.arg("-C").arg(repository_path).args(["credential", "approve"])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GCM_INTERACTIVE", "never")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(unix)] { use std::os::unix::process::CommandExt; command.process_group(0); }
+    let mut child = command.spawn().map_err(|_| "Could not start Git credential approval")?;
+    let id = child.id();
+    let Some(mut stdin) = child.stdin.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err("Could not send Git credential approval".into());
+    };
+    let request = format!("protocol=https\nhost={}\npath={}/{}.git\nusername={username}\npassword={}\n\n", repo.host, repo.owner, repo.repo, credential.password);
+    if stdin.write_all(request.as_bytes()).is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err("Could not send Git credential approval".into());
+    }
+    drop(stdin);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || { let _ = tx.send(child.wait()); });
+    match rx.recv_timeout(Duration::from_secs(10)) {
+        Ok(Ok(status)) if status.success() => Ok(()),
+        Ok(_) => Err("Git credential approval failed".into()),
+        Err(_) => {
+            #[cfg(unix)] { let _ = Command::new("kill").arg("-9").arg(format!("-{id}")).status(); }
+            #[cfg(windows)] { let _ = Command::new("taskkill").args(["/F", "/T", "/PID"]).arg(id.to_string()).status(); }
+            Err("Git credential approval timed out".into())
+        }
+    }
+}
+
+// A verified sign-in remains usable for subsequent Browse searches in this
+// process even if the user's configured helper has no persistent store. No
+// token is written to a project file or to the app's settings.
+static GITHUB_MODULE_SESSION_TOKENS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+
+fn github_module_session_tokens() -> &'static Mutex<HashMap<String, String>> {
+    GITHUB_MODULE_SESSION_TOKENS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 // Ask the configured credential helper for the HTTPS credential already used
@@ -3605,7 +3667,7 @@ fn parse_git_credential_password(output: &[u8]) -> Option<String> {
 // cannot unexpectedly open a sign-in window. The submodule browser has a
 // separate, explicitly clicked retry that permits GCM's browser UI. stdout
 // contains a secret and must never be included in an error or performance log.
-fn github_token_from_git_credential_helper(repository_path: &str, repo: &GitHubRepo, interactive: bool) -> Result<String, String> {
+fn github_token_from_git_credential_helper(repository_path: &str, repo: &GitHubRepo, interactive: bool) -> Result<GitHttpsCredential, String> {
     use std::io::Write;
 
     let mut command = Command::new("git");
@@ -3642,7 +3704,7 @@ fn github_token_from_git_credential_helper(repository_path: &str, repo: &GitHubR
     std::thread::spawn(move || { let _ = tx.send(child.wait_with_output()); });
     let timeout = if interactive { Duration::from_secs(300) } else { Duration::from_secs(5) };
     match rx.recv_timeout(timeout) {
-        Ok(Ok(output)) if output.status.success() => parse_git_credential_password(&output.stdout)
+        Ok(Ok(output)) if output.status.success() => parse_git_credential_response(&output.stdout)
             .ok_or_else(|| "The configured Git credential helper returned no HTTPS token. Check that Git Credential Manager is enabled for this host.".into()),
         Ok(Ok(output)) => Err(format!("Git credential lookup failed (exit {}). Check the Git Credential Manager sign-in window and try again.", output.status.code().map(|code| code.to_string()).unwrap_or_else(|| "unknown".into()))),
         Ok(Err(_)) => Err("Could not read the Git credential helper's response".into()),
@@ -3659,22 +3721,24 @@ struct GitHubGraphqlClient {
     http: reqwest::blocking::Client,
     endpoint: String,
     token: Option<String>,
+    credential_to_approve: Option<GitHttpsCredential>,
 }
 
 impl GitHubGraphqlClient {
     fn discover(repository_path: &str, repo: &GitHubRepo) -> Result<Self, String> {
-        Self::discover_with_auth(repository_path, repo, false)
+        Self::discover_with_auth(repository_path, repo, false, None)
     }
 
-    fn discover_with_auth(repository_path: &str, repo: &GitHubRepo, interactive_auth: bool) -> Result<Self, String> {
-        let token = if interactive_auth {
+    fn discover_with_auth(repository_path: &str, repo: &GitHubRepo, interactive_auth: bool, session_token: Option<String>) -> Result<Self, String> {
+        let (token, credential_to_approve) = if interactive_auth {
             // An explicit reconnect must bypass a possibly stale environment
             // token and use the Git credential helper's own sign-in flow.
-            Some(github_token_from_git_credential_helper(repository_path, repo, true)
-                .map_err(|detail| format!("Could not connect to {}: {detail}", repo.host))?)
+            let credential = github_token_from_git_credential_helper(repository_path, repo, true)
+                .map_err(|detail| format!("Could not connect to {}: {detail}", repo.host))?;
+            (Some(credential.password.clone()), Some(credential))
         } else {
-            github_token_from_environment(&repo.host)
-                .or_else(|| github_token_from_git_credential_helper(repository_path, repo, false).ok())
+            (session_token.or_else(|| github_token_from_environment(&repo.host))
+                .or_else(|| github_token_from_git_credential_helper(repository_path, repo, false).ok().map(|credential| credential.password)), None)
         };
         // GitHub's GraphQL API requires authentication even for public
         // repositories. Avoid several guaranteed-to-fail requests and give
@@ -3691,7 +3755,7 @@ impl GitHubGraphqlClient {
             .user_agent("Git-DrillDown/0.1")
             .build()
             .map_err(|error| format!("Could not initialize the GitHub API client: {error}"))?;
-        Ok(Self { http, endpoint: github_graphql_endpoint(&repo.host), token })
+        Ok(Self { http, endpoint: github_graphql_endpoint(&repo.host), token, credential_to_approve })
     }
 
     fn run(&self, query: &PrGhQuery) -> GhOutcome {
@@ -5607,6 +5671,7 @@ fn submodule_versions_inner(repository_path: String, relative_path: String) -> R
     let relative = safe_relative_path(&relative_path)?;
     let parent = internal_repository(&repository_path)?;
     let parent_revision = parent.index().ok().and_then(|index| index.get_path(&relative, 0)).map(|entry| entry.id.to_string()).unwrap_or_default();
+    let parent_committed_revision = parent_gitlink_oid(&parent, &relative_path, false).map(|oid| oid.to_string()).unwrap_or_default();
     let repo = internal_submodule_repository(&absolute)?;
     let current_revision = repo.head().ok().and_then(|head| head.target()).map(|id| id.to_string()).unwrap_or_default();
     // `Reference::shorthand()` returns the literal string "HEAD" for a
@@ -5688,7 +5753,7 @@ fn submodule_versions_inner(repository_path: String, relative_path: String) -> R
         }
     }
     perf_log(&format!("submodule_versions: TOTAL ({} refs/commits, {} containing branches)", versions.len(), current_containing_branches.len()), started.elapsed());
-    Ok(SubmoduleVersions { path: relative_path, current_revision, current_branch, parent_revision, current_containing_branches, history_context_branch, history_limit: HISTORY_LIMIT, versions })
+    Ok(SubmoduleVersions { path: relative_path, current_revision, current_branch, parent_revision, parent_committed_revision, current_containing_branches, history_context_branch, history_limit: HISTORY_LIMIT, versions })
 }
 
 fn submodule_revision_matches(query: &str, name: &str, kind: &str, revision: &str, subject: &str, author: &str, date: &str) -> bool {
@@ -5854,7 +5919,8 @@ fn search_github_modules_inner(repository_path: String, query: String, limit: Op
     }
     let limit = limit.unwrap_or(25).clamp(1, 50);
     let credential_repo = github_module_browser_context(&repository_path);
-    let client = GitHubGraphqlClient::discover_with_auth(&repository_path, &credential_repo, interactive_auth)?;
+    let session_token = if interactive_auth { None } else { github_module_session_tokens().lock().unwrap().get(&credential_repo.host).cloned() };
+    let client = GitHubGraphqlClient::discover_with_auth(&repository_path, &credential_repo, interactive_auth, session_token)?;
     let endpoint = "https://github.vitesco.io/api/v3/search/repositories";
     let search_query = format!("{query} org:eng");
     let mut request = client.http.get(endpoint)
@@ -5863,10 +5929,17 @@ fn search_github_modules_inner(repository_path: String, query: String, limit: Op
     if let Some(token) = &client.token { request = request.bearer_auth(token); }
     let response = request.send().map_err(|error| format!("GitHub repository search failed: {error}"))?;
     let status = response.status();
+    if status.as_u16() == 401 { github_module_session_tokens().lock().unwrap().remove(&credential_repo.host); }
     let payload = response.json::<serde_json::Value>()
         .map_err(|error| format!("GitHub repository search returned HTTP {status} with an unreadable response: {error}"))?;
     if !status.is_success() {
         return Err(format!("GitHub repository search failed with HTTP {status}: {}", github_api_error_message(&payload)));
+    }
+    if let Some(credential) = &client.credential_to_approve {
+        github_module_session_tokens().lock().unwrap().insert(credential_repo.host.clone(), credential.password.clone());
+        let approval_started = Instant::now();
+        let approved = approve_git_credential(&repository_path, &credential_repo, credential).is_ok();
+        perf_log(&format!("search_github_modules: credential_approve={}", if approved { "ok" } else { "unavailable (session-only)" }), approval_started.elapsed());
     }
     let items = payload.get("items").and_then(|value| value.as_array()).cloned().unwrap_or_default();
     let mut results = Vec::new();
@@ -10843,10 +10916,12 @@ mod tests {
     }
 
     #[test]
-    fn git_credential_parser_extracts_only_the_password_field() {
+    fn git_credential_parser_extracts_username_and_password_without_logging_them() {
         let output = b"protocol=https\nhost=github.vitesco.io\nusername=employee\npassword=secret-token\n";
-        assert_eq!(parse_git_credential_password(output).as_deref(), Some("secret-token"));
-        assert_eq!(parse_git_credential_password(b"username=employee\n"), None);
+        let credential = parse_git_credential_response(output).expect("a complete helper response should parse");
+        assert_eq!(credential.username.as_deref(), Some("employee"));
+        assert_eq!(credential.password, "secret-token");
+        assert!(parse_git_credential_response(b"username=employee\n").is_none());
     }
 
     #[test]
@@ -13278,6 +13353,8 @@ mod tests {
         run_git(&sub_path, &["switch", "main"]);
 
         let versions = submodule_versions_inner(repo_path.clone(), "vendor/dep".into()).unwrap();
+        let originally_committed = versions.parent_revision.clone();
+        assert_eq!(versions.parent_committed_revision, originally_committed, "before staging, the index and parent HEAD must expose the same gitlink");
         let feature_branch = versions.versions.iter().find(|v| v.kind == "branch" && v.name == "feature-x").expect("feature-x should be listed");
 
         switch_submodule_version_inner(repo_path.clone(), "vendor/dep".into(), feature_branch.revision.clone(), feature_branch.kind.clone(), feature_branch.name.clone()).unwrap();
@@ -13295,6 +13372,9 @@ mod tests {
         let after_stage = load_repository_inner(repo_path.clone(), Some(true)).unwrap();
         let staged_change = after_stage.changes.iter().find(|change| change.path == "vendor/dep").expect("the submodule change must still be present after staging");
         assert!(staged_change.staged, "explicit Stage must still be able to stage the moved submodule");
+        let staged_versions = submodule_versions_inner(repo_path.clone(), "vendor/dep".into()).unwrap();
+        assert_eq!(staged_versions.parent_revision, feature_branch.revision, "the parent index should expose the newly staged gitlink");
+        assert_eq!(staged_versions.parent_committed_revision, originally_committed, "the compare baseline must remain the last parent commit, not move with the staged index");
 
         // Once the user has explicitly staged the gitlink, a later Change
         // version must keep that staging intent but refresh the staged SHA.
