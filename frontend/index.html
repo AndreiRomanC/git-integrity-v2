@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Git DrillDown</title>
   <link rel="icon" type="image/png" href="assets/git-drilldown-mark.png">
-  <link rel="stylesheet" href="styles.css?v=20261003a-combine-branch-tags">
+  <link rel="stylesheet" href="styles.css?v=20261005a-gcm-reconnect">
 </head>
 <body>
   <div class="app-shell">
@@ -569,6 +569,10 @@
       <label><span>Repository search</span><input id="submoduleRepoSearch" type="text" placeholder="errm, dem, compiler…" autocomplete="off" autocapitalize="off" spellcheck="false"></label>
       <button id="runSubmoduleRepoSearch" type="button">Search repos</button>
     </div>
+    <div id="submoduleBrowserAuth" class="submodule-browser-auth" role="status" hidden>
+      <span id="submoduleBrowserAuthText">The GitHub Enterprise sign-in is not available to Git DrillDown.</span>
+      <button id="connectSubmoduleBrowser" type="button">Connect to github.vitesco.io…</button>
+    </div>
     <div class="submodule-browser-body">
       <section>
         <h3>Repositories</h3>
@@ -734,13 +738,13 @@
       <footer><button value="cancel">Cancel</button><button type="button" value="default" id="confirmNewTag" class="confirm">Create tag</button></footer>
     </form>
   </dialog>
-  <script src="console-context.js?v=20261003a-combine-branch-tags"></script>
-  <script src="graph-model.js?v=20261003a-combine-branch-tags"></script>
-  <script src="submodule-state.js?v=20261003a-combine-branch-tags"></script>
-  <script src="submodule-versions.js?v=20261003a-combine-branch-tags"></script>
-  <script src="local-diff.js?v=20261003a-combine-branch-tags"></script>
-  <script src="local-drive.js?v=20261003a-combine-branch-tags"></script>
-  <script src="pr-status.js?v=20261003a-combine-branch-tags"></script>
-  <script src="app.js?v=20261003a-combine-branch-tags"></script>
+  <script src="console-context.js?v=20261005a-gcm-reconnect"></script>
+  <script src="graph-model.js?v=20261005a-gcm-reconnect"></script>
+  <script src="submodule-state.js?v=20261005a-gcm-reconnect"></script>
+  <script src="submodule-versions.js?v=20261005a-gcm-reconnect"></script>
+  <script src="local-diff.js?v=20261005a-gcm-reconnect"></script>
+  <script src="local-drive.js?v=20261005a-gcm-reconnect"></script>
+  <script src="pr-status.js?v=20261005a-gcm-reconnect"></script>
+  <script src="app.js?v=20261005a-gcm-reconnect"></script>
 </body>
 </html>

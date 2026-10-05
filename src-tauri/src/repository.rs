@@ -3600,44 +3600,56 @@ fn parse_git_credential_password(output: &[u8]) -> Option<String> {
 
 // Ask the configured credential helper for the HTTPS credential already used
 // by Git. Git Credential Manager returns it through this standard plumbing on
-// Windows; macOS Keychain and other helpers use the same protocol. Interactive
-// prompting is disabled because a GUI subprocess has no usable terminal and
-// must never make the PR panel freeze. stdout contains a secret and therefore
-// must never be included in an error or performance log.
-fn github_token_from_git_credential_helper(repository_path: &str, repo: &GitHubRepo) -> Option<String> {
+// Windows; macOS Keychain and other helpers use the same protocol. Background
+// lookups must never prompt: PR refreshes and normal repository searches
+// cannot unexpectedly open a sign-in window. The submodule browser has a
+// separate, explicitly clicked retry that permits GCM's browser UI. stdout
+// contains a secret and must never be included in an error or performance log.
+fn github_token_from_git_credential_helper(repository_path: &str, repo: &GitHubRepo, interactive: bool) -> Result<String, String> {
     use std::io::Write;
 
     let mut command = Command::new("git");
     command.arg("-C").arg(repository_path).args(["credential", "fill"])
         .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GCM_INTERACTIVE", "Never")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    // `auto` still uses a cached credential without prompting, but may open
+    // the system browser when the user explicitly clicked Connect. Git's own
+    // terminal password prompt remains disabled in both modes.
+    command.env("GCM_INTERACTIVE", if interactive { "auto" } else { "never" });
     // Own process group (Unix) so a timeout kill below can reach the actual
     // credential helper git spawns as its child too — see
     // run_with_timeout_labeled's comment for why killing just this PID isn't
     // enough.
     #[cfg(unix)] { use std::os::unix::process::CommandExt; command.process_group(0); }
-    let mut child = command.spawn().ok()?;
+    let mut child = command.spawn().map_err(|error| format!("Could not start Git credential lookup: {error}"))?;
     let id = child.id();
     let request = format!("protocol=https\nhost={}\npath={}/{}.git\n\n", repo.host, repo.owner, repo.repo);
-    let mut stdin = child.stdin.take()?;
+    let Some(mut stdin) = child.stdin.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err("Could not send the credential request to Git".into());
+    };
     if stdin.write_all(request.as_bytes()).is_err() {
         let _ = child.kill();
-        return None;
+        let _ = child.wait();
+        return Err("Could not send the credential request to Git".into());
     }
     drop(stdin);
 
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || { let _ = tx.send(child.wait_with_output()); });
-    match rx.recv_timeout(Duration::from_secs(5)) {
-        Ok(Ok(output)) if output.status.success() => parse_git_credential_password(&output.stdout),
-        Ok(_) => None,
+    let timeout = if interactive { Duration::from_secs(300) } else { Duration::from_secs(5) };
+    match rx.recv_timeout(timeout) {
+        Ok(Ok(output)) if output.status.success() => parse_git_credential_password(&output.stdout)
+            .ok_or_else(|| "The configured Git credential helper returned no HTTPS token. Check that Git Credential Manager is enabled for this host.".into()),
+        Ok(Ok(output)) => Err(format!("Git credential lookup failed (exit {}). Check the Git Credential Manager sign-in window and try again.", output.status.code().map(|code| code.to_string()).unwrap_or_else(|| "unknown".into()))),
+        Ok(Err(_)) => Err("Could not read the Git credential helper's response".into()),
         Err(_) => {
             #[cfg(unix)] { let _ = Command::new("kill").arg("-9").arg(format!("-{id}")).status(); }
             #[cfg(windows)] { let _ = Command::new("taskkill").args(["/F", "/T", "/PID"]).arg(id.to_string()).status(); }
-            None
+            Err(if interactive { "Git Credential Manager sign-in did not finish within 5 minutes. Retry after checking the browser sign-in window." } else { "Git credential lookup did not finish within 5 seconds." }.into())
         }
     }
 }
@@ -3651,8 +3663,19 @@ struct GitHubGraphqlClient {
 
 impl GitHubGraphqlClient {
     fn discover(repository_path: &str, repo: &GitHubRepo) -> Result<Self, String> {
-        let token = github_token_from_environment(&repo.host)
-            .or_else(|| github_token_from_git_credential_helper(repository_path, repo));
+        Self::discover_with_auth(repository_path, repo, false)
+    }
+
+    fn discover_with_auth(repository_path: &str, repo: &GitHubRepo, interactive_auth: bool) -> Result<Self, String> {
+        let token = if interactive_auth {
+            // An explicit reconnect must bypass a possibly stale environment
+            // token and use the Git credential helper's own sign-in flow.
+            Some(github_token_from_git_credential_helper(repository_path, repo, true)
+                .map_err(|detail| format!("Could not connect to {}: {detail}", repo.host))?)
+        } else {
+            github_token_from_environment(&repo.host)
+                .or_else(|| github_token_from_git_credential_helper(repository_path, repo, false).ok())
+        };
         // GitHub's GraphQL API requires authentication even for public
         // repositories. Avoid several guaranteed-to-fail requests and give
         // one precise setup message instead.
@@ -5818,11 +5841,11 @@ fn github_api_error_message(payload: &serde_json::Value) -> String {
 }
 
 #[tauri::command]
-pub async fn search_github_modules(repository_path: String, query: String, limit: Option<usize>) -> Result<Vec<GitHubModuleSearchResult>, String> {
-    off_main_thread(move || search_github_modules_inner(repository_path, query, limit)).await
+pub async fn search_github_modules(repository_path: String, query: String, limit: Option<usize>, interactive_auth: Option<bool>) -> Result<Vec<GitHubModuleSearchResult>, String> {
+    off_main_thread(move || search_github_modules_inner(repository_path, query, limit, interactive_auth.unwrap_or(false))).await
 }
 
-fn search_github_modules_inner(repository_path: String, query: String, limit: Option<usize>) -> Result<Vec<GitHubModuleSearchResult>, String> {
+fn search_github_modules_inner(repository_path: String, query: String, limit: Option<usize>, interactive_auth: bool) -> Result<Vec<GitHubModuleSearchResult>, String> {
     let started = Instant::now();
     validate_path(&repository_path)?;
     let query = query.trim();
@@ -5831,7 +5854,7 @@ fn search_github_modules_inner(repository_path: String, query: String, limit: Op
     }
     let limit = limit.unwrap_or(25).clamp(1, 50);
     let credential_repo = github_module_browser_context(&repository_path);
-    let client = GitHubGraphqlClient::discover(&repository_path, &credential_repo)?;
+    let client = GitHubGraphqlClient::discover_with_auth(&repository_path, &credential_repo, interactive_auth)?;
     let endpoint = "https://github.vitesco.io/api/v3/search/repositories";
     let search_query = format!("{query} org:eng");
     let mut request = client.http.get(endpoint)

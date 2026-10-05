@@ -32,7 +32,7 @@ test('Add submodule can browse GitHub Enterprise modules without changing the ma
   assert.match(html, /id="browseSubmoduleRepository"[^>]*>Browse…<\/button>/);
   assert.match(html, /id="submoduleBrowserDialog"/);
   assert.match(html, /GITHUB ENTERPRISE · ENG/);
-  assert.match(app, /invoke\('search_github_modules', \{ repositoryPath: state\.repository\.path, query, limit: 25 \}\)/);
+  assert.match(app, /invoke\('search_github_modules', \{ repositoryPath, query, limit: 25, interactiveAuth \}\)/);
   assert.match(app, /const submoduleBrowserRefCache = new Map\(\)/);
   assert.match(app, /function filterLoadedSubmoduleRefs/);
   assert.match(app, /cachedSubmoduleRefs\(repo\)/);
@@ -41,6 +41,15 @@ test('Add submodule can browse GitHub Enterprise modules without changing the ma
   assert.match(app, /refs\.submoduleUrl\.value = repo\.portable_url/);
   assert.match(app, /initialRevision: selected\.revision \|\| null/);
   assert.match(app, /resetSubmoduleBrowseSelection\(\); if \(!refs\.submoduleName\.dataset\.edited\)/);
+});
+
+test('GitHub module search offers an explicit GCM sign-in retry only after an authentication error', () => {
+  assert.match(html, /id="submoduleBrowserAuth"[^>]*hidden/);
+  assert.match(html, /id="connectSubmoduleBrowser"[^>]*>Connect to github\.vitesco\.io…<\/button>/);
+  assert.match(app, /function submoduleBrowserNeedsAuthentication\(error\)/);
+  assert.match(app, /refs\.submoduleBrowserAuth\.hidden = !\(interactiveAuth \|\| submoduleBrowserNeedsAuthentication\(error\)\)/);
+  assert.match(app, /refs\.connectSubmoduleBrowser\.addEventListener\('click', \(\) => searchSubmoduleRepositories\(true\)\)/);
+  assert.match(css, /\.submodule-browser-auth\[hidden\] \{ display: none; \}/);
 });
 
 test('Vitesco browser URLs are suggested as portable gitmodules URLs', () => {

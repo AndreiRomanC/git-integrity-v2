@@ -401,6 +401,11 @@ button.pr-reviewer:hover { border-color: #59758e; background: #1b2b38; color: #e
 .submodule-browser-search input:focus { border-color: #58a6ff; box-shadow: 0 0 0 2px rgba(88,166,255,.12); }
 .submodule-browser-search button, .submodule-browser-dialog footer button { width: auto; height: 34px; margin: 0; border: 1px solid #4a789f; border-radius: 7px; background: #1f3a51; color: #d2eaff; font-size: 10px; font-weight: 800; white-space: nowrap; }
 .submodule-browser-search button:disabled, .submodule-browser-dialog footer button:disabled { opacity: .5; cursor: not-allowed; }
+.submodule-browser-auth { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 14px; border-bottom: 1px solid #795f38; background: #342818; color: #f2d6a8; font-size: 11px; line-height: 1.4; }
+.submodule-browser-auth[hidden] { display: none; }
+.submodule-browser-auth span { min-width: 0; }
+.submodule-browser-auth button { flex: none; width: auto; min-height: 34px; padding: 0 11px; border: 1px solid #ca9251; border-radius: 7px; background: #59381a; color: #ffe1af; font-size: 10px; font-weight: 800; cursor: pointer; }
+.submodule-browser-auth button:disabled { opacity: .6; cursor: not-allowed; }
 .submodule-browser-body { display: grid; grid-template-columns: minmax(300px, .82fr) minmax(520px, 1.18fr); min-height: min(560px, 62vh); }
 .submodule-browser-body section { min-width: 0; padding: 13px; border-right: 1px solid var(--border); }
 .submodule-browser-body section:last-child { border-right: 0; }
