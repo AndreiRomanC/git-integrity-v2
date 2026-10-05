@@ -245,7 +245,7 @@ fn stashed_paths_cache() -> &'static Mutex<HashMap<String, StashedPathsCacheEntr
 }
 
 fn invalidate_stashed_paths_cache(repository_path: &str) {
-    stashed_paths_cache().lock().unwrap().remove(repository_path);
+    stashed_paths_cache().lock().unwrap().remove(&repo_lock_key(repository_path));
 }
 
 // Explorer rows need one aggregate answer, not one Git walk per visible
@@ -253,16 +253,17 @@ fn invalidate_stashed_paths_cache(repository_path: &str) {
 // the stash OID list changes, and share the resulting path set across folder
 // navigation. This also notices stashes created or dropped outside the app.
 pub(super) fn all_stashed_paths(repository_path: &str, repo: &mut Repository) -> Result<Arc<HashSet<String>>, String> {
+    let repository_key = repo_lock_key(repository_path);
     let mut stash_oids = Vec::new();
     repo.stash_foreach(|_, _, oid| { stash_oids.push(*oid); true }).map_err(|error| error.message().to_string())?;
-    if let Some(cached) = stashed_paths_cache().lock().unwrap().get(repository_path).filter(|entry| entry.stash_oids == stash_oids).cloned() {
+    if let Some(cached) = stashed_paths_cache().lock().unwrap().get(&repository_key).filter(|entry| entry.stash_oids == stash_oids).cloned() {
         return Ok(cached.paths);
     }
 
     let mut paths = HashSet::new();
     for oid in &stash_oids { paths.extend(paths_in_stash(&repo, *oid)?); }
     let paths = Arc::new(paths);
-    stashed_paths_cache().lock().unwrap().insert(repository_path.to_string(), StashedPathsCacheEntry { stash_oids, paths: paths.clone() });
+    stashed_paths_cache().lock().unwrap().insert(repository_key, StashedPathsCacheEntry { stash_oids, paths: paths.clone() });
     Ok(paths)
 }
 

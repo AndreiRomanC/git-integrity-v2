@@ -50,7 +50,18 @@ test('GitHub module search offers an explicit GCM sign-in retry only after an au
   assert.match(app, /function submoduleBrowserNeedsAuthentication\(error\)/);
   assert.match(app, /refs\.submoduleBrowserAuth\.hidden = !\(interactiveAuth \|\| submoduleBrowserNeedsAuthentication\(error\)\)/);
   assert.match(app, /refs\.connectSubmoduleBrowser\.addEventListener\('click', \(\) => searchSubmoduleRepositories\(true\)\)/);
+  assert.match(app, /const submoduleBrowserRepositoryCache = new Map\(\)/);
+  assert.match(app, /searchSubmoduleRepositories\(false, \{ allowCache: true \}\)/);
+  assert.match(app, /recent result\. Search again to refresh/);
   assert.match(css, /\.submodule-browser-auth\[hidden\] \{ display: none; \}/);
+});
+
+test('pull request checks authenticate explicitly once and reuse the shared session', () => {
+  assert.match(app, /Check pull requests only when needed/);
+  assert.match(app, />Check pull requests<\/button>/);
+  assert.doesNotMatch(app, />Connect to GitHub<\/button>/);
+  assert.match(app, /invoke\('pr_status', \{ repositoryPath, branch: branch \|\| null, context, interactiveAuth \}\)/);
+  assert.match(app, /load\(action === 'connect'\)/);
 });
 
 test('submodule browser keeps long repository URLs and revision names readable', () => {
@@ -722,7 +733,9 @@ test('checkbox stage flush waits only for index writes, not for the slow visual 
   assert.match(app, /refreshStatusAndFolderInBackground\(repositoryPath, folder, `checkbox generation=\$\{generation\}`\)/);
   assert.match(app, /flushOneBatch scheduled background refresh/);
   assert.doesNotMatch(app, /await refreshStatusAndFolder\(repositoryPath, folder\);\n\s*jsPerfLog\(`flushOneBatch refresh/);
-  assert.match(app, /if \(state\.currentPath === folder\) await openDirectory\(folder, \{ force: true \}\);/);
+  assert.match(app, /if \(state\.view === 'explorer' && state\.currentPath === folder\) await openDirectory\(folder, \{ force: true, explorerOnly: true \}\);/);
+  assert.match(app, /function renderExplorerAfterStatusRefresh\(\)/);
+  assert.match(app, /if \(options\.explorerOnly && state\.view === 'explorer'\) renderExplorerAfterStatusRefresh\(\); else render\(\);/);
 });
 
 test('detached dirty submodules ask for a branch before commit or push', () => {

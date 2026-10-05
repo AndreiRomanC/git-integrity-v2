@@ -78,7 +78,12 @@ fn perf_log_session_header() {
 fn anonymized_repository_id(repository_path: &str) -> String {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    repository_path.hash(&mut hasher);
+    // Use the same canonical identity as every repository cache/lock below.
+    // A Windows path can arrive as either `D:\\repo` or `D:/repo/`; hashing
+    // the raw spelling made one real repository look like two unrelated ones
+    // in the performance log, precisely the same bug that used to split the
+    // expensive status caches themselves.
+    repo_lock_key(repository_path).hash(&mut hasher);
     format!("repo-{:08x}", (hasher.finish() & 0xffff_ffff) as u32)
 }
 
@@ -169,12 +174,13 @@ fn index_metadata_cache() -> &'static Mutex<HashMap<String, (Instant, (Arc<HashS
 // meant a real O(total tracked files) HashSet deep-copy every time, cache hit
 // or not. Cloning an Arc is an O(1) refcount bump regardless of set size.
 fn cached_index_metadata(repository: &str) -> (Arc<HashSet<String>>, Arc<HashSet<String>>) {
-    if let Some((cached_at, data)) = index_metadata_cache().lock().unwrap().get(repository) {
+    let key = repo_lock_key(repository);
+    if let Some((cached_at, data)) = index_metadata_cache().lock().unwrap().get(&key) {
         if cached_at.elapsed() < INDEX_METADATA_TTL { return data.clone(); }
     }
     let (tracked, submodules) = index_metadata(repository);
     let data = (Arc::new(tracked), Arc::new(submodules));
-    index_metadata_cache().lock().unwrap().insert(repository.to_string(), (Instant::now(), data.clone()));
+    index_metadata_cache().lock().unwrap().insert(key, (Instant::now(), data.clone()));
     data
 }
 
@@ -282,7 +288,8 @@ fn full_status_cache() -> &'static Mutex<HashMap<String, (Instant, Vec<(String, 
 }
 
 fn cached_full_statuses(repository: &Repository, repository_path: &str) -> Result<Vec<(String, String, bool)>, String> {
-    if let Some((cached_at, statuses)) = full_status_cache().lock().unwrap().get(repository_path) {
+    let key = repo_lock_key(repository_path);
+    if let Some((cached_at, statuses)) = full_status_cache().lock().unwrap().get(&key) {
         if cached_at.elapsed() < GIT_METADATA_TTL {
             perf_log("cached_full_statuses: HIT", Duration::ZERO);
             return Ok(statuses.clone());
@@ -299,7 +306,7 @@ fn cached_full_statuses(repository: &Repository, repository_path: &str) -> Resul
     // needed.
     let lock_handle = status_scan_lock(repository_path);
     let _guard = lock_handle.lock().unwrap();
-    if let Some((cached_at, statuses)) = full_status_cache().lock().unwrap().get(repository_path) {
+    if let Some((cached_at, statuses)) = full_status_cache().lock().unwrap().get(&key) {
         if cached_at.elapsed() < GIT_METADATA_TTL {
             perf_log("cached_full_statuses: HIT (after a concurrent scan)", Duration::ZERO);
             return Ok(statuses.clone());
@@ -308,7 +315,7 @@ fn cached_full_statuses(repository: &Repository, repository_path: &str) -> Resul
     let step = Instant::now();
     let statuses = internal_statuses(repository, None)?;
     perf_log("cached_full_statuses: MISS, scanned", step.elapsed());
-    full_status_cache().lock().unwrap().insert(repository_path.to_string(), (Instant::now(), statuses.clone()));
+    full_status_cache().lock().unwrap().insert(key, (Instant::now(), statuses.clone()));
     Ok(statuses)
 }
 
@@ -335,14 +342,15 @@ static STATUS_SCAN_LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = Onc
 
 fn status_scan_lock(repository: &str) -> Arc<Mutex<()>> {
     let mut locks = STATUS_SCAN_LOCKS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
-    locks.entry(repository.to_string()).or_insert_with(|| Arc::new(Mutex::new(()))).clone()
+    locks.entry(repo_lock_key(repository)).or_insert_with(|| Arc::new(Mutex::new(()))).clone()
 }
 
 fn recent_full_statuses(repository: &Repository, repository_path: &str) -> Result<Vec<(String, String, bool)>, String> {
+    let key = repo_lock_key(repository_path);
     // Fast path — no lock needed if a scan from a moment ago is still fresh
     // enough (the common case this exists for: refresh_status then stage_all
     // right after, or two refresh_status calls close together).
-    if let Some((cached_at, statuses)) = full_status_cache().lock().unwrap().get(repository_path) {
+    if let Some((cached_at, statuses)) = full_status_cache().lock().unwrap().get(&key) {
         if cached_at.elapsed() < FRESH_STATUS_REUSE_WINDOW {
             perf_log("recent_full_statuses: HIT (reuse window)", Duration::ZERO);
             return Ok(statuses.clone());
@@ -355,7 +363,7 @@ fn recent_full_statuses(repository: &Repository, repository_path: &str) -> Resul
     // through to an actual second scan.
     let lock_handle = status_scan_lock(repository_path);
     let _guard = lock_handle.lock().unwrap();
-    if let Some((cached_at, statuses)) = full_status_cache().lock().unwrap().get(repository_path) {
+    if let Some((cached_at, statuses)) = full_status_cache().lock().unwrap().get(&key) {
         if cached_at.elapsed() < FRESH_STATUS_REUSE_WINDOW {
             perf_log("recent_full_statuses: HIT (reuse window, after a concurrent scan)", Duration::ZERO);
             return Ok(statuses.clone());
@@ -364,7 +372,7 @@ fn recent_full_statuses(repository: &Repository, repository_path: &str) -> Resul
     let step = Instant::now();
     let statuses = internal_statuses(repository, None)?;
     perf_log("recent_full_statuses: MISS, fresh scan", step.elapsed());
-    full_status_cache().lock().unwrap().insert(repository_path.to_string(), (Instant::now(), statuses.clone()));
+    full_status_cache().lock().unwrap().insert(key, (Instant::now(), statuses.clone()));
     Ok(statuses)
 }
 
@@ -374,7 +382,7 @@ fn fresh_full_statuses(repository: &Repository, repository_path: &str, label: &s
     let step = Instant::now();
     let statuses = internal_statuses(repository, None)?;
     perf_log(&format!("{label}: fresh full status scan"), step.elapsed());
-    full_status_cache().lock().unwrap().insert(repository_path.to_string(), (Instant::now(), statuses.clone()));
+    full_status_cache().lock().unwrap().insert(repo_lock_key(repository_path), (Instant::now(), statuses.clone()));
     Ok(statuses)
 }
 
@@ -429,11 +437,12 @@ fn unpushed_paths(repository: &str) -> HashSet<String> {
 }
 
 fn cached_unpushed_paths(repository: &str) -> Arc<HashSet<String>> {
-    if let Some((cached_at, data)) = unpushed_paths_cache().lock().unwrap().get(repository) {
+    let key = repo_lock_key(repository);
+    if let Some((cached_at, data)) = unpushed_paths_cache().lock().unwrap().get(&key) {
         if cached_at.elapsed() < INDEX_METADATA_TTL { return data.clone(); }
     }
     let data = Arc::new(unpushed_paths(repository));
-    unpushed_paths_cache().lock().unwrap().insert(repository.to_string(), (Instant::now(), data.clone()));
+    unpushed_paths_cache().lock().unwrap().insert(key, (Instant::now(), data.clone()));
     data
 }
 
@@ -471,7 +480,7 @@ static SUBMODULE_UNPUSHED_LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>
 
 fn submodule_unpushed_lock(sub_path: &str) -> Arc<Mutex<()>> {
     let mut locks = SUBMODULE_UNPUSHED_LOCKS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
-    locks.entry(sub_path.to_string()).or_insert_with(|| Arc::new(Mutex::new(()))).clone()
+    locks.entry(repo_lock_key(sub_path)).or_insert_with(|| Arc::new(Mutex::new(()))).clone()
 }
 
 fn remote_relation(repo: &Repository, head_oid: Oid) -> SubmoduleRemoteRelation {
@@ -516,23 +525,24 @@ fn fresh_submodule_state(sub_path: &str) -> SubmoduleStateSnapshot {
     let lock_handle = submodule_unpushed_lock(sub_path);
     let _guard = lock_handle.lock().unwrap();
     let value = inspect_submodule_state(sub_path);
-    submodule_state_cache().lock().unwrap().insert(sub_path.to_string(), (Instant::now(), value.clone()));
+    submodule_state_cache().lock().unwrap().insert(repo_lock_key(sub_path), (Instant::now(), value.clone()));
     value
 }
 
 fn cached_submodule_state(sub_path: &str) -> SubmoduleStateSnapshot {
-    if let Some((cached_at, value)) = submodule_state_cache().lock().unwrap().get(sub_path) {
+    let key = repo_lock_key(sub_path);
+    if let Some((cached_at, value)) = submodule_state_cache().lock().unwrap().get(&key) {
         if cached_at.elapsed() < INDEX_METADATA_TTL { return value.clone(); }
     }
     let lock_handle = submodule_unpushed_lock(sub_path);
     let _guard = lock_handle.lock().unwrap();
     // Re-check after acquiring the lock — a concurrent caller for this exact
     // submodule may have just finished the real scan while this one waited.
-    if let Some((cached_at, value)) = submodule_state_cache().lock().unwrap().get(sub_path) {
+    if let Some((cached_at, value)) = submodule_state_cache().lock().unwrap().get(&key) {
         if cached_at.elapsed() < INDEX_METADATA_TTL { return value.clone(); }
     }
     let value = inspect_submodule_state(sub_path);
-    submodule_state_cache().lock().unwrap().insert(sub_path.to_string(), (Instant::now(), value.clone()));
+    submodule_state_cache().lock().unwrap().insert(key, (Instant::now(), value.clone()));
     value
 }
 
@@ -1350,7 +1360,8 @@ fn worktree_status(repository: &str, scope: Option<&str>) -> Vec<(String, String
     // when browsing far from any recent reload (the common case on a large
     // repository, and the reason the scoped scan exists at all) — this only
     // helps the case where a full scan was *just* computed for something else.
-    if let Some((cached_at, statuses)) = full_status_cache().lock().unwrap().get(repository) {
+    let key = repo_lock_key(repository);
+    if let Some((cached_at, statuses)) = full_status_cache().lock().unwrap().get(&key) {
         if cached_at.elapsed() < GIT_METADATA_TTL {
             return match scope {
                 None | Some("") => statuses.iter().map(|(path, status, _)| (path.clone(), status.clone())).collect(),
@@ -1388,7 +1399,7 @@ fn build_git_metadata(repository: &str, scope: Option<&str>, statuses: Option<Ve
 // repository" view) are cached independently — browsing into a small folder inside
 // a huge repository should be fast even if the repository-wide view was scanned
 // moments ago, and vice versa.
-fn metadata_cache_key(repository: &str, scope: &str) -> String { format!("{repository}\u{0}{scope}") }
+fn metadata_cache_key(repository: &str, scope: &str) -> String { format!("{}\u{0}{scope}", repo_lock_key(repository)) }
 
 fn cached_git_metadata(repository: &str, scope: &str) -> GitMetadata {
     let key = metadata_cache_key(repository, scope);
@@ -1433,7 +1444,8 @@ fn sorted_lookups_cache() -> &'static Mutex<HashMap<String, (Instant, Arc<Sorted
 }
 
 fn cached_sorted_lookups(repository: &str) -> Arc<SortedLookups> {
-    if let Some((cached_at, data)) = sorted_lookups_cache().lock().unwrap().get(repository) {
+    let key = repo_lock_key(repository);
+    if let Some((cached_at, data)) = sorted_lookups_cache().lock().unwrap().get(&key) {
         if cached_at.elapsed() < INDEX_METADATA_TTL { return data.clone(); }
     }
     let (tracked, _) = cached_index_metadata(repository);
@@ -1443,7 +1455,7 @@ fn cached_sorted_lookups(repository: &str) -> Arc<SortedLookups> {
     let mut unpushed_sorted: Vec<String> = unpushed.iter().cloned().collect();
     unpushed_sorted.sort_unstable();
     let data = Arc::new(SortedLookups { tracked: tracked_sorted, unpushed: unpushed_sorted });
-    sorted_lookups_cache().lock().unwrap().insert(repository.to_string(), (Instant::now(), data.clone()));
+    sorted_lookups_cache().lock().unwrap().insert(key, (Instant::now(), data.clone()));
     data
 }
 
@@ -1470,7 +1482,7 @@ fn replace_git_metadata(repository: &str, statuses: Vec<(String, String)>) {
 // invalidate_submodule_sync below.
 fn invalidate_git_metadata(repository: &str) {
     invalidate_scoped_and_index_metadata(repository);
-    full_status_cache().lock().unwrap().remove(repository);
+    full_status_cache().lock().unwrap().remove(&repo_lock_key(repository));
 }
 
 // The cheap part of invalidate_git_metadata: evicting cache entries costs
@@ -1482,11 +1494,69 @@ fn invalidate_scoped_and_index_metadata(repository: &str) {
     // Cache keys are "{repository}\0{scope}" (one entry per folder that's been
     // browsed) — a mutation can affect any of them, so drop every scope cached for
     // this repository, not just the unscoped entry.
-    let prefix = format!("{repository}\u{0}");
+    let repository_key = repo_lock_key(repository);
+    let prefix = format!("{repository_key}\u{0}");
     metadata_cache().lock().unwrap().retain(|key, _| !key.starts_with(&prefix));
-    index_metadata_cache().lock().unwrap().remove(repository);
-    unpushed_paths_cache().lock().unwrap().remove(repository);
-    sorted_lookups_cache().lock().unwrap().remove(repository);
+    index_metadata_cache().lock().unwrap().remove(&repository_key);
+    unpushed_paths_cache().lock().unwrap().remove(&repository_key);
+    sorted_lookups_cache().lock().unwrap().remove(&repository_key);
+}
+
+// Stage/Unstage changes only the index entries explicitly named by the
+// operation. Throwing away the repository-wide status snapshot here made a
+// one-file checkbox trigger a new walk of a 20 GB working tree immediately
+// afterward. Preserve the untouched rows and re-read only the affected
+// pathspecs. The original timestamp is deliberately preserved: a staging
+// click must not extend an old snapshot and hide unrelated external edits.
+// A still-current snapshot avoids the immediate duplicate scan; an expired
+// one is refreshed normally. If another full scan wins the race while these
+// tiny path scans run, its newer snapshot is left untouched.
+fn patch_status_cache_after_index_change(repository_path: &str, scopes: &[String]) {
+    invalidate_scoped_and_index_metadata(repository_path);
+    let repository_key = repo_lock_key(repository_path);
+    let snapshot = full_status_cache().lock().unwrap().get(&repository_key).cloned();
+    let Some((cached_at, mut statuses)) = snapshot else { return };
+    let Ok(repo) = internal_repository(repository_path) else {
+        full_status_cache().lock().unwrap().remove(&repository_key);
+        return;
+    };
+    let mut unique = scopes.iter().map(|scope| normalized(Path::new(scope))).filter(|scope| !scope.is_empty()).collect::<Vec<_>>();
+    unique.sort_unstable();
+    unique.dedup();
+    for scope in &unique {
+        let prefix = format!("{scope}/");
+        statuses.retain(|(path, _, _)| path != scope && !path.starts_with(&prefix));
+        match internal_statuses(&repo, Some(scope)) {
+            Ok(fresh) => statuses.extend(fresh),
+            Err(_) => {
+                let mut cache = full_status_cache().lock().unwrap();
+                if cache.get(&repository_key).is_some_and(|(current, _)| *current == cached_at) { cache.remove(&repository_key); }
+                return;
+            }
+        }
+    }
+    statuses.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut cache = full_status_cache().lock().unwrap();
+    if cache.get(&repository_key).is_some_and(|(current, _)| *current == cached_at) {
+        cache.insert(repository_key, (cached_at, statuses));
+        perf_log(&format!("status_cache: patched {} staged pathspec{}; avoided full rescan", unique.len(), if unique.len() == 1 { "" } else { "s" }), Duration::ZERO);
+    }
+}
+
+// Stage all begins from a deliberately fresh full snapshot. Once every row
+// has been staged, its resulting status can be represented exactly without
+// walking the same tree again: every successfully staged path remains a
+// change against HEAD, but now lives in the index (`??` becomes `A`).
+fn seed_status_cache_after_stage_all(repository_path: &str, mut before: Vec<(String, String, bool)>, result: &StageResult) {
+    for (path, code, staged) in &mut before {
+        let selected = result.staged_paths.iter().any(|scope| path == scope || path.starts_with(&format!("{scope}/")));
+        if selected {
+            *staged = true;
+            if code == "??" { *code = "A".into(); }
+        }
+    }
+    full_status_cache().lock().unwrap().insert(repo_lock_key(repository_path), (Instant::now(), before));
+    perf_log("stage_all: seeded post-stage status from its fresh pre-stage scan; avoided duplicate full rescan", Duration::ZERO);
 }
 
 // A submodule checkout-only operation (switching version, restoring the
@@ -1514,7 +1584,8 @@ fn invalidate_git_metadata_for_submodule_checkout(repository_path: &str, submodu
     invalidate_scoped_and_index_metadata(repository_path);
     let step = Instant::now();
     let mut cache = full_status_cache().lock().unwrap();
-    let Some((cached_at, statuses)) = cache.get(repository_path) else {
+    let repository_key = repo_lock_key(repository_path);
+    let Some((cached_at, statuses)) = cache.get(&repository_key) else {
         perf_log(&format!("invalidate_git_metadata_for_submodule_checkout: nothing cached to patch ({submodule_relative_path})"), step.elapsed());
         return;
     };
@@ -1524,13 +1595,13 @@ fn invalidate_git_metadata_for_submodule_checkout(repository_path: &str, submodu
         Ok(fresh) => {
             let now_dirty = !fresh.is_empty();
             patched.extend(fresh);
-            cache.insert(repository_path.to_string(), (cached_at, patched));
+            cache.insert(repository_key, (cached_at, patched));
             perf_log(&format!("invalidate_git_metadata_for_submodule_checkout: patched in place, avoided a full rescan ({submodule_relative_path}, now {})", if now_dirty { "dirty" } else { "clean" }), step.elapsed());
         }
         // Could not verify this one path — do not guess. Falls back to
         // exactly the old behavior: the next status need does a full scan.
         Err(_) => {
-            cache.remove(repository_path);
+            cache.remove(&repository_key);
             perf_log(&format!("invalidate_git_metadata_for_submodule_checkout: could not verify, fell back to a full clear ({submodule_relative_path})"), step.elapsed());
         }
     }
@@ -2068,8 +2139,9 @@ fn invalidate_submodule_sync(repository: &str) {
     // Prefix match, not a single exact key: submodule_state_cache is keyed
     // by each submodule's own absolute path (repository/relative/...), not
     // by the parent's path.
-    let prefix = format!("{repository}/");
-    submodule_state_cache().lock().unwrap().retain(|key, _| key != repository && !key.starts_with(&prefix));
+    let repository_key = repo_lock_key(repository);
+    let prefix = format!("{repository_key}/");
+    submodule_state_cache().lock().unwrap().retain(|key, _| key != &repository_key && !key.starts_with(&prefix));
 }
 
 // A fast, read-only, additive first phase for *opening a repository specifically*
@@ -2464,10 +2536,10 @@ fn stage_all_inner(repository_path: &str, scope: &str) -> Result<StageResult, St
     // deliberately take a fresh snapshot here before deciding what to stage.
     let full = fresh_full_statuses(&repo, repository_path, "stage_all")?;
     let paths: Vec<String> = if scope.is_empty() {
-        full.into_iter().map(|(path, _, _)| path).collect()
+        full.iter().map(|(path, _, _)| path.clone()).collect()
     } else {
         let prefix = format!("{scope}/");
-        full.into_iter().filter(|(path, _, _)| path == scope || path.starts_with(&prefix)).map(|(path, _, _)| path).collect()
+        full.iter().filter(|(path, _, _)| path == scope || path.starts_with(&prefix)).map(|(path, _, _)| path.clone()).collect()
     };
     perf_log(&format!("stage_all: status ready ({} paths, scope={scope:?})", paths.len()), step.elapsed());
     if paths.is_empty() { return Ok(StageResult::default()); }
@@ -2478,7 +2550,9 @@ fn stage_all_inner(repository_path: &str, scope: &str) -> Result<StageResult, St
     // "N paths staged" (the report this fixes: 4 submodules, each with an
     // unchanged HEAD, "staged" and counted as 4 while the index recorded
     // nothing new at all).
-    stage_files(repository_path.to_string(), paths)
+    let result = stage_files(repository_path.to_string(), paths)?;
+    seed_status_cache_after_stage_all(repository_path, full, &result);
+    Ok(result)
 }
 
 // What actually happened, path by path — never just a count of what was
@@ -2627,7 +2701,10 @@ fn stage_files_inner(path: &str, files: Vec<String>) -> Result<StageResult, Stri
     let step = Instant::now();
     index.write().map_err(|error| error.message().to_string())?;
     perf_log("stage_files: index.write()", step.elapsed());
-    invalidate_git_metadata(path);
+    drop(index);
+    let mut changed_scopes = safe_files.iter().map(|path| normalized(path)).collect::<Vec<_>>();
+    if !submodule_paths.is_empty() && Path::new(path).join(".gitmodules").exists() { changed_scopes.push(".gitmodules".into()); }
+    patch_status_cache_after_index_change(path, &changed_scopes);
     result.staged_paths.extend(files_to_add.iter().chain(dirs_to_add.iter()).chain(to_remove.iter()).map(|p| normalized(p)));
     Ok(result)
 }
@@ -2649,7 +2726,11 @@ pub fn unstage_files(path: String, files: Vec<String>) -> Result<(), String> {
     let _lock = lock_handle.lock().unwrap();
     log_repo_write_lock_acquired(&path, "unstage_files", queue_started.elapsed());
     let repo = internal_repository(&path)?; let head = repo.head().and_then(|head| head.peel(ObjectType::Commit)).map_err(|error| error.message().to_string())?;
-    let safe = files.iter().map(|file| safe_relative_path(file)).collect::<Result<Vec<_>, _>>()?; repo.reset_default(Some(&head), safe.iter()).map_err(|error| error.message().to_string())?; invalidate_git_metadata(&path); Ok(())
+    let safe = files.iter().map(|file| safe_relative_path(file)).collect::<Result<Vec<_>, _>>()?;
+    repo.reset_default(Some(&head), safe.iter()).map_err(|error| error.message().to_string())?;
+    let changed_scopes = safe.iter().map(|path| normalized(path)).collect::<Vec<_>>();
+    patch_status_cache_after_index_change(&path, &changed_scopes);
+    Ok(())
 }
 
 #[tauri::command]
@@ -3578,6 +3659,26 @@ fn gh_cli_available() -> bool {
 #[cfg(test)]
 fn gh_cli_available() -> bool { true }
 
+// Merely having `gh.exe` on PATH does not mean it is signed in to the GitHub
+// Enterprise host used by this repository. Previously that false positive
+// selected the gh provider, which then failed, while the already verified
+// Git Credential Manager/API session was never tried. Check the exact host
+// without printing (or logging) the token. Tests keep the injected gh runner.
+#[cfg(not(test))]
+fn gh_cli_authenticated(host: &str) -> bool {
+    let mut command = Command::new("gh");
+    command.args(["auth", "token", "--hostname", host])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    run_with_timeout_labeled(command, Duration::from_secs(5), "gh auth", "5 seconds")
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+fn gh_cli_authenticated(_host: &str) -> bool { true }
+
 fn github_graphql_endpoint(host: &str) -> String {
     if host.eq_ignore_ascii_case("github.com") {
         "https://api.github.com/graphql".into()
@@ -3651,13 +3752,38 @@ fn approve_git_credential(repository_path: &str, repo: &GitHubRepo, credential: 
     }
 }
 
-// A verified sign-in remains usable for subsequent Browse searches in this
-// process even if the user's configured helper has no persistent store. No
-// token is written to a project file or to the app's settings.
-static GITHUB_MODULE_SESSION_TOKENS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+// A credential approval can involve a slow or misconfigured helper. The API
+// request has already proved this credential is valid and the in-process
+// session below is immediately usable, so persistence is best-effort work and
+// must not keep the user's successful Search button spinning for 10 seconds.
+fn approve_git_credential_in_background(repository_path: String, repo: GitHubRepo, credential: GitHttpsCredential) {
+    std::thread::spawn(move || {
+        let started = Instant::now();
+        let approved = approve_git_credential(&repository_path, &repo, &credential).is_ok();
+        perf_log(&format!("github_session: credential_approve={}", if approved { "ok" } else { "unavailable (session remains active)" }), started.elapsed());
+    });
+}
 
-fn github_module_session_tokens() -> &'static Mutex<HashMap<String, String>> {
-    GITHUB_MODULE_SESSION_TOKENS.get_or_init(|| Mutex::new(HashMap::new()))
+// A verified sign-in is shared by every GitHub feature in this process:
+// submodule Browse, pull-request status/details, and comments. Previously the
+// token was isolated to Browse, so the very next PR request displayed another
+// connection error. Nothing is written to the repository or app settings.
+static GITHUB_SESSION_TOKENS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+
+fn github_session_tokens() -> &'static Mutex<HashMap<String, String>> {
+    GITHUB_SESSION_TOKENS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn github_session_token(host: &str) -> Option<String> {
+    github_session_tokens().lock().unwrap().get(&host.to_ascii_lowercase()).cloned()
+}
+
+fn remember_github_session_token(host: &str, token: String) {
+    github_session_tokens().lock().unwrap().insert(host.to_ascii_lowercase(), token);
+}
+
+fn forget_github_session_token(host: &str) {
+    github_session_tokens().lock().unwrap().remove(&host.to_ascii_lowercase());
 }
 
 // Ask the configured credential helper for the HTTPS credential already used
@@ -3726,11 +3852,11 @@ struct GitHubGraphqlClient {
 
 impl GitHubGraphqlClient {
     fn discover(repository_path: &str, repo: &GitHubRepo) -> Result<Self, String> {
-        Self::discover_with_auth(repository_path, repo, false, None)
+        Self::discover_with_auth(repository_path, repo, false, github_session_token(&repo.host))
     }
 
     fn discover_with_auth(repository_path: &str, repo: &GitHubRepo, interactive_auth: bool, session_token: Option<String>) -> Result<Self, String> {
-        let (token, credential_to_approve) = if interactive_auth {
+        let (token, credential_to_approve) = if interactive_auth && session_token.is_none() {
             // An explicit reconnect must bypass a possibly stale environment
             // token and use the Git credential helper's own sign-in flow.
             let credential = github_token_from_git_credential_helper(repository_path, repo, true)
@@ -3809,6 +3935,7 @@ impl GitHubGraphqlClient {
             Err(error) => return Err(format!("GitHub API returned HTTP {status} with an unreadable response: {error}")),
         };
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+            forget_github_session_token(&repo.host);
             return Err(format!("GitHub API authentication failed (HTTP {status}). The saved credential may be expired or may not have read access to this repository."));
         }
         if !status.is_success() {
@@ -3832,6 +3959,9 @@ impl GitHubGraphqlClient {
         let status = response.status();
         let payload = response.json::<serde_json::Value>()
             .map_err(|error| format!("GitHub REST API returned HTTP {status} with an unreadable response: {error}"))?;
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+            forget_github_session_token(&repo.host);
+        }
         if !status.is_success() {
             return Err(format!("GitHub REST API request failed with HTTP {status}."));
         }
@@ -4328,22 +4458,28 @@ fn pr_status_generation_map() -> &'static Mutex<HashMap<String, u64>> {
 }
 
 fn claim_pr_status_generation(repository_path: &str) -> u64 {
+    let repository_key = repo_lock_key(repository_path);
     let mut map = pr_status_generation_map().lock().unwrap();
-    let next = map.get(repository_path).copied().unwrap_or(0) + 1;
-    map.insert(repository_path.to_string(), next);
+    let next = map.get(&repository_key).copied().unwrap_or(0) + 1;
+    map.insert(repository_key, next);
     next
 }
 
 fn is_latest_pr_status_generation(repository_path: &str, generation: u64) -> bool {
-    pr_status_generation_map().lock().unwrap().get(repository_path).copied() == Some(generation)
+    pr_status_generation_map().lock().unwrap().get(&repo_lock_key(repository_path)).copied() == Some(generation)
 }
 
 #[tauri::command]
-pub async fn pr_status(repository_path: String, branch: Option<String>, context: Option<String>) -> Result<PrStatusResult, String> {
-    off_main_thread(move || pr_status_inner(repository_path, branch, context)).await
+pub async fn pr_status(repository_path: String, branch: Option<String>, context: Option<String>, interactive_auth: Option<bool>) -> Result<PrStatusResult, String> {
+    off_main_thread(move || pr_status_inner_with_auth(repository_path, branch, context, interactive_auth.unwrap_or(false))).await
 }
 
+#[cfg(test)]
 fn pr_status_inner(repository_path: String, branch: Option<String>, context: Option<String>) -> Result<PrStatusResult, String> {
+    pr_status_inner_with_auth(repository_path, branch, context, false)
+}
+
+fn pr_status_inner_with_auth(repository_path: String, branch: Option<String>, context: Option<String>, interactive_auth: bool) -> Result<PrStatusResult, String> {
     validate_path(&repository_path)?;
     let generation = claim_pr_status_generation(&repository_path);
     let repo = internal_repository(&repository_path)?;
@@ -4361,16 +4497,28 @@ fn pr_status_inner(repository_path: String, branch: Option<String>, context: Opt
         perf_log(&format!("pr_status: [{context_label}] repo={} superseded by a newer request — skipping the provider round", anonymized_repository_id(&repository_path)), Duration::ZERO);
         return Ok(PrStatusResult::plain("superseded", "A newer request for this repository has already superseded this one."));
     }
-    if gh_cli_available() {
-        perf_log(&format!("pr_status: [{context_label}] provider=gh"), Duration::ZERO);
-        return Ok(pr_status_impl(ctx, &repository_path, &context_label, &run_gh_pr_list));
+    // Prefer a verified API session when Browse (or an environment token)
+    // already supplied one. Otherwise gh is usable only when it is actually
+    // authenticated for this exact host — installation alone is insufficient.
+    let has_direct_token = github_session_token(&ctx.head_repo.host).is_some()
+        || github_token_from_environment(&ctx.head_repo.host).is_some();
+    if !interactive_auth && !has_direct_token && gh_cli_available() {
+        if gh_cli_authenticated(&ctx.head_repo.host) {
+            perf_log(&format!("pr_status: [{context_label}] provider=gh authenticated_host={}" , ctx.head_repo.host), Duration::ZERO);
+            return Ok(pr_status_impl(ctx, &repository_path, &context_label, &run_gh_pr_list));
+        }
+        perf_log(&format!("pr_status: [{context_label}] provider=gh skipped=not_authenticated host={}", ctx.head_repo.host), Duration::ZERO);
     }
 
     // No optional gh installation: reuse the HTTPS credential already held
     // by Git Credential Manager and query the same Enterprise host directly.
     // Discover once per panel refresh, before the concurrent candidate calls,
     // so no credential helper is invoked once per repository/row.
-    let api = match GitHubGraphqlClient::discover(&repository_path, &ctx.head_repo) {
+    let api = match if interactive_auth {
+        GitHubGraphqlClient::discover_with_auth(&repository_path, &ctx.head_repo, true, github_session_token(&ctx.head_repo.host))
+    } else {
+        GitHubGraphqlClient::discover(&repository_path, &ctx.head_repo)
+    } {
         Ok(api) => api,
         Err(detail) => return Ok(PrStatusResult {
             state: "auth_missing".into(),
@@ -4382,8 +4530,19 @@ fn pr_status_inner(repository_path: String, branch: Option<String>, context: Opt
             incoming_pull_requests: Vec::new(),
         }),
     };
-    perf_log(&format!("pr_status: [{context_label}] provider=github_api credential=git_or_environment"), Duration::ZERO);
-    Ok(pr_status_impl(ctx, &repository_path, &context_label, &|query| api.run(query)))
+    perf_log(&format!("pr_status: [{context_label}] provider=github_api credential={}", if has_direct_token { "verified_session_or_environment" } else if interactive_auth { "interactive_git_credential_helper" } else { "git_credential_helper" }), Duration::ZERO);
+    let credential_to_approve = api.credential_to_approve.clone();
+    let api_repo = ctx.head_repo.clone();
+    let api_host = api_repo.host.clone();
+    let result = pr_status_impl(ctx, &repository_path, &context_label, &|query| api.run(query));
+    if !matches!(result.state.as_str(), "auth_missing" | "api_error") {
+        if let Some(credential) = credential_to_approve {
+            remember_github_session_token(&api_host, credential.password.clone());
+            approve_git_credential_in_background(repository_path, api_repo, credential);
+            perf_log("pr_status: interactive credential verified; shared session ready; persistence scheduled", Duration::ZERO);
+        }
+    }
+    Ok(result)
 }
 
 fn parse_pull_request_target(url: &str) -> Option<(GitHubRepo, u64)> {
@@ -4429,7 +4588,8 @@ fn post_pull_request_comment_inner(repository_path: String, pull_request_url: St
     if body.is_empty() { return Err("Write a comment before sending it.".into()); }
     if body.chars().count() > 65_536 { return Err("The comment is too long (maximum 65,536 characters).".into()); }
     let (repo, number) = parse_pull_request_target(&pull_request_url).ok_or("The pull request link is invalid.")?;
-    let gh_error = if gh_cli_available() {
+    let has_direct_token = github_session_token(&repo.host).is_some() || github_token_from_environment(&repo.host).is_some();
+    let gh_error = if !has_direct_token && gh_cli_available() && gh_cli_authenticated(&repo.host) {
         match post_pull_request_comment_with_gh(&repo, number, body) {
             Ok(()) => {
                 perf_log(&format!("post_pull_request_comment: repo=<{}> pr={number} provider=gh sent", anonymized_repository_id(&repo.gh_repo_arg())), Duration::ZERO);
@@ -5136,7 +5296,7 @@ fn submodule_navigation_status_inner(repository_path: String, relative_path: Str
         .find(|sub| relative_string == sub.as_str() || relative_string.starts_with(&format!("{sub}/")))
         .cloned() else { return Ok(None) };
     let absolute_sub = Path::new(&repository_path).join(&submodule_path).to_string_lossy().into_owned();
-    let ready = full_status_cache().lock().unwrap().get(&absolute_sub).map(|(cached_at, _)| cached_at.elapsed() < GIT_METADATA_TTL).unwrap_or(false);
+    let ready = full_status_cache().lock().unwrap().get(&repo_lock_key(&absolute_sub)).map(|(cached_at, _)| cached_at.elapsed() < GIT_METADATA_TTL).unwrap_or(false);
     Ok(Some(SubmoduleNavigationStatus { submodule_path, ready }))
 }
 
@@ -5238,8 +5398,9 @@ fn load_directory_inner(repository_path: String, relative_path: String, force: O
         // right now, not a cached answer from up to 5 minutes ago. Scoped to
         // just the submodules under this folder's own repository, not every
         // submodule cached anywhere.
-        let prefix = format!("{status_repo}/");
-        submodule_state_cache().lock().unwrap().retain(|key, _| key != status_repo && !key.starts_with(&prefix));
+        let repository_key = repo_lock_key(status_repo);
+        let prefix = format!("{repository_key}/");
+        submodule_state_cache().lock().unwrap().retain(|key, _| key != &repository_key && !key.starts_with(&prefix));
     }
     let step = Instant::now();
     let git_metadata = cached_git_metadata(status_repo, status_scope);
@@ -5919,7 +6080,7 @@ fn search_github_modules_inner(repository_path: String, query: String, limit: Op
     }
     let limit = limit.unwrap_or(25).clamp(1, 50);
     let credential_repo = github_module_browser_context(&repository_path);
-    let session_token = if interactive_auth { None } else { github_module_session_tokens().lock().unwrap().get(&credential_repo.host).cloned() };
+    let session_token = if interactive_auth { None } else { github_session_token(&credential_repo.host) };
     let client = GitHubGraphqlClient::discover_with_auth(&repository_path, &credential_repo, interactive_auth, session_token)?;
     let endpoint = "https://github.vitesco.io/api/v3/search/repositories";
     let search_query = format!("{query} org:eng");
@@ -5929,17 +6090,16 @@ fn search_github_modules_inner(repository_path: String, query: String, limit: Op
     if let Some(token) = &client.token { request = request.bearer_auth(token); }
     let response = request.send().map_err(|error| format!("GitHub repository search failed: {error}"))?;
     let status = response.status();
-    if status.as_u16() == 401 { github_module_session_tokens().lock().unwrap().remove(&credential_repo.host); }
+    if status.as_u16() == 401 || status.as_u16() == 403 { forget_github_session_token(&credential_repo.host); }
     let payload = response.json::<serde_json::Value>()
         .map_err(|error| format!("GitHub repository search returned HTTP {status} with an unreadable response: {error}"))?;
     if !status.is_success() {
         return Err(format!("GitHub repository search failed with HTTP {status}: {}", github_api_error_message(&payload)));
     }
     if let Some(credential) = &client.credential_to_approve {
-        github_module_session_tokens().lock().unwrap().insert(credential_repo.host.clone(), credential.password.clone());
-        let approval_started = Instant::now();
-        let approved = approve_git_credential(&repository_path, &credential_repo, credential).is_ok();
-        perf_log(&format!("search_github_modules: credential_approve={}", if approved { "ok" } else { "unavailable (session-only)" }), approval_started.elapsed());
+        remember_github_session_token(&credential_repo.host, credential.password.clone());
+        approve_git_credential_in_background(repository_path.clone(), credential_repo.clone(), credential.clone());
+        perf_log("search_github_modules: credential_approve=scheduled_in_background session=ready", Duration::ZERO);
     }
     let items = payload.get("items").and_then(|value| value.as_array()).cloned().unwrap_or_default();
     let mut results = Vec::new();
@@ -10429,15 +10589,17 @@ mod tests {
         // and produce a false positive here.
         fs::write(base.join("src/main.rs"), "fn main() {}").unwrap();
         let path = base.to_string_lossy().into_owned();
+        let before = refresh_status_inner(path.clone()).unwrap();
+        assert!(before.iter().any(|change| change.path == "src/main.rs" && !change.staged));
 
         stage_files(path.clone(), vec!["src/main.rs".into()]).unwrap();
-        let staged = load_repository_inner(path.clone(), Some(true)).unwrap();
-        let change = staged.changes.iter().find(|change| change.path == "src/main.rs").expect("src/main.rs should be a pending change");
+        let staged = refresh_status_inner(path.clone()).unwrap();
+        let change = staged.iter().find(|change| change.path == "src/main.rs").expect("src/main.rs should be a pending change");
         assert!(change.staged, "src/main.rs should be staged after stage_files");
 
         unstage_files(path.clone(), vec!["src/main.rs".into()]).unwrap();
-        let unstaged = load_repository_inner(path.clone(), Some(true)).unwrap();
-        let change = unstaged.changes.iter().find(|change| change.path == "src/main.rs").expect("src/main.rs should still be a pending change (untracked, not staged)");
+        let unstaged = refresh_status_inner(path.clone()).unwrap();
+        let change = unstaged.iter().find(|change| change.path == "src/main.rs").expect("src/main.rs should still be a pending change (untracked, not staged)");
         assert!(!change.staged, "src/main.rs should no longer be staged after unstage_files");
 
         fs::remove_dir_all(base).unwrap();
@@ -10922,6 +11084,29 @@ mod tests {
         assert_eq!(credential.username.as_deref(), Some("employee"));
         assert_eq!(credential.password, "secret-token");
         assert!(parse_git_credential_response(b"username=employee\n").is_none());
+    }
+
+    #[test]
+    fn verified_github_session_is_shared_by_host_and_can_be_invalidated() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let host = format!("github-session-{suffix}.example.com");
+        remember_github_session_token(&host.to_uppercase(), "session-token".into());
+        assert_eq!(github_session_token(&host).as_deref(), Some("session-token"));
+        forget_github_session_token(&host.to_uppercase());
+        assert!(github_session_token(&host).is_none());
+    }
+
+    #[test]
+    fn repository_cache_identity_folds_separators_and_trailing_slashes() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let repository = std::env::temp_dir().join(format!("git-integrity-cache-key-{suffix}"));
+        fs::create_dir_all(&repository).unwrap();
+        let plain = repository.to_string_lossy().into_owned();
+        let trailing = format!("{plain}/");
+        let alternate_separators = plain.replace('/', "\\");
+        assert_eq!(repo_lock_key(&plain), repo_lock_key(&trailing));
+        assert_eq!(repo_lock_key(&plain), repo_lock_key(&alternate_separators));
+        fs::remove_dir_all(repository).unwrap();
     }
 
     #[test]
@@ -13426,12 +13611,13 @@ mod tests {
         // Seed a fresh, cached "everything is clean" full scan, as if
         // load_repository had already run once before this operation.
         let fake_marker = "__unmistakably_fake_marker__.txt".to_string();
-        full_status_cache().lock().unwrap().insert(repo_path.clone(), (Instant::now(), vec![(fake_marker.clone(), "??".into(), false)]));
+        let cache_key = repo_lock_key(&repo_path);
+        full_status_cache().lock().unwrap().insert(cache_key.clone(), (Instant::now(), vec![(fake_marker.clone(), "??".into(), false)]));
 
         switch_submodule_version_inner(repo_path.clone(), "vendor/dep".into(), feature_branch.revision.clone(), feature_branch.kind.clone(), feature_branch.name.clone()).unwrap();
 
         let cache = full_status_cache().lock().unwrap();
-        let (_, patched) = cache.get(&repo_path).expect("the cache entry must still exist — patched in place, not thrown away");
+        let (_, patched) = cache.get(&cache_key).expect("the cache entry must still exist — patched in place, not thrown away");
         assert!(patched.iter().any(|(path, _, _)| path == &fake_marker), "an unrelated cached path must survive untouched — proves no full rescan discarded it");
         let submodule_entry = patched.iter().find(|(path, _, _)| path == "vendor/dep");
         assert!(submodule_entry.is_some(), "the submodule's own entry must be present and correctly patched — it really did move");
@@ -15394,12 +15580,12 @@ mod tests {
         // (which run concurrently), so asserting its *total* size would be
         // flaky by construction; scoping to paths under this repository is
         // what actually proves the property under test.
-        let repo_prefix = repository.to_string_lossy().into_owned();
+        let repo_prefix = repo_lock_key(repository.to_str().unwrap());
         let scanned: std::collections::HashSet<String> = submodule_state_cache().lock().unwrap().keys()
             .filter(|key| key.starts_with(&repo_prefix)).cloned().collect();
-        assert!(scanned.contains(group_a[0].to_str().unwrap()), "the changed visible submodule must be scanned");
-        assert!(!scanned.contains(group_a[1].to_str().unwrap()), "a clean visible sibling must not be scanned");
-        for sub in &group_b { assert!(!scanned.contains(sub.to_str().unwrap()), "a submodule in a folder that was never listed must NOT have been scanned: {sub:?}"); }
+        assert!(scanned.contains(&repo_lock_key(group_a[0].to_str().unwrap())), "the changed visible submodule must be scanned");
+        assert!(!scanned.contains(&repo_lock_key(group_a[1].to_str().unwrap())), "a clean visible sibling must not be scanned");
+        for sub in &group_b { assert!(!scanned.contains(&repo_lock_key(sub.to_str().unwrap())), "a submodule in a folder that was never listed must NOT have been scanned: {sub:?}"); }
         assert_eq!(scanned.len(), 1, "exactly the one changed visible submodule, not every visible or registered submodule");
 
         fs::remove_dir_all(base).unwrap();
@@ -16216,7 +16402,7 @@ mod tests {
         let repo_string = repo_path.to_string_lossy().into_owned();
 
         let fake_marker = "__unmistakably_fake_marker__.txt".to_string();
-        full_status_cache().lock().unwrap().insert(repo_string.clone(), (Instant::now(), vec![(fake_marker.clone(), "??".into(), false)]));
+        full_status_cache().lock().unwrap().insert(repo_lock_key(&repo_string), (Instant::now(), vec![(fake_marker.clone(), "??".into(), false)]));
 
         let changes = refresh_status_inner(repo_string.clone()).unwrap();
         assert_eq!(changes.len(), 1, "should have reused the seeded entry, not scanned the (actually empty) real repository");

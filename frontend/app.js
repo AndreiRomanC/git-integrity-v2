@@ -70,6 +70,8 @@ let submoduleCrossSelected = null;
 let submoduleBrowserState = { repositories: [], selectedRepository: null, allRefs: [], refs: [], selectedRef: null, selectedRefs: [] };
 let submoduleBrowserSearchBusy = false;
 const submoduleBrowserRefCache = new Map();
+const submoduleBrowserRepositoryCache = new Map();
+const SUBMODULE_REPOSITORY_CACHE_TTL_MS = 5 * 60 * 1000;
 const recentRepos = JSON.parse(localStorage.getItem('recentRepos') || '[]');
 const REPOSITORY_ORIGINS_KEY = 'git-drilldown-repository-origins-v1';
 let repositoryOrigins = loadRepositoryOrigins();
@@ -705,7 +707,7 @@ function openSubmoduleBrowser() {
   refs.submoduleRepoSearch.value = seed && seed !== '../../eng/' ? seed : '';
   refs.submoduleBrowserDialog.showModal();
   refs.submoduleRepoSearch.focus();
-  if (refs.submoduleRepoSearch.value.trim().length >= 2) searchSubmoduleRepositories();
+  if (refs.submoduleRepoSearch.value.trim().length >= 2) searchSubmoduleRepositories(false, { allowCache: true });
 }
 function renderSubmoduleRepositoryResults() {
   const selected = submoduleBrowserState.selectedRepository;
@@ -793,10 +795,19 @@ function filterLoadedSubmoduleRefs(query = refs.submoduleRefSearch.value.trim())
 function submoduleBrowserNeedsAuthentication(error) {
   return /GitHub API authentication is required|GitHub API authentication failed|GitHub repository search failed with HTTP (401|403)/i.test(String(error));
 }
-async function searchSubmoduleRepositories(interactiveAuth = false) {
+async function searchSubmoduleRepositories(interactiveAuth = false, options = {}) {
   if (submoduleBrowserSearchBusy) return;
   const query = refs.submoduleRepoSearch.value.trim();
   if (query.length < 2) { refs.submoduleRepoResults.innerHTML = '<div class="version-loading">Type at least 2 characters.</div>'; return; }
+  const cacheKey = query.toLocaleLowerCase();
+  const cached = submoduleBrowserRepositoryCache.get(cacheKey);
+  if (!interactiveAuth && options.allowCache && cached && Date.now() - cached.savedAt < SUBMODULE_REPOSITORY_CACHE_TTL_MS) {
+    submoduleBrowserState.repositories = cached.results;
+    refs.submoduleBrowserAuth.hidden = true;
+    refs.submoduleBrowserStatus.textContent = `${cached.results.length} repositories found · recent result. Search again to refresh.`;
+    renderSubmoduleRepositoryResults();
+    return;
+  }
   submoduleBrowserSearchBusy = true;
   const repositoryPath = state.repository.path;
   const activeButton = interactiveAuth ? refs.connectSubmoduleBrowser : refs.runSubmoduleRepoSearch;
@@ -815,6 +826,7 @@ async function searchSubmoduleRepositories(interactiveAuth = false) {
     ];
     if (!refs.submoduleBrowserDialog.open || state.repository?.path !== repositoryPath) return;
     submoduleBrowserState.repositories = results || [];
+    submoduleBrowserRepositoryCache.set(cacheKey, { savedAt: Date.now(), results: submoduleBrowserState.repositories });
     refs.submoduleBrowserAuth.hidden = true;
     refs.submoduleBrowserStatus.textContent = `${submoduleBrowserState.repositories.length} repositories found.`;
     renderSubmoduleRepositoryResults();
@@ -2306,6 +2318,17 @@ function renderExplorer() {
   if (capped) { $('#explorerShowAll')?.addEventListener('click', () => { explorerRenderState.pendingShowAll = true; renderExplorer(); }); }
 }
 
+// A Stage/Unstage changes only the status rows already being shown. Rebuilding
+// the branch sidebar, graph state, stash UI and PR panels through global
+// render() took another 2–3 seconds in the Windows log even though none of
+// those can change here. Keep the Explorer's one relevant header count and
+// listing live, without touching unrelated views.
+function renderExplorerAfterStatusRefresh() {
+  const folderChangeCount = state.changes.filter(change => !state.currentPath || change.path === state.currentPath || change.path.startsWith(`${state.currentPath}/`)).length;
+  $('#showFolderChanges').textContent = `Folder changes · ${folderChangeCount}`;
+  renderExplorer();
+}
+
 let fileListDelegationAttached = false;
 function attachFileListDelegation() {
   if (fileListDelegationAttached) return;
@@ -2467,7 +2490,11 @@ function currentSubmoduleCompareContext() {
 // backend read even inside a submodule: a previous fast-paint/background-scan
 // experiment caused flicker and unreliable-feeling navigation on Windows.
 async function fetchAndRenderDirectory(path, requestId, options) {
-  if (!options.force && directoryCache.has(path)) { state.entries = directoryCache.get(path); render(); return; }
+  if (!options.force && directoryCache.has(path)) {
+    state.entries = directoryCache.get(path);
+    if (options.explorerOnly && state.view === 'explorer') renderExplorerAfterStatusRefresh(); else render();
+    return;
+  }
   refs.fileList.innerHTML = '<div class="loading-row"><i class="spinner"></i>Loading folder…</div>';
   if (!invoke) { state.entries = previewData.entries; directoryCache.set(path, state.entries); render(); return; }
   try {
@@ -2477,8 +2504,9 @@ async function fetchAndRenderDirectory(path, requestId, options) {
     directoryCache.set(path, entries);
     if (requestId !== explorerRequestSeq) return;
     const renderStarted = performance.now();
-    state.entries = entries; render();
-    jsPerfLog(`openDirectory render() (${path || '/'}, ${entries.length} entries)`, performance.now() - renderStarted);
+    state.entries = entries;
+    if (options.explorerOnly && state.view === 'explorer') renderExplorerAfterStatusRefresh(); else render();
+    jsPerfLog(`openDirectory ${options.explorerOnly ? 'explorer-only render' : 'render()'} (${path || '/'}, ${entries.length} entries)`, performance.now() - renderStarted);
   } catch (error) {
     if (requestId !== explorerRequestSeq) return;
     status(String(error), 'error'); refs.fileList.innerHTML = `<div class="empty-change">${esc(String(error))}</div>`;
@@ -6828,7 +6856,7 @@ async function refreshStatusAndFolderInBackground(repositoryPath, folder, reason
     }
     state.changes = changes; state.statusReady = true; updateChangeBadge();
     if (refs.changesDrawer.classList.contains('open')) renderChanges();
-    if (state.currentPath === folder) await openDirectory(folder, { force: true });
+    if (state.view === 'explorer' && state.currentPath === folder) await openDirectory(folder, { force: true, explorerOnly: true });
     jsPerfLog(`postStageRefresh END (${reason}, applied)`, performance.now() - startedAt);
   } catch (error) {
     jsPerfLog(`postStageRefresh ERROR (${reason}): ${String(error)}`, performance.now() - startedAt);
@@ -6850,7 +6878,7 @@ async function refreshStatusAndFolder(repositoryPath, folder) {
   if (state.repository?.path !== repositoryPath) return; // switched to a different repository while this was in flight
   state.changes = changes; state.statusReady = true; updateChangeBadge();
   if (refs.changesDrawer.classList.contains('open')) renderChanges();
-  await openDirectory(folder, { force: true });
+  if (state.view === 'explorer') await openDirectory(folder, { force: true, explorerOnly: true });
 }
 
 $('#showChanges').addEventListener('click', () => { state.changesScope = 'global'; applyDefaultCommitMessage(); renderChanges(); refs.changesDrawer.classList.add('open'); refreshChangesLightweight(); });
@@ -8218,7 +8246,7 @@ function createPrStatusPanel(root, options) {
   }
 
   function renderConnectPrompt() {
-    root.innerHTML = contextHeaderHtml() + '<div class="pr-status-empty pr-status-disconnected"><span>Connect only when you want to check GitHub. No request runs in the background.</span><button class="pr-status-retry" data-pr-status-action="connect">Connect to GitHub</button></div>';
+    root.innerHTML = contextHeaderHtml() + '<div class="pr-status-empty pr-status-disconnected"><span>Check pull requests only when needed. No request runs in the background.</span><button class="pr-status-retry" data-pr-status-action="refresh">Check pull requests</button></div>';
   }
 
   function renderState(result) {
@@ -8242,15 +8270,16 @@ function createPrStatusPanel(root, options) {
     const retryable = ['api_error', 'auth_missing', 'partial_result'].includes(result.state);
     const browserUrl = githubPullsBrowserUrl(result.queried_repo);
     const browserFallback = browserUrl && retryable ? `<button class="pr-open-link" data-open-url="${esc(browserUrl)}">Open pull requests in browser ↗</button>` : '';
-    const actionLabel = retryable ? 'Retry' : 'Refresh';
-    root.innerHTML = ctx + `<div class="pr-status-empty pr-status-${esc(result.state)}">${detail}<button class="pr-status-retry" data-pr-status-action="refresh">${actionLabel}</button>${browserFallback}</div>`;
+    const actionLabel = result.state === 'auth_missing' ? 'Sign in & retry' : retryable ? 'Retry' : 'Refresh';
+    const action = result.state === 'auth_missing' ? 'connect' : 'refresh';
+    root.innerHTML = ctx + `<div class="pr-status-empty pr-status-${esc(result.state)}">${detail}<button class="pr-status-retry" data-pr-status-action="${action}">${actionLabel}</button>${browserFallback}</div>`;
   }
 
   function contextKey() {
     return `${options.getRepositoryPath() || ''}::${options.getBranch() || ''}::${options.getContextLabel?.() || ''}`;
   }
 
-  async function load() {
+  async function load(interactiveAuth = false) {
     const repositoryPath = options.getRepositoryPath();
     const branch = options.getBranch();
     const context = options.getContextLabel?.() || null;
@@ -8260,7 +8289,7 @@ function createPrStatusPanel(root, options) {
     renderState({ state: 'loading', outgoing_pull_requests: [], incoming_pull_requests: [] });
     if (!invoke) { renderState({ state: 'no_open_pr', branch, outgoing_pull_requests: [], incoming_pull_requests: [] }); return; }
     try {
-      const result = await invoke('pr_status', { repositoryPath, branch: branch || null, context });
+      const result = await invoke('pr_status', { repositoryPath, branch: branch || null, context, interactiveAuth });
       if (myGeneration !== generation) return; // a newer load (or context change) superseded this one
       renderState(result);
     } catch (error) {
@@ -8286,7 +8315,8 @@ function createPrStatusPanel(root, options) {
   }
 
   root.addEventListener('click', event => {
-    if (event.target.closest('[data-pr-status-action]')) load();
+    const action = event.target.closest('[data-pr-status-action]')?.dataset.prStatusAction;
+    if (action) load(action === 'connect');
   });
   root.addEventListener('click', event => {
     const details = event.target.closest('[data-open-check-url]');
