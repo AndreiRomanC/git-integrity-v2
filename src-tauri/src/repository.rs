@@ -1325,6 +1325,7 @@ fn internal_submodule_repository(absolute_path: &Path) -> Result<Repository, Str
 }
 
 fn internal_statuses(repository: &Repository, scope: Option<&str>) -> Result<Vec<(String, String, bool)>, String> {
+    let total_started = Instant::now();
     let mut options = StatusOptions::new();
     // Correctness over saved time here: not recursing into wholly-untracked
     // directories was a deliberate speed trade that backfired — copying a new,
@@ -1356,13 +1357,30 @@ fn internal_statuses(repository: &Repository, scope: Option<&str>) -> Result<Vec
     // the scan to just the folder being viewed, so cost scales with that folder's
     // size instead of the entire repository's.
     if let Some(scope) = scope { if !scope.is_empty() { options.pathspec(scope); } }
+    let query_started = Instant::now();
     let statuses = repository.statuses(Some(&mut options)).map_err(|error| error.message().to_string())?;
-    Ok(statuses.iter().filter_map(|entry| {
+    let query_elapsed = query_started.elapsed();
+    let collect_started = Instant::now();
+    let result = statuses.iter().filter_map(|entry| {
         let path = entry.path()?.to_string(); let value = entry.status();
         let staged = value.intersects(Status::INDEX_NEW | Status::INDEX_MODIFIED | Status::INDEX_DELETED | Status::INDEX_RENAMED | Status::INDEX_TYPECHANGE);
         let code = if value.contains(Status::CONFLICTED) { "U" } else if value.contains(Status::WT_NEW) { "??" } else if value.intersects(Status::WT_DELETED | Status::INDEX_DELETED) { "D" } else if value.intersects(Status::INDEX_NEW) { "A" } else if value.intersects(Status::WT_RENAMED | Status::INDEX_RENAMED) { "R" } else { "M" };
         Some((path, code.to_string(), staged))
-    }).collect())
+    }).collect::<Vec<_>>();
+    let collect_elapsed = collect_started.elapsed();
+    let untracked = result.iter().filter(|(_, code, _)| code == "??").count();
+    let staged = result.iter().filter(|(_, _, staged)| *staged).count();
+    let scope_kind = if scope.is_some_and(|value| !value.is_empty()) { "scoped" } else { "full" };
+    perf_log(
+        &format!(
+            "status_scan: scope={scope_kind} changes={} untracked={untracked} staged={staged} query_ms={:.1} collect_ms={:.1}",
+            result.len(),
+            query_elapsed.as_secs_f64() * 1000.0,
+            collect_elapsed.as_secs_f64() * 1000.0,
+        ),
+        total_started.elapsed(),
+    );
+    Ok(result)
 }
 
 fn short_date(seconds: i64) -> String {
@@ -3833,9 +3851,55 @@ fn parse_git_credential_response(output: &[u8]) -> Option<GitHttpsCredential> {
 // operation follows a successful request with `approve`, which tells the
 // configured helper it may persist the verified credential. Keep the secret
 // exclusively on stdin, and never include subprocess output in diagnostics.
+const GIT_CREDENTIAL_APPROVE_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn git_executable_for_log() -> String {
+    let executable = if cfg!(windows) { "git.exe" } else { "git" };
+    let resolved = std::env::var_os("PATH")
+        .and_then(|path| std::env::split_paths(&path).map(|folder| folder.join(executable)).find(|candidate| candidate.is_file()));
+    let Some(path) = resolved else { return "PATH:git".into() };
+    let mut text = path.to_string_lossy().replace('\\', "/");
+    for home_name in ["USERPROFILE", "HOME"] {
+        if let Some(home) = std::env::var_os(home_name) {
+            let home = PathBuf::from(home).to_string_lossy().replace('\\', "/");
+            if !home.is_empty() && text.to_ascii_lowercase().starts_with(&home.to_ascii_lowercase()) {
+                text.replace_range(..home.len(), "<home>");
+                break;
+            }
+        }
+    }
+    text
+}
+
+fn classify_credential_helpers(raw: &[u8]) -> String {
+    let mut helpers = String::from_utf8_lossy(raw).lines().filter_map(|line| {
+        let lower = line.trim().to_ascii_lowercase();
+        if lower.is_empty() { None }
+        else if lower.contains("manager-core") { Some("manager-core") }
+        else if lower.contains("manager") { Some("manager") }
+        else if lower.contains("osxkeychain") { Some("osxkeychain") }
+        else if lower == "store" || lower.starts_with("store ") { Some("store") }
+        else if lower == "cache" || lower.starts_with("cache ") { Some("cache") }
+        else { Some("custom") }
+    }).collect::<Vec<_>>();
+    helpers.sort_unstable();
+    helpers.dedup();
+    if helpers.is_empty() { "none".into() } else { helpers.join("+") }
+}
+
+fn credential_helper_kind(repository_path: &str) -> String {
+    let mut command = Command::new("git");
+    command.arg("-C").arg(repository_path).args(["config", "--get-all", "credential.helper"])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(std::process::Stdio::null());
+    let Ok(output) = command.output() else { return "unavailable".into() };
+    if !output.status.success() { return "none".into(); }
+    classify_credential_helpers(&output.stdout)
+}
+
 fn approve_git_credential(repository_path: &str, repo: &GitHubRepo, credential: &GitHttpsCredential) -> Result<(), String> {
     use std::io::Write;
-    let Some(username) = credential.username.as_deref() else { return Err("Git credential helper returned no username".into()) };
+    let Some(username) = credential.username.as_deref() else { return Err("username_missing".into()) };
     let mut command = Command::new("git");
     command.arg("-C").arg(repository_path).args(["credential", "approve"])
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -3844,29 +3908,30 @@ fn approve_git_credential(repository_path: &str, repo: &GitHubRepo, credential: 
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     #[cfg(unix)] { use std::os::unix::process::CommandExt; command.process_group(0); }
-    let mut child = command.spawn().map_err(|_| "Could not start Git credential approval")?;
+    let mut child = command.spawn().map_err(|error| format!("spawn_failed(kind={:?})", error.kind()))?;
     let id = child.id();
     let Some(mut stdin) = child.stdin.take() else {
         let _ = child.kill();
         let _ = child.wait();
-        return Err("Could not send Git credential approval".into());
+        return Err("stdin_unavailable".into());
     };
     let request = format!("protocol=https\nhost={}\npath={}/{}.git\nusername={username}\npassword={}\n\n", repo.host, repo.owner, repo.repo, credential.password);
-    if stdin.write_all(request.as_bytes()).is_err() {
+    if let Err(error) = stdin.write_all(request.as_bytes()) {
         let _ = child.kill();
         let _ = child.wait();
-        return Err("Could not send Git credential approval".into());
+        return Err(format!("stdin_write_failed(kind={:?})", error.kind()));
     }
     drop(stdin);
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || { let _ = tx.send(child.wait()); });
-    match rx.recv_timeout(Duration::from_secs(10)) {
+    match rx.recv_timeout(GIT_CREDENTIAL_APPROVE_TIMEOUT) {
         Ok(Ok(status)) if status.success() => Ok(()),
-        Ok(_) => Err("Git credential approval failed".into()),
+        Ok(Ok(status)) => Err(format!("exit_nonzero(code={})", status.code().map(|code| code.to_string()).unwrap_or_else(|| "signal".into()))),
+        Ok(Err(error)) => Err(format!("wait_failed(kind={:?})", error.kind())),
         Err(_) => {
             #[cfg(unix)] { let _ = Command::new("kill").arg("-9").arg(format!("-{id}")).status(); }
             #[cfg(windows)] { let _ = Command::new("taskkill").args(["/F", "/T", "/PID"]).arg(id.to_string()).status(); }
-            Err("Git credential approval timed out".into())
+            Err("timeout".into())
         }
     }
 }
@@ -3874,12 +3939,18 @@ fn approve_git_credential(repository_path: &str, repo: &GitHubRepo, credential: 
 // A credential approval can involve a slow or misconfigured helper. The API
 // request has already proved this credential is valid and the in-process
 // session below is immediately usable, so persistence is best-effort work and
-// must not keep the user's successful Search button spinning for 10 seconds.
+// must not keep the user's successful Search button spinning while a helper
+// persists it. The result is deliberately diagnostic but secret-free.
 fn approve_git_credential_in_background(repository_path: String, repo: GitHubRepo, credential: GitHttpsCredential) {
     std::thread::spawn(move || {
         let started = Instant::now();
-        let approved = approve_git_credential(&repository_path, &repo, &credential).is_ok();
-        perf_log(&format!("github_session: credential_approve={}", if approved { "ok" } else { "unavailable (session remains active)" }), started.elapsed());
+        let git = git_executable_for_log();
+        let helper = credential_helper_kind(&repository_path);
+        perf_log(&format!("github_session: credential_approve=start git={git} helper={helper} timeout={}s", GIT_CREDENTIAL_APPROVE_TIMEOUT.as_secs()), Duration::ZERO);
+        match approve_git_credential(&repository_path, &repo, &credential) {
+            Ok(()) => perf_log("github_session: credential_approve=ok persisted=true", started.elapsed()),
+            Err(category) => perf_log(&format!("github_session: credential_approve=failed persisted=false session_active=true category={category}"), started.elapsed()),
+        }
     });
 }
 
@@ -6335,9 +6406,30 @@ fn github_module_cache_path(owner: &str, repository_name: &str) -> PathBuf {
         ))
 }
 
-fn ensure_github_module_cache(repository_path: &str, owner: &str, repository_name: &str) -> Result<PathBuf, String> {
+static GITHUB_MODULE_CACHE_LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
+
+fn github_module_cache_lock(owner: &str, repository_name: &str) -> Arc<Mutex<()>> {
+    let key = format!("{}/{}", owner.to_ascii_lowercase(), repository_name.to_ascii_lowercase());
+    let mut locks = GITHUB_MODULE_CACHE_LOCKS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
+    locks.entry(key).or_insert_with(|| Arc::new(Mutex::new(()))).clone()
+}
+
+fn exact_commit_oid(value: &str) -> Option<Oid> {
+    let value = value.trim();
+    (value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())).then(|| Oid::from_str(value).ok()).flatten()
+}
+
+fn cache_has_exact_revisions(cache_path: &Path, required_revisions: &[&str]) -> bool {
+    if required_revisions.is_empty() { return false; }
+    let Ok(repository) = Repository::open_bare(cache_path).or_else(|_| Repository::open(cache_path)) else { return false };
+    required_revisions.iter().all(|revision| exact_commit_oid(revision).is_some_and(|oid| repository.find_commit(oid).is_ok()))
+}
+
+fn ensure_github_module_cache(repository_path: &str, owner: &str, repository_name: &str, required_revisions: &[&str]) -> Result<PathBuf, String> {
     validate_path(repository_path)?;
     let (owner, repository_name) = validate_github_module_identity(owner, repository_name)?;
+    let lock_handle = github_module_cache_lock(&owner, &repository_name);
+    let _guard = lock_handle.lock().unwrap();
     let cache_path = github_module_cache_path(&owner, &repository_name);
     let cache_parent = cache_path.parent().ok_or_else(|| "Could not resolve the module cache folder".to_string())?;
     fs::create_dir_all(cache_parent).map_err(|error| format!("Could not create module cache folder: {error}"))?;
@@ -6345,6 +6437,14 @@ fn ensure_github_module_cache(repository_path: &str, owner: &str, repository_nam
     let cache_text = cache_path.to_string_lossy().into_owned();
     let started = Instant::now();
     if cache_path.join("HEAD").is_file() {
+        // Browse returns immutable full SHAs. Once those exact objects exist
+        // in the bare cache, another network fetch cannot make the requested
+        // comparison/export more correct; it can only delay it. Branch/tag
+        // names still fetch every time because their targets may have moved.
+        if cache_has_exact_revisions(&cache_path, required_revisions) {
+            perf_log(&format!("github_module_cache: reuse exact objects {owner}/{repository_name} revisions={}", required_revisions.len()), started.elapsed());
+            return Ok(cache_path);
+        }
         git_with_timeout(&cache_text, &["fetch", "--prune", "origin", "+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"], Duration::from_secs(300), "5 minutes")
             .map_err(|error| format!("Could not update cached module {owner}/{repository_name}: {error}"))?;
         perf_log(&format!("github_module_cache: fetch {owner}/{repository_name}"), started.elapsed());
@@ -8044,7 +8144,7 @@ pub async fn compare_submodule_revisions_file_list(repository_path: String, subm
 #[tauri::command]
 pub async fn compare_github_module_revisions_directory(repository_path: String, owner: String, repository_name: String, relative_path: String, left_ref: String, right_ref: String) -> Result<RevisionCompareDirectory, String> {
     off_main_thread(move || {
-        let cache = ensure_github_module_cache(&repository_path, &owner, &repository_name)?;
+        let cache = ensure_github_module_cache(&repository_path, &owner, &repository_name, &[&left_ref, &right_ref])?;
         let cache_path = cache.to_string_lossy().into_owned();
         compare_git_tree_directory(&cache_path, &relative_path, &left_ref, &right_ref)
     }).await
@@ -8053,7 +8153,7 @@ pub async fn compare_github_module_revisions_directory(repository_path: String, 
 #[tauri::command]
 pub async fn compare_github_module_revisions_file_list(repository_path: String, owner: String, repository_name: String, relative_path: String, left_ref: String, right_ref: String) -> Result<RevisionCompareDirectory, String> {
     off_main_thread(move || {
-        let cache = ensure_github_module_cache(&repository_path, &owner, &repository_name)?;
+        let cache = ensure_github_module_cache(&repository_path, &owner, &repository_name, &[&left_ref, &right_ref])?;
         let cache_path = cache.to_string_lossy().into_owned();
         compare_git_tree_file_list(&cache_path, &relative_path, &left_ref, &right_ref)
     }).await
@@ -8082,7 +8182,7 @@ fn compare_submodule_revision_file_inner(repository_path: String, submodule_path
 #[tauri::command]
 pub async fn compare_github_module_revision_file(repository_path: String, owner: String, repository_name: String, relative_path: String, left_ref: String, right_ref: String) -> Result<FileComparison, String> {
     off_main_thread(move || {
-        let cache = ensure_github_module_cache(&repository_path, &owner, &repository_name)?;
+        let cache = ensure_github_module_cache(&repository_path, &owner, &repository_name, &[&left_ref, &right_ref])?;
         let cache_path = cache.to_string_lossy().into_owned();
         compare_git_tree_file(&cache_path, &relative_path, &left_ref, &right_ref)
     }).await
@@ -8208,7 +8308,7 @@ fn export_submodule_compare_snapshots_inner(repository_path: String, submodule_p
 #[tauri::command]
 pub async fn export_github_module_compare_snapshots(repository_path: String, owner: String, repository_name: String, left_ref: String, right_ref: String, destination_path: String) -> Result<SubmoduleCompareSnapshotExport, String> {
     off_main_thread(move || {
-        let cache = ensure_github_module_cache(&repository_path, &owner, &repository_name)?;
+        let cache = ensure_github_module_cache(&repository_path, &owner, &repository_name, &[&left_ref, &right_ref])?;
         let (_, repository_name) = validate_github_module_identity(&owner, &repository_name)?;
         export_revision_pair_from_repository(&cache, &repository_name, &left_ref, &right_ref, &destination_path)
     }).await
@@ -8244,7 +8344,7 @@ fn export_revision_pair_from_repository(repository_path: &Path, display_name: &s
 #[tauri::command]
 pub async fn export_github_module_revision_snapshot(repository_path: String, owner: String, repository_name: String, revision: String, destination_path: String) -> Result<RevisionSnapshotExport, String> {
     off_main_thread(move || {
-        let cache = ensure_github_module_cache(&repository_path, &owner, &repository_name)?;
+        let cache = ensure_github_module_cache(&repository_path, &owner, &repository_name, &[&revision])?;
         let (_, repository_name) = validate_github_module_identity(&owner, &repository_name)?;
         let destination = PathBuf::from(destination_path);
         if !destination.is_dir() {
@@ -17431,6 +17531,32 @@ mod tests {
         assert!(Repository::open(&parent).unwrap().find_branch("main", BranchType::Local).is_ok(), "the parent's own main branch must still be completely untouched throughout");
 
         fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn credential_helper_diagnostics_classify_without_logging_configuration_details() {
+        assert_eq!(classify_credential_helpers(b"manager-core\n"), "manager-core");
+        assert_eq!(classify_credential_helpers(b"manager\nosxkeychain\nmanager\n"), "manager+osxkeychain");
+        assert_eq!(classify_credential_helpers(b"!secret-bearing custom command\n"), "custom");
+        assert_eq!(classify_credential_helpers(b""), "none");
+    }
+
+    #[test]
+    fn github_module_cache_reuses_only_exact_commit_objects() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let repository = std::env::temp_dir().join(format!("git-integrity-module-cache-{suffix}"));
+        create_libgit2_repository(&repository, "module.txt");
+        let oid = Repository::open(&repository).unwrap().head().unwrap().target().unwrap().to_string();
+
+        assert!(exact_commit_oid(&oid).is_some());
+        assert!(cache_has_exact_revisions(&repository, &[&oid]));
+        assert!(!cache_has_exact_revisions(&repository, &["HEAD"]), "a movable ref must still fetch before it is used");
+        assert!(!cache_has_exact_revisions(&repository, &[&oid[..12]]), "an abbreviated SHA is not strong enough to skip network refresh");
+        assert!(!cache_has_exact_revisions(&repository, &[]));
+        let missing = "0000000000000000000000000000000000000000";
+        assert!(!cache_has_exact_revisions(&repository, &[missing]));
+
+        fs::remove_dir_all(repository).unwrap();
     }
 
     #[test]

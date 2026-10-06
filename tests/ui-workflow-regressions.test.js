@@ -301,9 +301,13 @@ test('a selected submodule can be promoted to the normal full repository context
 test('the footer stays one-line while double-click exposes complete Git command results', () => {
   assert.match(app, /function status\(message, kind = ''\) \{[\s\S]*?if \(kind !== 'busy'\) refreshCommandHint\(\);/);
   assert.match(app, /async function refreshCommandHint\(\)[\s\S]*?invoke\('recent_git_commands'\)/);
-  assert.match(app, /commands\.find\(entry => entry\.running\) \|\| commands\[0\]/);
-  assert.match(app, /latest\.running \? 'running · ' : ''/);
+  assert.match(app, /const running = commands\.find\(entry => entry\.running\)/);
+  assert.doesNotMatch(app, /commands\.find\(entry => entry\.running\) \|\| commands\[0\]/, 'a completed command must stay in double-click history, not masquerade as current footer activity');
+  assert.match(app, /generation !== commandHintRefreshGeneration/);
+  assert.match(app, /refs\.statusCommandHint\.textContent = `running · \$\{running\.repo_hint\}: \$\{running\.command\}`/);
   assert.match(app, /setInterval\(\(\) => \{ if \(refs\.statusDot\.classList\.contains\('busy'\)\) refreshCommandHint\(\); \}, 750\)/);
+  assert.match(app, /footerStatusResetTimer = setTimeout\([\s\S]*?7_000/);
+  assert.match(app, /if \(changedContext\) resetFooterForContextChange\(\)/);
   assert.match(app, /refs\.statusFooter\.addEventListener\('dblclick', openCommandHistoryDialog\)/);
   assert.match(html, /id="commandHistoryDialog"/);
   assert.match(html, /id="statusCommandHint"/);

@@ -1035,7 +1035,7 @@ button.pr-reviewer:hover { border-color: #59758e; background: #1b2b38; color: #e
 .commit-scope-label.row input[type="checkbox"] { height: auto; width: auto; }
 
 footer { display: flex; align-items: center; gap: 8px; padding: 0 12px; background: #0b1015; border-top: 1px solid var(--border); color: #7f8f9f; font-size: 11px; }
-.footer-spacer { flex: 1; }.status-dot { flex: 0 0 8px; width: 8px; height: 8px; border-radius: 50%; background: var(--green); }.status-dot.error { background: var(--red); }.status-dot.busy { background: var(--amber); }.branch-footer { flex: 0 0 auto; padding-left: 14px; border-left: 1px solid var(--border); }.branch-footer b { color: #a8b8c7; }
+.footer-spacer { flex: 1; }.status-dot { flex: 0 0 8px; width: 8px; height: 8px; border-radius: 50%; background: var(--green); }.status-dot.error { background: var(--red); }.status-dot.busy, .status-dot.notice { background: var(--amber); }.branch-footer { flex: 0 0 auto; padding-left: 14px; border-left: 1px solid var(--border); }.branch-footer b { color: #a8b8c7; }
 .build-footer { padding-left: 14px; border-left: 1px solid var(--border); font-family: ui-monospace, monospace; color: #5c6b7a; }
 /* Deliberately quieter than the status text next to it — a passing trace of
    what the app just ran, not something meant to compete for attention.

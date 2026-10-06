@@ -314,16 +314,40 @@ function commitSubjectHtml(subject = '') {
   }
   parts.push(esc(subject.slice(cursor))); return parts.join('');
 }
+let footerStatusResetTimer = null;
+function setFooterReady() {
+  clearTimeout(footerStatusResetTimer); footerStatusResetTimer = null;
+  refs.statusText.textContent = 'Ready';
+  refs.statusText.title = '';
+  refs.statusDot.className = 'status-dot';
+  refreshCommandHint();
+}
+function resetFooterForContextChange() {
+  // Never erase genuine progress just because the user navigated while an
+  // operation is running. Once it finishes, status() below owns the result.
+  if (refs.statusDot.classList.contains('busy')) return;
+  setFooterReady();
+}
 function status(message, kind = '') {
+  clearTimeout(footerStatusResetTimer); footerStatusResetTimer = null;
   const fullMessage = String(message ?? '');
   const compactMessage = fullMessage.replace(/\s+/g, ' ').trim();
-  refs.statusText.textContent = compactMessage;
+  refs.statusText.textContent = compactMessage || 'Ready';
   refs.statusText.title = fullMessage !== compactMessage || compactMessage.length > 180 ? fullMessage : '';
   refs.statusDot.className = `status-dot ${kind}`;
   // Completed actions refresh immediately. Busy actions are refreshed by the
   // lightweight, busy-only ticker below after the backend has registered the
   // exact Git subprocess; failures here never mask the real operation.
   if (kind !== 'busy') refreshCommandHint();
+  else refs.statusCommandHint.hidden = true;
+  // Ordinary completion messages are confirmations, not permanent state.
+  // Errors and explicit notices stay until the next action/context change so
+  // information that requires a decision is never silently removed.
+  if (!kind && compactMessage) {
+    footerStatusResetTimer = setTimeout(() => {
+      if (refs.statusText.textContent === compactMessage && !refs.statusDot.classList.contains('busy')) setFooterReady();
+    }, 7_000);
+  }
 }
 let toastTimer; function showOperationToast(message, kind = '') { clearTimeout(toastTimer); refs.operationToast.textContent = message; refs.operationToast.className = `operation-toast ${kind}`; refs.operationToast.hidden = false; toastTimer = setTimeout(() => { refs.operationToast.hidden = true; }, 7000); }
 
@@ -404,23 +428,27 @@ function renderPersonalNoteSection(entry) {
 
 // The footer remains a single, deliberately quiet line. The richer command,
 // timing and output data lives only in the console opened by double-click.
-let commandHintRefreshInFlight = false;
+let commandHintRefreshGeneration = 0;
 async function refreshCommandHint() {
-  if (!invoke || commandHintRefreshInFlight) return;
-  commandHintRefreshInFlight = true;
+  if (!invoke) { refs.statusCommandHint.hidden = true; return; }
+  const generation = ++commandHintRefreshGeneration;
   try {
     const commands = await invoke('recent_git_commands');
-    // Prefer a currently running subprocess over a newer command that already
-    // finished; otherwise a fast status probe can hide the slow command the
-    // user is actually waiting for.
-    const latest = commands.find(entry => entry.running) || commands[0];
-    if (!latest) { refs.statusCommandHint.hidden = true; return; }
-    refs.statusCommandHint.textContent = `${latest.running ? 'running · ' : ''}${latest.repo_hint}: ${latest.command}`;
-    refs.statusCommandHint.classList.toggle('status-command-running', !!latest.running);
-    refs.statusCommandHint.classList.toggle('status-command-failed', !latest.running && !latest.success);
+    // An older response must never overwrite a newer completion refresh. That
+    // race previously left a finished command looking active indefinitely.
+    if (generation !== commandHintRefreshGeneration) return;
+    const running = commands.find(entry => entry.running);
+    if (!running) {
+      refs.statusCommandHint.textContent = '';
+      refs.statusCommandHint.classList.remove('status-command-running', 'status-command-failed');
+      refs.statusCommandHint.hidden = true;
+      return;
+    }
+    refs.statusCommandHint.textContent = `running · ${running.repo_hint}: ${running.command}`;
+    refs.statusCommandHint.classList.add('status-command-running');
+    refs.statusCommandHint.classList.remove('status-command-failed');
     refs.statusCommandHint.hidden = false;
   } catch { /* quiet by design — never disturb the action this rode along with */ }
-  finally { commandHintRefreshInFlight = false; }
 }
 
 function commandDurationText(entry) {
@@ -2555,7 +2583,9 @@ async function fetchAndRenderDirectory(path, requestId, options) {
 // after the mutation's own reload had just paid for one.
 async function openDirectory(path, options = {}) {
   if (!state.repository) return;
+  const changedContext = state.currentPath !== path;
   state.currentPath = path; state.selectedEntry = null;
+  if (changedContext) resetFooterForContextChange();
   const requestId = ++explorerRequestSeq;
 
   // During fast repository open, the expensive full status scan is already
@@ -2599,7 +2629,9 @@ async function paintDirectoryFast(path, requestId) {
 
 async function openDirectoryFast(path) {
   if (!state.repository) return;
+  const changedContext = state.currentPath !== path;
   state.currentPath = path; state.selectedEntry = null;
+  if (changedContext) resetFooterForContextChange();
   const requestId = ++explorerRequestSeq;
   await paintDirectoryFast(path, requestId);
 }
@@ -3551,7 +3583,7 @@ async function maybeOfferSubmoduleUpdateAfterMerge(target, beforeHead = '', oper
     { title: `Update submodules after ${operationLabel}?`, okLabel: 'Update submodules' }
   );
   if (ok) await initAndUpdateSubmodulesFromActions();
-  else status(`${operation} completed. Submodule folders were not updated; run “Init / Update Submodules” when you want to align them.`);
+  else status(`${operation} completed. Submodule folders were not updated; run “Init / Update Submodules” when you want to align them.`, 'notice');
 }
 async function maybeOfferSubmoduleUpdateBeforeMergeCommit(review) {
   if (!state.repository || review?.target?.isSubmodule) return;
@@ -3565,9 +3597,9 @@ async function maybeOfferSubmoduleUpdateBeforeMergeCommit(review) {
   );
   if (ok) {
     await initAndUpdateSubmodulesFromActions();
-    status('Submodules updated. Merge is still pending — run the build, then create the merge commit if it passes.');
+    status('Submodules updated. Merge is still pending — run the build, then create the merge commit if it passes.', 'notice');
   } else {
-    status('Merge is still pending. Submodule folders were not updated; run “Submodule update --init --recursive” before build if they are empty.');
+    status('Merge is still pending. Submodule folders were not updated; run “Submodule update --init --recursive” before build if they are empty.', 'notice');
   }
 }
 
@@ -4458,7 +4490,7 @@ async function openSubmoduleGraph(entry) {
 // the only difference from just navigating to Explorer directly is that this
 // remembers state.currentPath is already correct (it was never touched) so
 // no repository reload is needed, just a folder repaint.
-function leaveSubmoduleGraph() { if (!state.submoduleGraph) return; state.submoduleGraph = null; state.view = 'explorer'; render(); openDirectory(state.currentPath, { force: true }); }
+function leaveSubmoduleGraph() { if (!state.submoduleGraph) return; resetFooterForContextChange(); state.submoduleGraph = null; state.view = 'explorer'; render(); openDirectory(state.currentPath, { force: true }); }
 
 // Any navigation away from the graph view that ISN'T the explicit "Back to
 // parent repository" button above — Project Explorer, Compare & Sync,
@@ -4719,6 +4751,7 @@ function renderRemotes() {
 
 const loadRemotesGuard = createRequestGuard();
 async function loadRemotes() {
+  if (state.view !== 'remotes') resetFooterForContextChange();
   state.view = 'remotes'; refs.search.value = ''; clearDetails('Remote configuration');
   const stillCurrent = loadRemotesGuard();
   if (invoke) {
@@ -6927,6 +6960,7 @@ $('#closeChanges').addEventListener('click', () => refs.changesDrawer.classList.
 let searchTimeout; refs.search.addEventListener('input', () => { clearTimeout(searchTimeout); if (!refs.search.value.trim()) state.graphOnlySearchMatches = false; searchTimeout = setTimeout(() => { if (state.view === 'explorer') renderExplorer(); else if (state.view === 'commander' && state.compareMode === 'local-drive') localDriveWorkspace?.setFilter(refs.search.value); else if (state.view === 'commander') renderCommander(); else renderGraph(); }, 200); }); refs.commitMessage.addEventListener('input', renderChanges);
 async function returnToProjectNavigator() {
   closeSubmoduleGraph();
+  if (state.view !== 'explorer') resetFooterForContextChange();
   const selectedPath = state.selectedEntry?.relative_path;
   state.view = 'explorer'; state.selectedCommit = null; refs.search.value = ''; render();
   if (state.localDriveGitRefreshPending && invoke && state.repository) {
@@ -6951,6 +6985,7 @@ function syncLocalDriveToCommanderPath() {
 $('#navCommander').addEventListener('click', () => {
   const submoduleContext = currentSubmoduleCompareContext();
   closeSubmoduleGraph();
+  if (state.view !== 'commander') resetFooterForContextChange();
   const selected = state.selectedEntry;
   const nextCommanderPath = selected?.kind === 'file' ? parentPathOf(selected.relative_path) : selected?.kind === 'folder' ? selected.relative_path : state.currentPath;
   state.commanderFocus = selected?.kind === 'file' ? selected.relative_path : '';
@@ -6979,7 +7014,7 @@ refs.compareModeSubmodule.addEventListener('click', () => {
   render();
   if (state.submoduleCompare?.submodulePath) openSubmoduleCompareDirectory(state.commanderPath);
 });
-$('#navGraph').addEventListener('click', () => { closeSubmoduleGraph(); state.commits = state.allCommits.length ? state.allCommits : state.commits; state.historyScope = ''; state.historyKind = ''; state.selectedEntry = null; state.selectedCommit = null; state.view = 'graph'; refs.search.value = ''; clearDetails('Select a commit'); render(); });
+$('#navGraph').addEventListener('click', () => { closeSubmoduleGraph(); if (state.view !== 'graph') resetFooterForContextChange(); state.commits = state.allCommits.length ? state.allCommits : state.commits; state.historyScope = ''; state.historyKind = ''; state.selectedEntry = null; state.selectedCommit = null; state.view = 'graph'; refs.search.value = ''; clearDetails('Select a commit'); render(); });
 $('#navRemotes').addEventListener('click', () => { closeSubmoduleGraph(); loadRemotes(); });
 refs.leaveSubmoduleGraph.addEventListener('click', leaveSubmoduleGraph);
 // Covers window/pane resizes (a narrower details panel, dragging the app
