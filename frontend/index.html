@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Git DrillDown</title>
   <link rel="icon" type="image/png" href="assets/git-drilldown-mark.png">
-  <link rel="stylesheet" href="styles.css?v=20261005e-clean-checkout">
+  <link rel="stylesheet" href="styles.css?v=20261006g-command-console">
 </head>
 <body>
   <div class="app-shell">
@@ -263,7 +263,7 @@
       <footer id="subRevisionHelp">Loaded suggestions are instant. “Search all history” may walk more commits, but only when you ask.</footer>
     </dialog>
 
-    <footer id="statusFooter" title="Double-click for recent command history">
+    <footer id="statusFooter" title="Double-click to open the full Git command console">
       <span id="statusDot" class="status-dot"></span><span id="statusText">Ready</span>
       <code id="statusCommandHint" class="status-command-hint" hidden></code>
       <span class="footer-spacer"></span><span class="branch-footer">⑂ <b id="currentBranch">No branch</b></span>
@@ -703,9 +703,9 @@
       <footer><span style="flex:1"></span><button value="cancel">Close</button></footer>
     </form>
   </dialog>
-  <dialog id="commandHistoryDialog" class="publish-dialog">
+  <dialog id="commandHistoryDialog" class="publish-dialog command-history-dialog">
     <form method="dialog">
-      <header><div><h2>Recent commands</h2><p>The actual Git commands this app ran, including Git commands launched from Terminal/App Actions. The full Terminal transcript stays in the Terminal tab.</p></div><button value="cancel">×</button></header>
+      <header><div><h2>Git command console</h2><p>Full commands, timing and captured output for this app session. The footer stays compact; double-click it whenever you need these details.</p></div><button value="cancel">×</button></header>
       <div id="commandHistoryList" class="conflicts-list"></div>
       <footer><span style="flex:1"></span><button value="cancel">Close</button></footer>
     </form>
@@ -738,13 +738,13 @@
       <footer><button value="cancel">Cancel</button><button type="button" value="default" id="confirmNewTag" class="confirm">Create tag</button></footer>
     </form>
   </dialog>
-  <script src="console-context.js?v=20261005e-clean-checkout"></script>
-  <script src="graph-model.js?v=20261005e-clean-checkout"></script>
-  <script src="submodule-state.js?v=20261005e-clean-checkout"></script>
-  <script src="submodule-versions.js?v=20261005e-clean-checkout"></script>
-  <script src="local-diff.js?v=20261005e-clean-checkout"></script>
-  <script src="local-drive.js?v=20261005e-clean-checkout"></script>
-  <script src="pr-status.js?v=20261005e-clean-checkout"></script>
-  <script src="app.js?v=20261005e-clean-checkout"></script>
+  <script src="console-context.js?v=20261006g-command-console"></script>
+  <script src="graph-model.js?v=20261006g-command-console"></script>
+  <script src="submodule-state.js?v=20261006g-command-console"></script>
+  <script src="submodule-versions.js?v=20261006g-command-console"></script>
+  <script src="local-diff.js?v=20261006g-command-console"></script>
+  <script src="local-drive.js?v=20261006g-command-console"></script>
+  <script src="pr-status.js?v=20261006g-command-console"></script>
+  <script src="app.js?v=20261006g-command-console"></script>
 </body>
 </html>

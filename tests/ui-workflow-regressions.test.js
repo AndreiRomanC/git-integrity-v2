@@ -298,21 +298,19 @@ test('a selected submodule can be promoted to the normal full repository context
   assert.doesNotMatch(css, /button\[data-detail-action="subopenfull"\]::before/);
 });
 
-test('the status bar quietly shows the last real git command, and the footer opens its full history on double-click', () => {
-  // 'busy' means the action is still in flight — the command that will
-  // explain it hasn't been recorded on the backend yet, so refreshing then
-  // would show last time's stale command instead of this one's.
+test('the footer stays one-line while double-click exposes complete Git command results', () => {
   assert.match(app, /function status\(message, kind = ''\) \{[\s\S]*?if \(kind !== 'busy'\) refreshCommandHint\(\);/);
   assert.match(app, /async function refreshCommandHint\(\)[\s\S]*?invoke\('recent_git_commands'\)/);
+  assert.match(app, /commands\.find\(entry => entry\.running\) \|\| commands\[0\]/);
+  assert.match(app, /latest\.running \? 'running · ' : ''/);
+  assert.match(app, /setInterval\(\(\) => \{ if \(refs\.statusDot\.classList\.contains\('busy'\)\) refreshCommandHint\(\); \}, 750\)/);
   assert.match(app, /refs\.statusFooter\.addEventListener\('dblclick', openCommandHistoryDialog\)/);
   assert.match(html, /id="commandHistoryDialog"/);
   assert.match(html, /id="statusCommandHint"/);
-  // Its own row, not a reuse of .publish-commit: that class assumes a
-  // 4-column grid (checkbox/index, dot, 1fr content, badge) built for a
-  // clickable, togglable push-commit list — neither applies to this plain,
-  // unclickable 2-column read history, and .excluded means "de-prioritized"
-  // there, the wrong signal for "this command failed".
-  assert.match(app, /function commandHistoryRowHtml\(entry\) \{[\s\S]*?class="command-history-row \$\{entry\.success \? '' : 'failed'\}"/);
+  assert.match(app, /function commandHistoryRowHtml\(entry\) \{[\s\S]*?entry\.stdout[\s\S]*?entry\.stderr[\s\S]*?entry\.error/);
+  assert.match(app, /commandDurationText\(entry\)/);
+  assert.match(css, /\.command-history-command \{[^}]*white-space: pre-wrap;[^}]*overflow-wrap: anywhere;[^}]*user-select: text/);
+  assert.match(css, /#statusText \{[^}]*text-overflow: ellipsis;[^}]*white-space: nowrap/);
 });
 
 test('large Git errors stay inside the status footer instead of covering the application', () => {
@@ -663,15 +661,16 @@ test('working tree submodule rows route to a meaningful compare instead of an em
   assert.match(repository, /parent_gitlink_oid\(&parent, &relative_path, false\)/);
 });
 
-test('main project merges ask before updating submodule working trees', () => {
+test('main project merges and pulls ask before updating changed submodule working trees', () => {
   assert.match(app, /function parseChangedSubmodulePaths\(rawDiff = ''\)/);
   assert.match(app, /160000/);
-  assert.match(app, /function maybeOfferSubmoduleUpdateAfterMerge\(target, beforeHead = ''\)/);
+  assert.match(app, /function maybeOfferSubmoduleUpdateAfterMerge\(target, beforeHead = '', operation = 'Merge'\)/);
   assert.match(app, /target\?\.isSubmodule\) return/);
-  assert.match(app, /Update submodules after merge\?/);
+  assert.match(app, /Update submodules after \$\{operationLabel\}\?/);
   assert.match(app, /git submodule update --init --recursive/);
   assert.match(app, /await maybeOfferSubmoduleUpdateAfterMerge\(target, beforeHead\)/);
   assert.match(app, /await maybeOfferSubmoduleUpdateAfterMerge\(target\)/);
+  assert.match(app, /await maybeOfferSubmoduleUpdateAfterMerge\(\{ isSubmodule: false \}, beforeHead, 'Pull'\)/);
   assert.match(app, /await initAndUpdateSubmodulesFromActions\(\)/);
 });
 

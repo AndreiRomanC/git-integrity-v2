@@ -320,11 +320,9 @@ function status(message, kind = '') {
   refs.statusText.textContent = compactMessage;
   refs.statusText.title = fullMessage !== compactMessage || compactMessage.length > 180 ? fullMessage : '';
   refs.statusDot.className = `status-dot ${kind}`;
-  // 'busy' means something is still in flight — the command that will
-  // eventually explain it hasn't been recorded yet, so there is nothing
-  // new to show until whatever comes after (success/error/plain) calls
-  // this again. Discreet by design: never awaited, never lets a failure
-  // here surface as if it were the actual action's own error.
+  // Completed actions refresh immediately. Busy actions are refreshed by the
+  // lightweight, busy-only ticker below after the backend has registered the
+  // exact Git subprocess; failures here never mask the real operation.
   if (kind !== 'busy') refreshCommandHint();
 }
 let toastTimer; function showOperationToast(message, kind = '') { clearTimeout(toastTimer); refs.operationToast.textContent = message; refs.operationToast.className = `operation-toast ${kind}`; refs.operationToast.hidden = false; toastTimer = setTimeout(() => { refs.operationToast.hidden = true; }, 7000); }
@@ -404,33 +402,53 @@ function renderPersonalNoteSection(entry) {
   return `<div class="detail-section personal-note-section"><div class="personal-note-header"><h3>NOTES</h3><div class="personal-note-actions"><button data-note-action="edit">Edit</button><button data-note-action="delete">Delete</button></div></div><p>${esc(preview)}</p></div>`;
 }
 
-// Report: show the real git commands the app runs, quietly, next to the
-// status text — not a replacement for the Terminal's own transcript (that
-// already covers commands the user typed there directly), just a glanceable
-// trace of what this app itself just did. Double-click the footer for the
-// fuller, still-discreet history (openCommandHistoryDialog below).
+// The footer remains a single, deliberately quiet line. The richer command,
+// timing and output data lives only in the console opened by double-click.
+let commandHintRefreshInFlight = false;
 async function refreshCommandHint() {
-  if (!invoke) return;
+  if (!invoke || commandHintRefreshInFlight) return;
+  commandHintRefreshInFlight = true;
   try {
-    const [latest] = await invoke('recent_git_commands');
+    const commands = await invoke('recent_git_commands');
+    // Prefer a currently running subprocess over a newer command that already
+    // finished; otherwise a fast status probe can hide the slow command the
+    // user is actually waiting for.
+    const latest = commands.find(entry => entry.running) || commands[0];
     if (!latest) { refs.statusCommandHint.hidden = true; return; }
-    refs.statusCommandHint.textContent = `${latest.repo_hint}: ${latest.command}`;
-    refs.statusCommandHint.classList.toggle('status-command-failed', !latest.success);
+    refs.statusCommandHint.textContent = `${latest.running ? 'running · ' : ''}${latest.repo_hint}: ${latest.command}`;
+    refs.statusCommandHint.classList.toggle('status-command-running', !!latest.running);
+    refs.statusCommandHint.classList.toggle('status-command-failed', !latest.running && !latest.success);
     refs.statusCommandHint.hidden = false;
   } catch { /* quiet by design — never disturb the action this rode along with */ }
+  finally { commandHintRefreshInFlight = false; }
+}
+
+function commandDurationText(entry) {
+  if (entry.running) return `running for ${entry.seconds_ago < 1 ? '<1s' : `${Math.round(entry.seconds_ago)}s`}`;
+  const milliseconds = Number(entry.duration_ms || 0);
+  if (milliseconds < 1_000) return `${Math.max(0, Math.round(milliseconds))}ms`;
+  if (milliseconds < 60_000) return `${(milliseconds / 1_000).toFixed(milliseconds < 10_000 ? 1 : 0)}s`;
+  return `${Math.floor(milliseconds / 60_000)}m ${Math.round((milliseconds % 60_000) / 1_000)}s`;
 }
 
 function commandHistoryRowHtml(entry) {
   const ago = entry.seconds_ago < 60 ? `${Math.max(0, Math.round(entry.seconds_ago))}s ago`
     : entry.seconds_ago < 3600 ? `${Math.round(entry.seconds_ago / 60)}m ago`
     : `${Math.round(entry.seconds_ago / 3600)}h ago`;
-  // A dedicated class, not a reuse of .publish-commit: that class assumes a
-  // 4-column grid (index/checkbox, dot, 1fr content, badge) and a clickable
-  // row (cursor:pointer, hover highlight) for toggling what gets pushed —
-  // neither applies here, this list is a plain, unclickable 2-column read
-  // history. .excluded's dim-to-de-prioritize styling is also the wrong
-  // signal for "this command failed", which should stand out, not fade out.
-  return `<div class="command-history-row ${entry.success ? '' : 'failed'}"><span>${entry.success ? '✓' : '✗'}</span><div><strong><code>${esc(entry.command)}</code></strong><small>${esc(entry.repo_hint)} · ${ago}</small></div></div>`;
+  const stateClass = entry.running ? 'running' : entry.success ? 'success' : 'failed';
+  const stateLabel = entry.running ? 'RUNNING' : entry.success ? 'SUCCESS' : 'FAILED';
+  const exitText = entry.running || entry.exit_code == null ? '' : ` · exit ${entry.exit_code}`;
+  const streams = [];
+  if (entry.stdout) streams.push(`<section><b>OUTPUT</b><pre>${esc(entry.stdout)}</pre></section>`);
+  if (entry.stderr) streams.push(`<section class="stderr"><b>ERROR OUTPUT</b><pre>${esc(entry.stderr)}</pre></section>`);
+  if (entry.error) streams.push(`<section class="stderr"><b>COMMAND ERROR</b><pre>${esc(entry.error)}</pre></section>`);
+  const result = streams.length ? streams.join('')
+    : `<div class="command-history-empty-output">${entry.running ? 'Waiting for Git to finish…' : entry.success ? 'Completed successfully — no output.' : 'The command failed without additional output.'}</div>`;
+  return `<article class="command-history-row ${stateClass}">
+    <div class="command-history-summary"><span class="command-history-state">${stateLabel}</span><span>${esc(entry.repo_hint)} · ${entry.running ? commandDurationText(entry) : `${ago} · ${commandDurationText(entry)}`}${exitText}</span></div>
+    <code class="command-history-command">${esc(entry.command)}</code>
+    <div class="command-history-output">${result}</div>
+  </article>`;
 }
 
 async function openCommandHistoryDialog() {
@@ -443,6 +461,10 @@ async function openCommandHistoryDialog() {
   } catch (error) { const message = handleError(error); showOperationToast(`Could not load command history: ${message}`, 'error'); }
 }
 refs.statusFooter.addEventListener('dblclick', openCommandHistoryDialog);
+// Poll only while an operation is already marked busy. The local class check
+// costs nothing and avoids a permanent backend polling loop while still
+// letting a long Git command replace the previous footer hint with RUNNING.
+setInterval(() => { if (refs.statusDot.classList.contains('busy')) refreshCommandHint(); }, 750);
 
 // Keep progress attached to the exact control the user pressed. The global
 // status bar is useful context, but on a busy screen it is too easy to miss
@@ -3512,7 +3534,7 @@ async function changedSubmodulesBetweenRefs(fromRef, toRef = 'HEAD') {
   if (!result?.success) return [];
   return parseChangedSubmodulePaths(result.stdout || '');
 }
-async function maybeOfferSubmoduleUpdateAfterMerge(target, beforeHead = '') {
+async function maybeOfferSubmoduleUpdateAfterMerge(target, beforeHead = '', operation = 'Merge') {
   if (!state.repository || target?.isSubmodule) return;
   let changed = [];
   try {
@@ -3523,12 +3545,13 @@ async function maybeOfferSubmoduleUpdateAfterMerge(target, beforeHead = '') {
   if (!changed.length) return;
   const shown = changed.slice(0, 6).map(path => `- ${path}`).join('\n');
   const more = changed.length > 6 ? `\n- …and ${changed.length - 6} more` : '';
+  const operationLabel = operation === 'Pull' ? 'pull' : 'merge';
   const ok = await customConfirm(
-    `This merge changed ${changed.length} submodule version${changed.length === 1 ? '' : 's'}:\n${shown}${more}\n\nUpdate/init submodules now so the folders on disk match the merged project?\n\nThis runs:\ngit submodule update --init --recursive`,
-    { title: 'Update submodules after merge?', okLabel: 'Update submodules' }
+    `This ${operationLabel} changed ${changed.length} submodule version${changed.length === 1 ? '' : 's'}:\n${shown}${more}\n\nUpdate/init submodules now so the folders on disk match the updated project?\n\nThis runs:\ngit submodule update --init --recursive`,
+    { title: `Update submodules after ${operationLabel}?`, okLabel: 'Update submodules' }
   );
   if (ok) await initAndUpdateSubmodulesFromActions();
-  else status('Merge completed. Submodule folders were not updated; run “Init / Update Submodules” when you want to align them.');
+  else status(`${operation} completed. Submodule folders were not updated; run “Init / Update Submodules” when you want to align them.`);
 }
 async function maybeOfferSubmoduleUpdateBeforeMergeCommit(review) {
   if (!state.repository || review?.target?.isSubmodule) return;
@@ -6995,7 +7018,14 @@ $('#fetchProject').addEventListener('click', event => fetchProjectAndSubmodules(
 async function syncCurrent(action, button = null) {
   if (!invoke || !state.repository) return;
   const finishButton = beginButtonOperation(button, action === 'pull' ? 'Pulling…' : 'Pushing…');
-  try { status(`${action === 'pull' ? 'Pulling' : 'Pushing'} ${state.repository.current_branch}…`, 'busy'); await invoke('sync_repository', { repositoryPath: state.repository.path, action }); await loadRepository(state.repository.path, { keepPath: true }); status(`${action === 'pull' ? 'Pull' : 'Push'} complete`); }
+  try {
+    const beforeHead = action === 'pull' ? await currentHeadShaForMergePrompt() : '';
+    status(`${action === 'pull' ? 'Pulling' : 'Pushing'} ${state.repository.current_branch}…`, 'busy');
+    await invoke('sync_repository', { repositoryPath: state.repository.path, action });
+    await loadRepository(state.repository.path, { keepPath: true });
+    status(`${action === 'pull' ? 'Pull' : 'Push'} complete`);
+    if (action === 'pull') await maybeOfferSubmoduleUpdateAfterMerge({ isSubmodule: false }, beforeHead, 'Pull');
+  }
   catch (error) {
     const message = handleError(error);
     if (action === 'pull' && String(error).toLowerCase().includes('requires a merge')) {

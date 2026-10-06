@@ -77,25 +77,27 @@ pub fn run_git_command(repository_path: String, args: String) -> Result<RawGitRe
     if parts.is_empty() { return Err("Type a git subcommand, e.g. \"status\" or \"log --oneline -10\"".into()); }
     let read_only = is_read_only_git_subcommand(&parts[0]);
     let repo_id = anonymized_repository_id(&repository_path);
+    let arg_refs = parts.iter().map(String::as_str).collect::<Vec<_>>();
+    let history_id = begin_git_command(&repository_path, &arg_refs);
     let mut command = Command::new("git");
     configure_git_command(&mut command);
     command.arg("-C").arg(&repository_path).arg("-c").arg("color.ui=false").args(&parts);
     let output = match run_with_timeout(command) {
         Ok(output) => output,
         Err(error) => {
-            let arg_refs = parts.iter().map(String::as_str).collect::<Vec<_>>();
-            record_git_command(&repository_path, &arg_refs, false);
+            finish_git_command(history_id, false, None, "", "", &error);
             perf_log(&format!("run_git_command: {} ({repo_id}, read_only={read_only}) TIMED_OUT", parts[0]), started.elapsed());
             return Err(error);
         }
     };
     perf_log(&format!("run_git_command: {} ({repo_id}, read_only={read_only}) exit_code={:?}", parts[0], output.status.code()), started.elapsed());
-    let arg_refs = parts.iter().map(String::as_str).collect::<Vec<_>>();
-    record_git_command(&repository_path, &arg_refs, output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    finish_git_command(history_id, output.status.success(), output.status.code(), &stdout, &stderr, "");
     invalidate_git_metadata(&repository_path);
     Ok(RawGitResult {
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        stdout,
+        stderr,
         success: output.status.success(),
         exit_code: output.status.code(),
         read_only,
@@ -154,6 +156,10 @@ pub(in crate::repository) fn run_terminal_command_inner(repository_path: String,
                 .then(|| parts.into_iter().skip(1).collect::<Vec<_>>())
         })
         .filter(|parts| !parts.is_empty());
+    let history_id = terminal_git_args.as_ref().map(|parts| {
+        let arg_refs = parts.iter().map(String::as_str).collect::<Vec<_>>();
+        begin_git_command(&repository_path, &arg_refs)
+    });
 
     #[cfg(windows)]
     let mut command = {
@@ -180,23 +186,21 @@ pub(in crate::repository) fn run_terminal_command_inner(repository_path: String,
     let output = match run_with_timeout_labeled(command, GIT_COMMAND_TIMEOUT, "Terminal", "10 minutes") {
         Ok(output) => output,
         Err(error) => {
-            if let Some(parts) = terminal_git_args.as_ref() {
-                let arg_refs = parts.iter().map(String::as_str).collect::<Vec<_>>();
-                record_git_command(&repository_path, &arg_refs, false);
-            }
+            if let Some(history_id) = history_id { finish_git_command(history_id, false, None, "", "", &error); }
             perf_log(&format!("run_terminal_command: ({repo_id}, read_only={read_only}) TIMED_OUT"), started.elapsed());
             return Err(error);
         }
     };
     perf_log(&format!("run_terminal_command: ({repo_id}, read_only={read_only}) exit_code={:?}", output.status.code()), started.elapsed());
-    if let Some(parts) = terminal_git_args.as_ref() {
-        let arg_refs = parts.iter().map(String::as_str).collect::<Vec<_>>();
-        record_git_command(&repository_path, &arg_refs, output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    if let Some(history_id) = history_id {
+        finish_git_command(history_id, output.status.success(), output.status.code(), &stdout, &stderr, "");
     }
     if !read_only { invalidate_git_metadata(&repository_root); }
     Ok(RawGitResult {
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        stdout,
+        stderr,
         success: output.status.success(),
         exit_code: output.status.code(),
         read_only,

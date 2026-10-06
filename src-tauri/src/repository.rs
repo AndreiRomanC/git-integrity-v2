@@ -1,6 +1,6 @@
 use serde::Serialize;
 use git2::{BranchType, ObjectType, Oid, Repository, Sort, Status, StatusOptions};
-use std::{collections::{HashMap, HashSet, VecDeque}, fs, path::{Component, Path, PathBuf}, process::Command, sync::{Arc, Mutex, OnceLock}, time::{Instant, Duration, UNIX_EPOCH}};
+use std::{collections::{HashMap, HashSet, VecDeque}, fs, path::{Component, Path, PathBuf}, process::Command, sync::{Arc, Mutex, OnceLock, atomic::{AtomicU64, Ordering}}, time::{Instant, Duration, UNIX_EPOCH}};
 
 pub mod stash;
 pub mod branches;
@@ -1093,33 +1093,126 @@ fn run_with_timeout_labeled(mut command: Command, timeout: Duration, program_lab
     }
 }
 
-// A short, discreet trail of the actual git commands this app just ran on
-// the user's behalf — for the status bar's own quiet "what just happened"
-// hint and its double-click history, not a replacement for the Terminal's
-// own transcript (which already covers commands the *user* typed directly;
-// recording here is scoped to this one shared helper specifically so it
-// never doubles up with that). Bounded so a long session can't grow this
-// without limit; oldest entries are simply dropped.
+// A bounded trail of the actual Git commands the app runs. The footer uses
+// only the newest command as a quiet, one-line hint; its double-click console
+// uses the richer result below so failures and long-running operations no
+// longer disappear behind a bare success/failure icon.
 const RECENT_GIT_COMMANDS_LIMIT: usize = 50;
-static RECENT_GIT_COMMANDS: OnceLock<Mutex<VecDeque<(String, String, Instant, bool)>>> = OnceLock::new();
+// Enough for useful errors/diffs while keeping 50 unusually noisy commands
+// from turning into an unbounded in-memory transcript. Truncation is explicit
+// in the UI data instead of silently clipping text with CSS.
+const RECENT_GIT_COMMAND_OUTPUT_LIMIT: usize = 64 * 1024;
+static NEXT_RECENT_GIT_COMMAND_ID: AtomicU64 = AtomicU64::new(1);
 
-fn recent_git_commands_store() -> &'static Mutex<VecDeque<(String, String, Instant, bool)>> {
+#[derive(Clone)]
+struct RecentGitCommandRecord {
+    id: u64,
+    repo_hint: String,
+    command: String,
+    started: Instant,
+    finished: Option<Instant>,
+    success: Option<bool>,
+    exit_code: Option<i32>,
+    stdout: String,
+    stderr: String,
+    error: String,
+}
+
+static RECENT_GIT_COMMANDS: OnceLock<Mutex<VecDeque<RecentGitCommandRecord>>> = OnceLock::new();
+
+fn recent_git_commands_store() -> &'static Mutex<VecDeque<RecentGitCommandRecord>> {
     RECENT_GIT_COMMANDS.get_or_init(|| Mutex::new(VecDeque::new()))
 }
 
-fn record_git_command(path: &str, args: &[&str], success: bool) {
+fn display_git_command(args: &[&str]) -> String {
+    // A credential helper or authenticated remote can occasionally put a
+    // secret in a command argument. Keep the diagnostic command useful but
+    // never expose common authorization/password/token values in the UI.
+    let mut redact_next = false;
+    let safe_args = args.iter().map(|arg| {
+        if redact_next {
+            redact_next = false;
+            return "[redacted]".to_string();
+        }
+        let lower = arg.to_ascii_lowercase();
+        if matches!(lower.as_str(), "--password" | "--token" | "--oauth-token") {
+            redact_next = true;
+            return (*arg).to_string();
+        }
+        if lower.contains("authorization:") || lower.contains("http.extraheader=")
+            || lower.starts_with("password=") || lower.starts_with("token=")
+        {
+            return "[redacted credential]".to_string();
+        }
+        (*arg).to_string()
+    }).collect::<Vec<_>>();
+    format!("git {}", safe_args.join(" "))
+}
+
+fn bounded_command_output(value: &str) -> String {
+    if value.len() <= RECENT_GIT_COMMAND_OUTPUT_LIMIT { return value.to_string(); }
+    let mut split = RECENT_GIT_COMMAND_OUTPUT_LIMIT;
+    while !value.is_char_boundary(split) { split -= 1; }
+    format!("{}\n\n[… output truncated after {} KiB …]", &value[..split], RECENT_GIT_COMMAND_OUTPUT_LIMIT / 1024)
+}
+
+fn begin_git_command(path: &str, args: &[&str]) -> u64 {
     // The repository/submodule this ran against, not its full (possibly
     // anonymization-worthy) path — just enough to tell two concurrent
     // targets apart at a glance.
     let repo_hint = Path::new(path).file_name().and_then(|name| name.to_str()).unwrap_or(path).to_string();
-    let command = format!("git {}", args.join(" "));
+    let id = NEXT_RECENT_GIT_COMMAND_ID.fetch_add(1, Ordering::Relaxed);
     let mut store = recent_git_commands_store().lock().unwrap();
     if store.len() >= RECENT_GIT_COMMANDS_LIMIT { store.pop_front(); }
-    store.push_back((repo_hint, command, Instant::now(), success));
+    store.push_back(RecentGitCommandRecord {
+        id,
+        repo_hint,
+        command: display_git_command(args),
+        started: Instant::now(),
+        finished: None,
+        success: None,
+        exit_code: None,
+        stdout: String::new(),
+        stderr: String::new(),
+        error: String::new(),
+    });
+    id
+}
+
+fn finish_git_command(id: u64, success: bool, exit_code: Option<i32>, stdout: &str, stderr: &str, error: &str) {
+    let mut store = recent_git_commands_store().lock().unwrap();
+    if let Some(entry) = store.iter_mut().find(|entry| entry.id == id) {
+        entry.finished = Some(Instant::now());
+        entry.success = Some(success);
+        entry.exit_code = exit_code;
+        entry.stdout = bounded_command_output(stdout);
+        entry.stderr = bounded_command_output(stderr);
+        entry.error = bounded_command_output(error);
+    }
+}
+
+// Small no-output wrapper used by the bounded-store test. Real subprocess
+// paths use begin/finish so "running" is observable.
+#[cfg(test)]
+fn record_git_command(path: &str, args: &[&str], success: bool) {
+    let id = begin_git_command(path, args);
+    finish_git_command(id, success, None, "", "", "");
 }
 
 #[derive(Serialize)]
-pub struct RecentGitCommand { repo_hint: String, command: String, seconds_ago: f64, success: bool }
+pub struct RecentGitCommand {
+    id: u64,
+    repo_hint: String,
+    command: String,
+    seconds_ago: f64,
+    running: bool,
+    success: bool,
+    exit_code: Option<i32>,
+    duration_ms: Option<f64>,
+    stdout: String,
+    stderr: String,
+    error: String,
+}
 
 // Newest first. Read fresh on demand (no push/event channel) — this is a
 // deliberately low-stakes, glanceable feature, not something that needs to
@@ -1127,7 +1220,19 @@ pub struct RecentGitCommand { repo_hint: String, command: String, seconds_ago: f
 #[tauri::command]
 pub fn recent_git_commands() -> Vec<RecentGitCommand> {
     recent_git_commands_store().lock().unwrap().iter().rev()
-        .map(|(repo_hint, command, when, success)| RecentGitCommand { repo_hint: repo_hint.clone(), command: command.clone(), seconds_ago: when.elapsed().as_secs_f64(), success: *success })
+        .map(|entry| RecentGitCommand {
+            id: entry.id,
+            repo_hint: entry.repo_hint.clone(),
+            command: entry.command.clone(),
+            seconds_ago: entry.started.elapsed().as_secs_f64(),
+            running: entry.finished.is_none(),
+            success: entry.success.unwrap_or(false),
+            exit_code: entry.exit_code,
+            duration_ms: entry.finished.map(|finished| finished.duration_since(entry.started).as_secs_f64() * 1_000.0),
+            stdout: entry.stdout.clone(),
+            stderr: entry.stderr.clone(),
+            error: entry.error.clone(),
+        })
         .collect()
 }
 
@@ -1136,6 +1241,7 @@ fn git(path: &str, args: &[&str]) -> Result<String, String> {
 }
 
 fn git_with_timeout(path: &str, args: &[&str], timeout: Duration, timeout_label: &str) -> Result<String, String> {
+    let history_id = begin_git_command(path, args);
     let mut command = Command::new("git");
     // `-c` overrides must come before the subcommand to be recognized as
     // global git config, not passed through to it — configure_git_command's
@@ -1159,11 +1265,16 @@ fn git_with_timeout(path: &str, args: &[&str], timeout: Duration, timeout_label:
     // would matter most.
     let output = match run_with_timeout_labeled(command, timeout, "Git", timeout_label) {
         Ok(output) => output,
-        Err(error) => { record_git_command(path, args, false); return Err(error); }
+        Err(error) => {
+            finish_git_command(history_id, false, None, "", "", &error);
+            return Err(error);
+        }
     };
-    record_git_command(path, args, output.status.success());
-    if output.status.success() { Ok(String::from_utf8_lossy(&output.stdout).into_owned()) }
-    else { Err(String::from_utf8_lossy(&output.stderr).trim().to_string()) }
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    finish_git_command(history_id, output.status.success(), output.status.code(), &stdout, &stderr, "");
+    if output.status.success() { Ok(stdout) }
+    else { Err(stderr.trim().to_string()) }
 }
 
 fn git_owned(path: &str, args: Vec<String>) -> Result<String, String> {
@@ -8807,7 +8918,20 @@ mod tests {
         let mine = recorded.iter().find(|entry| entry.command == "git rev-parse --is-inside-work-tree" && entry.repo_hint == repository.file_name().unwrap().to_str().unwrap())
             .expect("the git() call above must be recorded, with the repository's own directory name as its hint");
         assert!(mine.success, "a command that actually succeeded must be recorded as such");
+        assert!(!mine.running, "a completed subprocess must no longer be shown as running");
+        assert_eq!(mine.stdout.trim(), "true", "the double-click console must retain successful command output");
+        assert!(mine.stderr.is_empty() && mine.error.is_empty());
+        assert!(mine.duration_ms.is_some(), "the completed command must expose its measured duration");
         assert!(mine.seconds_ago >= 0.0 && mine.seconds_ago < 30.0, "should report as just having happened, got {}s ago", mine.seconds_ago);
+
+        let running_id = begin_git_command(&repo_path, &["status", "--short"]);
+        let running = recent_git_commands().into_iter().find(|entry| entry.id == running_id).expect("a command must be visible as soon as it starts");
+        assert!(running.running);
+        assert!(running.duration_ms.is_none());
+        finish_git_command(running_id, false, None, "", "", "synthetic timeout");
+        let finished = recent_git_commands().into_iter().find(|entry| entry.id == running_id).unwrap();
+        assert!(!finished.running && !finished.success);
+        assert_eq!(finished.error, "synthetic timeout");
 
         let command_box = run_git_command(repo_path.clone(), "rev-parse --show-toplevel".into()).unwrap();
         assert!(command_box.success);
@@ -17305,6 +17429,90 @@ mod tests {
         delete_branch(sub_path_string, "renamed-in-submodule".into()).unwrap();
         assert!(Repository::open(&sub_path).unwrap().find_branch("renamed-in-submodule", BranchType::Local).is_err(), "the delete must have landed inside the submodule");
         assert!(Repository::open(&parent).unwrap().find_branch("main", BranchType::Local).is_ok(), "the parent's own main branch must still be completely untouched throughout");
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn parent_pull_refuses_dirty_files_before_advancing_the_branch() {
+        // Regression: the old pull implementation moved refs/heads/main to
+        // origin/main before checkout_head().  If a local edit blocked that
+        // checkout, HEAD stayed advanced while the index/worktree stayed old,
+        // making every incoming change appear as a new local modification.
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-safe-parent-pull-dirty-{suffix}"));
+        let remote = base.join("origin.git");
+        let local = base.join("local");
+        let other = base.join("other");
+        fs::create_dir_all(&remote).unwrap();
+        fs::create_dir_all(&local).unwrap();
+        run_git(&remote, &["init", "--bare"]);
+        run_git(&local, &["init", "-b", "main"]);
+        run_git(&local, &["config", "user.email", "test@example.com"]);
+        run_git(&local, &["config", "user.name", "Test User"]);
+        fs::write(local.join("file.txt"), "base\n").unwrap();
+        run_git(&local, &["add", "."]);
+        run_git(&local, &["commit", "-m", "Base"]);
+        run_git(&local, &["remote", "add", "origin", remote.to_str().unwrap()]);
+        run_git(&local, &["push", "-u", "origin", "main"]);
+
+        run_git(&base, &["clone", "-b", "main", remote.to_str().unwrap(), other.to_str().unwrap()]);
+        run_git(&other, &["config", "user.email", "test@example.com"]);
+        run_git(&other, &["config", "user.name", "Test User"]);
+        fs::write(other.join("file.txt"), "from server\n").unwrap();
+        run_git(&other, &["commit", "-am", "Remote update"]);
+        run_git(&other, &["push", "origin", "main"]);
+
+        fs::write(local.join("file.txt"), "important local edit\n").unwrap();
+        let before_head = run_git_capture(&local, &["rev-parse", "HEAD"]);
+        let before_index = run_git_capture(&local, &["rev-parse", ":file.txt"]);
+        let result = sync_repository_inner(local.to_string_lossy().into_owned(), "pull".into());
+
+        assert!(result.is_err(), "dirty parent pull must stop instead of partly applying the incoming commit");
+        assert!(result.unwrap_err().contains("working tree has 1 pending change"));
+        assert_eq!(run_git_capture(&local, &["rev-parse", "HEAD"]), before_head, "a rejected pull must not advance HEAD");
+        assert_eq!(run_git_capture(&local, &["rev-parse", ":file.txt"]), before_index, "a rejected pull must not rewrite the index");
+        assert_eq!(fs::read_to_string(local.join("file.txt")).unwrap(), "important local edit\n", "a rejected pull must preserve the exact local file");
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn parent_fast_forward_pull_finishes_with_head_index_and_worktree_aligned() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-safe-parent-pull-clean-{suffix}"));
+        let remote = base.join("origin.git");
+        let local = base.join("local");
+        let other = base.join("other");
+        fs::create_dir_all(&remote).unwrap();
+        fs::create_dir_all(&local).unwrap();
+        run_git(&remote, &["init", "--bare"]);
+        run_git(&local, &["init", "-b", "main"]);
+        run_git(&local, &["config", "user.email", "test@example.com"]);
+        run_git(&local, &["config", "user.name", "Test User"]);
+        fs::write(local.join("file.txt"), "base\n").unwrap();
+        run_git(&local, &["add", "."]);
+        run_git(&local, &["commit", "-m", "Base"]);
+        run_git(&local, &["remote", "add", "origin", remote.to_str().unwrap()]);
+        run_git(&local, &["push", "-u", "origin", "main"]);
+
+        run_git(&base, &["clone", "-b", "main", remote.to_str().unwrap(), other.to_str().unwrap()]);
+        run_git(&other, &["config", "user.email", "test@example.com"]);
+        run_git(&other, &["config", "user.name", "Test User"]);
+        fs::write(other.join("file.txt"), "from server\n").unwrap();
+        fs::write(other.join("new.txt"), "new from server\n").unwrap();
+        run_git(&other, &["add", "."]);
+        run_git(&other, &["commit", "-m", "Remote update"]);
+        run_git(&other, &["push", "origin", "main"]);
+        let remote_head = run_git_capture(&other, &["rev-parse", "HEAD"]);
+
+        sync_repository_inner(local.to_string_lossy().into_owned(), "pull".into()).expect("clean fast-forward pull should succeed");
+        let repository = Repository::open(&local).unwrap();
+        assert_eq!(run_git_capture(&local, &["rev-parse", "HEAD"]), remote_head);
+        assert_eq!(run_git_capture(&local, &["rev-parse", ":file.txt"]), run_git_capture(&local, &["rev-parse", "HEAD:file.txt"]), "index must match the pulled commit");
+        assert_eq!(fs::read_to_string(local.join("file.txt")).unwrap(), "from server\n");
+        assert_eq!(fs::read_to_string(local.join("new.txt")).unwrap(), "new from server\n");
+        assert!(internal_statuses(&repository, None).unwrap().is_empty(), "incoming files must not reappear as local changes after pull");
 
         fs::remove_dir_all(base).unwrap();
     }

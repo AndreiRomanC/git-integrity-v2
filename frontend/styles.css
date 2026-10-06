@@ -1042,21 +1042,30 @@ footer { display: flex; align-items: center; gap: 8px; padding: 0 12px; backgrou
    Ellipsis-truncated so a long command can never push the branch/build
    footer segments around; double-click the footer for the full history. */
 .status-command-hint { min-width: 0; max-width: 340px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding-left: 10px; font: 10px ui-monospace, SFMono-Regular, Consolas, monospace; color: #4c5a68; cursor: default; }
+.status-command-hint.status-command-running { color: #b68a43; }
 .status-command-hint.status-command-failed { color: #8a5a5f; }
 #statusFooter { min-width: 0; overflow: hidden; cursor: default; user-select: none; }
 #statusText { min-width: 0; max-width: min(720px, 56vw); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-/* Recent-commands dialog rows: a plain 2-column read history (icon,
-   content) — its own class rather than reusing .publish-commit, whose grid
-   expects 4 children (checkbox/index, dot, 1fr content, badge) and whose
-   .excluded modifier means "de-prioritized", not "failed". */
-.command-history-row { display: grid; grid-template-columns: 20px 1fr; align-items: center; gap: 9px; padding: 7px 11px; border-bottom: 1px solid var(--border-soft); }
+/* The footer is intentionally terse; this double-click-only view is the one
+   place where commands and their output must never be ellipsized. */
+.publish-dialog.command-history-dialog { width: min(980px, 94vw); max-width: 980px; }
+.command-history-dialog .conflicts-list { max-height: min(68vh, 720px); background: #0c1218; }
+.command-history-row { padding: 12px 14px; border-bottom: 1px solid var(--border-soft); }
 .command-history-row:last-child { border-bottom: 0; }
-.command-history-row > span { text-align: center; font-size: 11px; color: var(--muted); }
-.command-history-row div { min-width: 0; display: flex; flex-direction: column; gap: 4px; }
-.command-history-row strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; font-weight: 500; }
-.command-history-row small { color: #728595; font-size: 9px; }
-.command-history-row.failed > span { color: var(--red); }
-.command-history-row.failed strong { color: #d99aa0; }
+.command-history-summary { display: flex; align-items: center; gap: 8px; margin-bottom: 7px; color: #718596; font-size: 9px; }
+.command-history-state { min-width: 58px; padding: 2px 6px; border: 1px solid #38536a; border-radius: 10px; color: #91a9bb; font-size: 8px; font-weight: 800; letter-spacing: .6px; text-align: center; }
+.command-history-row.running .command-history-state { border-color: #80652f; color: #efbf68; }
+.command-history-row.success .command-history-state { border-color: #2d684f; color: #79d5ac; }
+.command-history-row.failed .command-history-state { border-color: #7a3b44; color: #ee929c; }
+.command-history-command { display: block; width: 100%; margin-bottom: 9px; color: #d6e4ee; font: 11px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; user-select: text; }
+.command-history-row.failed .command-history-command { color: #efb1b7; }
+.command-history-output { display: flex; flex-direction: column; gap: 7px; }
+.command-history-output section { min-width: 0; border-left: 2px solid #335570; padding-left: 9px; }
+.command-history-output section.stderr { border-left-color: #82454d; }
+.command-history-output b { display: block; margin-bottom: 4px; color: #6d8598; font-size: 8px; letter-spacing: .8px; }
+.command-history-output pre { max-height: 260px; margin: 0; overflow: auto; color: #aebfcb; font: 10px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; user-select: text; }
+.command-history-output .stderr pre { color: #dfa1a7; }
+.command-history-empty-output { color: #596b79; font-size: 9px; font-style: italic; }
 
 dialog { width: 430px; border: 1px solid #465563; border-radius: 10px; padding: 0; background: #19222c; color: var(--text); box-shadow: 0 25px 80px #000b; }
 dialog::backdrop { background: #05080cbf; }.dialog-symbol { display: grid; place-items: center; width: 48px; height: 48px; margin: 0 auto 16px; border-radius: 50%; background: #203f5d; color: var(--blue); font-size: 24px; }
