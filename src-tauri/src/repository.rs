@@ -680,7 +680,7 @@ pub struct SubmoduleRepositoryTarget {
 }
 
 #[derive(Serialize)]
-pub struct Branch { name: String, current: bool, remote: bool }
+pub struct Branch { name: String, current: bool, remote: bool, upstream: Option<String> }
 
 // kind is one of "local_branch" | "remote_branch" | "tag" — deliberately a
 // plain String at this JSON boundary (matching DirectoryEntry.kind's own
@@ -2586,8 +2586,12 @@ fn open_repository_fast_inner(path: String) -> Result<FastRepositoryData, String
     let step = Instant::now();
     let mut branches = Vec::new();
     for branch_type in [BranchType::Local, BranchType::Remote] { if let Ok(iterator) = repo.branches(Some(branch_type)) { for item in iterator.flatten() {
-        let branch_name = item.0.name().ok().flatten().unwrap_or("").to_string(); if branch_name.ends_with("/HEAD") { continue; }
-        branches.push(Branch { current: branch_type == BranchType::Local && branch_name == current_branch, name: branch_name, remote: branch_type == BranchType::Remote });
+        let branch = item.0;
+        let branch_name = branch.name().ok().flatten().unwrap_or("").to_string(); if branch_name.ends_with("/HEAD") { continue; }
+        let upstream = if branch_type == BranchType::Local {
+            branch.upstream().ok().and_then(|upstream| upstream.get().shorthand().map(str::to_string))
+        } else { None };
+        branches.push(Branch { current: branch_type == BranchType::Local && branch_name == current_branch, name: branch_name, remote: branch_type == BranchType::Remote, upstream });
     } } }
     perf_log("open_repository_fast: branches", step.elapsed());
 
@@ -2651,8 +2655,12 @@ fn load_repository_inner(path: String, force: Option<bool>) -> Result<Repository
     let step = Instant::now();
     let mut branches = Vec::new();
     for branch_type in [BranchType::Local, BranchType::Remote] { if let Ok(iterator) = repo.branches(Some(branch_type)) { for item in iterator.flatten() {
-        let branch_name = item.0.name().ok().flatten().unwrap_or("").to_string(); if branch_name.ends_with("/HEAD") { continue; }
-        branches.push(Branch { current: branch_type == BranchType::Local && branch_name == current_branch, name: branch_name, remote: branch_type == BranchType::Remote });
+        let branch = item.0;
+        let branch_name = branch.name().ok().flatten().unwrap_or("").to_string(); if branch_name.ends_with("/HEAD") { continue; }
+        let upstream = if branch_type == BranchType::Local {
+            branch.upstream().ok().and_then(|upstream| upstream.get().shorthand().map(str::to_string))
+        } else { None };
+        branches.push(Branch { current: branch_type == BranchType::Local && branch_name == current_branch, name: branch_name, remote: branch_type == BranchType::Remote, upstream });
     } } }
     perf_log("load_repository: branches", step.elapsed());
 
@@ -6511,6 +6519,17 @@ fn push_github_module_ref(results: &mut Vec<GitHubModuleRef>, seen: &mut HashSet
     results.len() >= limit
 }
 
+// `git ls-remote --heads --tags` already returns the complete ref advertisement
+// in one response. Truncating that response did not save a network round trip;
+// it merely made repositories with more than 180/300 refs look incomplete and
+// made local filtering unable to find perfectly valid branches or tags. An
+// empty query is the initial repository load and must therefore retain every
+// advertised branch/tag. A targeted server lookup (currently exact SHA) keeps
+// its small defensive result limit.
+fn github_module_ref_limit(query: &str, requested: Option<usize>) -> usize {
+    if query.is_empty() { usize::MAX } else { requested.unwrap_or(160).clamp(1, 300) }
+}
+
 fn github_module_refs_inner(repository_path: String, owner: String, repository_name: String, query: String, limit: Option<usize>) -> Result<Vec<GitHubModuleRef>, String> {
     let started = Instant::now();
     validate_path(&repository_path)?;
@@ -6520,7 +6539,7 @@ fn github_module_refs_inner(repository_path: String, owner: String, repository_n
         return Err("Choose a valid GitHub repository first.".into());
     }
     let query = query.trim().to_lowercase();
-    let limit = limit.unwrap_or(160).clamp(1, 300);
+    let limit = github_module_ref_limit(&query, limit);
     let url = github_module_clone_url(owner, repository_name);
     let raw = git_with_timeout(&repository_path, &["ls-remote", "--heads", "--tags", &url], Duration::from_secs(60), "60 seconds")
         .map_err(|detail| format!("Could not read branch/tag list from {owner}/{repository_name}: {detail}"))?;
@@ -9262,6 +9281,34 @@ mod tests {
         let result = cached_full_statuses(&repo, &repository_path).unwrap();
         assert_eq!(result, cached_statuses, "an unchanged, fresh cache entry must still follow the existing HIT path");
         fs::remove_dir_all(repository).unwrap();
+    }
+
+    #[test]
+    fn github_module_initial_ref_load_keeps_every_branch_and_tag() {
+        assert_eq!(github_module_ref_limit("", Some(180)), usize::MAX, "the initial empty-query load must never truncate refs");
+        assert_eq!(github_module_ref_limit("release", Some(180)), 180, "targeted lookups keep their defensive limit");
+        assert_eq!(github_module_ref_limit("deadbeef", Some(999)), 300, "targeted lookup limits remain bounded");
+
+        let mut results = Vec::new();
+        let mut seen = HashSet::new();
+        let limit = github_module_ref_limit("", Some(180));
+        for index in 0..420 {
+            let kind = if index % 2 == 0 { "branch" } else { "tag" };
+            let stopped = push_github_module_ref(
+                &mut results,
+                &mut seen,
+                limit,
+                format!("ref-{index:03}"),
+                format!("{index:040x}"),
+                kind,
+                String::new(),
+                String::new(),
+            );
+            assert!(!stopped, "an initial complete load must not stop at the former 180/300-ref limits");
+        }
+        assert_eq!(results.len(), 420);
+        assert_eq!(results.iter().filter(|item| item.kind == "branch").count(), 210);
+        assert_eq!(results.iter().filter(|item| item.kind == "tag").count(), 210);
     }
 
     // The two tests below are the only ones that touch RECENT_GIT_COMMANDS
@@ -13949,7 +13996,7 @@ mod tests {
     }
 
     #[test]
-    fn checkout_remote_tracking_branch_creates_attaches_and_refuses_to_rewrite_a_conflicting_local_branch() {
+    fn checkout_remote_tracking_branch_creates_attaches_and_refuses_ambiguous_existing_local_branches() {
         let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let base = std::env::temp_dir().join(format!("git-integrity-checkout-remote-tracking-{suffix}"));
         let upstream = base.join("upstream");
@@ -13992,7 +14039,26 @@ mod tests {
         assert!(!reused.created, "an existing, already-tracking local branch must be reused, not recreated");
         assert_eq!(Repository::open(&repository).unwrap().head().unwrap().shorthand(), Some("feature"));
 
-        // Case 3: a local branch named exactly like the remote's short name
+        // Case 3: a same-name local branch exists without any upstream. This
+        // is ambiguous: do not guess that the user intended to connect it,
+        // and prove that the branch, HEAD, and configuration remain untouched.
+        run_git(&upstream, &["switch", "-c", "unlinked"]);
+        fs::write(upstream.join("unlinked.txt"), "remote\n").unwrap();
+        run_git(&upstream, &["add", "unlinked.txt"]);
+        run_git(&upstream, &["commit", "-m", "Remote unlinked branch"]);
+        run_git(&upstream, &["switch", "-"]);
+        run_git(&repository, &["fetch", "origin"]);
+        run_git(&repository, &["branch", "unlinked", "feature"]);
+        let before_head = run_git_capture(&repository, &["symbolic-ref", "--short", "HEAD"]);
+        let before_oid = run_git_capture(&repository, &["rev-parse", "unlinked"]);
+        let error = checkout_remote_tracking_branch(repo_path.clone(), "origin/unlinked".into())
+            .expect_err("an existing local branch without an upstream must require an explicit user decision");
+        assert!(error.contains("unlinked") && error.contains("has no upstream") && error.contains("not changed"), "error should explain the ambiguous local branch without changing it: {error}");
+        assert_eq!(run_git_capture(&repository, &["symbolic-ref", "--short", "HEAD"]), before_head, "HEAD must stay on the original branch");
+        assert_eq!(run_git_capture(&repository, &["rev-parse", "unlinked"]), before_oid, "the unlinked local branch must not move");
+        assert!(Repository::open(&repository).unwrap().find_branch("unlinked", BranchType::Local).unwrap().upstream().is_err(), "the local branch must remain without an upstream");
+
+        // Case 4: a local branch named exactly like the remote's short name
         // already exists but tracks a *different* upstream — must be refused
         // outright, and left completely untouched (never silently repointed).
         run_git(&upstream, &["switch", "-c", "other"]);

@@ -47,7 +47,7 @@ test('Add submodule can browse GitHub Enterprise modules without changing the ma
   assert.match(app, /function filterLoadedSubmoduleRefs/);
   assert.match(app, /cachedSubmoduleRefs\(repo\)/);
   assert.match(app, /submoduleRefQueryLooksLikeSha/);
-  assert.match(app, /invoke\('github_module_refs', \{ repositoryPath: state\.repository\.path, owner: repo\.owner \|\| 'eng', repositoryName: repo\.name, query: trimmedQuery, limit: 180 \}\)/);
+  assert.match(app, /invoke\('github_module_refs', \{ repositoryPath: state\.repository\.path, owner: repo\.owner \|\| 'eng', repositoryName: repo\.name, query: trimmedQuery, limit: trimmedQuery \? 180 : null \}\)/);
   assert.match(app, /refs\.submoduleUrl\.value = repo\.portable_url/);
   assert.match(app, /initialRevision: selected\.revision \|\| null/);
   assert.match(app, /resetSubmoduleBrowseSelection\(\); if \(!refs\.submoduleName\.dataset\.edited\)/);
@@ -520,7 +520,6 @@ test('folder restore gives visible progress and rechecks the restored folder aft
 
 test('graph exposes branch and commit context actions without relying on lane identity', () => {
   assert.match(app, /data-graph-ref-name="\$\{esc\(badge\.name\)\}"/);
-  assert.match(app, /showGraphBranchContextMenu\(event, pill\.dataset\.graphRefName, pill\.dataset\.graphRefKind\)/);
   assert.match(app, /function graphBranchRefsForCommit\(commitId\)/);
   assert.match(app, /function graphMergeUnavailableReason\(branchName\)/);
   assert.match(app, /Checkout or switch to a branch first — HEAD is detached\./);
@@ -528,11 +527,12 @@ test('graph exposes branch and commit context actions without relying on lane id
   assert.match(app, /\$\{branchName\} → \$\{current\}\. Current branch is the only branch changed\./);
   assert.match(app, /openMergeBranchDialog\(activeGraphMergeTarget\(\), branchName\)/);
   assert.match(app, /showGraphCommitContextMenu\(event, row\.dataset\.id\)/);
-  assert.match(app, /const mergeItems = branchRefs\.slice\(0, 6\)\.map\(\(ref, index\) => graphMergeMenuItem\(ref\.name, `merge-\$\{index\}`\)\)/);
-  assert.match(app, /Create branch from this commit/);
-  assert.match(app, /Checkout this commit/);
-  assert.match(app, /Restore exact checkpoint…/);
-  assert.match(app, /Clean workspace to this commit/);
+  assert.doesNotMatch(app, /function showGraphBranchContextMenu\(/);
+  assert.match(app, /\.\.\.mergeRefs\.map\(\(ref, index\) => graphMergeMenuItem\(ref\.name, `merge-\$\{index\}`\)\)/);
+  assert.match(app, /Create new branch here…/);
+  assert.match(app, /Checkout exact commit/);
+  assert.match(app, /Clean checkout exact commit…/);
+  assert.match(app, /Clean checkout · discards local files/);
   assert.match(app, /invoke\('create_branch_at_commit', \{ repositoryPath: context\.path, branch: name\.trim\(\), commitId \}\)/);
   assert.match(app, /invoke\('checkout_commit', \{ repositoryPath: context\.path, commitId \}\)/);
   assert.match(app, /invoke\(branch \? 'restore_exact_checkpoint_branch' : 'restore_exact_checkpoint', \{ repositoryPath: context\.path, commitId/);
@@ -567,6 +567,12 @@ test('graph exposes branch and commit context actions without relying on lane id
   assert.match(app, /data-jump-head/);
   assert.match(app, /function jumpToGraphHead\(\)/);
   assert.match(app, /class="graph-current-jump"/);
+  assert.match(app, /function jumpToGraphBranchStart\(\)/);
+  assert.match(app, /data-jump-branch-start/);
+  assert.match(app, /Go to Branch start/);
+  assert.match(app, /Branch start is still being calculated/);
+  assert.match(app, /Loading older history to find branch start/);
+  assert.match(css, /\.graph-branch-start-jump/);
   assert.match(app, /YOU ARE HERE · HEAD/);
   assert.match(css, /\.head-location-pill/);
   assert.match(css, /\.graph-current-jump/);
@@ -612,7 +618,7 @@ test('repository branch compare reuses the Compare and Sync ref-diff flow', () =
   assert.match(app, /gitCompareMode: 'workspace'/);
   assert.match(app, /compare_git_revisions_directory/);
   assert.match(app, /invoke\('compare_git_revision_file', \{/);
-  assert.match(app, /id: 'compare-branch'[\s\S]*?openGraphBranchCompare\(branchName\)/);
+  assert.match(app, /label: `Compare \$\{branchName\}…`[\s\S]*?openGraphBranchCompare\(branchName\)/);
   assert.match(app, /state\.gitCompareMode = 'refs'/);
 });
 
@@ -625,13 +631,13 @@ test('graph branch menu can compare two explicitly selected branches', () => {
   assert.match(app, /function handleGraphBranchCompareSelection\(branchName\)/);
   assert.match(app, /handleGraphBranchCompareSelection\(pill\.dataset\.graphRefName\)/);
   assert.match(app, /querySelectorAll\('\.branch-row\[data-branch\]'\)[\s\S]*?addEventListener\('contextmenu'/);
-  assert.match(app, /data-action="compare-start"/);
-  assert.match(app, /data-action="compare-with-start"/);
+  assert.match(app, /id: 'compare-start'/);
+  assert.match(app, /id: 'compare-with-start'/);
   assert.doesNotMatch(app, /Compare branches…/);
   assert.doesNotMatch(app, /compare-branch-from-commit/);
   assert.match(app, /compare-start/);
   assert.match(app, /label: 'Set as compare start'/);
-  assert.match(app, /label: 'Compare with start'[\s\S]*?openGraphBranchCompare\(anchor\.branch, branchName\)/);
+  assert.match(app, /label: 'Compare with selected start'[\s\S]*?const start = anchor\.branch;[\s\S]*?openGraphBranchCompare\(start, branchName\)/);
   assert.match(css, /\.branch-ref-pill\.compare-start/);
   assert.match(css, /\.branch-row\.compare-start/);
 });
@@ -787,23 +793,30 @@ test('detached dirty submodules ask for a branch before commit or push', () => {
 
 test('graph branch context menus can attach detached HEAD to a local branch', () => {
   assert.match(app, /function graphCheckoutBranchMenuItem\(branchName, kind = 'local_branch', id = 'checkout-branch'\)/);
-  assert.match(app, /Create\/switch local branch \$\{localName\}/);
+  assert.match(app, /alreadyTracksRemote = Boolean\(localBranch && existingUpstream === branchName\)/);
+  assert.match(app, /Switch to local \$\{localName\}/);
+  assert.match(app, /Create local \$\{localName\} from \$\{branchName\}/);
+  assert.match(app, /Local \$\{localName\} has no upstream\./);
+  assert.match(app, /Cannot connect \$\{localName\} automatically/);
+  assert.match(app, /no pull, reset, or push\./i);
   assert.match(app, /switchRemoteTrackingBranch\(remoteBranch, button = null\)/);
   assert.match(app, /checkout_remote_tracking_branch/);
   assert.match(app, /Attach detached HEAD to this local branch/);
   assert.match(app, /openGraphBranchCompare\(branchName\)/);
-  assert.match(app, /showFloatingMenu\(event, \[[\s\S]*?\{ header: 'Branch actions' \}[\s\S]*?graphCheckoutBranchMenuItem\(branchName, kind\)[\s\S]*?graphMergeMenuItem\(branchName\)[\s\S]*?\{ header: 'Compare' \}[\s\S]*?\.\.\.compareItems/);
+  assert.match(app, /function showBranchMenu\(branchName, event\)[\s\S]*?\{ header: branch\.remote \? 'Remote branch' : 'Local branch' \}[\s\S]*?graphCheckoutBranchMenuItem\(branchName, branch\.remote \? 'remote_branch' : 'local_branch'\)[\s\S]*?\{ header: 'Merge' \}[\s\S]*?graphMergeMenuItem\(branchName\)[\s\S]*?\{ header: 'Compare · read only' \}/);
   assert.match(app, /localBranchesAtCommit = branchRefs\.filter\(ref => ref\.kind === 'local_branch'\)/);
-  assert.match(app, /Checkout this commit[\s\S]*?Checkout branch \$\{ref\.name\}[\s\S]*?Restore exact checkpoint[\s\S]*?Clean checkout branch \$\{ref\.name\}/);
-  assert.match(app, /menuItems\.push\([\s\S]*?\{ header: 'Compare' \},[\s\S]*?\.\.\.commitCompareItems/);
+  assert.match(app, /Checkout \/ attach HEAD[\s\S]*?graphCheckoutBranchMenuItem\(ref\.name, ref\.kind,[\s\S]*?Checkout exact commit[\s\S]*?Create new branch here/);
+  assert.match(app, /\{ header: 'Compare · read only' \},[\s\S]*?\.\.\.commitCompareItems/);
+  assert.match(app, /Clean checkout exact commit[\s\S]*?Clean checkout branch \$\{ref\.name\}/);
   assert.match(app, /item\.separator[\s\S]*?floating-menu-separator/);
   assert.match(app, /if \(item\.header\) return `<div class="floating-menu-section">/);
   assert.match(css, /\.floating-menu-separator/);
   assert.match(css, /\.floating-menu-section/);
   assert.match(css, /\.floating-action-menu \.menu-compare strong/);
   assert.match(css, /\.floating-action-menu \.menu-danger strong/);
-  assert.match(css, /\.floating-action-menu strong \{ display: block; font-size: 11px;/);
-  assert.match(app, /showGraphBranchContextMenu\(event, pill\.dataset\.graphRefName, pill\.dataset\.graphRefKind\)/);
+  assert.match(css, /\.floating-action-menu strong \{ display: block; font-size: 10\.5px;/);
+  assert.match(app, /row\.addEventListener\('contextmenu', event => showGraphCommitContextMenu\(event, row\.dataset\.id\)\)/);
+  assert.doesNotMatch(app, /showGraphBranchContextMenu/);
 });
 
 test('Remotes page shows a useful fetch-only overview without extra Git scans', () => {

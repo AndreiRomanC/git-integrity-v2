@@ -864,8 +864,8 @@ function filterLoadedSubmoduleRefs(query = refs.submoduleRefSearch.value.trim())
   submoduleBrowserState.selectedRef = filtered.some(ref => ref === submoduleBrowserState.selectedRef) ? submoduleBrowserState.selectedRef : null;
   refs.applySubmoduleBrowser.disabled = !submoduleBrowserState.selectedRepository || false;
   refs.submoduleBrowserStatus.textContent = query
-    ? `${repo.full_name}: ${filtered.length} local match${filtered.length === 1 ? '' : 'es'} from ${submoduleBrowserState.allRefs.length} loaded refs.`
-    : `${repo.full_name}: ${submoduleBrowserState.allRefs.length} refs loaded. Filtering is local.`;
+    ? `${repo.full_name}: ${filtered.length} local match${filtered.length === 1 ? '' : 'es'} from the complete list of ${submoduleBrowserState.allRefs.length} branches/tags.`
+    : `${repo.full_name}: complete list loaded (${submoduleBrowserState.allRefs.length} branches/tags). Filtering is local.`;
   renderSubmoduleRefResults();
   updateSubmoduleBrowserActions();
   return filtered.length;
@@ -947,7 +947,7 @@ async function searchSubmoduleRefs(query = refs.submoduleRefSearch.value.trim(),
   const finish = beginButtonOperation(refs.runSubmoduleRefSearch, 'Finding…');
   refs.submoduleRefResults.innerHTML = `<div class="version-loading"><i class="spinner"></i>${trimmedQuery ? 'Looking up exact revision…' : 'Reading branches and tags…'}</div>`;
   try {
-    const refsList = invoke ? await invoke('github_module_refs', { repositoryPath: state.repository.path, owner: repo.owner || 'eng', repositoryName: repo.name, query: trimmedQuery, limit: 180 }) : [
+    const refsList = invoke ? await invoke('github_module_refs', { repositoryPath: state.repository.path, owner: repo.owner || 'eng', repositoryName: repo.name, query: trimmedQuery, limit: trimmedQuery ? 180 : null }) : [
       { name: 'main', revision: '1111111111111111111111111111111111111111', kind: 'branch', subject: '', date: '' },
       { name: 'v1.0.0', revision: '2222222222222222222222222222222222222222', kind: 'tag', subject: '', date: '' }
     ];
@@ -967,7 +967,7 @@ async function searchSubmoduleRefs(query = refs.submoduleRefSearch.value.trim(),
     submoduleBrowserState.selectedRefs = submoduleBrowserSelectedCompareRefs().filter(ref => knownKeys.has(submoduleBrowserRefKey(ref)));
     refs.submoduleBrowserStatus.textContent = trimmedQuery
       ? `${repo.full_name}: ${submoduleBrowserState.refs.length} server match${submoduleBrowserState.refs.length === 1 ? '' : 'es'}; refs kept in memory for local filtering.`
-      : `${repo.full_name}: ${submoduleBrowserState.refs.length} refs loaded. Filtering is local.`;
+      : `${repo.full_name}: complete list loaded (${submoduleBrowserState.refs.length} branches/tags). Filtering is local.`;
     renderSubmoduleRefResults();
   } catch (error) {
     refs.submoduleRefResults.innerHTML = `<div class="version-loading">${esc(String(error))}</div>`;
@@ -4614,40 +4614,36 @@ function renderSubmodulePrHeading() {
 }
 
 function showBranchMenu(branchName, event) {
-  event.preventDefault();
-  event.stopPropagation();
-  document.querySelectorAll('.floating-action-menu, .branch-action-menu').forEach(menu => menu.remove());
   const context = activeRepositoryContext();
   const branch = (context.branches || []).find(item => item.name === branchName) || {};
   const anchor = graphBranchCompareAnchorMatches(context) ? state.graphBranchCompareAnchor : null;
-  const compareWithStart = anchor && anchor.branch !== branchName
-    ? `<button style="display:block;width:100%;padding:8px 14px;text-align:left;border:0;background:transparent;color:#d8e5f0;cursor:pointer;font-size:12px;" data-action="compare-with-start">Compare with start · ${esc(anchor.branch)} → ${esc(branchName)}</button>`
-    : '';
-  const mutableLocal = !branch.remote && !branch.isHead;
-  const menu = `<div class="branch-action-menu" style="position:fixed;top:${event.clientY}px;left:${event.clientX}px;z-index:100;background:#1a2530;border:1px solid #465563;border-radius:6px;box-shadow:0 8px 24px #0008;">
-    <button style="display:block;width:100%;padding:8px 14px;text-align:left;border:0;background:transparent;color:#d8e5f0;cursor:pointer;font-size:12px;" data-action="compare">Compare…</button>
-    <button style="display:block;width:100%;padding:8px 14px;text-align:left;border:0;background:transparent;color:#d8e5f0;cursor:pointer;font-size:12px;" data-action="compare-start">Set as compare start</button>
-    ${compareWithStart}
-    <div style="height:1px;background:#465563;margin:2px 0;"></div>
-    ${mutableLocal ? `<button style="display:block;width:100%;padding:8px 14px;text-align:left;border:0;background:transparent;color:#d8e5f0;cursor:pointer;font-size:12px;" data-action="rename">Rename</button>
-    <button style="display:block;width:100%;padding:8px 14px;text-align:left;border:0;background:transparent;color:#d8e5f0;cursor:pointer;font-size:12px;border-top:1px solid #465563;" data-action="delete">Delete</button>` : '<div style="padding:7px 14px;color:#7f92a4;font-size:11px;">Remote/current branch: compare actions only</div>'}
-  </div>`;
-  const menuEl = document.createElement('div');
-  menuEl.innerHTML = menu;
-  const menuContainer = menuEl.firstElementChild;
-  document.body.appendChild(menuContainer);
-  menuContainer.querySelectorAll('[data-action]').forEach(btn => {
-    btn.addEventListener('click', async () => {
-      document.body.removeChild(menuContainer);
-      const action = btn.dataset.action;
-      if (action === 'compare') { await openGraphBranchCompare(branchName); }
-      else if (action === 'compare-start') { setGraphBranchCompareStart(branchName); renderBranches(); renderGraph(); }
-      else if (action === 'compare-with-start') { await openGraphBranchCompare(anchor.branch, branchName); state.graphBranchCompareAnchor = null; }
-      else if (action === 'rename') { const newName = await customPrompt(`Rename branch "${branchName}" to:`, branchName, { title: 'Rename branch' }); if (newName && newName !== branchName) await renameBranch(branchName, newName); }
-      else if (action === 'delete') { if (await customConfirm(`Delete branch "${branchName}"?`, { title: 'Delete branch', danger: true, okLabel: 'Delete' })) await deleteBranch(branchName); }
-    });
-  });
-  document.addEventListener('click', (e) => { if (!menuContainer.contains(e.target)) document.body.removeChild(menuContainer); }, { once: true });
+  const isHead = !branch.remote && !!branch.current && !context.headDetached;
+  const mutableLocal = !branch.remote && !isHead;
+  const items = [
+    { header: branch.remote ? 'Remote branch' : 'Local branch' },
+    graphCheckoutBranchMenuItem(branchName, branch.remote ? 'remote_branch' : 'local_branch'),
+    { separator: true },
+    { header: 'Merge' },
+    graphMergeMenuItem(branchName),
+  ];
+  if (mutableLocal) {
+    items.push(
+      { separator: true },
+      { header: 'Manage local branch' },
+      { id: 'rename', label: `Rename ${branchName}…`, detail: 'Rename this local branch', run: async () => { const newName = await customPrompt(`Rename branch "${branchName}" to:`, branchName, { title: 'Rename branch' }); if (newName && newName !== branchName) await renameBranch(branchName, newName); } },
+      { id: 'delete', label: `Delete ${branchName}…`, detail: 'Delete the local branch reference', danger: true, run: async () => { if (await customConfirm(`Delete branch "${branchName}"?`, { title: 'Delete branch', danger: true, okLabel: 'Delete' })) await deleteBranch(branchName); } },
+    );
+  }
+  items.push(
+    { separator: true },
+    { header: 'Compare · read only' },
+    { id: 'compare', label: `Compare ${branchName}…`, detail: 'Open a read-only branch comparison', kind: 'compare', run: () => openGraphBranchCompare(branchName) },
+    { id: 'compare-start', label: 'Set as compare start', detail: branchName, kind: 'compare', run: () => { setGraphBranchCompareStart(branchName); renderBranches(); renderGraph(); } },
+  );
+  if (anchor && anchor.branch !== branchName) {
+    items.push({ id: 'compare-with-start', label: 'Compare with selected start', detail: `${anchor.branch} → ${branchName}`, kind: 'compare', run: () => { const start = anchor.branch; state.graphBranchCompareAnchor = null; openGraphBranchCompare(start, branchName); } });
+  }
+  showFloatingMenu(event, items);
 }
 
 // rename_branch/delete_branch are already fully generic on the backend —
@@ -5353,6 +5349,51 @@ function jumpToGraphHead() {
   if (row.animate) row.animate([{ boxShadow: '0 0 0 0 rgba(126, 211, 255, .85)' }, { boxShadow: '0 0 0 12px rgba(126, 211, 255, 0)' }], { duration: 900, easing: 'ease-out' });
 }
 
+function graphCommitRow(commitId) {
+  return Array.from(refs.graph?.querySelectorAll('.commit-row[data-id]') || []).find(row => row.dataset.id === commitId) || null;
+}
+
+async function jumpToGraphBranchStart() {
+  const initialGraph = activeGraphData();
+  const branchStart = ensureHeadMainMergeBase(initialGraph);
+  if (!branchStart?.oid) {
+    const key = `${initialGraph.path}::${initialGraph.headOid}`;
+    status(headMainMergeBaseFetchKey === key
+      ? 'Branch start is still being calculated. Try again in a moment.'
+      : 'Branch start is not available for this checkout.', 'error');
+    return;
+  }
+
+  // "Only matches" deliberately removes non-matching rows. Restore the
+  // topology before navigating so a valid branch-start row cannot remain
+  // hidden merely because it does not match the current search text.
+  if (state.graphOnlySearchMatches) {
+    state.graphOnlySearchMatches = false;
+    renderGraph();
+  }
+
+  const targetContext = state.submoduleGraph;
+  const targetPath = initialGraph.path;
+  let row = graphCommitRow(branchStart.oid);
+  while (!row && activeGraphData().commitsTruncated) {
+    const before = activeGraphData().commits.length;
+    status(`Loading older history to find branch start ${branchStart.oid.slice(0, 8)}…`, 'busy');
+    await loadOlderGraphCommits();
+    if (state.view !== 'graph' || state.submoduleGraph !== targetContext || activeGraphData().path !== targetPath) return;
+    if (activeGraphData().commits.length <= before) break;
+    row = graphCommitRow(branchStart.oid);
+  }
+
+  if (!row) {
+    status(`Branch start ${branchStart.oid.slice(0, 8)} is not present in the available graph history.`, 'error');
+    return;
+  }
+  row.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  selectCommit(branchStart.oid);
+  if (row.animate) row.animate([{ boxShadow: '0 0 0 0 rgba(245, 181, 75, .8)' }, { boxShadow: '0 0 0 12px rgba(245, 181, 75, 0)' }], { duration: 900, easing: 'ease-out' });
+  status(`Branch start: ${branchStart.oid.slice(0, 8)} against ${branchStart.base_ref}.`);
+}
+
 function activeGraphMergeTarget() {
   if (state.submoduleGraph) {
     return { targetPath: state.submoduleGraph.relativePath, label: state.submoduleGraph.repository.current_branch || state.submoduleGraph.name, isSubmodule: true };
@@ -5432,14 +5473,29 @@ function graphCheckoutBranchMenuItem(branchName, kind = 'local_branch', id = 'ch
   const g = activeGraphData();
   const isRemote = kind === 'remote_branch';
   const localName = isRemote ? remoteBranchShortName(branchName) : branchName;
+  const localBranch = isRemote
+    ? (g.branches || []).find(branch => !branch.remote && branch.name === localName)
+    : null;
+  const existingUpstream = String(localBranch?.upstream || '');
+  const alreadyTracksRemote = Boolean(localBranch && existingUpstream === branchName);
   const unavailable = !isRemote && branchName === g.currentBranch
-      ? 'Already on this branch.'
+    ? 'Already on this branch.'
+    : localBranch && !alreadyTracksRemote
+      ? existingUpstream
+        ? `Local ${localName} already tracks ${existingUpstream}. Nothing will be changed automatically.`
+        : `Local ${localName} has no upstream. Use the local branch directly or configure it explicitly; nothing will be changed automatically.`
       : '';
   return {
     id,
-    label: isRemote ? `Create/switch local branch ${localName}` : `Checkout branch ${branchName}`,
+    label: isRemote
+      ? localBranch
+        ? alreadyTracksRemote ? `Switch to local ${localName}` : `Cannot connect ${localName} automatically`
+        : `Create local ${localName} from ${branchName}`
+      : `Checkout branch ${branchName}`,
     detail: unavailable || (isRemote
-      ? `Create local "${localName}" tracking ${branchName}, or switch to it if it already exists.`
+      ? localBranch
+        ? `Already tracks ${branchName}. Switch only; no pull, reset, or push.`
+        : `Create it at ${branchName}, track that remote branch, and switch to it. No pull or push.`
       : (g.headDetached ? 'Attach detached HEAD to this local branch.' : `Switch current checkout to ${branchName}.`)),
     kind: 'primary',
     disabled: !!unavailable,
@@ -5605,27 +5661,6 @@ async function openGraphBranchCompare(branchName, rightRef = '') {
   await openCommanderDirectory('');
 }
 
-function showGraphBranchContextMenu(event, branchName, kind = 'local_branch') {
-  const context = activeRepositoryContext();
-  const anchor = graphBranchCompareAnchorMatches(context) ? state.graphBranchCompareAnchor : null;
-  const compareItems = [
-    { id: 'compare-branch', label: 'Compare this branch…', detail: 'Open Compare & Sync with this as the start ref', kind: 'compare', run: () => openGraphBranchCompare(branchName) },
-    { id: 'compare-start', label: 'Set as compare start', detail: branchName, kind: 'compare', run: () => setGraphBranchCompareStart(branchName) },
-  ];
-  if (anchor && anchor.branch !== branchName) {
-    compareItems.push({ id: 'compare-with-start', label: 'Compare with start', detail: `${anchor.branch} → ${branchName}`, kind: 'compare', run: () => openGraphBranchCompare(anchor.branch, branchName) });
-  }
-  showFloatingMenu(event, [
-    { header: 'Branch actions' },
-    graphCheckoutBranchMenuItem(branchName, kind),
-    { separator: true },
-    graphMergeMenuItem(branchName),
-    { separator: true },
-    { header: 'Compare' },
-    ...compareItems,
-  ]);
-}
-
 async function refreshAfterGraphCommitAction(repositoryPath) {
   directoryCache.clear();
   if (state.submoduleGraph && state.submoduleGraph.repository.path === repositoryPath) {
@@ -5715,20 +5750,34 @@ function showGraphCommitContextMenu(event, commitId) {
       run: () => { const start = commitAnchor.commitId; state.graphCommitCompareAnchor = null; openGraphRevisionCompare(start, commitId); },
     });
   }
-  const mergeItems = branchRefs.slice(0, 6).map((ref, index) => graphMergeMenuItem(ref.name, `merge-${index}`));
   const localBranchesAtCommit = branchRefs.filter(ref => ref.kind === 'local_branch');
-  const menuItems = [];
-  if (mergeItems.length) menuItems.push({ header: 'Merge' }, ...mergeItems, { separator: true });
+  const remoteBranchesAtCommit = branchRefs.filter(ref => ref.kind === 'remote_branch');
+  // A local branch and its origin counterpart on this same commit are the
+  // same merge input. Prefer the local name in that pair so the menu stays
+  // compact, while a remote-only ref remains fully available for merge.
+  const localNamesAtCommit = new Set(localBranchesAtCommit.map(ref => ref.name));
+  const mergeRefs = [...localBranchesAtCommit, ...remoteBranchesAtCommit.filter(ref => !localNamesAtCommit.has(remoteBranchShortName(ref.name)))];
+  const menuItems = [
+    { header: 'Checkout / attach HEAD' },
+    ...localBranchesAtCommit.map((ref, index) => graphCheckoutBranchMenuItem(ref.name, ref.kind, `checkout-local-${index}`)),
+    ...remoteBranchesAtCommit.map((ref, index) => graphCheckoutBranchMenuItem(ref.name, ref.kind, `checkout-remote-${index}`)),
+    { id: 'checkout', label: 'Checkout exact commit', detail: `${commitId.slice(0, 8)} · detached HEAD; branches stay unchanged`, kind: 'primary', run: () => checkoutGraphCommit(commitId) },
+    { id: 'branch', label: 'Create new branch here…', detail: `${commitId.slice(0, 8)} · new attached local branch`, kind: 'primary', run: () => createBranchFromGraphCommit(commitId) },
+  ];
+  if (mergeRefs.length) {
+    menuItems.push(
+      { separator: true },
+      { header: 'Merge into current branch' },
+      ...mergeRefs.map((ref, index) => graphMergeMenuItem(ref.name, `merge-${index}`)),
+    );
+  }
   menuItems.push(
-    { header: 'Commit actions' },
-    { id: 'branch', label: 'Create branch from this commit', detail: commitId.slice(0, 8), kind: 'primary', run: () => createBranchFromGraphCommit(commitId) },
-    { id: 'checkout', label: 'Checkout this commit', detail: 'Detached HEAD', kind: 'primary', run: () => checkoutGraphCommit(commitId) },
-    ...localBranchesAtCommit.map((ref, index) => ({ id: `commit-branch-${index}`, label: `Checkout branch ${ref.name}`, detail: 'Attached HEAD · same commit', kind: 'primary', run: () => switchBranch(ref.name) })),
     { separator: true },
-    { id: 'restore-exact', label: 'Restore exact checkpoint…', detail: 'Clean workspace to this commit', danger: true, run: () => restoreExactCheckpointFromGraphCommit(commitId) },
-    ...localBranchesAtCommit.map((ref, index) => ({ id: `clean-branch-${index}`, label: `Clean checkout branch ${ref.name}…`, detail: 'Discard local edits · attached HEAD', danger: true, run: () => restoreExactCheckpointFromGraphCommit(commitId, ref.name) })),
+    { header: 'Clean checkout · discards local files' },
+    { id: 'restore-exact', label: 'Clean checkout exact commit…', detail: `${commitId.slice(0, 8)} · detached HEAD`, danger: true, run: () => restoreExactCheckpointFromGraphCommit(commitId) },
+    ...localBranchesAtCommit.map((ref, index) => ({ id: `clean-branch-${index}`, label: `Clean checkout branch ${ref.name}…`, detail: 'Attach HEAD to this local branch after cleaning', danger: true, run: () => restoreExactCheckpointFromGraphCommit(commitId, ref.name) })),
     { separator: true },
-    { header: 'Compare' },
+    { header: 'Compare · read only' },
     ...commitCompareItems,
   );
   showFloatingMenu(event, menuItems);
@@ -5748,7 +5797,6 @@ function wireGraphRowInteractions(rowElements) {
     event.stopPropagation();
     copyText(button.dataset.copyCommitSha || '', 'Commit SHA copied.');
   })));
-  rowElements.forEach(row => row.querySelectorAll('[data-graph-ref-name]').forEach(pill => pill.addEventListener('contextmenu', event => showGraphBranchContextMenu(event, pill.dataset.graphRefName, pill.dataset.graphRefKind))));
   rowElements.forEach(row => row.querySelectorAll('[data-graph-ref-name]').forEach(pill => pill.addEventListener('click', event => {
     event.stopPropagation();
     handleGraphBranchCompareSelection(pill.dataset.graphRefName).catch(error => handleError(error));
@@ -5837,6 +5885,16 @@ function renderGraph() {
   // now" (point 4 of the rework).
   const refFilter = activeGraphRefFilter();
   const filterOptions = [['all', 'All'], ['branches', 'Branches'], ['releases', 'Releases']];
+  const headMainBase = ensureHeadMainMergeBase(g);
+  const branchStartVisible = !!(headMainBase?.oid && commits.some(commit => commit.id === headMainBase.oid));
+  const branchStartLookupPending = headMainMergeBaseFetchKey === `${g.path}::${g.headOid}`;
+  const branchStartTitle = headMainBase?.oid
+    ? branchStartVisible
+      ? `Go to branch start ${headMainBase.oid.slice(0, 8)} against ${headMainBase.base_ref}`
+      : `Load older history and go to branch start against ${headMainBase.base_ref}`
+    : branchStartLookupPending
+      ? 'Branch start is being calculated'
+      : 'Branch start is not available for this checkout';
   refs.graphView.style.setProperty('--lanes-width', `${lanesWidth}px`);
   // Message C, point 3's own literal example format ("Repository: X" /
   // "Branch: Y" or "Detached at Z" / "Parent: repo") — explicit, labeled
@@ -5852,10 +5910,12 @@ function renderGraph() {
     ${query ? `<span class="search-match-count">${onlySearchMatches ? `showing ${matchCount} match${matchCount === 1 ? '' : 'es'} only` : `${matchCount} match${matchCount === 1 ? '' : 'es'} — rest shown as context`}</span><button type="button" class="graph-search-toggle ${onlySearchMatches ? 'active' : ''}" data-graph-only-matches title="${onlySearchMatches ? 'Show full graph context again' : 'Show only matching commits without graph links'}">${onlySearchMatches ? 'Show context' : 'Only matches'}</button>` : ''}
     <div class="ref-filter-group" role="group" aria-label="Filter by ref kind">${filterOptions.map(([value, label]) => `<button type="button" class="ref-filter-btn ${refFilter === value ? 'active' : ''}" data-ref-filter="${value}">${label}</button>`).join('')}</div>
     <button type="button" class="graph-current-jump" data-jump-head ${headVisible ? '' : 'disabled'} title="${headVisible ? 'Jump to current HEAD in this graph' : 'Current HEAD is not loaded in this graph'}">⌖</button>
+    <button type="button" class="graph-branch-start-jump ${branchStartLookupPending ? 'is-loading' : ''}" data-jump-branch-start title="${esc(branchStartTitle)}" aria-label="Go to Branch start"><b>⑂</b><span>Go to Branch start</span></button>
     ${pickerOptions.length > 1 ? `<label class="primary-branch-picker"><span>Primary</span><select id="graphPrimaryBranch">${pickerOptions.map(opt => `<option value="${esc(opt.value)}" ${opt.value === selectedPickerValue ? 'selected' : ''}>${esc(opt.label)}</option>`).join('')}</select></label>` : ''}
     <span class="lane-header"><span>GRAPH</span><span>COMMIT</span></span>`;
   $('#graphPrimaryBranch')?.addEventListener('change', event => { setActiveGraphPrimaryBranch(event.target.value); renderGraph(); });
   refs.laneLegend.querySelectorAll('[data-jump-head]').forEach(button => button.addEventListener('click', jumpToGraphHead));
+  refs.laneLegend.querySelectorAll('[data-jump-branch-start]').forEach(button => button.addEventListener('click', jumpToGraphBranchStart));
   refs.laneLegend.querySelectorAll('[data-ref-filter]').forEach(button => button.addEventListener('click', () => { setActiveGraphRefFilter(button.dataset.refFilter); renderGraph(); }));
   refs.laneLegend.querySelectorAll('[data-graph-only-matches]').forEach(button => button.addEventListener('click', () => { state.graphOnlySearchMatches = !state.graphOnlySearchMatches; renderGraph(); }));
 
@@ -5881,7 +5941,6 @@ function renderGraph() {
   // detached HEAD or a remote-tracking ref has no "ahead of X" to compute
   // against itself.
   const divergence = !onlySearchMatches && primaryKind === 'branch' && primaryName ? ensureBranchDivergence(g.path, primaryName) : null;
-  const headMainBase = ensureHeadMainMergeBase(g);
   const aheadAnnotations = new Map(); // row index -> short text
   const branchPointRows = new Set(); // row indices that are a shared-ancestor base
   const commonAncestorRows = new Set(); // row indices that are merge-base(HEAD, origin/main/origin/master)
@@ -6723,7 +6782,7 @@ async function switchBranch(branch, button = null) {
       await openSubmoduleGraph({ relative_path: context.relativePath, name: context.name });
     } else {
       await invoke('switch_branch', { path: context.path, branch });
-      await loadRepository(context.path);
+      await loadRepository(context.path, { keepPath: true });
     }
   }
   catch (error) { handleError(error); }
@@ -6749,7 +6808,7 @@ async function switchRemoteTrackingBranch(remoteBranch, button = null) {
       await openSubmoduleGraph({ relative_path: context.relativePath, name: context.name });
     } else {
       const result = await invoke('checkout_remote_tracking_branch', { repositoryPath: context.path, remoteBranch });
-      await loadRepository(context.path);
+      await loadRepository(context.path, { keepPath: true });
       const verb = result?.created ? 'Created and switched to' : 'Switched to';
       showOperationToast(`${verb} ${result?.branch || localName} tracking ${result?.upstream || remoteBranch}.`, 'success');
     }

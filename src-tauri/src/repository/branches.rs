@@ -747,10 +747,12 @@ pub fn switch_branch(path: String, branch: String) -> Result<(), String> {
 // branch feature that tracks it, then checks that local branch out. This is
 // the safe GUI equivalent of:
 //   git switch --track origin/feature
-// with two deliberate guardrails:
+// with deliberate guardrails:
 // - an existing same-name local branch is never reset or moved;
-// - if that local branch already tracks a different upstream, the user gets a
-//   clear error instead of silently rewriting branch configuration.
+// - an existing branch is reused only when it already tracks the selected
+//   remote branch;
+// - a missing or different upstream is reported instead of silently changing
+//   branch configuration.
 #[tauri::command]
 pub fn checkout_remote_tracking_branch(repository_path: String, remote_branch: String) -> Result<RemoteTrackingCheckoutResult, String> {
     validate_path(&repository_path)?;
@@ -779,19 +781,18 @@ pub fn checkout_remote_tracking_branch(repository_path: String, remote_branch: S
 
     let mut created = false;
     match repo.find_branch(local_name, BranchType::Local) {
-        Ok(mut local_branch) => {
+        Ok(local_branch) => {
             let existing_upstream = local_branch.upstream()
                 .ok()
                 .and_then(|upstream| upstream.get().shorthand().map(str::to_string));
-            if let Some(existing) = existing_upstream {
-                if existing != remote_branch {
-                    return Err(format!(
-                        "Local branch \"{local_name}\" already tracks {existing}. It was not changed. Create a different local branch name if you want to track {remote_branch}."
-                    ));
-                }
-            } else {
-                local_branch.set_upstream(Some(remote_branch))
-                    .map_err(|error| format!("Could not set {remote_branch} as upstream for {local_name}: {}", error.message()))?;
+            match existing_upstream {
+                Some(existing) if existing == remote_branch => {}
+                Some(existing) => return Err(format!(
+                    "Local branch \"{local_name}\" already tracks {existing}. It was not changed. Create a different local branch name if you want to track {remote_branch}."
+                )),
+                None => return Err(format!(
+                    "Local branch \"{local_name}\" already exists but has no upstream. It was not changed. Switch to that local branch directly, or configure its upstream explicitly before using {remote_branch}."
+                )),
             }
         }
         Err(_) => {
