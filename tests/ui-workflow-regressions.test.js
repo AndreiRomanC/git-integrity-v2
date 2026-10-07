@@ -9,6 +9,15 @@ const app = fs.readFileSync(path.join(root, 'frontend/app.js'), 'utf8');
 const css = fs.readFileSync(path.join(root, 'frontend/styles.css'), 'utf8');
 const repository = fs.readFileSync(path.join(root, 'src-tauri/src/repository.rs'), 'utf8');
 
+test('slow backend round trips are measured without logging command arguments', () => {
+  assert.match(app, /const SLOW_INVOKE_LOG_THRESHOLD_MS = 250/);
+  assert.match(app, /if \(command === 'frontend_perf_log'\) return pending/);
+  assert.match(app, /if \(elapsedMs >= SLOW_INVOKE_LOG_THRESHOLD_MS\) jsPerfLog\(`invoke\(\$\{command\}\) SUCCESS`, elapsedMs\)/);
+  assert.match(app, /jsPerfLog\(`invoke\(\$\{command\}\) ERROR`, performance\.now\(\) - startedAt\)/);
+  const invokeTiming = app.match(/const startedAt = performance\.now\(\);[\s\S]*?return Promise\.resolve\(pending\)\.then\([\s\S]*?\n  \}\);/)?.[0] || '';
+  assert.doesNotMatch(invokeTiming, /JSON\.stringify\(args\)|\$\{args\}/);
+});
+
 test('Terminal is the first default command panel and has an explicit close button', () => {
   const terminalTab = html.indexOf('data-mode="console"');
   const actionsTab = html.indexOf('data-mode="commands"');
@@ -443,7 +452,23 @@ test('Publish dialog defaults to Safe publish and Fast publish asks for confirma
   assert.match(app, /const skipSubmoduleSafety = !!refs\.publishFastMode\?\.checked;/);
   assert.match(app, /if \(commitMode !== 'combine_only' && skipSubmoduleSafety && !overrideUnpushedSubmodules\) \{/);
   assert.match(app, /await customConfirm\(\s*\n\s*'Fast publish skips the submodule safety check\./);
+  assert.match(html, /id="publishSafetyExplanation"/);
+  assert.match(app, /Safe publish reads the submodule pointers in the outgoing commits and verifies each referenced SHA on its own remote\./);
+  assert.match(app, /It does not push submodules, merge, checkout, stage, or change local files\./);
+  assert.match(app, /Fast publish skips only the submodule remote-availability check\./);
   assert.match(app, /invoke\('publish_branch', \{ repositoryPath: state\.repository\.path, branch: state\.publish\.branch, remote: state\.publish\.remote, username: \$\('#publishUsername'\)\.value\.trim\(\), accessToken: \$\('#publishToken'\)\.value, uptoCommit: combined \? '' : state\.publishUpto \|\| '', overrideUnpushedSubmodules, skipSubmoduleSafety \}\)/);
+});
+
+test('Combine explains that it rewrites committed history without consuming parent working-tree changes', () => {
+  assert.match(app, /Combine affects committed history only:/);
+  assert.match(app, /Existing staged, unstaged and untracked parent-repository changes remain untouched and are not included\./);
+  assert.match(app, /The new commit preserves the exact committed files from the current HEAD\./);
+  assert.match(app, /Changes inside a submodule must be handled first\./);
+  const combineBackend = repository.match(/fn combine_local_commits_inner_with_auth[\s\S]*?\n\}\n\n\/\/ `GIT_TERMINAL_PROMPT/)?.[0] || '';
+  assert.doesNotMatch(combineBackend, /\["status",\s*"--porcelain/ , 'Combine must not add a whole-repository status scan');
+  assert.match(combineBackend, /let tree = old\.tree\(\)/, 'the combined commit must use the exact old HEAD tree by construction');
+  assert.match(combineBackend, /repo\.index\(\)[\s\S]*?\.has_conflicts\(\)/, 'Combine must reject unresolved index conflicts');
+  assert.match(combineBackend, /dirty_submodules_before_combine/, 'Combine must conservatively reject dirty submodules');
 });
 
 test('Publish preview clears stale selection and disables Push while loading or after an error', () => {

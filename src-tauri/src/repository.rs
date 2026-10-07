@@ -1,5 +1,5 @@
 use serde::Serialize;
-use git2::{BranchType, ObjectType, Oid, Repository, Sort, Status, StatusOptions};
+use git2::{BranchType, ObjectType, Oid, Repository, Sort, Status, StatusOptions, SubmoduleIgnore};
 use std::{collections::{HashMap, HashSet, VecDeque}, fs, path::{Component, Path, PathBuf}, process::Command, sync::{Arc, Mutex, OnceLock, atomic::{AtomicU64, Ordering}}, time::{Instant, Duration, UNIX_EPOCH}};
 
 pub mod stash;
@@ -283,8 +283,111 @@ async fn off_main_thread<T: Send + 'static>(body: impl FnOnce() -> Result<T, Str
 // ever seen after a mutation actually changed something.
 static FULL_STATUS_CACHE: OnceLock<Mutex<HashMap<String, (Instant, Vec<(String, String, bool)>)>>> = OnceLock::new();
 
+// A status walk can take tens of seconds on the real Windows repositories.
+// Mutating commands must remain free to run while that read-only walk is in
+// flight, so status_scan_lock intentionally does not serialize them together.
+// The per-repository epoch closes the resulting cache race instead: a scan may
+// finish, and its caller may still consume that one result, but it can publish
+// into FULL_STATUS_CACHE only if no status-affecting mutation happened since
+// the scan began.
+static STATUS_CACHE_EPOCHS: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+
 fn full_status_cache() -> &'static Mutex<HashMap<String, (Instant, Vec<(String, String, bool)>)>> {
     FULL_STATUS_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn status_cache_epochs() -> &'static Mutex<HashMap<String, u64>> {
+    STATUS_CACHE_EPOCHS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn status_cache_epoch(repository_path: &str) -> u64 {
+    let key = repo_lock_key(repository_path);
+    *status_cache_epochs().lock().unwrap().get(&key).unwrap_or(&0)
+}
+
+fn capture_status_cache_epoch(repository_path: &str, label: &str) -> u64 {
+    let epoch = status_cache_epoch(repository_path);
+    perf_log(
+        &format!(
+            "status_cache_epoch: scan start label={label} repo={} captured={epoch}",
+            anonymized_repository_id(repository_path),
+        ),
+        Duration::ZERO,
+    );
+    epoch
+}
+
+// Epoch comparison and cache insertion are one atomic critical section with
+// respect to invalidation. Checking first and inserting after releasing the
+// epoch lock would merely move the original race into that small gap.
+fn publish_full_status_if_epoch_current(
+    repository_path: &str,
+    captured_epoch: u64,
+    statuses: &[(String, String, bool)],
+    label: &str,
+) -> bool {
+    let key = repo_lock_key(repository_path);
+    let (current_epoch, accepted) = {
+        let epochs = status_cache_epochs().lock().unwrap();
+        let current_epoch = *epochs.get(&key).unwrap_or(&0);
+        let accepted = current_epoch == captured_epoch;
+        if accepted {
+            full_status_cache().lock().unwrap().insert(key, (Instant::now(), statuses.to_vec()));
+        }
+        (current_epoch, accepted)
+    };
+    perf_log(
+        &format!(
+            "status_cache_epoch: scan complete label={label} repo={} captured={captured_epoch} current={current_epoch} result={}",
+            anonymized_repository_id(repository_path),
+            if accepted { "accepted" } else { "stale-discarded" },
+        ),
+        Duration::ZERO,
+    );
+    accepted
+}
+
+// Incrementing the epoch and clearing the old entry are atomic relative to a
+// scan's compare-and-publish step. A scan either publishes before this block
+// (and is then removed here), or observes the newer epoch and is discarded.
+fn invalidate_full_status_cache(repository_path: &str, reason: &str) -> u64 {
+    let key = repo_lock_key(repository_path);
+    let next_epoch = {
+        let mut epochs = status_cache_epochs().lock().unwrap();
+        let epoch = epochs.entry(key.clone()).or_insert(0);
+        *epoch = epoch.wrapping_add(1);
+        full_status_cache().lock().unwrap().remove(&key);
+        *epoch
+    };
+    perf_log(
+        &format!(
+            "status_cache_epoch: invalidated repo={} current={next_epoch} reason={reason}",
+            anonymized_repository_id(repository_path),
+        ),
+        Duration::ZERO,
+    );
+    next_epoch
+}
+
+// Index-only and single-gitlink mutations can repair the existing snapshot
+// cheaply instead of clearing it. They still advance the epoch first so an
+// older full scan cannot overwrite that repaired snapshot when it finishes.
+fn advance_status_cache_epoch(repository_path: &str, reason: &str) -> u64 {
+    let key = repo_lock_key(repository_path);
+    let next_epoch = {
+        let mut epochs = status_cache_epochs().lock().unwrap();
+        let epoch = epochs.entry(key).or_insert(0);
+        *epoch = epoch.wrapping_add(1);
+        *epoch
+    };
+    perf_log(
+        &format!(
+            "status_cache_epoch: advanced repo={} current={next_epoch} reason={reason}",
+            anonymized_repository_id(repository_path),
+        ),
+        Duration::ZERO,
+    );
+    next_epoch
 }
 
 fn cached_full_statuses(repository: &Repository, repository_path: &str) -> Result<Vec<(String, String, bool)>, String> {
@@ -312,10 +415,11 @@ fn cached_full_statuses(repository: &Repository, repository_path: &str) -> Resul
             return Ok(statuses.clone());
         }
     }
+    let captured_epoch = capture_status_cache_epoch(repository_path, "cached_full_statuses");
     let step = Instant::now();
     let statuses = internal_statuses(repository, None)?;
     perf_log("cached_full_statuses: MISS, scanned", step.elapsed());
-    full_status_cache().lock().unwrap().insert(key, (Instant::now(), statuses.clone()));
+    publish_full_status_if_epoch_current(repository_path, captured_epoch, &statuses, "cached_full_statuses");
     Ok(statuses)
 }
 
@@ -369,20 +473,22 @@ fn recent_full_statuses(repository: &Repository, repository_path: &str) -> Resul
             return Ok(statuses.clone());
         }
     }
+    let captured_epoch = capture_status_cache_epoch(repository_path, "recent_full_statuses");
     let step = Instant::now();
     let statuses = internal_statuses(repository, None)?;
     perf_log("recent_full_statuses: MISS, fresh scan", step.elapsed());
-    full_status_cache().lock().unwrap().insert(key, (Instant::now(), statuses.clone()));
+    publish_full_status_if_epoch_current(repository_path, captured_epoch, &statuses, "recent_full_statuses");
     Ok(statuses)
 }
 
 fn fresh_full_statuses(repository: &Repository, repository_path: &str, label: &str) -> Result<Vec<(String, String, bool)>, String> {
     let lock_handle = status_scan_lock(repository_path);
     let _guard = lock_handle.lock().unwrap();
+    let captured_epoch = capture_status_cache_epoch(repository_path, label);
     let step = Instant::now();
     let statuses = internal_statuses(repository, None)?;
     perf_log(&format!("{label}: fresh full status scan"), step.elapsed());
-    full_status_cache().lock().unwrap().insert(repo_lock_key(repository_path), (Instant::now(), statuses.clone()));
+    publish_full_status_if_epoch_current(repository_path, captured_epoch, &statuses, label);
     Ok(statuses)
 }
 
@@ -916,17 +1022,48 @@ pub struct PublishStatus {
     remote_branch_exists: bool,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 pub struct CombinedLocalCommits {
     count: usize,
     revision: String,
     backup_ref: String,
 }
 
-// This deliberately accepts only a clean, attached branch whose actual server
-// tip is the first parent of a *linear* local-only sequence. A merge commit or
-// a stale remote-tracking ref needs a more explicit history operation, not a
-// silent flattening during Push. The old tip remains reachable by backup_ref.
+// libgit2 1.9 exposes WD_WD_MODIFIED and WD_UNTRACKED helpers, but git2 0.20
+// accidentally omits the accessor for the adjacent WD_INDEX_MODIFIED flag.
+// Keep the one upstream-defined bit here rather than falling back to a full
+// `git status` inside every submodule.
+const SUBMODULE_STATUS_WD_INDEX_MODIFIED: u32 = 1 << 11;
+
+fn dirty_submodules_before_combine(repo: &Repository) -> Result<Vec<String>, String> {
+    let started = Instant::now();
+    let submodules = repo.submodules().map_err(|error| format!("Could not inspect registered submodules before Combine: {}", error.message()))?;
+    let mut dirty = Vec::new();
+    for submodule in &submodules {
+        let name = submodule.name().ok_or_else(|| format!("Could not identify submodule {} before Combine", normalized(submodule.path())))?;
+        let status = repo.submodule_status(name, SubmoduleIgnore::None)
+            .map_err(|error| format!("Could not verify submodule {} before Combine: {}", normalized(submodule.path()), error.message()))?;
+        // WD_MODIFIED on its own only means the checked-out submodule commit
+        // differs from the superproject gitlink. That is ordinary parent-repo
+        // local state and Combine leaves it untouched. These three flags mean
+        // the submodule repository itself has staged, unstaged or untracked
+        // content, which we conservatively refuse to rewrite around.
+        let internally_dirty = status.bits() & SUBMODULE_STATUS_WD_INDEX_MODIFIED != 0
+            || status.is_wd_wd_modified()
+            || status.is_wd_untracked();
+        if internally_dirty { dirty.push(normalized(submodule.path())); }
+    }
+    perf_log(&format!("combine_local_commits: checked {} direct submodules ({} dirty)", submodules.len(), dirty.len()), started.elapsed());
+    Ok(dirty)
+}
+
+// This deliberately accepts only an attached branch whose actual server tip
+// is the first parent of a *linear* local-only sequence. A merge commit or a
+// stale remote-tracking ref needs a more explicit history operation, not a
+// silent flattening during Push. Ordinary parent-repository staged, unstaged
+// and untracked changes are safe: the new commit is built from old HEAD's tree
+// object and only the branch ref moves. The old tip remains reachable by
+// backup_ref.
 #[tauri::command]
 pub async fn combine_local_commits(repository_path: String, branch: String, remote: String, expected_tip: String, message: String, username: String, access_token: String) -> Result<CombinedLocalCommits, String> {
     off_main_thread(move || combine_local_commits_inner_with_auth(repository_path, branch, remote, expected_tip, message, username, access_token)).await
@@ -949,7 +1086,20 @@ fn combine_local_commits_inner_with_auth(repository_path: String, branch: String
     log_repo_write_lock_acquired(&repository_path, "combine_local_commits", queue_started.elapsed());
     let repo = internal_repository(&repository_path)?;
     repo.find_remote(remote).map_err(|_| format!("Remote {remote} is not configured"))?;
-    if repo.state() != git2::RepositoryState::Clean { return Err("Finish or abort the current merge/rebase before combining commits".into()); }
+    let repository_state = repo.state();
+    if repository_state != git2::RepositoryState::Clean {
+        return Err(format!("Combine is unavailable while a Git history operation is in progress ({repository_state:?}). Finish or abort it first."));
+    }
+    if repo.index().map_err(|error| format!("Could not inspect the Git index before Combine: {}", error.message()))?.has_conflicts() {
+        return Err("Combine is unavailable while the index contains unresolved conflicts. Resolve or abort them first.".into());
+    }
+    let dirty_submodules = dirty_submodules_before_combine(&repo)?;
+    if !dirty_submodules.is_empty() {
+        return Err(format!(
+            "Combine affects committed history only, but these submodules contain their own staged, unstaged or untracked changes: {}. Commit, stash or discard those submodule changes first; parent-repository local changes do not need to be stashed.",
+            dirty_submodules.join(", ")
+        ));
+    }
     let head = repo.head().map_err(|error| error.message().to_string())?;
     if !head.is_branch() || head.shorthand() != Some(branch) { return Err(format!("Checkout local branch {branch} before combining its commits")); }
     let old_oid = head.target().ok_or("HEAD has no commit")?;
@@ -990,8 +1140,6 @@ fn combine_local_commits_inner_with_auth(repository_path: String, branch: String
             .iter().find(|head| head.name() == server_ref).map(|head| head.oid())
     }.ok_or_else(|| format!("Server branch {remote}/{branch} is missing. Refresh/fetch before combining."))?;
     if server_oid != remote_oid { return Err(format!("{remote}/{branch} changed on the server. Fetch it and review the new commits before combining.")); }
-    let dirty = git(&repository_path, &["status", "--porcelain=v1", "--untracked-files=normal"])?;
-    if !dirty.trim().is_empty() { return Err("Commit, stash or remove current staged, modified and untracked files before combining. No workspace changes were rewritten.".into()); }
     let mut current = old_oid;
     let mut count = 0usize;
     while current != remote_oid {
@@ -1619,7 +1767,7 @@ fn replace_git_metadata(repository: &str, statuses: Vec<(String, String)>) {
 // invalidate_submodule_sync below.
 fn invalidate_git_metadata(repository: &str) {
     invalidate_scoped_and_index_metadata(repository);
-    full_status_cache().lock().unwrap().remove(&repo_lock_key(repository));
+    invalidate_full_status_cache(repository, "invalidate_git_metadata");
 }
 
 // The cheap part of invalidate_git_metadata: evicting cache entries costs
@@ -1650,11 +1798,16 @@ fn invalidate_scoped_and_index_metadata(repository: &str) {
 // tiny path scans run, its newer snapshot is left untouched.
 fn patch_status_cache_after_index_change(repository_path: &str, scopes: &[String]) {
     invalidate_scoped_and_index_metadata(repository_path);
+    let captured_epoch = advance_status_cache_epoch(repository_path, "index-change-patch");
     let repository_key = repo_lock_key(repository_path);
     let snapshot = full_status_cache().lock().unwrap().get(&repository_key).cloned();
     let Some((cached_at, mut statuses)) = snapshot else { return };
     let Ok(repo) = internal_repository(repository_path) else {
-        full_status_cache().lock().unwrap().remove(&repository_key);
+        let epochs = status_cache_epochs().lock().unwrap();
+        if *epochs.get(&repository_key).unwrap_or(&0) == captured_epoch {
+            let mut cache = full_status_cache().lock().unwrap();
+            if cache.get(&repository_key).is_some_and(|(current, _)| *current == cached_at) { cache.remove(&repository_key); }
+        }
         return;
     };
     let mut unique = scopes.iter().map(|scope| normalized(Path::new(scope))).filter(|scope| !scope.is_empty()).collect::<Vec<_>>();
@@ -1666,17 +1819,31 @@ fn patch_status_cache_after_index_change(repository_path: &str, scopes: &[String
         match internal_statuses(&repo, Some(scope)) {
             Ok(fresh) => statuses.extend(fresh),
             Err(_) => {
-                let mut cache = full_status_cache().lock().unwrap();
-                if cache.get(&repository_key).is_some_and(|(current, _)| *current == cached_at) { cache.remove(&repository_key); }
+                let epochs = status_cache_epochs().lock().unwrap();
+                if *epochs.get(&repository_key).unwrap_or(&0) == captured_epoch {
+                    let mut cache = full_status_cache().lock().unwrap();
+                    if cache.get(&repository_key).is_some_and(|(current, _)| *current == cached_at) { cache.remove(&repository_key); }
+                }
                 return;
             }
         }
     }
     statuses.sort_by(|left, right| left.0.cmp(&right.0));
-    let mut cache = full_status_cache().lock().unwrap();
-    if cache.get(&repository_key).is_some_and(|(current, _)| *current == cached_at) {
-        cache.insert(repository_key, (cached_at, statuses));
-        perf_log(&format!("status_cache: patched {} staged pathspec{}; avoided full rescan", unique.len(), if unique.len() == 1 { "" } else { "s" }), Duration::ZERO);
+    let accepted = {
+        let epochs = status_cache_epochs().lock().unwrap();
+        if *epochs.get(&repository_key).unwrap_or(&0) != captured_epoch { false }
+        else {
+            let mut cache = full_status_cache().lock().unwrap();
+            if cache.get(&repository_key).is_some_and(|(current, _)| *current == cached_at) {
+                cache.insert(repository_key, (cached_at, statuses));
+                true
+            } else { false }
+        }
+    };
+    if accepted {
+        perf_log(&format!("status_cache: patched {} staged pathspec{} at epoch {captured_epoch}; avoided full rescan", unique.len(), if unique.len() == 1 { "" } else { "s" }), Duration::ZERO);
+    } else {
+        perf_log(&format!("status_cache: discarded stale index patch captured at epoch {captured_epoch}"), Duration::ZERO);
     }
 }
 
@@ -1692,8 +1859,10 @@ fn seed_status_cache_after_stage_all(repository_path: &str, mut before: Vec<(Str
             if code == "??" { *code = "A".into(); }
         }
     }
-    full_status_cache().lock().unwrap().insert(repo_lock_key(repository_path), (Instant::now(), before));
-    perf_log("stage_all: seeded post-stage status from its fresh pre-stage scan; avoided duplicate full rescan", Duration::ZERO);
+    let captured_epoch = capture_status_cache_epoch(repository_path, "stage_all_seed");
+    if publish_full_status_if_epoch_current(repository_path, captured_epoch, &before, "stage_all_seed") {
+        perf_log("stage_all: seeded post-stage status from its fresh pre-stage scan; avoided duplicate full rescan", Duration::ZERO);
+    }
 }
 
 // A submodule checkout-only operation (switching version, restoring the
@@ -1719,26 +1888,44 @@ fn seed_status_cache_after_stage_all(repository_path: &str, mut before: Vec<(Str
 // leaving that part alone.
 fn invalidate_git_metadata_for_submodule_checkout(repository_path: &str, submodule_relative_path: &str) {
     invalidate_scoped_and_index_metadata(repository_path);
+    let captured_epoch = advance_status_cache_epoch(repository_path, "submodule-checkout-patch");
     let step = Instant::now();
-    let mut cache = full_status_cache().lock().unwrap();
     let repository_key = repo_lock_key(repository_path);
-    let Some((cached_at, statuses)) = cache.get(&repository_key) else {
+    let snapshot = full_status_cache().lock().unwrap().get(&repository_key).cloned();
+    let Some((cached_at, statuses)) = snapshot else {
         perf_log(&format!("invalidate_git_metadata_for_submodule_checkout: nothing cached to patch ({submodule_relative_path})"), step.elapsed());
         return;
     };
-    let cached_at = *cached_at;
-    let mut patched: Vec<(String, String, bool)> = statuses.iter().filter(|(path, _, _)| path != submodule_relative_path).cloned().collect();
+    let mut patched: Vec<(String, String, bool)> = statuses.into_iter().filter(|(path, _, _)| path != submodule_relative_path).collect();
     match internal_repository(repository_path).and_then(|repo| internal_statuses(&repo, Some(submodule_relative_path))) {
         Ok(fresh) => {
             let now_dirty = !fresh.is_empty();
             patched.extend(fresh);
-            cache.insert(repository_key, (cached_at, patched));
-            perf_log(&format!("invalidate_git_metadata_for_submodule_checkout: patched in place, avoided a full rescan ({submodule_relative_path}, now {})", if now_dirty { "dirty" } else { "clean" }), step.elapsed());
+            let accepted = {
+                let epochs = status_cache_epochs().lock().unwrap();
+                if *epochs.get(&repository_key).unwrap_or(&0) != captured_epoch { false }
+                else {
+                    let mut cache = full_status_cache().lock().unwrap();
+                    if cache.get(&repository_key).is_some_and(|(current, _)| *current == cached_at) {
+                        cache.insert(repository_key.clone(), (cached_at, patched));
+                        true
+                    } else { false }
+                }
+            };
+            if accepted {
+                perf_log(&format!("invalidate_git_metadata_for_submodule_checkout: patched in place at epoch {captured_epoch}, avoided a full rescan ({submodule_relative_path}, now {})", if now_dirty { "dirty" } else { "clean" }), step.elapsed());
+            } else {
+                perf_log(&format!("invalidate_git_metadata_for_submodule_checkout: discarded stale patch captured at epoch {captured_epoch} ({submodule_relative_path})"), step.elapsed());
+            }
         }
         // Could not verify this one path — do not guess. Falls back to
         // exactly the old behavior: the next status need does a full scan.
         Err(_) => {
-            cache.remove(&repository_key);
+            let epochs = status_cache_epochs().lock().unwrap();
+            if *epochs.get(&repository_key).unwrap_or(&0) == captured_epoch {
+                let mut cache = full_status_cache().lock().unwrap();
+                if cache.get(&repository_key).is_some_and(|(current, _)| *current == cached_at) { cache.remove(&repository_key); }
+            }
             perf_log(&format!("invalidate_git_metadata_for_submodule_checkout: could not verify, fell back to a full clear ({submodule_relative_path})"), step.elapsed());
         }
     }
@@ -8984,6 +9171,99 @@ mod tests {
         repo.commit(Some("HEAD"), &signature, &signature, "Initial commit", &tree, &[]).unwrap();
     }
 
+    fn unique_status_epoch_test_path(label: &str) -> String {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        std::env::temp_dir().join(format!("git-integrity-status-epoch-{label}-{suffix}")).to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn status_cache_epoch_accepts_a_scan_when_the_repository_did_not_change() {
+        let repository_path = unique_status_epoch_test_path("accepted");
+        let captured = capture_status_cache_epoch(&repository_path, "test-accepted");
+        let statuses = vec![("accepted.txt".to_string(), "M".to_string(), false)];
+
+        assert!(publish_full_status_if_epoch_current(&repository_path, captured, &statuses, "test-accepted"));
+        let cached = full_status_cache().lock().unwrap().get(&repo_lock_key(&repository_path)).cloned().unwrap().1;
+        assert_eq!(cached, statuses);
+        assert_eq!(status_cache_epoch(&repository_path), captured);
+    }
+
+    #[test]
+    fn status_cache_epoch_rejects_a_scan_when_the_repository_changes_in_flight() {
+        let repository_path = unique_status_epoch_test_path("in-flight");
+        let captured = capture_status_cache_epoch(&repository_path, "test-in-flight");
+        let ready = Arc::new(std::sync::Barrier::new(2));
+        let invalidated = Arc::new(std::sync::Barrier::new(2));
+        let worker_path = repository_path.clone();
+        let worker_ready = ready.clone();
+        let worker_invalidated = invalidated.clone();
+        let worker = std::thread::spawn(move || {
+            worker_ready.wait();
+            worker_invalidated.wait();
+            publish_full_status_if_epoch_current(
+                &worker_path,
+                captured,
+                &[("old.txt".to_string(), "M".to_string(), false)],
+                "test-in-flight",
+            )
+        });
+
+        ready.wait();
+        invalidate_git_metadata(&repository_path);
+        invalidated.wait();
+
+        assert!(!worker.join().unwrap(), "the result captured before invalidation must be rejected");
+        assert!(!full_status_cache().lock().unwrap().contains_key(&repo_lock_key(&repository_path)));
+    }
+
+    #[test]
+    fn status_cache_epoch_rejects_the_old_result_without_overwriting_a_newer_one() {
+        let repository_path = unique_status_epoch_test_path("preserve-newer");
+        let old_epoch = capture_status_cache_epoch(&repository_path, "test-old");
+        invalidate_git_metadata(&repository_path);
+        let new_epoch = capture_status_cache_epoch(&repository_path, "test-new");
+        let newer = vec![("newer.txt".to_string(), "A".to_string(), true)];
+        assert!(publish_full_status_if_epoch_current(&repository_path, new_epoch, &newer, "test-new"));
+
+        let old = vec![("old.txt".to_string(), "M".to_string(), false)];
+        assert!(!publish_full_status_if_epoch_current(&repository_path, old_epoch, &old, "test-old"));
+        let cached = full_status_cache().lock().unwrap().get(&repo_lock_key(&repository_path)).cloned().unwrap().1;
+        assert_eq!(cached, newer, "the rejected old scan must not replace the newer cache entry");
+    }
+
+    #[test]
+    fn status_cache_epoch_rejects_a_scan_after_multiple_invalidations() {
+        let repository_path = unique_status_epoch_test_path("multiple-invalidations");
+        let captured = capture_status_cache_epoch(&repository_path, "test-multiple-invalidations");
+        invalidate_git_metadata(&repository_path);
+        invalidate_git_metadata(&repository_path);
+        invalidate_git_metadata(&repository_path);
+
+        assert_eq!(status_cache_epoch(&repository_path), captured.wrapping_add(3));
+        assert!(!publish_full_status_if_epoch_current(
+            &repository_path,
+            captured,
+            &[("old.txt".to_string(), "M".to_string(), false)],
+            "test-multiple-invalidations",
+        ));
+        assert!(!full_status_cache().lock().unwrap().contains_key(&repo_lock_key(&repository_path)));
+    }
+
+    #[test]
+    fn status_cache_epoch_preserves_normal_cached_status_behavior() {
+        let repository = PathBuf::from(unique_status_epoch_test_path("normal-cache-hit"));
+        create_libgit2_repository(&repository, "README.md");
+        let repository_path = repository.to_string_lossy().into_owned();
+        let repo = Repository::open(&repository).unwrap();
+        let cached_statuses = vec![("cached-only.txt".to_string(), "??".to_string(), false)];
+        let captured = capture_status_cache_epoch(&repository_path, "test-normal-cache-hit");
+        assert!(publish_full_status_if_epoch_current(&repository_path, captured, &cached_statuses, "test-normal-cache-hit"));
+
+        let result = cached_full_statuses(&repo, &repository_path).unwrap();
+        assert_eq!(result, cached_statuses, "an unchanged, fresh cache entry must still follow the existing HIT path");
+        fs::remove_dir_all(repository).unwrap();
+    }
+
     // The two tests below are the only ones that touch RECENT_GIT_COMMANDS
     // (a process-global static shared across this whole test binary's
     // threads) — serialized against *each other* only, so the tight,
@@ -14607,9 +14887,6 @@ mod tests {
         let old_tree = run_git_capture(&repository, &["rev-parse", "HEAD^{tree}"]);
         let path = repository.to_string_lossy().into_owned();
         fs::write(repository.join("uncommitted.txt"), "keep this\n").unwrap();
-        assert!(combine_local_commits_inner(path.clone(), "main".into(), "origin".into(), old_tip.clone(), "One combined change".into()).is_err());
-        assert_eq!(run_git_capture(&repository, &["rev-parse", "HEAD"]), old_tip);
-        fs::remove_file(repository.join("uncommitted.txt")).unwrap();
         run_git(&repository, &["push", "origin", &format!("{old_tip}:refs/heads/other")]);
         run_git(&remote, &["update-ref", "refs/heads/main", &old_tip]);
         assert!(combine_local_commits_inner(path.clone(), "main".into(), "origin".into(), old_tip.clone(), "One combined change".into()).is_err(), "a server tip changed since the last fetch must block the rewrite");
@@ -14622,11 +14899,168 @@ mod tests {
         assert_eq!(run_git_capture(&repository, &["rev-parse", "HEAD^{tree}"]), old_tree);
         assert_eq!(run_git_capture(&repository, &["rev-parse", "HEAD^"]), original_base);
         assert_eq!(run_git_capture(&repository, &["rev-parse", &combined.backup_ref]), old_tip);
-        assert_eq!(run_git_capture(&repository, &["status", "--porcelain"]), "");
+        assert_eq!(fs::read_to_string(repository.join("uncommitted.txt")).unwrap(), "keep this\n");
+        assert_eq!(run_git_capture(&repository, &["status", "--porcelain"]), "?? uncommitted.txt", "untracked parent-repository files must remain untouched and outside the combined commit");
         assert_eq!(run_git_capture(&remote, &["rev-parse", "refs/heads/main"]), original_base, "Combine Only must leave origin untouched");
         publish_branch_inner(path, "main".into(), "origin".into(), String::new(), String::new(), String::new(), false).unwrap();
         assert_eq!(run_git_capture(&remote, &["rev-parse", "refs/heads/main"]), combined.revision);
         fs::remove_dir_all(base).unwrap();
+    }
+
+    struct CombineFixture {
+        base: PathBuf,
+        repository: PathBuf,
+        original_base: String,
+        old_tip: String,
+        old_tree: String,
+    }
+
+    fn combine_fixture(label: &str) -> CombineFixture {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-combine-{label}-{suffix}"));
+        let repository = base.join("local");
+        let remote = base.join("origin.git");
+        fs::create_dir_all(&repository).unwrap();
+        fs::create_dir_all(&remote).unwrap();
+        run_git(&remote, &["init", "--bare"]);
+        run_git(&repository, &["init", "-b", "main"]);
+        run_git(&repository, &["config", "user.name", "Test User"]);
+        run_git(&repository, &["config", "user.email", "test@example.com"]);
+        fs::write(repository.join("a.txt"), "base\n").unwrap();
+        run_git(&repository, &["add", "."]);
+        run_git(&repository, &["commit", "-m", "Base"]);
+        run_git(&repository, &["remote", "add", "origin", remote.to_str().unwrap()]);
+        run_git(&repository, &["push", "-u", "origin", "main"]);
+        let original_base = run_git_capture(&repository, &["rev-parse", "HEAD"]);
+        fs::write(repository.join("a.txt"), "first committed checkpoint\n").unwrap();
+        run_git(&repository, &["commit", "-am", "Checkpoint one"]);
+        fs::write(repository.join("b.txt"), "second committed checkpoint\n").unwrap();
+        run_git(&repository, &["add", "."]);
+        run_git(&repository, &["commit", "-m", "Checkpoint two"]);
+        let old_tip = run_git_capture(&repository, &["rev-parse", "HEAD"]);
+        let old_tree = run_git_capture(&repository, &["rev-parse", "HEAD^{tree}"]);
+        CombineFixture { base, repository, original_base, old_tip, old_tree }
+    }
+
+    fn combine_fixture_now(fixture: &CombineFixture) -> Result<CombinedLocalCommits, String> {
+        combine_local_commits_inner(
+            fixture.repository.to_string_lossy().into_owned(),
+            "main".into(),
+            "origin".into(),
+            fixture.old_tip.clone(),
+            "Combined checkpoints".into(),
+        )
+    }
+
+    #[test]
+    fn combine_preserves_unstaged_staged_mixed_and_untracked_parent_state_exactly() {
+        for scenario in ["unstaged", "staged", "staged-and-unstaged", "untracked"] {
+            let fixture = combine_fixture(scenario);
+            match scenario {
+                "unstaged" => fs::write(fixture.repository.join("a.txt"), "unstaged after committed checkpoints\n").unwrap(),
+                "staged" => {
+                    fs::write(fixture.repository.join("a.txt"), "staged after committed checkpoints\n").unwrap();
+                    run_git(&fixture.repository, &["add", "a.txt"]);
+                }
+                "staged-and-unstaged" => {
+                    fs::write(fixture.repository.join("a.txt"), "staged layer\n").unwrap();
+                    run_git(&fixture.repository, &["add", "a.txt"]);
+                    fs::write(fixture.repository.join("a.txt"), "unstaged layer over staged layer\n").unwrap();
+                }
+                "untracked" => fs::write(fixture.repository.join("local-only.txt"), "not committed\n").unwrap(),
+                _ => unreachable!(),
+            }
+            let status_before = run_git_capture(&fixture.repository, &["status", "--porcelain=v1", "--untracked-files=normal"]);
+            let staged_before = run_git_capture(&fixture.repository, &["diff", "--cached", "--binary"]);
+            let unstaged_before = run_git_capture(&fixture.repository, &["diff", "--binary"]);
+            let a_before = fs::read(fixture.repository.join("a.txt")).unwrap();
+            let untracked_before = fs::read(fixture.repository.join("local-only.txt")).ok();
+
+            let combined = combine_fixture_now(&fixture).unwrap();
+            assert_eq!(combined.count, 2);
+            assert_eq!(run_git_capture(&fixture.repository, &["rev-parse", "HEAD^{tree}"]), fixture.old_tree);
+            assert_eq!(run_git_capture(&fixture.repository, &["rev-parse", "HEAD^"]), fixture.original_base);
+            assert_eq!(run_git_capture(&fixture.repository, &["rev-parse", &combined.backup_ref]), fixture.old_tip);
+            assert_eq!(run_git_capture(&fixture.repository, &["status", "--porcelain=v1", "--untracked-files=normal"]), status_before, "{scenario}: staged/unstaged classification changed");
+            assert_eq!(run_git_capture(&fixture.repository, &["diff", "--cached", "--binary"]), staged_before, "{scenario}: staged patch changed");
+            assert_eq!(run_git_capture(&fixture.repository, &["diff", "--binary"]), unstaged_before, "{scenario}: unstaged patch changed");
+            assert_eq!(fs::read(fixture.repository.join("a.txt")).unwrap(), a_before, "{scenario}: working file content changed");
+            assert_eq!(fs::read(fixture.repository.join("local-only.txt")).ok(), untracked_before, "{scenario}: untracked content changed");
+            fs::remove_dir_all(fixture.base).unwrap();
+        }
+    }
+
+    #[test]
+    fn combine_blocks_dirty_submodules_without_stashing_them() {
+        let fixture = combine_fixture("dirty-submodule");
+        let dependency = fixture.base.join("dependency");
+        fs::create_dir_all(&dependency).unwrap();
+        run_git(&dependency, &["init", "-b", "main"]);
+        run_git(&dependency, &["config", "user.name", "Test User"]);
+        run_git(&dependency, &["config", "user.email", "test@example.com"]);
+        fs::write(dependency.join("module.txt"), "clean\n").unwrap();
+        run_git(&dependency, &["add", "."]);
+        run_git(&dependency, &["commit", "-m", "Dependency base"]);
+        run_git(&fixture.repository, &["-c", "protocol.file.allow=always", "submodule", "add", dependency.to_str().unwrap(), "vendor/dependency"]);
+        run_git(&fixture.repository, &["commit", "-am", "Add dependency"]);
+        let current_tip = run_git_capture(&fixture.repository, &["rev-parse", "HEAD"]);
+        fs::write(fixture.repository.join("vendor/dependency/module.txt"), "dirty inside submodule\n").unwrap();
+        let error = combine_local_commits_inner(
+            fixture.repository.to_string_lossy().into_owned(), "main".into(), "origin".into(), current_tip.clone(), "Combined checkpoints".into()
+        ).unwrap_err();
+        assert!(error.contains("vendor/dependency") && error.contains("submodules contain"), "unexpected dirty-submodule error: {error}");
+        assert_eq!(run_git_capture(&fixture.repository, &["rev-parse", "HEAD"]), current_tip);
+        assert_eq!(fs::read_to_string(fixture.repository.join("vendor/dependency/module.txt")).unwrap(), "dirty inside submodule\n");
+        run_git(&fixture.repository.join("vendor/dependency"), &["add", "module.txt"]);
+        let staged_error = combine_local_commits_inner(
+            fixture.repository.to_string_lossy().into_owned(), "main".into(), "origin".into(), current_tip.clone(), "Combined checkpoints".into()
+        ).unwrap_err();
+        assert!(staged_error.contains("vendor/dependency") && staged_error.contains("submodules contain"), "staged submodule changes must also block Combine: {staged_error}");
+        assert_eq!(run_git_capture(&fixture.repository, &["rev-parse", "HEAD"]), current_tip);
+        assert!(!run_git_capture(&fixture.repository.join("vendor/dependency"), &["diff", "--cached", "--name-only"]).is_empty(), "the submodule change must remain staged after the refusal");
+        fs::remove_dir_all(fixture.base).unwrap();
+    }
+
+    #[test]
+    fn combine_blocks_merge_rebase_and_unresolved_index_conflicts() {
+        let fixture = combine_fixture("unsafe-state");
+        let git_dir = fixture.repository.join(".git");
+        fs::write(git_dir.join("MERGE_HEAD"), format!("{}\n", fixture.original_base)).unwrap();
+        let merge_error = combine_fixture_now(&fixture).unwrap_err();
+        assert!(merge_error.contains("history operation is in progress") && merge_error.contains("Merge"), "unexpected merge-state error: {merge_error}");
+        fs::remove_file(git_dir.join("MERGE_HEAD")).unwrap();
+
+        fs::create_dir_all(git_dir.join("rebase-merge")).unwrap();
+        let rebase_error = combine_fixture_now(&fixture).unwrap_err();
+        assert!(rebase_error.contains("history operation is in progress") && rebase_error.contains("Rebase"), "unexpected rebase-state error: {rebase_error}");
+        fs::remove_dir_all(git_dir.join("rebase-merge")).unwrap();
+
+        run_git(&fixture.repository, &["branch", "conflict-side", &fixture.original_base]);
+        run_git(&fixture.repository, &["checkout", "conflict-side"]);
+        fs::write(fixture.repository.join("a.txt"), "conflicting branch content\n").unwrap();
+        run_git(&fixture.repository, &["commit", "-am", "Conflicting change"]);
+        run_git(&fixture.repository, &["checkout", "main"]);
+        let merge = Command::new("git").arg("-C").arg(&fixture.repository).args(["merge", "conflict-side"]).status().unwrap();
+        assert!(!merge.success(), "sanity check: merge should create an unresolved conflict");
+        for marker in ["MERGE_HEAD", "MERGE_MSG", "MERGE_MODE"] { let _ = fs::remove_file(git_dir.join(marker)); }
+        assert_eq!(Repository::open(&fixture.repository).unwrap().state(), git2::RepositoryState::Clean, "the remaining block must come from index conflicts, not a merge marker");
+        let conflict_error = combine_fixture_now(&fixture).unwrap_err();
+        assert!(conflict_error.contains("unresolved conflicts"), "unexpected conflict error: {conflict_error}");
+        assert_eq!(run_git_capture(&fixture.repository, &["rev-parse", "HEAD"]), fixture.old_tip);
+        fs::remove_dir_all(fixture.base).unwrap();
+    }
+
+    #[test]
+    fn combine_failure_keeps_old_head_and_the_recovery_reference() {
+        let fixture = combine_fixture("update-ref-failure");
+        let branch_lock = fixture.repository.join(".git/refs/heads/main.lock");
+        fs::write(&branch_lock, "block ref update\n").unwrap();
+        let error = combine_fixture_now(&fixture).unwrap_err();
+        assert!(error.contains("Original commits remain at refs/git-drilldown/backups/"), "unexpected ref-update error: {error}");
+        assert_eq!(run_git_capture(&fixture.repository, &["rev-parse", "HEAD"]), fixture.old_tip);
+        let backups = run_git_capture(&fixture.repository, &["for-each-ref", "--format=%(objectname)", "refs/git-drilldown/backups"]);
+        assert!(backups.lines().any(|oid| oid == fixture.old_tip), "the old tip must remain recoverable after branch update failure: {backups}");
+        fs::remove_dir_all(fixture.base).unwrap();
     }
 
     #[test]

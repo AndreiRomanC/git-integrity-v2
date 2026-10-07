@@ -27,6 +27,14 @@ const MUTATING_COMMANDS = new Set([
 // legitimate call that's about to set consoleCommandRunning in the first place.
 const REPO_SWITCH_COMMANDS = new Set(['load_repository', 'open_repository_fast']);
 const EMBEDDED_CONSOLE_COMMANDS = new Set(['run_git_command', 'run_terminal_command']);
+// Measure the whole frontend -> Tauri -> frontend round trip, not just the
+// backend phases that individual commands happen to log. Only slow calls and
+// failures are recorded so ordinary navigation does not flood the diagnostic
+// file. Arguments are deliberately excluded: they can contain repository
+// paths, commit messages or credentials and are not needed to identify which
+// command is slow. frontend_perf_log itself is excluded to avoid recursive
+// logging.
+const SLOW_INVOKE_LOG_THRESHOLD_MS = 250;
 const rawInvoke = window.__TAURI__?.core?.invoke;
 const invoke = rawInvoke && ((command, args) => {
   if (MUTATING_COMMANDS.has(command) && !state.statusReady) {
@@ -52,7 +60,23 @@ const invoke = rawInvoke && ((command, args) => {
     jsPerfLog(`invoke wrapper REFUSED ${command} (activeSubmodule status not ready)`, 0);
     return Promise.reject(message);
   }
-  return rawInvoke(command, args);
+  const startedAt = performance.now();
+  let pending;
+  try {
+    pending = rawInvoke(command, args);
+  } catch (error) {
+    if (command !== 'frontend_perf_log') jsPerfLog(`invoke(${command}) ERROR before promise`, performance.now() - startedAt);
+    throw error;
+  }
+  if (command === 'frontend_perf_log') return pending;
+  return Promise.resolve(pending).then(result => {
+    const elapsedMs = performance.now() - startedAt;
+    if (elapsedMs >= SLOW_INVOKE_LOG_THRESHOLD_MS) jsPerfLog(`invoke(${command}) SUCCESS`, elapsedMs);
+    return result;
+  }, error => {
+    jsPerfLog(`invoke(${command}) ERROR`, performance.now() - startedAt);
+    throw error;
+  });
 });
 const $ = selector => document.querySelector(selector);
 // Lane colors only — never branch identity, never commit state. Deliberately no
@@ -6330,8 +6354,14 @@ function updatePublishModeUi() {
   const mode = document.querySelector('[name="publishCommitMode"]:checked')?.value || 'all';
   if (button) button.textContent = mode === 'combine_only' ? 'Combine only' : mode === 'combine_push' ? 'Combine & push' : fast ? 'Fast publish' : 'Publish safely';
   $('#publishSafetyMode').hidden = mode === 'combine_only';
+  const safetyExplanation = $('#publishSafetyExplanation');
+  safetyExplanation.hidden = mode === 'combine_only';
+  safetyExplanation.classList.toggle('fast', !!fast);
+  safetyExplanation.textContent = fast
+    ? 'Fast publish skips only the submodule remote-availability check. It is quicker, but another clone can fail if an outgoing project commit points to a submodule commit that exists only on this computer.'
+    : 'Safe publish reads the submodule pointers in the outgoing commits and verifies each referenced SHA on its own remote. It does not push submodules, merge, checkout, stage, or change local files.';
   $('#publishCombinedMessageLabel').hidden = mode === 'all';
-  $('#publishCombineNotice').textContent = mode === 'all' ? '' : 'All local-only commits are combined; partial publish selections do not apply. A recovery reference is created before the branch moves.';
+  $('#publishCombineNotice').textContent = mode === 'all' ? '' : `Combine affects committed history only: ${state.publish?.ahead || state.publish?.commits?.length || 0} local-only commits become one. Existing staged, unstaged and untracked parent-repository changes remain untouched and are not included. A recovery reference is created before the branch moves. Changes inside a submodule must be handled first.`;
   const incompleteList = Number(state.publish?.outgoing_count) > (state.publish?.commits?.length || 0);
   refs.publishCommits.querySelectorAll('.publish-check').forEach(box => { box.disabled = mode !== 'all' || incompleteList; });
 }
@@ -6409,7 +6439,7 @@ async function confirmPublish(event, overrideUnpushedSubmodules = false, already
   const commitMode = document.querySelector('[name="publishCommitMode"]:checked')?.value || 'all';
   const combining = commitMode !== 'all';
   if (combining && !alreadyCombined && !overrideUnpushedSubmodules) {
-    const proceed = await customConfirm(`Combine ${state.publish.ahead} local-only commits on ${state.publish.branch} into one new commit?\n\nTheir final committed files are preserved, but their commit IDs change. A recovery reference to the original tip will be kept. ${commitMode === 'combine_only' ? 'Nothing will be pushed.' : 'The new commit will then be pushed.'}`, { title: commitMode === 'combine_only' ? 'Combine local commits' : 'Combine and push', danger: true, okLabel: commitMode === 'combine_only' ? 'Combine only' : 'Combine & push' });
+    const proceed = await customConfirm(`Combine ${state.publish.ahead} local-only commits on ${state.publish.branch} into one new commit?\n\nOnly committed history is combined. The new commit preserves the exact committed files from the current HEAD. Existing staged, unstaged and untracked parent-repository changes remain untouched and are not included. Their commit IDs change, and a recovery reference to the original tip will be kept. ${commitMode === 'combine_only' ? 'Nothing will be pushed.' : 'The new commit will then be pushed.'}`, { title: commitMode === 'combine_only' ? 'Combine local commits' : 'Combine and push', danger: true, okLabel: commitMode === 'combine_only' ? 'Combine only' : 'Combine & push' });
     if (!proceed) return;
   }
   const skipSubmoduleSafety = !!refs.publishFastMode?.checked;

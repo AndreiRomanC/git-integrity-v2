@@ -512,15 +512,16 @@
       <div class="publish-explain"><b id="publishDestination">—</b><span>All commits listed below will be published in order. Select files before Commit; select the destination here before Push.</span></div>
       <fieldset id="publishSafetyMode" class="publish-safety-mode">
         <legend>Publish mode</legend>
-        <label><input type="radio" name="publishSafetyMode" id="publishSafeMode" checked><span><strong>Safe publish</strong><small>Checks that referenced submodule commits exist on each submodule remote. Slower, but prevents broken clones.</small></span></label>
-        <label><input type="radio" name="publishSafetyMode" id="publishFastMode"><span><strong>Fast publish</strong><small>Skips the submodule remote safety check. Use only when you already know the submodule commits are pushed or this publish does not depend on them.</small></span></label>
+        <label><input type="radio" name="publishSafetyMode" id="publishSafeMode" checked><span><strong>Safe publish</strong><small>Before Push, verifies that every referenced submodule commit is available on that submodule's remote.</small></span></label>
+        <label><input type="radio" name="publishSafetyMode" id="publishFastMode"><span><strong>Fast publish</strong><small>Pushes without that remote-availability check. Use only when the submodule commits are already published.</small></span></label>
       </fieldset>
+      <p id="publishSafetyExplanation" class="publish-safety-explanation">Safe publish reads the submodule pointers in the outgoing commits and verifies each referenced SHA on its own remote. It does not push submodules, merge, checkout, stage, or change local files.</p>
       <div id="publishCommits" class="publish-commits"></div>
       <fieldset id="publishCommitMode" class="publish-commit-mode" hidden>
         <legend>Local commits</legend>
         <label><input type="radio" name="publishCommitMode" value="all" checked><span>Push All<small>Publish each commit as it is.</small></span></label>
-        <label><input type="radio" name="publishCommitMode" value="combine_push"><span>Combine &amp; Push<small>Replace local-only commits with one commit, then publish it.</small></span></label>
-        <label><input type="radio" name="publishCommitMode" value="combine_only"><span>Combine Only<small>Keep the new single commit local.</small></span></label>
+        <label><input type="radio" name="publishCommitMode" value="combine_push"><span>Combine &amp; Push<small>Replace committed local-only history with one commit, then publish it.</small></span></label>
+        <label><input type="radio" name="publishCommitMode" value="combine_only"><span>Combine Only<small>Replace committed local-only history and keep the new commit local.</small></span></label>
         <label id="publishCombinedMessageLabel" hidden><span>Combined commit message</span><textarea id="publishCombinedMessage" rows="2" placeholder="Describe the combined change"></textarea></label>
         <p id="publishCombineNotice"></p>
       </fieldset>
