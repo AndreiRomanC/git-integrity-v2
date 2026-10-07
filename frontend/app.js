@@ -3293,7 +3293,10 @@ async function confirmFolderRestore() {
   } catch (error) {
     refs.folderRestoreStatus.textContent = String(error);
     handleError(error);
-    try { state.changes = await invoke('refresh_status', { repositoryPath: state.repository.path }); render(); } catch (_) {}
+    try {
+      await requestRepositoryStatusRefresh(state.repository.path, { reason: 'folder-restore-recovery' });
+      render();
+    } catch (_) {}
   } finally {
     finishConfirmButton();
     updateFolderRestoreActionState();
@@ -6678,12 +6681,12 @@ async function flushOneBatch(options) {
       // This refresh is mandatory even when Commit requested skipReload:
       // Commit reads state.changes immediately after this flush, so it must
       // see Git's authoritative index rather than the optimistic click.
-      const changes = await invoke('refresh_status', { repositoryPath });
-      if (stillSameRepo()) {
-        state.changes = changes; state.statusReady = true; updateChangeBadge();
-        if (refs.changesDrawer.classList.contains('open')) renderChanges();
-        if (!options.skipReload && state.currentPath === folder) await openDirectory(folder, { force: true });
-      }
+      await requestRepositoryStatusRefresh(repositoryPath, {
+        folder,
+        repaintFolder: !options.skipReload,
+        reason: 'skipped-dirty-submodule',
+        isValid: stillSameRepo,
+      });
       const names = skippedSubmodules.map(path => path.split('/').pop()).join(', ');
       const message = `${skippedSubmodules.length === 1 ? 'This submodule' : 'These submodules'} (${names}) ${skippedSubmodules.length === 1 ? 'has' : 'have'} uncommitted files inside, but no new submodule commit to record in the parent project. Open ${skippedSubmodules.length === 1 ? 'it' : 'them'}, stage and commit the internal files there first; then stage the resulting submodule version here.`;
       status(message, 'error'); showOperationToast(message, 'error');
@@ -6977,16 +6980,77 @@ renderCommitMessageHistory();
 // opening it), and fails silently — this is a best-effort background
 // top-up, not a user-initiated action worth its own error toast.
 const refreshChangesLightweightGuard = createRequestGuard();
+
+const STATUS_REFRESH_CHANGES = 0;
+const STATUS_REFRESH_FOLDER = 1;
+
+function repositoryStatusRefreshScope({ folder = '', repaintFolder = false, reason = 'status', isValid = null } = {}) {
+  return {
+    rank: repaintFolder ? STATUS_REFRESH_FOLDER : STATUS_REFRESH_CHANGES,
+    folder,
+    repaintFolder,
+    reasons: [reason],
+    validators: typeof isValid === 'function' ? [isValid] : [],
+  };
+}
+
+function mergeRepositoryStatusRefreshScopes(left, right) {
+  if (!left) return right;
+  if (!right) return left;
+  const rightOwnsFolder = right.repaintFolder && Boolean(right.folder);
+  return {
+    rank: Math.max(left.rank, right.rank),
+    folder: rightOwnsFolder ? right.folder : left.folder,
+    repaintFolder: left.repaintFolder || right.repaintFolder,
+    reasons: [...new Set([...(left.reasons || []), ...(right.reasons || [])])],
+    validators: [...(left.validators || []), ...(right.validators || [])],
+  };
+}
+
+function describeRepositoryStatusRefreshScope(scope) {
+  return `${scope?.rank === STATUS_REFRESH_FOLDER ? 'status+folder' : 'status'}:${(scope?.reasons || []).join('+') || 'unspecified'}`;
+}
+
+// Coalesce only the lightweight `refresh_status` family. Full repository
+// reloads, fast-open completion, fetch/push and submodule inspection retain
+// their existing, specialized generation and invalidation semantics.
+const repositoryStatusRefreshCoordinator = window.GitDrillDownRefresh.createRefreshCoordinator({
+  execute: repositoryPath => invoke('refresh_status', { repositoryPath }),
+  mergeScope: mergeRepositoryStatusRefreshScopes,
+  describeScope: describeRepositoryStatusRefreshScope,
+  log: (event, details) => jsPerfLog(`statusRefresh ${event} (scope=${details.scope || details.pendingScope || details.to || 'n/a'})`, 0),
+  apply: async (repositoryPath, changes, scope) => {
+    if (state.repository?.path !== repositoryPath) {
+      jsPerfLog('statusRefresh result ignored (repository changed)', 0);
+      return;
+    }
+    const validators = scope.validators || [];
+    if (validators.length && !validators.some(isValid => {
+      try { return isValid(); } catch { return false; }
+    })) {
+      jsPerfLog('statusRefresh result ignored (request generation superseded)', 0);
+      return;
+    }
+    state.changes = changes;
+    state.statusReady = true;
+    updateChangeBadge();
+    if (refs.changesDrawer.classList.contains('open')) renderChanges();
+    if (scope.repaintFolder && state.view === 'explorer' && (!scope.folder || state.currentPath === scope.folder)) {
+      await openDirectory(state.currentPath, { force: true, explorerOnly: true });
+    }
+  },
+});
+
+function requestRepositoryStatusRefresh(repositoryPath, options = {}) {
+  return repositoryStatusRefreshCoordinator.request(repositoryPath, repositoryStatusRefreshScope(options));
+}
+
 async function refreshChangesLightweight() {
   if (!invoke || !state.repository) return;
   const repositoryPath = state.repository.path;
   const stillCurrent = refreshChangesLightweightGuard();
   try {
-    const changes = await invoke('refresh_status', { repositoryPath });
-    // state.repository.path itself (not just stillCurrent()) — a different
-    // repository could have been opened at the very same path a stale
-    // response would otherwise still match on identity alone.
-    if (stillCurrent() && state.repository?.path === repositoryPath) { state.changes = changes; updateChangeBadge(); if (refs.changesDrawer.classList.contains('open')) renderChanges(); }
+    await requestRepositoryStatusRefresh(repositoryPath, { reason: 'changes-drawer', isValid: stillCurrent });
   } catch { /* best-effort — a manual Refresh remains the explicit fallback */ }
 }
 
@@ -6998,14 +7062,12 @@ async function refreshStatusAndFolderInBackground(repositoryPath, folder, reason
   const startedAt = performance.now();
   jsPerfLog(`postStageRefresh START (${reason}, ${folder || '/'})`, 0);
   try {
-    const changes = await invoke('refresh_status', { repositoryPath });
-    if (seq !== postStageRefreshSeq || state.repository?.path !== repositoryPath) {
-      jsPerfLog(`postStageRefresh END (${reason}, stale after status)`, performance.now() - startedAt);
-      return;
-    }
-    state.changes = changes; state.statusReady = true; updateChangeBadge();
-    if (refs.changesDrawer.classList.contains('open')) renderChanges();
-    if (state.view === 'explorer' && state.currentPath === folder) await openDirectory(folder, { force: true, explorerOnly: true });
+    await requestRepositoryStatusRefresh(repositoryPath, {
+      folder,
+      repaintFolder: true,
+      reason,
+      isValid: () => seq === postStageRefreshSeq && state.repository?.path === repositoryPath,
+    });
     jsPerfLog(`postStageRefresh END (${reason}, applied)`, performance.now() - startedAt);
   } catch (error) {
     jsPerfLog(`postStageRefresh ERROR (${reason}): ${String(error)}`, performance.now() - startedAt);
@@ -7023,11 +7085,7 @@ async function refreshStatusAndFolderInBackground(repositoryPath, folder, reason
 // paying for a second backend scan right behind it — same reasoning as
 // every other post-mutation repaint in this file.
 async function refreshStatusAndFolder(repositoryPath, folder) {
-  const changes = await invoke('refresh_status', { repositoryPath });
-  if (state.repository?.path !== repositoryPath) return; // switched to a different repository while this was in flight
-  state.changes = changes; state.statusReady = true; updateChangeBadge();
-  if (refs.changesDrawer.classList.contains('open')) renderChanges();
-  if (state.view === 'explorer') await openDirectory(folder, { force: true, explorerOnly: true });
+  await requestRepositoryStatusRefresh(repositoryPath, { folder, repaintFolder: true, reason: 'mutation' });
 }
 
 $('#showChanges').addEventListener('click', () => { state.changesScope = 'global'; applyDefaultCommitMessage(); renderChanges(); refs.changesDrawer.classList.add('open'); refreshChangesLightweight(); });
@@ -7056,10 +7114,12 @@ async function returnToProjectNavigator() {
     state.localDriveGitRefreshPending = false;
     try {
       status('Refreshing Git after Local Drive changes…', 'busy');
-      state.changes = await invoke('refresh_status', { repositoryPath: state.repository.path });
-      state.statusReady = true;
       directoryCache.clear();
-      await openDirectory(state.currentPath, { force: true });
+      await requestRepositoryStatusRefresh(state.repository.path, {
+        folder: state.currentPath,
+        repaintFolder: true,
+        reason: 'local-drive',
+      });
       status('Git status refreshed');
     } catch (error) { handleError(error); }
   }

@@ -87,7 +87,7 @@ test('dirty-only submodules cannot remain falsely staged in the parent project',
   assert.match(flush, /stageResult = await invoke\('stage_files'/);
   assert.match(flush, /stageResult\?\.skipped_dirty_submodules \|\| \[\]/);
   assert.match(flush, /if \(change\) change\.staged = false/);
-  assert.match(flush, /await invoke\('refresh_status', \{ repositoryPath \}\)/);
+  assert.match(flush, /await requestRepositoryStatusRefresh\(repositoryPath, \{[\s\S]*?reason: 'skipped-dirty-submodule'/);
   assert.match(flush, /commit the internal files there first/);
   assert.match(app, /if \(!files\.length\) \{[\s\S]*?Nothing is staged[\s\S]*?return;/);
   assert.match(app, /Submodule version staged/);
@@ -771,11 +771,14 @@ test('submodule stash is disabled without local changes, and stage/unstage failu
 });
 
 test('checkbox stage flush waits only for index writes, not for the slow visual refresh', () => {
+  assert.match(html, /<script src="refresh-coordinator\.js\?v=[^"]+"><\/script>/);
+  assert.match(app, /const repositoryStatusRefreshCoordinator = window\.GitDrillDownRefresh\.createRefreshCoordinator/);
   assert.match(app, /async function refreshStatusAndFolderInBackground\(repositoryPath, folder, reason = 'stage'\)/);
   assert.match(app, /refreshStatusAndFolderInBackground\(repositoryPath, folder, `checkbox generation=\$\{generation\}`\)/);
   assert.match(app, /flushOneBatch scheduled background refresh/);
   assert.doesNotMatch(app, /await refreshStatusAndFolder\(repositoryPath, folder\);\n\s*jsPerfLog\(`flushOneBatch refresh/);
-  assert.match(app, /if \(state\.view === 'explorer' && state\.currentPath === folder\) await openDirectory\(folder, \{ force: true, explorerOnly: true \}\);/);
+  assert.match(app, /scope\.repaintFolder && state\.view === 'explorer' && \(!scope\.folder \|\| state\.currentPath === scope\.folder\)/);
+  assert.match(app, /await openDirectory\(state\.currentPath, \{ force: true, explorerOnly: true \}\)/);
   assert.match(app, /function renderExplorerAfterStatusRefresh\(\)/);
   assert.match(app, /if \(options\.explorerOnly && state\.view === 'explorer'\) renderExplorerAfterStatusRefresh\(\); else render\(\);/);
 });
