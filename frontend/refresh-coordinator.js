@@ -53,8 +53,11 @@
           continue;
         }
 
+        let applied;
         try {
-          await applyResult(key, finalResult, entry.aggregateScope);
+          // The integration may reject an obsolete repository/open context.
+          // Do not report that ignored response as an applied UI update.
+          applied = (await applyResult(key, finalResult, entry.aggregateScope)) !== false;
         } catch (error) {
           emit('apply-failed', { scope: describe(entry.aggregateScope), error: String(error) });
           if (entry.nextScope !== null) {
@@ -72,13 +75,13 @@
         // the same one-rerun treatment.
         if (entry.nextScope !== null) {
           entry.nextScope = merge(entry.aggregateScope, entry.nextScope);
-          emit('completed', { scope: describe(entry.aggregateScope), applied: true, pending: true });
+          emit('completed', { scope: describe(entry.aggregateScope), applied, pending: true });
           emit('rerun', { scope: describe(entry.nextScope), recovery: false });
           continue;
         }
 
         active.delete(key);
-        emit('completed', { scope: describe(entry.aggregateScope), applied: true, pending: false });
+        emit('completed', { scope: describe(entry.aggregateScope), applied, pending: false });
         entry.resolve(finalResult);
         return;
       }

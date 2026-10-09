@@ -3100,6 +3100,8 @@ function renderEntryDetails(entry) {
   const deletedRestoreAction = entry.kind === 'deleted' ? '<button data-detail-action="head" data-tooltip="Restore this deleted file from your last local commit (HEAD)">↶ Restore from last commit (HEAD)</button>' : '';
   const fileGitActions = entry.kind === 'file' && (entry.status || !entry.tracked) ? `<button data-detail-action="stage" data-tooltip="git add — add this file's current content to staging">＋ Stage this file</button><button data-detail-action="unstage" data-tooltip="Unstage — git restore --staged. Removes only the staging entry; your edits on disk are kept exactly as they are.">− Unstage</button><button data-detail-action="stashfile" data-tooltip="Sets this file aside in this repository's own stash. Parent projects and submodules have separate stash lists.">⇕ Stash this file</button><button data-detail-action="head" class="danger-action-soft" data-tooltip="Restore from your last local commit (HEAD) — git checkout HEAD -- file. Permanently discards ALL edits; the file on disk becomes identical to what you last committed. Cannot be undone.">↶ Restore from last commit (HEAD)</button><button data-detail-action="compare" data-tooltip="Open side-by-side compare with restore options">⇄ Compare with remote</button>` : '';
   const deleteAction = deletedEntry ? '' : '<button class="danger-action" data-detail-action="delete">Delete…</button>';
+  const fileRestoreAction = ['file', 'deleted'].includes(entry.kind) && entry.tracked && !submoduleBoundaryFor(entry.relative_path)
+    ? '<button data-detail-action="restorefolder" class="danger-action-soft" data-tooltip="Restore only this file from HEAD or a selected commit. Replaces staged and unstaged edits; branch and HEAD stay unchanged.">↶ Restore file…</button>' : '';
   const submoduleOpenActions = entry.kind === 'submodule' ? `${submoduleInitButton}<button data-detail-action="subopenfull" ${entry.submodule_initialized === false ? 'disabled' : ''} data-tooltip="${entry.submodule_initialized === false ? 'Initialize this submodule before opening it as a full repository.' : 'Open this submodule as a normal Git Drill Down repository. This does not modify the parent gitlink or push anything.'}">Open as Full Repository</button><button data-detail-action="subserver">Repository link ↗</button><button data-detail-action="subcompare" data-tooltip="Compare two exact revisions of this submodule without checkout">Compare submodule…</button><button data-detail-action="utrud" data-tooltip="Launches UTRUD with this folder path. UTRUD decides whether the selected folder is valid. Windows only.">▶ Run UTRUD</button>` : '';
   const submoduleHistoryActions = entry.kind === 'submodule' ? `<button data-detail-action="subgraph" data-tooltip="Open this submodule's own branch/commit history — never the parent project's">Submodule Branch Map</button><button data-detail-action="subrefchanges" data-tooltip="A different, narrower question: which commits in the PARENT project changed this submodule's recorded version. Not the submodule's own history.">Reference changes</button><button data-detail-action="versions">Change version</button><button data-detail-action="subnewbranch" data-tooltip="Create a new local branch in this submodule, starting from its current commit, and switch to it">＋ New branch…</button>` : '';
   const submoduleWorkActions = entry.kind === 'submodule' ? `<button data-detail-action="subcommit" ${canCommitInsideSubmodule ? '' : 'disabled'} data-tooltip="${esc(submoduleCommitTooltip)}">Commit submodule</button><button data-detail-action="substash" ${canStashInsideSubmodule ? '' : 'disabled'} data-tooltip="${canStashInsideSubmodule ? 'Set aside uncommitted files inside this submodule only. The parent project is untouched.' : 'No uncommitted local files inside this submodule to stash.'}">Stash changes</button><button data-detail-action="substashes" data-tooltip="View and restore this submodule's own stashes. The parent project's stash list is separate.">View stashes</button>` : '';
@@ -3107,7 +3109,7 @@ function renderEntryDetails(entry) {
   const submoduleDangerActions = entry.kind === 'submodule' ? `<button data-detail-action="subreset" class="danger-action-soft" ${entry.status ? '' : 'disabled'} data-tooltip="${entry.status ? 'Discard local changes and restore the exact submodule commit recorded by the parent project. This leaves detached HEAD, like git submodule update.' : 'The submodule already uses the version recorded by the parent project'}">↺ Restore project version…</button><button data-detail-action="subforcepush" ${canPushSubmodule ? '' : 'disabled'} class="danger-action-soft" data-tooltip="${canPushSubmodule ? '⚠️ Overwrites the remote branch with your local history, discarding any commits there are not in yours. Only safe if nobody else uses that remote.' : esc(submodulePushTooltip)}">Force push submodule…</button><button data-detail-action="location">Replace repository URL</button>${deleteAction}` : '';
   const detailActions = entry.kind === 'submodule'
     ? `${contextActionSectionHtml('Open / inspect', submoduleOpenActions, 'open-section')}${contextActionSectionHtml('History / version', submoduleHistoryActions)}${contextActionSectionHtml('Local work', submoduleWorkActions)}${contextActionSectionHtml('Remote sync', submoduleSyncActions)}${contextActionSectionHtml('Recovery / danger', submoduleDangerActions, 'danger-section')}`
-    : `${contextActionSectionHtml('', `${editAction}${navigationActions}${folderActions}${commitAction}${deletedRestoreAction}${fileGitActions}${deleteAction}`)}`;
+    : `${contextActionSectionHtml('', `${editAction}${navigationActions}${folderActions}${fileRestoreAction}${commitAction}${deletedRestoreAction}${fileGitActions}${deleteAction}`)}`;
   refs.details.innerHTML = `<div class="entry-details"><div class="entry-preview ${esc(entry.kind)}">${entry.kind === 'submodule' ? '◇' : entry.kind === 'folder' ? '▰' : '▤'}</div>
     <h2>${esc(entry.name)}</h2><div class="entry-path">${esc(entry.relative_path)}</div>${entry.kind === 'submodule' ? `<div class="submodule-badges"><span class="submodule-badge">◇ Git submodule</span>${submoduleCheckoutBadgeHtml(entry)}</div>` : ''}
     ${changeBanner}
@@ -3129,14 +3131,25 @@ function folderRestoreSourceRevision() {
   return state.folderRestore?.selectedCommit || '';
 }
 
+function invalidateFolderRestorePreview() {
+  const model = state.folderRestore;
+  if (!model) return;
+  model.previewRequest = (model.previewRequest || 0) + 1;
+  model.preview = null;
+  model.finishPreview?.();
+  model.finishPreview = null;
+  model.previewPending = false;
+}
+
 function changesForPathScope(scopePath) {
   const prefix = scopePath ? `${scopePath}/` : '';
   return (state.changes || []).filter(change => !scopePath || change.path === scopePath || change.path.startsWith(prefix));
 }
 
-function folderRestoreResultMessage(name, sourceLabel, remainingCount) {
-  if (!remainingCount) return `${name}: restore finished. No local changes remain in this folder.`;
+function folderRestoreResultMessage(name, sourceLabel, remainingCount, isFile = false) {
+  if (!remainingCount) return `${name}: restore finished. No local changes remain in this ${isFile ? 'file' : 'folder'}.`;
   if (sourceLabel === 'HEAD') {
+    if (isFile) return `${name}: restore finished, but local changes still remain. Open “Working tree” to see what Git still reports.`;
     return `${name}: restore finished, but ${remainingCount} local change${remainingCount === 1 ? '' : 's'} still remain. Open “Folder changes” to see what Git still reports.`;
   }
   return `${name}: restored from ${sourceLabel}. ${remainingCount} local change${remainingCount === 1 ? '' : 's'} ${remainingCount === 1 ? 'is' : 'are'} expected until you commit this restored snapshot.`;
@@ -3146,19 +3159,19 @@ function updateFolderRestoreActionState() {
   const model = state.folderRestore;
   if (!model) return;
   const sourceRevision = folderRestoreSourceRevision();
-  refs.confirmFolderRestore.disabled = !sourceRevision || model.loadingCommits;
-  refs.confirmFolderRestore.textContent = model.preview ? 'Restore folder' : 'Preview & restore';
+  refs.confirmFolderRestore.disabled = !sourceRevision || model.loadingCommits || model.previewPending;
+  refs.confirmFolderRestore.textContent = model.preview ? (model.isFile ? 'Restore file' : 'Restore folder') : 'Preview & restore';
 }
 
 function renderFolderRestoreCommits() {
   const model = state.folderRestore;
   if (!model) return;
   if (model.loadingCommits) {
-    refs.folderRestoreCommitList.innerHTML = '<div class="folder-restore-empty"><i class="spinner"></i> Loading folder history…</div>';
+    refs.folderRestoreCommitList.innerHTML = `<div class="folder-restore-empty"><i class="spinner"></i> Loading ${model.isFile ? 'file' : 'folder'} history…</div>`;
     return;
   }
   if (!model.commits.length) {
-    refs.folderRestoreCommitList.innerHTML = '<div class="folder-restore-empty">No commits found for this folder.</div>';
+    refs.folderRestoreCommitList.innerHTML = `<div class="folder-restore-empty">No commits found for this ${model.isFile ? 'file path' : 'folder'}.</div>`;
     return;
   }
   refs.folderRestoreCommitList.innerHTML = model.commits.map(commit => {
@@ -3177,13 +3190,13 @@ function renderFolderRestorePreview(preview = state.folderRestore?.preview) {
   const clean = preview.clean_candidates || [];
   const trackedHtml = tracked.length
     ? `<ul>${tracked.slice(0, 40).map(change => `<li><b>${esc(change.status)}</b> ${esc(change.path)}</li>`).join('')}${tracked.length > 40 ? `<li>…and ${tracked.length - 40} more</li>` : ''}</ul>`
-    : '<p>No tracked file difference was detected for this source. Local tracked edits may still be replaced when restoring to HEAD.</p>';
+    : '<p>No tracked differences from this source were detected in the index or working tree at preview time.</p>';
   const cleanHtml = refs.folderRestoreClean.checked
     ? clean.length
       ? `<ul class="danger-list">${clean.slice(0, 40).map(path => `<li>${esc(path)}</li>`).join('')}${clean.length > 40 ? `<li>…and ${clean.length - 40} more</li>` : ''}</ul>`
       : '<p>No untracked, non-ignored items would be cleaned.</p>'
     : '<p>Clean folder is off. Untracked files will be left in place.</p>';
-  refs.folderRestorePreview.innerHTML = `<div class="folder-restore-preview-card"><span>SOURCE</span><strong>${esc(preview.source_revision === 'HEAD' ? 'HEAD' : preview.source_id.slice(0, 8))} · ${commitSubjectHtml(preview.source_subject || 'No message')}</strong><small>${esc(preview.source_author || 'Unknown')} · ${esc(preview.source_date || '—')}</small></div><div class="folder-restore-preview-grid"><section><h4>Tracked changes to prepare</h4>${trackedHtml}</section><section><h4>Untracked clean preview</h4>${cleanHtml}</section></div>`;
+  refs.folderRestorePreview.innerHTML = `<div class="folder-restore-preview-card"><span>SOURCE</span><strong>${esc(preview.source_revision === 'HEAD' ? 'HEAD' : preview.source_id.slice(0, 8))} · ${commitSubjectHtml(preview.source_subject || 'No message')}</strong><small>${esc(preview.source_author || 'Unknown')} · ${esc(preview.source_date || '—')}</small></div><div class="folder-restore-preview-grid"><section><h4>Tracked paths to restore</h4><p>Index or working-tree differences relative to the source. Restore replaces both with that snapshot.</p>${trackedHtml}</section>${state.folderRestore?.isFile ? '' : `<section><h4>Untracked clean preview</h4>${cleanHtml}</section>`}</div>`;
   updateFolderRestoreActionState();
 }
 
@@ -3211,15 +3224,25 @@ async function loadFolderRestoreCommits() {
 }
 
 function openFolderRestoreDialog(entry) {
-  if (entry.kind !== 'folder') return;
-  state.folderRestore = { entry, commits: [], selectedCommit: '', loadingCommits: false, preview: null };
+  const isFile = ['file', 'deleted'].includes(entry.kind) && entry.tracked && !submoduleBoundaryFor(entry.relative_path);
+  if (entry.kind !== 'folder' && !isFile) return;
+  invalidateFolderRestorePreview();
+  state.folderRestore = { entry, isFile, commits: [], selectedCommit: '', loadingCommits: false, preview: null };
+  const kind = isFile ? 'file' : 'folder';
+  refs.folderRestoreDialog.querySelector('[data-restore-title]').textContent = `Restore ${kind}`;
+  refs.folderRestoreDialog.querySelector('[data-restore-kind]').textContent = kind.toUpperCase();
+  refs.folderRestoreDialog.querySelector('[data-restore-head-help]').textContent = `Discard local tracked changes in this ${kind} and match the current committed version.`;
+  refs.folderRestoreDialog.querySelector('[data-restore-commit-help]').textContent = `Bring this ${kind}'s snapshot from a previous commit into the current branch.`;
+  refs.folderRestoreDialog.querySelector('[data-restore-history-title]').textContent = `COMMITS TOUCHING THIS ${kind.toUpperCase()}`;
+  refs.folderRestoreDialog.querySelector('[data-restore-history-help]').hidden = !isFile;
   refs.folderRestorePath.textContent = entry.relative_path;
   refs.folderRestorePath.title = entry.relative_path;
-  refs.folderRestoreSubtitle.textContent = 'Restore index + working tree for this folder only. Branch and HEAD stay unchanged.';
+  refs.folderRestoreSubtitle.textContent = `Restore index + working tree for this ${kind} only. Branch and HEAD stay unchanged.`;
   refs.folderRestoreModeHead.checked = true;
   refs.folderRestoreModeCommit.checked = false;
   refs.folderRestoreCommitPicker.hidden = true;
-  refs.folderRestoreClean.checked = true;
+  refs.folderRestoreClean.checked = !isFile;
+  refs.folderRestoreClean.closest('label').hidden = isFile;
   refs.folderRestoreStatus.textContent = '';
   renderFolderRestorePreview(null);
   refs.folderRestoreDialog.showModal();
@@ -3230,54 +3253,77 @@ async function previewFolderRestore() {
   if (!model) return;
   const sourceRevision = folderRestoreSourceRevision();
   if (!sourceRevision) { refs.folderRestoreStatus.textContent = 'Choose a commit first.'; return; }
+  invalidateFolderRestorePreview();
+  const request = model.previewRequest;
+  const repositoryPath = state.repository.path;
+  const cleanUntracked = refs.folderRestoreClean.checked;
+  const stillCurrent = () => state.folderRestore === model && state.repository?.path === repositoryPath
+    && model.previewRequest === request && folderRestoreSourceRevision() === sourceRevision
+    && refs.folderRestoreClean.checked === cleanUntracked;
   if (!invoke) {
     model.preview = { folder: model.entry.relative_path, source_revision: sourceRevision, source_id: sourceRevision, source_subject: 'Preview only', source_author: 'Git DrillDown', source_date: '', tracked_changes: [], clean_candidates: [] };
     renderFolderRestorePreview();
     return;
   }
   const finishPreviewButton = beginButtonOperation(refs.previewFolderRestore, 'Previewing…');
+  model.finishPreview = finishPreviewButton;
+  model.previewPending = true;
   refs.confirmFolderRestore.disabled = true;
   refs.folderRestoreStatus.textContent = 'Preparing safe preview…';
   status(`Previewing restore for ${model.entry.name}…`, 'busy');
   try {
-    model.preview = await invoke('preview_folder_restore', { repositoryPath: state.repository.path, relativePath: model.entry.relative_path, sourceRevision, cleanUntracked: refs.folderRestoreClean.checked });
+    const preview = await invoke('preview_folder_restore', { repositoryPath: state.repository.path, relativePath: model.entry.relative_path, sourceRevision, cleanUntracked: refs.folderRestoreClean.checked, itemKind: model.isFile ? 'file' : 'folder' });
+    if (!stillCurrent()) return;
+    model.preview = preview;
     refs.folderRestoreStatus.textContent = 'Preview ready. Review the scope before restoring.';
     renderFolderRestorePreview();
     status(`${model.entry.name}: restore preview ready`);
   } catch (error) {
+    if (!stillCurrent()) return;
     model.preview = null;
     renderFolderRestorePreview(null);
     refs.folderRestoreStatus.textContent = String(error);
     status(`Restore preview failed for ${model.entry.name}`, 'error');
   } finally {
-    finishPreviewButton();
+    if (model.finishPreview === finishPreviewButton) {
+      finishPreviewButton();
+      model.finishPreview = null;
+      model.previewPending = false;
+    }
+    if (state.folderRestore === model) updateFolderRestoreActionState();
   }
 }
 
 async function confirmFolderRestore() {
   const model = state.folderRestore;
   if (!model) return;
+  const repositoryPath = state.repository.path;
   const finishConfirmButton = beginButtonOperation(refs.confirmFolderRestore, model.preview ? 'Restoring…' : 'Previewing…');
   if (!model.preview) {
     refs.folderRestoreStatus.textContent = 'Preparing preview before restore…';
     await previewFolderRestore();
     if (!model.preview) { finishConfirmButton(); updateFolderRestoreActionState(); return; }
   }
-  const cleanPaths = refs.folderRestoreClean.checked ? (model.preview.clean_candidates || []) : [];
+  const preview = model.preview;
+  const stillCurrent = () => state.folderRestore === model && state.repository?.path === repositoryPath
+    && model.preview === preview && folderRestoreSourceRevision() === preview.source_revision;
+  if (!stillCurrent()) { finishConfirmButton(); updateFolderRestoreActionState(); return; }
+  const cleanPaths = !model.isFile && refs.folderRestoreClean.checked ? (model.preview.clean_candidates || []) : [];
   const sourceLabel = refs.folderRestoreModeCommit.checked ? model.preview.source_id.slice(0, 8) : 'HEAD';
   const cleanNote = cleanPaths.length ? `\n\nUntracked items to delete:\n${cleanPaths.slice(0, 12).join('\n')}${cleanPaths.length > 12 ? `\n…and ${cleanPaths.length - 12} more` : ''}` : '';
-  const ok = await customConfirm(`This will replace only:\n${model.entry.relative_path}\n\nSource: ${sourceLabel} — ${model.preview.source_subject}\n\nIndex and working tree will both be updated. HEAD, branch and other folders will not be moved.${cleanNote}`, { title: 'Restore folder', danger: true, okLabel: 'Restore folder' });
-  if (!ok) { finishConfirmButton(); updateFolderRestoreActionState(); return; }
+  const restoreLabel = model.isFile ? 'Restore file' : 'Restore folder';
+  const ok = await customConfirm(`This will replace only:\n${model.entry.relative_path}\n\nSource: ${sourceLabel} — ${model.preview.source_subject}\n\nLocal staged and unstaged changes in this ${model.isFile ? 'file' : 'folder'} will be overwritten. Index and working tree will both be updated. HEAD, branch and other paths stay unchanged.${cleanNote}`, { title: restoreLabel, danger: true, okLabel: restoreLabel });
+  if (!ok || !stillCurrent()) { finishConfirmButton(); updateFolderRestoreActionState(); return; }
   if (!invoke) { finishConfirmButton(); refs.folderRestoreDialog.close(); status(`Preview: restore ${model.entry.relative_path}`); return; }
   const restoredPath = model.entry.relative_path;
   const restoredName = model.entry.name;
   refs.confirmFolderRestore.innerHTML = '<i class="spinner" aria-hidden="true"></i><span>Restoring…</span>';
   refs.confirmFolderRestore.setAttribute('aria-label', 'Restoring…');
   refs.confirmFolderRestore.title = 'Restoring…';
-  refs.folderRestoreStatus.textContent = 'Restoring selected folder…';
+  refs.folderRestoreStatus.textContent = `Restoring selected ${model.isFile ? 'file' : 'folder'}…`;
   status(`Restoring ${restoredName} from ${sourceLabel}…`, 'busy');
   try {
-    await invoke('restore_folder', { repositoryPath: state.repository.path, relativePath: restoredPath, sourceRevision: model.preview.source_id, cleanPaths });
+    await invoke('restore_folder', { repositoryPath: state.repository.path, relativePath: restoredPath, sourceRevision: model.preview.source_id, cleanPaths, itemKind: model.isFile ? 'file' : 'folder' });
     refs.folderRestoreDialog.close();
     const reopenPath = state.currentPath;
     directoryCache.clear();
@@ -3287,7 +3333,7 @@ async function confirmFolderRestore() {
     const freshEntry = state.entries.find(entry => entry.relative_path === restoredPath);
     if (freshEntry) await selectEntry(restoredPath);
     const remainingCount = changesForPathScope(restoredPath).length;
-    const message = folderRestoreResultMessage(restoredName, sourceLabel, remainingCount);
+    const message = folderRestoreResultMessage(restoredName, sourceLabel, remainingCount, model.isFile);
     status(message, sourceLabel === 'HEAD' && remainingCount ? 'error' : '');
     showOperationToast(`${message}\nNothing was committed or pushed.`, sourceLabel === 'HEAD' && remainingCount ? 'error' : 'success');
   } catch (error) {
@@ -5120,6 +5166,17 @@ function activeGraphData() {
 function activeGraphPrimaryBranch() { return state.submoduleGraph ? state.submoduleGraph.primaryBranch : state.graphPrimaryBranch; }
 function setActiveGraphPrimaryBranch(name) { if (state.submoduleGraph) state.submoduleGraph.primaryBranch = name; else state.graphPrimaryBranch = name; }
 
+// Branch Map-only presentation state. Separate choices preserve the original
+// Full Graph primary/filter settings; new repository contexts default to Full.
+const branchStoryViews = new WeakMap();
+function activeBranchStoryView() {
+  if (state.historyScope || state.historyKind) return null;
+  const context = state.submoduleGraph || state.repository;
+  if (!context) return null;
+  if (!branchStoryViews.has(context)) branchStoryViews.set(context, { mode: 'full', selection: null, refFilter: 'all' });
+  return branchStoryViews.get(context);
+}
+
 // The subtle All/Branches/Releases filter — same per-context isolation as
 // the primary-branch picker above, and the same "dim, never remove" rule
 // search already uses: filtering must never make buildGraphModel see a
@@ -5136,10 +5193,9 @@ function setActiveGraphRefFilter(value) { if (state.submoduleGraph) state.submod
 // latter recomputing it with a different (and, after the picker started
 // accepting detached HEAD and remote-tracking refs, no longer matching)
 // scheme of its own.
-function resolvePrimarySelection(g) {
+function resolvePrimarySelection(g, selection = activeGraphPrimaryBranch()) {
   const localBranchNames = (g.branches || []).filter(b => !b.remote).map(b => b.name);
   const remoteBranchNames = (g.branches || []).filter(b => b.remote).map(b => b.name);
-  const selection = activeGraphPrimaryBranch();
   if (selection === 'detached' && g.headDetached) return { kind: 'detached', name: null };
   if (selection?.startsWith('branch:') && localBranchNames.includes(selection.slice(7))) return { kind: 'branch', name: selection.slice(7) };
   if (selection?.startsWith('remote:') && remoteBranchNames.includes(selection.slice(7))) return { kind: 'remote', name: selection.slice(7) };
@@ -5266,6 +5322,10 @@ function ensureHeadMainMergeBase(g) {
 // currentBranch/refFilter (see renderGraph, which builds the real one).
 function mergeCommitPresentation(commit, ctx) {
   if ((commit.parents || []).length <= 1) return null;
+  if (ctx.story) {
+    const mainHistory = (commit.parents || []).slice(1).map(id => ctx.story.incoming.get(id)?.onBaseHistory).find(Boolean);
+    return { label: mainHistory ? 'MERGE · MAIN HISTORY' : 'MERGE', tooltip: `Real merge with ${commit.parents.length} parents.${mainHistory ? ` An incoming parent is reachable from current ${mainHistory}.` : ''} This does not establish the historical source branch name.` };
+  }
   const parentCommits = (commit.parents || []).map(parentId => ctx.commitById?.get(parentId)).filter(Boolean);
   const mainParent = parentCommits.find(parent => (parent.refs || []).some(ref => ref.kind === 'remote_branch' && (ref.name === 'origin/main' || ref.name === 'origin/master')));
   if (mainParent) {
@@ -5312,13 +5372,16 @@ function buildCommitRowHtml(commit, index, ctx) {
     : '';
   const structuralBadges = [
     headLocationPill,
+    ctx.story?.tipId === commit.id ? '<b class="head-location-pill" data-tooltip="Tip of the branch or revision selected for Branch Story, not necessarily the checked-out HEAD">Story tip</b>' : '',
+    ctx.story?.baseId === commit.id ? `<b class="branch-point-pill" data-tooltip="Unique common ancestor with ${esc(ctx.story.baseRef)} proven by loaded commit parents. This is not necessarily the original branch creation point.">Shared base</b>` : '',
+    ctx.story?.incoming.has(commit.id) ? `<b class="branch-point-pill" data-tooltip="Real incoming merge parent${ctx.story.incoming.get(commit.id).refs.length ? ' with current branch references shown below' : ' without a current branch reference; its historical name is unknown'}.${ctx.story.incoming.get(commit.id).onBaseHistory ? ` Also reachable from current ${esc(ctx.story.incoming.get(commit.id).onBaseHistory)}; this is ancestry, not an original branch name.` : ''}">${ctx.story.incoming.get(commit.id).refs.length ? 'Incoming path' : 'Historical Path'}</b>` : '',
     isCommonAncestorWithMain ? `<b class="branch-point-pill common-main-pill" data-tooltip="Real merge-base between HEAD and ${esc(commonAncestorBaseRef)} — where this checkout diverged from main">Branch start</b>` : '',
     !isCommonAncestorWithMain && isBranchPoint ? '<b class="branch-point-pill" data-tooltip="Common ancestor or lane transition — computed from commit parents, not lane color">⑂</b>' : '',
     isCommandBranchStart ? `<b class="branch-point-pill command-start-pill" data-tooltip="merge-base with ${esc(state.branchStartMarker.baseRef)} — where this branch split from the selected base">Command start</b>` : '',
     isCommitCompareStart ? '<b class="branch-point-pill compare-start-pill" data-tooltip="Commit compare start — right-click another commit to compare">Compare start</b>' : '',
   ].join('');
 
-  return `<article class="commit-row ${node.isHead ? 'is-head' : ''} ${hasPrimaryRemoteRef ? 'has-primary-remote-tip' : hasLocalBranchRef ? 'has-local-branch-tip' : hasRemoteBranchRef ? 'has-remote-branch-tip' : ''} ${isBranchPoint ? 'is-branch-point' : ''} ${isCommonAncestorWithMain ? 'is-common-ancestor-main' : ''} ${isMergeCommit ? 'is-merge-commit' : ''} ${isCommandBranchStart ? 'is-command-branch-start' : ''} ${isCommitCompareStart ? 'is-commit-compare-start' : ''} ${isMatch ? 'is-search-match' : ''} ${isSearchDimmed || isFilterDimmed ? 'is-search-dimmed' : ''}" data-id="${esc(commit.id)}" data-lane="${node.lane}">
+  return `<article class="commit-row ${node.isHead ? 'is-head' : ''} ${hasPrimaryRemoteRef ? 'has-primary-remote-tip' : hasLocalBranchRef ? 'has-local-branch-tip' : hasRemoteBranchRef ? 'has-remote-branch-tip' : ''} ${isBranchPoint ? 'is-branch-point' : ''} ${isCommonAncestorWithMain ? 'is-common-ancestor-main' : ''} ${isMergeCommit ? 'is-merge-commit' : ''} ${isCommandBranchStart ? 'is-command-branch-start' : ''} ${isCommitCompareStart ? 'is-commit-compare-start' : ''} ${isMatch ? 'is-search-match' : ''} ${isSearchDimmed || isFilterDimmed ? 'is-search-dimmed' : ''}"${ctx.story ? ` data-story-path="${ctx.story.spine.has(commit.id) ? 'first-parent' : 'incoming'}"` : ''} data-id="${esc(commit.id)}" data-lane="${node.lane}">
     <div class="graph-cell"></div>
     <div class="commit-body">
       <div class="commit-card"><div class="commit-main"><div class="commit-title-line">${structuralBadges}<span class="commit-title">${commitSubjectHtml(commit.subject)}</span></div><div class="commit-ref-line">${refsBadges(node.refs, node.isHead, ctx.currentBranch)}${stashPills}</div></div><span class="commit-id-wrap"><button type="button" class="commit-copy-sha" data-copy-commit-sha="${esc(commit.id)}" title="Copy full commit SHA">${esc(commit.id.slice(0, 8))} ⧉</button></span>
@@ -5835,6 +5898,8 @@ function renderGraph() {
   if (!query && state.graphOnlySearchMatches) state.graphOnlySearchMatches = false;
   const g = activeGraphData();
   const allGraphCommits = g.commits || [];
+  const storyView = activeBranchStoryView();
+  const storyMode = storyView?.mode === 'story';
   // .refs is now Vec<{name, kind}> from the backend — search must still
   // find a tag (or branch) by name, exactly as it did with the old flat
   // string list, just reading the structured shape correctly now.
@@ -5845,8 +5910,8 @@ function renderGraph() {
   // renders a disconnected result list — no parent/child edges — because a
   // filtered subset would otherwise imply ancestry relationships that the
   // hidden commits may be needed to explain.
-  const onlySearchMatches = !!(query && state.graphOnlySearchMatches);
-  const commits = onlySearchMatches ? allGraphCommits.filter(matchesQuery) : allGraphCommits;
+  const onlySearchMatches = !!(query && state.graphOnlySearchMatches && !storyMode);
+  let commits = onlySearchMatches ? allGraphCommits.filter(matchesQuery) : allGraphCommits;
   const currentBranch = g.currentBranch;
   // "Primary" drives which lane is lane 0 — defaults to whatever is
   // currently checked out (or, for a detached checkout, HEAD's exact
@@ -5858,12 +5923,14 @@ function renderGraph() {
   // "remote:<name>" so all three can share the one <select>.
   const localBranchNames = (g.branches || []).filter(b => !b.remote).map(b => b.name);
   const remoteBranchNames = (g.branches || []).filter(b => b.remote).map(b => b.name);
-  const { kind: primaryKind, name: primaryName } = resolvePrimarySelection(g);
+  const { kind: primaryKind, name: primaryName } = storyMode ? resolvePrimarySelection(g, storyView.selection) : resolvePrimarySelection(g);
   // primaryName can be either a local branch or a remote-tracking ref (the
   // picker accepts both) — match against whichever structured ref kind it
   // actually is, by name.
   const hasRefNamed = (commit, name) => (commit.refs || []).some(r => (r.kind === 'local_branch' || r.kind === 'remote_branch') && r.name === name);
   const primaryTip = primaryKind === 'detached' ? commits.find(c => c.id === g.headOid) : primaryName ? commits.find(c => hasRefNamed(c, primaryName)) : null;
+  const story = storyMode ? buildBranchStory(allGraphCommits, primaryTip?.id) : null;
+  if (story) commits = story.commits;
   const model = buildGraphModel(commits, primaryTip?.id);
   if (onlySearchMatches) model.forEach(node => { node.lane = 0; node.before = []; node.after = []; node.parents = []; });
   const nodeById = new Map(commits.map((commit, index) => [commit.id, model[index]]));
@@ -5886,9 +5953,9 @@ function renderGraph() {
   // project's own path, even while a submodule's Branch Map is open, so it
   // alone can't answer "which repository am I actually looking at right
   // now" (point 4 of the rework).
-  const refFilter = activeGraphRefFilter();
+  const refFilter = storyMode ? storyView.refFilter : activeGraphRefFilter();
   const filterOptions = [['all', 'All'], ['branches', 'Branches'], ['releases', 'Releases']];
-  const headMainBase = ensureHeadMainMergeBase(g);
+  const headMainBase = storyMode ? null : ensureHeadMainMergeBase(g);
   const branchStartVisible = !!(headMainBase?.oid && commits.some(commit => commit.id === headMainBase.oid));
   const branchStartLookupPending = headMainMergeBaseFetchKey === `${g.path}::${g.headOid}`;
   const branchStartTitle = headMainBase?.oid
@@ -5909,17 +5976,23 @@ function renderGraph() {
   refs.laneLegend.innerHTML = `<span class="time-direction"><b>NEWEST</b><i>↓</i><b>OLDEST</b></span>
     <span class="graph-path-badge" data-tooltip="${esc(g.path || '')}">${esc(g.path || '')}</span>
     ${identityBadges}
+    ${storyView ? `<div class="ref-filter-group" role="group" aria-label="Graph visualization"><button type="button" class="ref-filter-btn ${!storyMode ? 'active' : ''}" data-graph-visualization="full" aria-pressed="${!storyMode}">Full Graph</button><button type="button" class="ref-filter-btn ${storyMode ? 'active' : ''}" data-graph-visualization="story" aria-pressed="${storyMode}">Branch Story</button></div>` : ''}
     ${graphHeadBannerHtml(g, currentBranch, headVisible)}
-    ${query ? `<span class="search-match-count">${onlySearchMatches ? `showing ${matchCount} match${matchCount === 1 ? '' : 'es'} only` : `${matchCount} match${matchCount === 1 ? '' : 'es'} — rest shown as context`}</span><button type="button" class="graph-search-toggle ${onlySearchMatches ? 'active' : ''}" data-graph-only-matches title="${onlySearchMatches ? 'Show full graph context again' : 'Show only matching commits without graph links'}">${onlySearchMatches ? 'Show context' : 'Only matches'}</button>` : ''}
+    ${query && !storyMode ? `<span class="search-match-count">${onlySearchMatches ? `showing ${matchCount} match${matchCount === 1 ? '' : 'es'} only` : `${matchCount} match${matchCount === 1 ? '' : 'es'} — rest shown as context`}</span><button type="button" class="graph-search-toggle ${onlySearchMatches ? 'active' : ''}" data-graph-only-matches title="${onlySearchMatches ? 'Show full graph context again' : 'Show only matching commits without graph links'}">${onlySearchMatches ? 'Show context' : 'Only matches'}</button>` : ''}
     <div class="ref-filter-group" role="group" aria-label="Filter by ref kind">${filterOptions.map(([value, label]) => `<button type="button" class="ref-filter-btn ${refFilter === value ? 'active' : ''}" data-ref-filter="${value}">${label}</button>`).join('')}</div>
     <button type="button" class="graph-current-jump" data-jump-head ${headVisible ? '' : 'disabled'} title="${headVisible ? 'Jump to current HEAD in this graph' : 'Current HEAD is not loaded in this graph'}">⌖</button>
-    <button type="button" class="graph-branch-start-jump ${branchStartLookupPending ? 'is-loading' : ''}" data-jump-branch-start title="${esc(branchStartTitle)}" aria-label="Go to Branch start"><b>⑂</b><span>Go to Branch start</span></button>
-    ${pickerOptions.length > 1 ? `<label class="primary-branch-picker"><span>Primary</span><select id="graphPrimaryBranch">${pickerOptions.map(opt => `<option value="${esc(opt.value)}" ${opt.value === selectedPickerValue ? 'selected' : ''}>${esc(opt.label)}</option>`).join('')}</select></label>` : ''}
+    ${storyMode ? '' : `<button type="button" class="graph-branch-start-jump ${branchStartLookupPending ? 'is-loading' : ''}" data-jump-branch-start title="${esc(branchStartTitle)}" aria-label="Go to start"><b>⑂</b><span>Go to start</span></button>`}
+    ${pickerOptions.length > 1 || storyMode ? `<label class="primary-branch-picker"><span>${storyMode ? 'Story branch' : 'Primary'}</span><select id="graphPrimaryBranch">${pickerOptions.map(opt => `<option value="${esc(opt.value)}" ${opt.value === selectedPickerValue ? 'selected' : ''}>${esc(opt.label)}</option>`).join('')}</select></label>` : ''}
     <span class="lane-header"><span>GRAPH</span><span>COMMIT</span></span>`;
-  $('#graphPrimaryBranch')?.addEventListener('change', event => { setActiveGraphPrimaryBranch(event.target.value); renderGraph(); });
+  $('#graphPrimaryBranch')?.addEventListener('change', event => { if (storyMode) storyView.selection = event.target.value; else setActiveGraphPrimaryBranch(event.target.value); renderGraph(); });
+  refs.laneLegend.querySelectorAll('[data-graph-visualization]').forEach(button => button.addEventListener('click', () => {
+    if (button.dataset.graphVisualization === 'story' && storyView.selection === null) storyView.selection = activeGraphPrimaryBranch();
+    storyView.mode = button.dataset.graphVisualization;
+    renderGraph();
+  }));
   refs.laneLegend.querySelectorAll('[data-jump-head]').forEach(button => button.addEventListener('click', jumpToGraphHead));
   refs.laneLegend.querySelectorAll('[data-jump-branch-start]').forEach(button => button.addEventListener('click', jumpToGraphBranchStart));
-  refs.laneLegend.querySelectorAll('[data-ref-filter]').forEach(button => button.addEventListener('click', () => { setActiveGraphRefFilter(button.dataset.refFilter); renderGraph(); }));
+  refs.laneLegend.querySelectorAll('[data-ref-filter]').forEach(button => button.addEventListener('click', () => { if (storyMode) storyView.refFilter = button.dataset.refFilter; else setActiveGraphRefFilter(button.dataset.refFilter); renderGraph(); }));
   refs.laneLegend.querySelectorAll('[data-graph-only-matches]').forEach(button => button.addEventListener('click', () => { state.graphOnlySearchMatches = !state.graphOnlySearchMatches; renderGraph(); }));
 
   // Stash entries are informational pointers, not real DAG commits. Rendering
@@ -5943,7 +6016,7 @@ function renderGraph() {
   // supported by the backend — when a real local branch is primary; a
   // detached HEAD or a remote-tracking ref has no "ahead of X" to compute
   // against itself.
-  const divergence = !onlySearchMatches && primaryKind === 'branch' && primaryName ? ensureBranchDivergence(g.path, primaryName) : null;
+  const divergence = !storyMode && !onlySearchMatches && primaryKind === 'branch' && primaryName ? ensureBranchDivergence(g.path, primaryName) : null;
   const aheadAnnotations = new Map(); // row index -> short text
   const branchPointRows = new Set(); // row indices that are a shared-ancestor base
   const commonAncestorRows = new Set(); // row indices that are merge-base(HEAD, origin/main/origin/master)
@@ -5981,7 +6054,7 @@ function renderGraph() {
   // recompute the exact same inputs for just the newly-arrived rows,
   // without a second, drifting copy of the actual row markup — both paths
   // call buildCommitRowHtml for the real template.
-  lastGraphRenderContext = { model, lanesWidth, stashesByBase, aheadAnnotations, branchPointRows, commonAncestorRows, headMainBase, commitById: new Map(commits.map(commit => [commit.id, commit])), query, matchesQuery, currentBranch, refFilter, repositoryName: g.name, onlySearchMatches };
+  lastGraphRenderContext = { model, lanesWidth, stashesByBase, aheadAnnotations, branchPointRows, commonAncestorRows, headMainBase, commitById: new Map(commits.map(commit => [commit.id, commit])), query, matchesQuery, currentBranch, refFilter, repositoryName: g.name, onlySearchMatches, story };
   const rowsStarted = performance.now();
   const rows = commits.map((commit, index) => buildCommitRowHtml(commit, index, lastGraphRenderContext)).join('') || '<div class="empty-change">No commits in this history</div>';
 
@@ -5993,7 +6066,8 @@ function renderGraph() {
 
   const domStarted = performance.now();
   jsPerfLog(`renderGraph rows build (${commits.length} rows)`, domStarted - rowsStarted);
-  refs.graph.innerHTML = `<svg class="graph-overlay"></svg>` + rows + truncationStub + GRAPH_LEGEND_HTML;
+  const storySummary = story ? `<div class="branch-story-summary"><strong>${esc(primaryName || 'Detached HEAD')}</strong><span>${story.tipId ? `${commits.length} loaded commits · first-parent development path and incoming merge ancestry` : 'Selected tip is not in loaded history. Use Load older or select another branch.'}</span><span>${story.baseId ? `Shared base with ${esc(story.baseRef)}: ${esc(story.baseId.slice(0, 8))}` : 'Divergence point not established from loaded history.'} Graph paths are not branch identities; current refs are shown on their exact commits.${story.incomplete ? ' Some parents are outside loaded history.' : ''}</span></div>` : '';
+  refs.graph.innerHTML = storySummary + `<svg class="graph-overlay"></svg>` + rows + truncationStub + GRAPH_LEGEND_HTML;
   jsPerfLog(`renderGraph DOM render (${commits.length} rows)`, performance.now() - domStarted);
   wireGraphRowInteractions(refs.graph.querySelectorAll('.commit-row[data-id]'));
   $('#loadOlderCommits')?.addEventListener('click', loadOlderGraphCommits);
@@ -6040,6 +6114,7 @@ function scheduleGraphOverlayRedraw() {
 // to build on, a search query active (dimming/highlighting could touch
 // old rows too), or a ref filter other than "all" active (same reason).
 function appendOlderGraphRows(previousCommitCount) {
+  if (activeBranchStoryView()?.mode === 'story') { renderGraph(); return; }
   const g = activeGraphData();
   const commits = g.commits || [];
   const query = refs.search.value.trim().toLowerCase();
@@ -6986,19 +7061,26 @@ const STATUS_REFRESH_FOLDER = 1;
 
 function repositoryStatusRefreshScope({ folder = '', repaintFolder = false, reason = 'status', isValid = null } = {}) {
   return {
+    generation: repoOpenGeneration,
     rank: repaintFolder ? STATUS_REFRESH_FOLDER : STATUS_REFRESH_CHANGES,
     folder,
     repaintFolder,
     reasons: [reason],
-    validators: typeof isValid === 'function' ? [isValid] : [],
+    // A mandatory refresh has its own valid vote. An obsolete optional
+    // request must not veto it when the coordinator merges their scopes.
+    validators: [typeof isValid === 'function' ? isValid : () => true],
   };
 }
 
 function mergeRepositoryStatusRefreshScopes(left, right) {
   if (!left) return right;
   if (!right) return left;
-  const rightOwnsFolder = right.repaintFolder && Boolean(right.folder);
+  // Requests from different opens/reloads must never share validation or
+  // repaint targets, even when the user returns to the same repository path.
+  if (left.generation !== right.generation) return left.generation > right.generation ? left : right;
+  const rightOwnsFolder = right.repaintFolder; // '' is the repository root.
   return {
+    generation: right.generation,
     rank: Math.max(left.rank, right.rank),
     folder: rightOwnsFolder ? right.folder : left.folder,
     repaintFolder: left.repaintFolder || right.repaintFolder,
@@ -7020,24 +7102,25 @@ const repositoryStatusRefreshCoordinator = window.GitDrillDownRefresh.createRefr
   describeScope: describeRepositoryStatusRefreshScope,
   log: (event, details) => jsPerfLog(`statusRefresh ${event} (scope=${details.scope || details.pendingScope || details.to || 'n/a'})`, 0),
   apply: async (repositoryPath, changes, scope) => {
-    if (state.repository?.path !== repositoryPath) {
-      jsPerfLog('statusRefresh result ignored (repository changed)', 0);
-      return;
+    if (state.repository?.path !== repositoryPath || scope.generation !== repoOpenGeneration) {
+      jsPerfLog('statusRefresh result ignored (repository/open generation changed)', 0);
+      return false;
     }
     const validators = scope.validators || [];
     if (validators.length && !validators.some(isValid => {
       try { return isValid(); } catch { return false; }
     })) {
       jsPerfLog('statusRefresh result ignored (request generation superseded)', 0);
-      return;
+      return false;
     }
     state.changes = changes;
     state.statusReady = true;
     updateChangeBadge();
     if (refs.changesDrawer.classList.contains('open')) renderChanges();
-    if (scope.repaintFolder && state.view === 'explorer' && (!scope.folder || state.currentPath === scope.folder)) {
+    if (scope.repaintFolder && state.view === 'explorer' && state.currentPath === scope.folder) {
       await openDirectory(state.currentPath, { force: true, explorerOnly: true });
     }
+    return true;
   },
 });
 
@@ -7068,7 +7151,7 @@ async function refreshStatusAndFolderInBackground(repositoryPath, folder, reason
       reason,
       isValid: () => seq === postStageRefreshSeq && state.repository?.path === repositoryPath,
     });
-    jsPerfLog(`postStageRefresh END (${reason}, applied)`, performance.now() - startedAt);
+    jsPerfLog(`postStageRefresh END (${reason}, completed)`, performance.now() - startedAt);
   } catch (error) {
     jsPerfLog(`postStageRefresh ERROR (${reason}): ${String(error)}`, performance.now() - startedAt);
   }
@@ -7492,22 +7575,22 @@ refs.commitScope.addEventListener('click', openScopeCommit);
 refs.showPathHistory.addEventListener('click', showSelectedHistory);
 refs.scopeCommitMessage.addEventListener('input', () => { refs.confirmScopeCommit.disabled = !refs.scopeCommitMessage.value.trim(); });
 refs.confirmScopeCommit.addEventListener('click', commitSelectedScope);
-refs.folderRestoreModeHead.addEventListener('change', () => { refs.folderRestoreCommitPicker.hidden = true; if (state.folderRestore) state.folderRestore.preview = null; renderFolderRestorePreview(null); });
-refs.folderRestoreModeCommit.addEventListener('change', () => { refs.folderRestoreCommitPicker.hidden = false; if (state.folderRestore) state.folderRestore.preview = null; renderFolderRestorePreview(null); loadFolderRestoreCommits(); });
-refs.folderRestoreClean.addEventListener('change', () => { if (state.folderRestore) { state.folderRestore.preview = null; renderFolderRestorePreview(null); } });
+refs.folderRestoreModeHead.addEventListener('change', () => { refs.folderRestoreCommitPicker.hidden = true; invalidateFolderRestorePreview(); renderFolderRestorePreview(null); });
+refs.folderRestoreModeCommit.addEventListener('change', () => { refs.folderRestoreCommitPicker.hidden = false; invalidateFolderRestorePreview(); renderFolderRestorePreview(null); loadFolderRestoreCommits(); });
+refs.folderRestoreClean.addEventListener('change', () => { if (state.folderRestore) { invalidateFolderRestorePreview(); renderFolderRestorePreview(null); } });
 refs.refreshFolderRestoreCommits.addEventListener('click', loadFolderRestoreCommits);
 refs.folderRestoreCommitList.addEventListener('click', event => {
   const button = event.target.closest('[data-folder-restore-commit]');
   if (!button || !state.folderRestore) return;
   state.folderRestore.selectedCommit = button.dataset.folderRestoreCommit;
-  state.folderRestore.preview = null;
+  invalidateFolderRestorePreview();
   renderFolderRestoreCommits();
   renderFolderRestorePreview(null);
 });
 refs.previewFolderRestore.addEventListener('click', () => previewFolderRestore().catch(error => handleError(error)));
 refs.confirmFolderRestore.addEventListener('click', () => confirmFolderRestore().catch(error => handleError(error)));
-refs.folderRestoreDialog.addEventListener('cancel', () => { state.folderRestore = null; });
-refs.folderRestoreDialog.addEventListener('close', () => { if (!refs.folderRestoreDialog.open) state.folderRestore = null; });
+refs.folderRestoreDialog.addEventListener('cancel', () => { invalidateFolderRestorePreview(); state.folderRestore = null; });
+refs.folderRestoreDialog.addEventListener('close', () => { if (!refs.folderRestoreDialog.open) { invalidateFolderRestorePreview(); state.folderRestore = null; } });
 $('#initRepo').addEventListener('click', createRepositoryFromPicker);
 $('#newBranch').addEventListener('click', async () => {
   if (!state.repository) return;

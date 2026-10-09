@@ -496,14 +496,14 @@ test('folder restore is an explicit right-panel action with preview and scoped b
   assert.match(html, /id="folderRestoreClean" checked/);
   assert.match(app, /const folderActions = entry\.kind === 'folder'[\s\S]*?data-detail-action="restorefolder"/);
   assert.match(app, /if \(action === 'restorefolder'\) return openFolderRestoreDialog\(entry\)/);
-  assert.match(app, /invoke\('preview_folder_restore', \{ repositoryPath: state\.repository\.path, relativePath: model\.entry\.relative_path, sourceRevision, cleanUntracked: refs\.folderRestoreClean\.checked \}\)/);
-  assert.match(app, /invoke\('restore_folder', \{ repositoryPath: state\.repository\.path, relativePath: restoredPath, sourceRevision: model\.preview\.source_id, cleanPaths \}\)/);
+  assert.match(app, /invoke\('preview_folder_restore', \{ repositoryPath: state\.repository\.path, relativePath: model\.entry\.relative_path, sourceRevision, cleanUntracked: refs\.folderRestoreClean\.checked, itemKind: model\.isFile \? 'file' : 'folder' \}\)/);
+  assert.match(app, /invoke\('restore_folder', \{ repositoryPath: state\.repository\.path, relativePath: restoredPath, sourceRevision: model\.preview\.source_id, cleanPaths, itemKind: model\.isFile \? 'file' : 'folder' \}\)/);
   assert.match(html, /This does not move HEAD, switch branch, commit or push/);
 });
 
 test('folder restore gives visible progress and rechecks the restored folder after refresh', () => {
   assert.match(app, /function updateFolderRestoreActionState\(\)/);
-  assert.match(app, /refs\.confirmFolderRestore\.textContent = model\.preview \? 'Restore folder' : 'Preview & restore'/);
+  assert.match(app, /refs\.confirmFolderRestore\.textContent = model\.preview \? \(model\.isFile \? 'Restore file' : 'Restore folder'\) : 'Preview & restore'/);
   assert.match(app, /if \(!model\.preview\) \{[\s\S]*?await previewFolderRestore\(\);[\s\S]*?if \(!model\.preview\) \{ finishConfirmButton\(\); updateFolderRestoreActionState\(\); return; \}/);
   assert.match(app, /beginButtonOperation\(refs\.previewFolderRestore, 'Previewing…'\)/);
   assert.match(app, /status\(`Previewing restore for \$\{model\.entry\.name\}…`, 'busy'\)/);
@@ -512,7 +512,7 @@ test('folder restore gives visible progress and rechecks the restored folder aft
   assert.match(app, /await refreshStatusAndFolder\(state\.repository\.path, reopenPath\)/);
   assert.doesNotMatch(app, /await loadRepository\(state\.repository\.path, \{ reopenPath \}\);[\s\S]*?const freshEntry = state\.entries\.find\(entry => entry\.relative_path === restoredPath\)/);
   assert.match(app, /const freshEntry = state\.entries\.find\(entry => entry\.relative_path === restoredPath\);[\s\S]*?if \(freshEntry\) await selectEntry\(restoredPath\);/);
-  assert.match(app, /function folderRestoreResultMessage\(name, sourceLabel, remainingCount\)/);
+  assert.match(app, /function folderRestoreResultMessage\(name, sourceLabel, remainingCount, isFile = false\)/);
   assert.match(app, /restore finished, but \$\{remainingCount\} local change/);
   assert.match(app, /restored from \$\{sourceLabel\}\. \$\{remainingCount\} local change/);
   assert.match(app, /model\.loadingCommits = false;[\s\S]*?renderFolderRestoreCommits\(\)/);
@@ -569,7 +569,8 @@ test('graph exposes branch and commit context actions without relying on lane id
   assert.match(app, /class="graph-current-jump"/);
   assert.match(app, /function jumpToGraphBranchStart\(\)/);
   assert.match(app, /data-jump-branch-start/);
-  assert.match(app, /Go to Branch start/);
+  assert.match(app, /aria-label="Go to start"/);
+  assert.match(app, /<span>Go to start<\/span>/);
   assert.match(app, /Branch start is still being calculated/);
   assert.match(app, /Loading older history to find branch start/);
   assert.match(css, /\.graph-branch-start-jump/);
@@ -777,7 +778,8 @@ test('checkbox stage flush waits only for index writes, not for the slow visual 
   assert.match(app, /refreshStatusAndFolderInBackground\(repositoryPath, folder, `checkbox generation=\$\{generation\}`\)/);
   assert.match(app, /flushOneBatch scheduled background refresh/);
   assert.doesNotMatch(app, /await refreshStatusAndFolder\(repositoryPath, folder\);\n\s*jsPerfLog\(`flushOneBatch refresh/);
-  assert.match(app, /scope\.repaintFolder && state\.view === 'explorer' && \(!scope\.folder \|\| state\.currentPath === scope\.folder\)/);
+  assert.match(app, /scope\.repaintFolder && state\.view === 'explorer' && state\.currentPath === scope\.folder/);
+  assert.match(app, /scope\.generation !== repoOpenGeneration/);
   assert.match(app, /await openDirectory\(state\.currentPath, \{ force: true, explorerOnly: true \}\)/);
   assert.match(app, /function renderExplorerAfterStatusRefresh\(\)/);
   assert.match(app, /if \(options\.explorerOnly && state\.view === 'explorer'\) renderExplorerAfterStatusRefresh\(\); else render\(\);/);

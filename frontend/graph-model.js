@@ -205,10 +205,67 @@ function selectBranchRows(context) {
   return { rows, detached, detachedAt: (context && context.headOid) || '' };
 }
 
+// Read-only projection for Branch Story. This selects real nodes for the
+// existing graph engine; it never rewrites parents, assigns lanes or creates
+// synthetic edges. Preserve the backend's topological/chronological order
+// (sorting by timestamps alone can put a parent ahead of its child).
+function buildBranchStory(commits, tipId) {
+  const byId = new Map(commits.map(commit => [commit.id, commit]));
+  const tip = byId.get(tipId);
+  const result = { commits: [], tipId: tip?.id || null, spine: new Set(), incoming: new Map(), baseId: null, baseRef: null, incomplete: false };
+  if (!tip) return result;
+  const included = reachableFrom(tipId, commits);
+  result.commits = commits.filter(commit => included.has(commit.id));
+  result.incomplete = [...included].some(id => !byId.has(id));
+  let cursor = tip;
+  while (cursor && !result.spine.has(cursor.id)) {
+    result.spine.add(cursor.id);
+    cursor = byId.get(cursor.parents?.[0]);
+  }
+  // An incoming parent is a path endpoint, not evidence of a historical
+  // branch name. Multiple current refs on the same node remain intact.
+  for (const commit of result.commits) {
+    if (!result.spine.has(commit.id)) continue;
+    for (const parentId of (commit.parents || []).slice(1)) {
+      const parent = byId.get(parentId);
+      if (!parent) continue;
+      if (!result.incoming.has(parentId)) {
+        result.incoming.set(parentId, {
+          refs: (parent.refs || []).filter(ref => ref.kind === 'local_branch' || ref.kind === 'remote_branch'),
+          merges: [],
+        });
+      }
+      result.incoming.get(parentId).merges.push(commit.id);
+    }
+  }
+  // A unique best common ancestor can be proven from a complete loaded DAG.
+  // With missing parents or multiple merge bases, leave it unknown rather
+  // than claim a branch creation point. No extra Git query is made here.
+  const baseRef = ['origin/main', 'origin/master', 'main', 'master'].find(name =>
+    commits.some(commit => (commit.refs || []).some(ref => ref.name === name && (ref.kind === 'local_branch' || ref.kind === 'remote_branch'))));
+  const baseTip = baseRef && commits.find(commit => (commit.refs || []).some(ref => ref.name === baseRef && (ref.kind === 'local_branch' || ref.kind === 'remote_branch')));
+  if (baseTip && baseTip.id !== tipId) {
+    const baseAncestors = reachableFrom(baseTip.id, commits);
+    for (const [id, path] of result.incoming) {
+      // Positive reachability is reliable even in a partial window. It does
+      // not prove which branch name existed when the merge was made.
+      if (baseAncestors.has(id)) path.onBaseHistory = baseRef;
+    }
+    if (!result.incomplete && [...baseAncestors].every(id => byId.has(id))) {
+      const common = new Set([...included].filter(id => baseAncestors.has(id)));
+      const older = new Set();
+      for (const id of common) for (const parent of byId.get(id).parents || []) if (common.has(parent)) older.add(parent);
+      const best = [...common].filter(id => !older.has(id));
+      if (best.length === 1 && best[0] !== tipId) { result.baseId = best[0]; result.baseRef = baseRef; }
+    }
+  }
+  return result;
+}
+
 // Node (the test runner only — see the file banner above) sees `module`;
 // the webview, loading this as a plain <script>, does not, so the two
 // functions above stay ordinary globals there, exactly as if this code was
 // still inline in app.js. No bundler, no import/export syntax, either way.
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { reachableFrom, buildGraphModel, selectRefBadges, selectBranchRows };
+  module.exports = { reachableFrom, buildGraphModel, selectRefBadges, selectBranchRows, buildBranchStory };
 }

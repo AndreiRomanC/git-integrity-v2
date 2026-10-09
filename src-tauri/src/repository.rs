@@ -287,9 +287,9 @@ static FULL_STATUS_CACHE: OnceLock<Mutex<HashMap<String, (Instant, Vec<(String, 
 // Mutating commands must remain free to run while that read-only walk is in
 // flight, so status_scan_lock intentionally does not serialize them together.
 // The per-repository epoch closes the resulting cache race instead: a scan may
-// finish, and its caller may still consume that one result, but it can publish
-// into FULL_STATUS_CACHE only if no status-affecting mutation happened since
-// the scan began.
+// finish, but it can publish into the status/derived metadata caches only if
+// no status-affecting mutation happened since the scan began. UI status
+// callers also check their captured epoch before returning a snapshot.
 static STATUS_CACHE_EPOCHS: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
 
 fn full_status_cache() -> &'static Mutex<HashMap<String, (Instant, Vec<(String, String, bool)>)>> {
@@ -356,6 +356,9 @@ fn invalidate_full_status_cache(repository_path: &str, reason: &str) -> u64 {
         let mut epochs = status_cache_epochs().lock().unwrap();
         let epoch = epochs.entry(key.clone()).or_insert(0);
         *epoch = epoch.wrapping_add(1);
+        // Keep eviction atomic with epoch-checked derived-cache publication.
+        // No scans or Git operations run under this short bookkeeping lock.
+        invalidate_scoped_and_index_metadata_for_key(&key);
         full_status_cache().lock().unwrap().remove(&key);
         *epoch
     };
@@ -376,8 +379,9 @@ fn advance_status_cache_epoch(repository_path: &str, reason: &str) -> u64 {
     let key = repo_lock_key(repository_path);
     let next_epoch = {
         let mut epochs = status_cache_epochs().lock().unwrap();
-        let epoch = epochs.entry(key).or_insert(0);
+        let epoch = epochs.entry(key.clone()).or_insert(0);
         *epoch = epoch.wrapping_add(1);
+        invalidate_scoped_and_index_metadata_for_key(&key);
         *epoch
     };
     perf_log(
@@ -1705,10 +1709,11 @@ fn cached_git_metadata(repository: &str, scope: &str) -> GitMetadata {
             return metadata.clone();
         }
     }
+    let captured_epoch = status_cache_epoch(repository);
     let step = Instant::now();
     let metadata = build_git_metadata(repository, Some(scope), None);
     perf_log(&format!("cached_git_metadata: MISS, scanned ({scope})"), step.elapsed());
-    metadata_cache().lock().unwrap().insert(key, (Instant::now(), metadata.clone()));
+    publish_git_metadata_if_epoch_current(repository, scope, captured_epoch, metadata.clone());
     metadata
 }
 
@@ -1749,16 +1754,43 @@ fn has_sorted_prefix(sorted: &[String], prefix: &str) -> bool {
     sorted.get(idx).map(|candidate| candidate.starts_with(prefix)).unwrap_or(false)
 }
 
-fn replace_git_metadata(repository: &str, statuses: Vec<(String, String)>) {
+fn publish_git_metadata_if_epoch_current(repository: &str, scope: &str, captured_epoch: u64, metadata: GitMetadata) -> bool {
+    let repository_key = repo_lock_key(repository);
+    let (current_epoch, accepted) = {
+        let epochs = status_cache_epochs().lock().unwrap();
+        let current_epoch = *epochs.get(&repository_key).unwrap_or(&0);
+        let accepted = current_epoch == captured_epoch;
+        if accepted {
+            metadata_cache().lock().unwrap().insert(format!("{repository_key}\u{0}{scope}"), (Instant::now(), metadata));
+        }
+        (current_epoch, accepted)
+    };
+    perf_log(&format!(
+        "status_cache_epoch: metadata complete repo={} captured={captured_epoch} current={current_epoch} result={}",
+        anonymized_repository_id(repository), if accepted { "accepted" } else { "stale-discarded" },
+    ), Duration::ZERO);
+    accepted
+}
+
+const STATUS_SNAPSHOT_SUPERSEDED: &str = "Repository changed while reading status. This outdated result was discarded; refresh again if a newer refresh is not already running.";
+
+fn replace_git_metadata(repository: &str, statuses: Vec<(String, String)>, captured_epoch: u64) -> Result<(), String> {
     // `statuses` here is always a full, unscoped scan (from load_repository, which
     // needs every change for the Changes drawer regardless of folder) — seed the
     // repository-wide cache entry with it instead of discarding that work.
+    // Reject known-obsolete input before doing derived-metadata work. Check
+    // again atomically at insertion, since building metadata can take time.
+    if status_cache_epoch(repository) != captured_epoch {
+        perf_log("status_cache_epoch: metadata input stale-discarded", Duration::ZERO);
+        return Err(STATUS_SNAPSHOT_SUPERSEDED.into());
+    }
     let metadata = build_git_metadata(repository, None, Some(statuses));
-    metadata_cache().lock().unwrap().insert(metadata_cache_key(repository, ""), (Instant::now(), metadata));
+    if publish_git_metadata_if_epoch_current(repository, "", captured_epoch, metadata) { Ok(()) }
+    else { Err(STATUS_SNAPSHOT_SUPERSEDED.into()) }
 }
 
 // submodule_state_cache is deliberately NOT cleared by this or by
-// invalidate_scoped_and_index_metadata below: this runs after essentially
+// invalidate_scoped_and_index_metadata_for_key below: this runs after essentially
 // every mutation, including an ordinary file stage/commit that has nothing
 // to do with any submodule's own state — clearing it here would force the
 // next fold/load to redo real, expensive submodule I/O regardless, defeating
@@ -1766,7 +1798,6 @@ fn replace_git_metadata(repository: &str, statuses: Vec<(String, String)>) {
 // explicitly instead, wherever it's actually relevant: see
 // invalidate_submodule_sync below.
 fn invalidate_git_metadata(repository: &str) {
-    invalidate_scoped_and_index_metadata(repository);
     invalidate_full_status_cache(repository, "invalidate_git_metadata");
 }
 
@@ -1775,16 +1806,17 @@ fn invalidate_git_metadata(repository: &str) {
 // actual filesystem/libgit2 scan) is only paid lazily, scoped to exactly the
 // folder next opened. Shared with invalidate_git_metadata_for_submodule_checkout
 // below, which handles full_status_cache differently.
-fn invalidate_scoped_and_index_metadata(repository: &str) {
+fn invalidate_scoped_and_index_metadata_for_key(repository_key: &str) {
     // Cache keys are "{repository}\0{scope}" (one entry per folder that's been
     // browsed) — a mutation can affect any of them, so drop every scope cached for
     // this repository, not just the unscoped entry.
-    let repository_key = repo_lock_key(repository);
+    // Called under the epoch lock: use the already-normalized key so no
+    // filesystem canonicalization is performed in the critical section.
     let prefix = format!("{repository_key}\u{0}");
     metadata_cache().lock().unwrap().retain(|key, _| !key.starts_with(&prefix));
-    index_metadata_cache().lock().unwrap().remove(&repository_key);
-    unpushed_paths_cache().lock().unwrap().remove(&repository_key);
-    sorted_lookups_cache().lock().unwrap().remove(&repository_key);
+    index_metadata_cache().lock().unwrap().remove(repository_key);
+    unpushed_paths_cache().lock().unwrap().remove(repository_key);
+    sorted_lookups_cache().lock().unwrap().remove(repository_key);
 }
 
 // Stage/Unstage changes only the index entries explicitly named by the
@@ -1797,7 +1829,6 @@ fn invalidate_scoped_and_index_metadata(repository: &str) {
 // one is refreshed normally. If another full scan wins the race while these
 // tiny path scans run, its newer snapshot is left untouched.
 fn patch_status_cache_after_index_change(repository_path: &str, scopes: &[String]) {
-    invalidate_scoped_and_index_metadata(repository_path);
     let captured_epoch = advance_status_cache_epoch(repository_path, "index-change-patch");
     let repository_key = repo_lock_key(repository_path);
     let snapshot = full_status_cache().lock().unwrap().get(&repository_key).cloned();
@@ -1887,7 +1918,6 @@ fn seed_status_cache_after_stage_all(repository_path: &str, mut before: Vec<(Str
 // before: those are cheap to evict, so there is no correctness trade-off in
 // leaving that part alone.
 fn invalidate_git_metadata_for_submodule_checkout(repository_path: &str, submodule_relative_path: &str) {
-    invalidate_scoped_and_index_metadata(repository_path);
     let captured_epoch = advance_status_cache_epoch(repository_path, "submodule-checkout-patch");
     let step = Instant::now();
     let repository_key = repo_lock_key(repository_path);
@@ -2647,6 +2677,7 @@ fn load_repository_inner(path: String, force: Option<bool>) -> Result<Repository
     // scan from moments earlier just because nothing *this app* did
     // triggered an invalidation.
     if force.unwrap_or(false) { invalidate_git_metadata(&path); invalidate_submodule_sync(&path); }
+    let status_epoch = status_cache_epoch(&path);
     let mut repo = internal_repository(&path)?;
     let name = Path::new(&path).file_name().and_then(|n| n.to_str()).unwrap_or("repository").to_string();
     let head_detached = repo.head_detached().unwrap_or(false);
@@ -2696,7 +2727,7 @@ fn load_repository_inner(path: String, force: Option<bool>) -> Result<Repository
     let statuses = internal.iter().map(|(path, status, _)| (path.clone(), status.clone())).collect::<Vec<_>>();
     let changes = internal.into_iter().map(|(path, status, staged)| Change { status, path, staged }).collect();
 
-    replace_git_metadata(&path, statuses);
+    replace_git_metadata(&path, statuses, status_epoch)?;
     let submodule_paths: Vec<String> = cached_index_metadata(&path).1.iter().cloned().collect();
     let gitdir = repo.path().to_string_lossy().into_owned();
 
@@ -2795,10 +2826,11 @@ fn refresh_status_inner(repository_path: String) -> Result<Vec<Change>, String> 
     let started = Instant::now();
     validate_path(&repository_path)?;
     let repo = internal_repository(&repository_path)?;
+    let status_epoch = status_cache_epoch(&repository_path);
     let internal = recent_full_statuses(&repo, &repository_path)?;
     let statuses = internal.iter().map(|(path, status, _)| (path.clone(), status.clone())).collect::<Vec<_>>();
     let changes = internal.into_iter().map(|(path, status, staged)| Change { status, path, staged }).collect();
-    replace_git_metadata(&repository_path, statuses);
+    replace_git_metadata(&repository_path, statuses, status_epoch)?;
     perf_log("refresh_status: TOTAL", started.elapsed());
     Ok(changes)
 }
@@ -5708,9 +5740,10 @@ fn submodule_folder_status_inner(repository_path: String, relative_path: String)
     let (sub_path, _inner) = resolve_submodule_boundary(&repository_path, &relative_path)
         .ok_or("This path is not inside a submodule")?;
     let repo = internal_submodule_repository(Path::new(&sub_path))?;
+    let status_epoch = status_cache_epoch(&sub_path);
     let statuses = recent_full_statuses(&repo, &sub_path)?;
     let mapped = statuses.into_iter().map(|(path, status, _)| (path, status)).collect();
-    replace_git_metadata(&sub_path, mapped);
+    replace_git_metadata(&sub_path, mapped, status_epoch)?;
     Ok(())
 }
 
@@ -7644,23 +7677,17 @@ pub fn restore_remote_file(repository_path: String, relative_path: String, remot
     restore_file(repository_path, relative_path, remote_ref.to_string())
 }
 
-fn parse_name_status(output: &str) -> Vec<Change> {
-    output.lines().filter_map(|line| {
-        let mut parts = line.split('\t');
-        let status = parts.next()?.trim().to_string();
-        let path = parts.last().unwrap_or_default().trim().to_string();
-        (!status.is_empty() && !path.is_empty()).then_some(Change { status, path, staged: false })
-    }).collect()
-}
-
-fn parse_porcelain_status(output: &str) -> Vec<Change> {
-    output.lines().filter_map(|line| {
-        if line.len() < 4 { return None; }
-        let status = line[..2].trim().to_string();
-        if status == "??" { return None; }
-        let path = line[3..].trim().trim_matches('"').to_string();
-        (!status.is_empty() && !path.is_empty()).then_some(Change { status, path, staged: line.as_bytes().first().is_some_and(|byte| *byte != b' ') })
-    }).collect()
+// Only for `diff --name-status -z --no-renames`: fixed status/path pairs,
+// without Git's quoting of Unicode, whitespace or control characters.
+fn folder_restore_diff_changes(output: &str, staged: bool) -> Vec<Change> {
+    let mut fields = output.split_terminator('\0');
+    let mut changes = Vec::new();
+    while let (Some(status), Some(path)) = (fields.next(), fields.next()) {
+        if !status.is_empty() && !path.is_empty() {
+            changes.push(Change { status: status.into(), path: path.into(), staged });
+        }
+    }
+    changes
 }
 
 fn parse_clean_dry_run(output: &str) -> Vec<String> {
@@ -7680,26 +7707,90 @@ fn commit_for_folder_restore<'repo>(repo: &'repo Repository, source_revision: &s
 }
 
 fn folder_restore_preview_inner(repository_path: &str, relative_path: &str, source_revision: &str, clean_untracked: bool) -> Result<FolderRestorePreview, String> {
+    path_restore_preview_inner(repository_path, relative_path, source_revision, clean_untracked, false)
+}
+
+// The existing folder RPCs remain compatible; file mode is opt-in. Keep
+// restore_file (used by other workflows) and all submodule operations intact.
+fn restore_item_is_file(item_kind: Option<&str>) -> Result<bool, String> {
+    match item_kind.unwrap_or("folder") {
+        "folder" => Ok(false),
+        "file" => Ok(true),
+        _ => Err("Restore supports only a normal file or folder".into()),
+    }
+}
+
+fn validate_path_restore_target(repo: &Repository, repository_path: &str, relative: &Path, tree: &git2::Tree<'_>, source_revision: &str, is_file: bool) -> Result<(), String> {
+    let relative_string = normalized(relative);
+    let target = Path::new(repository_path).join(relative);
+    if !is_file {
+        if !target.is_dir() { return Err("Folder restore works only for an existing normal folder".into()); }
+        let entry = tree.get_path(relative).map_err(|_| format!("{relative_string} does not exist in {}", source_revision.trim()))?;
+        if entry.kind() != Some(ObjectType::Tree) { return Err(format!("{relative_string} is not a folder in {}", source_revision.trim())); }
+        return Ok(());
+    }
+
+    let index = repo.index().map_err(|error| error.message().to_string())?;
+    let head_tree = repo.head().ok().and_then(|head| head.peel_to_tree().ok());
+    // Inspect only the selected path and its ancestors. Never cross into a
+    // nested repository, gitlink, or directory symlink when restoring a file.
+    for ancestor in relative.ancestors().take_while(|path| !path.as_os_str().is_empty()) {
+        if index.get_path(ancestor, 0).is_some_and(|entry| entry.mode == 0o160000)
+            || tree.get_path(ancestor).ok().is_some_and(|entry| entry.filemode() == 0o160000)
+            || head_tree.as_ref().and_then(|tree| tree.get_path(ancestor).ok()).is_some_and(|entry| entry.filemode() == 0o160000) {
+            return Err("Use the existing submodule restore actions for submodules".into());
+        }
+        let absolute = Path::new(repository_path).join(ancestor);
+        if ancestor != relative && (absolute.join(".git").exists() || fs::symlink_metadata(&absolute).ok().is_some_and(|meta| meta.file_type().is_symlink())) {
+            return Err("File restore cannot cross a nested repository or directory symlink".into());
+        }
+    }
+    if fs::symlink_metadata(&target).ok().is_some_and(|meta| meta.file_type().is_dir()) {
+        return Err("Select a normal tracked file, not a directory".into());
+    }
+    let entry = tree.get_path(relative).map_err(|_| format!("{relative_string} does not exist at this path in {}. It may have been added, deleted or renamed. Choose a commit containing this exact path; nothing was changed.", source_revision.trim()))?;
+    if entry.kind() != Some(ObjectType::Blob) { return Err("Selected source is not a normal file".into()); }
+    let known_file = index.get_path(relative, 0).is_some()
+        || head_tree.as_ref().and_then(|tree| tree.get_path(relative).ok()).is_some_and(|entry| entry.kind() == Some(ObjectType::Blob));
+    if !known_file && fs::symlink_metadata(&target).is_ok() {
+        return Err("File restore is only available for tracked files; an untracked file already occupies this path".into());
+    }
+    Ok(())
+}
+
+fn path_restore_preview_inner(repository_path: &str, relative_path: &str, source_revision: &str, clean_untracked: bool, is_file: bool) -> Result<FolderRestorePreview, String> {
     validate_path(repository_path)?;
     let relative = safe_relative_path(relative_path)?;
     if relative.as_os_str().is_empty() { return Err("Select a folder to restore".into()); }
     let relative_string = normalized(&relative);
-    let folder_path = Path::new(repository_path).join(&relative);
-    if !folder_path.is_dir() { return Err("Folder restore works only for an existing normal folder".into()); }
     let repo = internal_repository(repository_path)?;
     let commit = commit_for_folder_restore(&repo, source_revision)?;
     let tree = commit.tree().map_err(|error| error.message().to_string())?;
-    let tree_entry = tree.get_path(&relative).map_err(|_| format!("{relative_string} does not exist in {}", source_revision.trim()))?;
-    if tree_entry.kind() != Some(ObjectType::Tree) {
-        return Err(format!("{relative_string} is not a folder in {}", source_revision.trim()));
-    }
+    validate_path_restore_target(&repo, repository_path, &relative, &tree, source_revision, is_file)?;
+    // File names can contain Git pathspec metacharacters. File mode must
+    // address exactly one path even for names such as [draft].txt.
+    let pathspec = if is_file { format!(":(top,literal){relative_string}") } else { relative_string.clone() };
     let source_id = commit.id().to_string();
-    let tracked_changes = if source_revision.trim() == "HEAD" || source_id == repo.head().ok().and_then(|head| head.target()).map(|id| id.to_string()).unwrap_or_default() {
-        parse_porcelain_status(&git(repository_path, &["status", "--porcelain", "--", &relative_string])?)
-    } else {
-        parse_name_status(&git(repository_path, &["diff", "--name-status", "HEAD", &source_id, "--", &relative_string])?)
-    };
-    let clean_candidates = if clean_untracked {
+    // Restore replaces BOTH index and worktree from this exact tree. A
+    // HEAD-to-source diff misses local edits and reports false positives
+    // after restoring the same snapshot twice. A worktree-only diff misses
+    // staged changes whose content has been undone again on disk.
+    // Both reads are path-scoped; only the second examines working files.
+    let index_changes = folder_restore_diff_changes(&git(repository_path, &["diff", "--cached", "--name-status", "-z", "--no-renames", "--no-ext-diff", &source_id, "--", &pathspec])?, true);
+    let worktree_changes = folder_restore_diff_changes(&git(repository_path, &["diff", "--name-status", "-z", "--no-renames", "--no-ext-diff", &source_id, "--", &pathspec])?, false);
+    let mut tracked_by_path = std::collections::BTreeMap::<String, Change>::new();
+    for change in index_changes.into_iter().chain(worktree_changes) {
+        if let Some(existing) = tracked_by_path.get_mut(&change.path) {
+            // The same file can differ in both layers, even in opposite
+            // ways. Show it once; restore will replace both layers.
+            if existing.status != change.status { existing.status = "M".into(); }
+            existing.staged |= change.staged;
+        } else {
+            tracked_by_path.insert(change.path.clone(), change);
+        }
+    }
+    let tracked_changes = tracked_by_path.into_values().collect();
+    let clean_candidates = if clean_untracked && !is_file {
         parse_clean_dry_run(&git(repository_path, &["clean", "-nd", "--", &relative_string])?)
     } else { Vec::new() };
     let source_subject = commit.summary().unwrap_or("No message").to_string();
@@ -7718,30 +7809,34 @@ fn folder_restore_preview_inner(repository_path: &str, relative_path: &str, sour
 }
 
 #[tauri::command]
-pub fn preview_folder_restore(repository_path: String, relative_path: String, source_revision: String, clean_untracked: bool) -> Result<FolderRestorePreview, String> {
-    folder_restore_preview_inner(&repository_path, &relative_path, &source_revision, clean_untracked)
+pub fn preview_folder_restore(repository_path: String, relative_path: String, source_revision: String, clean_untracked: bool, item_kind: Option<String>) -> Result<FolderRestorePreview, String> {
+    let is_file = restore_item_is_file(item_kind.as_deref())?;
+    if is_file { path_restore_preview_inner(&repository_path, &relative_path, &source_revision, false, true) }
+    else { folder_restore_preview_inner(&repository_path, &relative_path, &source_revision, clean_untracked) }
 }
 
 #[tauri::command]
-pub async fn restore_folder(repository_path: String, relative_path: String, source_revision: String, clean_paths: Vec<String>) -> Result<(), String> {
-    off_main_thread(move || restore_folder_inner(repository_path, relative_path, source_revision, clean_paths)).await
+pub async fn restore_folder(repository_path: String, relative_path: String, source_revision: String, clean_paths: Vec<String>, item_kind: Option<String>) -> Result<(), String> {
+    let is_file = restore_item_is_file(item_kind.as_deref())?;
+    off_main_thread(move || if is_file { path_restore_inner(repository_path, relative_path, source_revision, clean_paths, true) }
+        else { restore_folder_inner(repository_path, relative_path, source_revision, clean_paths) }).await
 }
 
 fn restore_folder_inner(repository_path: String, relative_path: String, source_revision: String, clean_paths: Vec<String>) -> Result<(), String> {
+    path_restore_inner(repository_path, relative_path, source_revision, clean_paths, false)
+}
+
+fn path_restore_inner(repository_path: String, relative_path: String, source_revision: String, clean_paths: Vec<String>, is_file: bool) -> Result<(), String> {
     let started = Instant::now();
     validate_path(&repository_path)?;
     let relative = safe_relative_path(&relative_path)?;
     if relative.as_os_str().is_empty() { return Err("Select a folder to restore".into()); }
     let relative_string = normalized(&relative);
-    let folder_path = Path::new(&repository_path).join(&relative);
-    if !folder_path.is_dir() { return Err("Folder restore works only for an existing normal folder".into()); }
     let repo = internal_repository(&repository_path)?;
     let commit = commit_for_folder_restore(&repo, &source_revision)?;
     let tree = commit.tree().map_err(|error| error.message().to_string())?;
-    let tree_entry = tree.get_path(&relative).map_err(|_| format!("{relative_string} does not exist in {}", source_revision.trim()))?;
-    if tree_entry.kind() != Some(ObjectType::Tree) {
-        return Err(format!("{relative_string} is not a folder in {}", source_revision.trim()));
-    }
+    validate_path_restore_target(&repo, &repository_path, &relative, &tree, &source_revision, is_file)?;
+    if is_file && !clean_paths.is_empty() { return Err("Clean is not available when restoring an individual file".into()); }
 
     let clean_relative = clean_paths.into_iter().map(|path| {
         let safe = safe_relative_path(path.trim_end_matches(['/', '\\']))?;
@@ -7756,11 +7851,14 @@ fn restore_folder_inner(repository_path: String, relative_path: String, source_r
     let lock_handle = repo_write_lock(&repository_path);
     let _lock = lock_handle.lock().unwrap();
     log_repo_write_lock_acquired(&repository_path, "restore_folder", queue_started.elapsed());
+    if is_file { validate_path_restore_target(&repo, &repository_path, &relative, &tree, &source_revision, true)?; }
     let source_id = commit.id().to_string();
-    git(&repository_path, &["restore", "--source", &source_id, "--staged", "--worktree", "--", &relative_string])
-        .map_err(|detail| format!("Folder restore failed: {detail}"))?;
-    let submodule_status = git(&repository_path, &["submodule", "status", "--recursive", "--", &relative_string])
-        .unwrap_or_default();
+    let pathspec = if is_file { format!(":(top,literal){relative_string}") } else { relative_string.clone() };
+    git(&repository_path, &["restore", "--source", &source_id, "--staged", "--worktree", "--", &pathspec])
+        .map_err(|detail| format!("{} restore failed: {detail}", if is_file { "File" } else { "Folder" }))?;
+    let submodule_status = if is_file { String::new() } else {
+        git(&repository_path, &["submodule", "status", "--recursive", "--", &relative_string]).unwrap_or_default()
+    };
     if !submodule_status.trim().is_empty() {
         let _ = git(&repository_path, &["submodule", "sync", "--recursive", "--", &relative_string]);
         git(&repository_path, &["-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive", "--force", "--", &relative_string])
@@ -7772,7 +7870,7 @@ fn restore_folder_inner(repository_path: String, relative_path: String, source_r
         git_owned(&repository_path, args).map_err(|detail| format!("Folder restored, but clean failed: {detail}"))?;
     }
     invalidate_git_metadata(&repository_path);
-    invalidate_submodule_sync(&repository_path);
+    if !is_file { invalidate_submodule_sync(&repository_path); }
     perf_log("restore_folder: TOTAL", started.elapsed());
     Ok(())
 }
@@ -9195,6 +9293,99 @@ mod tests {
         std::env::temp_dir().join(format!("git-integrity-status-epoch-{label}-{suffix}")).to_string_lossy().into_owned()
     }
 
+    fn status_epoch_test_metadata(file: &str) -> GitMetadata {
+        GitMetadata {
+            statuses: vec![(file.into(), "M".into())],
+            tracked: Arc::new(HashSet::new()), submodules: Arc::new(HashSet::new()),
+            unpushed: Arc::new(HashSet::new()),
+        }
+    }
+
+    #[test]
+    fn status_cache_epoch_guards_derived_metadata_for_root_and_folders() {
+        let repository_path = unique_status_epoch_test_path("derived-metadata");
+        let old_epoch = status_cache_epoch(&repository_path);
+        for scope in ["", "src"] {
+            assert!(publish_git_metadata_if_epoch_current(&repository_path, scope, old_epoch, status_epoch_test_metadata("old.txt")));
+        }
+        invalidate_git_metadata(&repository_path);
+        let new_epoch = status_cache_epoch(&repository_path);
+        for scope in ["", "src"] {
+            assert!(!metadata_cache().lock().unwrap().contains_key(&metadata_cache_key(&repository_path, scope)));
+            assert!(publish_git_metadata_if_epoch_current(&repository_path, scope, new_epoch, status_epoch_test_metadata("new.txt")));
+            assert!(!publish_git_metadata_if_epoch_current(&repository_path, scope, old_epoch, status_epoch_test_metadata("old.txt")));
+            let cached = metadata_cache().lock().unwrap().get(&metadata_cache_key(&repository_path, scope)).unwrap().1.clone();
+            assert_eq!(cached.statuses, vec![("new.txt".into(), "M".into())]);
+        }
+    }
+
+    #[test]
+    fn status_cache_epoch_rejected_full_scan_cannot_reseed_metadata_or_succeed_as_ui_status() {
+        let repository_path = unique_status_epoch_test_path("rejected-derived-input");
+        let old_epoch = status_cache_epoch(&repository_path);
+        let old_status = vec![("old.txt".into(), "M".into(), false)];
+        invalidate_git_metadata(&repository_path);
+        assert!(!publish_full_status_if_epoch_current(&repository_path, old_epoch, &old_status, "test-rejected"));
+        let mapped = old_status.into_iter().map(|(path, status, _)| (path, status)).collect();
+        assert_eq!(replace_git_metadata(&repository_path, mapped, old_epoch).unwrap_err(), STATUS_SNAPSHOT_SUPERSEDED);
+        assert!(!metadata_cache().lock().unwrap().contains_key(&metadata_cache_key(&repository_path, "")));
+        // The obsolete input was rejected before even trying to open a repo.
+        assert!(!Path::new(&repository_path).exists());
+    }
+
+    #[test]
+    fn status_cache_epoch_invalidation_during_metadata_build_does_not_block_or_publish_old_data() {
+        let repository_path = unique_status_epoch_test_path("metadata-in-flight");
+        let old_epoch = status_cache_epoch(&repository_path);
+        let ready = Arc::new(std::sync::Barrier::new(2));
+        let (release, resume) = std::sync::mpsc::channel();
+        let worker_path = repository_path.clone();
+        let worker_ready = ready.clone();
+        let worker = std::thread::spawn(move || {
+            // Represent a slow build outside the epoch lock. Main thread must
+            // be able to invalidate and publish newer metadata while it waits.
+            worker_ready.wait();
+            resume.recv_timeout(Duration::from_secs(5)).unwrap();
+            publish_git_metadata_if_epoch_current(&worker_path, "", old_epoch, status_epoch_test_metadata("old.txt"))
+        });
+        ready.wait();
+        for _ in 0..3 { invalidate_git_metadata(&repository_path); }
+        let new_epoch = status_cache_epoch(&repository_path);
+        assert!(publish_git_metadata_if_epoch_current(&repository_path, "", new_epoch, status_epoch_test_metadata("new.txt")));
+        release.send(()).unwrap();
+        assert!(!worker.join().unwrap());
+        assert_eq!(metadata_cache().lock().unwrap().get(&metadata_cache_key(&repository_path, "")).unwrap().1.statuses[0].0, "new.txt");
+    }
+
+    #[test]
+    fn status_cache_epoch_index_patch_evicts_metadata_and_rejects_old_publish() {
+        let repository_path = unique_status_epoch_test_path("metadata-index-patch");
+        let old_epoch = status_cache_epoch(&repository_path);
+        assert!(publish_git_metadata_if_epoch_current(&repository_path, "src", old_epoch, status_epoch_test_metadata("old.txt")));
+        advance_status_cache_epoch(&repository_path, "test-index-patch");
+        assert!(!metadata_cache().lock().unwrap().contains_key(&metadata_cache_key(&repository_path, "src")));
+        assert!(!publish_git_metadata_if_epoch_current(&repository_path, "src", old_epoch, status_epoch_test_metadata("old.txt")));
+    }
+
+    #[test]
+    fn status_cache_epoch_normal_refresh_reuses_status_and_seeds_metadata() {
+        let repository = PathBuf::from(unique_status_epoch_test_path("normal-derived-hit"));
+        create_libgit2_repository(&repository, "README.md");
+        let repository_path = repository.to_string_lossy().into_owned();
+        let captured = status_cache_epoch(&repository_path);
+        let cached_statuses = vec![("cache-only.txt".into(), "A".into(), true)];
+        assert!(publish_full_status_if_epoch_current(&repository_path, captured, &cached_statuses, "test-derived-hit"));
+        let before = full_status_cache().lock().unwrap().get(&repo_lock_key(&repository_path)).unwrap().0;
+        let changes = refresh_status_inner(repository_path.clone()).unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].path, "cache-only.txt");
+        assert!(changes[0].staged);
+        assert_eq!(full_status_cache().lock().unwrap().get(&repo_lock_key(&repository_path)).unwrap().0, before,
+            "the ordinary refresh must reuse the snapshot, not launch a new scan");
+        assert_eq!(cached_git_metadata(&repository_path, "").statuses, vec![("cache-only.txt".into(), "A".into())]);
+        fs::remove_dir_all(repository).unwrap();
+    }
+
     #[test]
     fn status_cache_epoch_accepts_a_scan_when_the_repository_did_not_change() {
         let repository_path = unique_status_epoch_test_path("accepted");
@@ -9406,6 +9597,231 @@ mod tests {
         assert_eq!(run_git_capture(&repository, &["write-tree"]), index_before, "the index must not be rebased against a branch that was never checked out");
         assert_eq!(fs::read_to_string(repository.join("shared.txt")).unwrap(), "important local edit\n", "the user's worktree content must remain untouched");
 
+        fs::remove_dir_all(repository).unwrap();
+    }
+
+    #[test]
+    fn folder_restore_repeated_snapshots_keep_the_same_history_and_refs() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let repository = std::env::temp_dir().join(format!("git-integrity-folder-history-{suffix}"));
+        create_libgit2_repository(&repository, "outside.txt");
+        fs::create_dir_all(repository.join("folder")).unwrap();
+        fs::write(repository.join("folder/file.txt"), "C2\n").unwrap();
+        run_git(&repository, &["add", "folder"]);
+        run_git(&repository, &["commit", "-m", "C2"]);
+        let older = run_git_capture(&repository, &["rev-parse", "HEAD"]);
+        fs::write(repository.join("folder/file.txt"), "C1\n").unwrap();
+        run_git(&repository, &["commit", "-am", "C1"]);
+        let head = run_git_capture(&repository, &["rev-parse", "HEAD"]);
+        let refs_before = run_git_capture(&repository, &["show-ref"]);
+        let branch = run_git_capture(&repository, &["symbolic-ref", "HEAD"]);
+        let root = repository.to_string_lossy().into_owned();
+        let history_ids = || path_history(root.clone(), "folder".into()).unwrap().into_iter().map(|commit| commit.id).collect::<Vec<_>>();
+        let before = history_ids();
+        assert_eq!(before, vec![head.clone(), older.clone()]);
+        fs::write(repository.join("outside.txt"), "outside local edit\n").unwrap();
+        for source in [&older, &head, &older, &head] {
+            restore_folder_inner(root.clone(), "folder".into(), source.clone(), Vec::new()).unwrap();
+            assert_eq!(history_ids(), before, "restored content must never become a history boundary");
+            assert_eq!(run_git_capture(&repository, &["rev-parse", "HEAD"]), head);
+            assert_eq!(run_git_capture(&repository, &["show-ref"]), refs_before);
+            assert_eq!(run_git_capture(&repository, &["symbolic-ref", "HEAD"]), branch);
+            assert_eq!(run_git_capture(&repository, &["rev-parse", ":folder/file.txt"]), run_git_capture(&repository, &["rev-parse", &format!("{source}:folder/file.txt")]));
+            assert_eq!(fs::read_to_string(repository.join("folder/file.txt")).unwrap(), if source == &older { "C2\n" } else { "C1\n" });
+            assert_eq!(fs::read_to_string(repository.join("outside.txt")).unwrap(), "outside local edit\n");
+        }
+        fs::remove_dir_all(repository).unwrap();
+    }
+
+    fn individual_restore_fixture(tag: &str) -> (PathBuf, String, String, String) {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("git-integrity-file-restore-{tag}-{suffix}"));
+        create_libgit2_repository(&root, "outside.txt");
+        fs::create_dir_all(root.join("folder")).unwrap();
+        fs::write(root.join("folder/file.txt"), "old\n").unwrap();
+        fs::write(root.join("folder/sibling.txt"), "sibling\n").unwrap();
+        run_git(&root, &["add", "folder"]);
+        run_git(&root, &["commit", "-m", "Old file"]);
+        let old = run_git_capture(&root, &["rev-parse", "HEAD"]);
+        fs::write(root.join("folder/file.txt"), "new\n").unwrap();
+        run_git(&root, &["commit", "-am", "New file"]);
+        let head = run_git_capture(&root, &["rev-parse", "HEAD"]);
+        let path = root.to_string_lossy().into_owned();
+        (root, path, old, head)
+    }
+
+    #[test]
+    fn individual_file_restore_reuses_preview_and_preserves_siblings_index_refs_and_history() {
+        let (root, path, old, head) = individual_restore_fixture("roundtrip");
+        let refs_before = run_git_capture(&root, &["show-ref"]);
+        let branch = run_git_capture(&root, &["symbolic-ref", "HEAD"]);
+        let history = || path_history(path.clone(), "folder/file.txt".into()).unwrap().into_iter().map(|c| c.id).collect::<Vec<_>>();
+        let original_history = history();
+        fs::write(root.join("folder/file.txt"), "staged target\n").unwrap();
+        fs::write(root.join("folder/sibling.txt"), "staged sibling\n").unwrap();
+        run_git(&root, &["add", "folder"]);
+        fs::write(root.join("folder/file.txt"), "unstaged target\n").unwrap();
+        fs::write(root.join("folder/sibling.txt"), "unstaged sibling\n").unwrap();
+        fs::write(root.join("folder/untracked.txt"), "keep untracked\n").unwrap();
+        fs::write(root.join("outside.txt"), "outside local\n").unwrap();
+        let sibling_index = run_git_capture(&root, &["rev-parse", ":folder/sibling.txt"]);
+        for source in [&old, &head, &old, &head] {
+            let preview = preview_folder_restore(path.clone(), "folder/file.txt".into(), source.clone(), true, Some("file".into())).unwrap();
+            assert_eq!(preview.source_id, *source);
+            assert!(preview.clean_candidates.is_empty(), "file mode must never clean siblings, even if requested");
+            assert!(preview.tracked_changes.iter().all(|change| change.path == "folder/file.txt"));
+            path_restore_inner(path.clone(), "folder/file.txt".into(), preview.source_id, Vec::new(), true).unwrap();
+            assert_eq!(fs::read_to_string(root.join("folder/file.txt")).unwrap(), if source == &old { "old\n" } else { "new\n" });
+            assert_eq!(run_git_capture(&root, &["rev-parse", ":folder/file.txt"]), run_git_capture(&root, &["rev-parse", &format!("{source}:folder/file.txt")]));
+            assert_eq!(run_git_capture(&root, &["rev-parse", ":folder/sibling.txt"]), sibling_index);
+            assert_eq!(fs::read_to_string(root.join("folder/sibling.txt")).unwrap(), "unstaged sibling\n");
+            assert_eq!(fs::read_to_string(root.join("folder/untracked.txt")).unwrap(), "keep untracked\n");
+            assert_eq!(fs::read_to_string(root.join("outside.txt")).unwrap(), "outside local\n");
+            assert_eq!(run_git_capture(&root, &["rev-parse", "HEAD"]), head);
+            assert_eq!(run_git_capture(&root, &["show-ref"]), refs_before);
+            assert_eq!(run_git_capture(&root, &["symbolic-ref", "HEAD"]), branch);
+            assert_eq!(history(), original_history);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn individual_file_restore_recovers_staged_and_unstaged_deletions() {
+        let (root, path, _, head) = individual_restore_fixture("deleted");
+        for staged in [false, true] {
+            fs::remove_file(root.join("folder/file.txt")).unwrap();
+            if staged { run_git(&root, &["add", "-u", "folder/file.txt"]); }
+            let preview = path_restore_preview_inner(&path, "folder/file.txt", "HEAD", false, true).unwrap();
+            assert_eq!(preview.tracked_changes.len(), 1);
+            assert_eq!(preview.tracked_changes[0].path, "folder/file.txt");
+            path_restore_inner(path.clone(), "folder/file.txt".into(), preview.source_id, Vec::new(), true).unwrap();
+            assert_eq!(fs::read_to_string(root.join("folder/file.txt")).unwrap(), "new\n");
+            assert!(run_git_capture(&root, &["status", "--porcelain"]).is_empty());
+            assert_eq!(run_git_capture(&root, &["rev-parse", "HEAD"]), head);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn individual_file_restore_missing_revision_path_and_renames_are_explicit_and_non_destructive() {
+        let (root, path, old, _) = individual_restore_fixture("missing-renamed");
+        fs::write(root.join("folder/file.txt"), "local to preserve\n").unwrap();
+        let index_before = run_git_capture(&root, &["write-tree"]);
+        let absent = format!("{old}^");
+        let error = path_restore_preview_inner(&path, "folder/file.txt", &absent, false, true).err().unwrap();
+        assert!(error.contains("does not exist at this path"));
+        assert!(path_restore_inner(path.clone(), "folder/file.txt".into(), absent, Vec::new(), true).is_err());
+        assert_eq!(run_git_capture(&root, &["write-tree"]), index_before);
+        assert_eq!(fs::read_to_string(root.join("folder/file.txt")).unwrap(), "local to preserve\n");
+        run_git(&root, &["mv", "folder/file.txt", "folder/renamed.txt"]);
+        run_git(&root, &["commit", "-am", "Rename file"]);
+        let renamed = run_git_capture(&root, &["rev-parse", "HEAD"]);
+        assert!(path_restore_preview_inner(&path, "folder/renamed.txt", &old, false, true).is_err(), "do not guess an old filename");
+        run_git(&root, &["rm", "folder/renamed.txt"]);
+        run_git(&root, &["commit", "-m", "Delete file"]);
+        let head = run_git_capture(&root, &["rev-parse", "HEAD"]);
+        let history = path_history(path.clone(), "folder/renamed.txt".into()).unwrap();
+        assert!(history.iter().any(|commit| commit.id == renamed));
+        path_restore_inner(path.clone(), "folder/renamed.txt".into(), renamed, Vec::new(), true).unwrap();
+        assert_eq!(fs::read_to_string(root.join("folder/renamed.txt")).unwrap(), "local to preserve\n");
+        assert!(!root.join("folder/file.txt").exists());
+        assert_eq!(run_git_capture(&root, &["rev-parse", "HEAD"]), head);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn individual_file_restore_treats_pathspec_characters_literally_and_rejects_clean() {
+        let (root, path, _, _) = individual_restore_fixture("literal");
+        for name in ["folder/[a].txt", "folder/a.txt"] { fs::write(root.join(name), "base\n").unwrap(); }
+        run_git(&root, &["add", "folder"]);
+        run_git(&root, &["commit", "-m", "Literal file names"]);
+        for name in ["folder/[a].txt", "folder/a.txt"] { fs::write(root.join(name), "local\n").unwrap(); }
+        let preview = path_restore_preview_inner(&path, "folder/[a].txt", "HEAD", false, true).unwrap();
+        assert_eq!(preview.tracked_changes.len(), 1);
+        assert_eq!(preview.tracked_changes[0].path, "folder/[a].txt");
+        assert!(path_restore_inner(path.clone(), "folder/[a].txt".into(), "HEAD".into(), vec!["folder/a.txt".into()], true).is_err());
+        assert_eq!(fs::read_to_string(root.join("folder/[a].txt")).unwrap(), "local\n");
+        path_restore_inner(path, "folder/[a].txt".into(), "HEAD".into(), Vec::new(), true).unwrap();
+        assert_eq!(fs::read_to_string(root.join("folder/[a].txt")).unwrap(), "base\n");
+        assert_eq!(fs::read_to_string(root.join("folder/a.txt")).unwrap(), "local\n");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn individual_file_restore_rejects_gitlinks_and_contents_inside_submodules() {
+        let (root, path, _, head) = individual_restore_fixture("submodule-boundary");
+        run_git(&root, &["update-index", "--add", "--cacheinfo", &format!("160000,{head},dep")]);
+        run_git(&root, &["commit", "-m", "Record gitlink"]);
+        fs::create_dir_all(root.join("dep")).unwrap();
+        fs::write(root.join("dep/file.txt"), "inside dependency\n").unwrap();
+        for target in ["dep", "dep/file.txt"] {
+            let error = path_restore_preview_inner(&path, target, "HEAD", false, true).err().unwrap();
+            assert!(error.contains("submodule"));
+            assert!(path_restore_inner(path.clone(), target.into(), "HEAD".into(), Vec::new(), true).is_err());
+        }
+        assert_eq!(fs::read_to_string(root.join("dep/file.txt")).unwrap(), "inside dependency\n");
+        assert!(!restore_item_is_file(None).unwrap());
+        assert!(!restore_item_is_file(Some("folder")).unwrap());
+        assert!(restore_item_is_file(Some("submodule")).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn folder_restore_preview_compares_source_with_index_and_worktree_not_head() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let repository = std::env::temp_dir().join(format!("git-integrity-folder-preview-local-{suffix}"));
+        create_libgit2_repository(&repository, "outside.txt");
+        fs::create_dir_all(repository.join("folder")).unwrap();
+        fs::write(repository.join("folder/file.txt"), "base\n").unwrap();
+        run_git(&repository, &["add", "folder"]);
+        run_git(&repository, &["commit", "-m", "Folder version"]);
+        let source = run_git_capture(&repository, &["rev-parse", "HEAD"]);
+        fs::write(repository.join("outside.txt"), "new unrelated commit\n").unwrap();
+        run_git(&repository, &["commit", "-am", "Outside only"]);
+        let root = repository.to_string_lossy().into_owned();
+        let paths = |revision: &str| folder_restore_preview_inner(&root, "folder", revision, false).unwrap().tracked_changes.into_iter().map(|change| change.path).collect::<Vec<_>>();
+        assert!(paths(&source).is_empty());
+        fs::write(repository.join("folder/file.txt"), "local\n").unwrap();
+        assert_eq!(paths("HEAD"), vec!["folder/file.txt"]);
+        assert_eq!(paths(&source), vec!["folder/file.txt"], "an older commit with the same folder tree must still preview local edits");
+        run_git(&repository, &["add", "folder"]);
+        fs::write(repository.join("folder/file.txt"), "base\n").unwrap();
+        assert_eq!(paths(&source), vec!["folder/file.txt"], "index-only differences must not disappear when worktree matches source");
+        restore_folder_inner(root.clone(), "folder".into(), source.clone(), Vec::new()).unwrap();
+        assert!(paths(&source).is_empty());
+        fs::write(repository.join("folder/file.txt"), "new committed content\n").unwrap();
+        run_git(&repository, &["commit", "-am", "New folder version"]);
+        restore_folder_inner(root.clone(), "folder".into(), source.clone(), Vec::new()).unwrap();
+        assert!(paths(&source).is_empty(), "repeating the same snapshot must not report HEAD-to-source differences");
+        assert_eq!(paths("HEAD"), vec!["folder/file.txt"]);
+        fs::remove_dir_all(repository).unwrap();
+    }
+
+    #[test]
+    fn folder_restore_preview_keeps_literal_paths_and_scopes_local_changes() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let repository = std::env::temp_dir().join(format!("git-integrity-folder-preview-paths-{suffix}"));
+        create_libgit2_repository(&repository, "outside.txt");
+        fs::create_dir_all(repository.join("folder")).unwrap();
+        let names = ["folder/spațiu file.txt", "folder/deleted.txt", "folder/index.txt"];
+        for name in names { fs::write(repository.join(name), "base\n").unwrap(); }
+        run_git(&repository, &["add", "folder"]);
+        run_git(&repository, &["commit", "-m", "Folder base"]);
+        fs::write(repository.join(names[0]), "unstaged\n").unwrap();
+        fs::remove_file(repository.join(names[1])).unwrap();
+        fs::write(repository.join(names[2]), "staged\n").unwrap();
+        run_git(&repository, &["add", names[2]]);
+        fs::write(repository.join("folder/untracked.txt"), "keep\n").unwrap();
+        fs::write(repository.join("outside.txt"), "outside\n").unwrap();
+        let root = repository.to_string_lossy().into_owned();
+        let mut paths = folder_restore_preview_inner(&root, "folder", "HEAD", false).unwrap().tracked_changes.into_iter().map(|change| change.path).collect::<Vec<_>>();
+        paths.sort();
+        let mut expected = names.map(String::from).to_vec(); expected.sort();
+        assert_eq!(paths, expected);
+        restore_folder_inner(root, "folder".into(), "HEAD".into(), Vec::new()).unwrap();
+        for name in names { assert_eq!(fs::read_to_string(repository.join(name)).unwrap(), "base\n"); }
+        assert_eq!(fs::read_to_string(repository.join("folder/untracked.txt")).unwrap(), "keep\n");
+        assert_eq!(fs::read_to_string(repository.join("outside.txt")).unwrap(), "outside\n");
         fs::remove_dir_all(repository).unwrap();
     }
 
@@ -12605,6 +13021,81 @@ mod tests {
     }
 
     // ---- Incoming PRs (current branch as the PR's base/target) ----
+
+    #[test]
+    fn pr_status_impl_distinguishes_feature_main_and_a_branch_without_prs() {
+        let (base, path) = pr_repo("branch-association-matrix");
+        run_git(&base, &["remote", "add", "origin", "https://github.vitesco.io/eng/small.git"]);
+        // One repository with four PRs into main, only one from our feature.
+        // The provider fixture implements the same head/base filters as the
+        // real queries; no network, credentials or user repositories involved.
+        let catalog: Vec<_> = ["feature/ours", "feature/two", "feature/three", "feature/four"]
+            .iter().enumerate().map(|(i, branch)| {
+                let mut pr = pr_json(i as u64 + 1, branch, "eng", "small");
+                pr["url"] = serde_json::json!(format!("https://github.vitesco.io/eng/small/pull/{}", i + 1));
+                pr
+            }).collect();
+        for (branch, expected_outgoing, expected_incoming) in [
+            ("feature/ours", 1, 0), ("main", 0, 4), ("feature/no-pr", 0, 0),
+        ] {
+            run_git(&base, &["checkout", "-q", "-b", branch]);
+            run_git(&base, &["config", &format!("branch.{branch}.remote"), "origin"]);
+            run_git(&base, &["config", &format!("branch.{branch}.merge"), &format!("refs/heads/{branch}")]);
+            let repo = internal_repository(&path).unwrap();
+            let seen = Mutex::new(Vec::new());
+            let run = |query: &PrGhQuery| {
+                assert_eq!(query.repo, "github.vitesco.io/eng/small");
+                assert_eq!(query.branch, branch);
+                seen.lock().unwrap().push(query.direction);
+                let field = if query.direction == PrQueryDirection::Head { "headRefName" } else { "baseRefName" };
+                GhOutcome::Prs(catalog.iter().filter(|pr| pr[field].as_str() == Some(query.branch.as_str())).cloned().collect())
+            };
+            let result = pr_status_impl(ctx_for(&repo), &path, "parent", &run);
+            assert_eq!(result.branch.as_deref(), Some(branch));
+            assert_eq!(result.queried_repo.as_deref(), Some("github.vitesco.io/eng/small"));
+            assert_eq!(result.outgoing_pull_requests.len(), expected_outgoing, "outgoing for {branch}");
+            assert_eq!(result.incoming_pull_requests.len(), expected_incoming, "incoming for {branch}");
+            assert_eq!(result.state, if expected_outgoing + expected_incoming == 0 { "no_open_pr" } else { "ok" });
+            assert!(!result.partial);
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen.len(), 2);
+            assert!(seen.contains(&PrQueryDirection::Head) && seen.contains(&PrQueryDirection::Base));
+        }
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn pr_status_impl_incoming_is_scoped_to_tracking_repository_not_other_remotes() {
+        let (base, path) = pr_repo("incoming-repository-scope");
+        run_git(&base, &["remote", "add", "origin", "https://github.vitesco.io/eng/small.git"]);
+        run_git(&base, &["remote", "add", "other", "https://github.vitesco.io/eng/unrelated.git"]);
+        run_git(&base, &["checkout", "-q", "-b", "main"]);
+        run_git(&base, &["config", "branch.main.remote", "origin"]);
+        run_git(&base, &["config", "branch.main.merge", "refs/heads/main"]);
+        let repo = internal_repository(&path).unwrap();
+        let run = |query: &PrGhQuery| {
+            assert_eq!(query.branch, "main");
+            if query.direction == PrQueryDirection::Base {
+                assert_eq!(query.repo, "github.vitesco.io/eng/small", "never list incoming PRs for another remote's main");
+                // A fork is legitimate as SOURCE of an incoming PR. Its URL
+                // belongs to the target repo, not to that fork.
+                let mut pr = pr_json(10, "feature/external", "contributor", "fork");
+                pr["url"] = serde_json::json!("https://github.vitesco.io/eng/small/pull/10");
+                GhOutcome::Prs(vec![pr])
+            } else {
+                // Same head branch name in another repo must not be ours.
+                GhOutcome::Prs(vec![pr_json(20, "main", "eng", "unrelated")])
+            }
+        };
+        let result = pr_status_impl(ctx_for(&repo), &path, "parent", &run);
+        assert_eq!(result.state, "ok");
+        assert!(result.outgoing_pull_requests.is_empty());
+        assert_eq!(result.incoming_pull_requests.len(), 1);
+        assert_eq!(result.incoming_pull_requests[0].url, "https://github.vitesco.io/eng/small/pull/10");
+        assert_eq!(result.incoming_pull_requests[0].target_branch, "main");
+        drop(repo);
+        fs::remove_dir_all(base).unwrap();
+    }
 
     #[test]
     fn pr_status_impl_detects_an_incoming_pr_whose_head_is_a_different_branch_than_ours() {

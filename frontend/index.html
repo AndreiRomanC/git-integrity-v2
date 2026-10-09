@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Git DrillDown</title>
   <link rel="icon" type="image/png" href="assets/git-drilldown-mark.png">
-  <link rel="stylesheet" href="styles.css?v=20261007d-refresh-coalescing">
+  <link rel="stylesheet" href="styles.css?v=20261009a-branch-story-file-restore">
 </head>
 <body>
   <div class="app-shell">
@@ -488,15 +488,16 @@
   </dialog>
   <dialog id="folderRestoreDialog" class="folder-restore-dialog">
     <form method="dialog">
-      <header><div><h2>Restore folder</h2><p id="folderRestoreSubtitle">Make only this folder match a selected revision.</p></div><button value="cancel">×</button></header>
+      <header><div><h2 data-restore-title>Restore folder</h2><p id="folderRestoreSubtitle">Make only this folder match a selected revision.</p></div><button value="cancel">×</button></header>
       <div class="folder-restore-body">
-        <div class="folder-restore-target"><span>FOLDER</span><strong id="folderRestorePath">—</strong></div>
+        <div class="folder-restore-target"><span data-restore-kind>FOLDER</span><strong id="folderRestorePath">—</strong></div>
         <div class="folder-restore-options">
-          <label><input type="radio" name="folderRestoreMode" id="folderRestoreModeHead" value="head" checked><span><b>Restore to HEAD</b><small>Discard local tracked changes in this folder and match the current committed version.</small></span></label>
-          <label><input type="radio" name="folderRestoreMode" id="folderRestoreModeCommit" value="commit"><span><b>Restore from commit…</b><small>Bring this folder's snapshot from a previous commit into the current branch.</small></span></label>
+          <label><input type="radio" name="folderRestoreMode" id="folderRestoreModeHead" value="head" checked><span><b>Restore to HEAD</b><small data-restore-head-help>Discard local tracked changes in this folder and match the current committed version.</small></span></label>
+          <label><input type="radio" name="folderRestoreMode" id="folderRestoreModeCommit" value="commit"><span><b>Restore from commit…</b><small data-restore-commit-help>Bring this folder's snapshot from a previous commit into the current branch.</small></span></label>
         </div>
         <div id="folderRestoreCommitPicker" class="folder-restore-commit-picker" hidden>
-          <div class="folder-restore-commit-head"><strong>COMMITS TOUCHING THIS FOLDER</strong><button type="button" id="refreshFolderRestoreCommits">Refresh</button></div>
+          <div class="folder-restore-commit-head"><strong data-restore-history-title>COMMITS TOUCHING THIS FOLDER</strong><button type="button" id="refreshFolderRestoreCommits">Refresh</button></div>
+          <p data-restore-history-help hidden>History follows this exact file path, not earlier names. A commit must contain this path to restore it.</p>
           <div id="folderRestoreCommitList" class="folder-restore-commit-list"></div>
         </div>
         <label class="folder-restore-clean"><input type="checkbox" id="folderRestoreClean" checked><span><b>Clean folder</b><small>Preview and remove untracked, non-ignored items inside this folder after restore.</small></span></label>
@@ -739,14 +740,14 @@
       <footer><button value="cancel">Cancel</button><button type="button" value="default" id="confirmNewTag" class="confirm">Create tag</button></footer>
     </form>
   </dialog>
-  <script src="console-context.js?v=20261007d-refresh-coalescing"></script>
-  <script src="graph-model.js?v=20261007d-refresh-coalescing"></script>
-  <script src="submodule-state.js?v=20261007d-refresh-coalescing"></script>
-  <script src="submodule-versions.js?v=20261007d-refresh-coalescing"></script>
-  <script src="local-diff.js?v=20261007d-refresh-coalescing"></script>
-  <script src="local-drive.js?v=20261007d-refresh-coalescing"></script>
-  <script src="pr-status.js?v=20261007d-refresh-coalescing"></script>
-  <script src="refresh-coordinator.js?v=20261007d-refresh-coalescing"></script>
-  <script src="app.js?v=20261007d-refresh-coalescing"></script>
+  <script src="console-context.js?v=20261009a-branch-story-file-restore"></script>
+  <script src="graph-model.js?v=20261009a-branch-story-file-restore"></script>
+  <script src="submodule-state.js?v=20261009a-branch-story-file-restore"></script>
+  <script src="submodule-versions.js?v=20261009a-branch-story-file-restore"></script>
+  <script src="local-diff.js?v=20261009a-branch-story-file-restore"></script>
+  <script src="local-drive.js?v=20261009a-branch-story-file-restore"></script>
+  <script src="pr-status.js?v=20261009a-branch-story-file-restore"></script>
+  <script src="refresh-coordinator.js?v=20261009a-branch-story-file-restore"></script>
+  <script src="app.js?v=20261009a-branch-story-file-restore"></script>
 </body>
 </html>
