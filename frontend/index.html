@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Git DrillDown</title>
   <link rel="icon" type="image/png" href="assets/git-drilldown-mark.png">
-  <link rel="stylesheet" href="styles.css?v=20261009a-branch-story-file-restore">
+  <link rel="stylesheet" href="styles.css?v=20261009b-staging-queue-history-pages">
 </head>
 <body>
   <div class="app-shell">
@@ -499,6 +499,7 @@
           <div class="folder-restore-commit-head"><strong data-restore-history-title>COMMITS TOUCHING THIS FOLDER</strong><button type="button" id="refreshFolderRestoreCommits">Refresh</button></div>
           <p data-restore-history-help hidden>History follows this exact file path, not earlier names. A commit must contain this path to restore it.</p>
           <div id="folderRestoreCommitList" class="folder-restore-commit-list"></div>
+          <div class="folder-restore-history-footer"><span id="folderRestoreHistoryStatus" role="status"></span><button type="button" id="loadOlderFolderRestoreCommits" hidden>Load older</button></div>
         </div>
         <label class="folder-restore-clean"><input type="checkbox" id="folderRestoreClean" checked><span><b>Clean folder</b><small>Preview and remove untracked, non-ignored items inside this folder after restore.</small></span></label>
         <div id="folderRestorePreview" class="folder-restore-preview"><p>Choose a restore source, then preview the exact scoped operation.</p></div>
@@ -740,14 +741,14 @@
       <footer><button value="cancel">Cancel</button><button type="button" value="default" id="confirmNewTag" class="confirm">Create tag</button></footer>
     </form>
   </dialog>
-  <script src="console-context.js?v=20261009a-branch-story-file-restore"></script>
-  <script src="graph-model.js?v=20261009a-branch-story-file-restore"></script>
-  <script src="submodule-state.js?v=20261009a-branch-story-file-restore"></script>
-  <script src="submodule-versions.js?v=20261009a-branch-story-file-restore"></script>
-  <script src="local-diff.js?v=20261009a-branch-story-file-restore"></script>
-  <script src="local-drive.js?v=20261009a-branch-story-file-restore"></script>
-  <script src="pr-status.js?v=20261009a-branch-story-file-restore"></script>
-  <script src="refresh-coordinator.js?v=20261009a-branch-story-file-restore"></script>
-  <script src="app.js?v=20261009a-branch-story-file-restore"></script>
+  <script src="console-context.js?v=20261009b-staging-queue-history-pages"></script>
+  <script src="graph-model.js?v=20261009b-staging-queue-history-pages"></script>
+  <script src="submodule-state.js?v=20261009b-staging-queue-history-pages"></script>
+  <script src="submodule-versions.js?v=20261009b-staging-queue-history-pages"></script>
+  <script src="local-diff.js?v=20261009b-staging-queue-history-pages"></script>
+  <script src="local-drive.js?v=20261009b-staging-queue-history-pages"></script>
+  <script src="pr-status.js?v=20261009b-staging-queue-history-pages"></script>
+  <script src="refresh-coordinator.js?v=20261009b-staging-queue-history-pages"></script>
+  <script src="app.js?v=20261009b-staging-queue-history-pages"></script>
 </body>
 </html>

@@ -1147,12 +1147,21 @@ dialog form { padding: 28px; text-align: center; }dialog h2 { margin: 0 0 10px; 
 .folder-restore-commit-picker { margin-bottom: 11px; border: 1px solid #314353; border-radius: 7px; overflow: hidden; background: #0e161d; }
 .folder-restore-commit-head { min-height: 34px; display: flex; align-items: center; gap: 10px; padding: 0 10px; border-bottom: 1px solid #263744; background: #121d27; }
 .folder-restore-commit-head button { width: auto; height: 24px; margin: 0 0 0 auto; padding: 0 8px; border: 1px solid #3a5267; border-radius: 5px; background: #192a39; color: #bfd5e6; font-size: 9px; }
-.folder-restore-commit-list { max-height: 220px; overflow: auto; padding: 5px; }
-.folder-restore-commit { width: 100%; min-height: 45px; display: grid; gap: 4px; margin: 0 0 3px; padding: 7px 9px; border: 1px solid transparent; border-radius: 5px; background: #121b23; color: #cbd7e1; text-align: left; }
+.folder-restore-commit-list { max-height: min(340px, 38vh); overflow: auto; padding: 6px; }
+.folder-restore-dialog .folder-restore-commit { width: 100%; height: auto; min-height: 56px; display: grid; grid-template-columns: 14px minmax(0, 1fr); align-items: start; gap: 9px; margin: 0 0 4px; padding: 10px; border: 1px solid transparent; border-radius: 5px; background: #121b23; color: #cbd7e1; text-align: left; white-space: normal; }
 .folder-restore-commit:hover { border-color: #3e566a; background: #172532; }
 .folder-restore-commit.selected { border-color: #5794c7; background: #183550; }
-.folder-restore-commit strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
-.folder-restore-commit small { color: #8598a8; font-size: 10px; }
+.folder-restore-commit:focus-visible { outline: 2px solid #8bc5f2; outline-offset: -2px; }
+.folder-restore-commit-marker { color: #7792aa; font-size: 12px; line-height: 1.5; }
+.folder-restore-commit.selected .folder-restore-commit-marker { color: #8bc5f2; }
+.folder-restore-commit-content { min-width: 0; display: grid; gap: 6px; }
+.folder-restore-commit strong { display: block; white-space: normal; overflow-wrap: anywhere; font-size: 12px; line-height: 1.5; font-weight: 600; }
+.folder-restore-commit-meta { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; color: #92a6b7; font-size: 10px; line-height: 1.5; overflow-wrap: anywhere; }
+.folder-restore-commit-meta code { color: #a5c4de; font-size: 10px; }
+.folder-restore-commit-meta time { margin-left: auto; white-space: nowrap; }
+.folder-restore-history-footer { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 8px 11px; border-top: 1px solid #263744; }
+.folder-restore-history-footer span { flex: 1; min-width: 180px; color: #92a6b7; font-size: 10px; line-height: 1.5; overflow-wrap: anywhere; }
+.folder-restore-history-footer button { width: auto; height: auto; margin: 0; padding: 5px 9px; font-size: 11px; }
 .folder-restore-empty { padding: 18px; color: #8395a6; text-align: center; font-size: 11px; }
 .folder-restore-empty.error { color: #ff9ba5; }
 .folder-restore-preview { margin: 12px 0; border: 1px solid #2f4150; border-radius: 7px; background: #0d141b; }

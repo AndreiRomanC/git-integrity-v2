@@ -27,6 +27,8 @@ const MUTATING_COMMANDS = new Set([
 // legitimate call that's about to set consoleCommandRunning in the first place.
 const REPO_SWITCH_COMMANDS = new Set(['load_repository', 'open_repository_fast']);
 const EMBEDDED_CONSOLE_COMMANDS = new Set(['run_git_command', 'run_terminal_command']);
+const STAGING_COMMANDS = new Set(['stage_files', 'unstage_files', 'stage_all']);
+const RECOVER_ON_MUTATION_ERROR = new Set(['merge_branch', 'resolve_conflict', 'open_merge_tool', 'complete_merge', 'abort_merge', 'stash_changes', 'stash_file', 'pop_stash', 'restore_stash_paths', 'abort_stash_conflict']);
 // Measure the whole frontend -> Tauri -> frontend round trip, not just the
 // backend phases that individual commands happen to log. Only slow calls and
 // failures are recorded so ordinary navigation does not flood the diagnostic
@@ -37,6 +39,10 @@ const EMBEDDED_CONSOLE_COMMANDS = new Set(['run_git_command', 'run_terminal_comm
 const SLOW_INVOKE_LOG_THRESHOLD_MS = 250;
 const rawInvoke = window.__TAURI__?.core?.invoke;
 const invoke = rawInvoke && ((command, args) => {
+  if (!STAGING_COMMANDS.has(command) && (MUTATING_COMMANDS.has(command) || REPO_SWITCH_COMMANDS.has(command)) &&
+      (activeStagingOperation || pendingToggleFlight || pendingToggles.size)) {
+    return Promise.reject('Stage/Unstage is still pending. Wait for it to finish, then retry this action.');
+  }
   if (MUTATING_COMMANDS.has(command) && !state.statusReady) {
     const message = 'Still loading status — please wait a moment.';
     status(message, 'error');
@@ -61,6 +67,8 @@ const invoke = rawInvoke && ((command, args) => {
     return Promise.reject(message);
   }
   const startedAt = performance.now();
+  const recoveryContext = RECOVER_ON_MUTATION_ERROR.has(command)
+    ? { path: state.repository?.path, generation: repoOpenGeneration } : null;
   let pending;
   try {
     pending = rawInvoke(command, args);
@@ -73,8 +81,9 @@ const invoke = rawInvoke && ((command, args) => {
     const elapsedMs = performance.now() - startedAt;
     if (elapsedMs >= SLOW_INVOKE_LOG_THRESHOLD_MS) jsPerfLog(`invoke(${command}) SUCCESS`, elapsedMs);
     return result;
-  }, error => {
+  }, async error => {
     jsPerfLog(`invoke(${command}) ERROR`, performance.now() - startedAt);
+    if (recoveryContext) await refreshAfterMutationFailure(recoveryContext);
     throw error;
   });
 });
@@ -306,7 +315,7 @@ const refs = {
   breadcrumbs: $('#breadcrumbs'), viewTitle: $('#viewTitle'), goUp: $('#goUp'), reloadFolder: $('#reloadFolder'), runCurrentUtrud: $('#runCurrentUtrud'),
   submoduleMenu: $('#submoduleMenu'), submoduleVersions: $('#submoduleVersions'), submoduleMenuName: $('#submoduleMenuName'), currentSubmoduleVersion: $('#currentSubmoduleVersion'), submoduleVersionSearch: $('#submoduleVersionSearch'), submoduleOpenGraph: $('#submoduleOpenGraph'),
   commitScope: $('#commitScope'), showPathHistory: $('#showPathHistory'), commitScopeDialog: $('#commitScopeDialog'), commitScopeName: $('#commitScopeName'), scopeCommitMessage: $('#scopeCommitMessage'), confirmScopeCommit: $('#confirmScopeCommit'),
-  folderRestoreDialog: $('#folderRestoreDialog'), folderRestorePath: $('#folderRestorePath'), folderRestoreSubtitle: $('#folderRestoreSubtitle'), folderRestoreModeHead: $('#folderRestoreModeHead'), folderRestoreModeCommit: $('#folderRestoreModeCommit'), folderRestoreCommitPicker: $('#folderRestoreCommitPicker'), folderRestoreCommitList: $('#folderRestoreCommitList'), refreshFolderRestoreCommits: $('#refreshFolderRestoreCommits'), folderRestoreClean: $('#folderRestoreClean'), folderRestorePreview: $('#folderRestorePreview'), folderRestoreStatus: $('#folderRestoreStatus'), previewFolderRestore: $('#previewFolderRestore'), confirmFolderRestore: $('#confirmFolderRestore'),
+  folderRestoreDialog: $('#folderRestoreDialog'), folderRestorePath: $('#folderRestorePath'), folderRestoreSubtitle: $('#folderRestoreSubtitle'), folderRestoreModeHead: $('#folderRestoreModeHead'), folderRestoreModeCommit: $('#folderRestoreModeCommit'), folderRestoreCommitPicker: $('#folderRestoreCommitPicker'), folderRestoreCommitList: $('#folderRestoreCommitList'), refreshFolderRestoreCommits: $('#refreshFolderRestoreCommits'), loadOlderFolderRestoreCommits: $('#loadOlderFolderRestoreCommits'), folderRestoreHistoryStatus: $('#folderRestoreHistoryStatus'), folderRestoreClean: $('#folderRestoreClean'), folderRestorePreview: $('#folderRestorePreview'), folderRestoreStatus: $('#folderRestoreStatus'), previewFolderRestore: $('#previewFolderRestore'), confirmFolderRestore: $('#confirmFolderRestore'),
   commanderView: $('#commanderView'), commanderRows: $('#commanderRows'), commanderBreadcrumbs: $('#commanderBreadcrumbs'), remoteRef: $('#remoteRef'), gitWorkspaceCompareControls: $('#gitWorkspaceCompareControls'), gitBranchCompareControls: $('#gitBranchCompareControls'), branchCompareLeftRef: $('#branchCompareLeftRef'), branchCompareRightRef: $('#branchCompareRightRef'), branchCompareSwap: $('#branchCompareSwap'), branchCompareRefresh: $('#branchCompareRefresh'), gitCompareFlatControls: $('#gitCompareFlatControls'), gitCompareFlatToggle: $('#gitCompareFlatToggle'), gitCompareFlatFilter: $('#gitCompareFlatFilter'), gitCompareLeftLabel: $('#gitCompareLeftLabel'), gitCompareRightLabel: $('#gitCompareRightLabel'), gitComparePanel: $('#gitComparePanel'), localDrivePanel: $('#localDrivePanel'), compareModeGit: $('#compareModeGit'), compareModeDrive: $('#compareModeDrive'), compareModeSubmodule: $('#compareModeSubmodule'), submoduleComparePanel: $('#submoduleComparePanel'), subCompareSubmodule: $('#subCompareSubmodule'), subCompareSubmoduleOptions: $('#subCompareSubmoduleOptions'), subCompareLeftRef: $('#subCompareLeftRef'), subCompareRightRef: $('#subCompareRightRef'), subComparePickLeft: $('#subComparePickLeft'), subComparePickRight: $('#subComparePickRight'), subCompareSwap: $('#subCompareSwap'), subCompareRefresh: $('#subCompareRefresh'), subCompareDownload: $('#subCompareDownload'), subCompareFlatControls: $('#subCompareFlatControls'), subCompareFlatToggle: $('#subCompareFlatToggle'), subCompareFlatFilter: $('#subCompareFlatFilter'), subCompareExact: $('#subCompareExact'), subCompareCommits: $('#subCompareCommits'), subCompareBreadcrumbs: $('#subCompareBreadcrumbs'), subCompareRows: $('#subCompareRows'), subRevisionDialog: $('#subCompareRevisionDialog'), subRevisionDialogSide: $('#subRevisionDialogSide'), subRevisionDialogTitle: $('#subRevisionDialogTitle'), subRevisionSearch: $('#subRevisionSearch'), subRevisionSearchAll: $('#subRevisionSearchAll'), subRevisionResults: $('#subRevisionResults'), subRevisionHelp: $('#subRevisionHelp'), compareDialog: $('#compareDialog'), compareTitle: $('#compareTitle'), compareSubtitle: $('#compareSubtitle'), localCompare: $('#localCompare'), remoteCompare: $('#remoteCompare'), compareDiffStatus: $('#compareDiffStatus'), previousCompareDifference: $('#previousCompareDifference'), nextCompareDifference: $('#nextCompareDifference'),
   remotesView: $('#remotesView'), remoteCards: $('#remoteCards'), editorDialog: $('#editorDialog'), editorTitle: $('#editorTitle'), editorPath: $('#editorPath'), editorContent: $('#editorContent'), locationRepository: $('#locationRepository'), locationBranch: $('#locationBranch'), locationPath: $('#locationPath'), parentRepositoryButton: $('#parentRepositoryButton'), parentRepositoryName: $('#parentRepositoryName'), leaveSubmoduleGraph: $('#leaveSubmoduleGraph'), publishDialog: $('#publishDialog'), publishBranch: $('#publishBranch'), publishRemote: $('#publishRemote'), publishCommits: $('#publishCommits'), publishSummary: $('#publishSummary'), publishDestination: $('#publishDestination'), publishBadge: $('#publishBadge'), publishSubtitle: $('#publishSubtitle'), publishSafeMode: $('#publishSafeMode'), publishFastMode: $('#publishFastMode'), cloneDialog: $('#cloneDialog'), cloneUrl: $('#cloneUrl'), cloneParent: $('#cloneParent'), cloneName: $('#cloneName'), cloneBranch: $('#cloneBranch'), cloneRecurseSubmodules: $('#cloneRecurseSubmodules'), confirmClone: $('#confirmClone'), submoduleDialog: $('#submoduleDialog'), submoduleUrl: $('#submoduleUrl'), submoduleParent: $('#submoduleParent'), submoduleName: $('#submoduleName'), submoduleUsername: $('#submoduleUsername'), submoduleToken: $('#submoduleToken'), submoduleAddStatus: $('#submoduleAddStatus'), submoduleBrowseSelection: $('#submoduleBrowseSelection'), browseSubmoduleRepository: $('#browseSubmoduleRepository'), submoduleBrowserDialog: $('#submoduleBrowserDialog'), submoduleRepoSearch: $('#submoduleRepoSearch'), runSubmoduleRepoSearch: $('#runSubmoduleRepoSearch'), submoduleBrowserAuth: $('#submoduleBrowserAuth'), submoduleBrowserAuthText: $('#submoduleBrowserAuthText'), connectSubmoduleBrowser: $('#connectSubmoduleBrowser'), submoduleRepoResults: $('#submoduleRepoResults'), submoduleRefHint: $('#submoduleRefHint'), submoduleRefSearch: $('#submoduleRefSearch'), runSubmoduleRefSearch: $('#runSubmoduleRefSearch'), submoduleRefResults: $('#submoduleRefResults'), submoduleBrowserStatus: $('#submoduleBrowserStatus'), compareSubmoduleBrowser: $('#compareSubmoduleBrowser'), applySubmoduleBrowser: $('#applySubmoduleBrowser'), confirmAddSubmodule: $('#confirmAddSubmodule'), operationToast: $('#operationToast'), drawerScopeTitle: $('#drawerScopeTitle'),
   mergeBranchDialog: $('#mergeBranchDialog'), mergeBranchSubtitle: $('#mergeBranchSubtitle'), mergeBranchCurrent: $('#mergeBranchCurrent'), mergeBranchSource: $('#mergeBranchSource'), mergeBranchStatus: $('#mergeBranchStatus'), confirmMergeBranch: $('#confirmMergeBranch'),
@@ -3166,17 +3175,24 @@ function updateFolderRestoreActionState() {
 function renderFolderRestoreCommits() {
   const model = state.folderRestore;
   if (!model) return;
-  if (model.loadingCommits) {
+  refs.refreshFolderRestoreCommits.disabled = model.loadingCommits;
+  refs.loadOlderFolderRestoreCommits.hidden = !model.historyHasMore;
+  refs.loadOlderFolderRestoreCommits.disabled = model.loadingCommits;
+  refs.loadOlderFolderRestoreCommits.textContent = model.loadingCommits ? 'Loading…' : 'Load older';
+  refs.folderRestoreHistoryStatus.textContent = model.historyError || (model.historyHead
+    ? `${model.commits.length} shown · ${model.historyOffset} repository commits checked${model.historyHasMore ? ' · More history available' : ' · End of history'}`
+    : 'History is checked in pages of up to 500 repository commits.');
+  if (model.loadingCommits && !model.commits.length) {
     refs.folderRestoreCommitList.innerHTML = `<div class="folder-restore-empty"><i class="spinner"></i> Loading ${model.isFile ? 'file' : 'folder'} history…</div>`;
     return;
   }
   if (!model.commits.length) {
-    refs.folderRestoreCommitList.innerHTML = `<div class="folder-restore-empty">No commits found for this ${model.isFile ? 'file path' : 'folder'}.</div>`;
+    refs.folderRestoreCommitList.innerHTML = `<div class="folder-restore-empty">${model.historyError ? 'History could not be loaded. Retry below.' : model.historyHasMore ? 'No matching commits in the loaded portion. Load older to continue searching.' : `No commits found for this ${model.isFile ? 'file path' : 'folder'}.`}</div>`;
     return;
   }
   refs.folderRestoreCommitList.innerHTML = model.commits.map(commit => {
     const selected = commit.id === model.selectedCommit;
-    return `<button type="button" class="folder-restore-commit ${selected ? 'selected' : ''}" data-folder-restore-commit="${esc(commit.id)}"><strong>${commitSubjectHtml(commit.subject)}</strong><small>${esc(commit.id.slice(0, 8))} · ${esc(commit.author || 'Unknown')} · ${esc(commit.date || '—')}</small></button>`;
+    return `<button type="button" class="folder-restore-commit ${selected ? 'selected' : ''}" data-folder-restore-commit="${esc(commit.id)}" aria-pressed="${selected}"><span class="folder-restore-commit-marker" aria-hidden="true">${selected ? '●' : '○'}</span><span class="folder-restore-commit-content"><strong>${esc(commit.subject || 'No message')}</strong><span class="folder-restore-commit-meta"><code title="${esc(commit.id)}">${esc(commit.id.slice(0, 8))}</code><span>${esc(commit.author || 'Unknown')}</span><time>${esc(commit.date || '—')}</time></span></span></button>`;
   }).join('');
 }
 
@@ -3200,26 +3216,38 @@ function renderFolderRestorePreview(preview = state.folderRestore?.preview) {
   updateFolderRestoreActionState();
 }
 
-async function loadFolderRestoreCommits() {
+async function loadFolderRestoreCommits(append = false) {
   const model = state.folderRestore;
-  if (!model || !invoke) return;
+  if (!model || !invoke || model.loadingCommits) return;
+  append = append === true;
+  if (append && !model.historyHasMore) return;
+  const repositoryPath = state.repository.path;
+  const request = (model.historyRequest || 0) + 1;
+  model.historyRequest = request;
+  const stillCurrent = () => state.folderRestore === model && state.repository?.path === repositoryPath && model.historyRequest === request;
+  if (!append) { invalidateFolderRestorePreview(); renderFolderRestorePreview(null); }
+  model.historyError = '';
   model.loadingCommits = true;
   renderFolderRestoreCommits();
+  updateFolderRestoreActionState();
   try {
-    const commits = await invoke('path_history', { repositoryPath: state.repository.path, relativePath: model.entry.relative_path });
-    if (state.folderRestore !== model) return;
-    model.commits = commits || [];
-    if (!model.selectedCommit && model.commits[0]) model.selectedCommit = model.commits[0].id;
-    model.loadingCommits = false;
-    renderFolderRestoreCommits();
+    const page = await invoke('restore_path_history', { repositoryPath, relativePath: model.entry.relative_path, headId: append ? model.historyHead : null, offset: append ? model.historyOffset : 0 });
+    if (!stillCurrent()) return;
+    const previous = append ? model.commits : [];
+    const knownIds = new Set(previous.map(commit => commit.id));
+    model.commits = previous.concat((page.commits || []).filter(commit => !knownIds.has(commit.id)));
+    model.historyHead = page.head_id;
+    model.historyOffset = page.next_offset;
+    model.historyHasMore = page.has_more;
+    if (!model.commits.some(commit => commit.id === model.selectedCommit)) model.selectedCommit = model.commits[0]?.id || '';
   } catch (error) {
-    if (state.folderRestore === model) {
-      model.loadingCommits = false;
-      refs.folderRestoreCommitList.innerHTML = `<div class="folder-restore-empty error">${esc(String(error))}</div>`;
-    }
+    if (stillCurrent()) model.historyError = `Could not load history: ${String(error)}. Retry with ${append ? 'Load older' : 'Refresh'}.`;
   } finally {
-    if (state.folderRestore === model) model.loadingCommits = false;
-    updateFolderRestoreActionState();
+    if (stillCurrent()) {
+      model.loadingCommits = false;
+      renderFolderRestoreCommits();
+      updateFolderRestoreActionState();
+    }
   }
 }
 
@@ -3244,6 +3272,7 @@ function openFolderRestoreDialog(entry) {
   refs.folderRestoreClean.checked = !isFile;
   refs.folderRestoreClean.closest('label').hidden = isFile;
   refs.folderRestoreStatus.textContent = '';
+  renderFolderRestoreCommits();
   renderFolderRestorePreview(null);
   refs.folderRestoreDialog.showModal();
 }
@@ -3620,6 +3649,21 @@ async function refreshAfterMerge() {
   directoryCache.clear();
   await loadRepository(state.repository.path, { keepPath: true });
   await checkForMergeConflicts();
+}
+
+// Error-only recovery: Git may have written files/index/merge state before
+// reporting failure. Never claim rollback and never refresh a different repo.
+async function refreshAfterMutationFailure(context) {
+  if (!context.path || state.repository?.path !== context.path || repoOpenGeneration !== context.generation) return;
+  try {
+    const loaded = await loadRepository(context.path, { keepPath: true });
+    if (loaded === false || state.repository?.path !== context.path) return;
+    await checkForMergeConflicts();
+    if (refs.stashesDialog.open && stashDialogContext) await refreshStashesList();
+  } catch (refreshError) {
+    jsPerfLog(`mutation recovery refresh failed: ${String(refreshError)}`, 0);
+    // The original Git error is still returned to the action's own handler.
+  }
 }
 
 function parseChangedSubmodulePaths(rawDiff = '') {
@@ -5375,9 +5419,9 @@ function buildCommitRowHtml(commit, index, ctx) {
     ctx.story?.tipId === commit.id ? '<b class="head-location-pill" data-tooltip="Tip of the branch or revision selected for Branch Story, not necessarily the checked-out HEAD">Story tip</b>' : '',
     ctx.story?.baseId === commit.id ? `<b class="branch-point-pill" data-tooltip="Unique common ancestor with ${esc(ctx.story.baseRef)} proven by loaded commit parents. This is not necessarily the original branch creation point.">Shared base</b>` : '',
     ctx.story?.incoming.has(commit.id) ? `<b class="branch-point-pill" data-tooltip="Real incoming merge parent${ctx.story.incoming.get(commit.id).refs.length ? ' with current branch references shown below' : ' without a current branch reference; its historical name is unknown'}.${ctx.story.incoming.get(commit.id).onBaseHistory ? ` Also reachable from current ${esc(ctx.story.incoming.get(commit.id).onBaseHistory)}; this is ancestry, not an original branch name.` : ''}">${ctx.story.incoming.get(commit.id).refs.length ? 'Incoming path' : 'Historical Path'}</b>` : '',
-    isCommonAncestorWithMain ? `<b class="branch-point-pill common-main-pill" data-tooltip="Real merge-base between HEAD and ${esc(commonAncestorBaseRef)} — where this checkout diverged from main">Branch start</b>` : '',
+    isCommonAncestorWithMain ? `<b class="branch-point-pill common-main-pill" data-tooltip="Real merge-base between HEAD and ${esc(commonAncestorBaseRef)} — current shared ancestor, not necessarily the original branch start">Shared base</b>` : '',
     !isCommonAncestorWithMain && isBranchPoint ? '<b class="branch-point-pill" data-tooltip="Common ancestor or lane transition — computed from commit parents, not lane color">⑂</b>' : '',
-    isCommandBranchStart ? `<b class="branch-point-pill command-start-pill" data-tooltip="merge-base with ${esc(state.branchStartMarker.baseRef)} — where this branch split from the selected base">Command start</b>` : '',
+    isCommandBranchStart ? `<b class="branch-point-pill command-start-pill" data-tooltip="merge-base with ${esc(state.branchStartMarker.baseRef)} — shared ancestor found by the command, not necessarily the original branch start">Shared base · command</b>` : '',
     isCommitCompareStart ? '<b class="branch-point-pill compare-start-pill" data-tooltip="Commit compare start — right-click another commit to compare">Compare start</b>' : '',
   ].join('');
 
@@ -5425,8 +5469,8 @@ async function jumpToGraphBranchStart() {
   if (!branchStart?.oid) {
     const key = `${initialGraph.path}::${initialGraph.headOid}`;
     status(headMainMergeBaseFetchKey === key
-      ? 'Branch start is still being calculated. Try again in a moment.'
-      : 'Branch start is not available for this checkout.', 'error');
+      ? 'Shared base is still being calculated. Try again in a moment.'
+      : 'Shared base is not available for this checkout.', 'error');
     return;
   }
 
@@ -5443,7 +5487,7 @@ async function jumpToGraphBranchStart() {
   let row = graphCommitRow(branchStart.oid);
   while (!row && activeGraphData().commitsTruncated) {
     const before = activeGraphData().commits.length;
-    status(`Loading older history to find branch start ${branchStart.oid.slice(0, 8)}…`, 'busy');
+    status(`Loading older history to find shared base ${branchStart.oid.slice(0, 8)}…`, 'busy');
     await loadOlderGraphCommits();
     if (state.view !== 'graph' || state.submoduleGraph !== targetContext || activeGraphData().path !== targetPath) return;
     if (activeGraphData().commits.length <= before) break;
@@ -5451,13 +5495,13 @@ async function jumpToGraphBranchStart() {
   }
 
   if (!row) {
-    status(`Branch start ${branchStart.oid.slice(0, 8)} is not present in the available graph history.`, 'error');
+    status(`Shared base ${branchStart.oid.slice(0, 8)} is not present in the available graph history.`, 'error');
     return;
   }
   row.scrollIntoView({ block: 'center', behavior: 'smooth' });
   selectCommit(branchStart.oid);
   if (row.animate) row.animate([{ boxShadow: '0 0 0 0 rgba(245, 181, 75, .8)' }, { boxShadow: '0 0 0 12px rgba(245, 181, 75, 0)' }], { duration: 900, easing: 'ease-out' });
-  status(`Branch start: ${branchStart.oid.slice(0, 8)} against ${branchStart.base_ref}.`);
+  status(`Shared base: ${branchStart.oid.slice(0, 8)} against ${branchStart.base_ref}. This may advance after merges; it is not necessarily the original branch start.`);
 }
 
 function activeGraphMergeTarget() {
@@ -5960,11 +6004,11 @@ function renderGraph() {
   const branchStartLookupPending = headMainMergeBaseFetchKey === `${g.path}::${g.headOid}`;
   const branchStartTitle = headMainBase?.oid
     ? branchStartVisible
-      ? `Go to branch start ${headMainBase.oid.slice(0, 8)} against ${headMainBase.base_ref}`
-      : `Load older history and go to branch start against ${headMainBase.base_ref}`
+      ? `Go to shared base ${headMainBase.oid.slice(0, 8)} against ${headMainBase.base_ref} — not necessarily the original branch start`
+      : `Load older history and go to shared base against ${headMainBase.base_ref}`
     : branchStartLookupPending
-      ? 'Branch start is being calculated'
-      : 'Branch start is not available for this checkout';
+      ? 'Shared base is being calculated'
+      : 'Shared base is not available for this checkout';
   refs.graphView.style.setProperty('--lanes-width', `${lanesWidth}px`);
   // Message C, point 3's own literal example format ("Repository: X" /
   // "Branch: Y" or "Detached at Z" / "Parent: repo") — explicit, labeled
@@ -5981,7 +6025,7 @@ function renderGraph() {
     ${query && !storyMode ? `<span class="search-match-count">${onlySearchMatches ? `showing ${matchCount} match${matchCount === 1 ? '' : 'es'} only` : `${matchCount} match${matchCount === 1 ? '' : 'es'} — rest shown as context`}</span><button type="button" class="graph-search-toggle ${onlySearchMatches ? 'active' : ''}" data-graph-only-matches title="${onlySearchMatches ? 'Show full graph context again' : 'Show only matching commits without graph links'}">${onlySearchMatches ? 'Show context' : 'Only matches'}</button>` : ''}
     <div class="ref-filter-group" role="group" aria-label="Filter by ref kind">${filterOptions.map(([value, label]) => `<button type="button" class="ref-filter-btn ${refFilter === value ? 'active' : ''}" data-ref-filter="${value}">${label}</button>`).join('')}</div>
     <button type="button" class="graph-current-jump" data-jump-head ${headVisible ? '' : 'disabled'} title="${headVisible ? 'Jump to current HEAD in this graph' : 'Current HEAD is not loaded in this graph'}">⌖</button>
-    ${storyMode ? '' : `<button type="button" class="graph-branch-start-jump ${branchStartLookupPending ? 'is-loading' : ''}" data-jump-branch-start title="${esc(branchStartTitle)}" aria-label="Go to start"><b>⑂</b><span>Go to start</span></button>`}
+    ${storyMode ? '' : `<button type="button" class="graph-branch-start-jump ${branchStartLookupPending ? 'is-loading' : ''}" data-jump-branch-start title="${esc(branchStartTitle)}" aria-label="Go to shared base"><b>⑂</b><span>Go to shared base</span></button>`}
     ${pickerOptions.length > 1 || storyMode ? `<label class="primary-branch-picker"><span>${storyMode ? 'Story branch' : 'Primary'}</span><select id="graphPrimaryBranch">${pickerOptions.map(opt => `<option value="${esc(opt.value)}" ${opt.value === selectedPickerValue ? 'selected' : ''}>${esc(opt.label)}</option>`).join('')}</select></label>` : ''}
     <span class="lane-header"><span>GRAPH</span><span>COMMIT</span></span>`;
   $('#graphPrimaryBranch')?.addEventListener('change', event => { if (storyMode) storyView.selection = event.target.value; else setActiveGraphPrimaryBranch(event.target.value); renderGraph(); });
@@ -6661,6 +6705,18 @@ let pendingToggleFlight = null;
 // happened.
 let activeStagingOperation = null;
 
+// One queue for checkbox batches AND bulk actions. Workers must not rely on
+// IPC delivery order to decide which index edit wins. The bulk actions include
+// their existing refresh so Commit sees the resulting staged selection.
+function runStagingOperation(action) {
+  const previous = activeStagingOperation;
+  const run = Promise.resolve(previous).then(action);
+  activeStagingOperation = run;
+  const clear = () => { if (activeStagingOperation === run) activeStagingOperation = null; };
+  run.then(clear, clear);
+  return run;
+}
+
 // A last-resort safety net for flushPendingTogglesNow, not a normal code
 // path — under ordinary conditions a flush finishes in well under a second.
 // If this ever fires, the real backend stage/unstage call is NOT cancelled
@@ -6696,7 +6752,12 @@ function toggleStage(path, checked) {
 // queued while a flush is already in progress is ever dropped or needs a
 // second, overlapping flush of its own.
 function ensureFlushRunning(options = {}) {
-  if (!pendingToggleFlight) pendingToggleFlight = flushLoop(options);
+  if (!pendingToggleFlight) {
+    pendingToggleFlight = flushLoop(options);
+    // Timer-started flushes have no waiter. Keep the rejection available to
+    // Commit/checkout, but do not emit an unhandled rejection from the timer.
+    pendingToggleFlight.catch(() => {});
+  }
   return pendingToggleFlight;
 }
 
@@ -6732,14 +6793,24 @@ async function flushOneBatch(options) {
   jsPerfLog(`flushOneBatch START (stage=${toStage.length}, unstage=${toUnstage.length}, generation=${generation})`, 0);
   const batchStarted = performance.now();
   let stageResult = null;
-  const run = (async () => {
+  const run = runStagingOperation(async () => {
     if (toStage.length) stageResult = await invoke('stage_files', { path: repositoryPath, files: toStage });
     if (toUnstage.length) await invoke('unstage_files', { path: repositoryPath, files: toUnstage });
-  })();
-  activeStagingOperation = run;
+  });
   try {
     await run;
     if (activeStagingOperation === run) activeStagingOperation = null;
+    if (stillSameRepo()) {
+      // A bulk refresh may have repainted status while these later checkbox
+      // edits waited in the queue. Apply the completed batch, but never replace
+      // an even newer click still waiting for the next batch.
+      for (const [path, checked] of batch) {
+        if (pendingToggles.has(path)) continue;
+        const change = state.changes.find(item => item.path === path);
+        if (change) change.staged = checked;
+      }
+      renderChanges();
+    }
     jsPerfLog(`flushOneBatch backend calls done (generation=${generation}, ${(performance.now() - batchStarted).toFixed(0)}ms)`, 0);
     // A parent repository can stage only a submodule's commit pointer. If
     // the submodule merely has uncommitted files inside it and HEAD has not
@@ -6800,6 +6871,7 @@ async function flushOneBatch(options) {
     if (stillSameRepo()) { try { await refreshStatusAndFolder(repositoryPath, state.currentPath); } catch { /* handleError below still reports the original failure */ } }
     const message = handleError(error);
     showOperationToast(`Stage/Unstage failed: ${message}`, 'error');
+    throw error; // a waiting Commit/checkout must not continue after failure
   }
 }
 
@@ -6815,15 +6887,23 @@ async function flushOneBatch(options) {
 // in well under a second) is the only thing that runs in practice.
 async function flushPendingTogglesNow(options = {}, context = 'the previous Stage/Unstage operation') {
   if (pendingToggleTimeout) { clearTimeout(pendingToggleTimeout); pendingToggleTimeout = null; }
-  const flight = pendingToggles.size ? ensureFlushRunning(options) : pendingToggleFlight;
+  if (!pendingToggles.size && !pendingToggleFlight && !activeStagingOperation) {
+    jsPerfLog('flushPendingTogglesNow END (nothing pending)', 0);
+    return;
+  }
+  const flight = (async () => {
+    while (pendingToggles.size || pendingToggleFlight || activeStagingOperation) {
+      const toggles = pendingToggles.size ? ensureFlushRunning(options) : pendingToggleFlight;
+      await Promise.all([toggles, activeStagingOperation]);
+    }
+  })();
   jsPerfLog(`flushPendingTogglesNow START (pendingToggles.size=${pendingToggles.size}, hasFlight=${!!flight}, activeStagingOperation=${!!activeStagingOperation})`, 0);
-  if (!flight) { jsPerfLog('flushPendingTogglesNow END (nothing pending)', 0); return; }
   const startedAt = performance.now();
   let timedOut = false;
   let timeoutHandle;
   const timeoutPromise = new Promise(resolve => { timeoutHandle = setTimeout(() => { timedOut = true; resolve(); }, STAGE_FLUSH_TIMEOUT_MS); });
-  await Promise.race([flight, timeoutPromise]);
-  clearTimeout(timeoutHandle);
+  try { await Promise.race([flight, timeoutPromise]); }
+  finally { clearTimeout(timeoutHandle); }
   jsPerfLog(`flushPendingTogglesNow END (${timedOut ? 'TIMEOUT' : 'done'}, ${(performance.now() - startedAt).toFixed(0)}ms)`, 0);
   if (timedOut) {
     // pendingToggleFlight is deliberately left exactly as it is — it still
@@ -6926,6 +7006,8 @@ $('#refresh').addEventListener('click', event => refreshRepository(event.current
 // afterward gets unstaged again, same as before.
 async function stageAllInScope(scope) {
   if (!invoke || !state.repository) return;
+  const repositoryPath = state.repository.path;
+  const folder = state.currentPath;
   const button = $('#stageAllButton'); const label = button.textContent;
   let run = null;
   try {
@@ -6940,11 +7022,18 @@ async function stageAllInScope(scope) {
     // comment) instead of trusting state.changes, which can already be stale
     // by the time this button is pressed — files added or removed from
     // outside the app since the last load wouldn't be in it at all.
-    run = (async () => {
-      try { return await invoke('stage_all', { repositoryPath: state.repository.path, scope }); }
+    run = runStagingOperation(async () => {
+      try {
+        const result = await invoke('stage_all', { repositoryPath, scope });
+        if (result.staged_paths.length && state.repository?.path === repositoryPath) {
+          const refreshStarted = performance.now();
+          await refreshStatusAndFolder(repositoryPath, folder);
+          jsPerfLog('stageAllInScope refreshStatusAndFolder', performance.now() - refreshStarted);
+        }
+        return result;
+      }
       finally { button.textContent = label; }
-    })();
-    activeStagingOperation = run;
+    });
     // The backend tells apart what genuinely landed in the index
     // (staged_paths) from a submodule that was only dirty *inside* it, with
     // no real gitlink change to record (skipped_dirty_submodules) — a
@@ -6968,18 +7057,14 @@ async function stageAllInScope(scope) {
       status(appliedMsg); showOperationToast(appliedMsg);
     }
     if (appliedMsg) jsPerfLog(`stageAllInScope UI message: ${appliedMsg}`, 0);
-    // Stage All only ever changes status — never branches, history, stashes,
-    // or a submodule-gitlink reconciliation pass, so a full loadRepository
-    // was unnecessary work paid on every click.
-    const refreshStarted = performance.now();
-    await refreshStatusAndFolder(state.repository.path, state.currentPath);
-    jsPerfLog('stageAllInScope refreshStatusAndFolder', performance.now() - refreshStarted);
   } catch (error) { handleError(error); }
   finally { if (activeStagingOperation === run) activeStagingOperation = null; button.disabled = false; renderChanges(); }
 }
 
 async function unstageAllInScope(scope) {
   if (!invoke || !state.repository) return;
+  const repositoryPath = state.repository.path;
+  const folder = state.currentPath;
   const button = $('#unstageAllButton'); const label = button.textContent;
   let run = null;
   try {
@@ -6989,12 +7074,13 @@ async function unstageAllInScope(scope) {
     const files = state.changes.filter(change => change.staged && (!scope || change.path === scope || change.path.startsWith(`${scope}/`))).map(change => change.path);
     if (!files.length) return;
     button.disabled = true; button.textContent = `Unstaging ${files.length} file${files.length === 1 ? '' : 's'}…`;
-    run = invoke('unstage_files', { path: state.repository.path, files }).finally(() => { button.textContent = label; });
-    activeStagingOperation = run;
+    run = runStagingOperation(async () => {
+      try {
+        await invoke('unstage_files', { path: repositoryPath, files });
+        if (state.repository?.path === repositoryPath) await refreshStatusAndFolder(repositoryPath, folder);
+      } finally { button.textContent = label; }
+    });
     await run;
-    // Unstage all only ever changes status — same reasoning as
-    // flushOneBatch/stageAllInScope, a full loadRepository was unnecessary.
-    await refreshStatusAndFolder(state.repository.path, state.currentPath);
   }
   catch (error) { handleError(error); }
   finally { if (activeStagingOperation === run) activeStagingOperation = null; button.disabled = false; renderChanges(); }
@@ -7578,7 +7664,8 @@ refs.confirmScopeCommit.addEventListener('click', commitSelectedScope);
 refs.folderRestoreModeHead.addEventListener('change', () => { refs.folderRestoreCommitPicker.hidden = true; invalidateFolderRestorePreview(); renderFolderRestorePreview(null); });
 refs.folderRestoreModeCommit.addEventListener('change', () => { refs.folderRestoreCommitPicker.hidden = false; invalidateFolderRestorePreview(); renderFolderRestorePreview(null); loadFolderRestoreCommits(); });
 refs.folderRestoreClean.addEventListener('change', () => { if (state.folderRestore) { invalidateFolderRestorePreview(); renderFolderRestorePreview(null); } });
-refs.refreshFolderRestoreCommits.addEventListener('click', loadFolderRestoreCommits);
+refs.refreshFolderRestoreCommits.addEventListener('click', () => loadFolderRestoreCommits());
+refs.loadOlderFolderRestoreCommits.addEventListener('click', () => loadFolderRestoreCommits(true));
 refs.folderRestoreCommitList.addEventListener('click', event => {
   const button = event.target.closest('[data-folder-restore-commit]');
   if (!button || !state.folderRestore) return;
@@ -7761,7 +7848,7 @@ async function findBranchStartCommit() {
   setConsoleMode('console');
   const target = consoleGitTarget();
   const baseRef = defaultBranchStartBaseRef();
-  status(`Finding branch start against ${baseRef}…`, 'busy');
+  status(`Finding shared base against ${baseRef}…`, 'busy');
   const mergeBase = await runTerminalFromConsole(`git merge-base HEAD ${baseRef}`);
   const sha = mergeBase?.stdout?.trim().split(/\s+/)[0];
   if (!mergeBase?.success || !/^[0-9a-f]{7,40}$/i.test(sha || '')) {
@@ -7776,7 +7863,7 @@ async function findBranchStartCommit() {
   render();
   const row = refs.graph.querySelector(`.commit-row[data-id="${CSS.escape(sha)}"]`);
   if (row) { row.scrollIntoView({ block: 'center' }); selectCommit(sha); }
-  status(`Branch start found: ${sha.slice(0, 8)} against ${baseRef}. Commands are shown in Terminal.`);
+  status(`Shared base found: ${sha.slice(0, 8)} against ${baseRef}. Not necessarily the original branch start. Commands are shown in Terminal.`);
 }
 
 async function initAndUpdateSubmodulesFromActions() {
@@ -7801,7 +7888,7 @@ function buildCommands() {
     { id: 'fetchall', name: 'Fetch All Remotes', description: 'Download new commits/refs from every configured remote, not just the first one', keywords: 'multiple upstream mirror', tags: ['explorer', 'graph'], fn: () => fetchAllRemotes() },
     { id: 'fetch-project', name: 'Fetch Project + Submodules', description: 'Safe update: fetch parent remotes and initialized submodule origins without pull, checkout or branch changes', keywords: 'submodule update all refresh server safe', tags: ['explorer', 'graph'], fn: () => fetchProjectAndSubmodules() },
     { id: 'init-update-submodules', name: 'Submodule update --init --recursive', description: 'Run git submodule update --init --recursive, then refresh the project. Use when submodule folders are empty or Git metadata is missing.', keywords: 'submodule init initialize recursive update empty missing metadata', tags: ['explorer', 'graph', 'relevant'], keepOpen: true, fn: initAndUpdateSubmodulesFromActions },
-    { id: 'branch-start', name: 'Find Branch Start Commit', description: 'Run merge-base against origin/main, show the commit details, and mark that split point on the Branch Map', keys: '', keywords: 'merge-base parent start base fork origin/main', tags: ['explorer', 'graph', 'relevant'], keepOpen: true, fn: findBranchStartCommit },
+    { id: 'branch-start', name: 'Find Shared Base Commit', description: 'Find the current merge-base against main and mark it on Branch Map. This can advance after merges; it is not necessarily the original branch start.', keys: '', keywords: 'merge-base parent start base fork origin/main', tags: ['explorer', 'graph', 'relevant'], keepOpen: true, fn: findBranchStartCommit },
     { id: 'stash', name: 'Stash Changes in Current Repository', description: 'Set aside changes only in the project or submodule currently being browsed', keys: 'Ctrl+Shift+S', tags: ['explorer'], fn: stashWork },
     { id: 'pop', name: 'View Stashes in Current Repository', description: 'View or restore saved changes for this project or submodule', keys: '', tags: ['explorer'], fn: popStash },
     { id: 'conflicts', name: 'Resolve Merge Conflicts', description: 'Open the conflict resolution dialog for a merge in progress', keys: '', keywords: 'merge conflict resolve', tags: state.pendingMainConflicts?.length ? ['explorer', 'graph', 'relevant'] : [], fn: () => openConflictsDialog(mergeTargetForMain(), state.pendingMainConflicts || []) },

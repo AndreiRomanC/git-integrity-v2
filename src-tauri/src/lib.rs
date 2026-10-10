@@ -63,6 +63,7 @@ pub fn run() {
             repository::restore_file,
             repository::restore_remote_file,
             repository::path_history,
+            repository::restore_path_history,
             repository::compare_remote_directory,
             repository::compare_remote_file_list,
             repository::compare_file_contents,

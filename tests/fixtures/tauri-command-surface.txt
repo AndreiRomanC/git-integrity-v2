@@ -107,6 +107,7 @@ restore_file
 restore_exact_checkpoint
 restore_exact_checkpoint_branch
 restore_folder
+restore_path_history
 restore_remote_file
 restore_stash_paths
 run_git_command

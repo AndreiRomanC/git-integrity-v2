@@ -26,9 +26,10 @@ pub fn stash_changes(repository_path: String) -> Result<(), String> {
         return Err("Nothing to stash — this repository has no uncommitted local changes.".into());
     }
     let signature = repo.signature().map_err(|_| "Configure user.name and user.email for this repository".to_string())?;
-    repo.stash_save2(&signature, None, Some(git2::StashFlags::INCLUDE_UNTRACKED)).map_err(|error| format!("Cannot stash changes: {}", error.message()))?;
+    let saved = repo.stash_save2(&signature, None, Some(git2::StashFlags::INCLUDE_UNTRACKED));
     invalidate_stashed_paths_cache(&repository_path);
     invalidate_git_metadata(&repository_path);
+    saved.map_err(|error| format!("Stash did not complete. Check the stash list and working tree before retrying; some changes may already have been saved. {}", error.message()))?;
     Ok(())
 }
 
@@ -82,9 +83,10 @@ pub fn stash_file(repository_path: String, relative_path: String) -> Result<(), 
     let repo = internal_repository(&repository_path)?;
     ensure_stash_operation_safe(&repo, "stash this file or folder")?;
     drop(repo);
-    git(&repository_path, &["stash", "push", "--include-untracked", "--", &relative_string])?;
+    let saved = git(&repository_path, &["stash", "push", "--include-untracked", "--", &relative_string]);
     invalidate_stashed_paths_cache(&repository_path);
     invalidate_git_metadata(&repository_path);
+    saved.map_err(|error| format!("Stash did not complete. Check the stash list and working tree before retrying. {error}"))?;
     Ok(())
 }
 
@@ -104,9 +106,10 @@ pub fn pop_stash(repository_path: String, stash_index: usize) -> Result<(), Stri
         return Err(format!("Cannot restore the complete stash because this repository already has uncommitted work:\n{}{more}\n\nCommit or stash the current work first, or restore only selected clean files. Nothing was changed.", files.join("\n")));
     }
     let mut options = git2::StashApplyOptions::new();
-    repo.stash_apply(stash_index, Some(&mut options)).map_err(|error| format!("Cannot restore stashed work: {}", error.message()))?;
+    let applied = repo.stash_apply(stash_index, Some(&mut options));
     invalidate_git_metadata(&repository_path);
-    let has_conflicts = repo.index().map(|index| index.has_conflicts()).unwrap_or(false);
+    applied.map_err(|error| format!("Stash restore did not complete; some files may have been restored. The stash was kept. Review conflicts and the working tree before retrying. {}", error.message()))?;
+    let has_conflicts = repo.index().map_err(|error| format!("Stash applied, but conflicts could not be checked. The stash was kept. {}", error.message()))?.has_conflicts();
     if !has_conflicts {
         repo.stash_drop(stash_index).map_err(|error| format!("Restored, but could not drop the stash entry: {}", error.message()))?;
         invalidate_stashed_paths_cache(&repository_path);
@@ -133,12 +136,6 @@ pub fn restore_stash_paths(repository_path: String, stash_index: usize, paths: V
     validate_path(&repository_path)?;
     if paths.is_empty() { return Err("Select at least one file to restore".into()); }
     let selected: HashSet<String> = paths.iter().map(|path| safe_relative_path(path).map(|p| normalized(&p))).collect::<Result<_, _>>()?;
-    let all_files: HashSet<String> = stash_entry_files(repository_path.clone(), stash_index)?.into_iter().collect();
-    let missing: Vec<&String> = selected.iter().filter(|path| !all_files.contains(*path)).collect();
-    if !missing.is_empty() {
-        return Err(format!("The selected path is not present in this stash: {}", missing.iter().map(|path| path.as_str()).collect::<Vec<_>>().join(", ")));
-    }
-
     let queue_started = Instant::now();
     let lock_handle = repo_write_lock(&repository_path);
     let _lock = lock_handle.lock().unwrap();
@@ -154,6 +151,12 @@ pub fn restore_stash_paths(repository_path: String, stash_index: usize, paths: V
     let mut stash_oid = None;
     repo.stash_foreach(|index, _, found| { if index == stash_index { stash_oid = Some(*found); } true }).map_err(|error| error.message().to_string())?;
     let stash_oid = stash_oid.ok_or("That stash entry no longer exists")?;
+    // Validate against the same immutable stash resolved under the write lock.
+    let all_files: HashSet<String> = paths_in_stash(&repo, stash_oid)?.into_iter().collect();
+    let missing: Vec<&String> = selected.iter().filter(|path| !all_files.contains(*path)).collect();
+    if !missing.is_empty() {
+        return Err(format!("The selected path is not present in this stash: {}", missing.iter().map(|path| path.as_str()).collect::<Vec<_>>().join(", ")));
+    }
     let stash_commit = repo.find_commit(stash_oid).map_err(|error| error.message().to_string())?;
     let untracked_commit = stash_commit.parent(2).ok();
     let untracked_tree = untracked_commit.as_ref().and_then(|commit| commit.tree().ok());
@@ -175,6 +178,7 @@ pub fn restore_stash_paths(repository_path: String, stash_index: usize, paths: V
     drop(stash_commit);
     drop(repo);
 
+    let restored = (|| -> Result<(), String> {
     if !tracked.is_empty() {
         let source = format!("--source={stash_oid}");
         let mut args = vec!["restore", source.as_str(), "--worktree", "--"];
@@ -188,11 +192,13 @@ pub fn restore_stash_paths(repository_path: String, stash_index: usize, paths: V
         args.extend(untracked);
         git(&repository_path, &args).map_err(|error| format!("Cannot restore the selected untracked file(s): {error}"))?;
     }
+    Ok(())
+    })();
     // The stash is intentionally kept as a backup after a partial restore,
     // but the Explorer should still repaint from fresh disk/status data.
     invalidate_stashed_paths_cache(&repository_path);
     invalidate_git_metadata(&repository_path);
-    Ok(())
+    restored.map_err(|error| format!("{error}\nSome selected files may already have been restored. The stash was kept unchanged; review the working tree before retrying."))
 }
 
 #[tauri::command]
@@ -205,9 +211,10 @@ pub fn abort_stash_conflict(repository_path: String) -> Result<(), String> {
     let repo = internal_repository(&repository_path)?;
     let head_commit = repo.head().map_err(|error| error.message().to_string())?.peel_to_commit().map_err(|error| error.message().to_string())?;
     let mut checkout = git2::build::CheckoutBuilder::new(); checkout.force();
-    repo.reset(head_commit.as_object(), git2::ResetType::Hard, Some(&mut checkout)).map_err(|error| error.message().to_string())?;
+    let reset = repo.reset(head_commit.as_object(), git2::ResetType::Hard, Some(&mut checkout));
     invalidate_stashed_paths_cache(&repository_path);
     invalidate_git_metadata(&repository_path);
+    reset.map_err(|error| format!("Discard did not complete; files may have changed. The stash was kept. Review the working tree. {}", error.message()))?;
     Ok(())
 }
 

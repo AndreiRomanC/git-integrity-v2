@@ -383,7 +383,7 @@ test('clone is reachable outside the empty state and sends explicit clone option
   assert.match(app, /invoke\('clone_repository', \{ url, parentPath, folderName, branch: branch \|\| null, recurseSubmodules \}\)/);
 });
 
-test('App actions can find and mark the branch start commit via visible git commands', () => {
+test('App actions can find and mark the shared base via visible git commands', () => {
   assert.match(app, /id: 'branch-start'/);
   assert.match(app, /git merge-base HEAD \$\{baseRef\}/);
   assert.match(app, /git show --no-patch --decorate --date=short --stat \$\{sha\}/);
@@ -559,7 +559,7 @@ test('graph exposes branch and commit context actions without relying on lane id
   assert.match(app, /Resolved\/staged — ready to complete the merge/);
   assert.match(app, /invoke\('graph_head_main_merge_base', \{ repositoryPath: g\.path \}\)/);
   assert.match(app, /commonAncestorRows/);
-  assert.match(app, /Branch start/);
+  assert.match(app, />Shared base<\/b>/);
   assert.match(app, /class="commit-date"/);
   assert.match(app, /data-copy-commit-sha/);
   assert.match(css, /\.commit-copy-sha/);
@@ -569,10 +569,12 @@ test('graph exposes branch and commit context actions without relying on lane id
   assert.match(app, /class="graph-current-jump"/);
   assert.match(app, /function jumpToGraphBranchStart\(\)/);
   assert.match(app, /data-jump-branch-start/);
-  assert.match(app, /aria-label="Go to start"/);
-  assert.match(app, /<span>Go to start<\/span>/);
-  assert.match(app, /Branch start is still being calculated/);
-  assert.match(app, /Loading older history to find branch start/);
+  assert.match(app, /aria-label="Go to shared base"/);
+  assert.match(app, /<span>Go to shared base<\/span>/);
+  assert.match(app, /Shared base is still being calculated/);
+  assert.match(app, /Loading older history to find shared base/);
+  assert.match(app, /not necessarily the original branch start/);
+  assert.doesNotMatch(app, />Branch start<\/b>|>Command start<\/b>/);
   assert.match(css, /\.graph-branch-start-jump/);
   assert.match(app, /YOU ARE HERE · HEAD/);
   assert.match(css, /\.head-location-pill/);

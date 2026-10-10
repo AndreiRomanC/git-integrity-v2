@@ -2914,7 +2914,7 @@ fn stage_all_inner(repository_path: &str, scope: &str) -> Result<StageResult, St
     // "N paths staged" (the report this fixes: 4 submodules, each with an
     // unchanged HEAD, "staged" and counted as 4 while the index recorded
     // nothing new at all).
-    let result = stage_files(repository_path.to_string(), paths)?;
+    let result = stage_files_blocking(repository_path.to_string(), paths)?;
     seed_status_cache_after_stage_all(repository_path, full, &result);
     Ok(result)
 }
@@ -2935,14 +2935,22 @@ pub struct StageResult {
 }
 
 #[tauri::command]
-pub fn stage_files(path: String, files: Vec<String>) -> Result<StageResult, String> {
+pub async fn stage_files(path: String, files: Vec<String>) -> Result<StageResult, String> {
+    off_main_thread(move || stage_files_blocking(path, files)).await
+}
+
+fn stage_files_blocking(path: String, files: Vec<String>) -> Result<StageResult, String> {
     let started = Instant::now();
     let file_count = files.len();
     perf_log(&format!("stage_files: START ({file_count} files)"), Duration::ZERO);
     let result = stage_files_inner(&path, files);
     match &result {
         Ok(outcome) => perf_log(&format!("stage_files: TOTAL ({file_count} requested, {} staged, {} skipped dirty submodules)", outcome.staged_paths.len(), outcome.skipped_dirty_submodules.len()), started.elapsed()),
-        Err(error) => perf_log(&format!("stage_files: ERROR ({file_count} files): {error}"), started.elapsed()),
+        Err(error) => {
+            // Earlier submodule/index writes in a batch may have succeeded.
+            invalidate_git_metadata(&path);
+            perf_log(&format!("stage_files: ERROR ({file_count} files): {error}"), started.elapsed());
+        }
     }
     result
 }
@@ -2978,7 +2986,7 @@ fn stage_files_inner(path: &str, files: Vec<String>) -> Result<StageResult, Stri
     // taken one at a time, never nested, can't form a cycle with anything
     // else that follows the same rule.
     for (sub_path, inner_files) in submodule_groups {
-        let inner = stage_files(sub_path, inner_files)?;
+        let inner = stage_files_blocking(sub_path, inner_files)?;
         result.staged_paths.extend(inner.staged_paths);
         result.skipped_dirty_submodules.extend(inner.skipped_dirty_submodules);
     }
@@ -3074,14 +3082,22 @@ fn stage_files_inner(path: &str, files: Vec<String>) -> Result<StageResult, Stri
 }
 
 #[tauri::command]
-pub fn unstage_files(path: String, files: Vec<String>) -> Result<(), String> {
+pub async fn unstage_files(path: String, files: Vec<String>) -> Result<(), String> {
+    off_main_thread(move || {
+        let result = unstage_files_blocking(path.clone(), files);
+        if result.is_err() { invalidate_git_metadata(&path); }
+        result
+    }).await
+}
+
+fn unstage_files_blocking(path: String, files: Vec<String>) -> Result<(), String> {
     validate_path(&path)?;
     let (files, submodule_groups) = partition_by_submodule(&path, files);
     // Same single-lock-at-a-time reasoning as stage_files_inner: unstaging
     // files *inside* a submodule is entirely that submodule's own
     // repository, done before the parent's own lock is acquired below, one
     // submodule lock at a time, never nested with the parent's.
-    for (sub_path, inner_files) in submodule_groups { unstage_files(sub_path, inner_files)?; }
+    for (sub_path, inner_files) in submodule_groups { unstage_files_blocking(sub_path, inner_files)?; }
     if files.is_empty() { return Ok(()); }
     // See repo_write_lock's doc comment — same concurrent-index race as
     // stage_files, from the exact same rapid-checkbox-click pattern.
@@ -7690,12 +7706,42 @@ fn folder_restore_diff_changes(output: &str, staged: bool) -> Vec<Change> {
     changes
 }
 
-fn parse_clean_dry_run(output: &str) -> Vec<String> {
-    output.lines().filter_map(|line| {
-        line.strip_prefix("Would remove ")
-            .map(|path| path.trim().trim_matches('"').trim_end_matches('/').replace('\\', "/"))
-            .filter(|path| !path.is_empty())
-    }).collect()
+fn parse_clean_dry_run(output: &str) -> Result<Vec<String>, String> {
+    let mut paths = Vec::new();
+    for value in output.lines().filter_map(|line| line.strip_prefix("Would remove ")) {
+        // Git uses C-style quoting, including octal UTF-8 bytes, independently
+        // of the host path separator. Never turn escape bytes into directories.
+        let decoded = if value.starts_with('"') {
+            let inner = value.strip_prefix('"').and_then(|s| s.strip_suffix('"'))
+                .ok_or("Cannot safely decode a quoted Clean path; nothing was changed")?;
+            let bytes = inner.as_bytes();
+            let mut result = Vec::new();
+            let mut i = 0;
+            while i < bytes.len() {
+                let byte = bytes[i]; i += 1;
+                if byte != b'\\' { result.push(byte); continue; }
+                let escape = *bytes.get(i).ok_or("Incomplete escape in Clean path")?; i += 1;
+                let decoded = match escape {
+                    b'"' | b'\\' => escape,
+                    b'a' => 7, b'b' => 8, b't' => b'\t', b'n' => b'\n',
+                    b'v' => 11, b'f' => 12, b'r' => b'\r',
+                    b'0'..=b'3' if i + 1 < bytes.len() && (b'0'..=b'7').contains(&bytes[i]) && (b'0'..=b'7').contains(&bytes[i + 1]) => {
+                        let byte = (escape - b'0') * 64 + (bytes[i] - b'0') * 8 + (bytes[i + 1] - b'0');
+                        i += 2; byte
+                    }
+                    _ => return Err("Unsupported escape in Clean path; nothing was changed".into()),
+                };
+                result.push(decoded);
+            }
+            String::from_utf8(result).map_err(|_| "Clean cannot safely handle a non-UTF-8 path")?
+        } else { value.to_string() };
+        // The application's shared path normalizer treats backslashes as
+        // separators. Refuse a literal backslash rather than clean another path.
+        if decoded.contains(['\\', '\0']) { return Err("Clean cannot safely handle a literal backslash or NUL in a file name".into()); }
+        let path = decoded.trim_end_matches('/');
+        if !path.is_empty() { paths.push(path.to_string()); }
+    }
+    Ok(paths)
 }
 
 fn commit_for_folder_restore<'repo>(repo: &'repo Repository, source_revision: &str) -> Result<git2::Commit<'repo>, String> {
@@ -7791,7 +7837,7 @@ fn path_restore_preview_inner(repository_path: &str, relative_path: &str, source
     }
     let tracked_changes = tracked_by_path.into_values().collect();
     let clean_candidates = if clean_untracked && !is_file {
-        parse_clean_dry_run(&git(repository_path, &["clean", "-nd", "--", &relative_string])?)
+        parse_clean_dry_run(&git(repository_path, &["clean", "-nd", "--", &relative_string])?)?
     } else { Vec::new() };
     let source_subject = commit.summary().unwrap_or("No message").to_string();
     let source_author = commit.author().name().unwrap_or("Unknown").to_string();
@@ -7866,7 +7912,7 @@ fn path_restore_inner(repository_path: String, relative_path: String, source_rev
     }
     if !clean_relative.is_empty() {
         let mut args = vec!["clean".to_string(), "-fd".to_string(), "--".to_string()];
-        args.extend(clean_relative);
+        args.extend(clean_relative.into_iter().map(|path| format!(":(top,literal){path}")));
         git_owned(&repository_path, args).map_err(|detail| format!("Folder restored, but clean failed: {detail}"))?;
     }
     invalidate_git_metadata(&repository_path);
@@ -7902,14 +7948,44 @@ fn last_commit_touching_path(repository_path: &str, relative: &Path) -> Option<(
 }
 
 #[tauri::command]
-pub fn path_history(repository_path: String, relative_path: String) -> Result<Vec<Commit>, String> {
+pub async fn path_history(repository_path: String, relative_path: String) -> Result<Vec<Commit>, String> {
+    // Open and walk the repository inside the existing blocking worker. Keep
+    // the same bounded, read-only history query and command response shape.
+    off_main_thread(move || Ok(path_history_page_inner(repository_path, relative_path, None, 0)?.commits)).await
+}
+
+#[derive(Serialize)]
+pub struct RestorePathHistoryPage {
+    commits: Vec<Commit>,
+    head_id: String,
+    next_offset: usize,
+    has_more: bool,
+}
+
+// Restore uses bounded, explicitly requested pages. Pin the walk to the first
+// page's HEAD so commits added between requests cannot shift page boundaries.
+#[tauri::command]
+pub async fn restore_path_history(repository_path: String, relative_path: String, head_id: Option<String>, offset: Option<usize>) -> Result<RestorePathHistoryPage, String> {
+    off_main_thread(move || path_history_page_inner(repository_path, relative_path, head_id, offset.unwrap_or(0))).await
+}
+
+fn path_history_page_inner(repository_path: String, relative_path: String, head_id: Option<String>, offset: usize) -> Result<RestorePathHistoryPage, String> {
     validate_path(&repository_path)?;
     let relative = safe_relative_path(&relative_path)?;
-    let repo = internal_repository(&repository_path)?; let mut walk = repo.revwalk().map_err(|error| error.message().to_string())?; walk.push_head().map_err(|error| error.message().to_string())?; let _ = walk.set_sorting(Sort::TOPOLOGICAL | Sort::TIME);
+    let repo = internal_repository(&repository_path)?;
+    let head = match head_id {
+        Some(id) => repo.find_commit(Oid::from_str(&id).map_err(|e| e.message().to_string())?),
+        None => repo.head().and_then(|head| head.peel_to_commit()),
+    }.map_err(|e| e.message().to_string())?.id();
+    let mut walk = repo.revwalk().map_err(|error| error.message().to_string())?;
+    walk.push(head).map_err(|error| error.message().to_string())?;
+    let _ = walk.set_sorting(Sort::TOPOLOGICAL | Sort::TIME);
+    let mut page_walk = walk.flatten().skip(offset);
+    let mut scanned = 0;
 
     struct Walked { oid: git2::Oid, parent_ids: Vec<git2::Oid>, included: bool, subject: String, author: String, date: String }
     let mut walked = Vec::new();
-    for oid in walk.flatten().take(500) { if let Ok(commit) = repo.find_commit(oid) {
+    for oid in page_walk.by_ref().take(500) { scanned += 1; if let Ok(commit) = repo.find_commit(oid) {
         let included = if relative.as_os_str().is_empty() { true } else { let parent_tree = commit.parent(0).ok().and_then(|parent| parent.tree().ok()); let mut options = git2::DiffOptions::new(); options.pathspec(&relative); if let Ok(tree) = commit.tree() { repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), Some(&mut options)).map(|diff| diff.deltas().next().is_some()).unwrap_or(false) } else { false } };
         walked.push(Walked { oid, parent_ids: commit.parent_ids().collect(), included, subject: commit.summary().unwrap_or("No message").into(), author: commit.author().name().unwrap_or("Unknown").into(), date: short_date(commit.time().seconds()) });
     } }
@@ -7934,10 +8010,12 @@ pub fn path_history(repository_path: String, relative_path: String) -> Result<Ve
         resolved.insert(entry.oid, ancestors);
     }
 
-    Ok(walked.into_iter().filter(|entry| entry.included).map(|entry| {
+    let has_more = page_walk.next().is_some();
+    let commits = walked.into_iter().filter(|entry| entry.included).map(|entry| {
         let parents = resolved.remove(&entry.oid).unwrap_or_default();
         Commit { id: entry.oid.to_string(), parents: parents.into_iter().map(|oid| oid.to_string()).collect(), subject: entry.subject, author: entry.author, date: entry.date, refs: Vec::new(), lane: 0 }
-    }).collect())
+    }).collect();
+    Ok(RestorePathHistoryPage { commits, head_id: head.to_string(), next_offset: offset + scanned, has_more })
 }
 
 fn resolve_commit(repository: &str, reference: &str) -> Result<String, String> {
@@ -9265,6 +9343,9 @@ pub fn file_blame(repository_path: String, relative_path: String) -> Result<File
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Existing synchronous algorithm tests; worker entry points are exercised
+    // explicitly with super::stage_files / super::unstage_files below.
+    use super::{stage_files_blocking as stage_files, unstage_files_blocking as unstage_files};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn run_git(path: &Path, args: &[&str]) {
@@ -9616,7 +9697,7 @@ mod tests {
         let refs_before = run_git_capture(&repository, &["show-ref"]);
         let branch = run_git_capture(&repository, &["symbolic-ref", "HEAD"]);
         let root = repository.to_string_lossy().into_owned();
-        let history_ids = || path_history(root.clone(), "folder".into()).unwrap().into_iter().map(|commit| commit.id).collect::<Vec<_>>();
+        let history_ids = || tauri::async_runtime::block_on(path_history(root.clone(), "folder".into())).unwrap().into_iter().map(|commit| commit.id).collect::<Vec<_>>();
         let before = history_ids();
         assert_eq!(before, vec![head.clone(), older.clone()]);
         fs::write(repository.join("outside.txt"), "outside local edit\n").unwrap();
@@ -9651,11 +9732,278 @@ mod tests {
     }
 
     #[test]
+    fn folder_restore_clean_decodes_git_quoted_paths_without_changing_their_meaning() {
+        let output = "Would remove \"folder/noti\\310\\233\\304\\203.txt\"\nWould remove folder/a file.txt\nWould remove \"folder/a\\\"b.txt\"\nWould remove \"folder/tab\\tname.txt\"\nWould remove folder/目录/\n";
+        assert_eq!(parse_clean_dry_run(output).unwrap(), vec!["folder/notiță.txt", "folder/a file.txt", "folder/a\"b.txt", "folder/tab\tname.txt", "folder/目录"]);
+        assert!(parse_clean_dry_run("Would remove \"folder/\\377.txt\"\n").is_err());
+        assert!(parse_clean_dry_run("Would remove \"folder/bad\\q.txt\"\n").is_err());
+        assert!(parse_clean_dry_run("Would remove \"folder/literal\\\\name\"\n").is_err());
+        assert!(parse_clean_dry_run("Would remove \"unfinished\n").is_err());
+    }
+
+    #[test]
+    fn folder_restore_clean_removes_only_confirmed_unicode_and_literal_paths() {
+        let (root, path, _, head) = individual_restore_fixture("clean-unicode");
+        run_git(&root, &["config", "core.quotePath", "true"]);
+        let selected = ["folder/notiță.txt", "folder/a file.txt", "folder/[a].txt"];
+        for file in selected { fs::write(root.join(file), "untracked\n").unwrap(); }
+        fs::write(root.join("folder/a.txt"), "keep unselected sibling\n").unwrap();
+        fs::write(root.join("outside.txt"), "outside local changes\n").unwrap();
+        let before_refs = run_git_capture(&root, &["show-ref"]);
+        let preview = folder_restore_preview_inner(&path, "folder", "HEAD", true).unwrap();
+        for file in selected { assert!(preview.clean_candidates.contains(&file.to_string()), "missing exact Clean candidate: {file}"); }
+        restore_folder_inner(path, "folder".into(), head.clone(), selected.iter().map(|file| file.to_string()).collect()).unwrap();
+        for file in selected { assert!(!root.join(file).exists(), "confirmed path should be removed: {file}"); }
+        assert_eq!(fs::read_to_string(root.join("folder/a.txt")).unwrap(), "keep unselected sibling\n");
+        assert_eq!(fs::read_to_string(root.join("outside.txt")).unwrap(), "outside local changes\n");
+        assert_eq!(run_git_capture(&root, &["rev-parse", "HEAD"]), head);
+        assert_eq!(run_git_capture(&root, &["show-ref"]), before_refs);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn staging_workers_keep_order_index_locking_and_commit_contents() {
+        let (root, path, _, head) = individual_restore_fixture("staging-worker");
+        fs::write(root.join("folder/file.txt"), "selected edit\n").unwrap();
+        fs::write(root.join("outside.txt"), "not selected\n").unwrap();
+        let lock = repo_write_lock(&path);
+        let held = lock.lock().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker_path = path.clone();
+        let worker = std::thread::spawn(move || {
+            let result = tauri::async_runtime::block_on(super::stage_files(worker_path, vec!["folder/file.txt".into()]));
+            tx.send(result).unwrap();
+        });
+        let premature = rx.recv_timeout(Duration::from_millis(100));
+        drop(held);
+        assert!(matches!(premature, Err(std::sync::mpsc::RecvTimeoutError::Timeout)), "staging must respect the existing repository write lock");
+        assert_eq!(rx.recv_timeout(Duration::from_secs(10)).unwrap().unwrap().staged_paths, vec!["folder/file.txt"]);
+        worker.join().unwrap();
+        for _ in 0..8 {
+            tauri::async_runtime::block_on(super::unstage_files(path.clone(), vec!["folder/file.txt".into()])).unwrap();
+            assert!(run_git_capture(&root, &["diff", "--cached", "--name-only"]).is_empty());
+            tauri::async_runtime::block_on(super::stage_files(path.clone(), vec!["folder/file.txt".into()])).unwrap();
+        }
+        assert_eq!(run_git_capture(&root, &["rev-parse", "HEAD"]), head);
+        create_commit(path.clone(), "After staging worker".into()).unwrap();
+        assert_eq!(run_git_capture(&root, &["show", "HEAD:folder/file.txt"]), "selected edit");
+        assert_eq!(fs::read_to_string(root.join("outside.txt")).unwrap(), "not selected\n");
+        assert_eq!(run_git_capture(&root, &["diff", "--name-only"]), "outside.txt");
+        fs::write(root.join("folder/file.txt"), "retry edit\n").unwrap();
+        fs::write(root.join(".git/index.lock"), "held externally").unwrap();
+        assert!(tauri::async_runtime::block_on(super::stage_files(path.clone(), vec!["folder/file.txt".into()])).is_err());
+        assert_eq!(fs::read_to_string(root.join(".git/index.lock")).unwrap(), "held externally");
+        fs::remove_file(root.join(".git/index.lock")).unwrap();
+        tauri::async_runtime::block_on(super::stage_files(path, vec!["folder/file.txt".into()])).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn partial_merge_fast_forward_failure_keeps_branch_tip_and_invalidates_status() {
+        let (root, path, old, tip) = individual_restore_fixture("ff-failure");
+        run_git(&root, &["branch", "incoming", &tip]);
+        run_git(&root, &["reset", "--hard", &old]);
+        let epoch = status_cache_epoch(&path);
+        fs::write(root.join(".git/index.lock"), "external lock").unwrap();
+        let error = merge_branch(path.clone(), "".into(), "incoming".into()).err().unwrap();
+        assert!(error.contains("branch was not advanced"), "{error}");
+        assert_eq!(run_git_capture(&root, &["rev-parse", "HEAD"]), old);
+        assert!(status_cache_epoch(&path) > epoch);
+        assert_eq!(fs::read_to_string(root.join(".git/index.lock")).unwrap(), "external lock");
+        fs::remove_file(root.join(".git/index.lock")).unwrap();
+        // A failed checkout may have written some files. Explicitly restore the
+        // disposable fixture before retrying; production never does this itself.
+        run_git(&root, &["reset", "--hard", &old]);
+        assert_eq!(merge_branch(path.clone(), "".into(), "incoming".into()).unwrap().status, "fast_forwarded");
+        assert_eq!(run_git_capture(&root, &["rev-parse", "HEAD"]), tip);
+        assert!(run_git_capture(&root, &["status", "--porcelain"]).is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn partial_merge_resolution_failure_invalidates_status_and_keeps_remaining_conflict() {
+        let (root, path, old, _) = individual_restore_fixture("resolution-failure");
+        run_git(&root, &["switch", "-c", "incoming", &old]);
+        fs::write(root.join("folder/file.txt"), "incoming edit\n").unwrap();
+        run_git(&root, &["commit", "-am", "Incoming"]);
+        run_git(&root, &["switch", "-"]);
+        assert_eq!(merge_branch(path.clone(), "".into(), "incoming".into()).unwrap().status, "conflicts");
+        let epoch = status_cache_epoch(&path);
+        fs::write(root.join(".git/index.lock"), "external lock").unwrap();
+        assert!(resolve_conflict(path.clone(), "".into(), "folder/file.txt".into(), "ours".into()).is_err());
+        assert_eq!(fs::read_to_string(root.join("folder/file.txt")).unwrap(), "new\n");
+        assert!(status_cache_epoch(&path) > epoch);
+        assert_eq!(list_conflicts(path.clone(), "".into()).unwrap().len(), 1);
+        fs::remove_file(root.join(".git/index.lock")).unwrap();
+        resolve_conflict(path.clone(), "".into(), "folder/file.txt".into(), "manual".into()).unwrap();
+        complete_merge(path, "".into(), "Resolved after retry".into()).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn partial_merge_cleanup_failure_reports_the_commit_already_created() {
+        use std::os::unix::fs::PermissionsExt;
+        let (root, path, old, before) = individual_restore_fixture("cleanup-failure");
+        run_git(&root, &["switch", "-c", "incoming", &old]);
+        fs::write(root.join("outside.txt"), "incoming edit\n").unwrap();
+        run_git(&root, &["commit", "-am", "Incoming"]);
+        run_git(&root, &["switch", "-"]);
+        run_git(&root, &["merge", "--no-commit", "--no-ff", "incoming"]);
+        // Git can write the commit, but cannot remove a child of this read-only
+        // state directory. Permission failure injection is Unix-specific.
+        fs::remove_file(root.join(".git/MERGE_MSG")).unwrap();
+        fs::create_dir(root.join(".git/MERGE_MSG")).unwrap();
+        fs::write(root.join(".git/MERGE_MSG/locked"), "cleanup obstruction").unwrap();
+        fs::set_permissions(root.join(".git/MERGE_MSG"), fs::Permissions::from_mode(0o555)).unwrap();
+        let epoch = status_cache_epoch(&path);
+        let result = complete_merge(path.clone(), "".into(), "Completed tree".into());
+        fs::set_permissions(root.join(".git/MERGE_MSG"), fs::Permissions::from_mode(0o755)).unwrap();
+        let error = result.unwrap_err();
+        let head = run_git_capture(&root, &["rev-parse", "HEAD"]);
+        assert_ne!(head, before);
+        assert!(error.contains(&head) && error.contains("was created"), "{error}");
+        assert!(status_cache_epoch(&path) > epoch);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn partial_merge_cleanup_retry_does_not_create_a_duplicate_commit() {
+        let (root, path, old, _) = individual_restore_fixture("merge-cleanup-retry");
+        run_git(&root, &["switch", "-c", "incoming", &old]);
+        fs::write(root.join("outside.txt"), "incoming edit\n").unwrap();
+        run_git(&root, &["commit", "-am", "Incoming"]);
+        let incoming = run_git_capture(&root, &["rev-parse", "HEAD"]);
+        run_git(&root, &["switch", "-"]);
+        let result = merge_branch(path.clone(), "".into(), "incoming".into()).unwrap();
+        assert_eq!(result.status, "merged");
+        let merged = run_git_capture(&root, &["rev-parse", "HEAD"]);
+        assert_eq!(run_git_capture(&root, &["rev-list", "--parents", "-n", "1", "HEAD"]).split_whitespace().count(), 3);
+        // Simulate a completed commit whose merge state cleanup was interrupted.
+        fs::write(root.join(".git/MERGE_HEAD"), format!("{incoming}\n")).unwrap();
+        fs::write(root.join(".git/MERGE_MSG"), "pending cleanup\n").unwrap();
+        let epoch = status_cache_epoch(&path);
+        let retried = complete_merge(path.clone(), "".into(), "Retry cleanup".into()).unwrap();
+        assert_eq!(retried, merged);
+        assert_eq!(run_git_capture(&root, &["rev-parse", "HEAD"]), merged);
+        assert!(!merge_in_progress(path.clone(), "".into()).unwrap());
+        assert!(status_cache_epoch(&path) > epoch);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn partial_stash_restore_failure_keeps_backup_and_invalidates_changed_files() {
+        let (root, path, _, _) = individual_restore_fixture("stash-partial-failure");
+        fs::write(root.join("folder/file.txt"), "saved tracked edit\n").unwrap();
+        fs::create_dir(root.join("saved")).unwrap();
+        fs::write(root.join("saved/new.txt"), "saved untracked\n").unwrap();
+        stash_changes(path.clone()).unwrap();
+        let stash = run_git_capture(&root, &["rev-parse", "refs/stash"]);
+        // Remove one loose blob only in this disposable fixture: the tracked
+        // restore can succeed, but the later untracked restore must fail.
+        let blob = run_git_capture(&root, &["rev-parse", "stash@{0}^3:saved/new.txt"]);
+        fs::remove_file(root.join(".git/objects").join(&blob[..2]).join(&blob[2..])).unwrap();
+        let epoch = status_cache_epoch(&path);
+        let error = restore_stash_paths(path.clone(), 0, vec!["folder/file.txt".into(), "saved/new.txt".into()]).unwrap_err();
+        assert!(error.contains("stash was kept unchanged"), "{error}");
+        assert_eq!(fs::read_to_string(root.join("folder/file.txt")).unwrap(), "saved tracked edit\n");
+        assert_eq!(run_git_capture(&root, &["rev-parse", "refs/stash"]), stash);
+        assert!(status_cache_epoch(&path) > epoch);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn partial_stash_apply_error_preserves_backup_and_invalidates_status() {
+        let (root, path, _, _) = individual_restore_fixture("stash-apply-failure");
+        fs::write(root.join("folder/file.txt"), "saved edit\n").unwrap();
+        fs::write(root.join("untracked.txt"), "saved untracked\n").unwrap();
+        stash_changes(path.clone()).unwrap();
+        let stash = run_git_capture(&root, &["rev-parse", "refs/stash"]);
+        let blob = run_git_capture(&root, &["rev-parse", "stash@{0}^3:untracked.txt"]);
+        fs::remove_file(root.join(".git/objects").join(&blob[..2]).join(&blob[2..])).unwrap();
+        let epoch = status_cache_epoch(&path);
+        let error = pop_stash(path.clone(), 0).unwrap_err();
+        assert!(error.to_lowercase().contains("stash was kept"), "{error}");
+        assert_eq!(run_git_capture(&root, &["rev-parse", "refs/stash"]), stash);
+        assert!(status_cache_epoch(&path) > epoch);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn path_history_worker_preserves_results_errors_and_local_state() {
+        let (root, path, _, _) = individual_restore_fixture("history-worker");
+        fs::write(root.join("folder/file.txt"), "staged edit\n").unwrap();
+        run_git(&root, &["add", "folder/file.txt"]);
+        fs::write(root.join("folder/file.txt"), "unstaged edit\n").unwrap();
+        fs::write(root.join("untracked.txt"), "local only\n").unwrap();
+        let index_before = fs::read(root.join(".git/index")).unwrap();
+        let head_before = fs::read(root.join(".git/HEAD")).unwrap();
+        let refs_before = run_git_capture(&root, &["show-ref"]);
+        for relative in ["", "folder", "folder/file.txt", "missing.txt"] {
+            let expected = path_history_page_inner(path.clone(), relative.into(), None, 0).unwrap().commits;
+            let actual = tauri::async_runtime::block_on(path_history(path.clone(), relative.into())).unwrap();
+            assert_eq!(serde_json::to_value(actual).unwrap(), serde_json::to_value(expected).unwrap());
+        }
+        let expected_error = path_history_page_inner(path.clone(), "../outside".into(), None, 0).err().unwrap();
+        let actual_error = tauri::async_runtime::block_on(path_history(path.clone(), "../outside".into())).err().unwrap();
+        assert_eq!(actual_error, expected_error);
+        let missing = root.join("not-a-repository").to_string_lossy().into_owned();
+        assert_eq!(
+            tauri::async_runtime::block_on(path_history(missing.clone(), "".into())).err(),
+            path_history_page_inner(missing, "".into(), None, 0).err()
+        );
+        assert_eq!(fs::read(root.join(".git/index")).unwrap(), index_before);
+        assert_eq!(fs::read(root.join(".git/HEAD")).unwrap(), head_before);
+        assert_eq!(run_git_capture(&root, &["show-ref"]), refs_before);
+        assert_eq!(fs::read_to_string(root.join("folder/file.txt")).unwrap(), "unstaged edit\n");
+        assert_eq!(fs::read_to_string(root.join("untracked.txt")).unwrap(), "local only\n");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn restore_path_history_pages_find_old_files_and_keep_the_original_head_boundary() {
+        let (root, path, old, file_head) = individual_restore_fixture("history-pages");
+        {
+            let repo = Repository::open(&root).unwrap();
+            let signature = git2::Signature::now("Test User", "test@example.com").unwrap();
+            let tree = repo.head().unwrap().peel_to_tree().unwrap();
+            // Real, cheap commit objects, without per-commit Git subprocesses.
+            for i in 0..501 {
+                let parent = repo.head().unwrap().peel_to_commit().unwrap();
+                repo.commit(Some("HEAD"), &signature, &signature, &format!("unrelated checkpoint {i}"), &tree, &[&parent]).unwrap();
+            }
+        }
+        let page = path_history_page_inner(path.clone(), "folder/file.txt".into(), None, 0).unwrap();
+        assert!(page.commits.is_empty());
+        assert!(page.has_more);
+        assert_eq!(page.next_offset, 500);
+        let pinned_head = page.head_id;
+        run_git(&root, &["commit", "--allow-empty", "-m", "new commit between pages"]);
+        let current_head = run_git_capture(&root, &["rev-parse", "HEAD"]);
+        let refs_before = run_git_capture(&root, &["show-ref"]);
+        for scope in ["folder/file.txt", "folder"] {
+            let older = path_history_page_inner(path.clone(), scope.into(), Some(pinned_head.clone()), 500).unwrap();
+            assert_eq!(older.head_id, pinned_head);
+            assert!(!older.has_more);
+            assert_eq!(older.next_offset, 504);
+            assert_eq!(older.commits.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(), vec![file_head.as_str(), old.as_str()]);
+            let repeated = path_history_page_inner(path.clone(), scope.into(), Some(pinned_head.clone()), 500).unwrap();
+            assert_eq!(repeated.commits[0].id, older.commits[0].id);
+        }
+        let refreshed = path_history_page_inner(path.clone(), "folder/file.txt".into(), None, 0).unwrap();
+        assert_eq!(refreshed.head_id, current_head);
+        assert_eq!(run_git_capture(&root, &["show-ref"]), refs_before);
+        assert_eq!(run_git_capture(&root, &["rev-parse", "HEAD"]), current_head);
+        assert!(path_history_page_inner(path, "folder".into(), Some("invalid".into()), 500).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn individual_file_restore_reuses_preview_and_preserves_siblings_index_refs_and_history() {
         let (root, path, old, head) = individual_restore_fixture("roundtrip");
         let refs_before = run_git_capture(&root, &["show-ref"]);
         let branch = run_git_capture(&root, &["symbolic-ref", "HEAD"]);
-        let history = || path_history(path.clone(), "folder/file.txt".into()).unwrap().into_iter().map(|c| c.id).collect::<Vec<_>>();
+        let history = || tauri::async_runtime::block_on(path_history(path.clone(), "folder/file.txt".into())).unwrap().into_iter().map(|c| c.id).collect::<Vec<_>>();
         let original_history = history();
         fs::write(root.join("folder/file.txt"), "staged target\n").unwrap();
         fs::write(root.join("folder/sibling.txt"), "staged sibling\n").unwrap();
@@ -9720,7 +10068,7 @@ mod tests {
         run_git(&root, &["rm", "folder/renamed.txt"]);
         run_git(&root, &["commit", "-m", "Delete file"]);
         let head = run_git_capture(&root, &["rev-parse", "HEAD"]);
-        let history = path_history(path.clone(), "folder/renamed.txt".into()).unwrap();
+        let history = tauri::async_runtime::block_on(path_history(path.clone(), "folder/renamed.txt".into())).unwrap();
         assert!(history.iter().any(|commit| commit.id == renamed));
         path_restore_inner(path.clone(), "folder/renamed.txt".into(), renamed, Vec::new(), true).unwrap();
         assert_eq!(fs::read_to_string(root.join("folder/renamed.txt")).unwrap(), "local to preserve\n");
@@ -10037,7 +10385,7 @@ mod tests {
         assert!(!head_files.lines().any(|path| path == "unrelated.txt"));
         let still_staged = git(repository.to_str().unwrap(), &["diff", "--cached", "--name-only"]).unwrap();
         assert!(still_staged.lines().any(|path| path == "unrelated.txt"));
-        assert!(!path_history(repository.to_string_lossy().into_owned(), "src/main.c".into()).unwrap().is_empty());
+        assert!(!tauri::async_runtime::block_on(path_history(repository.to_string_lossy().into_owned(), "src/main.c".into())).unwrap().is_empty());
         let commander = compare_remote_directory(repository.to_string_lossy().into_owned(), "".into(), "HEAD~1".into()).unwrap();
         assert!(commander.rows.iter().any(|row| row.relative_path == "src" && row.status == "modified"));
         assert!(commander.rows.iter().any(|row| row.relative_path == "unrelated.txt" && row.status == "local-only"));
@@ -14758,7 +15106,7 @@ mod tests {
         run_git(&repository, &["commit", "-am", "a.txt changes again"]); // included
 
         let path = repository.to_string_lossy().into_owned();
-        let history = path_history(path, "a.txt".into()).unwrap();
+        let history = tauri::async_runtime::block_on(path_history(path, "a.txt".into())).unwrap();
         assert_eq!(history.len(), 2, "only the two commits that touched a.txt should be listed: {:?}", history.iter().map(|c| &c.subject).collect::<Vec<_>>());
         assert_eq!(history[0].subject, "a.txt changes again");
         assert_eq!(history[1].subject, "root touches a.txt");
@@ -18407,7 +18755,7 @@ mod tests {
         commit_selected_internal(&parent_string, &[normalized(Path::new(&added))], &format!("Update submodule {added} to a new version")).unwrap();
 
         let submodule_history = submodule_repository_inner(parent_string.clone(), added.clone()).unwrap();
-        let reference_changes = path_history(parent_string, added.clone()).unwrap();
+        let reference_changes = tauri::async_runtime::block_on(path_history(parent_string, added.clone())).unwrap();
 
         assert!(submodule_history.commits.iter().any(|c| c.subject == "Submodule's own second commit"), "the submodule's own commit must be in its own history");
         assert!(!submodule_history.commits.iter().any(|c| c.subject.starts_with("Update submodule")), "a parent gitlink-update commit must never appear in the submodule's own history");

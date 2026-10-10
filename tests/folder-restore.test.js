@@ -35,6 +35,7 @@ function harness() {
 
 const preview = (source, paths = []) => ({ source_revision: source, source_id: source === 'HEAD' ? 'C1' : source,
   source_subject: 'snapshot', tracked_changes: paths.map(path => ({ status: 'M', path })), clean_candidates: [] });
+const historyPage = (commits, hasMore = false, offset = commits.length, head = 'C1') => ({ commits, has_more: hasMore, next_offset: offset, head_id: head });
 
 test('folder restore preview ignores a result for the previous source', async () => {
   const h = harness();
@@ -56,8 +57,8 @@ test('tracked files reuse the folder dialog with file history and no clean opera
   assert.equal(h.refs.folderRestoreClean.checked, false);
   assert.equal(h.refs.folderRestoreClean.closest('label').hidden, true);
   const history = h.context.loadFolderRestoreCommits();
-  assert.deepEqual({ ...h.calls[0].args }, { repositoryPath: 'repo', relativePath: 'folder/a.txt' });
-  h.calls[0].resolve([{ id: 'C1', subject: 'new file version' }, { id: 'C2', subject: 'older' }]);
+  assert.deepEqual({ ...h.calls[0].args }, { repositoryPath: 'repo', relativePath: 'folder/a.txt', headId: null, offset: 0 });
+  h.calls[0].resolve(historyPage([{ id: 'C1', subject: 'new file version' }, { id: 'C2', subject: 'older' }]));
   await history;
   const pending = h.context.previewFolderRestore();
   assert.equal(h.calls[1].command, 'preview_folder_restore');
@@ -176,10 +177,78 @@ test('folder restore history reloads from the repository and path, never the res
   for (let i = 0; i < 2; i++) {
     h.state.folderRestore.selectedCommit = 'C2';
     const pending = h.context.loadFolderRestoreCommits();
-    assert.equal(h.calls[i].command, 'path_history');
-    assert.deepEqual({ ...h.calls[i].args }, { repositoryPath: 'repo', relativePath: 'folder' });
-    h.calls[i].resolve([{ id: 'C1', subject: 'new' }, { id: 'C2', subject: 'old' }]);
+    assert.equal(h.calls[i].command, 'restore_path_history');
+    assert.deepEqual({ ...h.calls[i].args }, { repositoryPath: 'repo', relativePath: 'folder', headId: null, offset: 0 });
+    h.calls[i].resolve(historyPage([{ id: 'C1', subject: 'new' }, { id: 'C2', subject: 'old' }]));
     await pending;
-    assert.deepEqual(h.state.folderRestore.commits.map(commit => commit.id), ['C1', 'C2']);
+    assert.deepEqual(Array.from(h.state.folderRestore.commits, commit => commit.id), ['C1', 'C2']);
   }
+});
+
+test('restore history pages are explicit, pin HEAD and preserve selection when appending', async () => {
+  const h = harness();
+  const first = h.context.loadFolderRestoreCommits();
+  h.calls[0].resolve(historyPage([], true, 500));
+  await first;
+  assert.equal(h.calls.length, 1, 'no automatic older-history scan');
+  assert.match(h.refs.folderRestoreCommitList.innerHTML, /No matching commits in the loaded portion/);
+  assert.equal(h.refs.loadOlderFolderRestoreCommits.hidden, false);
+  const older = h.context.loadFolderRestoreCommits(true);
+  assert.deepEqual({ ...h.calls[1].args }, { repositoryPath: 'repo', relativePath: 'folder', headId: 'C1', offset: 500 });
+  h.calls[1].resolve(historyPage([{ id: 'OLD', subject: 'older file' }], true, 1000));
+  await older;
+  assert.equal(h.state.folderRestore.selectedCommit, 'OLD');
+  const oldest = h.context.loadFolderRestoreCommits(true);
+  h.calls[2].resolve(historyPage([{ id: 'ROOT', subject: 'created' }], false, 1001));
+  await oldest;
+  assert.deepEqual(Array.from(h.state.folderRestore.commits, c => c.id), ['OLD', 'ROOT']);
+  assert.equal(h.state.folderRestore.selectedCommit, 'OLD');
+  assert.equal(h.refs.loadOlderFolderRestoreCommits.hidden, true);
+  assert.match(h.refs.folderRestoreHistoryStatus.textContent, /End of history/);
+});
+
+test('restore history errors preserve loaded pages and support retry without skipping a page', async () => {
+  const h = harness();
+  const first = h.context.loadFolderRestoreCommits();
+  h.calls[0].resolve(historyPage([{ id: 'C1', subject: 'latest' }], true, 500)); await first;
+  const older = h.context.loadFolderRestoreCommits(true);
+  assert.equal(h.refs.loadOlderFolderRestoreCommits.disabled, true);
+  await h.context.loadFolderRestoreCommits(true);
+  assert.equal(h.calls.length, 2, 'no concurrent duplicate request');
+  h.calls[1].reject(new Error('read failed')); await older;
+  assert.equal(h.state.folderRestore.commits[0].id, 'C1');
+  assert.equal(h.state.folderRestore.historyOffset, 500);
+  assert.match(h.refs.folderRestoreHistoryStatus.textContent, /Retry with Load older/);
+  const retry = h.context.loadFolderRestoreCommits(true);
+  assert.equal(h.calls[2].args.offset, 500);
+  h.calls[2].resolve(historyPage([], false, 600)); await retry;
+});
+
+test('restore history from a closed dialog or another repository cannot replace the current list', async () => {
+  for (const switchRepository of [false, true]) {
+    const h = harness();
+    const pending = h.context.loadFolderRestoreCommits();
+    if (switchRepository) h.state.repository.path = 'another-repo';
+    else { h.refs.folderRestoreDialog.listeners.cancel(); h.context.openFolderRestoreDialog({ kind: 'folder', name: 'other', relative_path: 'other' }); }
+    h.calls[0].resolve(historyPage([{ id: 'STALE', subject: 'old response' }])); await pending;
+    assert.equal(h.state.folderRestore.commits.length, 0);
+  }
+});
+
+test('restore commit rows keep full long messages, separate metadata and accessible selection', () => {
+  const h = harness();
+  const message = 'A long commit subject — '.repeat(40);
+  h.state.folderRestore.commits = [{ id: '1234567890abcdef', subject: message, author: 'Long author', date: '2026-10-09' }];
+  h.state.folderRestore.selectedCommit = '1234567890abcdef';
+  h.context.renderFolderRestoreCommits();
+  const html = h.refs.folderRestoreCommitList.innerHTML;
+  assert.ok(html.includes(message));
+  assert.match(html, /aria-pressed="true"/);
+  assert.match(html, /<code title="1234567890abcdef">12345678<\/code>/);
+  assert.match(html, /<time>2026-10-09<\/time>/);
+  const css = fs.readFileSync(path.join(__dirname, '../frontend/styles.css'), 'utf8');
+  const subjectStyle = css.match(/\.folder-restore-commit strong \{([^}]+)\}/)[1];
+  assert.match(subjectStyle, /white-space: normal/);
+  assert.match(subjectStyle, /overflow-wrap: anywhere/);
+  assert.doesNotMatch(subjectStyle, /ellipsis|nowrap/);
 });

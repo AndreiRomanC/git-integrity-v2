@@ -391,19 +391,25 @@ pub fn merge_branch(repository_path: String, target_path: String, source_ref: St
     if analysis.is_fast_forward() {
         let target = annotated.id();
         let mut local = repo.find_reference(&format!("refs/heads/{current_branch}")).map_err(|error| error.message().to_string())?;
-        local.set_target(target, "fast-forward merge").map_err(|error| error.message().to_string())?;
-        repo.set_head(&format!("refs/heads/{current_branch}")).map_err(|error| error.message().to_string())?;
+        let target_commit = repo.find_commit(target).map_err(|error| error.message().to_string())?;
         let mut checkout = git2::build::CheckoutBuilder::new();
-        checkout.force();
-        repo.checkout_head(Some(&mut checkout)).map_err(|error| error.message().to_string())?;
+        checkout.safe();
+        // Do not advance the branch before files/index have been checked out.
+        // On an I/O failure the original ref remains recoverable; never hide
+        // partially changed files behind an unchanged cached status.
+        let checkout_result = repo.checkout_tree(target_commit.as_object(), Some(&mut checkout));
+        invalidate_git_metadata(&repository_path);
+        checkout_result.map_err(|error| format!("Fast-forward checkout failed; the branch was not advanced. Files may have changed; review the working tree before retrying. {}", error.message()))?;
+        local.set_target(target, "fast-forward merge").map_err(|error| format!("Files were checked out, but the branch could not be advanced. Review the working tree before retrying. {}", error.message()))?;
         invalidate_git_metadata(&repository_path);
         return Ok(MergeOutcome { status: "fast_forwarded".into(), message: format!("Fast-forwarded {current_branch} to {source_ref}."), conflicts: vec![] });
     }
 
     let mut checkout = git2::build::CheckoutBuilder::new();
     checkout.allow_conflicts(true).conflict_style_merge(true).force();
-    repo.merge(&[&annotated], None, Some(&mut checkout)).map_err(|error| error.message().to_string())?;
+    let merge_result = repo.merge(&[&annotated], None, Some(&mut checkout));
     invalidate_git_metadata(&repository_path);
+    merge_result.map_err(|error| format!("Merge did not complete. Files or merge state may have changed; review conflicts and the working tree before retrying. {}", error.message()))?;
     drop(annotated);
     drop(reference);
 
@@ -552,6 +558,8 @@ fn open_merge_tool_inner(repository_path: String, target_path: String, relative_
         .current_dir(&repository_path)
         .output()
         .map_err(|error| format!("Could not start git mergetool: {error}"))?;
+    // A tool can save a resolution and still exit unsuccessfully.
+    invalidate_git_metadata(&repository_path);
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -560,7 +568,6 @@ fn open_merge_tool_inner(repository_path: String, target_path: String, relative_
             "Git mergetool failed. Configure one with `git config merge.tool <tool>` or check `git mergetool --tool-help`.".into()
         } else { detail });
     }
-    invalidate_git_metadata(&repository_path);
     Ok(configured_tool.map(|tool| format!("Merge tool \"{tool}\" finished for {relative}."))
         .unwrap_or_else(|| format!("Git mergetool finished for {relative}.")))
 }
@@ -576,6 +583,7 @@ pub fn resolve_conflict(repository_path: String, target_path: String, relative_p
     log_repo_write_lock_acquired(&repository_path, "resolve_conflict", queue_started.elapsed());
     let repo = internal_repository(&repository_path)?;
     let absolute = Path::new(&repository_path).join(&relative);
+    let resolved = (|| -> Result<(), String> {
     match resolution.as_str() {
         "ours" | "theirs" => {
             let target = normalized(&relative);
@@ -609,11 +617,11 @@ pub fn resolve_conflict(repository_path: String, target_path: String, relative_p
                     let submodule_path = Path::new(&repository_path).join(&relative);
                     if internal_submodule_repository(&submodule_path).is_ok() {
                         let submodule_path_string = submodule_path.to_string_lossy().into_owned();
-                        git(&submodule_path_string, &["checkout", "--detach", &oid.to_string()])?;
+                        let checked_out = git(&submodule_path_string, &["checkout", "--detach", &oid.to_string()]);
                         invalidate_git_metadata(&submodule_path_string);
+                        checked_out?;
                     }
                 }
-                invalidate_git_metadata(&repository_path);
                 return Ok(());
             }
             let content = content.ok_or_else(|| format!("No {resolution} version exists for {relative_path} (it may have been added only on one side — deleting or keeping the existing file may be more appropriate)."))?;
@@ -631,8 +639,10 @@ pub fn resolve_conflict(repository_path: String, target_path: String, relative_p
     let mut index = repo.index().map_err(|error| error.message().to_string())?;
     index.add_path(&relative).map_err(|error| error.message().to_string())?;
     index.write().map_err(|error| error.message().to_string())?;
-    invalidate_git_metadata(&repository_path);
     Ok(())
+    })();
+    invalidate_git_metadata(&repository_path);
+    resolved
 }
 
 fn complete_merge_internal(repo: &mut Repository, repository_path: &str, message: &str) -> Result<String, String> {
@@ -645,12 +655,25 @@ fn complete_merge_internal(repo: &mut Repository, repository_path: &str, message
     if let Some(commit) = head_commit.as_ref() { parents.push(commit.clone()); }
     for oid in &merge_heads { if let Ok(commit) = repo.find_commit(*oid) { parents.push(commit); } }
     let tree_id = index.write_tree_to(repo).map_err(|error| error.message().to_string())?;
+    // A previous attempt may have committed successfully but failed while
+    // removing MERGE_HEAD/MERGE_MSG. Retry cleanup, not another merge commit.
+    if let Some(head) = head_commit.as_ref() {
+        if !merge_heads.is_empty() && head.parent_count() > 1 && head.tree_id() == tree_id &&
+            merge_heads.iter().all(|oid| head.parent_ids().skip(1).any(|parent| parent == *oid)) {
+            let oid = head.id();
+            let cleaned = repo.cleanup_state();
+            invalidate_git_metadata(repository_path);
+            cleaned.map_err(|error| format!("Merge commit {oid} already exists, but Git could not clear the merge state. No new commit was created. {}", error.message()))?;
+            return Ok(oid.to_string());
+        }
+    }
     let tree = repo.find_tree(tree_id).map_err(|error| error.message().to_string())?;
     let signature = repo.signature().map_err(|_| "Configure user.name and user.email for this repository".to_string())?;
     let parent_refs: Vec<&git2::Commit<'_>> = parents.iter().collect();
     let oid = repo.commit(Some("HEAD"), &signature, &signature, message, &tree, &parent_refs).map_err(|error| error.message().to_string())?;
-    repo.cleanup_state().map_err(|error| error.message().to_string())?;
+    let cleaned = repo.cleanup_state();
     invalidate_git_metadata(repository_path);
+    cleaned.map_err(|error| format!("Merge commit {oid} was created, but Git could not clear the merge state. Do not create another merge commit; inspect the repository state. {}", error.message()))?;
     Ok(oid.to_string())
 }
 
@@ -685,8 +708,11 @@ pub fn abort_merge(repository_path: String, target_path: String) -> Result<(), S
     let head_commit = repo.head().map_err(|error| error.message().to_string())?.peel_to_commit().map_err(|error| error.message().to_string())?;
     let mut checkout = git2::build::CheckoutBuilder::new();
     checkout.force();
-    repo.reset(head_commit.as_object(), git2::ResetType::Hard, Some(&mut checkout)).map_err(|error| error.message().to_string())?;
-    repo.cleanup_state().map_err(|error| error.message().to_string())?;
+    let reset = repo.reset(head_commit.as_object(), git2::ResetType::Hard, Some(&mut checkout));
     invalidate_git_metadata(&repository_path);
+    reset.map_err(|error| format!("Abort did not complete; files may have changed. Review the working tree and merge state. {}", error.message()))?;
+    let cleaned = repo.cleanup_state();
+    invalidate_git_metadata(&repository_path);
+    cleaned.map_err(|error| format!("Files were reset, but merge state cleanup failed: {}", error.message()))?;
     Ok(())
 }
