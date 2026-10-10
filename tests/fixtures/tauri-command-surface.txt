@@ -3,10 +3,12 @@ abort_stash_conflict
 add_submodule
 apply_submodule_merge_revision
 branch_creation_context
+branch_story_creation
 build_info
 change_submodule_url
 checkout_commit
 combine_local_commits
+comparison_authors
 checkout_remote_tracking_branch
 choose_folder
 clone_repository
@@ -135,3 +137,6 @@ trash_local_item
 unstage_files
 write_local_text_file
 write_text_file
+polarion_connect
+polarion_search
+polarion_project_context

@@ -1522,6 +1522,31 @@ function flatCompareRowHtml(row, datasetName) {
   </button>`;
 }
 
+const comparisonAuthorCache = createComparisonAuthorCache((command, args) => invoke(command, args));
+function renderComparisonAuthorFilter(container, context) {
+  container.classList.toggle('has-author-filter', Boolean(context));
+  let element = container.querySelector('.comparison-author-filter');
+  if (!element) { element = document.createElement('div'); element.className = 'comparison-author-filter'; container.append(element); }
+  element.hidden = !context;
+  if (!context) return null;
+  const model = comparisonAuthorCache.get(context);
+  element.innerHTML = model.authors
+    ? `<label>Files touched by author <select data-author-select><option value="">All authors — clear filter</option>${model.authors.map(author => `<option value="${esc(author.key)}" ${model.selected === author.key ? 'selected' : ''}>${esc(author.name)}${author.email ? ` &lt;${esc(author.email)}&gt;` : ' (no email)'} · ${author.paths.length} files</option>`).join('')}</select></label><small>Shows files touched by the selected author. The displayed differences may also include changes made by others.</small><details><summary>History scope and limitations</summary><p>Commits reachable from either revision but not both. Merge authors include files differing from any parent, including imported changes and conflict resolutions; this is not line ownership. Renames use the existing added/deleted paths; earlier touches are not followed across later renames. Author emails are used as recorded, without mailmap, co-author or cherry-pick attribution. Submodule contents are analyzed only when comparing that submodule directly.</p></details>`
+    : `<button type="button" data-load-authors ${model.pending ? 'disabled' : ''}>${model.pending ? 'Loading authors…' : 'Files touched by author…'}</button>${model.error ? `<small role="alert">${esc(model.error)} Complete comparison remains visible; retry to load authors.</small>` : ''}`;
+  element.querySelector('[data-author-select]')?.addEventListener('change', event => {
+    comparisonAuthorCache.select(model, event.target.value);
+    renderCommander();
+  });
+  element.querySelector('[data-load-authors]')?.addEventListener('click', async () => {
+    const request = comparisonAuthorCache.load(model);
+    renderCommander();
+    await request;
+    // Render the CURRENT context, never install old rows/selections on completion.
+    if (state.view === 'commander') renderCommander();
+  });
+  return model;
+}
+
 function renderCommander() {
   if (!state.repository) return;
   const localDrive = state.compareMode === 'local-drive';
@@ -1561,10 +1586,13 @@ function renderCommander() {
   refs.gitCompareLeftLabel.textContent = branchCompareMode ? 'START REF' : 'LOCAL WORKSPACE';
   refs.gitCompareRightLabel.textContent = branchCompareMode ? 'COMPARE WITH' : 'REMOTE BRANCH';
   if (branchCompareMode) renderBranchCompareSelectors();
+  const authorModel = renderComparisonAuthorFilter(refs.gitCompareFlatControls,
+    branchCompareMode && state.compareFlatMode && state.branchCompareLeftRevision && state.branchCompareRightRevision
+      ? { repositoryPath: state.repository.path, leftRevision: state.branchCompareLeftRevision, rightRevision: state.branchCompareRightRevision } : null);
   const remoteBranches = state.branches.filter(branch => branch.remote);
   refs.remoteRef.innerHTML = remoteBranches.map(branch => `<option value="${esc(branch.name)}" ${branch.name === state.remoteRef ? 'selected' : ''}>${esc(branch.name)}</option>`).join('') || '<option value="">No remote refs</option>';
   const flatMode = state.compareFlatMode;
-  const query = refs.search.value.trim().toLowerCase(); const rows = state.commanderRows.filter(row => compareRowVisible(row, query, flatMode ? state.compareFlatFilter : 'all'));
+  const query = refs.search.value.trim().toLowerCase(); const rows = state.commanderRows.filter(row => compareRowVisible(row, query, flatMode ? state.compareFlatFilter : 'all') && comparisonAuthorMatches(row, authorModel));
   const upRow = state.commanderPath && !flatMode ? `<button class="commander-row commander-grid up-row" data-commander-up="1">
     <span class="commander-side local">${iconFor({kind:'folder'})}<span class="commander-file-copy"><strong>..</strong><small>Parent folder</small></span></span><span class="compare-state"><i></i></span><span class="commander-side remote">${iconFor({kind:'folder'})}<span class="commander-file-copy"><strong>..</strong><small>Parent folder</small></span></span>
   </button>` : '';
@@ -1685,7 +1713,10 @@ function renderSubmoduleCompare() {
     refs.subCompareFlatFilter.value = state.subCompareFlatFilter;
   }
   const rowsSource = compare?.rows || [];
-  const query = refs.search.value.trim().toLowerCase(); const rows = rowsSource.filter(row => compareRowVisible(row, query, state.subCompareFlatMode ? state.subCompareFlatFilter : 'all'));
+  const authorModel = renderComparisonAuthorFilter(refs.subCompareFlatControls,
+    state.subCompareFlatMode && compare?.leftRevision && compare?.rightRevision
+      ? { repositoryPath: state.repository.path, ...(compare.externalOwner ? { owner: compare.externalOwner, repositoryName: compare.externalRepositoryName } : { submodulePath: compare.submodulePath }), leftRevision: compare.leftRevision, rightRevision: compare.rightRevision } : null);
+  const query = refs.search.value.trim().toLowerCase(); const rows = rowsSource.filter(row => compareRowVisible(row, query, state.subCompareFlatMode ? state.subCompareFlatFilter : 'all') && comparisonAuthorMatches(row, authorModel));
   const upRow = state.commanderPath && !state.subCompareFlatMode ? `<button class="commander-row commander-grid up-row" data-commander-up="1">
     <span class="commander-side local">${iconFor({kind:'folder'})}<span class="commander-file-copy"><strong>..</strong><small>Parent folder</small></span></span><span class="compare-state"><i></i></span><span class="commander-side remote">${iconFor({kind:'folder'})}<span class="commander-file-copy"><strong>..</strong><small>Parent folder</small></span></span>
   </button>` : '';
@@ -5213,6 +5244,27 @@ function setActiveGraphPrimaryBranch(name) { if (state.submoduleGraph) state.sub
 // Branch Map-only presentation state. Separate choices preserve the original
 // Full Graph primary/filter settings; new repository contexts default to Full.
 const branchStoryViews = new WeakMap();
+// One small reflog lookup per selected branch/tip and loaded graph generation.
+// No history walk, status scan, ref mutation or fallback to current merge-base.
+function ensureStoryCreation(g, view, kind, branch, tip) {
+  if (!invoke || kind !== 'branch' || !tip) { view.creation = null; return null; }
+  const key = `${g.path}::${branch}::${tip}`;
+  if (view.creation?.key === key && view.creation.commits === g.commits) return view.creation.id;
+  const entry = { key, commits: g.commits, id: null, pending: true };
+  view.creation = entry;
+  invoke('branch_story_creation', { repositoryPath: g.path, branch, tip }).then(id => {
+    entry.id = id;
+  }).catch(error => { entry.error = String(error); }).finally(() => {
+    entry.pending = false;
+    if (state.view === 'graph' && activeBranchStoryView() === view && view.creation === entry && view.mode === 'story') {
+      const selected = state.selectedCommit?.id;
+      renderGraph();
+      // Metadata completion must not clear the user's existing inspection.
+      if (selected) graphCommitRow(selected)?.classList.add('selected');
+    }
+  });
+  return null;
+}
 function activeBranchStoryView() {
   if (state.historyScope || state.historyKind) return null;
   const context = state.submoduleGraph || state.repository;
@@ -5417,6 +5469,7 @@ function buildCommitRowHtml(commit, index, ctx) {
   const structuralBadges = [
     headLocationPill,
     ctx.story?.tipId === commit.id ? '<b class="head-location-pill" data-tooltip="Tip of the branch or revision selected for Branch Story, not necessarily the checked-out HEAD">Story tip</b>' : '',
+    ctx.story?.start?.id === commit.id ? `<b class="branch-point-pill" data-tooltip="${esc(ctx.story.start.reason)}">Branch Start</b>` : '',
     ctx.story?.baseId === commit.id ? `<b class="branch-point-pill" data-tooltip="Unique common ancestor with ${esc(ctx.story.baseRef)} proven by loaded commit parents. This is not necessarily the original branch creation point.">Shared base</b>` : '',
     ctx.story?.incoming.has(commit.id) ? `<b class="branch-point-pill" data-tooltip="Real incoming merge parent${ctx.story.incoming.get(commit.id).refs.length ? ' with current branch references shown below' : ' without a current branch reference; its historical name is unknown'}.${ctx.story.incoming.get(commit.id).onBaseHistory ? ` Also reachable from current ${esc(ctx.story.incoming.get(commit.id).onBaseHistory)}; this is ancestry, not an original branch name.` : ''}">${ctx.story.incoming.get(commit.id).refs.length ? 'Incoming path' : 'Historical Path'}</b>` : '',
     isCommonAncestorWithMain ? `<b class="branch-point-pill common-main-pill" data-tooltip="Real merge-base between HEAD and ${esc(commonAncestorBaseRef)} — current shared ancestor, not necessarily the original branch start">Shared base</b>` : '',
@@ -5974,6 +6027,7 @@ function renderGraph() {
   const hasRefNamed = (commit, name) => (commit.refs || []).some(r => (r.kind === 'local_branch' || r.kind === 'remote_branch') && r.name === name);
   const primaryTip = primaryKind === 'detached' ? commits.find(c => c.id === g.headOid) : primaryName ? commits.find(c => hasRefNamed(c, primaryName)) : null;
   const story = storyMode ? buildBranchStory(allGraphCommits, primaryTip?.id) : null;
+  if (story) story.start = branchStoryStart(allGraphCommits, story, ensureStoryCreation(g, storyView, primaryKind, primaryName, primaryTip?.id));
   if (story) commits = story.commits;
   const model = buildGraphModel(commits, primaryTip?.id);
   if (onlySearchMatches) model.forEach(node => { node.lane = 0; node.before = []; node.after = []; node.parents = []; });
@@ -6025,7 +6079,7 @@ function renderGraph() {
     ${query && !storyMode ? `<span class="search-match-count">${onlySearchMatches ? `showing ${matchCount} match${matchCount === 1 ? '' : 'es'} only` : `${matchCount} match${matchCount === 1 ? '' : 'es'} — rest shown as context`}</span><button type="button" class="graph-search-toggle ${onlySearchMatches ? 'active' : ''}" data-graph-only-matches title="${onlySearchMatches ? 'Show full graph context again' : 'Show only matching commits without graph links'}">${onlySearchMatches ? 'Show context' : 'Only matches'}</button>` : ''}
     <div class="ref-filter-group" role="group" aria-label="Filter by ref kind">${filterOptions.map(([value, label]) => `<button type="button" class="ref-filter-btn ${refFilter === value ? 'active' : ''}" data-ref-filter="${value}">${label}</button>`).join('')}</div>
     <button type="button" class="graph-current-jump" data-jump-head ${headVisible ? '' : 'disabled'} title="${headVisible ? 'Jump to current HEAD in this graph' : 'Current HEAD is not loaded in this graph'}">⌖</button>
-    ${storyMode ? '' : `<button type="button" class="graph-branch-start-jump ${branchStartLookupPending ? 'is-loading' : ''}" data-jump-branch-start title="${esc(branchStartTitle)}" aria-label="Go to shared base"><b>⑂</b><span>Go to shared base</span></button>`}
+    ${storyMode ? `<button type="button" class="graph-branch-start-jump" data-jump-story-start ${story.start.id ? '' : 'disabled'} title="${esc(story.start.reason)}">⑂ Go to Branch Start</button>` : `<button type="button" class="graph-branch-start-jump ${branchStartLookupPending ? 'is-loading' : ''}" data-jump-branch-start title="${esc(branchStartTitle)}" aria-label="Go to shared base"><b>⑂</b><span>Go to shared base</span></button>`}
     ${pickerOptions.length > 1 || storyMode ? `<label class="primary-branch-picker"><span>${storyMode ? 'Story branch' : 'Primary'}</span><select id="graphPrimaryBranch">${pickerOptions.map(opt => `<option value="${esc(opt.value)}" ${opt.value === selectedPickerValue ? 'selected' : ''}>${esc(opt.label)}</option>`).join('')}</select></label>` : ''}
     <span class="lane-header"><span>GRAPH</span><span>COMMIT</span></span>`;
   $('#graphPrimaryBranch')?.addEventListener('change', event => { if (storyMode) storyView.selection = event.target.value; else setActiveGraphPrimaryBranch(event.target.value); renderGraph(); });
@@ -6036,6 +6090,10 @@ function renderGraph() {
   }));
   refs.laneLegend.querySelectorAll('[data-jump-head]').forEach(button => button.addEventListener('click', jumpToGraphHead));
   refs.laneLegend.querySelectorAll('[data-jump-branch-start]').forEach(button => button.addEventListener('click', jumpToGraphBranchStart));
+  refs.laneLegend.querySelector('[data-jump-story-start]')?.addEventListener('click', () => {
+    const row = graphCommitRow(story.start.id);
+    if (row) { row.scrollIntoView({ block: 'center', behavior: 'smooth' }); selectCommit(story.start.id); }
+  });
   refs.laneLegend.querySelectorAll('[data-ref-filter]').forEach(button => button.addEventListener('click', () => { if (storyMode) storyView.refFilter = button.dataset.refFilter; else setActiveGraphRefFilter(button.dataset.refFilter); renderGraph(); }));
   refs.laneLegend.querySelectorAll('[data-graph-only-matches]').forEach(button => button.addEventListener('click', () => { state.graphOnlySearchMatches = !state.graphOnlySearchMatches; renderGraph(); }));
 
@@ -6111,7 +6169,8 @@ function renderGraph() {
   const domStarted = performance.now();
   jsPerfLog(`renderGraph rows build (${commits.length} rows)`, domStarted - rowsStarted);
   const storySummary = story ? `<div class="branch-story-summary"><strong>${esc(primaryName || 'Detached HEAD')}</strong><span>${story.tipId ? `${commits.length} loaded commits · first-parent development path and incoming merge ancestry` : 'Selected tip is not in loaded history. Use Load older or select another branch.'}</span><span>${story.baseId ? `Shared base with ${esc(story.baseRef)}: ${esc(story.baseId.slice(0, 8))}` : 'Divergence point not established from loaded history.'} Graph paths are not branch identities; current refs are shown on their exact commits.${story.incomplete ? ' Some parents are outside loaded history.' : ''}</span></div>` : '';
-  refs.graph.innerHTML = storySummary + `<svg class="graph-overlay"></svg>` + rows + truncationStub + GRAPH_LEGEND_HTML;
+  const startSummary = story ? `<div class="branch-story-summary"><span>${storyView.creation?.pending ? 'Checking local branch creation record…' : esc(storyView.creation?.error || story.start.reason)}</span></div>` : '';
+  refs.graph.innerHTML = storySummary + startSummary + `<svg class="graph-overlay"></svg>` + rows + truncationStub + GRAPH_LEGEND_HTML;
   jsPerfLog(`renderGraph DOM render (${commits.length} rows)`, performance.now() - domStarted);
   wireGraphRowInteractions(refs.graph.querySelectorAll('.commit-row[data-id]'));
   $('#loadOlderCommits')?.addEventListener('click', loadOlderGraphCommits);
@@ -7125,6 +7184,21 @@ function recordDefaultCommitMessage() {
   renderCommitMessageHistory();
 }
 renderCommitMessageHistory();
+
+const polarionTaskPicker = createPolarionTaskPicker({ invoke, addMessage(message) {
+  refs.defaultCommitMessage.value = message;
+  refs.defaultCommitMessage.dispatchEvent(new Event('input', { bubbles: true }));
+  recordDefaultCommitMessage();
+  showOperationToast('Polarion task added to saved commit messages. No commit was created.');
+} });
+document.querySelectorAll('[data-polarion-search]').forEach(button => button.addEventListener('click', () => {
+  const mode = button.dataset.polarionSearch;
+  const context = activeRepositoryContext();
+  const path = mode === 'drawer' ? (state.changesScope === 'folder' ? state.currentPath : '')
+    : mode === 'scope' ? selectedScope().path
+    : context.isSubmodule ? '' : (state.selectedEntry?.relative_path || state.currentPath);
+  polarionTaskPicker.open(mode === 'context' ? context.path : state.repository?.path, path);
+}));
 
 // Opening the drawer no longer auto-stages everything in it — it used to
 // (every open silently staged every unstaged change in scope), which meant

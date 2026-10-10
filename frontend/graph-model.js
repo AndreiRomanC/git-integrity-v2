@@ -209,6 +209,12 @@ function selectBranchRows(context) {
 // existing graph engine; it never rewrites parents, assigns lanes or creates
 // synthetic edges. Preserve the backend's topological/chronological order
 // (sorting by timestamps alone can put a parent ahead of its child).
+function branchStoryBase(commits) {
+  const baseRef = ['origin/main', 'origin/master', 'main', 'master'].find(name =>
+    commits.some(commit => (commit.refs || []).some(ref => ref.name === name && (ref.kind === 'local_branch' || ref.kind === 'remote_branch'))));
+  const baseTip = baseRef && commits.find(commit => (commit.refs || []).some(ref => ref.name === baseRef && (ref.kind === 'local_branch' || ref.kind === 'remote_branch')));
+  return { baseRef, baseTip };
+}
 function buildBranchStory(commits, tipId) {
   const byId = new Map(commits.map(commit => [commit.id, commit]));
   const tip = byId.get(tipId);
@@ -241,9 +247,7 @@ function buildBranchStory(commits, tipId) {
   // A unique best common ancestor can be proven from a complete loaded DAG.
   // With missing parents or multiple merge bases, leave it unknown rather
   // than claim a branch creation point. No extra Git query is made here.
-  const baseRef = ['origin/main', 'origin/master', 'main', 'master'].find(name =>
-    commits.some(commit => (commit.refs || []).some(ref => ref.name === name && (ref.kind === 'local_branch' || ref.kind === 'remote_branch'))));
-  const baseTip = baseRef && commits.find(commit => (commit.refs || []).some(ref => ref.name === baseRef && (ref.kind === 'local_branch' || ref.kind === 'remote_branch')));
+  const { baseRef, baseTip } = branchStoryBase(commits);
   if (baseTip && baseTip.id !== tipId) {
     const baseAncestors = reachableFrom(baseTip.id, commits);
     for (const [id, path] of result.incoming) {
@@ -262,10 +266,41 @@ function buildBranchStory(commits, tipId) {
   return result;
 }
 
+// Confirm a first-parent fork with independent branch-creation metadata.
+// Neither a modern merge-base nor a structural fork alone proves creation.
+// A tracking branch created locally at an existing feature tip is NOT its fork.
+function branchStoryStart(commits, story, creationId) {
+  if (!creationId) return { id: null, reason: 'Branch Start unavailable: original local creation record is missing (or this is a remote ref).' };
+  const byId = new Map(commits.map(commit => [commit.id, commit]));
+  const chain = tip => {
+    const ids = [];
+    const visited = new Set();
+    while (tip && !visited.has(tip)) {
+      visited.add(tip);
+      const commit = byId.get(tip);
+      if (!commit) return null;
+      ids.push(tip);
+      // Older ancestors remain in the graph but need not be loaded merely
+      // to verify the recorded fork above them.
+      if (tip === creationId) return ids;
+      tip = commit.parents?.[0];
+    }
+    return ids;
+  };
+  const development = chain(story.tipId);
+  const { baseRef, baseTip } = branchStoryBase(commits);
+  const baseChain = baseTip && chain(baseTip.id);
+  if (!development || !baseChain) return { id: null, reason: 'Branch Start not confirmed: load older history; the first-parent paths or base reference are missing.' };
+  const baseIds = new Set(baseChain);
+  const fork = development.find(id => baseIds.has(id));
+  if (fork !== creationId || fork === story.tipId) return { id: null, reason: 'Branch Start not confirmed: local creation and first-parent divergence do not establish the same original start.' };
+  return { id: fork, reason: `Branch Start confirmed by local creation record and first-parent divergence from ${baseRef}.`, baseRef };
+}
+
 // Node (the test runner only — see the file banner above) sees `module`;
 // the webview, loading this as a plain <script>, does not, so the two
 // functions above stay ordinary globals there, exactly as if this code was
 // still inline in app.js. No bundler, no import/export syntax, either way.
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { reachableFrom, buildGraphModel, selectRefBadges, selectBranchRows, buildBranchStory };
+  module.exports = { reachableFrom, buildGraphModel, selectRefBadges, selectBranchRows, buildBranchStory, branchStoryStart };
 }

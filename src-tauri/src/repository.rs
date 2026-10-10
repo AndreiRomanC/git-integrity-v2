@@ -4,6 +4,9 @@ use std::{collections::{HashMap, HashSet, VecDeque}, fs, path::{Component, Path,
 
 pub mod stash;
 pub mod branches;
+pub mod comparison_authors;
+pub mod branch_story;
+pub mod polarion;
 pub mod command_console;
 pub mod remotes;
 #[cfg(test)]

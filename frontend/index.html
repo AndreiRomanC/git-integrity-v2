@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Git DrillDown</title>
   <link rel="icon" type="image/png" href="assets/git-drilldown-mark.png">
-  <link rel="stylesheet" href="styles.css?v=20261009b-staging-queue-history-pages">
+  <link rel="stylesheet" href="styles.css?v=20261010-polarion-portal">
 </head>
 <body>
   <div class="app-shell">
@@ -27,6 +27,7 @@
       <div class="default-commit-bar" title="Pre-fills every commit message box below — still editable there before you commit">
         <input id="defaultCommitMessage" type="text" list="defaultCommitMessageHistory" placeholder="Default commit message (optional) — e.g. P:OMBMS-21610 - fix X" autocomplete="off">
         <datalist id="defaultCommitMessageHistory"></datalist>
+        <button type="button" data-polarion-search="context" class="polarion-search-button" title="Find a Polarion task and add it to saved commit messages">P⌕</button>
         <a id="defaultCommitPolarionLink" class="polarion-link subtle-polarion-link" href="#" target="_blank" rel="noreferrer" hidden title="Open this Polarion work item">P↗</a>
       </div>
       <div class="top-actions">
@@ -226,6 +227,7 @@
         <div id="changes" class="change-list"></div>
         <div class="commit-area">
           <textarea id="commitMessage" placeholder="Describe your changes…"></textarea>
+          <button type="button" data-polarion-search="drawer" class="polarion-search-button">P⌕ Find task</button>
           <div><span id="selectionText">0 files staged</span><button id="commitButton" disabled>Commit changes</button></div>
         </div>
       </div>
@@ -343,6 +345,7 @@
       <h2>Commit selected changes</h2>
       <p>Only changes inside <strong id="commitScopeName">the current folder</strong> will be staged for this scoped commit. Existing staged changes outside this scope stay staged, but are not included.</p>
       <label><span>Commit message</span><textarea id="scopeCommitMessage" placeholder="Describe this change…"></textarea></label>
+      <button type="button" data-polarion-search="scope" class="polarion-search-button">P⌕ Find task</button>
       <div class="commit-dialog-actions"><button value="cancel">Cancel</button><button value="default" id="confirmScopeCommit" class="confirm" disabled>Commit selection</button></div>
     </form>
   </dialog>
@@ -741,14 +744,34 @@
       <footer><button value="cancel">Cancel</button><button type="button" value="default" id="confirmNewTag" class="confirm">Create tag</button></footer>
     </form>
   </dialog>
-  <script src="console-context.js?v=20261009b-staging-queue-history-pages"></script>
-  <script src="graph-model.js?v=20261009b-staging-queue-history-pages"></script>
-  <script src="submodule-state.js?v=20261009b-staging-queue-history-pages"></script>
-  <script src="submodule-versions.js?v=20261009b-staging-queue-history-pages"></script>
-  <script src="local-diff.js?v=20261009b-staging-queue-history-pages"></script>
-  <script src="local-drive.js?v=20261009b-staging-queue-history-pages"></script>
-  <script src="pr-status.js?v=20261009b-staging-queue-history-pages"></script>
-  <script src="refresh-coordinator.js?v=20261009b-staging-queue-history-pages"></script>
-  <script src="app.js?v=20261009b-staging-queue-history-pages"></script>
+  <dialog id="polarionTaskDialog" class="polarion-task-dialog">
+    <form method="dialog">
+      <header><div><h2>Find Polarion task</h2><small id="polarionContext"></small></div><button value="cancel" aria-label="Close Polarion search">×</button></header>
+      <div class="polarion-task-body">
+        <div class="polarion-connect-row"><span>Sign in through the dedicated Polarion browser window.</span><button type="button" id="polarionConnect">Connect / Polarion ↗</button></div>
+        <label for="polarionProjectQuery">Project · search or change</label>
+        <div class="polarion-search-row"><input id="polarionProjectQuery" placeholder="Project name or ID…" autocomplete="off"><button type="button" id="polarionProjectSearchButton">Find projects</button></div>
+        <p id="polarionChosenProject" class="polarion-project-choice"></p>
+        <label for="polarionTaskQuery">Task · ID or title</label>
+        <div class="polarion-search-row"><input id="polarionTaskQuery" placeholder="Search tasks in the selected project…" autocomplete="off"><button type="button" id="polarionTaskSearchButton">Find tasks</button></div>
+        <div class="polarion-assignee"><label><input id="polarionAssigned" type="checkbox"> Assigned to me</label><input id="polarionUser" aria-label="My Polarion user ID" placeholder="My Polarion user ID (not Git author)" hidden autocomplete="off"></div>
+        <div id="polarionResults" class="polarion-results" aria-label="Polarion search results"></div>
+        <div class="polarion-pages"><button type="button" id="polarionPrevious" disabled>← Previous</button><button type="button" id="polarionNext" disabled>Next →</button></div>
+        <p id="polarionStatus" role="status" aria-live="polite"></p>
+      </div>
+      <footer><span>Adds a saved message only — no commit.</span><button value="cancel">Cancel</button><button type="button" id="polarionAdd" class="confirm" disabled>Add to Commit List</button></footer>
+    </form>
+  </dialog>
+  <script src="polarion.js?v=20261010-polarion-portal"></script>
+  <script src="console-context.js?v=20261010-polarion-portal"></script>
+  <script src="graph-model.js?v=20261010-polarion-portal"></script>
+  <script src="submodule-state.js?v=20261010-polarion-portal"></script>
+  <script src="submodule-versions.js?v=20261010-polarion-portal"></script>
+  <script src="local-diff.js?v=20261010-polarion-portal"></script>
+  <script src="local-drive.js?v=20261010-polarion-portal"></script>
+  <script src="pr-status.js?v=20261010-polarion-portal"></script>
+  <script src="refresh-coordinator.js?v=20261010-polarion-portal"></script>
+  <script src="comparison-authors.js?v=20261010-polarion-portal"></script>
+  <script src="app.js?v=20261010-polarion-portal"></script>
 </body>
 </html>

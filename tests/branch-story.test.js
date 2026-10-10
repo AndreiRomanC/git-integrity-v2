@@ -5,6 +5,36 @@ const { buildBranchStory, buildGraphModel } = require('../frontend/graph-model.j
 const c = (id, parents = [], refs = []) => ({ id, parents, refs });
 const ref = (name, kind = 'local_branch') => ({ name, kind });
 const ids = story => story.commits.map(commit => commit.id);
+const { branchStoryStart } = require('../frontend/graph-model.js');
+
+test('Branch Start uses creation evidence and remains B after main merges, not current base D', () => {
+  const commits = originalForkFixture();
+  const story = buildBranchStory(commits, 'F1');
+  const before = JSON.stringify(commits);
+  assert.equal(story.baseId, 'D');
+  assert.equal(branchStoryStart(commits, story, 'B').id, 'B');
+  assert.equal(branchStoryStart(commits, buildBranchStory(commits, 'D1'), 'B').id, 'B');
+  assert.equal(JSON.stringify(commits), before);
+  assert.deepEqual(ids(story), commits.map(c => c.id));
+  assertRealEdges(story);
+});
+
+test('Branch Start refuses missing evidence, recently created tracking branch and partial ancestry', () => {
+  const commits = originalForkFixture();
+  const story = buildBranchStory(commits, 'F1');
+  for (const birth of [null, 'F1', 'C1', 'D']) assert.equal(branchStoryStart(commits, story, birth).id, null);
+  assert.equal(branchStoryStart(commits.slice(0, 6), buildBranchStory(commits.slice(0, 6), 'F1'), 'B').id, null);
+  const ff = [c('tip', ['B'], [ref('feature'), ref('origin/main', 'remote_branch')]), c('B')];
+  assert.equal(branchStoryStart(ff, buildBranchStory(ff, 'tip'), 'B').id, null);
+});
+
+test('Branch Start can be confirmed without loading ancestors older than the recorded start', () => {
+  const commits = originalForkFixture().filter(commit => commit.id !== 'A');
+  const story = buildBranchStory(commits, 'F1');
+  assert.equal(story.incomplete, true);
+  assert.equal(branchStoryStart(commits, story, 'B').id, 'B');
+  assert.equal(story.commits.find(commit => commit.id === 'B').parents[0], 'A');
+});
 function assertRealEdges(story) {
   const model = buildGraphModel(story.commits, story.tipId);
   for (const node of model) {
@@ -171,7 +201,7 @@ function appFunction(name) {
   return app.slice(start, end + 2);
 }
 function rendererHarness() {
-  const element = () => ({ innerHTML: '', value: '', style: { setProperty() {} }, querySelectorAll: () => [], addEventListener() {} });
+  const element = () => ({ innerHTML: '', value: '', style: { setProperty() {} }, querySelector: () => null, querySelectorAll: () => [], addEventListener() {} });
   const commits = [c('unrelated', ['root'], [ref('origin/main', 'remote_branch')]), c('tip', ['a'], [ref('feature')]), c('a', ['root']), c('root')];
   const graph = { path: '/fixture', name: 'fixture', currentBranch: 'feature', headOid: 'tip', headDetached: false, commits, branches: [{name:'feature'}, {name:'origin/main',remote:true}], stashes: [] };
   const state = { repository: {}, graphPrimaryBranch:'branch:feature', graphRefFilter:'all', graphOnlySearchMatches:false, historyKind:'', historyScope:'' };
@@ -180,6 +210,7 @@ function rendererHarness() {
   const context = {
     state, refs, ...require('../frontend/graph-model.js'), activeGraphData:()=>graph,
     performance, jsPerfLog:()=>{}, LANE_WIDTH:24, headMainMergeBaseFetchKey:null,
+    ensureStoryCreation:()=>null,
     ensureHeadMainMergeBase:()=>{ backendAnnotations++; return null; },
     ensureBranchDivergence:()=>{ backendAnnotations++; return null; },
     esc:value=>String(value ?? ''), commitSubjectHtml:value=>String(value ?? ''),
@@ -263,6 +294,56 @@ test('Branch Story UI: original fork is a normal selectable row, distinct from t
   assert.match(rowFor('D'), /not necessarily the original branch creation point/);
   assert.doesNotMatch(rowFor('D'), />Branch start</);
   assert.equal(h.annotationCalls(), 0, 'No extra Git lookup to reconstruct a branch name or creation event');
+});
+
+test('Branch Story UI: verified Branch Start marker and jump select the original commit, not the merge-base', () => {
+  const h = rendererHarness();
+  h.graph.commits = originalForkFixture(); h.graph.headOid = 'F1';
+  h.context.activeBranchStoryView().mode = 'story';
+  h.context.ensureStoryCreation = () => 'B';
+  let jump, selected, scrolled = false;
+  h.refs.laneLegend.querySelector = selector => selector === '[data-jump-story-start]'
+    ? { addEventListener: (_name, handler) => { jump = handler; } } : null;
+  h.context.graphCommitRow = id => { assert.equal(id, 'B'); return { scrollIntoView: () => { scrolled = true; } }; };
+  h.context.selectCommit = id => { selected = id; };
+  h.context.renderGraph();
+  const html = h.refs.graph.innerHTML;
+  const rowFor = id => html.match(new RegExp(`<article[^>]*data-id="${id}"[\\s\\S]*?</article>`))?.[0];
+  assert.match(rowFor('B'), />Branch Start</);
+  assert.doesNotMatch(rowFor('D'), />Branch Start</);
+  assert.match(h.refs.laneLegend.innerHTML, /Go to Branch Start/);
+  jump(); assert.equal(selected, 'B'); assert.equal(scrolled, true);
+  assert.deepEqual(Array.from(h.context.lastGraphRenderContext.story.commits, c => c.id), h.graph.commits.map(c => c.id));
+});
+
+test('Branch Story creation lookup is async, cached and ignores completion after selection changes', async () => {
+  const view = {mode:'story'};
+  const pending = [];
+  let rendered = 0;
+  let retained;
+  const context = { state: {view:'graph', selectedCommit:{id:'C'}},
+    graphCommitRow: id => ({classList:{add: () => { retained = id; }}}),
+    invoke: (_command, args) => new Promise(resolve => pending.push({args, resolve})),
+    activeBranchStoryView: () => view, renderGraph: () => { rendered++; } };
+  vm.createContext(context); vm.runInContext(appFunction('ensureStoryCreation'), context);
+  const graph = {path:'/repo', commits:[]};
+  assert.equal(context.ensureStoryCreation(graph, view, 'branch', 'feature', 'F1'), null);
+  context.ensureStoryCreation(graph, view, 'branch', 'feature', 'F1');
+  assert.equal(pending.length, 1);
+  context.ensureStoryCreation(graph, view, 'branch', 'other', 'G1');
+  pending[0].resolve('B'); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(rendered, 0);
+  pending[1].resolve('C'); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(rendered, 1);
+  assert.equal(retained, 'C');
+  assert.equal(context.ensureStoryCreation(graph, view, 'branch', 'other', 'G1'), 'C');
+  assert.equal(pending.length, 2);
+  assert.equal(context.ensureStoryCreation(graph, view, 'remote', 'origin/other', 'G1'), null);
+  assert.equal(view.creation, null);
+  context.ensureStoryCreation(graph, view, 'branch', 'next', 'H1');
+  context.state.view = 'explorer';
+  pending[2].resolve('D'); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(rendered, 1, 'Do not redraw a graph after leaving its page');
 });
 
 test('Branch Story UI: the original fork supports inspection, compare with HEAD, and compare with any commit', async () => {

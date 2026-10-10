@@ -2,10 +2,25 @@ mod local_drive;
 mod notes;
 mod repository;
 
+// Remote sign-in pages must never reach the desktop's Git/filesystem IPC.
+fn local_commands_only<F>(handler: F) -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static
+where F: Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static {
+    move |invoke| {
+        if invoke.message.webview_ref().label() != "main" {
+            invoke.resolver.reject("Desktop commands are unavailable in remote browser windows");
+            return true;
+        }
+        handler(invoke)
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![
+        .invoke_handler(local_commands_only(tauri::generate_handler![
+            repository::polarion::polarion_connect,
+            repository::polarion::polarion_search,
+            repository::polarion::polarion_project_context,
             repository::build_info,
             notes::load_drill_down_notes,
             notes::set_drill_down_note,
@@ -28,6 +43,7 @@ pub fn run() {
             repository::unstage_files,
             repository::create_commit,
             repository::branches::branch_creation_context,
+            repository::branch_story::branch_story_creation,
             repository::branches::graph_branch_divergence,
             repository::branches::graph_head_main_merge_base,
             repository::branches::create_branch,
@@ -71,6 +87,7 @@ pub fn run() {
             repository::compare_working_area_file,
             repository::compare_git_revisions_directory,
             repository::compare_git_revisions_file_list,
+            repository::comparison_authors::comparison_authors,
             repository::compare_git_revision_file,
             repository::compare_submodule_revisions_directory,
             repository::compare_submodule_revisions_file_list,
@@ -143,7 +160,7 @@ pub fn run() {
             local_drive::merge::replace_local_merge_file,
             repository::command_console::run_terminal_command,
             repository::run_utrud,
-        ])
+        ]))
         .run(tauri::generate_context!())
         .expect("error while running Git DrillDown");
 }

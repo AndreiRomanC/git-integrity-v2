@@ -98,6 +98,29 @@ fn notes_path_for_repository(repository_path: &str) -> Result<PathBuf, String> {
     )))
 }
 
+// A separate sidecar reuses the notes directory/naming without rewriting or
+// migrating a notes file (including notes created by older builds).
+pub(crate) fn polarion_project_path(repository_path: &str) -> Result<PathBuf, String> {
+    let repo = repository_workdir(repository_path)?;
+    let notes = notes_path_for_repository(repository_path)?;
+    let mut directory = notes.parent().ok_or("Missing metadata directory")?.to_path_buf();
+    if override_notes_root().is_none() {
+        let mut outside = repo.parent().ok_or("Missing repository parent")?.to_path_buf();
+        while Repository::discover(&outside).is_ok() {
+            outside = outside.parent().ok_or("Cannot find metadata location outside Git")?.to_path_buf();
+        }
+        directory = outside.join(".git-drilldown");
+    } else {
+        let existing = directory.ancestors().find(|path| path.exists()).ok_or("Invalid metadata directory")?;
+        if Repository::discover(existing).is_ok() || directory.starts_with(&repo) {
+            return Err("Polarion metadata directory must be outside Git working trees".into());
+        }
+    }
+    Ok(directory.join(format!("{}-{}.polarion-project.json",
+        safe_file_stem(repo.file_name().and_then(|n| n.to_str()).unwrap_or("repository")),
+        stable_hash(&format!("path:{}", repo.to_string_lossy())))))
+}
+
 fn read_notes_file(path: &Path) -> Result<HashMap<String, String>, String> {
     if !path.exists() {
         return Ok(HashMap::new());
@@ -342,5 +365,40 @@ mod tests {
             assert_eq!(loaded.notes.len(), 100);
             assert_eq!(loaded.notes.get("work/a/f042").map(String::as_str), Some("Note 42"));
         });
+    }
+
+    #[test]
+    fn polarion_sidecars_preserve_notes_and_separate_repositories() {
+        with_notes_dir("polarion", |_| {
+            let root = temp_root("polarion-repositories");
+            let repo = repo_at(&root, "repo", None);
+            let module = repo_at(&repo, "module", None);
+            let path = repo.to_string_lossy().into_owned();
+            set_drill_down_note(path.clone(), "work/a".into(), "Keep this note".into()).unwrap();
+            let note_file = notes_path_for_repository(&path).unwrap();
+            let before = fs::read(&note_file).unwrap();
+            let project_file = polarion_project_path(&path).unwrap();
+            let module_file = polarion_project_path(&module.to_string_lossy()).unwrap();
+            assert_ne!(project_file, module_file);
+            assert_eq!(project_file.parent(), note_file.parent());
+            fs::write(project_file, r#"{"id":"P","name":"Project"}"#).unwrap();
+            assert_eq!(fs::read(note_file).unwrap(), before);
+            assert_eq!(load_drill_down_notes(path).unwrap().notes["work/a"], "Keep this note");
+        });
+    }
+
+    #[test]
+    fn polarion_nested_repository_metadata_stays_outside_superproject() {
+        let _guard = NOTES_TEST_ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("GIT_DRILLDOWN_NOTES_DIR");
+        let root = temp_root("polarion-nested");
+        let repo = repo_at(&root, "repo", None);
+        let module = repo_at(&repo, "module", None);
+        let file = polarion_project_path(&module.to_string_lossy()).unwrap();
+        assert!(file.starts_with(fs::canonicalize(root).unwrap().join(".git-drilldown")));
+        std::env::set_var("GIT_DRILLDOWN_NOTES_DIR", repo.join("not-created/metadata"));
+        let rejected = polarion_project_path(&module.to_string_lossy());
+        std::env::remove_var("GIT_DRILLDOWN_NOTES_DIR");
+        assert!(rejected.is_err());
     }
 }
