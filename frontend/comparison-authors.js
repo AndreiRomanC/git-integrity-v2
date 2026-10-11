@@ -32,4 +32,14 @@ function comparisonAuthorMatches(row, model) {
   return !model?.paths || [row.relative_path, row.local?.relative_path, row.remote?.relative_path]
     .some(path => path && model.paths.has(path));
 }
-if (typeof module !== 'undefined' && module.exports) module.exports = { createComparisonAuthorCache, comparisonAuthorMatches };
+function workspaceComparisonAuthorContext(result) {
+  if (!result?.repository_path || !result.local_revision || !result.remote_revision) return null;
+  return {
+    repositoryPath: result.repository_path,
+    leftRevision: result.local_revision,
+    rightRevision: result.remote_revision,
+    comparisonPaths: [...new Set((result.rows || []).flatMap(row =>
+      [row.relative_path, row.local?.relative_path, row.remote?.relative_path].filter(Boolean)))].sort(),
+  };
+}
+if (typeof module !== 'undefined' && module.exports) module.exports = { createComparisonAuthorCache, comparisonAuthorMatches, workspaceComparisonAuthorContext };

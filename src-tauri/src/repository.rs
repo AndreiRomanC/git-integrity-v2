@@ -942,6 +942,8 @@ pub struct CommanderRow {
 
 #[derive(Serialize)]
 pub struct CommanderDirectory {
+    repository_path: String,
+    local_revision: Option<String>,
     remote_ref: String,
     remote_revision: String,
     relative_path: String,
@@ -8223,7 +8225,10 @@ fn compare_remote_file_list_inner(repository_path: &str, relative_path: &str, re
         rows.push(CommanderRow { name: relative_path.clone(), relative_path, local, remote, status });
     }
     rows.sort_by(|a, b| a.relative_path.to_lowercase().cmp(&b.relative_path.to_lowercase()));
-    Ok(CommanderDirectory { remote_ref: remote_ref.into(), remote_revision: commit, relative_path, rows })
+    // Read the resolved owner/HEAD from the same repository used for this list,
+    // including when the existing boundary routing entered a submodule.
+    let local_revision = repo.head().ok().and_then(|head| head.peel_to_commit().ok()).map(|head| head.id().to_string());
+    Ok(CommanderDirectory { repository_path: repository_path.into(), local_revision, remote_ref: remote_ref.into(), remote_revision: commit, relative_path, rows })
 }
 
 fn tree_file_content(repository_path: &str, revision: &str, relative_path: &str) -> Result<Option<Vec<u8>>, String> {
@@ -8361,7 +8366,7 @@ pub fn compare_remote_directory(repository_path: String, relative_path: String, 
         let b_folder = b.local.as_ref().or(b.remote.as_ref()).map(|entry| entry.kind.as_str() == "folder").unwrap_or(false);
         b_folder.cmp(&a_folder).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
     });
-    Ok(CommanderDirectory { remote_ref, remote_revision: commit, relative_path, rows })
+    Ok(CommanderDirectory { repository_path, local_revision: None, remote_ref, remote_revision: commit, relative_path, rows })
 }
 
 #[tauri::command]
@@ -16352,6 +16357,9 @@ mod tests {
         let parent_path = parent.to_string_lossy().into_owned();
 
         let remote_list = compare_remote_file_list_inner(&parent_path, "vendor/dep/module.txt", &format!("origin/{sub_branch}")).unwrap();
+        assert_eq!(remote_list.repository_path, sub_path.to_string_lossy());
+        assert_eq!(remote_list.local_revision.as_deref(), Some(run_git_capture(&sub_path, &["rev-parse", "HEAD"]).as_str()));
+        assert_eq!(remote_list.remote_revision, run_git_capture(&sub_path, &["rev-parse", &format!("origin/{sub_branch}")]));
         let row = remote_list.rows.iter().find(|row| row.relative_path == "module.txt").expect("the submodule's own module.txt must be reported, not a parent-relative path");
         assert_eq!(row.status, "modified", "the parent's own remote lookup would have failed since the parent has no such ref; only the submodule's own origin/<branch> makes this a real, resolvable comparison");
 

@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Git DrillDown</title>
   <link rel="icon" type="image/png" href="assets/git-drilldown-mark.png">
-  <link rel="stylesheet" href="styles.css?v=20261010-polarion-portal">
+  <link rel="stylesheet" href="styles.css?v=20261011-staging-flight">
 </head>
 <body>
   <div class="app-shell">
@@ -137,7 +137,7 @@
               </div>
             </div>
             <div id="gitCompareFlatControls" class="compare-flat-controls" hidden>
-              <button type="button" id="gitCompareFlatToggle" title="Show a flat list with all changed files">Flat file list</button>
+              <div class="compare-layout-choice" role="group" aria-label="Git comparison layout"><button type="button" id="gitCompareTree" class="active" aria-pressed="true" title="Browse folders side by side; double-click a folder to drill down">Drill-down</button><button type="button" id="gitCompareFlatToggle" aria-pressed="false" title="Show all changed files in a flat list, with optional author filtering">List</button></div>
               <label><span>FILTER</span><select id="gitCompareFlatFilter"><option value="all">All differences</option><option value="modified">Modified</option><option value="local-only">Only left</option><option value="remote-only">Only right</option><option value="type-changed">Type changed</option></select></label>
             </div>
             <div class="commander-head commander-grid"><span id="gitCompareLeftLabel">LOCAL WORKSPACE</span><span>STATE</span><span id="gitCompareRightLabel">REMOTE BRANCH</span></div>
@@ -157,7 +157,7 @@
             <div class="submodule-compare-exact" id="subCompareExact">Choose a submodule and two revisions.</div>
             <div class="submodule-compare-commits" id="subCompareCommits" hidden></div>
             <div id="subCompareFlatControls" class="compare-flat-controls">
-              <button type="button" id="subCompareFlatToggle" title="Show a flat list with all changed files">Flat file list</button>
+              <div class="compare-layout-choice" role="group" aria-label="Submodule comparison layout"><button type="button" id="subCompareTree" class="active" aria-pressed="true" title="Browse folders side by side; double-click a folder to drill down">Drill-down</button><button type="button" id="subCompareFlatToggle" aria-pressed="false" title="Show all changed files in a flat list, with optional author filtering">List</button></div>
               <label><span>FILTER</span><select id="subCompareFlatFilter"><option value="all">All differences</option><option value="modified">Modified</option><option value="local-only">Only left</option><option value="remote-only">Only right</option><option value="type-changed">Type changed</option></select></label>
             </div>
             <div class="commander-toolbar">
@@ -221,7 +221,7 @@
         <div><strong id="drawerScopeTitle">Working directory</strong><span id="changesSummary">No changes</span></div>
         <button id="stageAllButton" title="Stage every change in this view, syncing the index with what's actually on disk">Stage all</button>
         <button id="unstageAllButton" title="Unstage every staged change in this view">Unstage all</button>
-        <button id="closeChanges">×</button>
+        <button id="closeChanges" aria-label="Close Working tree" title="Close Working tree (Esc) — keeps your message and staging unchanged">×</button>
       </div>
       <div class="drawer-body">
         <div id="changes" class="change-list"></div>
@@ -762,16 +762,16 @@
       <footer><span>Adds a saved message only — no commit.</span><button value="cancel">Cancel</button><button type="button" id="polarionAdd" class="confirm" disabled>Add to Commit List</button></footer>
     </form>
   </dialog>
-  <script src="polarion.js?v=20261010-polarion-portal"></script>
-  <script src="console-context.js?v=20261010-polarion-portal"></script>
-  <script src="graph-model.js?v=20261010-polarion-portal"></script>
-  <script src="submodule-state.js?v=20261010-polarion-portal"></script>
-  <script src="submodule-versions.js?v=20261010-polarion-portal"></script>
-  <script src="local-diff.js?v=20261010-polarion-portal"></script>
-  <script src="local-drive.js?v=20261010-polarion-portal"></script>
-  <script src="pr-status.js?v=20261010-polarion-portal"></script>
-  <script src="refresh-coordinator.js?v=20261010-polarion-portal"></script>
-  <script src="comparison-authors.js?v=20261010-polarion-portal"></script>
-  <script src="app.js?v=20261010-polarion-portal"></script>
+  <script src="polarion.js?v=20261011-staging-flight"></script>
+  <script src="console-context.js?v=20261011-staging-flight"></script>
+  <script src="graph-model.js?v=20261011-staging-flight"></script>
+  <script src="submodule-state.js?v=20261011-staging-flight"></script>
+  <script src="submodule-versions.js?v=20261011-staging-flight"></script>
+  <script src="local-diff.js?v=20261011-staging-flight"></script>
+  <script src="local-drive.js?v=20261011-staging-flight"></script>
+  <script src="pr-status.js?v=20261011-staging-flight"></script>
+  <script src="refresh-coordinator.js?v=20261011-staging-flight"></script>
+  <script src="comparison-authors.js?v=20261011-staging-flight"></script>
+  <script src="app.js?v=20261011-staging-flight"></script>
 </body>
 </html>

@@ -24,6 +24,7 @@ pub struct SearchResult {
     #[serde(default)] session_token: bool,
     #[serde(default)] more: bool,
     #[serde(default)] received: usize,
+    #[serde(default)] prefix_fallback: bool,
     #[serde(default)] items: Vec<SearchItem>,
 }
 #[derive(Serialize)]
@@ -37,7 +38,13 @@ fn term(value: &str) -> Result<String, String> {
     if value.len() > 100 || !value.chars().all(|c| c.is_alphanumeric() || c == ' ' || c == '-' || c == '_') {
         return Err("Use letters, numbers, spaces, hyphens or underscores in the search.".into());
     }
-    Ok(value.split_whitespace().map(|word| format!("{}*", word.replace('-', "\\-"))).collect::<Vec<_>>().join(" AND "))
+    // A fragment such as AQ4 must also match VWAQ4. Keep very short terms
+    // prefix-only to avoid broad leading-wildcard queries on large servers.
+    // User-provided query operators remain disallowed above.
+    Ok(value.split_whitespace().map(|word| {
+        let prefix = if word.chars().count() >= 3 { "*" } else { "" };
+        format!("{prefix}{}*", word.replace('-', "\\-"))
+    }).collect::<Vec<_>>().join(" AND "))
 }
 fn search_url(kind: &str, project: &str, query: &str, user: &str, page: usize) -> Result<String, String> {
     if page == 0 || page > 1000 { return Err("Invalid search page".into()); }
@@ -61,6 +68,16 @@ fn search_url(kind: &str, project: &str, query: &str, user: &str, page: usize) -
     url.query_pairs_mut().append_pair("query", &filter).append_pair("page[size]", "25")
         .append_pair("page[number]", &page.to_string()).append_pair("sort", "id");
     Ok(url.to_string())
+}
+
+fn prefix_fallback_url(url: &str) -> Result<String, String> {
+    let mut fallback = reqwest::Url::parse(url).map_err(|_| "Invalid search URL")?;
+    let pairs: Vec<(String, String)> = fallback.query_pairs().map(|(key, value)| {
+        let value = if key == "query" { value.replace("(*", "(").replace("AND *", "AND ") } else { value.into_owned() };
+        (key.into_owned(), value)
+    }).collect();
+    fallback.query_pairs_mut().clear().extend_pairs(pairs);
+    Ok(fallback.to_string())
 }
 
 fn context_repository(repository_path: &str, relative_path: &str) -> Result<String, String> {
@@ -156,9 +173,27 @@ mod tests {
         let params = pairs(&url);
         assert_eq!(params["page[size]"], "25");
         assert_eq!(params["page[number]"], "2");
-        assert!(params["query"].contains("name:(Drive* AND Test*)"));
+        assert!(params["query"].contains("name:(*Drive* AND *Test*)"));
         assert!(search_url("projects", "", "", "", 1).is_err());
     }
+    #[test]
+    fn fragment_search_matches_inside_identifiers_and_keeps_short_terms_bounded() {
+        let query = pairs(&search_url("projects", "", "AQ4", "", 1).unwrap())["query"].clone();
+        assert_eq!(query, "(id:(*AQ4*) OR name:(*AQ4*) OR trackerPrefix:(*AQ4*))");
+        assert_eq!(term("  AQ4  Drive  ").unwrap(), "*AQ4* AND *Drive*");
+        assert_eq!(term("AQ").unwrap(), "AQ*");
+        assert_eq!(term("AQ4-123").unwrap(), "*AQ4\\-123*");
+        let tasks = pairs(&search_url("tasks", "VWAQ4", "AQ4", "sg964219", 1).unwrap());
+        assert!(tasks["query"].contains("id:(*AQ4*)"));
+        assert!(tasks["query"].contains("assignee.id:\"sg964219\""));
+        assert_eq!(tasks["page[size]"], "25");
+        let fallback = prefix_fallback_url(&search_url("tasks", "VWAQ4", "AQ4 Drive", "sg964219", 2).unwrap()).unwrap();
+        let legacy = pairs(&fallback);
+        assert!(legacy["query"].contains("id:(AQ4* AND Drive*)"));
+        assert!(legacy["query"].contains("assignee.id:\"sg964219\""));
+        assert_eq!(legacy["page[number]"], "2");
+    }
+
     #[test]
     fn task_search_scopes_project_type_and_optional_assignee() {
         let url = search_url("tasks", "VWAQ4", "VWAQ4-123", "sg964219", 1).unwrap();
@@ -214,6 +249,7 @@ mod tests {
 #[tauri::command]
 pub async fn polarion_search(app: tauri::AppHandle, kind: String, project: String, query: String, user: String, page: usize) -> Result<SearchResult, String> {
     let url = search_url(&kind, &project, &query, &user, page)?;
+    let fallback = prefix_fallback_url(&url)?;
     off_main_thread(move || {
         let started = Instant::now();
         let window = app.get_webview_window(WINDOW).ok_or_else(|| {
@@ -227,9 +263,12 @@ pub async fn polarion_search(app: tauri::AppHandle, kind: String, project: Strin
             if slot.is_some() { return Err("A Polarion search is already running.".into()); }
             *slot = Some((id.clone(), send));
         }
+        // Some installations reject leading wildcards. Preserve the former
+        // prefix search in that case, without downloading the project catalog.
         let script = include_str!("polarion-search.js")
-            .replace("__DDT_ARGUMENTS__", &serde_json::json!({"url":url,"kind":kind,"project":project,"request":id}).to_string());
-        perf_log(&format!("polarion: search_start request={id} kind={kind} page={page} query_len={} assigned_filter={}", query.len(), !user.is_empty()), Duration::ZERO);
+            .replace("__DDT_ARGUMENTS__", &serde_json::json!({"url":url,"fallbackUrl":fallback.as_str(),"kind":kind,"project":project,"request":id}).to_string());
+        let contains_terms = query.split_whitespace().filter(|word| word.chars().count() >= 3).count();
+        perf_log(&format!("polarion: search_start request={id} kind={kind} page={page} query_len={} assigned_filter={} match=contains_3plus contains_terms={contains_terms}", query.len(), !user.is_empty()), Duration::ZERO);
         let mut bridge_code = "eval_failed";
         let result = if window.eval(script).is_err() { Err("Polarion browser could not start the search".into()) }
             else {
@@ -241,7 +280,7 @@ pub async fn polarion_search(app: tauri::AppHandle, kind: String, project: Strin
             };
         if let Ok(mut slot) = pending().lock() { if slot.as_ref().is_some_and(|(key, _)| key == &id) { *slot = None; } }
         let detail = match &result {
-            Ok(data) => format!("code={} http={} session_token={} received={} results={} more={}", data.code, data.http, data.session_token, data.received, data.items.len(), data.more),
+            Ok(data) => format!("code={} http={} session_token={} received={} results={} more={} prefix_fallback={}", data.code, data.http, data.session_token, data.received, data.items.len(), data.more, data.prefix_fallback),
             Err(_) => format!("code={bridge_code}"),
         };
         perf_log(&format!("polarion: search_end request={id} kind={kind} page={page} {detail}"), started.elapsed());

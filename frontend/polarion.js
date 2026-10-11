@@ -8,7 +8,7 @@ function polarionSearchExplanation(result) {
     auth_required: 'Sign in in the Polarion window, then retry Search.',
     forbidden: 'Polarion refused API access. Your account permissions or portal REST-token configuration may prevent this search.',
     api_unavailable: 'The Polarion REST API is unavailable on this server.',
-    query_rejected: 'Polarion rejected the search query. Try a shorter name or ID.',
+    query_rejected: 'Polarion rejected the search query, possibly because this server does not allow fragment wildcards. Diagnostics include the matching mode; no broad fallback search was run.',
     not_json: 'The server returned a page instead of API results. Complete sign-in in the Polarion window, then retry.',
     network_error: 'The browser could not complete the API request. Check the Polarion window and connection.',
     timeout: 'Polarion search timed out. You can retry; no commit or message was added.',
@@ -75,7 +75,7 @@ function createPolarionTaskPicker({ invoke, addMessage }) {
       if (result.code !== 'ok') { lastSearch = null; say(polarionSearchExplanation(result)); return; }
       lastSearch = params; page = requestedPage; more = result.more;
       render(result.items, kind);
-      say(`${kind === 'projects' ? 'Projects' : 'Tasks'} · page ${page} · ${result.items.length} results${more ? ' · more available' : ''}. ${kind === 'projects' ? 'Select a project.' : 'Select a task to add it to the saved commit messages.'}`);
+      say(`${kind === 'projects' ? 'Projects' : 'Tasks'} · page ${page} · ${result.items.length} results${more ? ' · more available' : ''}. ${result.prefix_fallback ? 'The server rejected fragment search; using prefix search. Enter the beginning of the ID or name. ' : ''}${kind === 'projects' ? 'Select a project.' : 'Select a task to add it to the saved commit messages.'}`);
     } catch (error) { if (generation === ticket) { lastSearch = null; say(String(error)); } }
     finally { if (generation === ticket) { busy = false; update(); } }
   }

@@ -37,6 +37,21 @@ const RECOVER_ON_MUTATION_ERROR = new Set(['merge_branch', 'resolve_conflict', '
 // command is slow. frontend_perf_log itself is excluded to avoid recursive
 // logging.
 const SLOW_INVOKE_LOG_THRESHOLD_MS = 250;
+const DIAGNOSTIC_COMMANDS = new Set(['commit_staged', 'commit_files', 'commit_path', 'stage_files', 'unstage_files', 'stage_all', 'refresh_status', 'compare_file_contents']);
+let diagnosticRequestSequence = 0;
+function diagnosticErrorCategory(error) {
+  const text = String(error?.message || error).toLowerCase();
+  if (/binary files|files over 1 mb/.test(text)) return 'binary-or-size-limit';
+  if (text.includes('no remote-tracking branch')) return 'missing-submodule-remote';
+  if (text.includes('file does not exist in the selected remote')) return 'file-absent-in-remote';
+  if (text.includes('cannot read local file')) return 'local-file-read-failed';
+  if (/status.*changed|stale.*status|repository changed/.test(text)) return 'stale-status';
+  if (/index\.lock|locked file|lock.*exists/.test(text)) return 'git-lock';
+  if (/not found|notfound|does not exist|invalid.*ref/.test(text)) return 'missing-ref-or-object';
+  if (/timed? ?out|has not finished/.test(text)) return 'timeout';
+  if (/permission|access denied/.test(text)) return 'permission-denied';
+  return 'unclassified';
+}
 const rawInvoke = window.__TAURI__?.core?.invoke;
 const invoke = rawInvoke && ((command, args) => {
   if (!STAGING_COMMANDS.has(command) && (MUTATING_COMMANDS.has(command) || REPO_SWITCH_COMMANDS.has(command)) &&
@@ -67,22 +82,27 @@ const invoke = rawInvoke && ((command, args) => {
     return Promise.reject(message);
   }
   const startedAt = performance.now();
+  const diagnosticId = DIAGNOSTIC_COMMANDS.has(command) ? ++diagnosticRequestSequence : null;
+  if (diagnosticId) jsPerfLog(`ipc_trace: request=${diagnosticId} command=${command} event=start at=${new Date().toISOString()}`, 0);
   const recoveryContext = RECOVER_ON_MUTATION_ERROR.has(command)
     ? { path: state.repository?.path, generation: repoOpenGeneration } : null;
   let pending;
   try {
     pending = rawInvoke(command, args);
   } catch (error) {
+    if (diagnosticId) jsPerfLog(`ipc_trace: request=${diagnosticId} command=${command} event=throw category=${diagnosticErrorCategory(error)}`, performance.now() - startedAt);
     if (command !== 'frontend_perf_log') jsPerfLog(`invoke(${command}) ERROR before promise`, performance.now() - startedAt);
     throw error;
   }
   if (command === 'frontend_perf_log') return pending;
   return Promise.resolve(pending).then(result => {
     const elapsedMs = performance.now() - startedAt;
+    if (diagnosticId) jsPerfLog(`ipc_trace: request=${diagnosticId} command=${command} event=success`, elapsedMs);
     if (elapsedMs >= SLOW_INVOKE_LOG_THRESHOLD_MS) jsPerfLog(`invoke(${command}) SUCCESS`, elapsedMs);
     return result;
   }, async error => {
     jsPerfLog(`invoke(${command}) ERROR`, performance.now() - startedAt);
+    if (diagnosticId) jsPerfLog(`ipc_trace: request=${diagnosticId} command=${command} event=error category=${diagnosticErrorCategory(error)}`, performance.now() - startedAt);
     if (recoveryContext) await refreshAfterMutationFailure(recoveryContext);
     throw error;
   });
@@ -1029,6 +1049,7 @@ async function openGithubModuleCompareFromBrowser(anchorRef = null) {
   const rightRef = browserRefCompareValue(right);
   if (!leftRef || !rightRef) return status('Could not resolve the selected revisions.', 'error');
   state.compareMode = 'submodule';
+  state.subCompareFlatMode = false;
   state.view = 'commander';
   state.commanderPath = '';
   state.submoduleCompare = {
@@ -1523,16 +1544,21 @@ function flatCompareRowHtml(row, datasetName) {
 }
 
 const comparisonAuthorCache = createComparisonAuthorCache((command, args) => invoke(command, args));
-function renderComparisonAuthorFilter(container, context) {
-  container.classList.toggle('has-author-filter', Boolean(context));
+function renderComparisonAuthorFilter(container, context, options = {}) {
+  container.classList.toggle('has-author-filter', Boolean(context || options.visible));
   let element = container.querySelector('.comparison-author-filter');
   if (!element) { element = document.createElement('div'); element.className = 'comparison-author-filter'; container.append(element); }
-  element.hidden = !context;
-  if (!context) return null;
+  element.hidden = !(context || options.visible);
+  if (!context) {
+    element.innerHTML = options.visible ? '<button type="button" disabled>Files touched by author…</button><small>Available after loading a comparison with committed history.</small>' : '';
+    return null;
+  }
   const model = comparisonAuthorCache.get(context);
   element.innerHTML = model.authors
-    ? `<label>Files touched by author <select data-author-select><option value="">All authors — clear filter</option>${model.authors.map(author => `<option value="${esc(author.key)}" ${model.selected === author.key ? 'selected' : ''}>${esc(author.name)}${author.email ? ` &lt;${esc(author.email)}&gt;` : ' (no email)'} · ${author.paths.length} files</option>`).join('')}</select></label><small>Shows files touched by the selected author. The displayed differences may also include changes made by others.</small><details><summary>History scope and limitations</summary><p>Commits reachable from either revision but not both. Merge authors include files differing from any parent, including imported changes and conflict resolutions; this is not line ownership. Renames use the existing added/deleted paths; earlier touches are not followed across later renames. Author emails are used as recorded, without mailmap, co-author or cherry-pick attribution. Submodule contents are analyzed only when comparing that submodule directly.</p></details>`
+    ? `<label>Files touched by author <select data-author-select><option value="">All authors — clear filter</option>${model.authors.map(author => `<option value="${esc(author.key)}" ${model.selected === author.key ? 'selected' : ''}>${esc(author.name)}${author.email ? ` &lt;${esc(author.email)}&gt;` : ' (no email)'} · ${author.paths.length} files</option>`).join('')}</select></label><small>Shows files touched in non-merge commits by the selected author. The full diff may also include changes made by others.</small><details><summary>History scope and limitations</summary><p>Commits reachable from either revision but not both. Merge commits do not establish authorship: imported changes remain attributed to the authors of the original commits within this range. Edits made only during merge resolution are excluded. This is a conservative history filter, not proof of personal line ownership. Renames use the existing added/deleted paths; earlier touches are not followed across later renames. Author emails are used as recorded, without mailmap, co-author or cherry-pick attribution. Submodule contents are analyzed only when comparing that submodule directly.</p></details>`
     : `<button type="button" data-load-authors ${model.pending ? 'disabled' : ''}>${model.pending ? 'Loading authors…' : 'Files touched by author…'}</button>${model.error ? `<small role="alert">${esc(model.error)} Complete comparison remains visible; retry to load authors.</small>` : ''}`;
+  if (options.workspace) element.insertAdjacentHTML('beforeend', '<small>Authors come from commits between local HEAD and the compared remote revision. Uncommitted changes have no Git author; matching files still show the complete local–remote diff.</small>');
+  if (model.authors?.length === 0) element.insertAdjacentHTML('beforeend', '<small>No authors in the history between these revisions. All differences remain visible.</small>');
   element.querySelector('[data-author-select]')?.addEventListener('change', event => {
     comparisonAuthorCache.select(model, event.target.value);
     renderCommander();
@@ -1577,18 +1603,24 @@ function renderCommander() {
   if (refs.gitCompareFlatControls) refs.gitCompareFlatControls.hidden = false;
   if (refs.gitCompareFlatToggle) {
     refs.gitCompareFlatToggle.classList.toggle('active', state.compareFlatMode);
-    refs.gitCompareFlatToggle.textContent = state.compareFlatMode ? 'Folder tree' : 'Flat file list';
+    refs.gitCompareFlatToggle.setAttribute('aria-pressed', String(state.compareFlatMode));
+    $('#gitCompareTree').classList.toggle('active', !state.compareFlatMode);
+    $('#gitCompareTree').setAttribute('aria-pressed', String(!state.compareFlatMode));
   }
   if (refs.gitCompareFlatFilter) {
-    refs.gitCompareFlatFilter.hidden = !state.compareFlatMode;
+    refs.gitCompareFlatFilter.closest('label').hidden = !state.compareFlatMode;
     refs.gitCompareFlatFilter.value = state.compareFlatFilter;
   }
   refs.gitCompareLeftLabel.textContent = branchCompareMode ? 'START REF' : 'LOCAL WORKSPACE';
   refs.gitCompareRightLabel.textContent = branchCompareMode ? 'COMPARE WITH' : 'REMOTE BRANCH';
   if (branchCompareMode) renderBranchCompareSelectors();
+  const authorContext = branchCompareMode
+    ? (state.branchCompareLeftRevision && state.branchCompareRightRevision
+      ? { repositoryPath: state.repository.path, leftRevision: state.branchCompareLeftRevision, rightRevision: state.branchCompareRightRevision } : null)
+    : state.workspaceCompareAuthorContext;
   const authorModel = renderComparisonAuthorFilter(refs.gitCompareFlatControls,
-    branchCompareMode && state.compareFlatMode && state.branchCompareLeftRevision && state.branchCompareRightRevision
-      ? { repositoryPath: state.repository.path, leftRevision: state.branchCompareLeftRevision, rightRevision: state.branchCompareRightRevision } : null);
+    state.compareFlatMode ? authorContext : null,
+    { visible: state.compareFlatMode, workspace: !branchCompareMode });
   const remoteBranches = state.branches.filter(branch => branch.remote);
   refs.remoteRef.innerHTML = remoteBranches.map(branch => `<option value="${esc(branch.name)}" ${branch.name === state.remoteRef ? 'selected' : ''}>${esc(branch.name)}</option>`).join('') || '<option value="">No remote refs</option>';
   const flatMode = state.compareFlatMode;
@@ -1706,10 +1738,12 @@ function renderSubmoduleCompare() {
   renderSubmoduleCompareCommitList(compare);
   if (refs.subCompareFlatToggle) {
     refs.subCompareFlatToggle.classList.toggle('active', state.subCompareFlatMode);
-    refs.subCompareFlatToggle.textContent = state.subCompareFlatMode ? 'Folder tree' : 'Flat file list';
+    refs.subCompareFlatToggle.setAttribute('aria-pressed', String(state.subCompareFlatMode));
+    $('#subCompareTree').classList.toggle('active', !state.subCompareFlatMode);
+    $('#subCompareTree').setAttribute('aria-pressed', String(!state.subCompareFlatMode));
   }
   if (refs.subCompareFlatFilter) {
-    refs.subCompareFlatFilter.hidden = !state.subCompareFlatMode;
+    refs.subCompareFlatFilter.closest('label').hidden = !state.subCompareFlatMode;
     refs.subCompareFlatFilter.value = state.subCompareFlatFilter;
   }
   const rowsSource = compare?.rows || [];
@@ -1750,9 +1784,18 @@ async function openCommanderDirectory(path) {
     if (!state.branchCompareLeftRef || !state.branchCompareRightRef) { status('Choose both refs before comparing branches.', 'error'); return; }
   } else if (!state.remoteRef) { status('No remote-tracking branch is available. Fetch the repository first.', 'error'); return; }
   state.commanderPath = path; refs.commanderRows.innerHTML = `<div class="loading-row"><i class="spinner"></i>${branchCompareMode ? 'Comparing repository refs…' : 'Comparing local and remote…'}</div>`;
+  if (!branchCompareMode) {
+    state.workspaceCompareAuthorContext = null;
+    renderComparisonAuthorFilter(refs.gitCompareFlatControls, null, { visible: state.compareFlatMode });
+  }
   // Captured *after* commanderPath/view are updated, so the snapshot reflects
   // the folder this call is actually for.
-  const stillCurrent = openCommanderDirectoryGuard();
+  const sameRequest = openCommanderDirectoryGuard();
+  const flatMode = state.compareFlatMode;
+  const leftRef = state.branchCompareLeftRef, rightRef = state.branchCompareRightRef, remoteRef = state.remoteRef;
+  const stillCurrent = () => sameRequest() && state.view === 'commander' && state.compareMode === 'git'
+    && state.compareFlatMode === flatMode && (state.gitCompareMode === 'refs') === branchCompareMode
+    && (branchCompareMode ? state.branchCompareLeftRef === leftRef && state.branchCompareRightRef === rightRef : state.remoteRef === remoteRef);
   if (!invoke) { state.commanderRows = previewCommanderRows(); render(); return; }
   try {
     const result = branchCompareMode
@@ -1763,7 +1806,7 @@ async function openCommanderDirectory(path) {
     if (branchCompareMode) {
       state.branchCompareLeftRevision = result.left_revision || result.leftRevision || '';
       state.branchCompareRightRevision = result.right_revision || result.rightRevision || '';
-    }
+    } else state.workspaceCompareAuthorContext = state.compareFlatMode ? workspaceComparisonAuthorContext(result) : null;
     render(); status(branchCompareMode ? `Compared ${state.branchCompareLeftRef} with ${state.branchCompareRightRef}` : `Compared with ${state.remoteRef.slice(0, 40)}`);
   } catch (error) { if (stillCurrent()) { status(String(error), 'error'); refs.commanderRows.innerHTML = `<div class="loading-row">${esc(String(error))}</div>`; } }
 }
@@ -1776,7 +1819,12 @@ async function openSubmoduleCompareDirectory(path = state.commanderPath || '') {
   if (!compare.leftRef || !compare.rightRef) { refs.subCompareRows.innerHTML = '<div class="loading-row">Choose both revisions first.</div>'; return; }
   state.commanderPath = path;
   refs.subCompareRows.innerHTML = '<div class="loading-row"><i class="spinner"></i>Comparing submodule revisions…</div>';
-  const stillCurrent = openSubmoduleCompareDirectoryGuard();
+  const sameRequest = openSubmoduleCompareDirectoryGuard();
+  const flatMode = state.subCompareFlatMode;
+  const leftRef = compare.leftRef, rightRef = compare.rightRef;
+  const stillCurrent = () => sameRequest() && state.view === 'commander' && state.compareMode === 'submodule'
+    && state.submoduleCompare === compare && state.subCompareFlatMode === flatMode
+    && compare.leftRef === leftRef && compare.rightRef === rightRef;
   if (!invoke) {
     compare.rows = previewCommanderRows();
     compare.leftRevision = compare.leftRef;
@@ -1867,6 +1915,7 @@ async function openSubmoduleCompareFromEntry(entry, overrides = {}) {
   const hasExplicitLeftRef = Object.prototype.hasOwnProperty.call(revisionOverrides, 'leftRef');
   const hasExplicitRightRef = Object.prototype.hasOwnProperty.call(revisionOverrides, 'rightRef');
   state.compareMode = 'submodule';
+  state.subCompareFlatMode = false;
   state.view = 'commander';
   refs.search.value = '';
   state.commanderPath = normalizeRepositoryRelativePath(innerPath);
@@ -4486,7 +4535,7 @@ async function compareEntryWithRemote(entry) {
   // had just fetched sat hidden behind it — "took me to Compare & Sync and
   // didn't compare the file" from the outside, even though the row
   // lookup below did succeed.
-  state.commanderFocus = entry.relative_path; state.commanderPath = entry.relative_path.split('/').slice(0, -1).join('/'); state.view = 'commander'; state.compareMode = 'git'; state.gitCompareMode = 'workspace'; state.commanderRows = []; render();
+  state.commanderFocus = entry.relative_path; state.commanderPath = entry.relative_path.split('/').slice(0, -1).join('/'); state.view = 'commander'; state.compareMode = 'git'; state.gitCompareMode = 'workspace'; state.compareFlatMode = false; state.commanderRows = []; render();
   await openCommanderDirectory(state.commanderPath);
   const row = state.commanderRows.find(item => item.relative_path === entry.relative_path);
   if (row?.local?.kind === 'file' && row.remote?.kind === 'file') openFileCompare(row); else status('This file is not available on both local and selected remote', 'error');
@@ -5789,6 +5838,7 @@ async function openGraphRevisionCompare(leftRef, rightRef = '') {
   state.view = 'commander';
   state.compareMode = 'git';
   state.gitCompareMode = 'refs';
+  state.compareFlatMode = false;
   state.commanderPath = '';
   state.commanderRows = [];
   state.commanderFocus = '';
@@ -5812,6 +5862,7 @@ async function openGraphBranchCompare(branchName, rightRef = '') {
   state.view = 'commander';
   state.compareMode = 'git';
   state.gitCompareMode = 'refs';
+  state.compareFlatMode = false;
   state.commanderPath = '';
   state.commanderRows = [];
   state.commanderFocus = '';
@@ -6741,8 +6792,8 @@ let pendingToggleRepo = null; // which repository's index the queued paths belon
 let pendingToggleTimeout = null;
 let pendingToggleGeneration = 0;
 // Promise of the single currently-running flush loop, or null when none is
-// active. The ONLY two places that ever assign to this are ensureFlushRunning
-// (starts one) and flushLoop's own `finally` (clears it once the loop is
+// active. Only ensureFlushRunning owns this promise and its settlement cleanup
+// (starts one, then clears it once the loop is
 // genuinely drained — nothing left queued, not just "this one batch done").
 // No other code path touches it, specifically to close a real race that used
 // to exist here: the debounce timer used to assign a fresh
@@ -6812,10 +6863,23 @@ function toggleStage(path, checked) {
 // second, overlapping flush of its own.
 function ensureFlushRunning(options = {}) {
   if (!pendingToggleFlight) {
-    pendingToggleFlight = flushLoop(options);
-    // Timer-started flushes have no waiter. Keep the rejection available to
-    // Commit/checkout, but do not emit an unhandled rejection from the timer.
-    pendingToggleFlight.catch(() => {});
+    if (!pendingToggles.size) {
+      jsPerfLog('staging_queue: empty debounce skipped', 0);
+      return Promise.resolve();
+    }
+    // Publish ownership BEFORE running the loop. An empty/synchronously
+    // failing loop used to clear itself before assignment, leaving its settled
+    // promise installed forever and starving the UI inside the Commit barrier.
+    const flight = Promise.resolve().then(() => flushLoop(options));
+    pendingToggleFlight = flight;
+    const clear = outcome => {
+      if (pendingToggleFlight === flight) pendingToggleFlight = null;
+      jsPerfLog(`staging_queue: flight ${outcome}; queued=${pendingToggles.size} backend_active=${!!activeStagingOperation}`, 0);
+    };
+    // Registered before any caller waits; both success and rejection release
+    // ownership. Timer-started failures are handled without swallowing the
+    // rejection seen by a waiting Commit/checkout.
+    flight.then(() => clear('completed'), () => clear('failed'));
   }
   return pendingToggleFlight;
 }
@@ -6832,11 +6896,7 @@ async function flushLoop(options) {
     // moment the loop started.
     while (pendingToggles.size) { await flushOneBatch(options); }
   } finally {
-    // The one and only place pendingToggleFlight is ever cleared — on every
-    // exit path (the loop draining cleanly, or a batch throwing out of it) —
-    // so no exit can leave a stale promise reference sitting behind a truthy
-    // pendingToggleFlight for a later caller to wait on forever.
-    pendingToggleFlight = null;
+    // Ownership is released by ensureFlushRunning's settlement handlers.
     jsPerfLog(`flushLoop END (${(performance.now() - startedAt).toFixed(0)}ms)`, 0);
   }
 }
@@ -6913,7 +6973,7 @@ async function flushOneBatch(options) {
     }
   } catch (error) {
     if (activeStagingOperation === run) activeStagingOperation = null;
-    jsPerfLog(`flushOneBatch ERROR (generation=${generation}): ${String(error)}`, 0);
+    jsPerfLog(`flushOneBatch ERROR (generation=${generation}) category=${diagnosticErrorCategory(error)}`, 0);
     // A partial failure inside this batch (the stage call succeeded but the
     // following unstage call then failed, say) means we genuinely don't know
     // which half actually landed on disk — blindly flipping every optimistic
@@ -6923,7 +6983,7 @@ async function flushOneBatch(options) {
     // specifically, NOT loadRepository: loadRepository itself calls
     // flushPendingTogglesNow first, and pendingToggleFlight is still set to
     // *this exact flushLoop's own promise* at this point (only cleared once
-    // the whole loop drains, in flushLoop's finally) — calling something
+    // the whole loop drains, in its settlement handler) — calling something
     // that awaits it here would deadlock this recovery on itself until the
     // safety-net timeout. Status is all a stage/unstage failure could ever
     // have left uncertain anyway, same as the success path just above.
@@ -6950,20 +7010,24 @@ async function flushPendingTogglesNow(options = {}, context = 'the previous Stag
     jsPerfLog('flushPendingTogglesNow END (nothing pending)', 0);
     return;
   }
+  const startedAt = performance.now();
+  jsPerfLog(`flushPendingTogglesNow START (queued=${pendingToggles.size}, hasFlight=${!!pendingToggleFlight}, backend_active=${!!activeStagingOperation}, skipReload=${!!options.skipReload})`, 0);
   const flight = (async () => {
     while (pendingToggles.size || pendingToggleFlight || activeStagingOperation) {
       const toggles = pendingToggles.size ? ensureFlushRunning(options) : pendingToggleFlight;
       await Promise.all([toggles, activeStagingOperation]);
     }
   })();
-  jsPerfLog(`flushPendingTogglesNow START (pendingToggles.size=${pendingToggles.size}, hasFlight=${!!flight}, activeStagingOperation=${!!activeStagingOperation})`, 0);
-  const startedAt = performance.now();
   let timedOut = false;
   let timeoutHandle;
   const timeoutPromise = new Promise(resolve => { timeoutHandle = setTimeout(() => { timedOut = true; resolve(); }, STAGE_FLUSH_TIMEOUT_MS); });
   try { await Promise.race([flight, timeoutPromise]); }
+  catch (error) {
+    jsPerfLog(`flushPendingTogglesNow ERROR category=${diagnosticErrorCategory(error)} queued=${pendingToggles.size} hasFlight=${!!pendingToggleFlight} backend_active=${!!activeStagingOperation}`, performance.now() - startedAt);
+    throw error;
+  }
   finally { clearTimeout(timeoutHandle); }
-  jsPerfLog(`flushPendingTogglesNow END (${timedOut ? 'TIMEOUT' : 'done'}, ${(performance.now() - startedAt).toFixed(0)}ms)`, 0);
+  jsPerfLog(`flushPendingTogglesNow END (${timedOut ? 'TIMEOUT' : 'done'}, queued=${pendingToggles.size}, hasFlight=${!!pendingToggleFlight}, backend_active=${!!activeStagingOperation})`, performance.now() - startedAt);
   if (timedOut) {
     // pendingToggleFlight is deliberately left exactly as it is — it still
     // points at the real, still-running flight, and nothing here knows its
@@ -7346,7 +7410,13 @@ $('#showPublish').addEventListener('click', () => openPublish().catch(error => s
 $('#stashWork').addEventListener('click', stashWork);
 $('#popStash').addEventListener('click', popStash);
 $('#refreshStashes').addEventListener('click', () => refreshStashesList());
-$('#closeChanges').addEventListener('click', () => refs.changesDrawer.classList.remove('open'));
+function closeWorkingTree() {
+  const restoreFocus = refs.changesDrawer.contains(document.activeElement);
+  refs.changesDrawer.classList.remove('open');
+  // Closing is purely visual: keep the draft and staged/unstaged state.
+  if (restoreFocus) $('#showChanges').focus({ preventScroll: true });
+}
+$('#closeChanges').addEventListener('click', closeWorkingTree);
 let searchTimeout; refs.search.addEventListener('input', () => { clearTimeout(searchTimeout); if (!refs.search.value.trim()) state.graphOnlySearchMatches = false; searchTimeout = setTimeout(() => { if (state.view === 'explorer') renderExplorer(); else if (state.view === 'commander' && state.compareMode === 'local-drive') localDriveWorkspace?.setFilter(refs.search.value); else if (state.view === 'commander') renderCommander(); else renderGraph(); }, 200); }); refs.commitMessage.addEventListener('input', renderChanges);
 async function returnToProjectNavigator() {
   closeSubmoduleGraph();
@@ -7375,6 +7445,7 @@ function syncLocalDriveToCommanderPath() {
   }
 }
 $('#navCommander').addEventListener('click', () => {
+  if (state.view === 'commander') return;
   const submoduleContext = currentSubmoduleCompareContext();
   closeSubmoduleGraph();
   if (state.view !== 'commander') resetFooterForContextChange();
@@ -7387,18 +7458,18 @@ $('#navCommander').addEventListener('click', () => {
     state.compareMode = 'submodule';
     return openSubmoduleCompareFromEntry(submoduleContext.entry, { innerPath: submoduleContext.innerPath });
   }
-  if (state.compareMode !== 'submodule') state.commanderPath = nextCommanderPath;
+  state.compareMode = 'local-drive';
+  state.commanderPath = nextCommanderPath;
   state.view = 'commander';
   render();
-  if (state.compareMode === 'git') openCommanderDirectory(state.commanderPath);
-  else if (state.compareMode === 'submodule') openSubmoduleCompareDirectory(state.commanderPath);
-  else syncLocalDriveToCommanderPath();
+  syncLocalDriveToCommanderPath();
 });
-refs.compareModeGit.addEventListener('click', () => { if (state.compareMode === 'git') return; state.compareMode = 'git'; refs.search.value = ''; render(); openCommanderDirectory(state.commanderPath); });
+refs.compareModeGit.addEventListener('click', () => { if (state.compareMode === 'git') return; if (state.compareMode === 'submodule') state.commanderPath = state.currentPath; state.compareMode = 'git'; state.compareFlatMode = false; state.commanderRows = []; refs.search.value = ''; render(); openCommanderDirectory(state.commanderPath); });
 refs.compareModeDrive.addEventListener('click', () => { if (state.compareMode === 'local-drive') return; state.compareMode = 'local-drive'; refs.search.value = ''; render(); syncLocalDriveToCommanderPath(); });
 refs.compareModeSubmodule.addEventListener('click', () => {
   if (state.compareMode === 'submodule') return;
   state.compareMode = 'submodule';
+  state.subCompareFlatMode = false;
   refs.search.value = '';
   const submoduleContext = currentSubmoduleCompareContext();
   if (submoduleContext) return openSubmoduleCompareFromEntry(submoduleContext.entry, { innerPath: submoduleContext.innerPath });
@@ -7509,7 +7580,20 @@ refs.runCurrentUtrud.addEventListener('click', () => {
   const name = state.currentPath ? state.currentPath.split('/').filter(Boolean).at(-1) : state.repository.name;
   runUtrud({ kind: 'folder', name, relative_path: state.currentPath });
 });
-document.addEventListener('keydown', event => { if (event.key !== 'Escape' || state.view !== 'commander' || document.querySelector('dialog[open]')) return; event.preventDefault(); returnToProjectNavigator(); });
+function handleWorkspaceEscape(event) {
+  if (event.key !== 'Escape' || event.defaultPrevented || event.isComposing || document.querySelector('dialog[open]')) return;
+  // Native dialogs handle Escape themselves. Close just the top nonmodal layer.
+  const menu = document.querySelector('.floating-action-menu');
+  if (menu) menu.remove();
+  else if (!$('#repoPickerMenu').hidden) $('#repoPickerMenu').hidden = true;
+  else if (!refs.submoduleMenu.hidden) closeSubmoduleMenu();
+  else if (refs.changesDrawer.classList.contains('open')) closeWorkingTree();
+  else if (state.view === 'commander') returnToProjectNavigator();
+  else return;
+  event.preventDefault();
+  event.stopImmediatePropagation();
+}
+document.addEventListener('keydown', handleWorkspaceEscape);
 refs.remoteRef.addEventListener('change', () => { state.remoteRef = refs.remoteRef.value; if (state.compareMode === 'git' && state.gitCompareMode !== 'refs') openCommanderDirectory(state.commanderPath); });
 refs.branchCompareLeftRef?.addEventListener('change', () => { state.branchCompareLeftRef = refs.branchCompareLeftRef.value; state.branchCompareLeftRevision = ''; if (state.compareMode === 'git' && state.gitCompareMode === 'refs') openCommanderDirectory(state.commanderPath); });
 refs.branchCompareRightRef?.addEventListener('change', () => { state.branchCompareRightRef = refs.branchCompareRightRef.value; state.branchCompareRightRevision = ''; if (state.compareMode === 'git' && state.gitCompareMode === 'refs') openCommanderDirectory(state.commanderPath); });
@@ -7520,10 +7604,17 @@ refs.branchCompareSwap?.addEventListener('click', () => {
   if (state.compareMode === 'git' && state.gitCompareMode === 'refs') openCommanderDirectory(state.commanderPath);
 });
 refs.branchCompareRefresh?.addEventListener('click', () => openCommanderDirectory(state.commanderPath));
-refs.gitCompareFlatToggle?.addEventListener('click', () => {
-  state.compareFlatMode = !state.compareFlatMode;
-  openCommanderDirectory(state.commanderPath);
-});
+function setComparisonListMode(submodule, enabled) {
+  const key = submodule ? 'subCompareFlatMode' : 'compareFlatMode';
+  if (state[key] === enabled) return;
+  state[key] = enabled;
+  if (submodule) { if (state.submoduleCompare) state.submoduleCompare.rows = []; }
+  else state.commanderRows = [];
+  renderCommander();
+  return submodule ? openSubmoduleCompareDirectory(state.commanderPath) : openCommanderDirectory(state.commanderPath);
+}
+refs.gitCompareFlatToggle?.addEventListener('click', () => setComparisonListMode(false, true));
+$('#gitCompareTree').addEventListener('click', () => setComparisonListMode(false, false));
 refs.gitCompareFlatFilter?.addEventListener('change', () => { state.compareFlatFilter = refs.gitCompareFlatFilter.value || 'all'; renderCommander(); });
 function applySubmoduleCompareRevisionInputs() {
   if (!state.submoduleCompare) return false;
@@ -7669,10 +7760,8 @@ refs.subCompareRefresh.addEventListener('click', () => {
   openSubmoduleCompareDirectory(state.commanderPath || '');
 });
 refs.subCompareDownload.addEventListener('click', () => exportSubmoduleCompareSnapshots().catch(error => handleError(error)));
-refs.subCompareFlatToggle?.addEventListener('click', () => {
-  state.subCompareFlatMode = !state.subCompareFlatMode;
-  openSubmoduleCompareDirectory(state.commanderPath || '');
-});
+refs.subCompareFlatToggle?.addEventListener('click', () => setComparisonListMode(true, true));
+$('#subCompareTree').addEventListener('click', () => setComparisonListMode(true, false));
 refs.subCompareFlatFilter?.addEventListener('change', () => { state.subCompareFlatFilter = refs.subCompareFlatFilter.value || 'all'; renderSubmoduleCompare(); });
 refs.subCompareSwap.addEventListener('click', () => {
   if (!state.submoduleCompare) return;
@@ -7723,13 +7812,6 @@ document.addEventListener('click', event => {
   // dialog itself even closes.
   const childActionOpen = refs.newBranchDialog.open || $('#newTagDialog').open || $('#submodulePublishDialog').open;
   if (!childActionOpen && !refs.submoduleMenu.hidden && !refs.submoduleMenu.contains(event.target) && !event.target.closest('[data-entry]') && !event.target.closest('[data-detail-action="versions"]')) closeSubmoduleMenu();
-});
-document.addEventListener('keydown', event => {
-  if (event.key !== 'Escape' || refs.submoduleMenu.hidden) return;
-  const childActionOpen = refs.newBranchDialog.open || $('#newTagDialog').open || $('#submodulePublishDialog').open;
-  if (childActionOpen) return;
-  event.preventDefault();
-  closeSubmoduleMenu();
 });
 refs.commitScope.addEventListener('click', openScopeCommit);
 refs.showPathHistory.addEventListener('click', showSelectedHistory);
@@ -7827,6 +7909,10 @@ refs.confirmNewBranch.addEventListener('click', async () => {
 });
 refs.commitButton.addEventListener('click', async () => {
   if (blockDetachedHeadWork('commit')) return;
+  const trace = ++diagnosticRequestSequence;
+  const commitStartedAt = performance.now();
+  let commitPhase = 'staging-barrier';
+  jsPerfLog(`commit_ui: request=${trace} phase=${commitPhase} event=start at=${new Date().toISOString()}`, 0);
   // Without this, the button gave no sign anything was happening — for a
   // commit touching many files (real work happens on the backend: staging,
   // writing the tree, then a full status/history reload) that looked
@@ -7836,7 +7922,7 @@ refs.commitButton.addEventListener('click', async () => {
   // that flush (waiting on a checkbox toggle from a moment ago) must not be
   // able to fire a second, overlapping commit.
   refs.commitButton.disabled = true;
-  refs.commitButton.textContent = (activeStagingOperation || pendingToggles.size) ? 'Waiting for staging…' : 'Committing…';
+  refs.commitButton.textContent = (activeStagingOperation || pendingToggleFlight || pendingToggles.size) ? 'Waiting for staging…' : 'Committing…';
   status(refs.commitButton.textContent, 'busy');
   // Everything from here on is inside one try/finally — flushPendingTogglesNow
   // used to be called outside any try, so its safety-net timeout (or any
@@ -7861,7 +7947,9 @@ refs.commitButton.addEventListener('click', async () => {
     if (activeStagingOperation) { try { await activeStagingOperation; } catch { /* already reported by whichever button started it */ } }
     const folder = state.changesScope === 'folder' ? state.currentPath : '';
     const files = state.changes.filter(change => change.staged && (!folder || change.path === folder || change.path.startsWith(`${folder}/`))).map(change => change.path);
+    jsPerfLog(`commit_ui: request=${trace} phase=index-ready files=${files.length} scope=${folder ? 'folder' : 'repository'}`, performance.now() - commitStartedAt);
     if (!files.length) {
+      commitPhase = 'nothing-staged';
       const message = 'Nothing is staged. If the changed item is a submodule, open it and commit its internal files first; the parent project can record only the resulting submodule commit.';
       status(message, 'error'); showOperationToast(message, 'error');
       return;
@@ -7873,14 +7961,25 @@ refs.commitButton.addEventListener('click', async () => {
     // that case (real work on a large repo/index) since the real on-disk
     // index already *is* the tree this commit needs. A folder-scoped commit
     // is a genuine subset, so it still goes through commit_files.
+    commitPhase = 'write';
+    jsPerfLog(`commit_ui: request=${trace} phase=write event=start`, performance.now() - commitStartedAt);
     if (folder) await invoke('commit_files', { repositoryPath: state.repository.path, files, message: refs.commitMessage.value });
     else await invoke('commit_staged', { repositoryPath: state.repository.path, message: refs.commitMessage.value });
+    commitPhase = 'refresh-after-successful-write';
+    jsPerfLog(`commit_ui: request=${trace} phase=${commitPhase} event=start`, performance.now() - commitStartedAt);
     refs.commitMessage.value = ''; refs.commitButton.textContent = 'Updating status…'; status(refs.commitButton.textContent, 'busy'); await loadRepository(state.repository.path, { reopenPath: folder });
     const successMsg = `Committed ${files.length} file${files.length === 1 ? '' : 's'}${folder ? ` in "${folder}"` : ''}. Push when you're ready to send it to the server.`;
     status(successMsg); showOperationToast(successMsg, 'success');
+    commitPhase = 'completed';
   }
-  catch (error) { const message = handleError(error); showOperationToast(`Commit failed: ${message}`, 'error'); }
-  finally { refs.commitButton.textContent = 'Commit changes'; renderChanges(); }
+  catch (error) {
+    jsPerfLog(`commit_ui: request=${trace} phase=${commitPhase} event=error category=${diagnosticErrorCategory(error)}`, performance.now() - commitStartedAt);
+    const message = handleError(error); showOperationToast(`Commit failed: ${message}`, 'error');
+  }
+  finally {
+    jsPerfLog(`commit_ui: request=${trace} phase=${commitPhase} event=end`, performance.now() - commitStartedAt);
+    refs.commitButton.textContent = 'Commit changes'; renderChanges();
+  }
 });
 
 // Actions and Terminal — two tabs sharing one input:

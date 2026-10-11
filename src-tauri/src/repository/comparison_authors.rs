@@ -13,20 +13,32 @@ pub struct ComparisonAuthor {
 }
 
 // Symmetric difference: commits reachable from either endpoint but not both.
-// A merge contributes the UNION of its diffs against every parent. This
-// deliberately includes imports and resolutions (even a resolution identical
-// to one parent), not a claim of personal line ownership by the merge author.
+// Only non-merge commits establish a touch. A merge diff against any parent
+// contains imported changes; even the intersection of parent diffs can contain
+// automatically merged edits. Do not attribute those to the merge author.
+// Incoming commits are still walked and attributed to their recorded authors.
 fn collect(repo: &Repository, left: Oid, right: Oid) -> Result<Vec<ComparisonAuthor>, String> {
+    collect_for_paths(repo, left, right, None)
+}
+
+fn collect_for_paths(repo: &Repository, left: Oid, right: Oid, comparison_paths: Option<Vec<String>>) -> Result<Vec<ComparisonAuthor>, String> {
     if repo.is_shallow() {
         return Err("Author filtering needs complete local history; this repository is shallow. No partial author results were applied.".into());
     }
     let started = Instant::now();
-    let left_tree = repo.find_commit(left).and_then(|c| c.tree()).map_err(|e| e.to_string())?;
-    let right_tree = repo.find_commit(right).and_then(|c| c.tree()).map_err(|e| e.to_string())?;
-    let comparison = repo.diff_tree_to_tree(Some(&left_tree), Some(&right_tree), None).map_err(|e| e.to_string())?;
-    let relevant: HashSet<String> = comparison.deltas().flat_map(|d| {
-        [d.old_file().path().map(normalized), d.new_file().path().map(normalized)].into_iter().flatten()
-    }).collect();
+    let relevant: HashSet<String> = if let Some(paths) = comparison_paths {
+        // Workspace comparisons already have their exact displayed paths. Do
+        // not scan the worktree again or intersect only HEAD's net tree diff:
+        // a committed change may have been undone before a local edit.
+        paths.into_iter().collect()
+    } else {
+        let left_tree = repo.find_commit(left).and_then(|c| c.tree()).map_err(|e| e.to_string())?;
+        let right_tree = repo.find_commit(right).and_then(|c| c.tree()).map_err(|e| e.to_string())?;
+        let comparison = repo.diff_tree_to_tree(Some(&left_tree), Some(&right_tree), None).map_err(|e| e.to_string())?;
+        comparison.deltas().flat_map(|d| {
+            [d.old_file().path().map(normalized), d.new_file().path().map(normalized)].into_iter().flatten()
+        }).collect()
+    };
     let mut authors: BTreeMap<String, (ComparisonAuthor, HashSet<String>)> = BTreeMap::new();
     let mut count = 0;
     for (tip, hide) in [(left, right), (right, left)] {
@@ -49,6 +61,11 @@ fn collect(repo: &Repository, left: Oid, right: Oid) -> Result<Vec<ComparisonAut
             }, HashSet::new()));
             author.commits += 1;
             author.merge_commits += usize::from(commit.parent_count() > 1);
+            // Keep merge-only authors selectable (zero matching files), but
+            // never treat integrating other people's commits as their own edit.
+            // Resolution-only edits are deliberately excluded: stored parent
+            // trees cannot prove which edits were made manually by this author.
+            if commit.parent_count() > 1 { continue; }
             let tree = commit.tree().map_err(|e| e.to_string())?;
             for parent_index in 0..commit.parent_count().max(1) {
                 let parent_tree = if commit.parent_count() == 0 { None }
@@ -69,12 +86,12 @@ fn collect(repo: &Repository, left: Oid, right: Oid) -> Result<Vec<ComparisonAut
         author.paths.sort();
         author
     }).collect();
-    perf_log(&format!("comparison_authors: {count} commits (object trees only)"), started.elapsed());
+    perf_log(&format!("comparison_authors: {count} commits (object trees only; non-merge touches)"), started.elapsed());
     Ok(result)
 }
 
 #[tauri::command]
-pub async fn comparison_authors(repository_path: String, submodule_path: Option<String>, owner: Option<String>, repository_name: Option<String>, left_revision: String, right_revision: String) -> Result<Vec<ComparisonAuthor>, String> {
+pub async fn comparison_authors(repository_path: String, submodule_path: Option<String>, owner: Option<String>, repository_name: Option<String>, left_revision: String, right_revision: String, comparison_paths: Option<Vec<String>>) -> Result<Vec<ComparisonAuthor>, String> {
     off_main_thread(move || {
         validate_path(&repository_path)?;
         let path = match (owner, repository_name, submodule_path) {
@@ -91,7 +108,8 @@ pub async fn comparison_authors(repository_path: String, submodule_path: Option<
         let repo = internal_repository(&path.to_string_lossy())?;
         let left = Oid::from_str(&left_revision).map_err(|e| e.to_string())?;
         let right = Oid::from_str(&right_revision).map_err(|e| e.to_string())?;
-        collect(&repo, left, right)
+        if comparison_paths.is_some() { collect_for_paths(&repo, left, right, comparison_paths) }
+        else { collect(&repo, left, right) }
     }).await
 }
 
@@ -101,7 +119,9 @@ mod tests {
     struct Fixture { repo: Repository, path: PathBuf }
     impl Fixture {
         fn new() -> Self {
-            let path = std::env::temp_dir().join(format!("ddt-author-test-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let sequence = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!("ddt-author-test-{}-{}-{sequence}", std::process::id(), std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
             Self { repo: Repository::init(&path).unwrap(), path }
         }
         fn commit(&self, email: &str, files: &[(&str, &str)], parents: &[Oid]) -> Oid {
@@ -135,17 +155,40 @@ mod tests {
     }
 
     #[test]
-    fn comparison_authors_merge_union_includes_imports_and_resolution_equal_to_parent() {
+    fn comparison_authors_merge_does_not_attribute_imports_or_resolutions_to_integrator() {
         let f = Fixture::new();
         let base = f.commit("base@test", &[("f", "base")], &[]);
         let local = f.commit("alice@test", &[("f", "ours"), ("ours", "x")], &[base]);
         let incoming = f.commit("bob@test", &[("f", "theirs"), ("import", "x")], &[base]);
         let merged = f.commit("merger@test", &[("f", "ours"), ("ours", "x"), ("import", "x"), ("resolution", "new")], &[local, incoming]);
         let authors = collect(&f.repo, base, merged).unwrap();
-        assert_eq!(paths(&authors, "merger@test"), ["f", "import", "ours", "resolution"]);
+        assert!(paths(&authors, "merger@test").is_empty());
+        assert_eq!(paths(&authors, "alice@test"), ["f", "ours"]);
+        assert_eq!(paths(&authors, "bob@test"), ["f", "import"]);
         assert_eq!(authors.iter().find(|a| a.email == "merger@test").unwrap().merge_commits, 1);
-        // Against local, unchanged f/ours must NOT leak into filtered results.
-        assert_eq!(paths(&collect(&f.repo, local, merged).unwrap(), "merger@test"), ["import", "resolution"]);
+        assert!(paths(&collect(&f.repo, local, merged).unwrap(), "merger@test").is_empty());
+        assert_eq!(paths(&collect(&f.repo, local, merged).unwrap(), "bob@test"), ["import"]);
+    }
+
+    #[test]
+    fn comparison_authors_keeps_personal_touches_after_other_authors_and_repeated_merges() {
+        let f = Fixture::new();
+        let base = f.commit("base@test", &[("shared", "base")], &[]);
+        let alice = f.commit("alice@test", &[("shared", "alice")], &[base]);
+        let bob = f.commit("bob@test", &[("shared", "bob"), ("import", "bob")], &[base]);
+        // Even a file differing from BOTH parents may be an automatic merge,
+        // not an edit authored by the person pressing Merge.
+        let merged = f.commit("alice@test", &[("shared", "alice and bob"), ("import", "bob")], &[alice, bob]);
+        let carol = f.commit("carol@test", &[("shared", "carol later"), ("import", "bob"), ("new", "carol")], &[bob]);
+        let final_merge = f.commit("alice@test", &[("shared", "all edits"), ("import", "bob"), ("new", "carol")], &[merged, carol]);
+        let authors = collect(&f.repo, base, final_merge).unwrap();
+        assert_eq!(paths(&authors, "alice@test"), ["shared"]);
+        assert_eq!(paths(&authors, "bob@test"), ["import", "shared"]);
+        assert_eq!(paths(&authors, "carol@test"), ["new", "shared"]);
+        let compare = compare_git_tree_file(&f.path.to_string_lossy(), "shared", &base.to_string(), &final_merge.to_string()).unwrap();
+        assert_eq!(compare.remote_content, "all edits");
+        let workspace = collect_for_paths(&f.repo, base, final_merge, Some(vec!["shared".into(), "import".into(), "new".into()])).unwrap();
+        assert_eq!(paths(&workspace, "alice@test"), ["shared"]);
     }
 
     #[test]
@@ -159,6 +202,29 @@ mod tests {
         assert_eq!(paths(&forward, "right@test"), ["old"]);
         assert_eq!(serde_json::to_value(&forward).unwrap(), serde_json::to_value(collect(&f.repo, right, left).unwrap()).unwrap());
         assert_eq!(compare_git_tree_file_list(&f.path.to_string_lossy(), "", &base.to_string(), &left.to_string()).unwrap().rows.len(), 2);
+    }
+
+    #[test]
+    fn comparison_authors_workspace_paths_include_reverted_touches_but_not_unattributed_files() {
+        let f = Fixture::new();
+        let base = f.commit("base@test", &[("f", "base")], &[]);
+        let changed = f.commit("alice@test", &[("f", "changed")], &[base]);
+        let tip = f.commit("bob@test", &[("f", "base")], &[changed]);
+        f.repo.reference("refs/heads/main", tip, true, "test").unwrap();
+        f.repo.set_head("refs/heads/main").unwrap();
+        fs::write(f.path.join("f"), "local edit after revert").unwrap();
+        fs::write(f.path.join("untracked"), "no author").unwrap();
+        let mut index = f.repo.index().unwrap();
+        index.add_path(Path::new("f")).unwrap(); index.write().unwrap();
+        let before = fs::read(f.repo.path().join("index")).unwrap();
+        assert!(paths(&collect(&f.repo, base, tip).unwrap(), "alice@test").is_empty());
+        let authors = collect_for_paths(&f.repo, base, tip, Some(vec!["f".into(), "untracked".into()])).unwrap();
+        assert_eq!(paths(&authors, "alice@test"), ["f"]);
+        assert_eq!(paths(&authors, "bob@test"), ["f"]);
+        assert!(collect_for_paths(&f.repo, tip, tip, Some(vec!["f".into()])).unwrap().is_empty());
+        assert_eq!(fs::read(f.repo.path().join("index")).unwrap(), before);
+        assert_eq!(fs::read_to_string(f.path.join("f")).unwrap(), "local edit after revert");
+        assert_eq!(fs::read_to_string(f.path.join("untracked")).unwrap(), "no author");
     }
 
     #[test]

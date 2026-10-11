@@ -3,10 +3,11 @@
 (async () => {
   const args = __DDT_ARGUMENTS__;
   let session_token = false;
+  let prefix_fallback = false;
   const reply = data => {
     const target = new URL('https://polarion.vitesco.io/polarion/__ddt_search_result');
     target.searchParams.set('request', args.request);
-    target.searchParams.set('data', JSON.stringify({ session_token, ...data }));
+    target.searchParams.set('data', JSON.stringify({ session_token, prefix_fallback, ...data }));
     location.href = target.href; // intercepted and cancelled by the native host
   };
   if (location.origin !== 'https://polarion.vitesco.io') return reply({ code: 'wrong_origin' });
@@ -19,7 +20,12 @@
       if (token) { headers['X-Polarion-REST-Token'] = token; session_token = true; }
     }
     // Never forward the REST token to a redirect target (including SSO).
-    const response = await fetch(args.url, { headers, credentials: 'same-origin', redirect: 'manual', signal: abort.signal });
+    const options = { headers, credentials: 'same-origin', redirect: 'manual', signal: abort.signal };
+    let response = await fetch(args.url, options);
+    if (response.status === 400 && args.fallbackUrl && args.fallbackUrl !== args.url) {
+      prefix_fallback = true;
+      response = await fetch(args.fallbackUrl, options);
+    }
     if (response.type === 'opaqueredirect') return reply({ code: 'auth_required' });
     const http = response.status;
     if (!response.ok) return reply({ http, code: http === 401 ? 'auth_required' : http === 403 ? 'forbidden' : [404,405,501,503].includes(http) ? 'api_unavailable' : http === 400 ? 'query_rejected' : 'http_error' });

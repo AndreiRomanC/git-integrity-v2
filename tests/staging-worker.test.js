@@ -13,7 +13,7 @@ function harness() {
   const state = { repository: { path: 'repo' }, currentPath: '', changes: [{ path: 'a', staged: false }] };
   const buttons = {};
   const context = { state, performance, jsPerfLog() {}, renderChanges() {}, status() {}, showOperationToast() {},
-    handleError: error => String(error),
+    handleError: error => String(error), diagnosticErrorCategory: () => 'test-error',
     setTimeout(fn, ms) { timers.set(++id, { fn, ms }); return id; }, clearTimeout(key) { timers.delete(key); },
     $: selector => buttons[selector] ||= { textContent: selector, disabled: false },
     invoke: (command, args) => new Promise((resolve, reject) => { events.push(command); calls.push({ command, args, resolve, reject }); }),
@@ -27,9 +27,71 @@ function harness() {
   vm.createContext(context);
   vm.runInContext(app.slice(app.indexOf('let pendingToggles ='), app.indexOf("$('#openRepo').addEventListener")) +
     app.slice(app.indexOf('async function stageAllInScope('), app.indexOf('// Pre-fills the commit message box')) +
-    '\nglobalThis.flush = flushPendingTogglesNow;', context);
+    '\nglobalThis.flush = flushPendingTogglesNow; globalThis.hasFlight = () => pendingToggleFlight !== null;', context);
   return { context, state, calls, events, timers };
 }
+
+test('empty debounce cannot leave a settled staging flight or block the Commit barrier', async () => {
+  const h = harness();
+  await h.context.ensureFlushRunning();
+  assert.equal(h.context.hasFlight(), false);
+  await h.context.flush();
+  assert.equal(h.calls.length, 0);
+});
+
+test('late debounce after a second checkbox batch cannot freeze Commit', async () => {
+  const h = harness();
+  h.context.toggleStage('a', true);
+  const firstTimer = [...h.timers.values()].find(t => t.ms === 300);
+  firstTimer.fn(); await tick();
+  h.context.toggleStage('a', false);
+  h.calls[0].resolve({ skipped_dirty_submodules: [] }); await tick();
+  h.calls[1].resolve(); await tick();
+  assert.equal(h.context.hasFlight(), false);
+  // The loop already consumed this click, but its debounce timer fires later.
+  [...h.timers.values()].find(t => t.ms === 300).fn();
+  await tick();
+  assert.equal(h.context.hasFlight(), false);
+  await h.context.flush();
+  assert.equal(h.calls.length, 2);
+});
+
+test('a synchronously failing flush releases ownership before retry', async () => {
+  const h = harness();
+  vm.runInContext('flushOneBatch = () => { pendingToggles.clear(); throw new Error("sync failure"); };', h.context);
+  h.context.toggleStage('a', true);
+  await assert.rejects(h.context.ensureFlushRunning(), /sync failure/);
+  assert.equal(h.context.hasFlight(), false);
+  await h.context.flush();
+});
+
+test('actual Commit handler proceeds after a late empty debounce and refreshes after writing', async () => {
+  const h = harness();
+  let clickCommit;
+  h.context.blockDetachedHeadWork = () => false;
+  h.context.refs = {
+    commitButton: { addEventListener: (_, handler) => { clickCommit = handler; } },
+    commitMessage: { value: 'checkpoint' },
+  };
+  vm.runInContext('let diagnosticRequestSequence = 0;\n' +
+    app.slice(app.indexOf("refs.commitButton.addEventListener('click'"), app.indexOf('// Actions and Terminal —')), h.context);
+  h.context.toggleStage('a', true);
+  const staging = h.context.flush();
+  await tick();
+  h.calls[0].resolve({ skipped_dirty_submodules: [] });
+  await staging;
+  await h.context.ensureFlushRunning(); // delayed debounce after queue drained
+  const committing = clickCommit();
+  await tick();
+  assert.deepEqual(h.calls.map(call => call.command), ['stage_files', 'commit_staged']);
+  assert.equal(h.calls[1].args.message, 'checkpoint');
+  assert.ok(!h.events.includes('load'), 'refresh must wait for commit success');
+  h.calls[1].resolve();
+  await committing;
+  assert.equal(h.events.at(-1), 'load');
+  assert.equal(h.context.refs.commitMessage.value, '');
+  assert.equal(h.context.refs.commitButton.textContent, 'Commit changes');
+});
 
 test('rapid checkbox changes drain in order; Commit barrier waits for the final unstage', async () => {
   const h = harness();

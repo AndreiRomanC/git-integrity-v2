@@ -4,17 +4,34 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 const { polarionCommitMessage, polarionSearchExplanation } = require('../frontend/polarion.js');
 const source = fs.readFileSync(require('node:path').join(__dirname, '../src-tauri/src/repository/polarion-search.js'), 'utf8');
-async function portal({ status = 200, origin = 'https://polarion.vitesco.io', contentType = 'application/json', type = 'basic', data = { data: [] }, error = null, token = 'SECRET', kind = 'tasks' } = {}) {
+async function portal({ status = 200, origin = 'https://polarion.vitesco.io', contentType = 'application/json', type = 'basic', data = { data: [] }, error = null, token = 'SECRET', kind = 'tasks', fallbackUrl = null, statuses = null } = {}) {
   let request = null, reply = null;
+  const requests = [];
   const location = { origin, set href(value) { reply = JSON.parse(new URL(value).searchParams.get('data')); } };
   const sandbox = { URL, AbortController, setTimeout, clearTimeout, location, window: { getRestApiToken: () => token }, fetch: async (url, options) => {
     request = { url, options };
+    requests.push(request);
+    const code = statuses ? statuses[requests.length - 1] : status;
     if (error) throw error;
-    return { status, type, ok: status >= 200 && status < 300, headers: { get: () => contentType }, json: async () => data };
+    return { status: code, type, ok: code >= 200 && code < 300, headers: { get: () => contentType }, json: async () => data };
   } };
-  await vm.runInNewContext(source.replace('__DDT_ARGUMENTS__', JSON.stringify({ url: 'https://polarion.vitesco.io/polarion/rest/v1/projects/P/workitems', project: 'P', kind, request: '1' })), sandbox);
-  return { request, reply };
+  await vm.runInNewContext(source.replace('__DDT_ARGUMENTS__', JSON.stringify({ url: 'https://polarion.vitesco.io/polarion/rest/v1/projects/P/workitems', fallbackUrl, project: 'P', kind, request: '1' })), sandbox);
+  return { request, reply, requests };
 }
+test('fragment rejection falls back once to legacy prefix search, not on authentication or empty results', async () => {
+  const fallbackUrl = 'https://polarion.vitesco.io/polarion/rest/v1/projects/P/workitems?query=id:AQ4*';
+  const result = await portal({ fallbackUrl, statuses: [400, 200] });
+  assert.equal(result.requests.length, 2);
+  assert.equal(result.requests[1].url, fallbackUrl);
+  assert.equal(result.reply.prefix_fallback, true);
+  assert.equal(result.reply.code, 'ok');
+  assert.equal(JSON.stringify(result.reply).includes('SECRET'), false);
+  for (const status of [200, 401, 403, 500]) {
+    const check = await portal({ fallbackUrl, status });
+    assert.equal(check.requests.length, 1);
+    assert.equal(check.reply.prefix_fallback, false);
+  }
+});
 test('selected task reuses existing message syntax and rejects incompatible IDs', () => {
   assert.equal(polarionCommitMessage({ id: 'P-123', title: 'Title\ncontinued' }), 'P:P-123 - Title continued');
   assert.throws(() => polarionCommitMessage({ id: 'bad/id', title: 'x' }));

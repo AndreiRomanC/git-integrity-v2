@@ -1,8 +1,41 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { createComparisonAuthorCache, comparisonAuthorMatches } = require('../frontend/comparison-authors.js');
+const { createComparisonAuthorCache, comparisonAuthorMatches, workspaceComparisonAuthorContext } = require('../frontend/comparison-authors.js');
 const context = { repositoryPath: '/repo', leftRevision: 'a', rightRevision: 'b' };
 const authors = [{ key: 'email:a@test', name: 'Name', email: 'a@test', paths: ['old', 'new', 'modified'] }];
+
+test('selecting a merge-only author with no personal touches shows no files, not all files', async () => {
+  const cache = createComparisonAuthorCache(async () => [
+    ...authors, { key: 'email:merger@test', name: 'Integrator', email: 'merger@test', paths: [] },
+  ]);
+  const model = cache.get(context);
+  await cache.load(model);
+  const rows = [{ relative_path: 'modified' }, { relative_path: 'imported' }];
+  cache.select(model, 'email:a@test');
+  assert.deepEqual(rows.filter(row => comparisonAuthorMatches(row, model)), [rows[0]]);
+  cache.select(model, 'email:merger@test');
+  assert.equal(rows.filter(row => comparisonAuthorMatches(row, model)).length, 0);
+  cache.select(model, '');
+  assert.equal(rows.filter(row => comparisonAuthorMatches(row, model)).length, 2);
+});
+
+test('workspace author context uses resolved owner and revisions, and the actual list paths', async () => {
+  const result = { repository_path: '/repo/modules/a', local_revision: 'head-sha', remote_revision: 'remote-sha',
+    rows: [{ relative_path: 'new', local: { relative_path: 'new' }, remote: { relative_path: 'old' } }, { relative_path: 'untracked' }] };
+  const context = workspaceComparisonAuthorContext(result);
+  assert.deepEqual(context, { repositoryPath: '/repo/modules/a', leftRevision: 'head-sha', rightRevision: 'remote-sha', comparisonPaths: ['new', 'old', 'untracked'] });
+  const cache = createComparisonAuthorCache(async () => authors);
+  const model = cache.get(context);
+  await cache.load(model); cache.select(model, authors[0].key);
+  assert.equal(comparisonAuthorMatches(result.rows[0], model), true);
+  assert.equal(comparisonAuthorMatches(result.rows[1], model), false);
+  const changed = workspaceComparisonAuthorContext({ ...result, rows: [{ relative_path: 'other' }] });
+  assert.notEqual(cache.get(changed), model);
+  assert.equal(cache.get(workspaceComparisonAuthorContext(result)), model);
+  cache.select(model, '');
+  assert.equal(comparisonAuthorMatches(result.rows[1], model), true);
+  assert.equal(workspaceComparisonAuthorContext({ ...result, local_revision: null }), null);
+});
 
 test('author metadata is opt-in, cached and does not change comparison rows', async () => {
   let calls = 0;
