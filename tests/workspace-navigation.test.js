@@ -125,3 +125,34 @@ test('late comparison response cannot install a list after switching tab or layo
     }
   }
 });
+
+test('pending comparison clears old rows and exposes loading state across rerenders', async () => {
+  for (const submodule of [false,true]) {
+    let finish;
+    const compare = {submodulePath:'module',leftRef:'a',rightRef:'b',rows:['old']};
+    const c = {
+      state:{repository:{path:'/repo'},view:'commander',compareMode:submodule?'submodule':'git',gitCompareMode:'refs',
+        compareFlatMode:true,subCompareFlatMode:true,submoduleCompare:compare,commanderRows:['old'],branchCompareLeftRef:'a',branchCompareRightRef:'b'},
+      refs:{commanderRows:{},subCompareRows:{}}, ensureBranchCompareRefs(){},
+      openCommanderDirectoryGuard:()=>()=>true,openSubmoduleCompareDirectoryGuard:()=>()=>true,
+      invoke:()=>new Promise(resolve=>{finish=resolve;}),render(){},status(){},revisionDisplay:String,
+    };
+    load([submodule?'openSubmoduleCompareDirectory':'openCommanderDirectory'],c);
+    const pending = submodule?c.openSubmoduleCompareDirectory(''):c.openCommanderDirectory('');
+    assert.equal((submodule?compare.rows:c.state.commanderRows).length,0);
+    assert.ok(submodule?compare.loading:c.state.commanderComparisonLoading);
+    finish({rows:['new']}); await pending;
+    assert.equal(submodule?compare.loading:c.state.commanderComparisonLoading,null);
+    assert.equal((submodule?compare.rows:c.state.commanderRows)[0],'new');
+  }
+});
+
+test('comparison renderer retains loading instead of painting a previous context', () => {
+  const element=()=>({classList:{toggle(){}},setAttribute(){},closest(){return this;},value:'',innerHTML:''});
+  const refs=new Proxy({}, {get(o,k){return o[k] ||= element();}});
+  const c={state:{repository:{path:'/repo'},compareMode:'git',gitCompareMode:'refs',compareFlatMode:true,commanderComparisonLoading:{},commanderRows:['old']},
+    refs,localDriveWorkspace:null,renderCommanderBreadcrumbs(){},renderBranchCompareSelectors(){},$:element};
+  load(['renderCommander'],c);c.renderCommander();
+  assert.match(refs.commanderRows.innerHTML,/Loading comparison/);
+  assert.doesNotMatch(refs.commanderRows.innerHTML,/old/);
+});

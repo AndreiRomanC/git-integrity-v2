@@ -37,6 +37,32 @@ const preview = (source, paths = []) => ({ source_revision: source, source_id: s
   source_subject: 'snapshot', tracked_changes: paths.map(path => ({ status: 'M', path })), clean_candidates: [] });
 const historyPage = (commits, hasMore = false, offset = commits.length, head = 'C1') => ({ commits, has_more: hasMore, next_offset: offset, head_id: head });
 
+test('file details offer only the source-selection restore, preserving the submodule fallback', () => {
+  const details = { innerHTML: '', querySelectorAll: () => [] };
+  const context = { refs: { details }, esc: String, submoduleBoundaryFor: () => null,
+    entryGitSummary: () => '', formatSize: () => '', formatModified: () => '',
+    renderPersonalNoteSection: () => '', renderEntryLastCommitInner: () => '' };
+  vm.createContext(context);
+  vm.runInContext(app.slice(app.indexOf('function contextActionSectionHtml('), app.indexOf('function folderRestoreSourceRevision()')), context);
+  for (const kind of ['file', 'deleted']) {
+    const entry = { kind, tracked: true, status: 'M', name: 'a.txt', relative_path: 'folder/a.txt' };
+    context.submoduleBoundaryFor = () => null;
+    context.renderEntryDetails(entry);
+    assert.equal((details.innerHTML.match(/data-detail-action="restorefolder"/g) || []).length, 1);
+    assert.doesNotMatch(details.innerHTML, /data-detail-action="head"/);
+    assert.match(details.innerHTML, /HEAD or a selected commit/);
+    if (kind === 'file') {
+      for (const action of ['stage', 'unstage', 'stashfile', 'compare']) {
+        assert.ok(details.innerHTML.includes(`data-detail-action="${action}"`));
+      }
+    }
+    context.submoduleBoundaryFor = () => 'folder';
+    context.renderEntryDetails(entry);
+    assert.doesNotMatch(details.innerHTML, /data-detail-action="restorefolder"/);
+    assert.equal((details.innerHTML.match(/data-detail-action="head"/g) || []).length, 1);
+  }
+});
+
 test('folder restore preview ignores a result for the previous source', async () => {
   const h = harness();
   const pending = h.context.previewFolderRestore();

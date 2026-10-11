@@ -620,7 +620,7 @@ test('repository branch compare reuses the Compare and Sync ref-diff flow', () =
   assert.match(html, /id="branchCompareRightRef"/);
   assert.match(app, /gitCompareMode: 'workspace'/);
   assert.match(app, /compare_git_revisions_directory/);
-  assert.match(app, /invoke\('compare_git_revision_file', \{/);
+  assert.match(app, /const command = context\?\.owner \? 'compare_github_module_revision_file'[\s\S]*?: 'compare_git_revision_file';[\s\S]*?invoke\(command, \{/);
   assert.match(app, /label: `Compare \$\{branchName\}…`[\s\S]*?openGraphBranchCompare\(branchName\)/);
   assert.match(app, /state\.gitCompareMode = 'refs'/);
 });

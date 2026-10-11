@@ -1,6 +1,7 @@
 //! Optional, read-only metadata for the existing snapshot comparison.
 use super::*;
 use std::collections::BTreeMap;
+pub mod strict;
 
 #[derive(Debug, Serialize)]
 pub struct ComparisonAuthor {
@@ -10,6 +11,18 @@ pub struct ComparisonAuthor {
     commits: usize,
     merge_commits: usize,
     paths: Vec<String>,
+    direct_paths: Vec<String>,
+    evidence: BTreeMap<String, Vec<ComparisonTouch>>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ComparisonTouch {
+    commit: String,
+    parent: Option<String>,
+    change: String,
+    direct: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    witness_path: Option<String>,
 }
 
 // Symmetric difference: commits reachable from either endpoint but not both.
@@ -39,26 +52,36 @@ fn collect_for_paths(repo: &Repository, left: Oid, right: Oid, comparison_paths:
             [d.old_file().path().map(normalized), d.new_file().path().map(normalized)].into_iter().flatten()
         }).collect()
     };
-    let mut authors: BTreeMap<String, (ComparisonAuthor, HashSet<String>)> = BTreeMap::new();
+    let mut authors: BTreeMap<String, (ComparisonAuthor, HashSet<String>, HashSet<String>)> = BTreeMap::new();
     let mut count = 0;
+    let mut direct_count = 0;
     for (tip, hide) in [(left, right), (right, left)] {
         let mut walk = repo.revwalk().map_err(|e| e.to_string())?;
+        // Children before parents lets us follow each endpoint's first-parent
+        // chain during the existing walk, with no second walk or tree diff.
+        walk.set_sorting(git2::Sort::TOPOLOGICAL).map_err(|e| e.to_string())?;
         walk.push(tip).map_err(|e| e.to_string())?;
         walk.hide(hide).map_err(|e| e.to_string())?;
+        let mut direct_next = Some(tip);
         for oid in walk {
             count += 1;
             if count > 100_000 || started.elapsed() > Duration::from_secs(60) {
                 return Err("Author history is too large for this request. Choose closer revisions. No partial author results were applied.".into());
             }
             let commit = repo.find_commit(oid.map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+            let direct = direct_next == Some(commit.id());
+            if direct {
+                direct_next = if commit.parent_count() == 0 { None }
+                    else { Some(commit.parent_id(0).map_err(|e| e.to_string())?) };
+            }
             let signature = commit.author();
             let name = signature.name().unwrap_or("Unknown author").to_string();
             let email = signature.email().unwrap_or("").trim().to_string();
             // Preserve email case: do not silently merge distinct identities.
             let key = if email.is_empty() { format!("name:{name}") } else { format!("email:{email}") };
-            let (author, paths) = authors.entry(key.clone()).or_insert_with(|| (ComparisonAuthor {
-                key, name, email, commits: 0, merge_commits: 0, paths: Vec::new(),
-            }, HashSet::new()));
+            let (author, paths, direct_paths) = authors.entry(key.clone()).or_insert_with(|| (ComparisonAuthor {
+                key, name, email, commits: 0, merge_commits: 0, paths: Vec::new(), direct_paths: Vec::new(), evidence: BTreeMap::new(),
+            }, HashSet::new(), HashSet::new()));
             author.commits += 1;
             author.merge_commits += usize::from(commit.parent_count() > 1);
             // Keep merge-only authors selectable (zero matching files), but
@@ -66,6 +89,7 @@ fn collect_for_paths(repo: &Repository, left: Oid, right: Oid, comparison_paths:
             // Resolution-only edits are deliberately excluded: stored parent
             // trees cannot prove which edits were made manually by this author.
             if commit.parent_count() > 1 { continue; }
+            direct_count += usize::from(direct);
             let tree = commit.tree().map_err(|e| e.to_string())?;
             for parent_index in 0..commit.parent_count().max(1) {
                 let parent_tree = if commit.parent_count() == 0 { None }
@@ -75,18 +99,36 @@ fn collect_for_paths(repo: &Repository, left: Oid, right: Oid, comparison_paths:
                     // Renames retain existing comparison semantics (delete/add).
                     for path in [delta.old_file().path(), delta.new_file().path()].into_iter().flatten() {
                         let path = normalized(path);
-                        if relevant.contains(&path) { paths.insert(path); }
+                        if relevant.contains(&path) {
+                            // At most one direct and one imported witness per
+                            // path. Reuse this diff: no extra history/worktree
+                            // scan, and no unbounded list of all file touches.
+                            let evidence = author.evidence.entry(path.clone()).or_default();
+                            if !evidence.iter().any(|touch| touch.direct == direct) {
+                                evidence.push(ComparisonTouch {
+                                    commit: commit.id().to_string(),
+                                    parent: if commit.parent_count() == 0 { None } else { Some(commit.parent_id(0).map_err(|e| e.to_string())?.to_string()) },
+                                    change: format!("{:?}", delta.status()),
+                                    direct,
+                                    witness_path: None,
+                                });
+                            }
+                            if direct { direct_paths.insert(path.clone()); }
+                            paths.insert(path);
+                        }
                     }
                 }
             }
         }
     }
-    let result = authors.into_values().map(|(mut author, paths)| {
+    let result = authors.into_values().map(|(mut author, paths, direct_paths)| {
         author.paths = paths.into_iter().collect();
         author.paths.sort();
+        author.direct_paths = direct_paths.into_iter().collect();
+        author.direct_paths.sort();
         author
     }).collect();
-    perf_log(&format!("comparison_authors: {count} commits (object trees only; non-merge touches)"), started.elapsed());
+    perf_log(&format!("comparison_authors: {count} commits; direct_non_merge={direct_count} (object trees only; non-merge touches; first-parent metadata)"), started.elapsed());
     Ok(result)
 }
 
@@ -136,6 +178,100 @@ mod tests {
     impl Drop for Fixture { fn drop(&mut self) { let _ = fs::remove_dir_all(&self.path); } }
     fn paths<'a>(authors: &'a [ComparisonAuthor], email: &str) -> Vec<&'a str> {
         authors.iter().find(|a| a.email == email).unwrap().paths.iter().map(String::as_str).collect()
+    }
+
+    #[test]
+    fn flat_list_preserves_gitlink_only_changes_without_submodule_objects() {
+        let f = Fixture::new();
+        let signature = git2::Signature::now("Author", "author@test").unwrap();
+        let make = |sha: &str, parent: Option<Oid>| {
+            let mut builder = f.repo.treebuilder(None).unwrap();
+            builder.insert("module", Oid::from_str(sha).unwrap(), 0o160000).unwrap();
+            let tree = f.repo.find_tree(builder.write().unwrap()).unwrap();
+            let parents: Vec<_> = parent.into_iter().map(|id| f.repo.find_commit(id).unwrap()).collect();
+            f.repo.commit(None, &signature, &signature, "pointer", &tree, &parents.iter().collect::<Vec<_>>()).unwrap()
+        };
+        let base = make("1111111111111111111111111111111111111111", None);
+        let tip = make("2222222222222222222222222222222222222222", Some(base));
+        let rows = compare_git_tree_file_list(&f.path.to_string_lossy(), "", &base.to_string(), &tip.to_string()).unwrap().rows;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, "modified");
+        assert_eq!(rows[0].local.as_ref().unwrap().kind, "submodule");
+        assert_eq!(rows[0].remote.as_ref().unwrap().kind, "submodule");
+        assert_eq!(rows[0].local.as_ref().unwrap().revision.as_deref(), Some("1111111111111111111111111111111111111111"));
+        let comparison = compare_git_tree_file(&f.path.to_string_lossy(), "module", &base.to_string(), &tip.to_string()).unwrap();
+        assert_eq!(comparison.local_content, "Subproject commit 1111111111111111111111111111111111111111\n");
+        assert_eq!(comparison.remote_content, "Subproject commit 2222222222222222222222222222222222222222\n");
+        assert!(tree_file_content(&f.path.to_string_lossy(), &base.to_string(), "module", false).is_err());
+    }
+
+    #[test]
+    fn evidence_reuses_real_parent_diffs_and_is_bounded_per_path() {
+        let f = Fixture::new();
+        let base = f.commit("base@test", &[("shared", "base"), ("gone", "old")], &[]);
+        let direct = f.commit("alice@test", &[("shared", "direct")], &[base]);
+        let side = f.commit("alice@test", &[("shared", "side"), ("gone", "old"), ("imported", "side")], &[base]);
+        let merged = f.commit("alice@test", &[("shared", "combined"), ("imported", "side")], &[direct, side]);
+        let tip = f.commit("alice@test", &[("shared", "later"), ("imported", "side")], &[merged]);
+        let result = collect(&f.repo, base, tip).unwrap();
+        let author = result.iter().find(|a| a.email == "alice@test").unwrap();
+        let evidence = &author.evidence["shared"];
+        assert_eq!(evidence.len(), 2);
+        let own = evidence.iter().find(|e| e.direct).unwrap();
+        assert_eq!(own.commit, tip.to_string());
+        assert_eq!(own.parent, Some(merged.to_string()));
+        let imported = evidence.iter().find(|e| !e.direct).unwrap();
+        assert_eq!(imported.commit, side.to_string());
+        assert_eq!(imported.parent, Some(base.to_string()));
+        assert_eq!(author.evidence["gone"][0].change, "Deleted");
+        assert_eq!(author.evidence["imported"][0].change, "Added");
+        assert!(author.evidence.values().flatten().all(|e| e.commit != merged.to_string()));
+        let diff = compare_git_tree_file(&f.path.to_string_lossy(), "shared", own.parent.as_ref().unwrap(), &own.commit).unwrap();
+        assert_eq!(diff.local_content, "combined");
+        assert_eq!(diff.remote_content, "later");
+    }
+
+    #[test]
+    fn direct_history_excludes_same_author_imports_but_keeps_later_direct_touches() {
+        let f = Fixture::new();
+        let base = f.commit("base@test", &[("shared", "base")], &[]);
+        let own = f.commit("alice@test", &[("shared", "own")], &[base]);
+        let side = f.commit("alice@test", &[("shared", "base"), ("imported", "side"), ("later", "side")], &[base]);
+        let merged = f.commit("alice@test", &[("shared", "own"), ("imported", "side"), ("later", "side")], &[own, side]);
+        let tip = f.commit("alice@test", &[("shared", "own"), ("imported", "side"), ("later", "direct edit")], &[merged]);
+        let result = collect(&f.repo, base, tip).unwrap();
+        let alice = result.iter().find(|a| a.email == "alice@test").unwrap();
+        assert_eq!(alice.paths, ["imported", "later", "shared"]);
+        assert_eq!(alice.direct_paths, ["later", "shared"]);
+        assert_eq!(serde_json::to_value(&result).unwrap(), serde_json::to_value(collect(&f.repo, tip, base).unwrap()).unwrap());
+        let workspace = collect_for_paths(&f.repo, base, tip, Some(vec!["imported".into(), "later".into(), "untracked".into()])).unwrap();
+        assert_eq!(workspace.iter().find(|a| a.email == "alice@test").unwrap().direct_paths, ["later"]);
+    }
+
+    #[test]
+    fn direct_history_keeps_both_diverged_endpoints_and_excludes_merge_only_edits() {
+        let f = Fixture::new();
+        let base = f.commit("base@test", &[], &[]);
+        let left = f.commit("alice@test", &[("left", "x")], &[base]);
+        let right = f.commit("alice@test", &[("right", "x")], &[base]);
+        let result = collect(&f.repo, left, right).unwrap();
+        assert_eq!(result[0].direct_paths, ["left", "right"]);
+        let merged = f.commit("merger@test", &[("left", "x"), ("right", "x"), ("resolution", "x")], &[left, right]);
+        let result = collect(&f.repo, base, merged).unwrap();
+        assert_eq!(result.iter().find(|a| a.email == "alice@test").unwrap().direct_paths, ["left"]);
+        assert!(result.iter().find(|a| a.email == "merger@test").unwrap().direct_paths.is_empty());
+        assert!(collect(&f.repo, merged, merged).unwrap().is_empty());
+    }
+
+    #[test]
+    fn direct_history_does_not_guess_squash_or_fast_forward_provenance() {
+        let f = Fixture::new();
+        let base = f.commit("base@test", &[], &[]);
+        // A single-parent commit cannot tell us whether its files were typed,
+        // copied, squash-imported, or brought in via a fast-forward.
+        let tip = f.commit("alice@test", &[("import", "x")], &[base]);
+        let result = collect(&f.repo, base, tip).unwrap();
+        assert_eq!(result[0].direct_paths, result[0].paths);
     }
 
     #[test]

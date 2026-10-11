@@ -929,6 +929,8 @@ pub struct CommanderEntry {
     relative_path: String,
     kind: String,
     size: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    revision: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -8029,7 +8031,7 @@ fn resolve_commit(repository: &str, reference: &str) -> Result<String, String> {
 
 fn remote_directory_entries(repository: &str, commit: &str, relative_path: &str) -> Result<HashMap<String, CommanderEntry>, String> {
     let repo = internal_repository(repository)?; let oid = git2::Oid::from_str(commit).map_err(|error| error.message().to_string())?; let commit = repo.find_commit(oid).map_err(|error| error.message().to_string())?; let root = commit.tree().map_err(|error| error.message().to_string())?; let tree = if relative_path.is_empty() { root } else { let entry = match root.get_path(Path::new(relative_path)) { Ok(entry) => entry, Err(_) => return Ok(HashMap::new()) }; repo.find_tree(entry.id()).map_err(|error| error.message().to_string())? };
-    let mut entries = HashMap::new(); for entry in tree.iter() { let name = entry.name().unwrap_or("").to_string(); let path = if relative_path.is_empty() { name.clone() } else { format!("{relative_path}/{name}") }; let kind = if entry.filemode() == 0o160000 { "submodule" } else if entry.kind() == Some(ObjectType::Tree) { "folder" } else { "file" }; let size = if entry.kind() == Some(ObjectType::Blob) { repo.find_blob(entry.id()).map(|blob| blob.size() as u64).unwrap_or(0) } else { 0 }; entries.insert(name.clone(), CommanderEntry { name, relative_path: path, kind: kind.into(), size }); }
+    let mut entries = HashMap::new(); for entry in tree.iter() { let name = entry.name().unwrap_or("").to_string(); let path = if relative_path.is_empty() { name.clone() } else { format!("{relative_path}/{name}") }; let kind = if entry.filemode() == 0o160000 { "submodule" } else if entry.kind() == Some(ObjectType::Tree) { "folder" } else { "file" }; let size = if entry.kind() == Some(ObjectType::Blob) { repo.find_blob(entry.id()).map(|blob| blob.size() as u64).unwrap_or(0) } else { 0 }; entries.insert(name.clone(), CommanderEntry { name, relative_path: path, kind: kind.into(), size, revision: None }); }
     Ok(entries)
 }
 
@@ -8056,7 +8058,7 @@ fn tree_directory_entries(repository: &str, commit: &str, relative_path: &str) -
         let path = if relative_path.is_empty() { name.clone() } else { format!("{relative_path}/{name}") };
         let kind = if entry.filemode() == 0o160000 { "submodule" } else if entry.kind() == Some(ObjectType::Tree) { "folder" } else { "file" };
         let size = if entry.kind() == Some(ObjectType::Blob) { repo.find_blob(entry.id()).map(|blob| blob.size() as u64).unwrap_or(0) } else { 0 };
-        let commander_entry = CommanderEntry { name: name.clone(), relative_path: path, kind: kind.into(), size };
+        let commander_entry = CommanderEntry { name: name.clone(), relative_path: path, kind: kind.into(), size, revision: None };
         entries.insert(name, GitTreeEntry { entry: commander_entry, oid: entry.id(), filemode: entry.filemode() });
     }
     Ok(entries)
@@ -8135,13 +8137,17 @@ fn revision_compare_result(repository_path: &str, relative_path: String, left_re
     }
 }
 
-fn diff_file_entry(repo: &Repository, path: Option<&Path>, oid: Oid) -> Option<CommanderEntry> {
+fn diff_file_entry(repo: &Repository, path: Option<&Path>, oid: Oid, mode: git2::FileMode) -> Option<CommanderEntry> {
     let path = path?;
     let relative_path = normalized(path);
-    if relative_path.is_empty() || repo.find_blob(oid).is_err() { return None; }
+    if relative_path.is_empty() || oid.is_zero() { return None; }
+    if mode == git2::FileMode::Commit {
+        return Some(CommanderEntry { name: relative_path.clone(), relative_path, kind: "submodule".into(), size: 0, revision: Some(oid.to_string()) });
+    }
+    if repo.find_blob(oid).is_err() { return None; }
     let name = path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_else(|| relative_path.clone());
     let size = repo.find_blob(oid).map(|blob| blob.size() as u64).unwrap_or(0);
-    Some(CommanderEntry { name, relative_path, kind: "file".into(), size })
+    Some(CommanderEntry { name, relative_path, kind: "file".into(), size, revision: None })
 }
 
 fn workdir_diff_file_entry(repository_path: &str, path: Option<&Path>) -> Option<CommanderEntry> {
@@ -8152,7 +8158,7 @@ fn workdir_diff_file_entry(repository_path: &str, path: Option<&Path>) -> Option
     let metadata = fs::metadata(&absolute).ok()?;
     if !metadata.is_file() { return None; }
     let name = path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_else(|| relative_path.clone());
-    Some(CommanderEntry { name, relative_path, kind: "file".into(), size: metadata.len() })
+    Some(CommanderEntry { name, relative_path, kind: "file".into(), size: metadata.len(), revision: None })
 }
 
 fn compare_git_tree_file_list(repository_path: &str, relative_path: &str, left_ref: &str, right_ref: &str) -> Result<RevisionCompareDirectory, String> {
@@ -8172,8 +8178,8 @@ fn compare_git_tree_file_list(repository_path: &str, relative_path: &str, left_r
     for delta in diff.deltas() {
         let old_file = delta.old_file();
         let new_file = delta.new_file();
-        let local = diff_file_entry(&repo, old_file.path(), old_file.id());
-        let remote = diff_file_entry(&repo, new_file.path(), new_file.id());
+        let local = diff_file_entry(&repo, old_file.path(), old_file.id(), old_file.mode());
+        let remote = diff_file_entry(&repo, new_file.path(), new_file.id(), new_file.mode());
         if local.is_none() && remote.is_none() { continue; }
         let status = match delta.status() {
             git2::Delta::Added => "remote-only",
@@ -8212,8 +8218,10 @@ fn compare_remote_file_list_inner(repository_path: &str, relative_path: &str, re
     for delta in diff.deltas() {
         let old_file = delta.old_file();
         let new_file = delta.new_file();
-        let local = workdir_diff_file_entry(repository_path, new_file.path());
-        let remote = diff_file_entry(&repo, old_file.path(), old_file.id());
+        let local = if new_file.mode() == git2::FileMode::Commit {
+            diff_file_entry(&repo, new_file.path(), new_file.id(), new_file.mode())
+        } else { workdir_diff_file_entry(repository_path, new_file.path()) };
+        let remote = diff_file_entry(&repo, old_file.path(), old_file.id(), old_file.mode());
         if local.is_none() && remote.is_none() { continue; }
         let status = match delta.status() {
             git2::Delta::Added | git2::Delta::Untracked => "local-only",
@@ -8231,7 +8239,7 @@ fn compare_remote_file_list_inner(repository_path: &str, relative_path: &str, re
     Ok(CommanderDirectory { repository_path: repository_path.into(), local_revision, remote_ref: remote_ref.into(), remote_revision: commit, relative_path, rows })
 }
 
-fn tree_file_content(repository_path: &str, revision: &str, relative_path: &str) -> Result<Option<Vec<u8>>, String> {
+fn tree_file_content(repository_path: &str, revision: &str, relative_path: &str, allow_gitlink: bool) -> Result<Option<Vec<u8>>, String> {
     let repo = internal_repository(repository_path)?;
     let oid = git2::Oid::from_str(revision).map_err(|error| error.message().to_string())?;
     let tree = repo.find_commit(oid).and_then(|commit| commit.tree()).map_err(|error| error.message().to_string())?;
@@ -8239,6 +8247,9 @@ fn tree_file_content(repository_path: &str, revision: &str, relative_path: &str)
         Ok(entry) => entry,
         Err(_) => return Ok(None),
     };
+    if allow_gitlink && entry.filemode() == 0o160000 {
+        return Ok(Some(format!("Subproject commit {}\n", entry.id()).into_bytes()));
+    }
     if entry.kind() != Some(ObjectType::Blob) {
         return Err(format!("{relative_path} is not a text file in {revision}"));
     }
@@ -8251,8 +8262,8 @@ fn compare_git_tree_file(repository_path: &str, relative_path: &str, left_ref: &
     let relative_path = normalized(&relative);
     let left_revision = resolve_commit(repository_path, left_ref)?;
     let right_revision = resolve_commit(repository_path, right_ref)?;
-    let left = tree_file_content(repository_path, &left_revision, &relative_path)?.unwrap_or_default();
-    let right = tree_file_content(repository_path, &right_revision, &relative_path)?.unwrap_or_default();
+    let left = tree_file_content(repository_path, &left_revision, &relative_path, true)?.unwrap_or_default();
+    let right = tree_file_content(repository_path, &right_revision, &relative_path, true)?.unwrap_or_default();
     if left.len() > 1_000_000 || right.len() > 1_000_000 || left.contains(&0) || right.contains(&0) {
         return Err("Binary files and files over 1 MB are not shown in the text compare view".into());
     }
@@ -8346,7 +8357,7 @@ pub fn compare_remote_directory(repository_path: String, relative_path: String, 
         // an extra per-file system call.
         let metadata = item.metadata().map_err(|error| error.to_string())?;
         let kind = if git_metadata.submodules.contains(&path) { "submodule" } else if metadata.is_dir() { "folder" } else { "file" };
-        let local = CommanderEntry { name: name.clone(), relative_path: path.clone(), kind: kind.into(), size: if metadata.is_file() { metadata.len() } else { 0 } };
+        let local = CommanderEntry { name: name.clone(), relative_path: path.clone(), kind: kind.into(), size: if metadata.is_file() { metadata.len() } else { 0 }, revision: None };
         let remote_entry = remote.remove(&name);
         let prefix = format!("{path}/");
         let has_changes = changed.iter().any(|changed_path| changed_path == &path || changed_path.starts_with(&prefix));
@@ -8440,7 +8451,7 @@ fn head_file_content(repository_path: &str, relative_path: &str) -> Result<Vec<u
         Ok(revision) => revision,
         Err(_) => return Ok(Vec::new()),
     };
-    tree_file_content(repository_path, &revision, relative_path).map(|content| content.unwrap_or_default())
+    tree_file_content(repository_path, &revision, relative_path, false).map(|content| content.unwrap_or_default())
 }
 
 fn index_file_content(repo: &Repository, relative: &Path) -> Result<Vec<u8>, String> {

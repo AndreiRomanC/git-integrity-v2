@@ -1,0 +1,545 @@
+//! Conservative, demand-driven provenance of endpoint differences. No checkout,
+//! index, worktree, blame subprocess, fetch, or submodule traversal is involved.
+//! Unlike a path-touch filter, a witness must explain a surviving endpoint fact.
+use super::*;
+use std::sync::Arc;
+
+#[derive(Debug, Serialize, Default)]
+pub struct Contributions {
+    paths: Vec<String>,
+    ambiguous_paths: BTreeMap<String, String>,
+    evidence: BTreeMap<String, Vec<ComparisonTouch>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct Entry { id: Oid, mode: i32 }
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum Probe {
+    // Presence AND absence are traced. Blaming the old line would incorrectly
+    // attribute deletions to its original writer rather than its remover.
+    Line(Vec<u8>, bool),
+    Atomic(Option<Entry>),
+    Exists(bool),
+    Mode(Option<i32>),
+}
+
+#[derive(Clone, Debug)]
+enum Proof { Other, Own(Oid, Option<Oid>, String), Unknown }
+
+#[derive(Clone)]
+struct CommitInfo { tree: Oid, parents: Vec<Oid>, author: String }
+struct Text { counts: HashMap<Vec<u8>, usize>, supported: bool }
+
+struct Analysis<'a> {
+    repo: &'a Repository,
+    author: &'a str,
+    exclusive: HashSet<Oid>,
+    commits: HashMap<Oid, CommitInfo>,
+    entries: HashMap<(Oid, String), Option<Entry>>,
+    texts: HashMap<Oid, Arc<Text>>,
+    renames: HashMap<(Oid, Oid), HashMap<String, (String, bool)>>,
+    proofs: HashMap<(Oid, String, Probe), Proof>,
+    deletions: HashMap<(Oid, String), HashSet<Vec<u8>>>,
+    started: Instant,
+    visits: usize,
+    bytes: usize,
+}
+
+fn identity(commit: &git2::Commit<'_>) -> String {
+    let signature = commit.author();
+    let email = signature.email().unwrap_or("").trim();
+    if email.is_empty() { format!("name:{}", signature.name().unwrap_or("Unknown author")) }
+    else { format!("email:{email}") }
+}
+
+fn rename_counts(diff: &git2::Diff<'_>) -> (HashMap<Oid, usize>, HashMap<Oid, usize>) {
+    let mut removed = HashMap::new(); let mut added = HashMap::new();
+    for delta in diff.deltas() {
+        if delta.status() == git2::Delta::Deleted { *removed.entry(delta.old_file().id()).or_insert(0) += 1; }
+        if delta.status() == git2::Delta::Added { *added.entry(delta.new_file().id()).or_insert(0) += 1; }
+    }
+    (removed, added)
+}
+
+impl<'a> Analysis<'a> {
+    fn budget(&mut self) -> Result<(), String> {
+        self.visits += 1;
+        if self.visits > 250_000 || self.bytes > 64 * 1024 * 1024 || self.started.elapsed() > Duration::from_secs(30) {
+            return Err("Strict attribution exceeded its analysis budget. No partial results were applied; choose closer revisions or disable the strict filter.".into());
+        }
+        Ok(())
+    }
+
+    fn commit(&mut self, id: Oid) -> Result<CommitInfo, String> {
+        if let Some(info) = self.commits.get(&id) { return Ok(info.clone()); }
+        let commit = self.repo.find_commit(id).map_err(|e| e.to_string())?;
+        let info = CommitInfo { tree: commit.tree_id(), parents: commit.parent_ids().collect(), author: identity(&commit) };
+        self.commits.insert(id, info.clone());
+        Ok(info)
+    }
+
+    fn entry(&mut self, id: Oid, path: &str) -> Result<Option<Entry>, String> {
+        let key = (id, path.to_string());
+        if let Some(entry) = self.entries.get(&key) { return Ok(*entry); }
+        self.budget()?;
+        let info = self.commit(id)?;
+        let tree = self.repo.find_tree(info.tree).map_err(|e| e.to_string())?;
+        let entry = match tree.get_path(Path::new(path)) {
+            Ok(entry) => Some(Entry { id: entry.id(), mode: entry.filemode() }),
+            Err(e) if e.code() == git2::ErrorCode::NotFound => None,
+            Err(e) => return Err(e.to_string()),
+        };
+        self.entries.insert(key, entry);
+        Ok(entry)
+    }
+
+    fn text(&mut self, entry: Option<Entry>) -> Result<Arc<Text>, String> {
+        let Some(entry) = entry else { return Ok(Arc::new(Text { counts: HashMap::new(), supported: true })); };
+        if entry.mode == 0o160000 || entry.mode == 0o40000 {
+            return Ok(Arc::new(Text { counts: HashMap::new(), supported: false }));
+        }
+        if let Some(text) = self.texts.get(&entry.id) { return Ok(text.clone()); }
+        let blob = self.repo.find_blob(entry.id).map_err(|e| e.to_string())?;
+        let supported = blob.size() <= 2 * 1024 * 1024 && !blob.is_binary();
+        let mut counts = HashMap::new();
+        if supported {
+            self.bytes += blob.size();
+            self.budget()?;
+            for line in blob.content().split_inclusive(|byte| *byte == b'\n') {
+                *counts.entry(line.to_vec()).or_insert(0) += 1;
+            }
+        }
+        let text = Arc::new(Text { counts, supported });
+        self.texts.insert(entry.id, text.clone());
+        Ok(text)
+    }
+
+    fn matches(&mut self, id: Oid, path: &str, probe: &Probe) -> Result<Option<bool>, String> {
+        let entry = self.entry(id, path)?;
+        Ok(match probe {
+            Probe::Atomic(value) => Some(entry == *value),
+            Probe::Exists(value) => Some(entry.is_some() == *value),
+            Probe::Mode(value) => Some(entry.map(|e| e.mode) == *value),
+            Probe::Line(line, present) => {
+                let text = self.text(entry)?;
+                let count = text.counts.get(line).copied().unwrap_or(0);
+                if !text.supported || count > 1 { None } else { Some((count == 1) == *present) }
+            }
+        })
+    }
+
+    // Rename discovery is lazy (only when a present path is absent in a parent).
+    // Exact blob renames can preserve provenance. Edited/similarity-only rename
+    // associations are not sufficiently certain for strict content attribution.
+    fn parent_path(&mut self, child: Oid, parent: Oid, path: &str, probe: &Probe) -> Result<Option<String>, String> {
+        if !matches!(probe, Probe::Line(_, _)) || self.entry(parent, path)?.is_some() || self.entry(child, path)?.is_none() {
+            return Ok(Some(path.into()));
+        }
+        let key = (child, parent);
+        if !self.renames.contains_key(&key) {
+            self.budget()?;
+            let child_tree = self.commit(child)?.tree;
+            let parent_tree = self.commit(parent)?.tree;
+            let child_tree = self.repo.find_tree(child_tree).map_err(|e| e.to_string())?;
+            let parent_tree = self.repo.find_tree(parent_tree).map_err(|e| e.to_string())?;
+            let mut diff = self.repo.diff_tree_to_tree(Some(&parent_tree), Some(&child_tree), None).map_err(|e| e.to_string())?;
+            let (removed, added) = rename_counts(&diff);
+            let mut options = git2::DiffFindOptions::new();
+            options.renames(true).rename_limit(200);
+            diff.find_similar(Some(&mut options)).map_err(|e| e.to_string())?;
+            let mut paths = HashMap::new();
+            for delta in diff.deltas().filter(|d| d.status() == git2::Delta::Renamed) {
+                if let (Some(old), Some(new)) = (delta.old_file().path(), delta.new_file().path()) {
+                    let exact_unique = delta.old_file().id() == delta.new_file().id()
+                        && removed.get(&delta.old_file().id()) == Some(&1) && added.get(&delta.new_file().id()) == Some(&1);
+                    paths.insert(normalized(new), (normalized(old), exact_unique));
+                }
+            }
+            self.renames.insert(key, paths);
+        }
+        Ok(match self.renames[&key].get(path) {
+            Some((old, true)) => Some(old.clone()),
+            Some((_, false)) => None,
+            None => Some(path.into()),
+        })
+    }
+
+    fn trace(&mut self, id: Oid, path: &str, probe: &Probe, depth: usize) -> Result<Proof, String> {
+        if !self.exclusive.contains(&id) { return Ok(Proof::Other); }
+        if depth > 256 { return Ok(Proof::Unknown); }
+        let key = (id, path.to_string(), probe.clone());
+        if let Some(proof) = self.proofs.get(&key) { return Ok(proof.clone()); }
+        self.bytes += path.len() + if let Probe::Line(line, _) = probe { line.len() } else { 64 };
+        self.budget()?;
+        if self.matches(id, path, probe)? != Some(true) { return Ok(Proof::Unknown); }
+        let info = self.commit(id)?;
+        let mut inherited = Vec::new();
+        for parent in &info.parents {
+            let Some(parent_path) = self.parent_path(id, *parent, path, probe)? else { inherited.push(Proof::Unknown); continue; };
+            match self.matches(*parent, &parent_path, probe)? {
+                Some(true) => inherited.push(self.trace(*parent, &parent_path, probe, depth + 1)?),
+                None => inherited.push(Proof::Unknown),
+                Some(false) => {},
+            }
+        }
+        let proof = if !inherited.is_empty() {
+            // Equal content in multiple parents has multiple possible origins.
+            // Do not pick the author's parent simply because it is convenient.
+            if inherited.iter().all(|p| matches!(p, Proof::Own(..))) { inherited.remove(0) }
+            else if inherited.iter().all(|p| matches!(p, Proof::Other)) { Proof::Other }
+            else { Proof::Unknown }
+        } else if info.parents.len() > 1 {
+            // Novel merge content/deletion may be a resolution or a different
+            // historical merge driver. Never attribute it from authorship alone.
+            Proof::Unknown
+        } else if info.parents.is_empty() && matches!(probe, Probe::Line(_, false) | Probe::Atomic(None) | Probe::Exists(false) | Probe::Mode(None)) {
+            Proof::Other
+        } else if info.author == self.author {
+            if let (Probe::Line(line, false), Some(parent)) = (probe, info.parents.first()) {
+                // A->B->C must not credit B's author merely because A is still
+                // absent. Replacement provenance is proved by surviving added
+                // lines; absence alone proves only a standalone deletion hunk.
+                if self.standalone_deletion(id, *parent, path, line)? {
+                    Proof::Own(id, Some(*parent), path.into())
+                } else { Proof::Unknown }
+            } else { Proof::Own(id, info.parents.first().copied(), path.into()) }
+        } else { Proof::Other };
+        self.proofs.insert(key, proof.clone());
+        Ok(proof)
+    }
+
+    fn standalone_deletion(&mut self, id: Oid, parent: Oid, path: &str, line: &[u8]) -> Result<bool, String> {
+        let key = (id, path.to_string());
+        if !self.deletions.contains_key(&key) {
+            let old = self.entry(parent, path)?.map(|e| self.repo.find_blob(e.id)).transpose().map_err(|e| e.to_string())?;
+            let new = self.entry(id, path)?.map(|e| self.repo.find_blob(e.id)).transpose().map_err(|e| e.to_string())?;
+            let mut options = git2::DiffOptions::new(); options.context_lines(0).interhunk_lines(0);
+            let patch = git2::Patch::from_buffers(old.as_ref().map(|b| b.content()).unwrap_or(&[]), None,
+                new.as_ref().map(|b| b.content()).unwrap_or(&[]), None, Some(&mut options)).map_err(|e| e.to_string())?;
+            let mut deleted = HashSet::new();
+            for h in 0..patch.num_hunks() {
+                let (_, count) = patch.hunk(h).map_err(|e| e.to_string())?;
+                let mut removed = Vec::new(); let mut replacement = false;
+                for i in 0..count {
+                    let line = patch.line_in_hunk(h, i).map_err(|e| e.to_string())?;
+                    if line.origin() == '+' { replacement = true; }
+                    if line.origin() == '-' { removed.push(line.content().to_vec()); }
+                }
+                if !replacement { deleted.extend(removed); }
+            }
+            self.deletions.insert(key.clone(), deleted);
+        }
+        Ok(self.deletions[&key].contains(line))
+    }
+}
+
+fn collect_strict(repo: &Repository, left: Oid, right: Oid, author: &str) -> Result<Contributions, String> {
+    if repo.is_shallow() { return Err("Strict attribution requires complete local history. No results were applied.".into()); }
+    let started = Instant::now();
+    let mut exclusive = HashSet::new();
+    for (tip, hide) in [(left, right), (right, left)] {
+        let mut walk = repo.revwalk().map_err(|e| e.to_string())?;
+        walk.push(tip).map_err(|e| e.to_string())?;
+        walk.hide(hide).map_err(|e| e.to_string())?;
+        for id in walk {
+            exclusive.insert(id.map_err(|e| e.to_string())?);
+            if exclusive.len() > 100_000 || started.elapsed() > Duration::from_secs(30) { return Err("History exceeds the strict attribution budget. Choose closer revisions.".into()); }
+        }
+    }
+    let mut analysis = Analysis { repo, author, exclusive, commits: HashMap::new(), entries: HashMap::new(), texts: HashMap::new(), renames: HashMap::new(), proofs: HashMap::new(), deletions: HashMap::new(), started, visits: 0, bytes: 0 };
+    let left_tree = repo.find_commit(left).and_then(|c| c.tree()).map_err(|e| e.to_string())?;
+    let right_tree = repo.find_commit(right).and_then(|c| c.tree()).map_err(|e| e.to_string())?;
+    let mut diff = repo.diff_tree_to_tree(Some(&left_tree), Some(&right_tree), None).map_err(|e| e.to_string())?;
+    let (removed, added) = rename_counts(&diff);
+    let mut options = git2::DiffFindOptions::new();
+    options.renames(true).exact_match_only(true).rename_threshold(100).rename_limit(200);
+    diff.find_similar(Some(&mut options)).map_err(|e| e.to_string())?;
+    let mut result = Contributions::default();
+    for delta in diff.deltas() {
+        let old = delta.old_file().path().map(normalized);
+        let new = delta.new_file().path().map(normalized);
+        let old_path = old.as_deref().or(new.as_deref()).unwrap_or("");
+        let new_path = new.as_deref().or(old.as_deref()).unwrap_or("");
+        if delta.status() == git2::Delta::Renamed && (removed.get(&delta.old_file().id()) != Some(&1) || added.get(&delta.new_file().id()) != Some(&1)) {
+            for path in [old, new].into_iter().flatten() {
+                result.ambiguous_paths.insert(path, "Multiple identical files make rename pairing ambiguous. No historical file identity was guessed.".into());
+            }
+            continue;
+        }
+        let a = analysis.entry(left, old_path)?;
+        let b = analysis.entry(right, new_path)?;
+        let mut probes = Vec::new();
+        let mut ambiguous = false;
+        if a.into_iter().chain(b).any(|e| e.mode == 0o160000) {
+            probes.push((left, old_path.to_string(), Probe::Atomic(a)));
+            probes.push((right, new_path.to_string(), Probe::Atomic(b)));
+        } else {
+            let at = analysis.text(a)?;
+            let bt = analysis.text(b)?;
+            if at.supported && bt.supported {
+                let lines: std::collections::BTreeSet<_> = at.counts.keys().chain(bt.counts.keys()).cloned().collect();
+                for line in lines {
+                    let ac = at.counts.get(&line).copied().unwrap_or(0);
+                    let bc = bt.counts.get(&line).copied().unwrap_or(0);
+                    if ac == bc { continue; }
+                    if ac > 1 || bc > 1 || line.len() > 8192 { ambiguous = true; continue; }
+                    probes.push((left, old_path.to_string(), Probe::Line(line.clone(), ac == 1)));
+                    probes.push((right, new_path.to_string(), Probe::Line(line, bc == 1)));
+                }
+                if at.counts.is_empty() && bt.counts.is_empty() && a.is_some() != b.is_some() {
+                    probes.push((left, old_path.to_string(), Probe::Exists(a.is_some())));
+                    probes.push((right, new_path.to_string(), Probe::Exists(b.is_some())));
+                }
+            } else {
+                // Binary/oversized blobs have no safe partial-edit attribution.
+                ambiguous = true;
+            }
+            if a.is_some() && b.is_some() && a.map(|e| e.mode) != b.map(|e| e.mode) {
+                probes.push((left, old_path.to_string(), Probe::Mode(a.map(|e| e.mode))));
+                probes.push((right, new_path.to_string(), Probe::Mode(b.map(|e| e.mode))));
+            }
+            if old_path != new_path {
+                for path in [old_path, new_path] {
+                    probes.push((left, path.to_string(), Probe::Exists(analysis.entry(left, path)?.is_some())));
+                    probes.push((right, path.to_string(), Probe::Exists(analysis.entry(right, path)?.is_some())));
+                }
+            }
+        }
+        // Pure reordering/duplicate-line edits cannot be established by unique
+        // line provenance. Report uncertainty instead of guessing line identity.
+        if probes.is_empty() { ambiguous = true; }
+        if probes.len() > 4096 { probes.clear(); ambiguous = true; }
+        let mut witness = None;
+        for (tip, path, probe) in probes {
+            match analysis.trace(tip, &path, &probe, 0)? {
+                Proof::Own(commit, parent, path) => { witness = Some((commit, parent, path)); break; },
+                Proof::Unknown => ambiguous = true,
+                Proof::Other => {},
+            }
+        }
+        let paths: HashSet<_> = [old, new].into_iter().flatten().collect();
+        for path in paths {
+            if let Some((commit, parent, witness_path)) = &witness {
+                result.paths.push(path.clone());
+                // The witness's historic path may differ after an exact rename.
+                result.evidence.insert(path, vec![ComparisonTouch { commit: commit.to_string(), parent: parent.map(|p| p.to_string()), change: "Surviving contribution".into(), direct: true, witness_path: Some(witness_path.clone()) }]);
+            } else if ambiguous {
+                result.ambiguous_paths.insert(path, "Attribution is inconclusive (merge resolution, duplicate/moved lines, rename ambiguity, binary/large file, or history depth). Not included as a proven contribution.".into());
+            }
+        }
+    }
+    result.paths.sort(); result.paths.dedup();
+    perf_log(&format!("comparison_author_contributions: left={} right={} commits={} paths={} ambiguous={} visits={} budget_bytes={}", &left.to_string()[..8], &right.to_string()[..8], analysis.exclusive.len(), result.paths.len(), result.ambiguous_paths.len(), analysis.visits, analysis.bytes), started.elapsed());
+    Ok(result)
+}
+
+#[tauri::command]
+pub async fn comparison_author_contributions(repository_path: String, submodule_path: Option<String>, owner: Option<String>, repository_name: Option<String>, left_revision: String, right_revision: String, author_key: String, comparison_paths: Option<Vec<String>>) -> Result<Contributions, String> {
+    off_main_thread(move || {
+        if comparison_paths.is_some() {
+            return Err("Strict attribution is available for two committed revisions. Local uncommitted differences have no Git author; compare HEAD with the other revision or disable the strict filter.".into());
+        }
+        validate_path(&repository_path)?;
+        let path = match (owner, repository_name, submodule_path) {
+            (Some(owner), Some(name), None) => { let (owner, name) = validate_github_module_identity(&owner, &name)?; github_module_cache_path(&owner, &name) },
+            (None, None, Some(path)) => validate_submodule(&repository_path, &path)?,
+            (None, None, None) => PathBuf::from(repository_path),
+            _ => return Err("Invalid comparison repository context".into()),
+        };
+        let repo = internal_repository(&path.to_string_lossy())?;
+        collect_strict(&repo, Oid::from_str(&left_revision).map_err(|e| e.to_string())?, Oid::from_str(&right_revision).map_err(|e| e.to_string())?, &author_key)
+    }).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::SystemTime;
+    struct Fixture { repo: Repository, path: PathBuf }
+    impl Fixture {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!("ddt-strict-{}-{}-{}", std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos(), NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+            Self { repo: Repository::init(&path).unwrap(), path }
+        }
+        fn commit(&self, author: &str, files: &[(&str, &str)], parents: &[Oid]) -> Oid {
+            self.entries(author, &files.iter().map(|(p,c)| (*p,*c,0o100644)).collect::<Vec<_>>(), parents)
+        }
+        fn entries(&self, author: &str, files: &[(&str, &str, i32)], parents: &[Oid]) -> Oid {
+            let mut builder = self.repo.treebuilder(None).unwrap();
+            for (name, content, mode) in files {
+                let id = if *mode == 0o160000 { Oid::from_str(content).unwrap() } else { self.repo.blob(content.as_bytes()).unwrap() };
+                builder.insert(*name, id, *mode).unwrap();
+            }
+            let tree = self.repo.find_tree(builder.write().unwrap()).unwrap();
+            let sig = git2::Signature::now(author, &format!("{author}@test")).unwrap();
+            let parents: Vec<_> = parents.iter().map(|id| self.repo.find_commit(*id).unwrap()).collect();
+            self.repo.commit(None, &sig, &sig, "fixture", &tree, &parents.iter().collect::<Vec<_>>()).unwrap()
+        }
+        fn check(&self, left: Oid, right: Oid, author: &str, paths: &[&str]) -> Contributions {
+            let key = format!("email:{author}@test");
+            let result = collect_strict(&self.repo,left,right,&key).unwrap();
+            assert_eq!(result.paths,paths, "author={author}");
+            let reverse = collect_strict(&self.repo,right,left,&key).unwrap();
+            assert_eq!(reverse.paths,result.paths,"direction must not change inclusion");
+            assert_eq!(reverse.ambiguous_paths.keys().collect::<Vec<_>>(),result.ambiguous_paths.keys().collect::<Vec<_>>());
+            result
+        }
+    }
+    impl Drop for Fixture { fn drop(&mut self) { let _ = fs::remove_dir_all(&self.path); } }
+
+    #[test]
+    fn direct_shared_file_keeps_full_diff_and_is_read_only() {
+        let f = Fixture::new();
+        let base = f.commit("base", &[("f","base\n")], &[]);
+        let a = f.commit("alice", &[("f","base\nalice\n")], &[base]);
+        let b = f.commit("bob", &[("f","base\nalice\nbob\n")], &[a]);
+        f.repo.reference("refs/heads/main", b, true, "fixture").unwrap(); f.repo.set_head("refs/heads/main").unwrap();
+        fs::write(f.path.join("f"), "staged").unwrap();
+        let mut index = f.repo.index().unwrap(); index.add_path(Path::new("f")).unwrap(); index.write().unwrap();
+        fs::write(f.path.join("f"), "unstaged").unwrap(); fs::write(f.path.join("untracked"),"untouched").unwrap();
+        let index_before = fs::read(f.repo.path().join("index")).unwrap();
+        f.check(base,b,"alice",&["f"]); f.check(base,b,"bob",&["f"]);
+        assert_eq!(fs::read(f.repo.path().join("index")).unwrap(),index_before);
+        assert_eq!(fs::read_to_string(f.path.join("f")).unwrap(),"unstaged");
+        assert_eq!(fs::read_to_string(f.path.join("untracked")).unwrap(),"untouched");
+        assert_eq!(f.repo.head().unwrap().target(),Some(b));
+        let diff = compare_git_tree_file(&f.path.to_string_lossy(),"f",&base.to_string(),&b.to_string()).unwrap();
+        assert_eq!(diff.remote_content,"base\nalice\nbob\n");
+    }
+
+    #[test]
+    fn overwritten_and_reverted_contributions_do_not_qualify() {
+        let f = Fixture::new();
+        let base = f.commit("base", &[("f","base\n")], &[]);
+        let a = f.commit("alice", &[("f","alice replacement\n")], &[base]);
+        let b = f.commit("bob", &[("f","bob replacement\n")], &[a]);
+        f.check(base,b,"alice",&[]); f.check(base,b,"bob",&["f"]);
+        let reverted = f.commit("bob", &[("f","base\nbob extra\n")], &[b]);
+        f.check(base,reverted,"alice",&[]);
+    }
+
+    #[test]
+    fn standalone_deletions_and_empty_files_are_attributed() {
+        let f = Fixture::new();
+        let base = f.commit("base", &[("f","keep\ndelete\n"),("gone","old\n")], &[]);
+        let a = f.commit("alice", &[("f","keep\n"),("empty","")], &[base]);
+        f.check(base,a,"alice",&["empty","f","gone"]);
+        let b = f.commit("bob", &[("f","keep\ndelete\n"),("empty","")], &[a]);
+        f.check(base,b,"alice",&["empty","gone"]);
+    }
+
+    #[test]
+    fn repeated_merges_preserve_original_authors_not_integrator() {
+        let f = Fixture::new();
+        let base = f.commit("base", &[("f","base\n")], &[]);
+        let a = f.commit("alice", &[("f","base\nalice\n")], &[base]);
+        let b = f.commit("bob", &[("f","base\nbob\n"),("import","bob\n")], &[base]);
+        let m = f.commit("integrator", &[("f","base\nalice\nbob\n"),("import","bob\n")], &[a,b]);
+        let c = f.commit("carol", &[("f","base\nbob\ncarol\n"),("import","bob\n")], &[b]);
+        let tip = f.commit("integrator", &[("f","base\nalice\nbob\ncarol\n"),("import","bob\n")], &[m,c]);
+        f.check(base,tip,"alice",&["f"]); f.check(base,tip,"bob",&["f","import"]);
+        f.check(base,tip,"integrator",&[]); f.check(c,tip,"alice",&["f"]);
+        f.check(c,tip,"bob",&[]);
+    }
+
+    #[test]
+    fn feature_to_feature_and_same_author_side_branch() {
+        let f = Fixture::new();
+        let base = f.commit("base", &[("f","base\n")], &[]);
+        let left = f.commit("alice", &[("f","base\nleft\n")], &[base]);
+        let side = f.commit("alice", &[("f","base\nside\n"),("side","side\n")], &[base]);
+        let tip = f.commit("bob", &[("f","base\nside\n"),("side","side\n")], &[base,side]);
+        f.check(left,tip,"alice",&["f","side"]); f.check(base,tip,"bob",&[]);
+    }
+
+    #[test]
+    fn novel_conflict_resolution_is_explicitly_inconclusive() {
+        let f = Fixture::new();
+        let base = f.commit("base", &[("f","base\n")], &[]);
+        let a = f.commit("alice", &[("f","ours\n")], &[base]);
+        let b = f.commit("bob", &[("f","theirs\n")], &[base]);
+        let m = f.commit("resolver", &[("f","novel resolution\n")], &[a,b]);
+        assert!(f.check(base,m,"resolver",&[]).ambiguous_paths.contains_key("f"));
+        f.check(base,m,"alice",&[]); f.check(base,m,"bob",&[]);
+    }
+
+    #[test]
+    fn same_content_multiple_parent_origins_are_not_guessed() {
+        let f = Fixture::new();
+        let base = f.commit("base", &[], &[]);
+        let a = f.commit("alice", &[("f","same\n")], &[base]);
+        let b = f.commit("bob", &[("f","same\n")], &[base]);
+        let m = f.commit("resolver", &[("f","same\n")], &[a,b]);
+        assert!(f.check(base,m,"alice",&[]).ambiguous_paths.contains_key("f"));
+    }
+
+    #[test]
+    fn exact_rename_preserves_content_provenance_and_path_change() {
+        let f = Fixture::new();
+        let base = f.commit("base", &[("old","base\n")], &[]);
+        let a = f.commit("alice", &[("old","base\nalice\n")], &[base]);
+        let renamed = f.commit("bob", &[("new","base\nalice\n")], &[a]);
+        // Endpoint edited renames are still represented as delete/add rows.
+        let result = collect_strict(&f.repo,base,renamed,"email:alice@test").unwrap();
+        assert!(result.paths.contains(&"new".to_string()));
+        f.check(a,renamed,"bob",&["new","old"]);
+    }
+
+    #[test]
+    fn gitlinks_are_atomic_and_do_not_require_submodule_objects() {
+        let f = Fixture::new();
+        let one = "1111111111111111111111111111111111111111";
+        let two = "2222222222222222222222222222222222222222";
+        let three = "3333333333333333333333333333333333333333";
+        let base = f.entries("base", &[("module",one,0o160000)], &[]);
+        let a = f.entries("alice", &[("module",two,0o160000)], &[base]);
+        let imported = f.entries("integrator", &[("module",two,0o160000)], &[base,a]);
+        f.check(base,imported,"alice",&["module"]); f.check(base,imported,"integrator",&[]);
+        let overwritten = f.entries("bob", &[("module",three,0o160000)], &[imported]);
+        f.check(base,overwritten,"alice",&[]); f.check(base,overwritten,"bob",&["module"]);
+        let reverted = f.entries("bob", &[("module",one,0o160000)], &[overwritten]);
+        f.check(base,reverted,"alice",&[]);
+        let deleted = f.entries("alice", &[], &[base]);
+        f.check(base,deleted,"alice",&["module"]);
+    }
+
+    #[test]
+    fn duplicate_lines_binary_files_and_reordering_are_explicit() {
+        let f = Fixture::new();
+        let base = f.commit("base", &[("duplicate","x\nx\n"),("order","a\nb\n"),("binary","a\0b")], &[]);
+        let a = f.commit("alice", &[("duplicate","x\n"),("order","b\na\n"),("binary","a\0c")], &[base]);
+        let result = f.check(base,a,"alice",&[]);
+        assert_eq!(result.ambiguous_paths.len(),3);
+    }
+
+    #[test]
+    fn mode_only_changes_and_added_gitlinks_have_atomic_provenance() {
+        let f = Fixture::new();
+        let base = f.entries("base", &[("script","unchanged\n",0o100644)], &[]);
+        let tip = f.entries("alice", &[("script","unchanged\n",0o100755),("module","1111111111111111111111111111111111111111",0o160000)], &[base]);
+        f.check(base,tip,"alice",&["module","script"]);
+        f.check(tip,tip,"alice",&[]);
+    }
+
+    #[test]
+    fn incomplete_history_is_an_error_not_an_unfiltered_result() {
+        let f = Fixture::new();
+        let base = f.commit("base", &[], &[]);
+        let tip = f.commit("alice", &[("f","own\n")], &[base]);
+        assert!(collect_strict(&f.repo,base,Oid::zero(),"email:alice@test").is_err());
+        fs::write(f.repo.path().join("shallow"),format!("{tip}\n")).unwrap();
+        let reopened = Repository::open(&f.path).unwrap();
+        assert!(collect_strict(&reopened,base,tip,"email:alice@test").unwrap_err().contains("complete local history"));
+    }
+
+    #[test]
+    fn duplicate_blob_rename_pairing_is_never_used_as_certain_provenance() {
+        let f = Fixture::new();
+        let base = f.commit("base", &[("a","same\n"),("b","same\n")], &[]);
+        let tip = f.commit("alice", &[("c","same\n"),("d","same\n")], &[base]);
+        let result = f.check(base,tip,"alice",&[]);
+        assert_eq!(result.ambiguous_paths.len(),4);
+    }
+}

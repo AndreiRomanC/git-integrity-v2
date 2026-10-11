@@ -88,6 +88,7 @@ pub fn run() {
             repository::compare_git_revisions_directory,
             repository::compare_git_revisions_file_list,
             repository::comparison_authors::comparison_authors,
+            repository::comparison_authors::strict::comparison_author_contributions,
             repository::compare_git_revision_file,
             repository::compare_submodule_revisions_directory,
             repository::compare_submodule_revisions_file_list,

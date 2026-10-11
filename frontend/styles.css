@@ -1355,8 +1355,16 @@ dialog form { padding: 28px; text-align: center; }dialog h2 { margin: 0 0 10px; 
 .comparison-author-filter[hidden] { display: none; }
 .comparison-author-filter label { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 .comparison-author-filter select { max-width: 100%; min-width: 0; }
+.comparison-author-filter .comparison-author-direct { font-size: 12px; gap: 6px; }
+.comparison-author-direct input { width: auto; margin: 0; flex: 0 0 auto; }
 .comparison-author-filter small, .comparison-author-filter details { font-size: 12px; color: var(--muted); }
 .comparison-author-filter p { max-width: 85ch; margin: 6px 0; }
+.comparison-file-evidence { grid-column: 1 / -1; color: var(--muted); font-size: 11px; padding: 2px 12px 5px; border-bottom: 1px solid var(--border-soft); }
+.comparison-file-evidence summary { cursor: pointer; width: fit-content; }
+.comparison-file-evidence p { margin: 6px 0; overflow-wrap: anywhere; }
+.comparison-touch { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 6px 0; }
+.comparison-touch span { min-width: 0; overflow-wrap: anywhere; }
+.comparison-touch button { flex-shrink: 0; font-size: 11px; padding: 4px 8px; }
 .compare-flat-controls.has-author-filter { flex-wrap: wrap; }
 .polarion-search-button { flex: none; white-space: nowrap; font-size: 11px; padding: 5px 9px; }
 .commit-dialog .polarion-search-button, .commit-area > .polarion-search-button { width: auto; height: 28px; margin: 6px 0; align-self: flex-start; background: var(--surface); color: var(--blue); border: 1px solid var(--border); border-radius: 6px; }
