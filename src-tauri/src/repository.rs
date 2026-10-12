@@ -6586,19 +6586,7 @@ fn github_module_ref_limit(query: &str, requested: Option<usize>) -> usize {
     if query.is_empty() { usize::MAX } else { requested.unwrap_or(160).clamp(1, 300) }
 }
 
-fn github_module_refs_inner(repository_path: String, owner: String, repository_name: String, query: String, limit: Option<usize>) -> Result<Vec<GitHubModuleRef>, String> {
-    let started = Instant::now();
-    validate_path(&repository_path)?;
-    let owner = owner.trim();
-    let repository_name = repository_name.trim().trim_end_matches(".git");
-    if owner.is_empty() || repository_name.is_empty() || owner.contains('/') || repository_name.contains('/') {
-        return Err("Choose a valid GitHub repository first.".into());
-    }
-    let query = query.trim().to_lowercase();
-    let limit = github_module_ref_limit(&query, limit);
-    let url = github_module_clone_url(owner, repository_name);
-    let raw = git_with_timeout(&repository_path, &["ls-remote", "--heads", "--tags", &url], Duration::from_secs(60), "60 seconds")
-        .map_err(|detail| format!("Could not read branch/tag list from {owner}/{repository_name}: {detail}"))?;
+fn parse_github_module_advertised_refs(raw: &str) -> Vec<GitHubModuleRef> {
     let mut branches = Vec::new();
     let mut tags: HashMap<String, String> = HashMap::new();
     for line in raw.lines() {
@@ -6618,14 +6606,37 @@ fn github_module_refs_inner(repository_path: String, owner: String, repository_n
     branches.sort_by(|left, right| left.0.cmp(&right.0));
     let mut tag_items = tags.into_iter().collect::<Vec<_>>();
     tag_items.sort_by(|left, right| left.0.cmp(&right.0));
+    branches.into_iter().map(|(name, revision)| (name, revision, "branch"))
+        .chain(tag_items.into_iter().map(|(name, revision)| (name, revision, "tag")))
+        .map(|(name, revision, kind)| GitHubModuleRef { name, revision, kind: kind.into(), subject: String::new(), date: String::new() })
+        .collect()
+}
+
+fn github_module_refs_inner(repository_path: String, owner: String, repository_name: String, query: String, limit: Option<usize>) -> Result<Vec<GitHubModuleRef>, String> {
+    let started = Instant::now();
+    validate_path(&repository_path)?;
+    let owner = owner.trim();
+    let repository_name = repository_name.trim().trim_end_matches(".git");
+    if owner.is_empty() || repository_name.is_empty() || owner.contains('/') || repository_name.contains('/') {
+        return Err("Choose a valid GitHub repository first.".into());
+    }
+    let query = query.trim().to_lowercase();
+    let limit = github_module_ref_limit(&query, limit);
+    let url = github_module_clone_url(owner, repository_name);
+    let raw = git_with_timeout(&repository_path, &["ls-remote", "--heads", "--tags", &url], Duration::from_secs(60), "60 seconds")
+        .map_err(|detail| format!("Could not read branch/tag list from {owner}/{repository_name}: {detail}"))?;
+    let advertised = parse_github_module_advertised_refs(&raw);
+    perf_log(&format!("github_module_refs: {owner}/{repository_name} advertised_branches={} advertised_tags={} response_bytes={}",
+        advertised.iter().filter(|item| item.kind == "branch").count(),
+        advertised.iter().filter(|item| item.kind == "tag").count(), raw.len()), started.elapsed());
     let mut results = Vec::new();
     let mut seen = HashSet::new();
     let matches = |name: &str, sha: &str, kind: &str| query.is_empty() || name.to_lowercase().contains(&query) || sha.to_lowercase().contains(&query) || kind.contains(&query);
-    for (name, sha) in branches {
-        if matches(&name, &sha, "branch") && push_github_module_ref(&mut results, &mut seen, limit, name, sha, "branch", String::new(), String::new()) { return Ok(results); }
-    }
-    for (name, sha) in tag_items {
-        if matches(&name, &sha, "tag") && push_github_module_ref(&mut results, &mut seen, limit, name, sha, "tag", String::new(), String::new()) { return Ok(results); }
+    for item in advertised {
+        if matches(&item.name, &item.revision, &item.kind) && push_github_module_ref(&mut results, &mut seen, limit, item.name, item.revision, &item.kind, String::new(), String::new()) {
+            perf_log(&format!("github_module_refs: {owner}/{repository_name} query_len={} results={} lookup_limit_reached=true", query.len(), results.len()), started.elapsed());
+            return Ok(results);
+        }
     }
     if looks_like_commit_query(&query) {
         let credential_repo = github_module_browser_context(&repository_path);
@@ -9572,6 +9583,42 @@ mod tests {
         let result = cached_full_statuses(&repo, &repository_path).unwrap();
         assert_eq!(result, cached_statuses, "an unchanged, fresh cache entry must still follow the existing HIT path");
         fs::remove_dir_all(repository).unwrap();
+    }
+
+    #[test]
+    fn github_module_ref_parser_preserves_32_branches_and_88_tags() {
+        let commit = "a".repeat(40);
+        let tag_object = "b".repeat(40);
+        let mut raw = String::new();
+        for index in 0..32 {
+            raw.push_str(&format!("{commit}\trefs/heads/branch-{index:03}\r\n"));
+        }
+        for index in 0..88 {
+            let name = format!("refs/tags/release/long-tag-{index:03}");
+            // Annotated tags resolve to commits; lightweight tags need no peeling.
+            // Alternate advertisement order to ensure peeling is order independent.
+            if index % 3 == 0 {
+                raw.push_str(&format!("{commit}\t{name}^{{}}\r\n{tag_object}\t{name}\r\n"));
+            } else if index % 3 == 1 {
+                raw.push_str(&format!("{tag_object}\t{name}\r\n{commit}\t{name}^{{}}\r\n"));
+            } else {
+                raw.push_str(&format!("{commit}\t{name}\r\n"));
+            }
+        }
+        let refs = parse_github_module_advertised_refs(&raw);
+        assert_eq!(refs.len(), 120);
+        assert_eq!(refs.iter().filter(|r| r.kind == "branch").count(), 32);
+        assert_eq!(refs.iter().filter(|r| r.kind == "tag").count(), 88);
+        assert!(refs.iter().all(|r| r.revision == commit));
+        assert_eq!(refs.last().unwrap().name, "release/long-tag-087");
+    }
+
+    #[test]
+    fn github_module_ref_parser_has_no_output_size_or_ref_count_cap() {
+        let raw = (0..2400).map(|index| format!("{:040x}\trefs/{}/ref-{index:05}\n", index + 1,
+            if index < 1200 { "heads" } else { "tags" })).collect::<String>();
+        assert!(raw.len() > RECENT_GIT_COMMAND_OUTPUT_LIMIT);
+        assert_eq!(parse_github_module_advertised_refs(&raw).len(), 2400);
     }
 
     #[test]

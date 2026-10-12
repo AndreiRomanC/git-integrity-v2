@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Git DrillDown</title>
   <link rel="icon" type="image/png" href="assets/git-drilldown-mark.png">
-  <link rel="stylesheet" href="styles.css?v=20261011-strict-contributions">
+  <link rel="stylesheet" href="styles.css?v=20261012-submodule-ref-cache-fix">
 </head>
 <body>
   <div class="app-shell">
@@ -585,7 +585,7 @@
         <div id="submoduleRepoResults" class="submodule-browser-list"><div class="version-loading">Search in github.vitesco.io/eng.</div></div>
       </section>
       <section>
-        <div class="submodule-ref-heading"><h3>Branches, tags, commits</h3><small id="submoduleRefHint">Select a repository first.</small></div>
+        <div class="submodule-ref-heading"><h3>Branches, tags, commits</h3><small id="submoduleRefHint">Select a repository first.</small><button id="refreshSubmoduleRefs" type="button" title="Reload all branches and tags from the server" aria-label="Reload all branches and tags">↻</button></div>
         <div class="submodule-browser-search compact">
           <label><span>Filter loaded refs or type SHA</span><input id="submoduleRefSearch" type="text" placeholder="filter branch/tag locally, or paste SHA…" autocomplete="off" autocapitalize="off" spellcheck="false"></label>
           <button id="runSubmoduleRefSearch" type="button" title="Filters locally after refs are loaded; asks the server only for an exact SHA not already loaded.">Find refs</button>
@@ -762,16 +762,16 @@
       <footer><span>Adds a saved message only — no commit.</span><button value="cancel">Cancel</button><button type="button" id="polarionAdd" class="confirm" disabled>Add to Commit List</button></footer>
     </form>
   </dialog>
-  <script src="polarion.js?v=20261011-strict-contributions"></script>
-  <script src="console-context.js?v=20261011-strict-contributions"></script>
-  <script src="graph-model.js?v=20261011-strict-contributions"></script>
-  <script src="submodule-state.js?v=20261011-strict-contributions"></script>
-  <script src="submodule-versions.js?v=20261011-strict-contributions"></script>
-  <script src="local-diff.js?v=20261011-strict-contributions"></script>
-  <script src="local-drive.js?v=20261011-strict-contributions"></script>
-  <script src="pr-status.js?v=20261011-strict-contributions"></script>
-  <script src="refresh-coordinator.js?v=20261011-strict-contributions"></script>
-  <script src="comparison-authors.js?v=20261011-strict-contributions"></script>
-  <script src="app.js?v=20261011-strict-contributions"></script>
+  <script src="polarion.js?v=20261012-submodule-ref-cache-fix"></script>
+  <script src="console-context.js?v=20261012-submodule-ref-cache-fix"></script>
+  <script src="graph-model.js?v=20261012-submodule-ref-cache-fix"></script>
+  <script src="submodule-state.js?v=20261012-submodule-ref-cache-fix"></script>
+  <script src="submodule-versions.js?v=20261012-submodule-ref-cache-fix"></script>
+  <script src="local-diff.js?v=20261012-submodule-ref-cache-fix"></script>
+  <script src="local-drive.js?v=20261012-submodule-ref-cache-fix"></script>
+  <script src="pr-status.js?v=20261012-submodule-ref-cache-fix"></script>
+  <script src="refresh-coordinator.js?v=20261012-submodule-ref-cache-fix"></script>
+  <script src="comparison-authors.js?v=20261012-submodule-ref-cache-fix"></script>
+  <script src="app.js?v=20261012-submodule-ref-cache-fix"></script>
 </body>
 </html>

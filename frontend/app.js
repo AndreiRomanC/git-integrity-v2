@@ -122,6 +122,8 @@ let versionFilter = 'branch';
 let submoduleCrossSelected = null;
 let submoduleBrowserState = { repositories: [], selectedRepository: null, allRefs: [], refs: [], selectedRef: null, selectedRefs: [] };
 let submoduleBrowserSearchBusy = false;
+let submoduleRefRequest = 0;
+let finishSubmoduleRefRequest = null;
 const submoduleBrowserRefCache = new Map();
 const submoduleBrowserRepositoryCache = new Map();
 const SUBMODULE_REPOSITORY_CACHE_TTL_MS = 5 * 60 * 1000;
@@ -756,14 +758,23 @@ function submoduleBrowserRefLabel(ref = {}) {
   return `${kind} ${name}${sha ? ` @ ${sha}` : ''}`;
 }
 function submoduleRepoCacheKey(repo = {}) {
-  return `${repo.owner || 'eng'}/${repo.name || ''}`.toLowerCase();
+  return `${state.repository?.path || ''}|${repo.owner || 'eng'}/${repo.name || ''}`;
 }
 function cacheSubmoduleRefs(repo, refsList = []) {
   if (!repo?.name) return;
-  submoduleBrowserRefCache.set(submoduleRepoCacheKey(repo), refsList);
+  submoduleBrowserRefCache.set(submoduleRepoCacheKey(repo), { refs: refsList, savedAt: Date.now() });
 }
 function cachedSubmoduleRefs(repo) {
-  return repo?.name ? submoduleBrowserRefCache.get(submoduleRepoCacheKey(repo)) || null : null;
+  const cached = repo?.name ? submoduleBrowserRefCache.get(submoduleRepoCacheKey(repo)) : null;
+  return cached && Date.now() - cached.savedAt < SUBMODULE_REPOSITORY_CACHE_TTL_MS ? cached.refs : null;
+}
+function invalidateSubmoduleRefRequest() {
+  submoduleRefRequest++;
+  finishSubmoduleRefRequest?.();
+  finishSubmoduleRefRequest = null;
+}
+function submoduleRefCounts(refsList) {
+  return `${refsList.filter(ref => ref.kind === 'branch').length} branches · ${refsList.filter(ref => ref.kind === 'tag').length} tags`;
 }
 function submoduleRefQueryLooksLikeSha(query = '') {
   return /^[0-9a-f]{7,40}$/i.test(String(query).trim());
@@ -796,6 +807,7 @@ function updateSubmoduleBrowserActions() {
   refs.applySubmoduleBrowser.disabled = !submoduleBrowserState.selectedRepository;
 }
 function resetSubmoduleBrowser() {
+  invalidateSubmoduleRefRequest();
   submoduleBrowserState = { repositories: [], selectedRepository: null, allRefs: [], refs: [], selectedRef: null, selectedRefs: [] };
   refs.submoduleBrowserAuth.hidden = true;
   refs.submoduleRepoResults.innerHTML = '<div class="version-loading">Search in github.vitesco.io/eng.</div>';
@@ -884,8 +896,8 @@ function renderSubmoduleRefResults() {
 function filterLoadedSubmoduleRefs(query = refs.submoduleRefSearch.value.trim()) {
   const repo = submoduleBrowserState.selectedRepository;
   if (!repo) { refs.submoduleRefResults.innerHTML = '<div class="version-loading">Select a repository first.</div>'; return 0; }
-  if (!submoduleBrowserState.allRefs.length) {
-    refs.submoduleRefResults.innerHTML = '<div class="version-loading">Refs are not loaded yet. Press Find once.</div>';
+  if (!submoduleBrowserState.refsComplete) {
+    if (!finishSubmoduleRefRequest) refs.submoduleRefResults.innerHTML = '<div class="version-loading">Refs are not loaded yet. Press Find once.</div>';
     return 0;
   }
   const filtered = submoduleBrowserState.allRefs.filter(ref => submoduleRefMatches(ref, query));
@@ -893,8 +905,8 @@ function filterLoadedSubmoduleRefs(query = refs.submoduleRefSearch.value.trim())
   submoduleBrowserState.selectedRef = filtered.some(ref => ref === submoduleBrowserState.selectedRef) ? submoduleBrowserState.selectedRef : null;
   refs.applySubmoduleBrowser.disabled = !submoduleBrowserState.selectedRepository || false;
   refs.submoduleBrowserStatus.textContent = query
-    ? `${repo.full_name}: ${filtered.length} local match${filtered.length === 1 ? '' : 'es'} from the complete list of ${submoduleBrowserState.allRefs.length} branches/tags.`
-    : `${repo.full_name}: complete list loaded (${submoduleBrowserState.allRefs.length} branches/tags). Filtering is local.`;
+    ? `${repo.full_name}: ${filtered.length} local matches · ${submoduleRefCounts(submoduleBrowserState.allRefs)} loaded.`
+    : `${repo.full_name}: ${submoduleRefCounts(submoduleBrowserState.allRefs)} loaded from server. Filtering is local; refresh to check for new refs.`;
   renderSubmoduleRefResults();
   updateSubmoduleBrowserActions();
   return filtered.length;
@@ -906,6 +918,7 @@ async function searchSubmoduleRepositories(interactiveAuth = false, options = {}
   if (submoduleBrowserSearchBusy) return;
   const query = refs.submoduleRepoSearch.value.trim();
   if (query.length < 2) { refs.submoduleRepoResults.innerHTML = '<div class="version-loading">Type at least 2 characters.</div>'; return; }
+  invalidateSubmoduleRefRequest();
   const cacheKey = query.toLocaleLowerCase();
   const cached = submoduleBrowserRepositoryCache.get(cacheKey);
   if (!interactiveAuth && options.allowCache && cached && Date.now() - cached.savedAt < SUBMODULE_REPOSITORY_CACHE_TTL_MS) {
@@ -948,10 +961,13 @@ async function searchSubmoduleRepositories(interactiveAuth = false, options = {}
   } finally { finish(); otherButton.disabled = otherWasDisabled; submoduleBrowserSearchBusy = false; }
 }
 async function selectSubmoduleRepository(repo) {
+  invalidateSubmoduleRefRequest();
   submoduleBrowserState.selectedRepository = repo;
   submoduleBrowserState.selectedRef = null;
   submoduleBrowserState.selectedRefs = [];
-  submoduleBrowserState.allRefs = cachedSubmoduleRefs(repo) || [];
+  const cached = cachedSubmoduleRefs(repo);
+  submoduleBrowserState.refsComplete = cached !== null;
+  submoduleBrowserState.allRefs = cached || [];
   submoduleBrowserState.refs = [];
   refs.applySubmoduleBrowser.disabled = false;
   updateSubmoduleBrowserActions();
@@ -959,7 +975,7 @@ async function selectSubmoduleRepository(repo) {
   refs.submoduleRefSearch.value = '';
   refs.submoduleBrowserStatus.textContent = `${repo.full_name} selected. Pick a branch/tag/commit, or use its default checkout.`;
   renderSubmoduleRepositoryResults();
-  if (submoduleBrowserState.allRefs.length) {
+  if (submoduleBrowserState.refsComplete) {
     filterLoadedSubmoduleRefs('');
   } else {
     await searchSubmoduleRefs('', { forceRemote: true });
@@ -968,40 +984,54 @@ async function selectSubmoduleRepository(repo) {
 async function searchSubmoduleRefs(query = refs.submoduleRefSearch.value.trim(), options = {}) {
   const repo = submoduleBrowserState.selectedRepository;
   if (!repo) { refs.submoduleRefResults.innerHTML = '<div class="version-loading">Select a repository first.</div>'; return; }
-  const trimmedQuery = String(query || '').trim();
-  if (!options.forceRemote && submoduleBrowserState.allRefs.length) {
+  const trimmedQuery = options.forceRemote || !submoduleBrowserState.refsComplete ? '' : String(query || '').trim();
+  if (!options.forceRemote && submoduleBrowserState.refsComplete) {
     const matches = filterLoadedSubmoduleRefs(trimmedQuery);
     if (matches || !submoduleRefQueryLooksLikeSha(trimmedQuery)) return;
   }
-  const finish = beginButtonOperation(refs.runSubmoduleRefSearch, 'Finding…');
+  invalidateSubmoduleRefRequest();
+  const request = submoduleRefRequest;
+  const model = submoduleBrowserState;
+  const repositoryPath = state.repository.path;
+  const current = () => request === submoduleRefRequest && model === submoduleBrowserState
+    && model.selectedRepository === repo && refs.submoduleBrowserDialog.open && state.repository?.path === repositoryPath;
+  const started = performance.now();
+  finishSubmoduleRefRequest = beginButtonOperation(refs.runSubmoduleRefSearch, 'Finding…');
+  submoduleBrowserState.refs = [];
   refs.submoduleRefResults.innerHTML = `<div class="version-loading"><i class="spinner"></i>${trimmedQuery ? 'Looking up exact revision…' : 'Reading branches and tags…'}</div>`;
   try {
     const refsList = invoke ? await invoke('github_module_refs', { repositoryPath: state.repository.path, owner: repo.owner || 'eng', repositoryName: repo.name, query: trimmedQuery, limit: trimmedQuery ? 180 : null }) : [
       { name: 'main', revision: '1111111111111111111111111111111111111111', kind: 'branch', subject: '', date: '' },
       { name: 'v1.0.0', revision: '2222222222222222222222222222222222222222', kind: 'tag', subject: '', date: '' }
     ];
-    if (!trimmedQuery || options.forceRemote) {
+    if (!current()) { jsPerfLog('submodule_browser_refs: stale response discarded', performance.now() - started); return; }
+    if (!trimmedQuery) {
       submoduleBrowserState.allRefs = refsList || [];
+      submoduleBrowserState.refsComplete = true;
       cacheSubmoduleRefs(repo, submoduleBrowserState.allRefs);
       submoduleBrowserState.refs = submoduleBrowserState.allRefs;
     } else {
       const known = new Map(submoduleBrowserState.allRefs.map(ref => [`${ref.kind}|${ref.name}|${ref.revision}`, ref]));
       for (const ref of refsList || []) known.set(`${ref.kind}|${ref.name}|${ref.revision}`, ref);
       submoduleBrowserState.allRefs = [...known.values()];
-      cacheSubmoduleRefs(repo, submoduleBrowserState.allRefs);
       submoduleBrowserState.refs = (refsList || []).length ? refsList : submoduleBrowserState.allRefs.filter(ref => submoduleRefMatches(ref, trimmedQuery));
     }
     submoduleBrowserState.selectedRef = null;
     const knownKeys = new Set(submoduleBrowserState.allRefs.map(submoduleBrowserRefKey));
     submoduleBrowserState.selectedRefs = submoduleBrowserSelectedCompareRefs().filter(ref => knownKeys.has(submoduleBrowserRefKey(ref)));
-    refs.submoduleBrowserStatus.textContent = trimmedQuery
-      ? `${repo.full_name}: ${submoduleBrowserState.refs.length} server match${submoduleBrowserState.refs.length === 1 ? '' : 'es'}; refs kept in memory for local filtering.`
-      : `${repo.full_name}: complete list loaded (${submoduleBrowserState.refs.length} branches/tags). Filtering is local.`;
-    renderSubmoduleRefResults();
+    // Apply the latest typed filter, not the query at the start of the request.
+    filterLoadedSubmoduleRefs();
+    jsPerfLog(`submodule_browser_refs: ${submoduleRefCounts(submoduleBrowserState.allRefs)} visible=${submoduleBrowserState.refs.length} lookup=${trimmedQuery ? 'sha' : 'complete'}`, performance.now() - started);
   } catch (error) {
+    if (!current()) return;
     refs.submoduleRefResults.innerHTML = `<div class="version-loading">${esc(String(error))}</div>`;
     refs.submoduleBrowserStatus.textContent = String(error);
-  } finally { finish(); }
+  } finally {
+    if (request === submoduleRefRequest) {
+      finishSubmoduleRefRequest?.();
+      finishSubmoduleRefRequest = null;
+    }
+  }
 }
 function applySubmoduleBrowserSelection() {
   const repo = submoduleBrowserState.selectedRepository;
@@ -7221,6 +7251,7 @@ refs.runSubmoduleRepoSearch.addEventListener('click', () => searchSubmoduleRepos
 refs.connectSubmoduleBrowser.addEventListener('click', () => searchSubmoduleRepositories(true));
 refs.submoduleRepoSearch.addEventListener('keydown', event => { if (event.key === 'Enter') { event.preventDefault(); searchSubmoduleRepositories(); } });
 refs.runSubmoduleRefSearch.addEventListener('click', () => searchSubmoduleRefs());
+$('#refreshSubmoduleRefs').addEventListener('click', () => searchSubmoduleRefs('', { forceRemote: true }));
 refs.submoduleRefSearch.addEventListener('keydown', event => { if (event.key === 'Enter') { event.preventDefault(); searchSubmoduleRefs(); } });
 refs.submoduleRefSearch.addEventListener('input', () => filterLoadedSubmoduleRefs());
 refs.applySubmoduleBrowser.addEventListener('click', applySubmoduleBrowserSelection);
