@@ -68,6 +68,15 @@ function comparisonAuthorEmptyMessage(model) {
   }
   return 'No changed files match this filter';
 }
+function comparisonAuthorDiagnostic(model, totalRows, shownRows, otherFilterActive) {
+  if (!model?.selected) return '';
+  const strict = model.directOnly;
+  const result = model.strictResult;
+  const phase = strict ? (result?.error ? 'error' : result?.pending ? 'pending' : result?.result ? 'complete' : 'not-started')
+    : model.error ? 'error' : model.pending ? 'pending' : model.authors ? 'complete' : 'not-started';
+  // Counts and immutable revisions only; never log names, emails or search text.
+  return `comparison_author_display: mode=${strict ? 'strict' : 'normal'} phase=${phase} left=${model.context.leftRevision} right=${model.context.rightRevision} author_index=${model.authors?.findIndex(author => author.key === model.selected) ?? -1} total_rows=${totalRows} matched_paths=${model.paths?.size ?? 0} shown_rows=${shownRows} inconclusive=${Object.keys(result?.result?.ambiguous_paths || {}).length} other_filter=${Boolean(otherFilterActive)}`;
+}
 function comparisonAuthorEvidence(row, model) {
   const author = model?.authors?.find(item => item.key === model.selected);
   if (!author) return [];
@@ -90,4 +99,4 @@ function workspaceComparisonAuthorContext(result) {
       [row.relative_path, row.local?.relative_path, row.remote?.relative_path].filter(Boolean)))].sort(),
   };
 }
-if (typeof module !== 'undefined' && module.exports) module.exports = { createComparisonAuthorCache, comparisonAuthorMatches, comparisonAuthorEmptyMessage, comparisonAuthorEvidence, workspaceComparisonAuthorContext };
+if (typeof module !== 'undefined' && module.exports) module.exports = { createComparisonAuthorCache, comparisonAuthorMatches, comparisonAuthorEmptyMessage, comparisonAuthorDiagnostic, comparisonAuthorEvidence, workspaceComparisonAuthorContext };

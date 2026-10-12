@@ -3,9 +3,21 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
-const { createComparisonAuthorCache, comparisonAuthorMatches, comparisonAuthorEmptyMessage, comparisonAuthorEvidence, workspaceComparisonAuthorContext } = require('../frontend/comparison-authors.js');
+const { createComparisonAuthorCache, comparisonAuthorMatches, comparisonAuthorEmptyMessage, comparisonAuthorDiagnostic, comparisonAuthorEvidence, workspaceComparisonAuthorContext } = require('../frontend/comparison-authors.js');
 const context = { repositoryPath: '/repo', leftRevision: 'a', rightRevision: 'b' };
 const authors = [{ key: 'email:a@test', name: 'Name', email: 'a@test', paths: ['old', 'new', 'modified'] }];
+
+test('display diagnostics distinguish failure from empty results without logging identity', () => {
+  const model = {context, selected:authors[0].key, authors, directOnly:true, paths:new Set(), strictResult:{error:'budget'}};
+  const failed = comparisonAuthorDiagnostic(model, 500, 0, false);
+  assert.match(failed, /phase=error left=a right=b author_index=0 total_rows=500 matched_paths=0 shown_rows=0/);
+  assert.doesNotMatch(failed, /a@test|Name|email:/);
+  model.strictResult = {result:{paths:[],ambiguous_paths:{f:'unknown'}}};
+  assert.match(comparisonAuthorDiagnostic(model,500,0,false), /phase=complete/);
+  assert.match(comparisonAuthorDiagnostic(model,500,0,true), /inconclusive=1 other_filter=true/);
+  model.strictResult.pending = true;
+  assert.match(comparisonAuthorDiagnostic(model,500,0,false), /phase=pending/);
+});
 
 test('strict failure and pending analysis are not presented as a successful empty filter', () => {
   const model = {selected:'email:a@test',directOnly:true};

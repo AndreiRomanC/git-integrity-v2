@@ -47,6 +47,19 @@ struct Analysis<'a> {
     bytes: usize,
     peak_bytes: usize,
     current_path: String,
+    request_id: u64,
+    file_total: usize,
+    outcomes: [usize; 3], // proven, inconclusive, no surviving witness
+    file_started: Instant,
+    file_visits: usize,
+    probes: usize,
+    probes_done: usize,
+    detail_logs: usize,
+}
+
+fn strict_budget_reason(bytes: usize, elapsed: Duration) -> Option<&'static str> {
+    if bytes > 64 * 1024 * 1024 { Some("per-file memory") }
+    else if elapsed > Duration::from_secs(30) { Some("elapsed time") } else { None }
 }
 
 fn identity(commit: &git2::Commit<'_>) -> String {
@@ -69,11 +82,12 @@ impl<'a> Analysis<'a> {
     fn budget(&mut self) -> Result<(), String> {
         self.visits += 1;
         self.peak_bytes = self.peak_bytes.max(self.bytes);
-        let reason = if self.visits > 250_000 { Some("history visits") }
-            else if self.bytes > 64 * 1024 * 1024 { Some("per-file memory") }
-            else if self.started.elapsed() > Duration::from_secs(30) { Some("elapsed time") } else { None };
+        // Cache hits and inexpensive line probes are not expensive Git walks.
+        // A global count prematurely aborted large comparisons within seconds.
+        // Retain real elapsed-time/memory limits and count visits diagnostically.
+        let reason = strict_budget_reason(self.bytes, self.started.elapsed());
         if let Some(reason) = reason {
-            perf_log(&format!("comparison_author_contributions: budget_exceeded reason={reason} path={:?} visits={} bytes={} commits={}", self.current_path, self.visits, self.bytes, self.exclusive.len()), self.started.elapsed());
+            perf_log(&format!("comparison_author_contributions: request={} budget_exceeded reason={reason} path={:?} visits={} file_visits={} bytes={} commits={} files_done={}/{} proven={} inconclusive={} no_witness={} probes_done={}/{} partial_results_applied=false", self.request_id, self.current_path, self.visits, self.visits - self.file_visits, self.bytes, self.exclusive.len(), self.outcomes.iter().sum::<usize>(), self.file_total, self.outcomes[0], self.outcomes[1], self.outcomes[2], self.probes_done, self.probes), self.started.elapsed());
             return Err(format!("Strict attribution exceeded its analysis budget ({reason}). No partial results were applied; choose closer revisions or disable the strict filter."));
         }
         Ok(())
@@ -88,6 +102,18 @@ impl<'a> Analysis<'a> {
         self.proofs.clear(); self.deletions.clear(); self.unchanged_origins.clear();
         self.bytes = 0;
         self.current_path = path.into();
+        self.file_started = Instant::now();
+        self.file_visits = self.visits;
+        self.probes = 0; self.probes_done = 0;
+    }
+
+    fn finish_file(&mut self, outcome: usize, witness: Option<Oid>) {
+        self.outcomes[outcome] += 1;
+        // Bound diagnostics: never log file contents, line text or credentials.
+        if self.detail_logs < 20 || (self.file_started.elapsed() > Duration::from_millis(250) && self.detail_logs < 30) {
+            self.detail_logs += 1;
+            perf_log(&format!("comparison_author_contributions: request={} file={:?} outcome={} probes_done={}/{} visits={} bytes={} witness={}", self.request_id, self.current_path, ["proven", "inconclusive", "no_surviving_witness"][outcome], self.probes_done, self.probes, self.visits - self.file_visits, self.bytes, witness.map(|id| id.to_string()).unwrap_or_else(|| "none".into())), self.file_started.elapsed());
+        }
     }
 
     fn unchanged_origin(&mut self, mut id: Oid, path: &str) -> Result<Oid, String> {
@@ -103,6 +129,9 @@ impl<'a> Analysis<'a> {
             skipped.push(key);
             id = info.parents[0];
         }
+        // Cache the stopping point as well: every line in this file otherwise
+        // repeats the same parent/entry equality check at the changed commit.
+        if self.exclusive.contains(&id) { self.unchanged_origins.entry((id, path.to_string())).or_insert(id); }
         for key in skipped { self.unchanged_origins.insert(key, id); }
         Ok(id)
     }
@@ -274,7 +303,9 @@ impl<'a> Analysis<'a> {
 fn collect_strict(repo: &Repository, left: Oid, right: Oid, author: &str) -> Result<Contributions, String> {
     if repo.is_shallow() { return Err("Strict attribution requires complete local history. No results were applied.".into()); }
     let started = Instant::now();
-    perf_log(&format!("comparison_author_contributions: start left={} right={}", &left.to_string()[..8], &right.to_string()[..8]), Duration::ZERO);
+    static NEXT_REQUEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let request_id = NEXT_REQUEST.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    perf_log(&format!("comparison_author_contributions: request={request_id} start repo={} left={left} right={right} time_limit_ms=30000 per_file_bytes_limit=67108864 visit_limit=none", anonymized_repository_id(&repo.path().to_string_lossy())), Duration::ZERO);
     let mut exclusive = HashSet::new();
     for (tip, hide) in [(left, right), (right, left)] {
         let mut walk = repo.revwalk().map_err(|e| e.to_string())?;
@@ -282,10 +313,13 @@ fn collect_strict(repo: &Repository, left: Oid, right: Oid, author: &str) -> Res
         walk.hide(hide).map_err(|e| e.to_string())?;
         for id in walk {
             exclusive.insert(id.map_err(|e| e.to_string())?);
-            if exclusive.len() > 100_000 || started.elapsed() > Duration::from_secs(30) { return Err("History exceeds the strict attribution budget. Choose closer revisions.".into()); }
+            if exclusive.len() > 100_000 || started.elapsed() > Duration::from_secs(30) {
+                perf_log(&format!("comparison_author_contributions: request={request_id} history_budget_exceeded commits={}", exclusive.len()), started.elapsed());
+                return Err("History exceeds the strict attribution budget. Choose closer revisions.".into());
+            }
         }
     }
-    let mut analysis = Analysis { repo, author, exclusive, commits: HashMap::new(), entries: HashMap::new(), texts: HashMap::new(), renames: HashMap::new(), proofs: HashMap::new(), deletions: HashMap::new(), unchanged_origins: HashMap::new(), started, visits: 0, bytes: 0, peak_bytes: 0, current_path: String::new() };
+    let mut analysis = Analysis { repo, author, exclusive, commits: HashMap::new(), entries: HashMap::new(), texts: HashMap::new(), renames: HashMap::new(), proofs: HashMap::new(), deletions: HashMap::new(), unchanged_origins: HashMap::new(), started, visits: 0, bytes: 0, peak_bytes: 0, current_path: String::new(), request_id, file_total: 0, outcomes: [0; 3], file_started: started, file_visits: 0, probes: 0, probes_done: 0, detail_logs: 0 };
     let left_tree = repo.find_commit(left).and_then(|c| c.tree()).map_err(|e| e.to_string())?;
     let right_tree = repo.find_commit(right).and_then(|c| c.tree()).map_err(|e| e.to_string())?;
     let mut diff = repo.diff_tree_to_tree(Some(&left_tree), Some(&right_tree), None).map_err(|e| e.to_string())?;
@@ -293,6 +327,8 @@ fn collect_strict(repo: &Repository, left: Oid, right: Oid, author: &str) -> Res
     let mut options = git2::DiffFindOptions::new();
     options.renames(true).exact_match_only(true).rename_threshold(100).rename_limit(200);
     diff.find_similar(Some(&mut options)).map_err(|e| e.to_string())?;
+    analysis.file_total = diff.deltas().len();
+    perf_log(&format!("comparison_author_contributions: request={request_id} history_commits={} comparison_deltas={}", analysis.exclusive.len(), analysis.file_total), started.elapsed());
     let mut result = Contributions::default();
     for delta in diff.deltas() {
         let old = delta.old_file().path().map(normalized);
@@ -304,6 +340,7 @@ fn collect_strict(repo: &Repository, left: Oid, right: Oid, author: &str) -> Res
             for path in [old, new].into_iter().flatten() {
                 result.ambiguous_paths.insert(path, "Multiple identical files make rename pairing ambiguous. No historical file identity was guessed.".into());
             }
+            analysis.finish_file(1, None);
             continue;
         }
         let a = analysis.entry(left, old_path)?;
@@ -348,15 +385,21 @@ fn collect_strict(repo: &Repository, left: Oid, right: Oid, author: &str) -> Res
         // Pure reordering/duplicate-line edits cannot be established by unique
         // line provenance. Report uncertainty instead of guessing line identity.
         if probes.is_empty() { ambiguous = true; }
-        if probes.len() > 4096 { probes.clear(); ambiguous = true; }
+        // A large endpoint diff can still contain one small, provable personal
+        // contribution. Never discard every candidate because the file has
+        // many imported lines. Trace until a witness is found; the existing
+        // request time/memory budgets still fail closed if exhausted.
         let mut witness = None;
+        analysis.probes = probes.len();
         for (tip, path, probe) in probes {
+            analysis.probes_done += 1;
             match analysis.trace(tip, &path, &probe, 0)? {
                 Proof::Own(commit, parent, path) => { witness = Some((commit, parent, path)); break; },
                 Proof::Unknown => ambiguous = true,
                 Proof::Other => {},
             }
         }
+        analysis.finish_file(if witness.is_some() { 0 } else if ambiguous { 1 } else { 2 }, witness.as_ref().map(|(commit, _, _)| *commit));
         let paths: HashSet<_> = [old, new].into_iter().flatten().collect();
         for path in paths {
             if let Some((commit, parent, witness_path)) = &witness {
@@ -369,7 +412,7 @@ fn collect_strict(repo: &Repository, left: Oid, right: Oid, author: &str) -> Res
         }
     }
     result.paths.sort(); result.paths.dedup();
-    perf_log(&format!("comparison_author_contributions: left={} right={} commits={} paths={} ambiguous={} visits={} peak_file_bytes={}", &left.to_string()[..8], &right.to_string()[..8], analysis.exclusive.len(), result.paths.len(), result.ambiguous_paths.len(), analysis.visits, analysis.peak_bytes), started.elapsed());
+    perf_log(&format!("comparison_author_contributions: request={request_id} complete left={left} right={right} commits={} paths={} ambiguous={} files_done={}/{} proven={} inconclusive={} no_witness={} visits={} peak_file_bytes={} detail_logs={}", analysis.exclusive.len(), result.paths.len(), result.ambiguous_paths.len(), analysis.outcomes.iter().sum::<usize>(), analysis.file_total, analysis.outcomes[0], analysis.outcomes[1], analysis.outcomes[2], analysis.visits, analysis.peak_bytes, analysis.detail_logs), started.elapsed());
     Ok(result)
 }
 
@@ -459,6 +502,58 @@ mod tests {
         let tip = f.commit("alice", &refs, &[base]);
         let paths = files.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>();
         f.check(base, tip, "alice", &paths);
+    }
+
+    #[test]
+    fn older_commit_comparison_keeps_an_author_witness_after_many_imported_lines() {
+        let f = Fixture::new();
+        let base = f.commit("base", &[("f", "base\n")], &[]);
+        let imported = (0..2100).map(|i| format!("imported-{i:04}\n")).collect::<String>();
+        let bob = f.commit("bob", &[("f", &imported)], &[base]);
+        let personal = format!("{imported}zz-personal\n");
+        let tip = f.commit("alice", &[("f", &personal)], &[bob]);
+        f.check(bob, tip, "alice", &["f"]);
+        // Same surviving contribution, but a larger diff from an older commit.
+        f.check(base, tip, "alice", &["f"]);
+        f.repo.reference("refs/heads/start", base, true, "fixture").unwrap();
+        f.repo.reference("refs/heads/end", tip, true, "fixture").unwrap();
+        let path = f.path.to_string_lossy();
+        let named = compare_git_tree_file_list(&path, "", "start", "end").unwrap();
+        let commits = compare_git_tree_file_list(&path, "", &base.to_string(), &tip.to_string()).unwrap();
+        assert_eq!(named.left_revision, commits.left_revision);
+        assert_eq!(named.right_revision, commits.right_revision);
+        assert_eq!(serde_json::to_value(&named.rows).unwrap(), serde_json::to_value(&commits.rows).unwrap());
+        let filter = |result: &RevisionCompareDirectory| collect_strict(&f.repo,
+            Oid::from_str(&result.left_revision).unwrap(), Oid::from_str(&result.right_revision).unwrap(), "email:alice@test").unwrap();
+        assert_eq!(serde_json::to_value(filter(&named)).unwrap(), serde_json::to_value(filter(&commits)).unwrap());
+        let imported_only = f.commit("alice", &[("f", &imported)], &[base, bob]);
+        f.check(base, imported_only, "alice", &[]);
+        let own_branch = f.commit("alice", &[("f", "base\nzz-personal\n")], &[base]);
+        let merged = f.commit("integrator", &[("f", &personal)], &[own_branch, bob]);
+        f.check(base, merged, "alice", &["f"]);
+        f.check(base, merged, "integrator", &[]);
+    }
+
+    #[test]
+    fn elapsed_time_and_memory_safety_limits_are_preserved() {
+        assert_eq!(strict_budget_reason(795519, Duration::from_millis(2202)), None);
+        assert_eq!(strict_budget_reason(64 * 1024 * 1024 + 1, Duration::ZERO), Some("per-file memory"));
+        assert_eq!(strict_budget_reason(0, Duration::from_millis(30001)), Some("elapsed time"));
+    }
+
+    #[test]
+    fn inexpensive_cached_probes_do_not_exhaust_a_global_visit_quota() {
+        let f = Fixture::new();
+        let names = (0..60).map(|i| format!("import-{i:03}")).collect::<Vec<_>>();
+        let initial = names.iter().map(|name| (name.as_str(), "base\n")).collect::<Vec<_>>();
+        let base = f.commit("base", &initial, &[]);
+        let imported = (0..5000).map(|i| format!("imported-{i:05}\n")).collect::<String>();
+        let mut files = names.iter().map(|name| (name.as_str(), imported.as_str())).collect::<Vec<_>>();
+        let bob = f.commit("bob", &files, &[base]);
+        files.push(("zz-own", "personal\n"));
+        let tip = f.commit("alice", &files, &[bob]);
+        // More than 250k cheap, cached line probes; no large blob or deep history.
+        f.check(base, tip, "alice", &["zz-own"]);
     }
 
     #[test]

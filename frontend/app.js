@@ -1674,6 +1674,14 @@ function renderComparisonAuthorFilter(container, context, options = {}) {
   return model;
 }
 
+function logComparisonAuthorDisplay(model, totalRows, shownRows, otherFilterActive) {
+  const message = comparisonAuthorDiagnostic(model, totalRows, shownRows, otherFilterActive);
+  if (message && model.lastDisplayDiagnostic !== message) {
+    model.lastDisplayDiagnostic = message;
+    jsPerfLog(message, 0);
+  }
+}
+
 function renderCommander() {
   if (!state.repository) return;
   const localDrive = state.compareMode === 'local-drive';
@@ -1730,6 +1738,7 @@ function renderCommander() {
   refs.remoteRef.innerHTML = remoteBranches.map(branch => `<option value="${esc(branch.name)}" ${branch.name === state.remoteRef ? 'selected' : ''}>${esc(branch.name)}</option>`).join('') || '<option value="">No remote refs</option>';
   const flatMode = state.compareFlatMode;
   const query = refs.search.value.trim().toLowerCase(); const rows = state.commanderRows.filter(row => compareRowVisible(row, query, flatMode ? state.compareFlatFilter : 'all') && comparisonAuthorMatches(row, authorModel));
+  if (flatMode) logComparisonAuthorDisplay(authorModel, state.commanderRows.length, rows.length, query || state.compareFlatFilter !== 'all');
   const upRow = state.commanderPath && !flatMode ? `<button class="commander-row commander-grid up-row" data-commander-up="1">
     <span class="commander-side local">${iconFor({kind:'folder'})}<span class="commander-file-copy"><strong>..</strong><small>Parent folder</small></span></span><span class="compare-state"><i></i></span><span class="commander-side remote">${iconFor({kind:'folder'})}<span class="commander-file-copy"><strong>..</strong><small>Parent folder</small></span></span>
   </button>` : '';
@@ -1865,6 +1874,7 @@ function renderSubmoduleCompare() {
     state.subCompareFlatMode && compare?.leftRevision && compare?.rightRevision
       ? { repositoryPath: state.repository.path, ...(compare.externalOwner ? { owner: compare.externalOwner, repositoryName: compare.externalRepositoryName } : { submodulePath: compare.submodulePath }), leftRevision: compare.leftRevision, rightRevision: compare.rightRevision } : null);
   const query = refs.search.value.trim().toLowerCase(); const rows = rowsSource.filter(row => compareRowVisible(row, query, state.subCompareFlatMode ? state.subCompareFlatFilter : 'all') && comparisonAuthorMatches(row, authorModel));
+  if (state.subCompareFlatMode) logComparisonAuthorDisplay(authorModel, rowsSource.length, rows.length, query || state.subCompareFlatFilter !== 'all');
   const upRow = state.commanderPath && !state.subCompareFlatMode ? `<button class="commander-row commander-grid up-row" data-commander-up="1">
     <span class="commander-side local">${iconFor({kind:'folder'})}<span class="commander-file-copy"><strong>..</strong><small>Parent folder</small></span></span><span class="compare-state"><i></i></span><span class="commander-side remote">${iconFor({kind:'folder'})}<span class="commander-file-copy"><strong>..</strong><small>Parent folder</small></span></span>
   </button>` : '';
