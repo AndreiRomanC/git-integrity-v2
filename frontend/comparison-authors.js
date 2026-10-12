@@ -61,6 +61,13 @@ function comparisonAuthorMatches(row, model) {
   return !model?.paths || [row.relative_path, row.local?.relative_path, row.remote?.relative_path]
     .some(path => path && model.paths.has(path));
 }
+function comparisonAuthorEmptyMessage(model) {
+  if (model?.selected && model.directOnly) {
+    if (model.strictResult?.error) return 'Strict analysis could not finish. No results were applied; see the error above.';
+    if (!model.strictResult?.result || model.strictResult?.pending) return 'Analyzing actual contributions…';
+  }
+  return 'No changed files match this filter';
+}
 function comparisonAuthorEvidence(row, model) {
   const author = model?.authors?.find(item => item.key === model.selected);
   if (!author) return [];
@@ -83,4 +90,4 @@ function workspaceComparisonAuthorContext(result) {
       [row.relative_path, row.local?.relative_path, row.remote?.relative_path].filter(Boolean)))].sort(),
   };
 }
-if (typeof module !== 'undefined' && module.exports) module.exports = { createComparisonAuthorCache, comparisonAuthorMatches, comparisonAuthorEvidence, workspaceComparisonAuthorContext };
+if (typeof module !== 'undefined' && module.exports) module.exports = { createComparisonAuthorCache, comparisonAuthorMatches, comparisonAuthorEmptyMessage, comparisonAuthorEvidence, workspaceComparisonAuthorContext };

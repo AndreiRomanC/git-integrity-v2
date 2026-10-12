@@ -3,9 +3,22 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
-const { createComparisonAuthorCache, comparisonAuthorMatches, comparisonAuthorEvidence, workspaceComparisonAuthorContext } = require('../frontend/comparison-authors.js');
+const { createComparisonAuthorCache, comparisonAuthorMatches, comparisonAuthorEmptyMessage, comparisonAuthorEvidence, workspaceComparisonAuthorContext } = require('../frontend/comparison-authors.js');
 const context = { repositoryPath: '/repo', leftRevision: 'a', rightRevision: 'b' };
 const authors = [{ key: 'email:a@test', name: 'Name', email: 'a@test', paths: ['old', 'new', 'modified'] }];
+
+test('strict failure and pending analysis are not presented as a successful empty filter', () => {
+  const model = {selected:'email:a@test',directOnly:true};
+  assert.match(comparisonAuthorEmptyMessage(model), /Analyzing/);
+  model.strictResult = {error:'budget exceeded'};
+  assert.match(comparisonAuthorEmptyMessage(model), /could not finish/);
+  assert.doesNotMatch(comparisonAuthorEmptyMessage(model), /No changed files match/);
+  model.strictResult = {result:{paths:[]}};
+  assert.equal(comparisonAuthorEmptyMessage(model), 'No changed files match this filter');
+  model.directOnly = false;
+  model.strictResult = {error:'previous failure'};
+  assert.equal(comparisonAuthorEmptyMessage(model), 'No changed files match this filter');
+});
 
 test('per-file evidence uses selected identity and active mode without including other paths', async () => {
   const direct = {commit:'direct',parent:'base',direct:true,change:'Modified'};

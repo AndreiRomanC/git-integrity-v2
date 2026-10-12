@@ -41,9 +41,12 @@ struct Analysis<'a> {
     renames: HashMap<(Oid, Oid), HashMap<String, (String, bool)>>,
     proofs: HashMap<(Oid, String, Probe), Proof>,
     deletions: HashMap<(Oid, String), HashSet<Vec<u8>>>,
+    unchanged_origins: HashMap<(Oid, String), Oid>,
     started: Instant,
     visits: usize,
     bytes: usize,
+    peak_bytes: usize,
+    current_path: String,
 }
 
 fn identity(commit: &git2::Commit<'_>) -> String {
@@ -65,10 +68,43 @@ fn rename_counts(diff: &git2::Diff<'_>) -> (HashMap<Oid, usize>, HashMap<Oid, us
 impl<'a> Analysis<'a> {
     fn budget(&mut self) -> Result<(), String> {
         self.visits += 1;
-        if self.visits > 250_000 || self.bytes > 64 * 1024 * 1024 || self.started.elapsed() > Duration::from_secs(30) {
-            return Err("Strict attribution exceeded its analysis budget. No partial results were applied; choose closer revisions or disable the strict filter.".into());
+        self.peak_bytes = self.peak_bytes.max(self.bytes);
+        let reason = if self.visits > 250_000 { Some("history visits") }
+            else if self.bytes > 64 * 1024 * 1024 { Some("per-file memory") }
+            else if self.started.elapsed() > Duration::from_secs(30) { Some("elapsed time") } else { None };
+        if let Some(reason) = reason {
+            perf_log(&format!("comparison_author_contributions: budget_exceeded reason={reason} path={:?} visits={} bytes={} commits={}", self.current_path, self.visits, self.bytes, self.exclusive.len()), self.started.elapsed());
+            return Err(format!("Strict attribution exceeded its analysis budget ({reason}). No partial results were applied; choose closer revisions or disable the strict filter."));
         }
         Ok(())
+    }
+
+    fn begin_file(&mut self, path: &str) {
+        // Evidence already stored in the result owns its data. Provenance caches
+        // are only needed for the current file, not every previous delta.
+        // Keep commit-pair rename maps shared: recomputing a whole-tree rename
+        // diff separately for every added path would undo the performance gain.
+        self.entries.clear(); self.texts.clear();
+        self.proofs.clear(); self.deletions.clear(); self.unchanged_origins.clear();
+        self.bytes = 0;
+        self.current_path = path.into();
+    }
+
+    fn unchanged_origin(&mut self, mut id: Oid, path: &str) -> Result<Oid, String> {
+        let mut skipped = Vec::new();
+        while self.exclusive.contains(&id) {
+            let key = (id, path.to_string());
+            if let Some(origin) = self.unchanged_origins.get(&key) { id = *origin; break; }
+            self.budget()?;
+            let info = self.commit(id)?;
+            // Never jump across a merge, rename, mode change or content change.
+            // Every supported probe has identical truth on identical entries.
+            if info.parents.len() != 1 || self.entry(id, path)? != self.entry(info.parents[0], path)? { break; }
+            skipped.push(key);
+            id = info.parents[0];
+        }
+        for key in skipped { self.unchanged_origins.insert(key, id); }
+        Ok(id)
     }
 
     fn commit(&mut self, id: Oid) -> Result<CommitInfo, String> {
@@ -166,6 +202,7 @@ impl<'a> Analysis<'a> {
     }
 
     fn trace(&mut self, id: Oid, path: &str, probe: &Probe, depth: usize) -> Result<Proof, String> {
+        let id = self.unchanged_origin(id, path)?;
         if !self.exclusive.contains(&id) { return Ok(Proof::Other); }
         if depth > 256 { return Ok(Proof::Unknown); }
         let key = (id, path.to_string(), probe.clone());
@@ -237,6 +274,7 @@ impl<'a> Analysis<'a> {
 fn collect_strict(repo: &Repository, left: Oid, right: Oid, author: &str) -> Result<Contributions, String> {
     if repo.is_shallow() { return Err("Strict attribution requires complete local history. No results were applied.".into()); }
     let started = Instant::now();
+    perf_log(&format!("comparison_author_contributions: start left={} right={}", &left.to_string()[..8], &right.to_string()[..8]), Duration::ZERO);
     let mut exclusive = HashSet::new();
     for (tip, hide) in [(left, right), (right, left)] {
         let mut walk = repo.revwalk().map_err(|e| e.to_string())?;
@@ -247,7 +285,7 @@ fn collect_strict(repo: &Repository, left: Oid, right: Oid, author: &str) -> Res
             if exclusive.len() > 100_000 || started.elapsed() > Duration::from_secs(30) { return Err("History exceeds the strict attribution budget. Choose closer revisions.".into()); }
         }
     }
-    let mut analysis = Analysis { repo, author, exclusive, commits: HashMap::new(), entries: HashMap::new(), texts: HashMap::new(), renames: HashMap::new(), proofs: HashMap::new(), deletions: HashMap::new(), started, visits: 0, bytes: 0 };
+    let mut analysis = Analysis { repo, author, exclusive, commits: HashMap::new(), entries: HashMap::new(), texts: HashMap::new(), renames: HashMap::new(), proofs: HashMap::new(), deletions: HashMap::new(), unchanged_origins: HashMap::new(), started, visits: 0, bytes: 0, peak_bytes: 0, current_path: String::new() };
     let left_tree = repo.find_commit(left).and_then(|c| c.tree()).map_err(|e| e.to_string())?;
     let right_tree = repo.find_commit(right).and_then(|c| c.tree()).map_err(|e| e.to_string())?;
     let mut diff = repo.diff_tree_to_tree(Some(&left_tree), Some(&right_tree), None).map_err(|e| e.to_string())?;
@@ -261,6 +299,7 @@ fn collect_strict(repo: &Repository, left: Oid, right: Oid, author: &str) -> Res
         let new = delta.new_file().path().map(normalized);
         let old_path = old.as_deref().or(new.as_deref()).unwrap_or("");
         let new_path = new.as_deref().or(old.as_deref()).unwrap_or("");
+        analysis.begin_file(new_path);
         if delta.status() == git2::Delta::Renamed && (removed.get(&delta.old_file().id()) != Some(&1) || added.get(&delta.new_file().id()) != Some(&1)) {
             for path in [old, new].into_iter().flatten() {
                 result.ambiguous_paths.insert(path, "Multiple identical files make rename pairing ambiguous. No historical file identity was guessed.".into());
@@ -330,7 +369,7 @@ fn collect_strict(repo: &Repository, left: Oid, right: Oid, author: &str) -> Res
         }
     }
     result.paths.sort(); result.paths.dedup();
-    perf_log(&format!("comparison_author_contributions: left={} right={} commits={} paths={} ambiguous={} visits={} budget_bytes={}", &left.to_string()[..8], &right.to_string()[..8], analysis.exclusive.len(), result.paths.len(), result.ambiguous_paths.len(), analysis.visits, analysis.bytes), started.elapsed());
+    perf_log(&format!("comparison_author_contributions: left={} right={} commits={} paths={} ambiguous={} visits={} peak_file_bytes={}", &left.to_string()[..8], &right.to_string()[..8], analysis.exclusive.len(), result.paths.len(), result.ambiguous_paths.len(), analysis.visits, analysis.peak_bytes), started.elapsed());
     Ok(result)
 }
 
@@ -388,6 +427,39 @@ mod tests {
         }
     }
     impl Drop for Fixture { fn drop(&mut self) { let _ = fs::remove_dir_all(&self.path); } }
+
+    #[test]
+    fn distant_commit_snapshots_skip_unchanged_file_history() {
+        let f = Fixture::new();
+        let base = f.commit("base", &[("large", "base\n")], &[]);
+        let imported = (0..1500).map(|i| format!("imported unique line {i}\n")).collect::<String>();
+        let bob = f.commit("bob", &[("large", &imported)], &[base]);
+        let mut tip = f.commit("alice", &[("large", &imported), ("own", "mine\n")], &[bob]);
+        for _ in 0..280 {
+            tip = f.commit("bob", &[("large", &imported), ("own", "mine\n")], &[tip]);
+        }
+        f.check(base, tip, "alice", &["own"]);
+        f.check(base, tip, "bob", &["large"]);
+        // The UI resolves both branch names and selected commits to these same SHAs.
+        f.repo.reference("refs/heads/start", base, true, "test").unwrap();
+        f.repo.reference("refs/heads/end", tip, true, "test").unwrap();
+        let named_left = f.repo.revparse_single("start").unwrap().peel_to_commit().unwrap().id();
+        let named_right = f.repo.revparse_single("end").unwrap().peel_to_commit().unwrap().id();
+        f.check(named_left, named_right, "alice", &["own"]);
+    }
+
+    #[test]
+    fn many_files_do_not_accumulate_previous_file_provenance_memory() {
+        let f = Fixture::new();
+        let base = f.commit("base", &[], &[]);
+        let padding = "padding\n".repeat(120_000);
+        let files = (0..72).map(|i| (format!("file-{i:03}"), format!("own-{i}\n{padding}"))).collect::<Vec<_>>();
+        assert!(files.iter().map(|(_, text)| text.len()).sum::<usize>() > 64 * 1024 * 1024);
+        let refs = files.iter().map(|(name, text)| (name.as_str(), text.as_str())).collect::<Vec<_>>();
+        let tip = f.commit("alice", &refs, &[base]);
+        let paths = files.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>();
+        f.check(base, tip, "alice", &paths);
+    }
 
     #[test]
     fn direct_shared_file_keeps_full_diff_and_is_read_only() {
