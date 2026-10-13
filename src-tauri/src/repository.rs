@@ -1017,6 +1017,7 @@ pub struct FolderRestorePreview {
     source_author: String,
     source_date: String,
     tracked_changes: Vec<Change>,
+    staged_paths: Vec<String>,
     clean_candidates: Vec<String>,
 }
 
@@ -7126,21 +7127,38 @@ fn validate_tag_name(name: &str) -> Result<(), String> {
 // why the submodule ends up in detached HEAD afterward — same as ordinary
 // `git submodule update` always does.
 #[tauri::command]
-pub async fn reset_submodule(repository_path: String, relative_path: String) -> Result<String, String> {
-    off_main_thread(move || reset_submodule_inner(repository_path, relative_path)).await
+pub async fn reset_submodule(repository_path: String, relative_path: String, use_parent_head: Option<bool>) -> Result<String, String> {
+    off_main_thread(move || reset_submodule_with_source(repository_path, relative_path, use_parent_head.unwrap_or(false))).await
 }
 
 fn reset_submodule_inner(repository_path: String, relative_path: String) -> Result<String, String> {
+    reset_submodule_with_source(repository_path, relative_path, false)
+}
+
+fn reset_submodule_with_source(repository_path: String, relative_path: String, use_parent_head: bool) -> Result<String, String> {
     validate_path(&repository_path)?;
     let absolute = validate_submodule(&repository_path, &relative_path)?;
     let relative = safe_relative_path(&relative_path)?;
     let relative_string = normalized(&relative);
+    let parent_lock = repo_write_lock(&repository_path);
+    let _parent_guard = parent_lock.lock().unwrap();
     let parent = internal_repository(&repository_path)?;
     let index = parent.index().map_err(|error| error.message().to_string())?;
     let entry = index.iter().find(|entry| String::from_utf8_lossy(&entry.path) == relative_string)
         .ok_or("This path is not a registered submodule in the parent index")?;
-    let target_oid = entry.id;
-    drop(index); drop(parent); // read-only above — only the submodule itself is mutated below
+    let head = if use_parent_head {
+        if parent.state() != git2::RepositoryState::Clean || index.has_conflicts() {
+            return Err("Finish or abort the parent Git operation before restoring and unstaging its submodule pointer. Nothing was changed.".into());
+        }
+        Some(parent.head().and_then(|head| head.peel_to_commit()).map_err(|error| error.message().to_string())?)
+    } else { None };
+    let target_oid = if let Some(head) = &head {
+        let tree = head.tree().map_err(|error| error.message().to_string())?;
+        let recorded = tree.get_path(&relative).map_err(|_| "This submodule is absent from parent HEAD. Nothing was changed.".to_string())?;
+        if recorded.filemode() != 0o160000 { return Err("Parent HEAD does not contain a submodule at this path. Nothing was changed.".into()); }
+        recorded.id()
+    } else { entry.id };
+    drop(index);
     let absolute_string = absolute.to_string_lossy().into_owned();
     let queue_started = Instant::now();
     let lock_handle = repo_write_lock(&absolute_string);
@@ -7160,6 +7178,12 @@ fn reset_submodule_inner(repository_path: String, relative_path: String) -> Resu
     checkout.force().remove_untracked(true).remove_ignored(true);
     sub_repo.checkout_head(Some(&mut checkout)).map_err(|error| error.message().to_string())?;
     drop(sub_repo);
+    if let Some(head) = head {
+        // Explicit option only: literal, scoped index reset. No parent files
+        // are checked out and unrelated staged entries are preserved.
+        git(&repository_path, &["restore", "--source", &head.id().to_string(), "--staged", "--", &format!(":(top,literal){relative_string}")])
+            .map_err(|detail| { invalidate_git_metadata(&absolute_string); invalidate_git_metadata(&repository_path); format!("Submodule restored, but its parent pointer could not be unstaged: {detail}") })?;
+    }
     invalidate_git_metadata(&absolute_string); // the submodule's own cache — its HEAD just moved
     invalidate_git_metadata_for_submodule_checkout(&repository_path, &relative_string);
     invalidate_submodule_sync(&repository_path); // this app just changed a submodule's registration/version
@@ -7652,9 +7676,13 @@ fn commit_selected_internal(repository_path: &str, files: &[String], message: &s
 
 #[tauri::command]
 pub fn restore_file(repository_path: String, relative_path: String, source_ref: String) -> Result<(), String> {
+    restore_file_with_staging(repository_path, relative_path, source_ref, false)
+}
+
+fn restore_file_with_staging(repository_path: String, relative_path: String, source_ref: String, leave_unstaged: bool) -> Result<(), String> {
     validate_path(&repository_path)?;
     if let Some((sub_path, inner_relative)) = resolve_submodule_boundary(&repository_path, &relative_path) {
-        return restore_file(sub_path, inner_relative, source_ref);
+        return restore_file_with_staging(sub_path, inner_relative, source_ref, leave_unstaged);
     }
     let relative = safe_relative_path(&relative_path)?; if relative.as_os_str().is_empty() { return Err("Select a file".into()); }
     let queue_started = Instant::now();
@@ -7662,6 +7690,9 @@ pub fn restore_file(repository_path: String, relative_path: String, source_ref: 
     let _lock = lock_handle.lock().unwrap();
     log_repo_write_lock_acquired(&repository_path, "restore_file", queue_started.elapsed());
     let repo = internal_repository(&repository_path)?;
+    if leave_unstaged && (repo.state() != git2::RepositoryState::Clean || repo.index().map_err(|error| error.message().to_string())?.has_conflicts()) {
+        return Err("Finish or abort the current Git operation before restoring and unstaging this file. Nothing was restored.".into());
+    }
     let object = repo.revparse_single(source_ref.trim()).or_else(|_| repo.revparse_single(&format!("refs/remotes/{}", source_ref.trim()))).map_err(|error| format!("Cannot resolve {source_ref}: {}", error.message()))?;
     let commit = object.peel_to_commit().map_err(|error| error.message().to_string())?; let tree = commit.tree().map_err(|error| error.message().to_string())?;
     let entry = match tree.get_path(&relative) {
@@ -7683,6 +7714,10 @@ pub fn restore_file(repository_path: String, relative_path: String, source_ref: 
             } else if destination.exists() {
                 fs::remove_file(&destination).map_err(|error| error.to_string())?;
             }
+            if leave_unstaged && repo.head().and_then(|head| head.peel_to_tree()).and_then(|tree| tree.get_path(&relative)).is_ok() {
+                git(&repository_path, &["restore", "--source", "HEAD", "--staged", "--", &format!(":(top,literal){}", normalized(&relative))])
+                    .map_err(|detail| { invalidate_git_metadata(&repository_path); format!("File removed to match the source, but could not be unstaged: {detail}") })?;
+            }
             invalidate_git_metadata(&repository_path);
             return Ok(());
         }
@@ -7693,22 +7728,25 @@ pub fn restore_file(repository_path: String, relative_path: String, source_ref: 
     fs::write(destination, blob.content()).map_err(|error| error.to_string())?;
     if source_ref.trim() == "HEAD" {
         repo.reset_default(Some(&object), [relative.as_path()]).map_err(|error| format!("File restored, but staging could not be reset: {}", error.message()))?;
+    } else if leave_unstaged {
+        git(&repository_path, &["restore", "--source", "HEAD", "--staged", "--", &format!(":(top,literal){}", normalized(&relative))])
+            .map_err(|detail| { invalidate_git_metadata(&repository_path); format!("File restored, but could not be unstaged: {detail}") })?;
     }
     invalidate_git_metadata(&repository_path); Ok(())
 }
 
 #[tauri::command]
-pub fn restore_remote_file(repository_path: String, relative_path: String, remote_ref: String) -> Result<(), String> {
+pub fn restore_remote_file(repository_path: String, relative_path: String, remote_ref: String, leave_unstaged: Option<bool>) -> Result<(), String> {
     validate_path(&repository_path)?;
     if let Some((sub_path, inner_relative)) = resolve_submodule_boundary(&repository_path, &relative_path) {
         let sub_remote_ref = default_remote_ref(&sub_path).ok_or("This submodule has no remote-tracking branch. Fetch the submodule first.")?;
-        return restore_remote_file(sub_path, inner_relative, sub_remote_ref);
+        return restore_remote_file(sub_path, inner_relative, sub_remote_ref, leave_unstaged);
     }
     let remote_ref = remote_ref.trim();
     let (remote, _) = remote_ref.split_once('/').ok_or("Choose a remote branch such as origin/main")?;
     let repo = internal_repository(&repository_path)?; repo.find_remote(remote).map_err(|_| "The selected remote is not configured".to_string())?;
     git(&repository_path, &["fetch", remote]).map_err(|detail| format!("Fetch failed: {detail}"))?;
-    restore_file(repository_path, relative_path, remote_ref.to_string())
+    restore_file_with_staging(repository_path, relative_path, remote_ref.to_string(), leave_unstaged.unwrap_or(false))
 }
 
 // Only for `diff --name-status -z --no-renames`: fixed status/path pairs,
@@ -7833,7 +7871,7 @@ fn path_restore_preview_inner(repository_path: &str, relative_path: &str, source
     validate_path_restore_target(&repo, repository_path, &relative, &tree, source_revision, is_file)?;
     // File names can contain Git pathspec metacharacters. File mode must
     // address exactly one path even for names such as [draft].txt.
-    let pathspec = if is_file { format!(":(top,literal){relative_string}") } else { relative_string.clone() };
+    let pathspec = format!(":(top,literal){relative_string}");
     let source_id = commit.id().to_string();
     // Restore replaces BOTH index and worktree from this exact tree. A
     // HEAD-to-source diff misses local edits and reports false positives
@@ -7842,6 +7880,10 @@ fn path_restore_preview_inner(repository_path: &str, relative_path: &str, source
     // Both reads are path-scoped; only the second examines working files.
     let index_changes = folder_restore_diff_changes(&git(repository_path, &["diff", "--cached", "--name-status", "-z", "--no-renames", "--no-ext-diff", &source_id, "--", &pathspec])?, true);
     let worktree_changes = folder_restore_diff_changes(&git(repository_path, &["diff", "--name-status", "-z", "--no-renames", "--no-ext-diff", &source_id, "--", &pathspec])?, false);
+    // Staging is relative to HEAD, not to the selected historical source.
+    // This reads only the selected index paths; it does not scan working files.
+    let staged_paths = folder_restore_diff_changes(&git(repository_path, &["diff", "--cached", "--name-status", "-z", "--no-renames", "--no-ext-diff", "HEAD", "--", &pathspec])?, true)
+        .into_iter().map(|change| change.path).collect();
     let mut tracked_by_path = std::collections::BTreeMap::<String, Change>::new();
     for change in index_changes.into_iter().chain(worktree_changes) {
         if let Some(existing) = tracked_by_path.get_mut(&change.path) {
@@ -7868,6 +7910,7 @@ fn path_restore_preview_inner(repository_path: &str, relative_path: &str, source
         source_author,
         source_date,
         tracked_changes,
+        staged_paths,
         clean_candidates,
     })
 }
@@ -7880,10 +7923,9 @@ pub fn preview_folder_restore(repository_path: String, relative_path: String, so
 }
 
 #[tauri::command]
-pub async fn restore_folder(repository_path: String, relative_path: String, source_revision: String, clean_paths: Vec<String>, item_kind: Option<String>) -> Result<(), String> {
+pub async fn restore_folder(repository_path: String, relative_path: String, source_revision: String, clean_paths: Vec<String>, item_kind: Option<String>, leave_unstaged: Option<bool>) -> Result<(), String> {
     let is_file = restore_item_is_file(item_kind.as_deref())?;
-    off_main_thread(move || if is_file { path_restore_inner(repository_path, relative_path, source_revision, clean_paths, true) }
-        else { restore_folder_inner(repository_path, relative_path, source_revision, clean_paths) }).await
+    off_main_thread(move || path_restore_with_staging(repository_path, relative_path, source_revision, clean_paths, is_file, leave_unstaged.unwrap_or(false))).await
 }
 
 fn restore_folder_inner(repository_path: String, relative_path: String, source_revision: String, clean_paths: Vec<String>) -> Result<(), String> {
@@ -7891,6 +7933,10 @@ fn restore_folder_inner(repository_path: String, relative_path: String, source_r
 }
 
 fn path_restore_inner(repository_path: String, relative_path: String, source_revision: String, clean_paths: Vec<String>, is_file: bool) -> Result<(), String> {
+    path_restore_with_staging(repository_path, relative_path, source_revision, clean_paths, is_file, false)
+}
+
+fn path_restore_with_staging(repository_path: String, relative_path: String, source_revision: String, clean_paths: Vec<String>, is_file: bool, leave_unstaged: bool) -> Result<(), String> {
     let started = Instant::now();
     validate_path(&repository_path)?;
     let relative = safe_relative_path(&relative_path)?;
@@ -7915,9 +7961,12 @@ fn path_restore_inner(repository_path: String, relative_path: String, source_rev
     let lock_handle = repo_write_lock(&repository_path);
     let _lock = lock_handle.lock().unwrap();
     log_repo_write_lock_acquired(&repository_path, "restore_folder", queue_started.elapsed());
+    if leave_unstaged && (repo.state() != git2::RepositoryState::Clean || repo.index().map_err(|error| error.message().to_string())?.has_conflicts()) {
+        return Err("Cannot unstage as part of restore while a merge, rebase or other Git operation is in progress. Nothing was restored.".into());
+    }
     if is_file { validate_path_restore_target(&repo, &repository_path, &relative, &tree, &source_revision, true)?; }
     let source_id = commit.id().to_string();
-    let pathspec = if is_file { format!(":(top,literal){relative_string}") } else { relative_string.clone() };
+    let pathspec = format!(":(top,literal){relative_string}");
     git(&repository_path, &["restore", "--source", &source_id, "--staged", "--worktree", "--", &pathspec])
         .map_err(|detail| format!("{} restore failed: {detail}", if is_file { "File" } else { "Folder" }))?;
     let submodule_status = if is_file { String::new() } else {
@@ -7932,6 +7981,10 @@ fn path_restore_inner(repository_path: String, relative_path: String, source_rev
         let mut args = vec!["clean".to_string(), "-fd".to_string(), "--".to_string()];
         args.extend(clean_relative.into_iter().map(|path| format!(":(top,literal){path}")));
         git_owned(&repository_path, args).map_err(|detail| format!("Folder restored, but clean failed: {detail}"))?;
+    }
+    if leave_unstaged {
+        git(&repository_path, &["restore", "--source", "HEAD", "--staged", "--", &pathspec])
+            .map_err(|detail| { invalidate_git_metadata(&repository_path); format!("Files were restored, but could not be unstaged: {detail}. Check the index before committing.") })?;
     }
     invalidate_git_metadata(&repository_path);
     if !is_file { invalidate_submodule_sync(&repository_path); }
@@ -10065,6 +10118,89 @@ mod tests {
     }
 
     #[test]
+    fn restore_preview_reports_staging_relative_to_head_even_when_source_matches() {
+        let (root, path, old, _) = individual_restore_fixture("staged-source");
+        path_restore_inner(path.clone(), "folder/file.txt".into(), old.clone(), vec![], true).unwrap();
+        let preview = path_restore_preview_inner(&path, "folder/file.txt", &old, false, true).unwrap();
+        assert!(preview.tracked_changes.is_empty());
+        assert_eq!(preview.staged_paths, vec!["folder/file.txt"]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn restore_leave_unstaged_is_scoped_and_preserves_restored_content_and_refs() {
+        for is_file in [true, false] {
+            let (root, path, old, head) = individual_restore_fixture("leave-unstaged");
+            let refs_before = run_git_capture(&root, &["show-ref"]);
+            fs::write(root.join("folder/file.txt"), "staged target\n").unwrap();
+            fs::write(root.join("outside.txt"), "staged outside\n").unwrap();
+            fs::write(root.join("folder/sibling.txt"), "staged sibling\n").unwrap();
+            run_git(&root, &["add", "."]);
+            fs::write(root.join("outside.txt"), "unstaged outside\n").unwrap();
+            fs::write(root.join("folder/untracked.txt"), "untouched\n").unwrap();
+            let outside_index = run_git_capture(&root, &["rev-parse", ":outside.txt"]);
+            let sibling_index = run_git_capture(&root, &["rev-parse", ":folder/sibling.txt"]);
+            let selected = if is_file { "folder/file.txt" } else { "folder" };
+            path_restore_with_staging(path.clone(), selected.into(), old, vec![], is_file, true).unwrap();
+            assert_eq!(fs::read_to_string(root.join("folder/file.txt")).unwrap(), "old\n");
+            assert_eq!(run_git_capture(&root, &["rev-parse", ":folder/file.txt"]), run_git_capture(&root, &["rev-parse", "HEAD:folder/file.txt"]));
+            assert_eq!(run_git_capture(&root, &["rev-parse", ":outside.txt"]), outside_index);
+            assert_eq!(fs::read_to_string(root.join("outside.txt")).unwrap(), "unstaged outside\n");
+            assert_eq!(fs::read_to_string(root.join("folder/untracked.txt")).unwrap(), "untouched\n");
+            if is_file { assert_eq!(run_git_capture(&root, &["rev-parse", ":folder/sibling.txt"]), sibling_index); }
+            assert_eq!(run_git_capture(&root, &["rev-parse", "HEAD"]), head);
+            assert_eq!(run_git_capture(&root, &["show-ref"]), refs_before);
+            path_restore_with_staging(path, selected.into(), head, vec![], is_file, true).unwrap();
+            assert_eq!(fs::read_to_string(root.join("folder/file.txt")).unwrap(), "new\n");
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn restore_leave_unstaged_refuses_in_progress_merge_before_changing_files() {
+        let (root, path, old, head) = individual_restore_fixture("unstage-merge");
+        fs::write(root.join("folder/file.txt"), "keep staged\n").unwrap();
+        run_git(&root, &["add", "folder/file.txt"]);
+        let index = fs::read(root.join(".git/index")).unwrap();
+        fs::write(root.join(".git/MERGE_HEAD"), format!("{head}\n")).unwrap();
+        let error = path_restore_with_staging(path, "folder/file.txt".into(), old, vec![], true, true).unwrap_err();
+        assert!(error.contains("Nothing was restored"));
+        assert_eq!(fs::read(root.join(".git/index")).unwrap(), index);
+        assert_eq!(fs::read_to_string(root.join("folder/file.txt")).unwrap(), "keep staged\n");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn restore_file_optional_unstage_keeps_other_index_entries() {
+        let (root, path, old, _) = individual_restore_fixture("remote-unstage");
+        fs::write(root.join("folder/file.txt"), "staged\n").unwrap();
+        fs::write(root.join("outside.txt"), "outside\n").unwrap();
+        run_git(&root, &["add", "."]);
+        let staged = run_git_capture(&root, &["rev-parse", ":folder/file.txt"]);
+        let outside = run_git_capture(&root, &["rev-parse", ":outside.txt"]);
+        restore_file_with_staging(path.clone(), "folder/file.txt".into(), old.clone(), false).unwrap();
+        assert_eq!(run_git_capture(&root, &["rev-parse", ":folder/file.txt"]), staged);
+        restore_file_with_staging(path, "folder/file.txt".into(), old, true).unwrap();
+        assert_eq!(fs::read_to_string(root.join("folder/file.txt")).unwrap(), "old\n");
+        assert_eq!(run_git_capture(&root, &["rev-parse", ":folder/file.txt"]), run_git_capture(&root, &["rev-parse", "HEAD:folder/file.txt"]));
+        assert_eq!(run_git_capture(&root, &["rev-parse", ":outside.txt"]), outside);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn restore_file_absent_from_source_can_leave_deletion_unstaged() {
+        let (root, path, old, _) = individual_restore_fixture("unstaged-deletion");
+        fs::write(root.join("added.txt"), "new file\n").unwrap();
+        run_git(&root, &["add", "added.txt"]);
+        run_git(&root, &["commit", "-m", "Add file"]);
+        let index = run_git_capture(&root, &["rev-parse", ":added.txt"]);
+        restore_file_with_staging(path, "added.txt".into(), old, true).unwrap();
+        assert!(!root.join("added.txt").exists());
+        assert_eq!(run_git_capture(&root, &["rev-parse", ":added.txt"]), index);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn individual_file_restore_reuses_preview_and_preserves_siblings_index_refs_and_history() {
         let (root, path, old, head) = individual_restore_fixture("roundtrip");
         let refs_before = run_git_capture(&root, &["show-ref"]);
@@ -10466,7 +10602,7 @@ mod tests {
         run_git(&repository, &["remote", "add", "origin", repository.to_str().unwrap()]);
         run_git(&repository, &["fetch", "origin"]);
         fs::write(repository.join("src/main.c"), "int main(void) { return 3; }").unwrap();
-        restore_remote_file(repository.to_string_lossy().into_owned(), "src/main.c".into(), "origin/main".into()).unwrap();
+        restore_remote_file(repository.to_string_lossy().into_owned(), "src/main.c".into(), "origin/main".into(), None).unwrap();
         assert!(!read_text_file(repository.to_string_lossy().into_owned(), "src/main.c".into()).unwrap().content.contains("return 3"));
         assert_eq!(submodule_repository_inner(repository.to_string_lossy().into_owned(), "vendor/dependency".into()).unwrap().repository.name, "dependency");
         assert_eq!(list_remotes(repository.to_string_lossy().into_owned()).unwrap().len(), 1);
@@ -14682,6 +14818,34 @@ mod tests {
     // and kept surprising the user afterward. Restore project version's own
     // stated purpose is "the exact commit recorded by the parent project",
     // so it must clear that cruft too.
+    #[test]
+    fn reset_submodule_explicit_parent_head_option_unstages_only_selected_pointer() {
+        let (base, _, _, _) = individual_restore_fixture("submodule-unstage");
+        let repository = base.join("parent");
+        let dependency = base.join("dep");
+        create_libgit2_repository(&repository, "README.md");
+        create_libgit2_repository(&dependency, "module.txt");
+        run_git(&repository, &["-c", "protocol.file.allow=always", "submodule", "add", dependency.to_str().unwrap(), "vendor/dep"]);
+        run_git(&repository, &["commit", "-am", "Add dep"]);
+        let child = repository.join("vendor/dep");
+        let original = run_git_capture(&child, &["rev-parse", "HEAD"]);
+        fs::write(child.join("module.txt"), "new pointer\n").unwrap();
+        run_git(&child, &["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-am", "New dep"]);
+        let staged = run_git_capture(&child, &["rev-parse", "HEAD"]);
+        fs::write(repository.join("README.md"), "staged unrelated\n").unwrap();
+        run_git(&repository, &["add", "README.md", "vendor/dep"]);
+        let unrelated = run_git_capture(&repository, &["rev-parse", ":README.md"]);
+        let parent_head = run_git_capture(&repository, &["rev-parse", "HEAD"]);
+        let path = repository.to_string_lossy().into_owned();
+        assert_eq!(reset_submodule_inner(path.clone(), "vendor/dep".into()).unwrap(), staged, "default still uses the index");
+        assert_eq!(reset_submodule_with_source(path, "vendor/dep".into(), true).unwrap(), original);
+        assert_eq!(run_git_capture(&child, &["rev-parse", "HEAD"]), original);
+        assert_eq!(run_git_capture(&repository, &["rev-parse", ":vendor/dep"]), original);
+        assert_eq!(run_git_capture(&repository, &["rev-parse", ":README.md"]), unrelated);
+        assert_eq!(run_git_capture(&repository, &["rev-parse", "HEAD"]), parent_head);
+        fs::remove_dir_all(base).unwrap();
+    }
+
     #[test]
     fn reset_submodule_removes_untracked_and_ignored_leftovers_not_just_tracked_drift() {
         let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();

@@ -28,7 +28,7 @@ enum Probe {
 enum Proof { Other, Own(Oid, Option<Oid>, String), Unknown }
 
 #[derive(Clone)]
-struct CommitInfo { tree: Oid, parents: Vec<Oid>, author: String }
+struct CommitInfo { tree: Oid, parents: Vec<Oid>, author: String, time: i64 }
 struct Text { counts: HashMap<Vec<u8>, usize>, supported: bool }
 
 struct Analysis<'a> {
@@ -139,7 +139,7 @@ impl<'a> Analysis<'a> {
     fn commit(&mut self, id: Oid) -> Result<CommitInfo, String> {
         if let Some(info) = self.commits.get(&id) { return Ok(info.clone()); }
         let commit = self.repo.find_commit(id).map_err(|e| e.to_string())?;
-        let info = CommitInfo { tree: commit.tree_id(), parents: commit.parent_ids().collect(), author: identity(&commit) };
+        let info = CommitInfo { tree: commit.tree_id(), parents: commit.parent_ids().collect(), author: identity(&commit), time: commit.time().seconds() };
         self.commits.insert(id, info.clone());
         Ok(info)
     }
@@ -405,7 +405,7 @@ fn collect_strict(repo: &Repository, left: Oid, right: Oid, author: &str) -> Res
             if let Some((commit, parent, witness_path)) = &witness {
                 result.paths.push(path.clone());
                 // The witness's historic path may differ after an exact rename.
-                result.evidence.insert(path, vec![ComparisonTouch { commit: commit.to_string(), parent: parent.map(|p| p.to_string()), change: "Surviving contribution".into(), direct: true, witness_path: Some(witness_path.clone()) }]);
+                result.evidence.insert(path, vec![ComparisonTouch { commit: commit.to_string(), date: short_date(analysis.commit(*commit)?.time), parent: parent.map(|p| p.to_string()), change: "Surviving contribution".into(), direct: true, witness_path: Some(witness_path.clone()) }]);
             } else if ambiguous {
                 result.ambiguous_paths.insert(path, "Attribution is inconclusive (merge resolution, duplicate/moved lines, rename ambiguity, binary/large file, or history depth). Not included as a proven contribution.".into());
             }
@@ -463,6 +463,10 @@ mod tests {
             let key = format!("email:{author}@test");
             let result = collect_strict(&self.repo,left,right,&key).unwrap();
             assert_eq!(result.paths,paths, "author={author}");
+            for touch in result.evidence.values().flatten() {
+                let witness = self.repo.find_commit(Oid::from_str(&touch.commit).unwrap()).unwrap();
+                assert_eq!(touch.date, short_date(witness.time().seconds()));
+            }
             let reverse = collect_strict(&self.repo,right,left,&key).unwrap();
             assert_eq!(reverse.paths,result.paths,"direction must not change inclusion");
             assert_eq!(reverse.ambiguous_paths.keys().collect::<Vec<_>>(),result.ambiguous_paths.keys().collect::<Vec<_>>());

@@ -12,6 +12,7 @@ function polarionSearchExplanation(result) {
     not_json: 'The server returned a page instead of API results. Complete sign-in in the Polarion window, then retry.',
     network_error: 'The browser could not complete the API request. Check the Polarion window and connection.',
     timeout: 'Polarion search timed out. You can retry; no commit or message was added.',
+    catalog_limit: 'The project catalog is too large to load within this search limit. No incomplete results were shown. Diagnostics are in the log.',
     wrong_origin: 'Finish signing in and return to the Polarion portal in its window, then retry Search.',
     invalid_response: 'The API response did not have the expected format.',
     http_error: 'Polarion returned an unexpected HTTP response.',
@@ -24,14 +25,23 @@ function createPolarionTaskPicker({ invoke, addMessage }) {
   let generation = 0, context = null, project = null, selected = null, busy = false;
   let lastSearch = null, page = 1, more = false;
   const say = text => { el('Status').textContent = text; };
+  const connection = (state, text) => {
+    el('Connection').dataset.state = state;
+    el('Connection').textContent = text;
+    el('Connect').textContent = state === 'required' ? 'Sign in to Polarion ↗' : 'Open Polarion ↗';
+  };
   const update = () => {
     el('ProjectSearchButton').disabled = busy || !context;
     el('TaskSearchButton').disabled = busy || !project || !context;
+    el('TaskQuery').disabled = !project;
+    el('Assigned').disabled = !project;
+    el('Connect').disabled = busy;
     el('Add').disabled = busy || !selected;
     el('Previous').disabled = busy || !lastSearch || page <= 1;
     el('Next').disabled = busy || !lastSearch || !more;
+    el('Pages').hidden = !lastSearch || (page <= 1 && !more);
     el('User').hidden = !el('Assigned').checked;
-    el('ChosenProject').textContent = project ? `${project.id} · ${project.name}` : 'No project selected';
+    el('ChosenProject').textContent = project ? `Selected: ${project.id} · ${project.name}` : 'Choose a project from the search results to enable task search.';
   };
   const clearResults = () => { selected = null; el('Results').replaceChildren(); more = false; update(); };
   async function chooseProject(item) {
@@ -46,6 +56,11 @@ function createPolarionTaskPicker({ invoke, addMessage }) {
   }
   function render(items, kind) {
     el('Results').replaceChildren();
+    if (!items.length) {
+      const empty = document.createElement('p'); empty.className = 'polarion-empty';
+      empty.textContent = kind === 'projects' ? 'No matching projects. Try another part of the name or ID.' : 'No matching tasks in this project.';
+      el('Results').append(empty);
+    }
     for (const item of items) {
       const row = document.createElement('button'); row.type = 'button'; row.className = 'polarion-result';
       row.setAttribute('aria-pressed', 'false');
@@ -72,16 +87,22 @@ function createPolarionTaskPicker({ invoke, addMessage }) {
     try {
       const result = await invoke('polarion_search', { ...params, page: requestedPage });
       if (generation !== ticket || !dialog.open) return;
-      if (result.code !== 'ok') { lastSearch = null; say(polarionSearchExplanation(result)); return; }
+      if (result.code !== 'ok') {
+        lastSearch = null;
+        if (['auth_required', 'wrong_origin', 'not_json'].includes(result.code)) connection('required', 'Sign-in required · open Polarion, then retry the search');
+        else connection('unknown', 'Access could not be verified · see details below');
+        say(polarionSearchExplanation(result)); return;
+      }
+      connection('connected', result.catalog_cached ? 'Using projects from this session · cached for up to 2 minutes' : 'Connected · Polarion search access verified');
       lastSearch = params; page = requestedPage; more = result.more;
       render(result.items, kind);
       say(`${kind === 'projects' ? 'Projects' : 'Tasks'} · page ${page} · ${result.items.length} results${more ? ' · more available' : ''}. ${result.prefix_fallback ? 'The server rejected fragment search; using prefix search. Enter the beginning of the ID or name. ' : ''}${kind === 'projects' ? 'Select a project.' : 'Select a task to add it to the saved commit messages.'}`);
-    } catch (error) { if (generation === ticket) { lastSearch = null; say(String(error)); } }
+    } catch (error) { if (generation === ticket) { lastSearch = null; connection('unknown', 'Connection not verified · open Polarion if sign-in is needed'); say(String(error)); } }
     finally { if (generation === ticket) { busy = false; update(); } }
   }
   el('Connect').addEventListener('click', async () => {
     const ticket = generation;
-    try { await invoke('polarion_connect'); if (generation === ticket) say('Sign in in the Polarion window, return here and press Search. The system browser session is not imported.'); }
+    try { await invoke('polarion_connect'); if (generation === ticket) { connection('unknown', 'Polarion opened · run a search to verify access'); say('Complete sign-in if requested, then return here and search. An existing session in this Polarion window is reused; Edge sign-in is separate.'); } }
     catch (error) { if (generation === ticket) say(String(error)); }
   });
   el('ProjectSearchButton').addEventListener('click', () => search('projects'));
@@ -108,6 +129,7 @@ function createPolarionTaskPicker({ invoke, addMessage }) {
       if (!repositoryPath || dialog.open) return;
       const ticket = ++generation;
       context = null; project = null; selected = null; busy = true; lastSearch = null;
+      connection('unknown', 'Connection not checked · Search verifies access');
       el('ProjectQuery').value = ''; el('TaskQuery').value = ''; el('Context').textContent = ''; clearResults();
       dialog.showModal(); say('Reading the repository’s saved Polarion project…');
       try {
@@ -115,7 +137,7 @@ function createPolarionTaskPicker({ invoke, addMessage }) {
         if (generation !== ticket) return;
         context = loaded; project = loaded.project;
         el('Context').textContent = loaded.repository_path;
-        say('Open Connect / Polarion to sign in if needed. Search runs only when requested; adding a task never creates a commit.');
+        say(project ? 'Project remembered. Search tasks, or search above to change the project.' : 'Search for any part of a project name or ID, regardless of capitalization. If sign-in is needed, open Polarion first.');
       } catch (error) { if (generation === ticket) say(String(error)); }
       finally { if (generation === ticket) { busy = false; update(); el(project ? 'TaskQuery' : 'ProjectQuery').focus(); } }
     },

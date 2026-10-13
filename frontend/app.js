@@ -324,6 +324,7 @@ const previewData = {
   ]
 };
 const refs = {
+  folderRestoreUnstage: $('#folderRestoreUnstage'), folderRestoreStagedNotice: $('#folderRestoreStagedNotice'),
   repoName: $('#repoName'), repoPath: $('#repoPath'), branches: $('#branches'), graph: $('#graph'),
   graphView: $('#graphView'), emptyState: $('#emptyState'), laneLegend: $('#laneLegend'),
   details: $('#detailsPanel'), currentBranch: $('#currentBranch'), statusText: $('#statusText'),
@@ -656,12 +657,15 @@ function customConfirm(message, options = {}) {
     const dialog = $('#appConfirmDialog');
     $('#appConfirmTitle').textContent = options.title || 'Confirm';
     $('#appConfirmMessage').textContent = message;
+    $('#appConfirmOptionRow').hidden = !options.checkbox;
+    $('#appConfirmOptionText').textContent = options.checkbox?.label || '';
+    $('#appConfirmOption').checked = !!options.checkbox?.checked;
     $('#appConfirmIcon').textContent = options.danger ? '!' : '?';
     const okButton = $('#appConfirmOk');
     okButton.textContent = options.okLabel || 'Confirm';
     okButton.className = options.danger ? 'danger' : 'confirm';
     const cleanup = (result) => { dialog.close(); okButton.removeEventListener('click', onOk); cancelButton.removeEventListener('click', onCancel); dialog.removeEventListener('cancel', onCancel); resolve(result); };
-    const onOk = () => cleanup(true);
+    const onOk = () => { if (options.checkbox) options.checkbox.checked = $('#appConfirmOption').checked; cleanup(true); };
     const onCancel = () => cleanup(false);
     const cancelButton = $('#appConfirmCancel');
     okButton.addEventListener('click', onOk); cancelButton.addEventListener('click', onCancel); dialog.addEventListener('cancel', onCancel);
@@ -1578,6 +1582,9 @@ function comparisonEvidenceRowHtml(row, model) {
   if (!model?.selected) return '';
   return `<details class="comparison-file-evidence" data-author-evidence="${esc(row.relative_path)}"><summary>Why included?</summary><div data-evidence-body></div></details>`;
 }
+function comparisonEvidenceCommitHtml(touch) {
+  return `<code title="${esc(touch.commit)}">${esc(touch.commit.slice(0, 8))}</code> · <time title="Commit date (UTC, same as history)">${esc(touch.date || 'Date unavailable')}</time>`;
+}
 function bindComparisonEvidence(container, rows, model) {
   if (!model?.selected) return;
   const byPath = new Map(rows.map(row => [row.relative_path, row]));
@@ -1590,9 +1597,9 @@ function bindComparisonEvidence(container, rows, model) {
       const author = model.authors.find(item => item.key === model.selected) || {name:model.selected,email:''};
       const body = details.querySelector('[data-evidence-body]');
       body.innerHTML = `<p>${esc(author.name)}${author.email ? ` &lt;${esc(author.email)}&gt;` : ''}</p>` + (touches.length
-        ? '<p>Example commits proving inclusion, not a complete file history. Each change is measured against its own parent; the list diff still compares the two selected revisions.</p>' + touches.map((touch, index) => `<div class="comparison-touch"><span><strong>${model.directOnly ? 'Contribution to the compared difference' : touch.direct ? 'Direct history · non-merge commit' : 'Imported history · non-merge commit'}</strong><br><code title="${esc(touch.commit)}">${esc(touch.commit.slice(0, 8))}</code> · ${esc(touch.change)} · parent <code title="${esc(touch.parent || '')}">${esc(touch.parent?.slice(0, 8) || 'none (initial commit)')}</code></span><button type="button" data-evidence-diff="${index}" ${touch.parent ? '' : 'disabled'}>View this change</button></div>`).join('') + '<p>Recorded Git authorship is not proof of manual editing. Squash/copy imports can look like direct commits.</p>'
+        ? '<p>Example commits proving inclusion, not a complete file history. Each change is measured against its own parent; the list diff still compares the two selected revisions.</p>' + touches.map((touch, index) => `<div class="comparison-touch"><span><strong>${model.directOnly ? 'Contribution to the compared difference' : touch.direct ? 'Direct history · non-merge commit' : 'Imported history · non-merge commit'}</strong><br>${comparisonEvidenceCommitHtml(touch)} · ${esc(touch.change)} · parent <code title="${esc(touch.parent || '')}">${esc(touch.parent?.slice(0, 8) || 'none (initial commit)')}</code></span><button type="button" data-evidence-diff="${index}" ${touch.parent ? '' : 'disabled'}>View this change</button></div>`).join('') + '<p>Recorded Git authorship is not proof of manual editing. Squash/copy imports can look like direct commits.</p>'
         : '<p>Evidence is unavailable in this cached result. Reopen the comparison in the updated application; no claim of manual authorship can be made.</p>');
-      touches.forEach(touch => jsPerfLog(`comparison_author_evidence: commit=${touch.commit} parent=${touch.parent || 'root'} direct=${touch.direct} change=${touch.change}`, 0));
+      touches.forEach(touch => jsPerfLog(`comparison_author_evidence: commit=${touch.commit} date=${touch.date || 'unknown'} parent=${touch.parent || 'root'} direct=${touch.direct} change=${touch.change}`, 0));
       body.querySelectorAll('[data-evidence-diff]').forEach(button => button.addEventListener('click', event => {
         event.preventDefault(); event.stopPropagation();
         const touch = touches[Number(button.dataset.evidenceDiff)];
@@ -2303,6 +2310,9 @@ function resetCompareDiffNavigation(message = 'Loading differences…') {
   refs.previousCompareDifference.disabled = refs.nextCompareDifference.disabled = true;
   refs.compareDialog.querySelectorAll('[data-diff-row]').forEach(node => node.classList.remove('active-compare-difference'));
 }
+function syncCompareVerticalScroll(source, target) {
+  if (Math.abs(target.scrollTop - source.scrollTop) > 1) target.scrollTop = source.scrollTop;
+}
 function setCompareActionsDisabled(disabled) {
   if (disabled) { ['#compareRestoreRemote','#compareRestoreHead','#compareStage','#compareUnstage'].forEach(selector => { $(selector).disabled = true; }); return; }
   // Re-enabling must respect which side of the comparison actually exists.
@@ -2314,16 +2324,21 @@ async function applyFileRecovery(forcedAction = '') {
   const action = forcedAction, row = state.comparingRow;
   if (!row) { setCompareActionStatus('No file is selected for comparison.', 'error'); return; }
   if (!action) { setCompareActionStatus('No action was received. Close Compare and open the file again.', 'error'); return; }
-  const descriptions = { remote: `fetch ${state.remoteRef} and replace the working file with that server snapshot — may differ from your last local commit; staging is not changed`, head: 'discard working-file edits and restore your last local commit (HEAD) — does not fetch anything from the server', stage: 'add the current working-file content to the staging area', unstage: 'remove only the staging-area entry while keeping working-file edits' };
-  if (['remote','head'].includes(action) && !await customConfirm(`This will ${descriptions[action]} for ${row.relative_path}. Continue?`, { title: action === 'head' ? 'Restore from last commit (HEAD)' : 'Restore from server', danger: true, okLabel: 'Continue' })) return;
+  const repositoryPath = state.repository?.path, remoteRef = state.remoteRef;
+  const unstageChoice = { label: 'Remove this file from staging after restore; keep the restored content on disk', checked: false };
+  const staged = (state.changes || []).some(change => change.path === row.relative_path && change.staged);
+  const descriptions = { remote: `fetch ${remoteRef} and replace the working file with that server snapshot — may differ from your last local commit; existing staged content is kept unless you select the option below`, head: 'discard staged and working-file edits and restore your last local commit (HEAD) — this file is also removed from staging; does not fetch anything from the server', stage: 'add the current working-file content to the staging area', unstage: 'remove only the staging-area entry while keeping working-file edits' };
+  if (['remote','head'].includes(action) && !await customConfirm(`${staged ? 'Warning: this file is currently staged.\n\n' : ''}This will ${descriptions[action]} for ${row.relative_path}. Other files are unchanged. Continue?`, { title: action === 'head' ? 'Restore from last commit (HEAD)' : 'Restore from server', danger: true, okLabel: 'Continue', checkbox: action === 'remote' ? unstageChoice : null })) return;
+  if (state.repository?.path !== repositoryPath || state.comparingRow !== row || state.remoteRef !== remoteRef) return;
   if (!invoke) { setCompareActionStatus(`Preview complete: ${descriptions[action]}`, 'success'); return; }
   try {
     setCompareActionsDisabled(true); setCompareActionStatus(action === 'remote' ? `Contacting server and fetching ${state.remoteRef}…` : `Applying ${action} to ${row.name}…`, 'busy');
     status(action === 'remote' ? `Fetching ${state.remoteRef} and restoring ${row.name}…` : `Applying action to ${row.name}…`, 'busy');
     if (action === 'remote') {
-      await invoke('restore_remote_file', { repositoryPath: state.repository.path, relativePath: row.relative_path, remoteRef: state.remoteRef });
+      await invoke('restore_remote_file', { repositoryPath, relativePath: row.relative_path, remoteRef, leaveUnstaged: unstageChoice.checked });
       const comparison = await invoke('compare_file_contents', { repositoryPath: state.repository.path, relativePath: row.relative_path, remoteRef: state.remoteRef }); renderComparisonContents(comparison.local_content, comparison.remote_content); refs.compareSubtitle.textContent = `LOCAL NOW MATCHES ${state.remoteRef} · fetched from server`; directoryCache.clear();
-      const msg = `${row.name}: the file on disk was overwritten with the ${state.remoteRef} version. Yes — the project was updated.`;
+      await requestRepositoryStatusRefresh(repositoryPath, { reason: 'file-restore' });
+      const msg = `${row.name}: the file on disk was overwritten with the ${remoteRef} version.${unstageChoice.checked ? ' This file was removed from staging.' : ''}`;
       setCompareActionStatus(`Success: ${row.name} now contains the fetched server version.`, 'success'); status(msg); showOperationToast(msg, 'success'); return;
     }
     if (action === 'head') await invoke('restore_file', { repositoryPath: state.repository.path, relativePath: row.relative_path, sourceRef: 'HEAD' }); else await invoke(action === 'stage' ? 'stage_files' : 'unstage_files', { path: state.repository.path, files: [row.relative_path] });
@@ -3403,6 +3418,11 @@ function updateFolderRestoreActionState() {
 function renderFolderRestoreCommits() {
   const model = state.folderRestore;
   if (!model) return;
+  const start = model.compareStart;
+  const comparisonStatus = refs.folderRestoreCommitPicker.querySelector('[data-restore-compare-status]');
+  comparisonStatus.textContent = start ? `Compare start: ${start.id.slice(0, 8)}` : 'Compare: set a start below, then compare another commit.';
+  comparisonStatus.title = start ? `${start.id} · ${start.subject || 'No message'}` : 'Read-only comparison. No restore is performed.';
+  refs.folderRestoreCommitPicker.querySelector('[data-restore-compare-clear]').hidden = !start;
   refs.refreshFolderRestoreCommits.disabled = model.loadingCommits;
   refs.loadOlderFolderRestoreCommits.hidden = !model.historyHasMore;
   refs.loadOlderFolderRestoreCommits.disabled = model.loadingCommits;
@@ -3420,17 +3440,47 @@ function renderFolderRestoreCommits() {
   }
   refs.folderRestoreCommitList.innerHTML = model.commits.map(commit => {
     const selected = commit.id === model.selectedCommit;
-    return `<button type="button" class="folder-restore-commit ${selected ? 'selected' : ''}" data-folder-restore-commit="${esc(commit.id)}" aria-pressed="${selected}"><span class="folder-restore-commit-marker" aria-hidden="true">${selected ? '●' : '○'}</span><span class="folder-restore-commit-content"><strong>${esc(commit.subject || 'No message')}</strong><span class="folder-restore-commit-meta"><code title="${esc(commit.id)}">${esc(commit.id.slice(0, 8))}</code><span>${esc(commit.author || 'Unknown')}</span><time>${esc(commit.date || '—')}</time></span></span></button>`;
+    const isStart = start?.id === commit.id;
+    return `<div class="folder-restore-commit-row ${isStart ? 'compare-start' : ''}"><button type="button" class="folder-restore-commit ${selected ? 'selected' : ''}" data-folder-restore-commit="${esc(commit.id)}" aria-pressed="${selected}" title="Select this snapshot for restore"><span class="folder-restore-commit-marker" aria-hidden="true">${selected ? '●' : '○'}</span><span class="folder-restore-commit-content"><strong>${esc(commit.subject || 'No message')}</strong><span class="folder-restore-commit-meta"><code title="${esc(commit.id)}">${esc(commit.id.slice(0, 8))}</code><span>${esc(commit.author || 'Unknown')}</span><time>${esc(commit.date || '—')}</time></span></span></button><div class="folder-restore-compare-actions" aria-label="Read-only comparison"><button type="button" data-restore-compare-start="${esc(commit.id)}" aria-pressed="${isStart}" title="Set ${esc(commit.id.slice(0, 8))} as comparison start; does not change the restore selection">${isStart ? '✓ Compare start' : 'Set start'}</button>${start && !isStart ? `<button type="button" data-restore-compare-with="${esc(commit.id)}" title="Open Compare & Sync: ${esc(start.id.slice(0, 8))} → ${esc(commit.id.slice(0, 8))}. Nothing will be restored.">Compare with start</button>` : ''}</div></div>`;
   }).join('');
+}
+
+function setFolderRestoreCompareStart(commitId) {
+  const model = state.folderRestore;
+  if (!model || model.repositoryPath !== state.repository?.path) return;
+  const commit = model.commits.find(item => item.id === commitId);
+  if (!commit) return;
+  model.compareStart = { id: commit.id, subject: commit.subject };
+  renderFolderRestoreCommits();
+}
+
+async function compareFolderRestoreWithStart(commitId) {
+  const model = state.folderRestore;
+  if (!model || !refs.folderRestoreDialog.open || model.repositoryPath !== state.repository?.path) return;
+  const start = model.compareStart?.id;
+  if (!start || start === commitId || !model.commits.some(commit => commit.id === commitId)) return;
+  const target = model.entry.relative_path;
+  const path = model.isFile ? target.split('/').slice(0, -1).join('/') : target;
+  const focus = model.isFile ? target : '';
+  // The history belongs to the restore repository, never a previously opened
+  // submodule graph. Reuse the same read-only comparison as Branch Map.
+  invalidateFolderRestorePreview();
+  state.folderRestore = null;
+  refs.folderRestoreDialog.close();
+  await openRepositoryRevisionCompare(start, commitId, path, focus);
 }
 
 function renderFolderRestorePreview(preview = state.folderRestore?.preview) {
   if (!preview) {
+    refs.folderRestoreStagedNotice.hidden = true;
     refs.folderRestorePreview.innerHTML = '<p>Choose a restore source, then preview the exact scoped operation.</p>';
     updateFolderRestoreActionState();
     return;
   }
   const tracked = preview.tracked_changes || [];
+  const staged = preview.staged_paths || [];
+  refs.folderRestoreStagedNotice.hidden = !staged.length;
+  refs.folderRestoreStagedNotice.textContent = staged.length ? `${staged.length} path${staged.length === 1 ? ' is' : 's are'} currently staged in this selection. Restore overwrites that staged snapshot too. Enable “Leave restored changes unstaged” below to remove this selection from staging; other paths stay unchanged.` : '';
   const clean = preview.clean_candidates || [];
   const trackedHtml = tracked.length
     ? `<ul>${tracked.slice(0, 40).map(change => `<li><b>${esc(change.status)}</b> ${esc(change.path)}</li>`).join('')}${tracked.length > 40 ? `<li>…and ${tracked.length - 40} more</li>` : ''}</ul>`
@@ -3483,7 +3533,7 @@ function openFolderRestoreDialog(entry) {
   const isFile = ['file', 'deleted'].includes(entry.kind) && entry.tracked && !submoduleBoundaryFor(entry.relative_path);
   if (entry.kind !== 'folder' && !isFile) return;
   invalidateFolderRestorePreview();
-  state.folderRestore = { entry, isFile, commits: [], selectedCommit: '', loadingCommits: false, preview: null };
+  state.folderRestore = { repositoryPath: state.repository.path, entry, isFile, commits: [], selectedCommit: '', compareStart: null, loadingCommits: false, preview: null };
   const kind = isFile ? 'file' : 'folder';
   refs.folderRestoreDialog.querySelector('[data-restore-title]').textContent = `Restore ${kind}`;
   refs.folderRestoreDialog.querySelector('[data-restore-kind]').textContent = kind.toUpperCase();
@@ -3498,6 +3548,8 @@ function openFolderRestoreDialog(entry) {
   refs.folderRestoreModeCommit.checked = false;
   refs.folderRestoreCommitPicker.hidden = true;
   refs.folderRestoreClean.checked = !isFile;
+  refs.folderRestoreUnstage.checked = false;
+  refs.folderRestoreStagedNotice.hidden = true;
   refs.folderRestoreClean.closest('label').hidden = isFile;
   refs.folderRestoreStatus.textContent = '';
   renderFolderRestoreCommits();
@@ -3562,14 +3614,17 @@ async function confirmFolderRestore() {
     if (!model.preview) { finishConfirmButton(); updateFolderRestoreActionState(); return; }
   }
   const preview = model.preview;
+  const leaveUnstaged = refs.folderRestoreUnstage.checked;
   const stillCurrent = () => state.folderRestore === model && state.repository?.path === repositoryPath
-    && model.preview === preview && folderRestoreSourceRevision() === preview.source_revision;
+    && model.preview === preview && folderRestoreSourceRevision() === preview.source_revision
+    && refs.folderRestoreUnstage.checked === leaveUnstaged;
   if (!stillCurrent()) { finishConfirmButton(); updateFolderRestoreActionState(); return; }
   const cleanPaths = !model.isFile && refs.folderRestoreClean.checked ? (model.preview.clean_candidates || []) : [];
   const sourceLabel = refs.folderRestoreModeCommit.checked ? model.preview.source_id.slice(0, 8) : 'HEAD';
   const cleanNote = cleanPaths.length ? `\n\nUntracked items to delete:\n${cleanPaths.slice(0, 12).join('\n')}${cleanPaths.length > 12 ? `\n…and ${cleanPaths.length - 12} more` : ''}` : '';
   const restoreLabel = model.isFile ? 'Restore file' : 'Restore folder';
-  const ok = await customConfirm(`This will replace only:\n${model.entry.relative_path}\n\nSource: ${sourceLabel} — ${model.preview.source_subject}\n\nLocal staged and unstaged changes in this ${model.isFile ? 'file' : 'folder'} will be overwritten. Index and working tree will both be updated. HEAD, branch and other paths stay unchanged.${cleanNote}`, { title: restoreLabel, danger: true, okLabel: restoreLabel });
+  const stagingNote = `${preview.staged_paths?.length ? `\n\nWarning: ${preview.staged_paths.length} selected path(s) are currently staged.` : ''}\n\n${leaveUnstaged ? 'After restore, this selection will be removed from staging. Restored content stays on disk; differences from HEAD remain unstaged.' : 'The restored snapshot will also be written to staging. When restoring HEAD, the selected staged changes are removed; an older snapshot can create staged changes.'}`;
+  const ok = await customConfirm(`This will replace only:\n${model.entry.relative_path}\n\nSource: ${sourceLabel} — ${model.preview.source_subject}\n\nLocal staged and unstaged changes in this ${model.isFile ? 'file' : 'folder'} will be overwritten. Index and working tree will both be updated. HEAD, branch and other paths stay unchanged.${stagingNote}${cleanNote}`, { title: restoreLabel, danger: true, okLabel: restoreLabel });
   if (!ok || !stillCurrent()) { finishConfirmButton(); updateFolderRestoreActionState(); return; }
   if (!invoke) { finishConfirmButton(); refs.folderRestoreDialog.close(); status(`Preview: restore ${model.entry.relative_path}`); return; }
   const restoredPath = model.entry.relative_path;
@@ -3580,7 +3635,7 @@ async function confirmFolderRestore() {
   refs.folderRestoreStatus.textContent = `Restoring selected ${model.isFile ? 'file' : 'folder'}…`;
   status(`Restoring ${restoredName} from ${sourceLabel}…`, 'busy');
   try {
-    await invoke('restore_folder', { repositoryPath: state.repository.path, relativePath: restoredPath, sourceRevision: model.preview.source_id, cleanPaths, itemKind: model.isFile ? 'file' : 'folder' });
+    await invoke('restore_folder', { repositoryPath, relativePath: restoredPath, sourceRevision: model.preview.source_id, cleanPaths, itemKind: model.isFile ? 'file' : 'folder', leaveUnstaged });
     refs.folderRestoreDialog.close();
     const reopenPath = state.currentPath;
     directoryCache.clear();
@@ -3592,7 +3647,7 @@ async function confirmFolderRestore() {
     const remainingCount = changesForPathScope(restoredPath).length;
     const message = folderRestoreResultMessage(restoredName, sourceLabel, remainingCount, model.isFile);
     status(message, sourceLabel === 'HEAD' && remainingCount ? 'error' : '');
-    showOperationToast(`${message}\nNothing was committed or pushed.`, sourceLabel === 'HEAD' && remainingCount ? 'error' : 'success');
+    showOperationToast(`${message}${leaveUnstaged ? '\nThis selection was removed from staging.' : ''}\nNothing was committed or pushed.`, sourceLabel === 'HEAD' && remainingCount ? 'error' : 'success');
   } catch (error) {
     refs.folderRestoreStatus.textContent = String(error);
     handleError(error);
@@ -3803,14 +3858,18 @@ async function commitSubmoduleChanges(entry) {
 
 async function resetSubmodule(entry) {
   if (entry.kind !== 'submodule') return;
-  const confirmed = await customConfirm(`Restore "${entry.name}" to the exact commit recorded by the parent project?\n\nThis discards dirty edits, staged files and local-only commits, deletes untracked and ignored files, and leaves the submodule in detached HEAD. It does NOT make a local branch match origin. This cannot be undone from here.`, { title: 'Restore project version', okLabel: 'Restore project version', danger: true });
+  const repositoryPath = state.repository.path;
+  const choice = { label: 'Use parent HEAD and remove only this submodule pointer from staging', checked: false };
+  const staged = (state.changes || []).some(change => change.path === entry.relative_path && change.staged);
+  const confirmed = await customConfirm(`Restore "${entry.name}" to the exact commit recorded by the parent project?\n\n${staged ? 'Warning: this submodule pointer is currently staged.\n' : ''}By default, the source is the parent INDEX, including a staged version change. Select the option below to use the parent’s committed HEAD instead and unstage only this pointer. Staged files INSIDE the submodule will be discarded in either case.\n\nThis discards dirty edits, staged files and local-only commits, deletes untracked and ignored files, and leaves the submodule in detached HEAD. It does NOT make a local branch match origin. This cannot be undone from here.`, { title: 'Restore project version', okLabel: 'Restore project version', danger: true, checkbox: choice });
   if (!confirmed) return;
+  if (state.repository?.path !== repositoryPath) return;
   if (!invoke) return status(`Preview: reset ${entry.name}`);
   try {
     status(`Restoring the project-recorded version of ${entry.name}…`, 'busy');
-    await invoke('reset_submodule', { repositoryPath: state.repository.path, relativePath: entry.relative_path });
+    await invoke('reset_submodule', { repositoryPath, relativePath: entry.relative_path, useParentHead: choice.checked });
     directoryCache.clear(); await loadRepository(state.repository.path, { reopenPath: state.currentPath });
-    const successMsg = `${entry.name}: restored to the commit recorded by the parent project (detached HEAD). Local work was discarded; no branch was matched to origin.`;
+    const successMsg = `${entry.name}: restored to the parent ${choice.checked ? 'HEAD; the selected pointer was unstaged' : 'index version; parent staging was preserved'} (detached HEAD). Local changes were discarded; no branch was matched to origin.`;
     status(successMsg); showOperationToast(successMsg, 'success');
   }
   catch (error) { const message2 = handleError(error); showOperationToast(`Reset failed: ${message2}`, 'error'); }
@@ -4689,7 +4748,8 @@ async function compareEntryWithRemote(entry) {
   if (row?.local?.kind === 'file' && row.remote?.kind === 'file') openFileCompare(row); else status('This file is not available on both local and selected remote', 'error');
 }
 async function runEntryFileAction(entry, action) {
-  const explanations = { head: 'RESTORE: this permanently discards ALL uncommitted edits in this file. The file on disk will become identical to the last commit (HEAD). This cannot be undone. Continue?', stage: 'Add this file to the staging area?', unstage: 'UNSTAGE: remove this file from staging. Your edits on disk are kept exactly as they are — only the staging entry is removed. Continue?' };
+  const staged = (state.changes || []).some(change => change.path === entry.relative_path && change.staged);
+  const explanations = { head: `${staged ? 'Warning: this file is currently staged.\n\n' : ''}RESTORE: this permanently discards ALL staged and unstaged edits in this file. The file on disk and its index entry will become identical to the last commit (HEAD), removing this file from staging. Other files remain unchanged. This cannot be undone. Continue?`, stage: 'Add this file to the staging area?', unstage: 'UNSTAGE: remove this file from staging. Your edits on disk are kept exactly as they are — only the staging entry is removed. Continue?' };
   const successMessages = { head: `${entry.name}: restored from the last commit (HEAD) — edits on disk were discarded.`, stage: `${entry.name}: staged. It will be included in the next commit.`, unstage: `${entry.name}: unstaged — removed from staging, edits on disk were kept unchanged.` };
   const titles = { head: 'Restore file', stage: 'Stage file', unstage: 'Unstage file' };
   if (!await customConfirm(explanations[action], { title: titles[action], danger: action === 'head', okLabel: action === 'head' ? 'Discard everything' : 'Continue' })) return;
@@ -5272,7 +5332,7 @@ function renderStashesList() {
   refs.stashesList.innerHTML = stashes.map(stash => `<div class="conflict-row stash-entry-row" data-stash-index="${stash.index}">
     <div class="conflict-head"><span class="conflict-path">stash@{${stash.index}}: ${esc(stash.message.replace(/^WIP on [^:]+:\s*[0-9a-f]+\s*/, 'WIP on ') || 'Saved changes')}</span><button class="stash-drop-icon" data-drop-stash="${stash.index}" title="Drop this entire stash — discards everything left in it, for good">✕</button></div>
     <div class="stash-file-list" data-stash-file-list="${stash.index}"><i class="spinner"></i></div>
-  </div>`).join('') || '<div class="empty-change">Nothing set aside right now.</div>';
+  </div>`).join('') || '<div class="empty-change stash-empty">Nothing set aside right now.</div>';
   stashes.forEach(stash => loadStashFileList(stash.index, generation));
   refs.stashesList.querySelectorAll('[data-drop-stash]').forEach(button => button.addEventListener('click', () => dropStashEntry(Number(button.dataset.dropStash))));
 }
@@ -5515,12 +5575,13 @@ async function loadOlderGraphCommits() {
   // landing after either can never silently append onto the wrong context.
   const targetContext = state.submoduleGraph;
   const targetPath = g.path;
+  const previousCommits = g.commits;
   const previousCommitCount = g.commits.length;
   loadingOlderCommits = true;
   if (state.view === 'graph') renderGraph();
   try {
     const page = await invoke('load_older_commits', { repositoryPath: targetPath, afterCommitId: oldest.id, limit: GRAPH_COMMIT_WINDOW });
-    if (state.submoduleGraph !== targetContext || activeGraphData().path !== targetPath) return; // superseded — see the comment above
+    if (state.submoduleGraph !== targetContext || activeGraphData().path !== targetPath || activeGraphData().commits !== previousCommits) return false; // also reject a refresh in the same repository
     if (state.submoduleGraph) {
       state.submoduleGraph.commits = state.submoduleGraph.commits.concat(page.commits);
       state.submoduleGraph.commits_truncated = page.has_more;
@@ -5529,6 +5590,7 @@ async function loadOlderGraphCommits() {
       state.allCommits = state.commits;
       state.commits_truncated = page.has_more;
     }
+    return true;
   } catch (error) { status(String(error), 'error'); }
   finally {
     loadingOlderCommits = false;
@@ -5537,6 +5599,31 @@ async function loadOlderGraphCommits() {
     // that, and falls back to a full renderGraph whenever it isn't sure).
     if (state.view === 'graph') appendOlderGraphRows(previousCommitCount);
   }
+}
+
+async function showStoryMergeParent(parentId) {
+  const view = activeBranchStoryView();
+  if (!view || view.mode !== 'story' || view.loadingParent || loadingOlderCommits) return;
+  const context = state.submoduleGraph || state.repository;
+  const selection = view.selection;
+  const current = () => state.view === 'graph' && (state.submoduleGraph || state.repository) === context && activeBranchStoryView() === view && view.mode === 'story' && view.selection === selection;
+  view.loadingParent = parentId;
+  try {
+    // Reuse normal history pagination, including its real Git parents and
+    // ordering. Explicitly bounded: never walk an entire large repository
+    // automatically merely because a merge row was rendered.
+    for (let page = 0; page < 5 && current() && !graphCommitRow(parentId); page++) {
+      if (!activeGraphData().commitsTruncated) break;
+      if (!await loadOlderGraphCommits()) return;
+    }
+    if (!current()) return;
+    const row = graphCommitRow(parentId);
+    jsPerfLog(`branch_story_incoming: parent=${parentId} visible=${!!row} loaded=${activeGraphData().commits.length} truncated=${activeGraphData().commitsTruncated}`, 0);
+    if (row) { row.scrollIntoView({ block: 'center', behavior: 'smooth' }); selectCommit(parentId); }
+    else status(activeGraphData().commitsTruncated
+      ? 'Incoming history is still beyond the loaded pages. Click Load history again to continue.'
+      : 'This incoming commit is not available in the loaded local history. Refresh the graph; a shallow or incomplete repository may need more history.', 'error');
+  } finally { view.loadingParent = null; }
 }
 
 // Real, backend-computed ahead/behind + merge-base per local branch relative
@@ -5660,6 +5747,11 @@ function buildCommitRowHtml(commit, index, ctx) {
   const matchesFilter = ctx.refFilter === 'all' || isBranchPoint || (ctx.refFilter === 'branches' ? (refKinds.has('local_branch') || refKinds.has('remote_branch')) : refKinds.has('tag'));
   const isFilterDimmed = !matchesFilter;
   const mergePresentation = mergeCommitPresentation(commit, ctx);
+  const incomingHistory = ctx.story?.mergeParents.get(commit.id)?.map(parent => {
+    const names = parent.refs.map(ref => ref.name).join(', ');
+    const label = names ? `Current refs: ${names}` : 'Historical Path';
+    return `<span class="story-merge-source"><span title="${esc(names || 'No current branch ref is loaded at this incoming commit; its original branch name is not established')}">Incoming · ${esc(label)}</span><button type="button" data-story-parent="${esc(parent.id)}" title="${esc(parent.id)}">${esc(parent.id.slice(0, 8))} · ${parent.loaded ? 'Show commit' : 'Load history'}</button>${parent.loaded ? '' : '<small>Not loaded yet</small>'}</span>`;
+  }).join('') || '';
   const headLocationPill = node.isHead
     ? `<b class="head-location-pill" data-tooltip="This is the commit currently checked out in ${esc(ctx.repositoryName || 'this repository')}">YOU ARE HERE · HEAD</b>`
     : '';
@@ -5680,7 +5772,7 @@ function buildCommitRowHtml(commit, index, ctx) {
     <div class="commit-body">
       <div class="commit-card"><div class="commit-main"><div class="commit-title-line">${structuralBadges}<span class="commit-title">${commitSubjectHtml(commit.subject)}</span></div><div class="commit-ref-line">${refsBadges(node.refs, node.isHead, ctx.currentBranch)}${stashPills}</div></div><span class="commit-id-wrap"><button type="button" class="commit-copy-sha" data-copy-commit-sha="${esc(commit.id)}" title="Copy full commit SHA">${esc(commit.id.slice(0, 8))} ⧉</button></span>
       <span class="commit-date">${esc(commit.date || '—')}</span><span class="topology-badges">${mergePresentation ? `<b class="merge-badge" data-tooltip="${esc(mergePresentation.tooltip)}">${esc(mergePresentation.label)}</b>` : ''}</span><span class="commit-author">${esc(commit.author)}</span></div>
-      ${ahead ? `<div class="ahead-annotation">${esc(ahead)}</div>` : ''}${stashDetails}
+      ${incomingHistory ? `<div class="story-merge-sources">${incomingHistory}</div>` : ''}${ahead ? `<div class="ahead-annotation">${esc(ahead)}</div>` : ''}${stashDetails}
     </div>
   </article>`;
 }
@@ -5982,21 +6074,26 @@ async function openGraphRevisionCompare(leftRef, rightRef = '') {
     const entry = { kind: 'submodule', name: context.name, relative_path: context.relativePath };
     return openSubmoduleCompareFromEntry(entry, { leftRef, rightRef });
   }
+  return openRepositoryRevisionCompare(leftRef, rightRef);
+}
+
+async function openRepositoryRevisionCompare(leftRef, rightRef, path = '', focus = '') {
+  if (!state.repository?.path || !leftRef || !rightRef) return;
   closeSubmoduleGraph();
   state.view = 'commander';
   state.compareMode = 'git';
   state.gitCompareMode = 'refs';
   state.compareFlatMode = false;
-  state.commanderPath = '';
+  state.commanderPath = path;
   state.commanderRows = [];
-  state.commanderFocus = '';
+  state.commanderFocus = focus;
   state.branchCompareLeftRef = leftRef;
   state.branchCompareRightRef = rightRef;
   state.branchCompareLeftRevision = '';
   state.branchCompareRightRevision = '';
   refs.search.value = '';
   render();
-  await openCommanderDirectory('');
+  await openCommanderDirectory(path);
 }
 
 async function openGraphBranchCompare(branchName, rightRef = '') {
@@ -6155,6 +6252,10 @@ function showGraphCommitContextMenu(event, commitId) {
 function wireGraphRowInteractions(rowElements) {
   rowElements.forEach(row => row.addEventListener('click', () => selectCommit(row.dataset.id)));
   rowElements.forEach(row => row.addEventListener('contextmenu', event => showGraphCommitContextMenu(event, row.dataset.id)));
+  rowElements.forEach(row => row.querySelectorAll('[data-story-parent]').forEach(button => button.addEventListener('click', event => {
+    event.stopPropagation();
+    showStoryMergeParent(button.dataset.storyParent).catch(handleError);
+  })));
   rowElements.forEach(row => row.querySelectorAll('[data-copy-commit-sha]').forEach(button => button.addEventListener('click', event => {
     event.stopPropagation();
     copyText(button.dataset.copyCommitSha || '', 'Commit SHA copied.');
@@ -6226,6 +6327,15 @@ function renderGraph() {
   const hasRefNamed = (commit, name) => (commit.refs || []).some(r => (r.kind === 'local_branch' || r.kind === 'remote_branch') && r.name === name);
   const primaryTip = primaryKind === 'detached' ? commits.find(c => c.id === g.headOid) : primaryName ? commits.find(c => hasRefNamed(c, primaryName)) : null;
   const story = storyMode ? buildBranchStory(allGraphCommits, primaryTip?.id) : null;
+  if (story && (storyView.diagnosticCommits !== g.commits || storyView.diagnosticTip !== story.tipId)) {
+    storyView.diagnosticCommits = g.commits; storyView.diagnosticTip = story.tipId;
+    const merges = [...story.mergeParents];
+    const missing = merges.filter(([, parents]) => parents.some(parent => !parent.loaded));
+    jsPerfLog(`branch_story: tip=${story.tipId || 'unloaded'} loaded=${story.commits.length} merges=${merges.length} missing_incoming=${missing.length} truncated=${!!g.commitsTruncated}`, 0);
+    // Bound diagnostics; include recent merges even when complete, so an
+    // overlapping/redundant parent can be distinguished from missing data.
+    merges.slice(0, 12).forEach(([id, parents]) => jsPerfLog(`branch_story_merge: commit=${id} incoming=${parents.map(parent => `${parent.id}:${parent.loaded ? 'loaded' : 'unloaded'}`).join(',')}`, 0));
+  }
   if (story) story.start = branchStoryStart(allGraphCommits, story, ensureStoryCreation(g, storyView, primaryKind, primaryName, primaryTip?.id));
   if (story) commits = story.commits;
   const model = buildGraphModel(commits, primaryTip?.id);
@@ -6278,7 +6388,7 @@ function renderGraph() {
     ${query && !storyMode ? `<span class="search-match-count">${onlySearchMatches ? `showing ${matchCount} match${matchCount === 1 ? '' : 'es'} only` : `${matchCount} match${matchCount === 1 ? '' : 'es'} — rest shown as context`}</span><button type="button" class="graph-search-toggle ${onlySearchMatches ? 'active' : ''}" data-graph-only-matches title="${onlySearchMatches ? 'Show full graph context again' : 'Show only matching commits without graph links'}">${onlySearchMatches ? 'Show context' : 'Only matches'}</button>` : ''}
     <div class="ref-filter-group" role="group" aria-label="Filter by ref kind">${filterOptions.map(([value, label]) => `<button type="button" class="ref-filter-btn ${refFilter === value ? 'active' : ''}" data-ref-filter="${value}">${label}</button>`).join('')}</div>
     <button type="button" class="graph-current-jump" data-jump-head ${headVisible ? '' : 'disabled'} title="${headVisible ? 'Jump to current HEAD in this graph' : 'Current HEAD is not loaded in this graph'}">⌖</button>
-    ${storyMode ? `<button type="button" class="graph-branch-start-jump" data-jump-story-start ${story.start.id ? '' : 'disabled'} title="${esc(story.start.reason)}">⑂ Go to Branch Start</button>` : `<button type="button" class="graph-branch-start-jump ${branchStartLookupPending ? 'is-loading' : ''}" data-jump-branch-start title="${esc(branchStartTitle)}" aria-label="Go to shared base"><b>⑂</b><span>Go to shared base</span></button>`}
+    ${storyMode ? `<button type="button" class="graph-branch-start-jump" data-jump-story-start ${story.start.id ? '' : 'disabled'} title="${esc(story.start.reason)}">⑂ Go to start</button>` : `<button type="button" class="graph-branch-start-jump ${branchStartLookupPending ? 'is-loading' : ''}" data-jump-branch-start title="${esc(branchStartTitle)}" aria-label="Go to start"><b>⑂</b><span>Go to start</span></button>`}
     ${pickerOptions.length > 1 || storyMode ? `<label class="primary-branch-picker"><span>${storyMode ? 'Story branch' : 'Primary'}</span><select id="graphPrimaryBranch">${pickerOptions.map(opt => `<option value="${esc(opt.value)}" ${opt.value === selectedPickerValue ? 'selected' : ''}>${esc(opt.label)}</option>`).join('')}</select></label>` : ''}
     <span class="lane-header"><span>GRAPH</span><span>COMMIT</span></span>`;
   $('#graphPrimaryBranch')?.addEventListener('change', event => { if (storyMode) storyView.selection = event.target.value; else setActiveGraphPrimaryBranch(event.target.value); renderGraph(); });
@@ -6384,7 +6494,7 @@ function renderGraph() {
   if (commits.length) requestAnimationFrame(() => {
     if (lastGraphModel !== model) return; // superseded by a newer render before this frame ran
     const overlayStarted = performance.now();
-    drawGraphOverlay(model, lanesWidth, { disconnected: onlySearchMatches });
+    drawGraphOverlay(model, lanesWidth, { disconnected: onlySearchMatches, showMissingParents: !!story });
     jsPerfLog(`renderGraph SVG overlay (${commits.length} commits)`, performance.now() - overlayStarted);
   });
 }
@@ -6403,7 +6513,7 @@ let lastGraphOnlySearchMatches = false;
 function scheduleGraphOverlayRedraw() {
   clearTimeout(graphOverlayRedrawTimer);
   graphOverlayRedrawTimer = setTimeout(() => {
-    if (state.view === 'graph' && lastGraphModel && lastGraphModel.length) drawGraphOverlay(lastGraphModel, lastGraphLanesWidth, { disconnected: lastGraphOnlySearchMatches });
+    if (state.view === 'graph' && lastGraphModel && lastGraphModel.length) drawGraphOverlay(lastGraphModel, lastGraphLanesWidth, { disconnected: lastGraphOnlySearchMatches, showMissingParents: !!lastGraphRenderContext?.story });
   }, 80);
 }
 
@@ -6511,7 +6621,15 @@ function drawGraphOverlay(model, lanesWidth, options = {}) {
     model.forEach(node => {
       const from = positions.get(node.commitId); if (!from) return;
       node.parents.forEach(parent => {
-        const to = positions.get(parent.commitId); if (!to) return;
+        const to = positions.get(parent.commitId);
+        if (!to) {
+          if (options.showMissingParents && node.parents.length > 1) {
+            const x = laneX(parent.targetLane);
+            const d = `M${from.x} ${from.y} Q${x} ${from.y} ${x} ${from.y + 16}`;
+            parts.push(`<path class="graph-edge graph-missing-parent" d="${d}" fill="none" stroke="${palette[parent.targetLane % palette.length]}" stroke-width="2" stroke-dasharray="3 3"><title>Parent ${esc(parent.commitId)} is outside loaded history</title></path>`);
+          }
+          return;
+        }
         const color = palette[node.lane % palette.length];
         if (from.x === to.x) {
           const attrs = `x1="${from.x}" y1="${from.y}" x2="${to.x}" y2="${to.y}"`;
@@ -7689,6 +7807,7 @@ document.querySelectorAll('[name="publishCommitMode"]').forEach(input => input.a
 }));
 $('#publishCombinedMessage').addEventListener('input', updatePublishSummary);
 [['#compareRestoreRemote','remote'],['#compareRestoreHead','head'],['#compareStage','stage'],['#compareUnstage','unstage']].forEach(([selector, action]) => $(selector)?.addEventListener('click', event => { event.preventDefault(); updateRecoveryHelp(action); applyFileRecovery(action).catch(error => handleError(error)); }));
+[refs.localCompare, refs.remoteCompare].forEach((pane, index, panes) => pane.addEventListener('scroll', () => syncCompareVerticalScroll(pane, panes[1 - index]), { passive: true }));
 refs.previousCompareDifference?.addEventListener('click', () => goToCompareDifference(-1));
 refs.nextCompareDifference?.addEventListener('click', () => goToCompareDifference(1));
 document.addEventListener('click', event => { const link = event.target.closest('.polarion-link'); if (!link) return; event.preventDefault(); if (invoke) invoke('open_external_url', { url: link.href }).catch(error => status(String(error), 'error')); else window.open(link.href, '_blank', 'noopener'); });
@@ -7969,15 +8088,23 @@ refs.confirmScopeCommit.addEventListener('click', commitSelectedScope);
 refs.folderRestoreModeHead.addEventListener('change', () => { refs.folderRestoreCommitPicker.hidden = true; invalidateFolderRestorePreview(); renderFolderRestorePreview(null); });
 refs.folderRestoreModeCommit.addEventListener('change', () => { refs.folderRestoreCommitPicker.hidden = false; invalidateFolderRestorePreview(); renderFolderRestorePreview(null); loadFolderRestoreCommits(); });
 refs.folderRestoreClean.addEventListener('change', () => { if (state.folderRestore) { invalidateFolderRestorePreview(); renderFolderRestorePreview(null); } });
+refs.folderRestoreUnstage.addEventListener('change', () => updateFolderRestoreActionState());
 refs.refreshFolderRestoreCommits.addEventListener('click', () => loadFolderRestoreCommits());
 refs.loadOlderFolderRestoreCommits.addEventListener('click', () => loadFolderRestoreCommits(true));
 refs.folderRestoreCommitList.addEventListener('click', event => {
+  const start = event.target.closest('[data-restore-compare-start]');
+  if (start) { setFolderRestoreCompareStart(start.dataset.restoreCompareStart); return; }
+  const compare = event.target.closest('[data-restore-compare-with]');
+  if (compare) { compareFolderRestoreWithStart(compare.dataset.restoreCompareWith).catch(error => handleError(error)); return; }
   const button = event.target.closest('[data-folder-restore-commit]');
   if (!button || !state.folderRestore) return;
   state.folderRestore.selectedCommit = button.dataset.folderRestoreCommit;
   invalidateFolderRestorePreview();
   renderFolderRestoreCommits();
   renderFolderRestorePreview(null);
+});
+refs.folderRestoreCommitPicker.querySelector('[data-restore-compare-clear]').addEventListener('click', () => {
+  if (state.folderRestore) { state.folderRestore.compareStart = null; renderFolderRestoreCommits(); }
 });
 refs.previewFolderRestore.addEventListener('click', () => previewFolderRestore().catch(error => handleError(error)));
 refs.confirmFolderRestore.addEventListener('click', () => confirmFolderRestore().catch(error => handleError(error)));

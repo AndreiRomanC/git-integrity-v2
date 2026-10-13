@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Git DrillDown</title>
   <link rel="icon" type="image/png" href="assets/git-drilldown-mark.png">
-  <link rel="stylesheet" href="styles.css?v=20261012-strict-diagnostics">
+  <link rel="stylesheet" href="styles.css?v=20261013-restore-staging-scroll">
 </head>
 <body>
   <div class="app-shell">
@@ -314,6 +314,7 @@
     <div class="dialog-symbol" id="appConfirmIcon">?</div>
     <h2 id="appConfirmTitle">Confirm</h2>
     <p id="appConfirmMessage" style="white-space: pre-line;"></p>
+    <label id="appConfirmOptionRow" class="confirm-option-row" hidden><input id="appConfirmOption" type="checkbox"><span id="appConfirmOptionText"></span></label>
     <div class="commit-dialog-actions" style="justify-content:center;">
       <button type="button" id="appConfirmCancel">Cancel</button>
       <button type="button" id="appConfirmOk" class="confirm">Confirm</button>
@@ -500,12 +501,15 @@
         </div>
         <div id="folderRestoreCommitPicker" class="folder-restore-commit-picker" hidden>
           <div class="folder-restore-commit-head"><strong data-restore-history-title>COMMITS TOUCHING THIS FOLDER</strong><button type="button" id="refreshFolderRestoreCommits">Refresh</button></div>
+          <div class="folder-restore-compare-bar"><span data-restore-compare-status role="status">Compare: set a start below, then compare another commit.</span><button type="button" data-restore-compare-clear hidden>Clear start</button><small>Opens Compare &amp; Sync at this path. Read-only; nothing is restored.</small></div>
           <p data-restore-history-help hidden>History follows this exact file path, not earlier names. A commit must contain this path to restore it.</p>
           <div id="folderRestoreCommitList" class="folder-restore-commit-list"></div>
           <div class="folder-restore-history-footer"><span id="folderRestoreHistoryStatus" role="status"></span><button type="button" id="loadOlderFolderRestoreCommits" hidden>Load older</button></div>
         </div>
         <label class="folder-restore-clean"><input type="checkbox" id="folderRestoreClean" checked><span><b>Clean folder</b><small>Preview and remove untracked, non-ignored items inside this folder after restore.</small></span></label>
         <div id="folderRestorePreview" class="folder-restore-preview"><p>Choose a restore source, then preview the exact scoped operation.</p></div>
+        <p id="folderRestoreStagedNotice" class="restore-staged-notice" role="status" hidden></p>
+        <label class="folder-restore-clean"><input type="checkbox" id="folderRestoreUnstage"><span><b>Leave restored changes unstaged</b><small>Restore the selected content, then reset only this selection’s staging to HEAD. Other staged paths stay untouched. Not available during an unfinished merge/rebase.</small></span></label>
         <p id="folderRestoreStatus" class="submodule-operation-status" role="status"></p>
       </div>
       <footer><span>This does not move HEAD, switch branch, commit or push.</span><button value="cancel">Cancel</button><button type="button" id="previewFolderRestore">Preview</button><button type="button" id="confirmFolderRestore" class="danger-action-soft" disabled>Restore folder</button></footer>
@@ -748,30 +752,32 @@
     <form method="dialog">
       <header><div><h2>Find Polarion task</h2><small id="polarionContext"></small></div><button value="cancel" aria-label="Close Polarion search">×</button></header>
       <div class="polarion-task-body">
-        <div class="polarion-connect-row"><span>Sign in through the dedicated Polarion browser window.</span><button type="button" id="polarionConnect">Connect / Polarion ↗</button></div>
-        <label for="polarionProjectQuery">Project · search or change</label>
-        <div class="polarion-search-row"><input id="polarionProjectQuery" placeholder="Project name or ID…" autocomplete="off"><button type="button" id="polarionProjectSearchButton">Find projects</button></div>
+        <div class="polarion-connect-row"><div><strong id="polarionConnection" role="status" data-state="unknown">Connection not checked</strong><small>This Polarion window keeps its own session; Edge sign-in is separate.</small></div><button type="button" id="polarionConnect">Open Polarion ↗</button></div>
+        <label for="polarionProjectQuery">1 · Choose project</label>
+        <div class="polarion-search-row"><input id="polarionProjectQuery" placeholder="Any part of the name or ID · e.g. aq4" autocomplete="off"><button type="button" id="polarionProjectSearchButton">Find projects</button></div>
+        <small>Matches anywhere in the name or ID, regardless of capitalization.</small>
         <p id="polarionChosenProject" class="polarion-project-choice"></p>
-        <label for="polarionTaskQuery">Task · ID or title</label>
+        <label for="polarionTaskQuery">2 · Find task in the selected project</label>
         <div class="polarion-search-row"><input id="polarionTaskQuery" placeholder="Search tasks in the selected project…" autocomplete="off"><button type="button" id="polarionTaskSearchButton">Find tasks</button></div>
         <div class="polarion-assignee"><label><input id="polarionAssigned" type="checkbox"> Assigned to me</label><input id="polarionUser" aria-label="My Polarion user ID" placeholder="My Polarion user ID (not Git author)" hidden autocomplete="off"></div>
+        <small>Your Polarion user ID is needed only for “Assigned to me”; it is not inferred from Git or Edge.</small>
         <div id="polarionResults" class="polarion-results" aria-label="Polarion search results"></div>
-        <div class="polarion-pages"><button type="button" id="polarionPrevious" disabled>← Previous</button><button type="button" id="polarionNext" disabled>Next →</button></div>
+        <div id="polarionPages" class="polarion-pages" hidden><button type="button" id="polarionPrevious" disabled>← Previous</button><button type="button" id="polarionNext" disabled>Next →</button></div>
         <p id="polarionStatus" role="status" aria-live="polite"></p>
       </div>
       <footer><span>Adds a saved message only — no commit.</span><button value="cancel">Cancel</button><button type="button" id="polarionAdd" class="confirm" disabled>Add to Commit List</button></footer>
     </form>
   </dialog>
-  <script src="polarion.js?v=20261012-strict-diagnostics"></script>
-  <script src="console-context.js?v=20261012-strict-diagnostics"></script>
-  <script src="graph-model.js?v=20261012-strict-diagnostics"></script>
-  <script src="submodule-state.js?v=20261012-strict-diagnostics"></script>
-  <script src="submodule-versions.js?v=20261012-strict-diagnostics"></script>
-  <script src="local-diff.js?v=20261012-strict-diagnostics"></script>
-  <script src="local-drive.js?v=20261012-strict-diagnostics"></script>
-  <script src="pr-status.js?v=20261012-strict-diagnostics"></script>
-  <script src="refresh-coordinator.js?v=20261012-strict-diagnostics"></script>
-  <script src="comparison-authors.js?v=20261012-strict-diagnostics"></script>
-  <script src="app.js?v=20261012-strict-diagnostics"></script>
+  <script src="polarion.js?v=20261013-restore-staging-scroll"></script>
+  <script src="console-context.js?v=20261013-restore-staging-scroll"></script>
+  <script src="graph-model.js?v=20261013-restore-staging-scroll"></script>
+  <script src="submodule-state.js?v=20261013-restore-staging-scroll"></script>
+  <script src="submodule-versions.js?v=20261013-restore-staging-scroll"></script>
+  <script src="local-diff.js?v=20261013-restore-staging-scroll"></script>
+  <script src="local-drive.js?v=20261013-restore-staging-scroll"></script>
+  <script src="pr-status.js?v=20261013-restore-staging-scroll"></script>
+  <script src="refresh-coordinator.js?v=20261013-restore-staging-scroll"></script>
+  <script src="comparison-authors.js?v=20261013-restore-staging-scroll"></script>
+  <script src="app.js?v=20261013-restore-staging-scroll"></script>
 </body>
 </html>

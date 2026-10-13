@@ -7,6 +7,20 @@ const { createComparisonAuthorCache, comparisonAuthorMatches, comparisonAuthorEm
 const context = { repositoryPath: '/repo', leftRevision: 'a', rightRevision: 'b' };
 const authors = [{ key: 'email:a@test', name: 'Name', email: 'a@test', paths: ['old', 'new', 'modified'] }];
 
+test('Why included shows the witness commit date and handles older cached evidence honestly', () => {
+  const app = fs.readFileSync(path.join(__dirname,'../frontend/app.js'),'utf8');
+  const context = {esc:value=>String(value).replaceAll('<','&lt;')};
+  vm.createContext(context);
+  vm.runInContext(app.slice(app.indexOf('function comparisonEvidenceCommitHtml('),app.indexOf('function bindComparisonEvidence(')),context);
+  const touch = {commit:'123456789abcdef',date:'2026-10-13'};
+  const html = context.comparisonEvidenceCommitHtml(touch);
+  assert.match(html,/12345678<\/code> · <time[^>]*>2026-10-13<\/time>/);
+  assert.match(html,/UTC/);
+  assert.match(context.comparisonEvidenceCommitHtml({commit:'old'}),/Date unavailable/);
+  assert.match(context.comparisonEvidenceCommitHtml({...touch,date:'<invalid>'}),/&lt;invalid>/);
+  assert.match(app.slice(app.indexOf('function bindComparisonEvidence('),app.indexOf('function renderComparisonAuthorFilter(')),/comparisonEvidenceCommitHtml\(touch\)/);
+});
+
 test('display diagnostics distinguish failure from empty results without logging identity', () => {
   const model = {context, selected:authors[0].key, authors, directOnly:true, paths:new Set(), strictResult:{error:'budget'}};
   const failed = comparisonAuthorDiagnostic(model, 500, 0, false);

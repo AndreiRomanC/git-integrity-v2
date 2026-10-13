@@ -497,7 +497,7 @@ test('folder restore is an explicit right-panel action with preview and scoped b
   assert.match(app, /const folderActions = entry\.kind === 'folder'[\s\S]*?data-detail-action="restorefolder"/);
   assert.match(app, /if \(action === 'restorefolder'\) return openFolderRestoreDialog\(entry\)/);
   assert.match(app, /invoke\('preview_folder_restore', \{ repositoryPath: state\.repository\.path, relativePath: model\.entry\.relative_path, sourceRevision, cleanUntracked: refs\.folderRestoreClean\.checked, itemKind: model\.isFile \? 'file' : 'folder' \}\)/);
-  assert.match(app, /invoke\('restore_folder', \{ repositoryPath: state\.repository\.path, relativePath: restoredPath, sourceRevision: model\.preview\.source_id, cleanPaths, itemKind: model\.isFile \? 'file' : 'folder' \}\)/);
+  assert.match(app, /invoke\('restore_folder', \{ repositoryPath, relativePath: restoredPath, sourceRevision: model\.preview\.source_id, cleanPaths, itemKind: model\.isFile \? 'file' : 'folder', leaveUnstaged \}\)/);
   assert.match(html, /This does not move HEAD, switch branch, commit or push/);
 });
 
@@ -569,8 +569,8 @@ test('graph exposes branch and commit context actions without relying on lane id
   assert.match(app, /class="graph-current-jump"/);
   assert.match(app, /function jumpToGraphBranchStart\(\)/);
   assert.match(app, /data-jump-branch-start/);
-  assert.match(app, /aria-label="Go to shared base"/);
-  assert.match(app, /<span>Go to shared base<\/span>/);
+  assert.match(app, /aria-label="Go to start"/);
+  assert.match(app, /<span>Go to start<\/span>/);
   assert.match(app, /Shared base is still being calculated/);
   assert.match(app, /Loading older history to find shared base/);
   assert.match(app, /not necessarily the original branch start/);
@@ -591,7 +591,7 @@ test('graph search can optionally show only matches as a disconnected result lis
   assert.match(app, /data-graph-only-matches/);
   assert.match(app, /Only matches/);
   assert.match(app, /if \(onlySearchMatches\) model\.forEach\(node => \{ node\.lane = 0; node\.before = \[\]; node\.after = \[\]; node\.parents = \[\]; \}\)/);
-  assert.match(app, /drawGraphOverlay\(model, lanesWidth, \{ disconnected: onlySearchMatches \}\)/);
+  assert.match(app, /drawGraphOverlay\(model, lanesWidth, \{ disconnected: onlySearchMatches, showMissingParents: !!story \}\)/);
   assert.match(app, /if \(!options\.disconnected\) \{/);
   assert.match(css, /\.graph-search-toggle/);
 });

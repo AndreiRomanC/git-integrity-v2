@@ -91,7 +91,7 @@ test('Compare & Sync reuses submodule context and does not reset an already open
 });
 test('fresh graph comparisons reset to drill-down; explicit List choice is idempotent', async () => {
   for (const name of ['openGraphBranchCompare', 'openGraphRevisionCompare']) {
-    const c = load([name], { state: { compareFlatMode: true }, refs: { search: {} },
+    const c = load(['openRepositoryRevisionCompare', name], { state: { repository: { path: '/repo' }, compareFlatMode: true }, refs: { search: {} },
       activeRepositoryContext: () => ({ path: '/repo', isSubmodule: false }), closeSubmoduleGraph() {}, render() {}, openCommanderDirectory: async () => {},
     });
     await c[name]('main', 'feature'); assert.equal(c.state.compareFlatMode, false);
@@ -102,6 +102,27 @@ test('fresh graph comparisons reset to drill-down; explicit List choice is idemp
   assert.equal(calls, 1); assert.equal(c.state.commanderRows.length, 0);
   c.setComparisonListMode(false, false); assert.equal(calls, 2);
   c.setComparisonListMode(true, true); assert.equal(calls, 3); assert.equal(c.state.submoduleCompare.rows.length, 0);
+});
+test('restore comparison reuses Git Compare at the selected path, ignoring a stale submodule graph', async () => {
+  let opened;
+  const c = load(['openRepositoryRevisionCompare'], {
+    state: { repository: { path: '/parent' }, submoduleGraph: { repository: { path: '/parent/dep' } }, compareMode: 'submodule', compareFlatMode: true, commanderRows: ['old'], branchCompareLeftRevision: 'stale', branchCompareRightRevision: 'stale' },
+    refs: { search: { value: 'old filter' } },
+    closeSubmoduleGraph() { c.state.submoduleGraph = null; }, render() {},
+    openCommanderDirectory: async path => { opened = path; },
+  });
+  await c.openRepositoryRevisionCompare('exact-old-sha', 'exact-new-sha', 'src', 'src/a.txt');
+  assert.equal(opened, 'src');
+  assert.equal(c.state.repository.path, '/parent');
+  assert.equal(c.state.submoduleGraph, null);
+  assert.equal(c.state.compareMode, 'git');
+  assert.equal(c.state.gitCompareMode, 'refs');
+  assert.equal(c.state.compareFlatMode, false);
+  assert.equal(c.state.commanderFocus, 'src/a.txt');
+  assert.equal(c.state.branchCompareLeftRef, 'exact-old-sha');
+  assert.equal(c.state.branchCompareRightRef, 'exact-new-sha');
+  assert.equal(c.state.branchCompareLeftRevision, '');
+  assert.equal(c.state.commanderRows.length, 0);
 });
 test('late comparison response cannot install a list after switching tab or layout', async () => {
   for (const submodule of [false, true]) {

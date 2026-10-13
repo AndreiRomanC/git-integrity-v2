@@ -218,7 +218,7 @@ function branchStoryBase(commits) {
 function buildBranchStory(commits, tipId) {
   const byId = new Map(commits.map(commit => [commit.id, commit]));
   const tip = byId.get(tipId);
-  const result = { commits: [], tipId: tip?.id || null, spine: new Set(), incoming: new Map(), baseId: null, baseRef: null, incomplete: false };
+  const result = { commits: [], tipId: tip?.id || null, spine: new Set(), incoming: new Map(), mergeParents: new Map(), baseId: null, baseRef: null, incomplete: false };
   if (!tip) return result;
   const included = reachableFrom(tipId, commits);
   result.commits = commits.filter(commit => included.has(commit.id));
@@ -231,6 +231,12 @@ function buildBranchStory(commits, tipId) {
   // An incoming parent is a path endpoint, not evidence of a historical
   // branch name. Multiple current refs on the same node remain intact.
   for (const commit of result.commits) {
+    if ((commit.parents || []).length > 1) {
+      result.mergeParents.set(commit.id, commit.parents.slice(1).map(id => ({
+        id, loaded: byId.has(id),
+        refs: (byId.get(id)?.refs || []).filter(ref => ref.kind === 'local_branch' || ref.kind === 'remote_branch'),
+      })));
+    }
     if (!result.spine.has(commit.id)) continue;
     for (const parentId of (commit.parents || []).slice(1)) {
       const parent = byId.get(parentId);

@@ -126,6 +126,96 @@ test('Branch Story: fast-forward and squash histories never invent a merge or de
   assertRealEdges(story);
 });
 
+test('Branch Story: every merge exposes incoming parents, including missing and nested historical paths', () => {
+  const commits = [c('tip', ['own', 'side', 'unloaded']), c('own', ['root']), c('side', ['root', 'nested'], [ref('origin/topic', 'remote_branch')]), c('nested', ['root']), c('root')];
+  const story = buildBranchStory(commits, 'tip');
+  assert.deepEqual(story.mergeParents.get('tip'), [
+    {id:'side',loaded:true,refs:[ref('origin/topic', 'remote_branch')]},
+    {id:'unloaded',loaded:false,refs:[]},
+  ]);
+  assert.deepEqual(story.mergeParents.get('side'), [{id:'nested',loaded:true,refs:[]}]);
+  assert.equal(story.incomplete, true);
+  assertRealEdges(story);
+});
+
+test('Branch Story UI: missing merge source is explicit; loaded sources can be selected; Full Graph is unchanged', () => {
+  const h = rendererHarness();
+  h.graph.commits = [c('tip', ['a','side'], [ref('feature')]),c('a')];
+  h.context.renderGraph();
+  const full = h.refs.graph.innerHTML;
+  h.context.activeBranchStoryView().mode = 'story'; h.context.renderGraph();
+  assert.match(h.refs.graph.innerHTML, /data-story-parent="side"[^>]*>side · Load history/);
+  assert.match(h.refs.graph.innerHTML, /Not loaded yet/);
+  assert.match(h.refs.graph.innerHTML, /Historical Path/);
+  h.context.activeBranchStoryView().mode = 'full'; h.context.renderGraph();
+  assert.equal(h.refs.graph.innerHTML, full);
+  h.graph.commits = [...h.graph.commits, c('side', [], [ref('origin/topic','remote_branch')])];
+  h.context.activeBranchStoryView().mode = 'story'; h.context.renderGraph();
+  assert.match(h.refs.graph.innerHTML, /Current refs: origin\/topic/);
+  assert.match(h.refs.graph.innerHTML, /side · Show commit/);
+  assert.doesNotMatch(h.refs.graph.innerHTML, /Not loaded yet/);
+});
+
+test('Branch Story incoming navigation reuses bounded paging and stops after context changes', async () => {
+  const h = rendererHarness();
+  h.state.view = 'graph';
+  const view = h.context.activeBranchStoryView(); view.mode = 'story';
+  let pages = 0, selected = null, visible = false, messages = [];
+  h.graph.commitsTruncated = true;
+  h.context.graphCommitRow = () => visible ? {scrollIntoView(){}} : null;
+  h.context.selectCommit = id => {selected = id;};
+  h.context.status = text => messages.push(text);
+  h.context.loadOlderGraphCommits = async () => {pages++; visible = pages === 2; return true;};
+  vm.runInContext('async ' + appFunction('showStoryMergeParent'), h.context);
+  await h.context.showStoryMergeParent('side');
+  assert.equal(pages,2); assert.equal(selected,'side'); assert.equal(view.loadingParent,null);
+  await h.context.showStoryMergeParent('side'); assert.equal(pages,2,'Already loaded: no Git call');
+  visible = false; pages = 0;
+  h.context.loadOlderGraphCommits = async () => {pages++; return true;};
+  await h.context.showStoryMergeParent('far');
+  assert.equal(pages,5); assert.match(messages.pop(), /beyond the loaded pages/);
+  pages = 0; selected = null;
+  h.context.loadOlderGraphCommits = async () => {pages++; view.selection = 'branch:another'; return true;};
+  await h.context.showStoryMergeParent('stale');
+  assert.equal(pages,1); assert.equal(selected,null);
+  h.context.loadOlderGraphCommits = async () => false;
+  await h.context.showStoryMergeParent('failed');
+  assert.equal(view.loadingParent,null);
+});
+
+test('Branch Story SVG marks unloaded parents instead of silently dropping the incoming edge', () => {
+  const h = rendererHarness();
+  const commits = [c('merge',['own','missing']),c('own')];
+  const model = buildGraphModel(commits,'merge');
+  const svg = {setAttribute(){},innerHTML:''};
+  h.refs.graph.querySelector = () => svg;
+  h.refs.graph.querySelectorAll = () => commits.map((commit,i) => ({offsetTop:i*70,offsetHeight:60,classList:{contains:()=>false}}));
+  h.context.palette = ['blue','gold']; h.context.laneX = lane => lane*24+12;
+  vm.runInContext(appFunction('drawGraphOverlay'),h.context);
+  h.context.drawGraphOverlay(model,72,{showMissingParents:true});
+  assert.match(svg.innerHTML, /graph-missing-parent/);
+  assert.match(svg.innerHTML, /Parent missing is outside loaded history/);
+  h.context.drawGraphOverlay(model,72,{});
+  assert.doesNotMatch(svg.innerHTML, /graph-missing-parent/);
+});
+
+test('Incoming history pagination cannot append old results after a same-repository refresh', async () => {
+  const h = rendererHarness();
+  h.state.view = 'graph'; h.state.submoduleGraph = null;
+  h.context.GRAPH_COMMIT_WINDOW = 500;
+  h.context.appendOlderGraphRows = () => {};
+  let complete;
+  h.context.invoke = () => new Promise(resolve => {complete = resolve;});
+  vm.runInContext('async ' + appFunction('loadOlderGraphCommits'), h.context);
+  const pending = h.context.loadOlderGraphCommits();
+  const refreshed = [c('new-head')];
+  h.graph.commits = refreshed; h.state.commits = refreshed;
+  complete({commits:[c('old-page')],has_more:false});
+  assert.equal(await pending,false);
+  assert.strictEqual(h.state.commits,refreshed);
+  assert.equal(h.context.loadingOlderCommits,false);
+});
+
 test('Branch Story: historical incoming paths keep multiple labels at different nodes', () => {
   const refs = [ref('release'), ref('origin/release', 'remote_branch'), ref('v1', 'tag')];
   const commits = [c('m', ['a', 'incoming']), c('incoming', ['older']), c('a', ['root']), c('older', ['root'], refs), c('root')];
@@ -311,7 +401,7 @@ test('Branch Story UI: verified Branch Start marker and jump select the original
   const rowFor = id => html.match(new RegExp(`<article[^>]*data-id="${id}"[\\s\\S]*?</article>`))?.[0];
   assert.match(rowFor('B'), />Branch Start</);
   assert.doesNotMatch(rowFor('D'), />Branch Start</);
-  assert.match(h.refs.laneLegend.innerHTML, /Go to Branch Start/);
+  assert.match(h.refs.laneLegend.innerHTML, /Go to start/);
   jump(); assert.equal(selected, 'B'); assert.equal(scrolled, true);
   assert.deepEqual(Array.from(h.context.lastGraphRenderContext.story.commits, c => c.id), h.graph.commits.map(c => c.id));
 });
@@ -350,6 +440,7 @@ test('Branch Story UI: the original fork supports inspection, compare with HEAD,
   const h = rendererHarness();
   const calls = [], handlers = {};
   const context = { path: '/fixture', isSubmodule: false, name: 'fixture' };
+  h.state.repository.path = context.path;
   Object.assign(h.context, {
     activeRepositoryContext: () => context,
     graphBranchRefsForCommit: () => [],
@@ -359,8 +450,8 @@ test('Branch Story UI: the original fork supports inspection, compare with HEAD,
     openCommanderDirectory: async scope => calls.push(['compare', scope, h.state.branchCompareLeftRef, h.state.branchCompareRightRef]),
   });
   const names = ['graphCommitCompareAnchorMatches', 'setGraphCommitCompareStart',
-    'openGraphRevisionCompare', 'showGraphCommitContextMenu', 'wireGraphRowInteractions'];
-  vm.runInContext(names.map(name => `${name === 'openGraphRevisionCompare' ? 'async ' : ''}${appFunction(name)}`).join('\n'), h.context);
+    'openRepositoryRevisionCompare', 'openGraphRevisionCompare', 'showGraphCommitContextMenu', 'wireGraphRowInteractions'];
+  vm.runInContext(names.map(name => `${['openRepositoryRevisionCompare', 'openGraphRevisionCompare'].includes(name) ? 'async ' : ''}${appFunction(name)}`).join('\n'), h.context);
   h.graph.commits = originalForkFixture(); h.graph.headOid = 'F1';
   h.context.activeBranchStoryView().mode = 'story';
   h.context.renderGraph();

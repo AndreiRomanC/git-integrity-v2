@@ -16,7 +16,7 @@ function harness() {
       addEventListener(event, fn) { this.listeners[event] = fn; },
       showModal() { this.open = true; }, setAttribute() {},
       close() { this.open = false; },
-      querySelector(selector) { return nodes[selector] ||= {}; },
+      querySelector(selector) { return nodes[selector] ||= { listeners: {}, addEventListener(event, fn) { this.listeners[event] = fn; } }; },
       closest(selector) { return nodes[selector] ||= {}; },
     };
   } });
@@ -36,6 +36,166 @@ function harness() {
 const preview = (source, paths = []) => ({ source_revision: source, source_id: source === 'HEAD' ? 'C1' : source,
   source_subject: 'snapshot', tracked_changes: paths.map(path => ({ status: 'M', path })), clean_candidates: [] });
 const historyPage = (commits, hasMore = false, offset = commits.length, head = 'C1') => ({ commits, has_more: hasMore, next_offset: offset, head_id: head });
+
+test('restore history comparison selects two exact commits without changing restore source', async () => {
+  const h = harness();
+  const model = h.state.folderRestore;
+  model.commits = [{ id: 'C1', subject: 'New' }, { id: 'C2', subject: 'Old' }];
+  model.selectedCommit = 'C1';
+  model.preview = preview('HEAD');
+  const oldPreview = model.preview;
+  h.context.setFolderRestoreCompareStart('C2');
+  assert.equal(model.compareStart.id, 'C2');
+  assert.equal(model.selectedCommit, 'C1');
+  assert.equal(model.preview, oldPreview);
+  assert.match(h.refs.folderRestoreCommitList.innerHTML, /data-restore-compare-with="C1"/);
+  assert.doesNotMatch(h.refs.folderRestoreCommitList.innerHTML, /data-restore-compare-with="C2"/);
+  let args;
+  h.context.openRepositoryRevisionCompare = async (...values) => { args = values; };
+  await h.context.compareFolderRestoreWithStart('C1');
+  assert.deepEqual(args, ['C2', 'C1', 'folder', '']);
+  assert.equal(h.refs.folderRestoreDialog.open, false);
+  assert.equal(h.state.folderRestore, null);
+  assert.equal(h.calls.length, 0, 'no restore, stage, checkout or additional history request');
+});
+
+test('file restore comparison opens the existing comparison at its folder and focuses the file', async () => {
+  const h = harness();
+  h.context.openFolderRestoreDialog({ kind: 'file', tracked: true, name: 'file.txt', relative_path: 'src/file.txt' });
+  h.state.folderRestore.commits = [{ id: 'old' }, { id: 'new' }];
+  h.context.setFolderRestoreCompareStart('old');
+  let args;
+  h.context.openRepositoryRevisionCompare = async (...values) => { args = values; };
+  await h.context.compareFolderRestoreWithStart('new');
+  assert.deepEqual(args, ['old', 'new', 'src', 'src/file.txt']);
+});
+
+test('comparison rejects missing commits, identical selection and repository changes', async () => {
+  const h = harness();
+  h.state.folderRestore.commits = [{ id: 'A' }, { id: 'B' }];
+  h.context.setFolderRestoreCompareStart('unknown');
+  assert.equal(h.state.folderRestore.compareStart, null);
+  h.context.setFolderRestoreCompareStart('A');
+  let count = 0;
+  h.context.openRepositoryRevisionCompare = async () => { count++; };
+  await h.context.compareFolderRestoreWithStart('A');
+  await h.context.compareFolderRestoreWithStart('unknown');
+  h.state.repository.path = 'another-repo';
+  await h.context.compareFolderRestoreWithStart('B');
+  h.context.setFolderRestoreCompareStart('B');
+  assert.equal(h.state.folderRestore.compareStart.id, 'A');
+  assert.equal(h.refs.folderRestoreDialog.open, true);
+  assert.equal(count, 0);
+});
+
+test('compare start survives loading more history and is cleared for a new restore dialog', async () => {
+  const h = harness();
+  h.state.folderRestore.commits = [{ id: 'A' }];
+  h.state.folderRestore.historyHasMore = true;
+  h.context.setFolderRestoreCompareStart('A');
+  const pending = h.context.loadFolderRestoreCommits(true);
+  h.calls[0].resolve(historyPage([{ id: 'B' }]));
+  await pending;
+  assert.equal(h.state.folderRestore.compareStart.id, 'A');
+  assert.match(h.refs.folderRestoreCommitList.innerHTML, /data-restore-compare-with="B"/);
+  h.context.openFolderRestoreDialog({ kind: 'folder', name: 'new', relative_path: 'new' });
+  assert.equal(h.state.folderRestore.compareStart, null);
+});
+
+test('read-only compare clicks never trigger restore selection handlers', async () => {
+  const h = harness();
+  h.state.folderRestore.commits = [{ id: 'A' }, { id: 'B' }];
+  h.state.folderRestore.selectedCommit = 'B';
+  const event = (selector, dataset) => ({ target: { closest: name => name === selector ? { dataset } : null } });
+  h.refs.folderRestoreCommitList.listeners.click(event('[data-restore-compare-start]', { restoreCompareStart: 'A' }));
+  assert.equal(h.state.folderRestore.selectedCommit, 'B');
+  let pair;
+  h.context.openRepositoryRevisionCompare = async (left, right) => { pair = [left, right]; };
+  h.refs.folderRestoreCommitList.listeners.click(event('[data-restore-compare-with]', { restoreCompareWith: 'B' }));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(pair, ['A', 'B']);
+  assert.equal(h.calls.length, 0);
+});
+
+test('restore warns about HEAD-relative staging even when the selected source already matches', () => {
+  const h = harness();
+  h.context.renderFolderRestorePreview({ ...preview('C2'), staged_paths: ['folder/file.txt'] });
+  assert.equal(h.refs.folderRestoreStagedNotice.hidden, false);
+  assert.match(h.refs.folderRestoreStagedNotice.textContent, /currently staged/);
+  h.context.renderFolderRestorePreview({ ...preview('HEAD'), staged_paths: [] });
+  assert.equal(h.refs.folderRestoreStagedNotice.hidden, true);
+});
+
+test('restore passes explicit unstage choice and resets it for the next selection', async () => {
+  const h = harness();
+  h.state.folderRestore.preview = { ...preview('HEAD'), staged_paths: ['folder/file.txt'] };
+  assert.equal(h.refs.folderRestoreUnstage.checked, false);
+  h.refs.folderRestoreUnstage.checked = true;
+  h.context.customConfirm = async message => {
+    assert.match(message, /currently staged/);
+    assert.match(message, /removed from staging/);
+    return true;
+  };
+  h.context.changesForPathScope = () => [];
+  const pending = h.context.confirmFolderRestore();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(h.calls[0].command, 'restore_folder');
+  assert.equal(h.calls[0].args.leaveUnstaged, true);
+  h.calls[0].resolve();
+  await pending;
+  h.context.openFolderRestoreDialog({ kind: 'folder', name: 'other', relative_path: 'other' });
+  assert.equal(h.refs.folderRestoreUnstage.checked, false);
+});
+
+test('changing unstage choice during confirmation cancels the old restore', async () => {
+  const h = harness();
+  h.state.folderRestore.preview = preview('HEAD');
+  let decide;
+  h.context.customConfirm = () => new Promise(resolve => { decide = resolve; });
+  const pending = h.context.confirmFolderRestore();
+  h.refs.folderRestoreUnstage.checked = true;
+  decide(true);
+  await pending;
+  assert.equal(h.calls.length, 0);
+});
+
+test('file comparison synchronizes vertical scrolling without moving horizontal position', () => {
+  const context = {};
+  vm.createContext(context);
+  vm.runInContext(app.slice(app.indexOf('function syncCompareVerticalScroll('), app.indexOf('function setCompareActionsDisabled(')), context);
+  const left = { scrollTop: 300, scrollLeft: 170 }, right = { scrollTop: 0, scrollLeft: 25 };
+  context.syncCompareVerticalScroll(left, right);
+  assert.equal(right.scrollTop, 300);
+  assert.equal(right.scrollLeft, 25);
+  assert.equal(left.scrollLeft, 170);
+});
+
+test('optional restore checkbox does not leak into other confirmations', async () => {
+  const nodes = new Map();
+  const node = selector => {
+    if (!nodes.has(selector)) nodes.set(selector, { listeners: {},
+      addEventListener(event, callback) { this.listeners[event] = callback; },
+      removeEventListener(event) { delete this.listeners[event]; },
+      showModal() { this.open = true; }, close() { this.open = false; },
+    });
+    return nodes.get(selector);
+  };
+  const context = { $: node };
+  vm.createContext(context);
+  vm.runInContext(app.slice(app.indexOf('function customConfirm('), app.indexOf('function customPrompt(')), context);
+  const option = { label: 'Unstage this selection', checked: false };
+  const first = context.customConfirm('Restore?', { checkbox: option });
+  assert.equal(node('#appConfirmOptionRow').hidden, false);
+  node('#appConfirmOption').checked = true;
+  node('#appConfirmOk').listeners.click();
+  assert.equal(await first, true);
+  assert.equal(option.checked, true);
+  const second = context.customConfirm('Unrelated confirmation');
+  assert.equal(node('#appConfirmOptionRow').hidden, true);
+  assert.equal(node('#appConfirmOption').checked, false);
+  node('#appConfirmCancel').listeners.click();
+  assert.equal(await second, false);
+});
 
 test('file details offer only the source-selection restore, preserving the submodule fallback', () => {
   const details = { innerHTML: '', querySelectorAll: () => [] };

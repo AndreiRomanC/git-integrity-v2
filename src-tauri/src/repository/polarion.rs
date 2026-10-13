@@ -25,6 +25,8 @@ pub struct SearchResult {
     #[serde(default)] more: bool,
     #[serde(default)] received: usize,
     #[serde(default)] prefix_fallback: bool,
+    #[serde(default)] catalog_cached: bool,
+    #[serde(default)] catalog_pages: usize,
     #[serde(default)] items: Vec<SearchItem>,
 }
 #[derive(Serialize)]
@@ -53,8 +55,11 @@ fn search_url(kind: &str, project: &str, query: &str, user: &str, page: usize) -
     let filter;
     if kind == "projects" {
         if words.is_empty() { return Err("Type part of a project name or ID first.".into()); }
-        filter = format!("(id:({words}) OR name:({words}) OR trackerPrefix:({words}))");
-        url.query_pairs_mut().append_pair("fields[projects]", "id,name");
+        // Display pages are applied after case-insensitive substring matching.
+        // The portal reads all accessible catalog pages on explicit search.
+        url.query_pairs_mut().append_pair("fields[projects]", "id,name")
+            .append_pair("page[size]", "100").append_pair("page[number]", "1").append_pair("sort", "id");
+        return Ok(url.to_string());
     } else if kind == "tasks" && identifier(project) {
         url.set_path(&format!("/polarion/rest/v1/projects/{project}/workitems"));
         filter = format!("type:task{}{}",
@@ -156,7 +161,7 @@ pub async fn polarion_connect(app: tauri::AppHandle) -> Result<(), String> {
 
 fn validate_result(raw: &str) -> Result<SearchResult, String> {
     let result: SearchResult = serde_json::from_str(raw).map_err(|_| "Invalid Polarion search response")?;
-    if !["ok", "auth_required", "forbidden", "api_unavailable", "query_rejected", "http_error", "not_json", "network_error", "timeout", "wrong_origin", "invalid_response"].contains(&result.code.as_str())
+    if !["ok", "auth_required", "forbidden", "api_unavailable", "query_rejected", "http_error", "not_json", "network_error", "timeout", "wrong_origin", "invalid_response", "catalog_limit"].contains(&result.code.as_str())
         || result.items.len() > 25 || result.items.iter().any(|item| !identifier(&item.id) || item.title.len() > 2000) {
         return Err("Invalid Polarion result; no entries were added".into());
     }
@@ -168,18 +173,18 @@ mod tests {
     use super::*;
     fn pairs(url: &str) -> HashMap<String, String> { reqwest::Url::parse(url).unwrap().query_pairs().into_owned().collect() }
     #[test]
-    fn project_search_is_server_filtered_and_paged() {
+    fn project_search_uses_catalog_without_server_wildcard_filter() {
         let url = search_url("projects", "", "Drive Test", "", 2).unwrap();
         let params = pairs(&url);
-        assert_eq!(params["page[size]"], "25");
-        assert_eq!(params["page[number]"], "2");
-        assert!(params["query"].contains("name:(*Drive* AND *Test*)"));
+        assert_eq!(params["page[size]"], "100");
+        assert_eq!(params["page[number]"], "1");
+        assert!(!params.contains_key("query"));
+        assert_eq!(params["fields[projects]"], "id,name");
         assert!(search_url("projects", "", "", "", 1).is_err());
     }
     #[test]
     fn fragment_search_matches_inside_identifiers_and_keeps_short_terms_bounded() {
-        let query = pairs(&search_url("projects", "", "AQ4", "", 1).unwrap())["query"].clone();
-        assert_eq!(query, "(id:(*AQ4*) OR name:(*AQ4*) OR trackerPrefix:(*AQ4*))");
+        assert!(!pairs(&search_url("projects", "", "AQ4", "", 1).unwrap()).contains_key("query"));
         assert_eq!(term("  AQ4  Drive  ").unwrap(), "*AQ4* AND *Drive*");
         assert_eq!(term("AQ").unwrap(), "AQ*");
         assert_eq!(term("AQ4-123").unwrap(), "*AQ4\\-123*");
@@ -254,7 +259,7 @@ pub async fn polarion_search(app: tauri::AppHandle, kind: String, project: Strin
         let started = Instant::now();
         let window = app.get_webview_window(WINDOW).ok_or_else(|| {
             perf_log("polarion: search code=browser_not_open", started.elapsed());
-            "Open Connect / Polarion, sign in, then retry Search.".to_string()
+            "Open Polarion, sign in if needed, then retry Search.".to_string()
         })?;
         let id = NEXT.fetch_add(1, Ordering::Relaxed).to_string();
         let (send, receive) = mpsc::channel();
@@ -263,12 +268,12 @@ pub async fn polarion_search(app: tauri::AppHandle, kind: String, project: Strin
             if slot.is_some() { return Err("A Polarion search is already running.".into()); }
             *slot = Some((id.clone(), send));
         }
-        // Some installations reject leading wildcards. Preserve the former
-        // prefix search in that case, without downloading the project catalog.
+        // Project matching uses the paginated accessible catalog in the portal,
+        // independent of server wildcard/case rules. Task search is unchanged.
         let script = include_str!("polarion-search.js")
-            .replace("__DDT_ARGUMENTS__", &serde_json::json!({"url":url,"fallbackUrl":fallback.as_str(),"kind":kind,"project":project,"request":id}).to_string());
+            .replace("__DDT_ARGUMENTS__", &serde_json::json!({"url":url,"fallbackUrl":fallback.as_str(),"kind":kind,"project":project,"query":query,"page":page,"request":id}).to_string());
         let contains_terms = query.split_whitespace().filter(|word| word.chars().count() >= 3).count();
-        perf_log(&format!("polarion: search_start request={id} kind={kind} page={page} query_len={} assigned_filter={} match=contains_3plus contains_terms={contains_terms}", query.len(), !user.is_empty()), Duration::ZERO);
+        perf_log(&format!("polarion: search_start request={id} kind={kind} page={page} query_len={} assigned_filter={} match={} contains_terms={contains_terms}", query.len(), !user.is_empty(), if kind == "projects" { "catalog_case_insensitive_contains" } else { "contains_3plus" }), Duration::ZERO);
         let mut bridge_code = "eval_failed";
         let result = if window.eval(script).is_err() { Err("Polarion browser could not start the search".into()) }
             else {
@@ -280,7 +285,7 @@ pub async fn polarion_search(app: tauri::AppHandle, kind: String, project: Strin
             };
         if let Ok(mut slot) = pending().lock() { if slot.as_ref().is_some_and(|(key, _)| key == &id) { *slot = None; } }
         let detail = match &result {
-            Ok(data) => format!("code={} http={} session_token={} received={} results={} more={} prefix_fallback={}", data.code, data.http, data.session_token, data.received, data.items.len(), data.more, data.prefix_fallback),
+            Ok(data) => format!("code={} http={} session_token={} received={} results={} more={} prefix_fallback={} catalog_cached={} catalog_pages={}", data.code, data.http, data.session_token, data.received, data.items.len(), data.more, data.prefix_fallback, data.catalog_cached, data.catalog_pages),
             Err(_) => format!("code={bridge_code}"),
         };
         perf_log(&format!("polarion: search_end request={id} kind={kind} page={page} {detail}"), started.elapsed());

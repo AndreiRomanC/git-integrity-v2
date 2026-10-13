@@ -18,6 +18,7 @@ pub struct ComparisonAuthor {
 #[derive(Debug, Serialize)]
 pub struct ComparisonTouch {
     commit: String,
+    date: String,
     parent: Option<String>,
     change: String,
     direct: bool,
@@ -107,6 +108,7 @@ fn collect_for_paths(repo: &Repository, left: Oid, right: Oid, comparison_paths:
                             if !evidence.iter().any(|touch| touch.direct == direct) {
                                 evidence.push(ComparisonTouch {
                                     commit: commit.id().to_string(),
+                                    date: short_date(commit.time().seconds()),
                                     parent: if commit.parent_count() == 0 { None } else { Some(commit.parent_id(0).map_err(|e| e.to_string())?.to_string()) },
                                     change: format!("{:?}", delta.status()),
                                     direct,
@@ -219,6 +221,7 @@ mod tests {
         assert_eq!(evidence.len(), 2);
         let own = evidence.iter().find(|e| e.direct).unwrap();
         assert_eq!(own.commit, tip.to_string());
+        assert_eq!(own.date, short_date(f.repo.find_commit(tip).unwrap().time().seconds()));
         assert_eq!(own.parent, Some(merged.to_string()));
         let imported = evidence.iter().find(|e| !e.direct).unwrap();
         assert_eq!(imported.commit, side.to_string());
