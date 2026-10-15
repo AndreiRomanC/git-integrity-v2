@@ -606,9 +606,68 @@ const localDriveWorkspace = globalThis.LocalDriveWorkspace?.create({
   root: refs.localDrivePanel,
   invoke,
   notify: status,
+  exportSnapshots: downloadSnapshots,
   confirm: (message, options) => customConfirm(message, options),
   prompt: (message, defaultValue, options) => customPrompt(message, defaultValue, options),
   onMutation: paths => refreshGitAfterLocalDriveMutation(paths).catch(error => handleError(error)),
+});
+
+// Capture sources before opening the picker; navigation must not change what
+// the user chose to export. This flow never refreshes or mutates Git state.
+async function downloadSnapshots(name, sources, button) {
+  if (!invoke || !sources?.length || button?.dataset.exporting) return;
+  const captured = JSON.parse(JSON.stringify(sources));
+  if (button) { button.dataset.exporting = 'true'; button.disabled = true; }
+  try {
+    const destinationPath = await invoke('choose_folder');
+    if (!destinationPath) return;
+    status('Downloading snapshots locally…', 'busy');
+    const path = await invoke('export_snapshots', { name, sources: captured, destinationPath });
+    status(`Snapshots downloaded: ${path}`);
+    showOperationToast(`Snapshots downloaded:\n${path}`, 'success');
+    return path;
+  } catch (error) { handleError(error); showOperationToast(`Snapshot download failed: ${String(error)}`, 'error'); }
+  finally { if (button) { delete button.dataset.exporting; button.disabled = false; } }
+}
+
+function fileComparisonDownloadSources(comparison, name) {
+  return [
+    comparison.local_exists === false ? { kind: 'missing' } : { kind: 'text', name, content: comparison.local_content || '' },
+    comparison.remote_exists === false ? { kind: 'missing' } : { kind: 'text', name, content: comparison.remote_content || '' },
+  ];
+}
+
+function captureFileComparisonDownload(comparison) {
+  const name = (comparison.relative_path || state.comparingRow?.relative_path || 'file.txt').split(/[\\/]/).pop();
+  state.compareDownloadSnapshot = { name, sources: fileComparisonDownloadSources(comparison, name) };
+  $('#compareDownload').disabled = false;
+}
+
+function commanderDownloadSnapshot(result, repositoryPath, branchCompareMode) {
+  const relative = result.relative_path || '';
+  const repository = result.repository_path || repositoryPath;
+  const revision = sha => ({ kind: 'revision', repository_path: repository, revision: sha, relative_path: relative });
+  const left = result.left_revision || result.leftRevision;
+  const right = result.right_revision || result.rightRevision;
+  if (branchCompareMode && (!left || !right)) return null;
+  if (!branchCompareMode && !result.remote_revision) return null;
+  return { name: relative.split('/').pop() || repository.split(/[\\/]/).filter(Boolean).pop() || 'folder',
+    sources: branchCompareMode ? [revision(left), revision(right)] : [
+      { kind: 'local', path: `${repository.replace(/[\\/]+$/, '')}/${relative}` }, revision(result.remote_revision),
+    ] };
+}
+
+$('#compareDownload')?.addEventListener('click', async event => {
+  const snapshot = state.compareDownloadSnapshot;
+  if (!snapshot) return;
+  await downloadSnapshots(snapshot.name, snapshot.sources, event.currentTarget);
+  $('#compareDownload').disabled = !state.compareDownloadSnapshot;
+});
+$('#gitCompareDownload')?.addEventListener('click', async event => {
+  const snapshot = state.commanderExportSnapshot;
+  if (!snapshot || state.commanderComparisonLoading) return;
+  await downloadSnapshots(snapshot.name, snapshot.sources, event.currentTarget);
+  $('#gitCompareDownload').disabled = !state.commanderExportSnapshot || !!state.commanderComparisonLoading;
 });
 
 function handleError(error) {
@@ -1691,6 +1750,8 @@ function logComparisonAuthorDisplay(model, totalRows, shownRows, otherFilterActi
 
 function renderCommander() {
   if (!state.repository) return;
+  const download = $('#gitCompareDownload');
+  if (download) download.disabled = !state.commanderExportSnapshot || !!state.commanderComparisonLoading || !!download.dataset.exporting;
   const localDrive = state.compareMode === 'local-drive';
   const submoduleMode = state.compareMode === 'submodule';
   const gitMode = !localDrive && !submoduleMode;
@@ -1920,6 +1981,9 @@ async function openCommanderDirectory(path) {
   } else if (!state.remoteRef) { status('No remote-tracking branch is available. Fetch the repository first.', 'error'); return; }
   const loading = {};
   state.commanderComparisonLoading = loading;
+  state.commanderExportSnapshot = null;
+  const download = $('#gitCompareDownload');
+  if (download) download.disabled = true;
   state.commanderRows = [];
   state.commanderPath = path; refs.commanderRows.innerHTML = `<div class="loading-row"><i class="spinner"></i>${branchCompareMode ? 'Comparing repository refs…' : 'Comparing local and remote…'}</div>`;
   if (!branchCompareMode) {
@@ -1942,6 +2006,7 @@ async function openCommanderDirectory(path) {
     if (!stillCurrent()) return;
     state.commanderComparisonLoading = null;
     state.commanderRows = result.rows;
+    state.commanderExportSnapshot = commanderDownloadSnapshot(result, state.repository.path, branchCompareMode);
     if (branchCompareMode) {
       state.branchCompareLeftRevision = result.left_revision || result.leftRevision || '';
       state.branchCompareRightRevision = result.right_revision || result.rightRevision || '';
@@ -2158,7 +2223,7 @@ async function openSubmoduleRevisionFileCompare(row) {
         rightRef: compare.rightRevision || compare.rightRef,
       });
     if (!stillCurrent() || state.comparingRow !== row) return;
-    renderComparisonContents(comparison.local_content || (leftMissing ? '(file does not exist on left revision)' : ''), comparison.remote_content || (rightMissing ? '(file does not exist on right revision)' : ''));
+    renderComparisonContents(comparison.local_content || (leftMissing ? '(file does not exist on left revision)' : ''), comparison.remote_content || (rightMissing ? '(file does not exist on right revision)' : ''), comparison);
   } catch (error) { if (stillCurrent() && state.comparingRow === row) { refs.localCompare.textContent = String(error); refs.remoteCompare.textContent = ''; } }
 }
 
@@ -2191,7 +2256,7 @@ async function openGitRevisionFileCompare(row, evidence = null) {
       rightRef,
     });
     if (!stillCurrent() || state.comparingRow !== row) return;
-    renderComparisonContents(comparison.local_content || (leftMissing ? '(file does not exist on start ref)' : ''), comparison.remote_content || (rightMissing ? '(file does not exist on compare ref)' : ''));
+    renderComparisonContents(comparison.local_content || (leftMissing ? '(file does not exist on start ref)' : ''), comparison.remote_content || (rightMissing ? '(file does not exist on compare ref)' : ''), comparison);
   } catch (error) { if (stillCurrent() && state.comparingRow === row) { refs.localCompare.textContent = String(error); refs.remoteCompare.textContent = ''; } }
 }
 
@@ -2217,7 +2282,7 @@ async function openFileCompare(row) {
   try {
     const comparison = await invoke('compare_file_contents', { repositoryPath: state.repository.path, relativePath: row.relative_path, remoteRef: state.remoteRef });
     if (!stillCurrent() || state.comparingRow !== row) return; // a newer file's compare (same guard) or the dialog moved on
-    renderComparisonContents(comparison.local_content || (localMissing ? '(file does not exist locally)' : ''), comparison.remote_content);
+    renderComparisonContents(comparison.local_content || (localMissing ? '(file does not exist locally)' : ''), comparison.remote_content, comparison);
   } catch (error) { if (stillCurrent() && state.comparingRow === row) { refs.localCompare.textContent = String(error); refs.remoteCompare.textContent = ''; } }
 }
 
@@ -2242,7 +2307,7 @@ async function openIndexWorktreeCompare(change) {
   try {
     const comparison = await invoke('compare_working_area_file', { repositoryPath: state.repository.path, relativePath: change.path, staged });
     if (!stillCurrent() || state.comparingRow !== row) return;
-    renderComparisonContents(comparison.local_content || '', comparison.remote_content || '');
+    renderComparisonContents(comparison.local_content || '', comparison.remote_content || '', comparison);
   } catch (error) {
     if (stillCurrent() && state.comparingRow === row) {
       refs.localCompare.textContent = String(error);
@@ -2304,6 +2369,9 @@ function setCompareReadOnly(readOnly, message = '') {
   if (readOnly) setCompareActionStatus(message || 'Read-only comparison.', 'busy');
 }
 function resetCompareDiffNavigation(message = 'Loading differences…') {
+  state.compareDownloadSnapshot = null;
+  const download = $('#compareDownload');
+  if (download) download.disabled = true;
   state.compareDiffRows = [];
   state.compareDiffActive = -1;
   refs.compareDiffStatus.textContent = message;
@@ -2336,7 +2404,7 @@ async function applyFileRecovery(forcedAction = '') {
     status(action === 'remote' ? `Fetching ${state.remoteRef} and restoring ${row.name}…` : `Applying action to ${row.name}…`, 'busy');
     if (action === 'remote') {
       await invoke('restore_remote_file', { repositoryPath, relativePath: row.relative_path, remoteRef, leaveUnstaged: unstageChoice.checked });
-      const comparison = await invoke('compare_file_contents', { repositoryPath: state.repository.path, relativePath: row.relative_path, remoteRef: state.remoteRef }); renderComparisonContents(comparison.local_content, comparison.remote_content); refs.compareSubtitle.textContent = `LOCAL NOW MATCHES ${state.remoteRef} · fetched from server`; directoryCache.clear();
+      const comparison = await invoke('compare_file_contents', { repositoryPath: state.repository.path, relativePath: row.relative_path, remoteRef: state.remoteRef }); renderComparisonContents(comparison.local_content, comparison.remote_content, comparison); refs.compareSubtitle.textContent = `LOCAL NOW MATCHES ${state.remoteRef} · fetched from server`; directoryCache.clear();
       await requestRepositoryStatusRefresh(repositoryPath, { reason: 'file-restore' });
       const msg = `${row.name}: the file on disk was overwritten with the ${remoteRef} version.${unstageChoice.checked ? ' This file was removed from staging.' : ''}`;
       setCompareActionStatus(`Success: ${row.name} now contains the fetched server version.`, 'success'); status(msg); showOperationToast(msg, 'success'); return;
@@ -2351,7 +2419,8 @@ async function applyFileRecovery(forcedAction = '') {
 }
 function updateRecoveryHelp(action = '') { const help = { stage: '`git add` – Stage the current file content', unstage: 'UNSTAGE (`git restore --staged`) – unstages only, your edits on disk stay exactly as they are', head: 'RESTORE FROM LAST COMMIT (`git checkout HEAD -- file`) – no network access; discards edits using what you already have locally', remote: `RESTORE FROM SERVER – fetches ${state.remoteRef || 'remote'} first, then overwrites the file with that server version (can differ from your last local commit if the server has newer changes)` }; if (action) { $('#recoveryHelp').textContent = help[action]; } else { const allOptions = `Stage: ${help.stage} • Unstage: ${help.unstage} • Restore from last commit: ${help.head} • Restore from server: ${help.remote}`; $('#recoveryHelp').textContent = allOptions; } }
 
-function renderComparisonContents(localText, remoteText) {
+function renderComparisonContents(localText, remoteText, snapshot = null) {
+  if (snapshot) captureFileComparisonDownload(snapshot);
   const diffEngine = window.LocalDriveDiff || globalThis.LocalDriveDiff;
   const diff = diffEngine?.buildLineDiff
     ? diffEngine.buildLineDiff(localText, remoteText, undefined, 'exact')
@@ -3018,6 +3087,12 @@ function renderSubmoduleVersions() {
       : rows;
   }
   refs.submoduleVersions.innerHTML = html;
+  refs.submoduleVersions.querySelectorAll('[data-download-version]').forEach(button => button.addEventListener('click', event => {
+    event.stopPropagation();
+    if (!submoduleMenuEntry || !state.repository) return;
+    downloadSnapshots(submoduleMenuEntry.name, [{ kind: 'revision', repository_path: state.repository.path,
+      submodule_path: submoduleMenuEntry.relative_path, revision: button.closest('[data-revision]').dataset.revision, relative_path: '' }], button);
+  }));
   refs.submoduleVersions.querySelectorAll('[data-related-version]').forEach(button => button.addEventListener('click', event => {
     event.stopPropagation();
     submoduleCrossSelected = { kind: button.dataset.relatedKind, name: button.dataset.relatedName };
@@ -3441,7 +3516,7 @@ function renderFolderRestoreCommits() {
   refs.folderRestoreCommitList.innerHTML = model.commits.map(commit => {
     const selected = commit.id === model.selectedCommit;
     const isStart = start?.id === commit.id;
-    return `<div class="folder-restore-commit-row ${isStart ? 'compare-start' : ''}"><button type="button" class="folder-restore-commit ${selected ? 'selected' : ''}" data-folder-restore-commit="${esc(commit.id)}" aria-pressed="${selected}" title="Select this snapshot for restore"><span class="folder-restore-commit-marker" aria-hidden="true">${selected ? '●' : '○'}</span><span class="folder-restore-commit-content"><strong>${esc(commit.subject || 'No message')}</strong><span class="folder-restore-commit-meta"><code title="${esc(commit.id)}">${esc(commit.id.slice(0, 8))}</code><span>${esc(commit.author || 'Unknown')}</span><time>${esc(commit.date || '—')}</time></span></span></button><div class="folder-restore-compare-actions" aria-label="Read-only comparison"><button type="button" data-restore-compare-start="${esc(commit.id)}" aria-pressed="${isStart}" title="Set ${esc(commit.id.slice(0, 8))} as comparison start; does not change the restore selection">${isStart ? '✓ Compare start' : 'Set start'}</button>${start && !isStart ? `<button type="button" data-restore-compare-with="${esc(commit.id)}" title="Open Compare & Sync: ${esc(start.id.slice(0, 8))} → ${esc(commit.id.slice(0, 8))}. Nothing will be restored.">Compare with start</button>` : ''}</div></div>`;
+    return `<div class="folder-restore-commit-row ${isStart ? 'compare-start' : ''}"><button type="button" class="folder-restore-commit ${selected ? 'selected' : ''}" data-folder-restore-commit="${esc(commit.id)}" aria-pressed="${selected}" title="Select this snapshot for restore"><span class="folder-restore-commit-marker" aria-hidden="true">${selected ? '●' : '○'}</span><span class="folder-restore-commit-content"><strong>${esc(commit.subject || 'No message')}</strong><span class="folder-restore-commit-meta"><code title="${esc(commit.id)}">${esc(commit.id.slice(0, 8))}</code><span>${esc(commit.author || 'Unknown')}</span><time>${esc(commit.date || '—')}</time></span></span></button><div class="folder-restore-compare-actions" aria-label="Read-only comparison"><button type="button" class="snapshot-download" data-restore-download="${esc(commit.id)}" title="Download this ${model.isFile ? 'file' : 'folder'} snapshot; no restore" aria-label="Download snapshot">⇩</button><button type="button" data-restore-compare-start="${esc(commit.id)}" aria-pressed="${isStart}" title="Set ${esc(commit.id.slice(0, 8))} as comparison start; does not change the restore selection">${isStart ? '✓ Compare start' : 'Set start'}</button>${start && !isStart ? `<button type="button" data-restore-compare-with="${esc(commit.id)}" title="Open Compare & Sync: ${esc(start.id.slice(0, 8))} → ${esc(commit.id.slice(0, 8))}. Nothing will be restored.">Compare with start</button>` : ''}</div></div>`;
   }).join('');
 }
 
@@ -6494,7 +6569,7 @@ function renderGraph() {
   if (commits.length) requestAnimationFrame(() => {
     if (lastGraphModel !== model) return; // superseded by a newer render before this frame ran
     const overlayStarted = performance.now();
-    drawGraphOverlay(model, lanesWidth, { disconnected: onlySearchMatches, showMissingParents: !!story });
+    drawGraphOverlay(model, lanesWidth, { disconnected: onlySearchMatches, branchStory: !!story });
     jsPerfLog(`renderGraph SVG overlay (${commits.length} commits)`, performance.now() - overlayStarted);
   });
 }
@@ -6513,7 +6588,7 @@ let lastGraphOnlySearchMatches = false;
 function scheduleGraphOverlayRedraw() {
   clearTimeout(graphOverlayRedrawTimer);
   graphOverlayRedrawTimer = setTimeout(() => {
-    if (state.view === 'graph' && lastGraphModel && lastGraphModel.length) drawGraphOverlay(lastGraphModel, lastGraphLanesWidth, { disconnected: lastGraphOnlySearchMatches, showMissingParents: !!lastGraphRenderContext?.story });
+    if (state.view === 'graph' && lastGraphModel && lastGraphModel.length) drawGraphOverlay(lastGraphModel, lastGraphLanesWidth, { disconnected: lastGraphOnlySearchMatches, branchStory: !!lastGraphRenderContext?.story });
   }, 80);
 }
 
@@ -6620,14 +6695,20 @@ function drawGraphOverlay(model, lanesWidth, options = {}) {
   if (!options.disconnected) {
     model.forEach(node => {
       const from = positions.get(node.commitId); if (!from) return;
-      node.parents.forEach(parent => {
+      node.parents.forEach((parent, parentIndex) => {
         const to = positions.get(parent.commitId);
         if (!to) {
-          if (options.showMissingParents && node.parents.length > 1) {
+          if (options.branchStory && node.parents.length > 1) {
             const x = laneX(parent.targetLane);
             const d = `M${from.x} ${from.y} Q${x} ${from.y} ${x} ${from.y + 16}`;
             parts.push(`<path class="graph-edge graph-missing-parent" d="${d}" fill="none" stroke="${palette[parent.targetLane % palette.length]}" stroke-width="2" stroke-dasharray="3 3"><title>Parent ${esc(parent.commitId)} is outside loaded history</title></path>`);
           }
+          return;
+        }
+        if (options.branchStory && parentIndex > 0) {
+          const d = branchStoryIncomingPath(from, to, laneX(parent.targetLane), LANE_WIDTH, lanesWidth);
+          const incomingColor = palette[parent.targetLane % palette.length];
+          parts.push(`<path class="graph-edge-underlay" d="${d}"/><path class="graph-edge graph-incoming-edge" d="${d}" stroke="${incomingColor}" stroke-width="3"/>`);
           return;
         }
         const color = palette[node.lane % palette.length];
@@ -8092,6 +8173,15 @@ refs.folderRestoreUnstage.addEventListener('change', () => updateFolderRestoreAc
 refs.refreshFolderRestoreCommits.addEventListener('click', () => loadFolderRestoreCommits());
 refs.loadOlderFolderRestoreCommits.addEventListener('click', () => loadFolderRestoreCommits(true));
 refs.folderRestoreCommitList.addEventListener('click', event => {
+  const download = event.target.closest('[data-restore-download]');
+  if (download) {
+    const model = state.folderRestore;
+    if (model?.repositoryPath === state.repository?.path && model.commits.some(commit => commit.id === download.dataset.restoreDownload)) {
+      downloadSnapshots(model.entry.name, [{ kind: 'revision', repository_path: model.repositoryPath,
+        revision: download.dataset.restoreDownload, relative_path: model.entry.relative_path }], download);
+    }
+    return;
+  }
   const start = event.target.closest('[data-restore-compare-start]');
   if (start) { setFolderRestoreCompareStart(start.dataset.restoreCompareStart); return; }
   const compare = event.target.closest('[data-restore-compare-with]');

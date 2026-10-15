@@ -591,7 +591,7 @@ test('graph search can optionally show only matches as a disconnected result lis
   assert.match(app, /data-graph-only-matches/);
   assert.match(app, /Only matches/);
   assert.match(app, /if \(onlySearchMatches\) model\.forEach\(node => \{ node\.lane = 0; node\.before = \[\]; node\.after = \[\]; node\.parents = \[\]; \}\)/);
-  assert.match(app, /drawGraphOverlay\(model, lanesWidth, \{ disconnected: onlySearchMatches, showMissingParents: !!story \}\)/);
+  assert.match(app, /drawGraphOverlay\(model, lanesWidth, \{ disconnected: onlySearchMatches, branchStory: !!story \}\)/);
   assert.match(app, /if \(!options\.disconnected\) \{/);
   assert.match(css, /\.graph-search-toggle/);
 });

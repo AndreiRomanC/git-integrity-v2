@@ -74,6 +74,7 @@
       filePath: '', original: '', encoding: 'utf-8', fingerprint: '', side: 'right', editing: false,
     };
     const comparison = {
+      download: documentRef?.querySelector('#downloadLocalDriveComparison'),
       dialog: documentRef?.querySelector('#localDriveCompareDialog'),
       summary: documentRef?.querySelector('#localDriveCompareSummary'),
       leftPathNode: documentRef?.querySelector('#localDriveCompareLeftPath'),
@@ -104,6 +105,7 @@
       activeDifferenceRow: -1, readOnly: false,
     };
     const folderMerge = {
+      download: documentRef?.querySelector('#downloadLocalFolderComparison'),
       dialog: documentRef?.querySelector('#localFolderMergeDialog'),
       title: documentRef?.querySelector('#localFolderMergeTitle'),
       summary: documentRef?.querySelector('#localFolderMergeSummary'),
@@ -490,6 +492,7 @@
     }
 
     function updateComparisonState(message = '') {
+      if (comparison.download) comparison.download.disabled = comparison.loading || !!comparison.download.dataset.exporting;
       const leftDirty = comparisonDirty('left');
       const rightDirty = comparisonDirty('right');
       if (comparison.saveLeft) comparison.saveLeft.disabled = comparison.readOnly || comparison.loading || !leftDirty;
@@ -585,6 +588,8 @@
       comparison.loading = true;
       comparison.leftPath = pair.left.path || '';
       comparison.rightPath = pair.right.path || '';
+      comparison.leftMissing = !!pair.left.missing;
+      comparison.rightMissing = !!pair.right.missing;
       comparison.leftOriginal = comparison.leftText = '';
       comparison.rightOriginal = comparison.rightText = '';
       comparison.leftFingerprint = comparison.rightFingerprint = '';
@@ -917,6 +922,7 @@
           : `Copy ${item} ${direction === 'left-to-right' ? '→' : '←'}`;
       }
       if (folderMerge.rescan) folderMerge.rescan.disabled = folderMerge.loading;
+      if (folderMerge.download) folderMerge.download.disabled = folderMerge.loading || !!folderMerge.download.dataset.exporting;
       if (folderMerge.compareMode) folderMerge.compareMode.disabled = folderMerge.loading;
       if (folderMerge.guidedMode) folderMerge.guidedMode.disabled = folderMerge.loading;
       if (folderMerge.direction) folderMerge.direction.disabled = folderMerge.loading;
@@ -1169,6 +1175,25 @@
     comparison.showEdit?.addEventListener('click', () => setComparisonMode('edit'));
     comparison.previousDifference?.addEventListener('click', () => navigateComparisonDifference(-1));
     comparison.nextDifference?.addEventListener('click', () => navigateComparisonDifference(1));
+    comparison.download?.addEventListener('click', async () => {
+      if (comparison.loading) return;
+      syncComparisonEditors();
+      const sources = ['left', 'right'].map(side => {
+        const name = comparison[`${side}Path`].split(/[\\/]/).pop() || 'file.txt';
+        const content = comparison[`${side}Text`];
+        return comparison[`${side}Missing`] && !content ? { kind: 'missing' }
+          : { kind: 'text', name, content, encoding: comparison[`${side}Encoding`] };
+      });
+      await options.exportSnapshots?.('file-comparison', sources, comparison.download);
+      updateComparisonState();
+    });
+    folderMerge.download?.addEventListener('click', async () => {
+      if (folderMerge.loading || !folderMerge.leftRoot || !folderMerge.rightRoot) return;
+      await options.exportSnapshots?.('folder-comparison', [
+        { kind: 'local', path: folderMerge.leftRoot }, { kind: 'local', path: folderMerge.rightRoot },
+      ], folderMerge.download);
+      renderFolderMerge();
+    });
     comparison.rules?.addEventListener('change', () => {
       comparison.activeDifferenceRow = -1;
       if (comparison.mode === 'diff') renderComparison();

@@ -303,10 +303,23 @@ function branchStoryStart(commits, story, creationId) {
   return { id: fork, reason: `Branch Start confirmed by local creation record and first-parent divergence from ${baseRef}.`, baseRef };
 }
 
+// Story-only edge geometry. A single Bézier spanning thousands of vertical
+// pixels barely leaves the main lane near the merge. Turn into the reserved
+// incoming lane within 24px, then follow it to the actual parent node. This
+// changes neither topology nor lane assignment. Same-column endpoints still
+// get a visible side route, inside the existing graph gutter.
+function branchStoryIncomingPath(from, to, incomingX, laneWidth, graphWidth) {
+  const routeX = incomingX === from.x
+    ? from.x + (from.x + laneWidth / 2 < graphWidth ? 1 : -1) * laneWidth / 2
+    : incomingX;
+  const turn = Math.sign(to.y - from.y) * Math.min(24, Math.abs(to.y - from.y) / 3);
+  return `M${from.x} ${from.y} C${from.x} ${from.y + turn / 2} ${routeX} ${from.y + turn / 2} ${routeX} ${from.y + turn} L${routeX} ${to.y - turn} C${routeX} ${to.y - turn / 2} ${to.x} ${to.y - turn / 2} ${to.x} ${to.y}`;
+}
+
 // Node (the test runner only — see the file banner above) sees `module`;
 // the webview, loading this as a plain <script>, does not, so the two
 // functions above stay ordinary globals there, exactly as if this code was
 // still inline in app.js. No bundler, no import/export syntax, either way.
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { reachableFrom, buildGraphModel, selectRefBadges, selectBranchRows, buildBranchStory, branchStoryStart };
+  module.exports = { reachableFrom, buildGraphModel, selectRefBadges, selectBranchRows, buildBranchStory, branchStoryStart, branchStoryIncomingPath };
 }

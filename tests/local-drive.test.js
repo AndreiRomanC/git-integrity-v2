@@ -31,7 +31,7 @@ function classList() { return { toggle() {} }; }
 function fakeNode() {
   const listeners = {};
   return {
-    listeners, hidden: false, disabled: false, open: false, value: '', textContent: '', innerHTML: '', title: '',
+    listeners, dataset: {}, hidden: false, disabled: false, open: false, value: '', textContent: '', innerHTML: '', title: '',
     classList: { toggle() {}, add() {}, remove() {} },
     addEventListener(type, callback) { listeners[type] = callback; },
     insertAdjacentHTML(_position, html) { this.innerHTML += html; },
@@ -43,6 +43,7 @@ function fakeNode() {
 
 function fakeComparisonDocument() {
   const ids = [
+    'downloadLocalDriveComparison', 'downloadLocalFolderComparison',
     'localDriveCompareDialog', 'localDriveCompareSummary', 'localDriveCompareLeftPath', 'localDriveCompareRightPath',
     'localDriveDiffView', 'localDriveDiffRows', 'localDriveMergeEditors', 'localDriveCompareLeftContent',
     'localDriveCompareRightContent', 'showLocalDriveDiff', 'editLocalDriveDiff', 'copyAllLocalDriveRight',
@@ -142,6 +143,43 @@ test('Local Drive can sync the right pane to the current repository folder witho
   assert.equal(calls.filter(call => call.command === 'list_local_directory').at(-1).args.path, '/repo/src/module');
   assert.equal(dom.panes.right.querySelector('[data-drive-path]').textContent, '/repo/src/module');
   assert.equal(dom.panes.left.querySelector('[data-drive-path]').textContent, '/work');
+});
+
+test('downloads preserve both loaded local texts and encoding without rereading or saving', async () => {
+  const dom = fakeLocalDriveDom(), document = fakeComparisonDocument();
+  const calls = [], exports = [];
+  const workspace = create({ root: dom.root, document, diff: require('../frontend/local-diff.js'),
+    exportSnapshots: async (name, sources) => exports.push({name,sources}),
+    invoke: async (command, args) => {
+      calls.push(command);
+      if (command === 'list_local_directory') return {path:args.path,parent:args.path === '/repo' ? '/work' : '/',entries:[{name:'same.txt',path:`${args.path}/same.txt`,kind:'file'}]};
+      if (command === 'read_local_text_file') return {content:args.path.startsWith('/repo') ? 'right\r\n' : 'left\r\n',encoding:'utf-16le',fingerprint:'loaded'};
+      if (command === 'compare_local_directories') return {left_root:'/work',right_root:'/repo',counts:{},entries:[]};
+      throw Error(command);
+    },
+  });
+  await workspace.activate('/repo');
+  for (const side of ['left','right']) {
+    const row = {dataset:{driveEntry:'0'},classList:classList()}; dom.panes[side].entryButtons=[row];
+    dom.listeners.click({target:{closest:s=>s==='[data-drive-side]'?dom.panes[side]:s==='[data-drive-entry]'?row:null}});
+  }
+  function shortcut(action) { dom.listeners.click({target:{closest:s=>s==='[data-drive-shortcut]'?{dataset:{driveShortcut:action}}:null}}); }
+  shortcut('compare'); await new Promise(r=>setImmediate(r));
+  const before = calls.length;
+  await document.nodes.downloadLocalDriveComparison.listeners.click();
+  assert.equal(calls.length,before);
+  assert.deepEqual(exports[0].sources,[
+    {kind:'text',name:'same.txt',content:'left\r\n',encoding:'utf-16le'},
+    {kind:'text',name:'same.txt',content:'right\r\n',encoding:'utf-16le'},
+  ]);
+  document.nodes.copyAllLocalDriveRight.listeners.click();
+  await document.nodes.downloadLocalDriveComparison.listeners.click();
+  assert.equal(exports[1].sources[1].content,'left\r\n','prepared edits are exported without saving originals');
+  document.nodes.localDriveCompareDialog.close();
+  shortcut('folder-compare'); await new Promise(r=>setImmediate(r));
+  await document.nodes.downloadLocalFolderComparison.listeners.click();
+  assert.deepEqual(exports[2].sources,[{kind:'local',path:'/work'},{kind:'local',path:'/repo'}]);
+  assert.equal(calls.some(command=>command.startsWith('write_')||command.startsWith('copy_')),false);
 });
 
 test('F2 compares the selected file from each pane with two reads and no filesystem mutation', async () => {

@@ -52,6 +52,7 @@ entry_last_commit
 export_github_module_compare_snapshots
 export_github_module_revision_snapshot
 export_submodule_compare_snapshots
+export_snapshots
 fetch_all_remotes
 fetch_project
 fetch_remote

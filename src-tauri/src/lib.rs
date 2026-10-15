@@ -94,6 +94,7 @@ pub fn run() {
             repository::compare_submodule_revisions_file_list,
             repository::compare_submodule_revision_file,
             repository::export_submodule_compare_snapshots,
+            repository::snapshot_export::export_snapshots,
             repository::compare_github_module_revisions_directory,
             repository::compare_github_module_revisions_file_list,
             repository::compare_github_module_revision_file,

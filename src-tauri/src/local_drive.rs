@@ -412,7 +412,7 @@ fn cp1252_byte(character: char) -> Option<u8> {
     })
 }
 
-fn encode_local_text(content: &str, encoding: &str) -> Result<Vec<u8>, String> {
+pub(crate) fn encode_local_text(content: &str, encoding: &str) -> Result<Vec<u8>, String> {
     match encoding {
         "utf-8" => Ok(content.as_bytes().to_vec()),
         "utf-8-bom" => Ok([&[0xef, 0xbb, 0xbf][..], content.as_bytes()].concat()),

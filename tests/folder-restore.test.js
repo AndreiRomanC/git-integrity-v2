@@ -37,6 +37,19 @@ const preview = (source, paths = []) => ({ source_revision: source, source_id: s
   source_subject: 'snapshot', tracked_changes: paths.map(path => ({ status: 'M', path })), clean_candidates: [] });
 const historyPage = (commits, hasMore = false, offset = commits.length, head = 'C1') => ({ commits, has_more: hasMore, next_offset: offset, head_id: head });
 
+test('restore history download exports only its path and commit without selecting or restoring', () => {
+  const h = harness(), downloads = [];
+  h.state.folderRestore.commits = [{id:'C2'}];
+  h.state.folderRestore.selectedCommit = 'C1';
+  h.context.downloadSnapshots = (...args) => downloads.push(args);
+  const button = {dataset:{restoreDownload:'C2'}};
+  h.refs.folderRestoreCommitList.listeners.click({target:{closest:selector=>selector==='[data-restore-download]'?button:null}});
+  assert.equal(h.state.folderRestore.selectedCommit,'C1');
+  assert.equal(downloads.length,1);
+  assert.deepEqual(JSON.parse(JSON.stringify(downloads[0][1])),[{kind:'revision',repository_path:'repo',revision:'C2',relative_path:'folder'}]);
+  assert.equal(h.calls.length,0);
+});
+
 test('restore history comparison selects two exact commits without changing restore source', async () => {
   const h = harness();
   const model = h.state.folderRestore;

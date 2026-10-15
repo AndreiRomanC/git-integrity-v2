@@ -1,7 +1,7 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { buildBranchStory, buildGraphModel } = require('../frontend/graph-model.js');
+const { buildBranchStory, buildGraphModel, branchStoryIncomingPath } = require('../frontend/graph-model.js');
 const c = (id, parents = [], refs = []) => ({ id, parents, refs });
 const ref = (name, kind = 'local_branch') => ({ name, kind });
 const ids = story => story.commits.map(commit => commit.id);
@@ -192,11 +192,56 @@ test('Branch Story SVG marks unloaded parents instead of silently dropping the i
   h.refs.graph.querySelectorAll = () => commits.map((commit,i) => ({offsetTop:i*70,offsetHeight:60,classList:{contains:()=>false}}));
   h.context.palette = ['blue','gold']; h.context.laneX = lane => lane*24+12;
   vm.runInContext(appFunction('drawGraphOverlay'),h.context);
-  h.context.drawGraphOverlay(model,72,{showMissingParents:true});
+  h.context.drawGraphOverlay(model,72,{branchStory:true});
   assert.match(svg.innerHTML, /graph-missing-parent/);
   assert.match(svg.innerHTML, /Parent missing is outside loaded history/);
   h.context.drawGraphOverlay(model,72,{});
   assert.doesNotMatch(svg.innerHTML, /graph-missing-parent/);
+});
+
+test('Story incoming edge leaves the main lane within 24px even for a distant parent', () => {
+  for (const y of [200, 6000, 50000]) {
+    const from = {x:15,y:100}, to = {x:45,y};
+    const path = branchStoryIncomingPath(from,to,45,30,90);
+    assert.ok(path.startsWith('M15 100 C15 112 45 112 45 124 L45 '));
+    assert.ok(path.endsWith(`45 ${y}`), 'Connect to the real parent, not an artificial endpoint');
+    assert.deepEqual(from,{x:15,y:100}); assert.deepEqual(to,{x:45,y});
+  }
+});
+
+test('Story incoming edge handles short, same-column and reversed edges inside the gutter', () => {
+  assert.equal(branchStoryIncomingPath({x:15,y:100},{x:45,y:118},45,30,90),
+    'M15 100 C15 103 45 103 45 106 L45 112 C45 115 45 115 45 118');
+  assert.equal(branchStoryIncomingPath({x:15,y:100},{x:15,y:6000},15,30,90),
+    'M15 100 C15 112 30 112 30 124 L30 5976 C30 5988 15 5988 15 6000');
+  assert.match(branchStoryIncomingPath({x:75,y:100},{x:75,y:6000},75,30,90), /C75 112 60 112 60 124/);
+  assert.equal(branchStoryIncomingPath({x:45,y:118},{x:15,y:100},15,30,90),
+    'M45 118 C45 115 15 115 15 112 L15 106 C15 103 15 103 15 100');
+});
+
+test('Story SVG separates incoming parents, retains every edge and leaves Full Graph rendering unchanged', () => {
+  const h = rendererHarness();
+  const commits = [c('merge',['own','incoming','another']),c('own'),c('incoming'),c('another')];
+  const model = buildGraphModel(commits,'merge');
+  const originalModel = JSON.stringify(model);
+  const svg = {setAttribute(){},innerHTML:''};
+  h.refs.graph.querySelector = () => svg;
+  h.refs.graph.querySelectorAll = () => commits.map((commit,i) => ({offsetTop:[0,70,6000,6500][i],offsetHeight:60,classList:{contains:()=>false}}));
+  h.context.palette = ['blue','gold','green']; h.context.laneX = lane => lane*24+12;
+  vm.runInContext(appFunction('drawGraphOverlay'),h.context);
+  h.context.drawGraphOverlay(model,72,{});
+  const full = svg.innerHTML;
+  assert.match(full,/M12 30 C12 3030 36 3030 36 6030/,'Original Full Graph Bézier');
+  h.context.drawGraphOverlay(model,72,{branchStory:true});
+  assert.match(svg.innerHTML,/M12 30 C12 42 36 42 36 54 L36 6006/);
+  assert.match(svg.innerHTML,/M12 30 C12 42 60 42 60 54 L60 6506/);
+  assert.equal((svg.innerHTML.match(/class="graph-edge graph-incoming-edge"/g)||[]).length,2);
+  assert.match(svg.innerHTML, /x1="12" y1="30" x2="12" y2="100"/, 'First parent unchanged');
+  assert.equal(JSON.stringify(model),originalModel,'Routing cannot alter lanes, nodes or parent IDs');
+  h.context.drawGraphOverlay(model,72,{});
+  assert.equal(svg.innerHTML,full,'Switching back restores exact Full Graph SVG');
+  h.context.drawGraphOverlay(model,72,{branchStory:true,disconnected:true});
+  assert.doesNotMatch(svg.innerHTML,/graph-incoming-edge/,'No edges in disconnected search results');
 });
 
 test('Incoming history pagination cannot append old results after a same-repository refresh', async () => {

@@ -100,7 +100,7 @@ test('evidence reuses the read-only diff dialog with exact parent and repository
     assert.equal(calls[0].args.leftRef,owner ? 'parent-sha' : 'left');
     assert.equal(calls[0].args.rightRef,owner ? 'touch-sha' : 'right');
     assert.equal(calls[0].args.relativePath,owner ? 'exact.c' : 'file.c');
-    assert.deepEqual(rendered,[['before','after']]);
+    assert.deepEqual(rendered,[['before','after',{local_content:'before',remote_content:'after'}]]);
     if (owner?.submodulePath) assert.equal(calls[0].args.submodulePath,'modules/a');
     if (owner?.owner) assert.equal(calls[0].args.owner,'eng');
   }

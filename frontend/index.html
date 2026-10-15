@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Git DrillDown</title>
   <link rel="icon" type="image/png" href="assets/git-drilldown-mark.png">
-  <link rel="stylesheet" href="styles.css?v=20261013-restore-staging-scroll">
+  <link rel="stylesheet" href="styles.css?v=20261015-snapshot-download">
 </head>
 <body>
   <div class="app-shell">
@@ -126,6 +126,7 @@
           <div id="gitComparePanel" class="compare-panel" hidden>
             <div class="commander-toolbar">
               <nav id="commanderBreadcrumbs" class="commander-breadcrumbs"></nav>
+              <button type="button" id="gitCompareDownload" class="snapshot-download" title="Download both complete folder snapshots, not only filtered rows" aria-label="Download both folder snapshots" disabled>⇩</button>
               <div id="gitWorkspaceCompareControls" class="git-compare-controls">
                 <label><span>REMOTE SNAPSHOT</span><select id="remoteRef"></select></label>
               </div>
@@ -369,6 +370,7 @@
       <strong id="compareActionStatus" role="status" class="compare-status-line">Ready — choose one action for this file.</strong>
       <div class="compare-diff-nav" aria-label="Difference navigation">
         <span id="compareDiffStatus">No differences loaded yet.</span>
+        <button type="button" id="compareDownload" class="snapshot-download" title="Download both loaded text versions into left and right folders" aria-label="Download both file versions" disabled>⇩</button>
         <button type="button" id="previousCompareDifference" disabled>↑ Previous difference</button>
         <button type="button" id="nextCompareDifference" disabled>↓ Next difference</button>
       </div>
@@ -406,6 +408,7 @@
           <button type="button" id="editLocalDriveDiff" role="tab">Aligned editor</button>
         </div>
         <div class="local-drive-difference-tools">
+          <button type="button" id="downloadLocalDriveComparison" class="snapshot-download" title="Download both displayed texts, including unsaved prepared edits, without saving to the originals" aria-label="Download both displayed file versions" disabled>⇩</button>
           <button type="button" id="previousLocalDriveDifference" title="Go to the previous important difference">↑ Previous</button>
           <button type="button" id="nextLocalDriveDifference" title="Go to the next important difference">↓ Next</button>
           <label title="Changes ignored by this rule remain visible but are not treated as merge blocks">Rules
@@ -452,6 +455,7 @@
         <button type="button" id="closeLocalFolderMerge" aria-label="Close">×</button>
       </header>
       <div class="local-folder-modebar">
+        <button type="button" id="downloadLocalFolderComparison" class="snapshot-download" title="Download both complete folders as they are on disk now; Git metadata excluded, display filters do not limit export" aria-label="Download both folders" disabled>⇩</button>
         <div class="local-folder-modes" role="tablist" aria-label="Folder operation mode">
           <button type="button" id="localFolderCompareMode" class="active" role="tab">Compare only</button>
           <button type="button" id="localFolderGuidedMode" role="tab">Guided merge</button>
@@ -768,16 +772,16 @@
       <footer><span>Adds a saved message only — no commit.</span><button value="cancel">Cancel</button><button type="button" id="polarionAdd" class="confirm" disabled>Add to Commit List</button></footer>
     </form>
   </dialog>
-  <script src="polarion.js?v=20261013-restore-staging-scroll"></script>
-  <script src="console-context.js?v=20261013-restore-staging-scroll"></script>
-  <script src="graph-model.js?v=20261013-restore-staging-scroll"></script>
-  <script src="submodule-state.js?v=20261013-restore-staging-scroll"></script>
-  <script src="submodule-versions.js?v=20261013-restore-staging-scroll"></script>
-  <script src="local-diff.js?v=20261013-restore-staging-scroll"></script>
-  <script src="local-drive.js?v=20261013-restore-staging-scroll"></script>
-  <script src="pr-status.js?v=20261013-restore-staging-scroll"></script>
-  <script src="refresh-coordinator.js?v=20261013-restore-staging-scroll"></script>
-  <script src="comparison-authors.js?v=20261013-restore-staging-scroll"></script>
-  <script src="app.js?v=20261013-restore-staging-scroll"></script>
+  <script src="polarion.js?v=20261015-snapshot-download"></script>
+  <script src="console-context.js?v=20261015-snapshot-download"></script>
+  <script src="graph-model.js?v=20261015-snapshot-download"></script>
+  <script src="submodule-state.js?v=20261015-snapshot-download"></script>
+  <script src="submodule-versions.js?v=20261015-snapshot-download"></script>
+  <script src="local-diff.js?v=20261015-snapshot-download"></script>
+  <script src="local-drive.js?v=20261015-snapshot-download"></script>
+  <script src="pr-status.js?v=20261015-snapshot-download"></script>
+  <script src="refresh-coordinator.js?v=20261015-snapshot-download"></script>
+  <script src="comparison-authors.js?v=20261015-snapshot-download"></script>
+  <script src="app.js?v=20261015-snapshot-download"></script>
 </body>
 </html>

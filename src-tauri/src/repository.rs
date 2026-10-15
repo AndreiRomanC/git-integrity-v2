@@ -9,6 +9,7 @@ pub mod branch_story;
 pub mod polarion;
 pub mod command_console;
 pub mod remotes;
+pub mod snapshot_export;
 #[cfg(test)]
 use stash::{abort_stash_conflict, drop_stash, list_stashes, list_submodule_stashes, pop_stash, restore_stash_paths, stash_changes, stash_entry_files, stash_file};
 #[cfg(test)]
@@ -958,6 +959,8 @@ pub struct FileComparison {
     remote_ref: String,
     local_content: String,
     remote_content: String,
+    local_exists: bool,
+    remote_exists: bool,
 }
 
 #[derive(Serialize)]
@@ -8326,12 +8329,14 @@ fn compare_git_tree_file(repository_path: &str, relative_path: &str, left_ref: &
     let relative_path = normalized(&relative);
     let left_revision = resolve_commit(repository_path, left_ref)?;
     let right_revision = resolve_commit(repository_path, right_ref)?;
-    let left = tree_file_content(repository_path, &left_revision, &relative_path, true)?.unwrap_or_default();
-    let right = tree_file_content(repository_path, &right_revision, &relative_path, true)?.unwrap_or_default();
+    let left = tree_file_content(repository_path, &left_revision, &relative_path, true)?;
+    let right = tree_file_content(repository_path, &right_revision, &relative_path, true)?;
+    let (local_exists, remote_exists) = (left.is_some(), right.is_some());
+    let (left, right) = (left.unwrap_or_default(), right.unwrap_or_default());
     if left.len() > 1_000_000 || right.len() > 1_000_000 || left.contains(&0) || right.contains(&0) {
         return Err("Binary files and files over 1 MB are not shown in the text compare view".into());
     }
-    Ok(FileComparison { relative_path, remote_ref: right_ref.into(), local_content: String::from_utf8_lossy(&left).into_owned(), remote_content: String::from_utf8_lossy(&right).into_owned() })
+    Ok(FileComparison { relative_path, remote_ref: right_ref.into(), local_content: String::from_utf8_lossy(&left).into_owned(), remote_content: String::from_utf8_lossy(&right).into_owned(), local_exists, remote_exists })
 }
 
 fn changed_paths_against(repository: &str, commit: &str, relative_path: &str) -> HashSet<String> {
@@ -8463,15 +8468,16 @@ pub fn compare_file_contents(repository_path: String, relative_path: String, rem
     let absolute = Path::new(&repository_path).join(&relative);
     // The file may exist only on the remote (not yet fetched locally), so a missing
     // local file is a valid state here, not an error — it just renders as empty/absent.
+    let mut local_exists = true;
     let local = match fs::read(&absolute) {
         Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => { local_exists = false; Vec::new() },
         Err(error) => return Err(format!("Cannot read local file: {error}")),
     };
     if local.len() > 1_000_000 || local.contains(&0) { return Err("Binary files and files over 1 MB are not shown in the text compare view".into()); }
     let commit = resolve_commit(&repository_path, &remote_ref)?; let repo = internal_repository(&repository_path)?; let oid = git2::Oid::from_str(&commit).map_err(|error| error.message().to_string())?; let tree = repo.find_commit(oid).and_then(|commit| commit.tree()).map_err(|error| error.message().to_string())?; let entry = tree.get_path(&relative).map_err(|_| "The file does not exist in the selected remote revision".to_string())?; let remote = repo.find_blob(entry.id()).map_err(|error| error.message().to_string())?.content().to_vec();
     if remote.len() > 1_000_000 || remote.contains(&0) { return Err("Binary files and files over 1 MB are not shown in the text compare view".into()); }
-    Ok(FileComparison { relative_path, remote_ref, local_content: String::from_utf8_lossy(&local).into_owned(), remote_content: String::from_utf8_lossy(&remote).into_owned() })
+    Ok(FileComparison { relative_path, remote_ref, local_content: String::from_utf8_lossy(&local).into_owned(), remote_content: String::from_utf8_lossy(&remote).into_owned(), local_exists, remote_exists: true })
 }
 
 fn compare_index_worktree_file_inner(repository_path: String, relative_path: String) -> Result<FileComparison, String> {
@@ -8483,9 +8489,10 @@ fn compare_index_worktree_file_inner(repository_path: String, relative_path: Str
     let relative = safe_relative_path(&relative_path)?;
     let relative_path = normalized(&relative);
     let absolute = Path::new(&repository_path).join(&relative);
+    let mut local_exists = true;
     let worktree = match fs::read(&absolute) {
         Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => { local_exists = false; Vec::new() },
         Err(error) => return Err(format!("Cannot read working-tree file: {error}")),
     };
     let repo = internal_repository(&repository_path)?;
@@ -8500,6 +8507,8 @@ fn compare_index_worktree_file_inner(repository_path: String, relative_path: Str
     Ok(FileComparison {
         relative_path,
         remote_ref: "index".into(),
+        local_exists,
+        remote_exists: index.get_path(&relative, 0).is_some(),
         local_content: String::from_utf8_lossy(&worktree).into_owned(),
         remote_content: String::from_utf8_lossy(&indexed).into_owned(),
     })
@@ -8510,27 +8519,27 @@ pub async fn compare_index_worktree_file(repository_path: String, relative_path:
     off_main_thread(move || compare_index_worktree_file_inner(repository_path, relative_path)).await
 }
 
-fn head_file_content(repository_path: &str, relative_path: &str) -> Result<Vec<u8>, String> {
+fn head_file_content(repository_path: &str, relative_path: &str) -> Result<Option<Vec<u8>>, String> {
     let revision = match resolve_commit(repository_path, "HEAD") {
         Ok(revision) => revision,
-        Err(_) => return Ok(Vec::new()),
+        Err(_) => return Ok(None),
     };
-    tree_file_content(repository_path, &revision, relative_path, false).map(|content| content.unwrap_or_default())
+    tree_file_content(repository_path, &revision, relative_path, false)
 }
 
-fn index_file_content(repo: &Repository, relative: &Path) -> Result<Vec<u8>, String> {
+fn index_file_content(repo: &Repository, relative: &Path) -> Result<Option<Vec<u8>>, String> {
     let index = repo.index().map_err(|error| error.message().to_string())?;
     match index.get_path(relative, 0) {
-        Some(entry) => repo.find_blob(entry.id).map(|blob| blob.content().to_vec()).map_err(|error| error.message().to_string()),
-        None => Ok(Vec::new()),
+        Some(entry) => repo.find_blob(entry.id).map(|blob| Some(blob.content().to_vec())).map_err(|error| error.message().to_string()),
+        None => Ok(None),
     }
 }
 
-fn worktree_file_content(repository_path: &str, relative: &Path) -> Result<Vec<u8>, String> {
+fn worktree_file_content(repository_path: &str, relative: &Path) -> Result<Option<Vec<u8>>, String> {
     let absolute = Path::new(repository_path).join(relative);
     match fs::read(&absolute) {
-        Ok(bytes) => Ok(bytes),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(format!("Cannot read working-tree file: {error}")),
     }
 }
@@ -8549,12 +8558,17 @@ fn compare_working_area_file_inner(repository_path: String, relative_path: Strin
     } else {
         (index_file_content(&repo, &relative)?, worktree_file_content(&repository_path, &relative)?, "working-tree")
     };
+    // Presence comes from the same reads as the contents: no extra lookup/scan.
+    let (local_exists, remote_exists) = (left.is_some(), right.is_some());
+    let (left, right) = (left.unwrap_or_default(), right.unwrap_or_default());
     if left.len() > 1_000_000 || right.len() > 1_000_000 || left.contains(&0) || right.contains(&0) {
         return Err("Binary files and files over 1 MB are not shown in the text compare view".into());
     }
     Ok(FileComparison {
         relative_path,
         remote_ref: right_label.into(),
+        local_exists,
+        remote_exists,
         local_content: String::from_utf8_lossy(&left).into_owned(),
         remote_content: String::from_utf8_lossy(&right).into_owned(),
     })

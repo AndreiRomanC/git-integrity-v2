@@ -4,6 +4,8 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 const app = fs.readFileSync(require('node:path').join(__dirname, '../frontend/app.js'), 'utf8');
 function load(names, context) {
+  context.$ ||= () => null;
+  if (names.includes('openCommanderDirectory')) names = ['commanderDownloadSnapshot', ...names];
   vm.createContext(context);
   for (const name of names) {
     const code = app.match(new RegExp(`(?:async )?function ${name}\\([^]*?\\n}`))?.[0];
