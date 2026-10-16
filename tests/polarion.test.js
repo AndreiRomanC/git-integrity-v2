@@ -4,7 +4,7 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 const { polarionCommitMessage, polarionSearchExplanation } = require('../frontend/polarion.js');
 const source = fs.readFileSync(require('node:path').join(__dirname, '../src-tauri/src/repository/polarion-search.js'), 'utf8');
-async function portal({ status = 200, origin = 'https://polarion.vitesco.io', contentType = 'application/json', type = 'basic', data = { data: [] }, error = null, token = 'SECRET', kind = 'tasks', fallbackUrl = null, statuses = null, pages = null, query = '', page = 1, portalWindow = {}, resourceId = '', project = 'P', probes = [], url = null, responseHeaders = {}, body = null, clock = null } = {}) {
+async function portal({ status = 200, origin = 'https://polarion.vitesco.io', contentType = 'application/json', type = 'basic', data = { data: [] }, error = null, token = 'SECRET', kind = 'tasks', fallbackUrl = null, readFallback = false, statuses = null, pages = null, query = '', page = 1, portalWindow = {}, resourceId = '', project = 'P', probes = [], url = null, responseHeaders = {}, body = null, clock = null } = {}) {
   let request = null, reply = null;
   const requests = [];
   const location = { origin, set href(value) { reply = JSON.parse(new URL(value).searchParams.get('data')); } };
@@ -17,7 +17,7 @@ async function portal({ status = 200, origin = 'https://polarion.vitesco.io', co
     return { status: code, type, ok: code >= 200 && code < 300, body, headers: { get: key => key === 'content-type' ? contentType : responseHeaders[key] || '' }, json: async () => pages ? pages[requests.length - 1] : data };
   } };
   if (clock) sandbox.Date = class extends Date { static now() { return clock(); } };
-  await vm.runInNewContext(source.replace('__DDT_ARGUMENTS__', JSON.stringify({ url: url || (kind === 'projects' ? 'https://polarion.vitesco.io/polarion/rest/v1/projects?fields[projects]=id,name,trackerPrefix&page[size]=100' : 'https://polarion.vitesco.io/polarion/rest/v1/projects/P/workitems'), fallbackUrl, project, resourceId, kind, query, page, probes, request: '1' })), sandbox);
+  await vm.runInNewContext(source.replace('__DDT_ARGUMENTS__', JSON.stringify({ url: url || (kind === 'projects' ? 'https://polarion.vitesco.io/polarion/rest/v1/projects?fields[projects]=id,name,trackerPrefix&page[size]=100' : 'https://polarion.vitesco.io/polarion/rest/v1/projects/P/workitems'), fallbackUrl, readFallback, project, resourceId, kind, query, page, probes, request: '1' })), sandbox);
   return { request, reply, requests };
 }
 test('fragment rejection falls back once to legacy prefix search, not on authentication or empty results', async () => {
@@ -309,4 +309,26 @@ test('diagnostic alternatives remain independent and budget exhaustion reports c
   assert.ok(budget.requests.length < 6); assert.ok(budget.reply.diagnostics.some(d => d.code === 'not_run' && d.reason === 'budget'));
   const wrongOrigin = await portal({ kind: 'diagnostics', probes, origin: 'https://identity.example' });
   assert.equal(wrongOrigin.requests.length, 0); assert.equal(wrongOrigin.reply.code, 'wrong_origin');
+});
+test('optional LiveDoc metadata rejection falls back once, without pretending a prefix search or inventing fields', async () => {
+  const fallbackUrl = api + '/projects/P/spaces/S/documents/D?fields[documents]=title';
+  const data = { data: { id: 'P/S/D', type: 'documents', attributes: { title: 'Exact LiveDoc' } } };
+  const found = await portal({ kind: 'document', resourceId: 'P/S/D', readFallback: true, fallbackUrl, statuses: [400,200], data });
+  assert.equal(found.requests.length, 2); assert.equal(found.reply.metadata_fallback, true); assert.equal(found.reply.prefix_fallback, false);
+  assert.equal(found.reply.diagnostics[1].step, 'metadata_fallback');
+  assert.equal(found.reply.snapshot.title, 'Exact LiveDoc'); assert.equal(found.reply.snapshot.status, '');
+  assert.match(found.reply.snapshot.fields.compatibilityNote, /title only/);
+  for (const status of [200,401,403,404,405,500]) {
+    const check = await portal({ kind: 'document', resourceId: 'P/S/D', readFallback: true, fallbackUrl, status, data });
+    assert.equal(check.requests.length, 1); assert.equal(check.reply.metadata_fallback, undefined);
+  }
+});
+test('compatible element reads preserve actual work-item relationships and never conceal missing details', async () => {
+  const fallbackUrl = api + '/projects/P/spaces/S/documents/D/parts?fields[document_parts]=id,type,workItem';
+  const { reply } = await portal({ kind: 'elements', resourceId: 'P/S/D', readFallback: true, fallbackUrl, statuses: [400,200], data: {
+    data: [{ id: 'P/S/D/part', type: 'document_parts', attributes: { type: 'workitem' }, relationships: { workItem: { data: { id: 'P/P-1', type: 'workitems' } } } }],
+  } });
+  assert.equal(reply.code, 'ok'); assert.equal(reply.elements.length, 1); assert.equal(reply.elements[0].id, 'P/P-1');
+  assert.equal(reply.incomplete, 1); assert.match(reply.elements[0].fields.details, /not returned/);
+  assert.equal(reply.metadata_fallback, true); assert.equal(reply.prefix_fallback, false);
 });

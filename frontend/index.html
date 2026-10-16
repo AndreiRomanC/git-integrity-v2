@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Git DrillDown</title>
   <link rel="icon" type="image/png" href="assets/git-drilldown-mark.png">
-  <link rel="stylesheet" href="styles.css?v=20261016-polarion-diagnostics">
-  <link rel="stylesheet" href="polarion.css?v=20261016-polarion-diagnostics">
+  <link rel="stylesheet" href="styles.css?v=20261016-polarion-structdoc-link">
+  <link rel="stylesheet" href="polarion.css?v=20261016-polarion-structdoc-link">
 </head>
 <body>
   <div class="app-shell">
@@ -771,57 +771,75 @@
   <dialog id="polarionTaskDialog" class="polarion-task-dialog">
     <form method="dialog">
       <header><div><h2>Polarion workspace</h2><small id="polarionContext"></small></div><button value="cancel" aria-label="Close Polarion search">×</button></header>
-      <div class="polarion-task-body">
+      <div class="polarion-workspace-chrome">
         <div class="polarion-connect-row"><div><strong id="polarionConnection" role="status" data-state="unknown">Connection not checked</strong><small>This Polarion window keeps its own session; Edge sign-in is separate.</small></div><button type="button" id="polarionConnect">Open Polarion ↗</button></div>
         <p id="polarionChosenProject" class="polarion-project-choice"></p>
-        <details class="polarion-diagnostics"><summary>Read access diagnostics</summary>
-          <small>Explicit GET checks only · up to 25 seconds. Logs endpoint templates, timings and error categories, never tokens or task contents. A StructDoc link also checks its exact Document/Page location. On “StructDoc work item”, the current query is tested with alternative syntax.</small>
-          <label for="polarionDiagnosticUrl">StructDoc link (optional)</label>
-          <div class="polarion-search-row"><input id="polarionDiagnosticUrl" inputmode="url" placeholder="https://polarion.vitesco.io/polarion/#/project/…/wiki/…" autocomplete="off"><button type="button" id="polarionDiagnostics">Check read access</button></div>
-          <small>The link's project is used for these checks only; your selected project and saved associations stay unchanged. No automatic sign-in or background probes.</small>
-          <div id="polarionDiagnosticReport" aria-label="Polarion read access checks"></div>
-        </details>
-        <nav class="polarion-workspace-tabs" aria-label="Polarion sections"><button type="button" id="polarionTabProjects">Projects</button><button type="button" id="polarionTabTasks">Tasks</button><button type="button" id="polarionTabDocuments">StructDocs</button></nav>
-        <section id="polarionPanelProjects">
+        <nav class="polarion-workspace-tabs" role="tablist" aria-label="Polarion sections"><button type="button" role="tab" aria-controls="polarionPanelProjects" id="polarionTabProjects">Projects</button><button type="button" role="tab" aria-controls="polarionPanelTasks" id="polarionTabTasks">Tasks</button><button type="button" role="tab" aria-controls="polarionPanelDocuments" id="polarionTabDocuments">StructDocs</button></nav>
+      </div>
+      <div class="polarion-task-body" id="polarionTabBody">
+        <section id="polarionPanelProjects" role="tabpanel" aria-labelledby="polarionTabProjects">
+          <div class="polarion-section-heading"><h3>Choose a project</h3><small>Search the accessible project catalog.</small></div>
           <label for="polarionProjectQuery">Find or change project</label>
           <div class="polarion-search-row"><input id="polarionProjectQuery" placeholder="Any part of name, ID or prefix · e.g. aq4" autocomplete="off"><button type="button" id="polarionProjectSearchButton">Find projects</button><button type="button" id="polarionAllProjects">All projects</button></div>
-          <small>Case-insensitive substring search across every accessible catalog page. Only projects your account can access are listed; portal navigation sections are not projects.</small>
+          <small>Matches any part of the name, ID or prefix, without case sensitivity. Portal navigation sections are not projects.</small>
+          <div id="polarionProjectWorkspace">
+            <div id="polarionResults" class="polarion-results" aria-label="Polarion search results" hidden></div>
+            <div id="polarionPages" class="polarion-pages" hidden><button type="button" id="polarionPrevious" disabled>← Previous</button><button type="button" id="polarionNext" disabled>Next →</button></div>
+            <div id="polarionSelectionActions" class="polarion-selection-actions" hidden><button type="button" id="polarionView" disabled>Read details</button><button type="button" id="polarionPrimaryButton" disabled>Set primary task</button><button type="button" id="polarionAssociate" hidden disabled>Associate StructDoc</button></div>
+            <section id="polarionDetail" class="polarion-detail" hidden aria-label="Polarion item details"></section>
+          </div>
         </section>
-        <section id="polarionPanelTasks" hidden>
+        <section id="polarionPanelTasks" role="tabpanel" aria-labelledby="polarionTabTasks" hidden>
+          <div class="polarion-section-heading"><h3>Tasks &amp; commit references</h3><small>Choose a primary task or add a reference to your commit list.</small></div>
           <div id="polarionPrimary" class="polarion-saved-card"></div>
           <label for="polarionTaskQuery">Find task in the selected project</label>
           <div class="polarion-search-row"><input id="polarionTaskQuery" placeholder="Task ID or title…" autocomplete="off"><button type="button" id="polarionTaskSearchButton">Find tasks</button></div>
           <div class="polarion-assignee"><label><input id="polarionAssigned" type="checkbox"> Assigned to me</label><span id="polarionIdentity"></span><button type="button" id="polarionDetectUser">Detect signed-in user</button><button type="button" id="polarionOtherUser">Other user…</button><input id="polarionUser" aria-label="Polarion assignee user ID" placeholder="Polarion user ID" hidden autocomplete="off"><button type="button" id="polarionUseMe" hidden>Use me</button></div>
-          <small>Remembered on this computer. Other-user filtering does not replace your default identity. Never inferred from Git.</small>
+          <small>Your user ID is remembered on this computer. Filtering another user does not replace it.</small>
+          <div id="polarionTaskWorkspace"></div>
         </section>
-        <section id="polarionPanelDocuments" hidden>
+        <section id="polarionPanelDocuments" role="tabpanel" aria-labelledby="polarionTabDocuments" hidden>
+          <div class="polarion-section-heading"><h3>Structure documents</h3><small>Open a LiveDoc, associate it locally, then read its elements.</small></div>
+          <div class="polarion-open-document">
+            <label for="polarionDiagnosticUrl">Polarion StructDoc link</label>
+            <div class="polarion-search-row"><input id="polarionDiagnosticUrl" inputmode="url" placeholder="https://polarion.vitesco.io/polarion/#/project/…/wiki/…" autocomplete="off"><button type="button" id="polarionOpenDocument" disabled>Open document</button></div>
+            <small id="polarionDocumentHint">Paste a LiveDoc link to open it directly, even when the server does not support catalog search.</small>
+          </div>
           <div id="polarionDocument" class="polarion-saved-card"></div>
-          <label for="polarionDocumentQuery">Find a StructDoc / structure document</label>
-          <div class="polarion-search-row"><select id="polarionDocumentSource" aria-label="StructDoc source"><option value="documents">LiveDoc / Document</option><option value="containers">StructDoc work item</option></select><input id="polarionDocumentQuery" placeholder="Name, space or path · Structure Information" autocomplete="off"><button type="button" id="polarionDocumentSearchButton">Search</button></div>
-          <small>Searches all project spaces, not just one folder. For “30 Development → Architectural Level → Structure Information”, search the actual document name or space. Company-specific StructDocs may instead be work items.</small>
-          <div class="polarion-search-row polarion-element-filters"><input id="polarionElementQuery" placeholder="Filter loaded elements locally…" aria-label="Filter StructDoc elements"><select id="polarionElementType" aria-label="Element type"><option value="">All types</option></select></div>
-          <small id="polarionElementSummary">Associate a document, then read its elements. Actual Polarion types are shown, including architectural, design and solution elements when configured.</small>
-          <div id="polarionElements" class="polarion-elements"></div>
+          <details class="polarion-catalog-search"><summary>Find by name or work item</summary>
+            <label for="polarionDocumentQuery">Optional catalog search</label>
+            <div class="polarion-search-row"><select id="polarionDocumentSource" aria-label="StructDoc source"><option value="documents">LiveDoc / Document</option><option value="containers">StructDoc work item</option></select><input id="polarionDocumentQuery" placeholder="Name, space or path…" autocomplete="off"><button type="button" id="polarionDocumentSearchButton">Search</button></div>
+            <small>Requires catalog access on the server. If unavailable, use the document link above. Custom StructDocs may instead be work items.</small>
+          </details>
+          <div id="polarionDocumentWorkspace"></div>
+          <section id="polarionDocumentElements" class="polarion-document-elements" hidden aria-label="Saved StructDoc elements">
+            <h4>Saved document elements</h4>
+            <div class="polarion-search-row polarion-element-filters"><input id="polarionElementQuery" placeholder="Filter loaded elements locally…" aria-label="Filter StructDoc elements"><select id="polarionElementType" aria-label="Element type"><option value="">All types</option></select></div>
+            <small id="polarionElementSummary">Associate a document, then read its elements.</small>
+            <div id="polarionElements" class="polarion-elements"></div>
+          </section>
+          <details class="polarion-diagnostics"><summary>Troubleshooting · read access</summary>
+            <small id="polarionDiagnosticSummary">Optional, explicit GET checks. Results stay in this tab and the log.</small>
+            <div class="polarion-diagnostic-actions"><button type="button" id="polarionDiagnostics">Check read access</button><small>Uses the link above · up to 25 seconds · no automatic sign-in</small></div>
+            <small>The link's project scopes these checks only. Saved associations stay unchanged. For work-item search, the current query is tested with alternative syntax. A 404 alone does not prove a permission problem.</small>
+            <div id="polarionDiagnosticReport" aria-label="Polarion read access checks"></div>
+          </details>
         </section>
-        <div id="polarionResults" class="polarion-results" aria-label="Polarion search results"></div>
-        <div id="polarionPages" class="polarion-pages" hidden><button type="button" id="polarionPrevious" disabled>← Previous</button><button type="button" id="polarionNext" disabled>Next →</button></div>
-        <div class="polarion-selection-actions"><button type="button" id="polarionView" disabled>Read details</button><button type="button" id="polarionPrimaryButton" disabled>Set primary task</button><button type="button" id="polarionAssociate" hidden disabled>Associate StructDoc</button></div>
-        <section id="polarionDetail" class="polarion-detail" hidden aria-label="Polarion item details"></section>
-        <p id="polarionStatus" role="status" aria-live="polite"></p>
       </div>
-      <footer><span>Read-only on Polarion. Snapshots stay outside Git. No automatic commit.</span><button value="cancel">Close</button><button type="button" id="polarionAdd" class="confirm" disabled>Add to Commit List</button></footer>
+      <div class="polarion-status-area"><p id="polarionStatus" role="status" aria-live="polite"></p></div>
+      <footer><span>Read-only on Polarion · local snapshots outside Git</span><button value="cancel">Close</button><button type="button" id="polarionAdd" class="confirm" disabled>Add to Commit List</button></footer>
     </form>
   </dialog>
-  <script src="polarion.js?v=20261016-polarion-diagnostics"></script>
-  <script src="console-context.js?v=20261016-polarion-diagnostics"></script>
-  <script src="graph-model.js?v=20261016-polarion-diagnostics"></script>
-  <script src="submodule-state.js?v=20261016-polarion-diagnostics"></script>
-  <script src="submodule-versions.js?v=20261016-polarion-diagnostics"></script>
-  <script src="local-diff.js?v=20261016-polarion-diagnostics"></script>
-  <script src="local-drive.js?v=20261016-polarion-diagnostics"></script>
-  <script src="pr-status.js?v=20261016-polarion-diagnostics"></script>
-  <script src="refresh-coordinator.js?v=20261016-polarion-diagnostics"></script>
-  <script src="comparison-authors.js?v=20261016-polarion-diagnostics"></script>
-  <script src="app.js?v=20261016-polarion-diagnostics"></script>
+  <script src="polarion.js?v=20261016-polarion-structdoc-link"></script>
+  <script src="console-context.js?v=20261016-polarion-structdoc-link"></script>
+  <script src="graph-model.js?v=20261016-polarion-structdoc-link"></script>
+  <script src="submodule-state.js?v=20261016-polarion-structdoc-link"></script>
+  <script src="submodule-versions.js?v=20261016-polarion-structdoc-link"></script>
+  <script src="local-diff.js?v=20261016-polarion-structdoc-link"></script>
+  <script src="local-drive.js?v=20261016-polarion-structdoc-link"></script>
+  <script src="pr-status.js?v=20261016-polarion-structdoc-link"></script>
+  <script src="refresh-coordinator.js?v=20261016-polarion-structdoc-link"></script>
+  <script src="comparison-authors.js?v=20261016-polarion-structdoc-link"></script>
+  <script src="app.js?v=20261016-polarion-structdoc-link"></script>
 </body>
 </html>

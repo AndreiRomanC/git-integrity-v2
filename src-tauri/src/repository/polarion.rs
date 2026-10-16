@@ -70,6 +70,7 @@ pub struct SearchResult {
     #[serde(default)] more: bool,
     #[serde(default)] received: usize,
     #[serde(default)] prefix_fallback: bool,
+    #[serde(default)] metadata_fallback: bool,
     #[serde(default)] catalog_cached: bool,
     #[serde(default)] catalog_pages: usize,
     #[serde(default)] matched: usize,
@@ -176,6 +177,32 @@ fn read_url(kind: &str, id: &str, page: usize) -> Result<String, String> {
         _ => {},
     }
     Ok(url.to_string())
+}
+
+fn read_args(kind: &str, resource: &str, page: usize, revision: Option<&str>) -> Result<serde_json::Value, String> {
+    let from_link = kind == "document_link";
+    let resource = if from_link { diagnostic_resource(resource)?.ok_or("Paste a StructDoc link first")? } else { resource.to_string() };
+    let kind = if from_link { "document" } else { kind };
+    let mut url = reqwest::Url::parse(&read_url(kind, &resource, page)?).map_err(|_| "Invalid Polarion URL")?;
+    if let Some(revision) = revision.filter(|r| !r.is_empty()) {
+        if revision.len() > 120 || !revision.bytes().all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c)) { return Err("Invalid Polarion revision".into()); }
+        url.query_pairs_mut().append_pair("revision", revision);
+    }
+    let fallback = if kind == "document" || kind == "elements" {
+        let mut fallback = url.clone();
+        let pairs: Vec<_> = fallback.query_pairs().map(|(key, value)| {
+            let value = match key.as_ref() {
+                "fields[documents]" => "title".to_string(),
+                "fields[document_parts]" => "id,type,workItem".to_string(),
+                _ => value.into_owned(),
+            };
+            (key.into_owned(), value)
+        }).collect();
+        fallback.query_pairs_mut().clear().extend_pairs(pairs);
+        Some(fallback.to_string())
+    } else { None };
+    Ok(serde_json::json!({ "url":url.to_string(), "fallbackUrl":fallback, "readFallback":fallback.is_some(), "kind":kind,
+        "resourceId":resource, "project":resource.split('/').next().unwrap_or(""), "page":page, "fromLink":from_link }))
 }
 
 fn valid_snapshot(snapshot: &Snapshot) -> bool {
@@ -464,7 +491,7 @@ fn diagnostic_endpoint(route: &str) -> Option<&'static str> {
 }
 
 fn valid_diagnostic(d: &HttpDiagnostic) -> bool {
-    ["primary", "prefix_fallback", "catalog_page", "metadata", "current_user", "project_access", "tasks_baseline", "documents_catalog", "spaces", "document_exact", "page_exact", "space_documents", "space_pages", "document_parts", "query_current", "query_prefix", "query_without_id_star"].contains(&d.step.as_str())
+    ["primary", "prefix_fallback", "metadata_fallback", "catalog_page", "metadata", "current_user", "project_access", "tasks_baseline", "documents_catalog", "spaces", "document_exact", "page_exact", "space_documents", "space_pages", "document_parts", "query_current", "query_prefix", "query_without_id_star"].contains(&d.step.as_str())
         && diagnostic_endpoint(&d.route).is_some() && d.duration_ms <= 600_000 && d.http <= 599 && d.page <= 1000 && d.count <= 100_000
         && ["ok", "auth_required", "forbidden", "api_unavailable", "query_rejected", "http_error", "not_json", "network_error", "timeout", "invalid_response", "not_run"].contains(&d.code.as_str())
         && ["", "leading_wildcard", "unknown_field", "query_syntax", "unsupported_parameter", "permission_denied", "authentication_required", "not_found", "unclassified", "error_body_limit", "partial_errors", "unexpected_resource", "prerequisite_missing", "budget"].contains(&d.reason.as_str())
@@ -605,6 +632,31 @@ mod tests {
         assert!(search_url("containers", "P", "ab", "", 1).is_err());
         assert!(search_url("documents", "P", "30 Development/Structure", "", 1).is_ok());
     }
+    #[test]
+    fn opening_a_document_link_reuses_exact_reads_without_catalogs_or_probes() {
+        let link = "https://polarion.vitesco.io/polarion/#/project/VWAQ4/wiki/Structure%20Information/VWAQ4-SW_ERRM_StructDoc_2_0_0";
+        let args = read_args("document_link", link, 1, None).unwrap();
+        assert_eq!(args["kind"], "document"); assert_eq!(args["project"], "VWAQ4"); assert_eq!(args["fromLink"], true);
+        assert_eq!(args["resourceId"], "VWAQ4/Structure Information/VWAQ4-SW_ERRM_StructDoc_2_0_0");
+        assert!(args["url"].as_str().unwrap().contains("/spaces/Structure%20Information/documents/VWAQ4-SW_ERRM_StructDoc_2_0_0?"));
+        assert!(args.get("probes").is_none()); assert!(args.get("query").is_none());
+        assert_eq!(pairs(args["fallbackUrl"].as_str().unwrap())["fields[documents]"], "title");
+        assert!(read_args("document_link", "https://evil.test/polarion/#/project/P/wiki/S/D", 1, None).is_err());
+        assert!(read_args("document_link", "", 1, None).is_err());
+    }
+    #[test]
+    fn document_compatibility_fallback_preserves_scope_revision_and_relationships() {
+        let args = read_args("elements", "P/S/D", 2, Some("12345")).unwrap();
+        assert_eq!(args["resourceId"], "P/S/D"); assert_eq!(args["page"], 2);
+        let original = pairs(args["url"].as_str().unwrap());
+        let fallback = pairs(args["fallbackUrl"].as_str().unwrap());
+        for key in ["revision", "include", "page[size]", "page[number]", "fields[workitems]"] { assert_eq!(original[key], fallback[key], "{key}"); }
+        assert_eq!(fallback["fields[document_parts]"], "id,type,workItem");
+        assert_eq!(fallback["revision"], "12345");
+        assert_eq!(read_args("workitem", "P/P-1", 1, None).unwrap()["fallbackUrl"], serde_json::Value::Null);
+        assert_eq!(read_args("user", "", 1, None).unwrap()["fallbackUrl"], serde_json::Value::Null);
+        assert!(read_args("elements", "P/S/D", 1, Some("123&token=secret")).is_err());
+    }
     fn sample_snapshot(id: &str, kind: &str, item_type: &str) -> Snapshot {
         Snapshot { id: id.into(), title: "Saved title".into(), kind: kind.into(), item_type: item_type.into(), fetched_at: "2026-10-16T12:00:00Z".into(), ..Snapshot::default() }
     }
@@ -685,14 +737,7 @@ pub async fn polarion_diagnostics(app: tauri::AppHandle, project: String, resour
 
 #[tauri::command]
 pub async fn polarion_read(app: tauri::AppHandle, kind: String, resource_id: String, page: usize, revision: Option<String>) -> Result<SearchResult, String> {
-    let mut url = read_url(&kind, &resource_id, page)?;
-    if let Some(revision) = revision.filter(|r| !r.is_empty()) {
-        if revision.len() > 120 || !revision.bytes().all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c)) { return Err("Invalid Polarion revision".into()); }
-        let mut parsed = reqwest::Url::parse(&url).map_err(|_| "Invalid Polarion URL")?;
-        parsed.query_pairs_mut().append_pair("revision", &revision);
-        url = parsed.to_string();
-    }
-    portal_request(app, serde_json::json!({"url":url,"kind":kind,"resourceId":resource_id,"page":page})).await
+    portal_request(app, read_args(&kind, &resource_id, page, revision.as_deref())?).await
 }
 
 async fn portal_request(app: tauri::AppHandle, mut args: serde_json::Value) -> Result<SearchResult, String> {
@@ -718,7 +763,7 @@ async fn portal_request(app: tauri::AppHandle, mut args: serde_json::Value) -> R
         let script = include_str!("polarion-search.js").replace("__DDT_ARGUMENTS__", &args.to_string());
         let contains_terms = query.split_whitespace().filter(|word| word.chars().count() >= 3).count();
         let matching = match kind { "projects" | "documents" => "catalog_case_insensitive_contains", "tasks" | "containers" => "contains_3plus", "diagnostics" => "explicit_read_checks", _ => "exact_resource" };
-        perf_log(&format!("polarion: search_start request={id} kind={kind} page={page} project={} resource_present={} probes={} query_len={} assigned_filter={} match={matching} contains_terms={contains_terms}", args["project"].as_str().filter(|p| identifier(p)).unwrap_or("none"), args["resourceId"].as_str().is_some(), args["probes"].as_array().map_or(0, |p| p.len()), query.len(), args["assigned"].as_bool().unwrap_or(false)), Duration::ZERO);
+        perf_log(&format!("polarion: search_start request={id} kind={kind} page={page} project={} resource_present={} from_link={} probes={} query_len={} assigned_filter={} match={matching} contains_terms={contains_terms}", args["project"].as_str().filter(|p| identifier(p)).unwrap_or("none"), args["resourceId"].as_str().is_some(), args["fromLink"].as_bool().unwrap_or(false), args["probes"].as_array().map_or(0, |p| p.len()), query.len(), args["assigned"].as_bool().unwrap_or(false)), Duration::ZERO);
         let mut bridge_code = "eval_failed";
         let result = if window.eval(script).is_err() { Err("Polarion browser could not start the search".into()) }
             else {
@@ -733,7 +778,7 @@ async fn portal_request(app: tauri::AppHandle, mut args: serde_json::Value) -> R
             };
         if let Ok(mut slot) = pending().lock() { if slot.as_ref().is_some_and(|(key, _)| key == &id) { *slot = None; } }
         let detail = match &result {
-            Ok(data) => format!("code={} http={} session_token={} received={} matched={} results={} more={} prefix_fallback={} catalog_cached={} catalog_pages={} identity_detected={} snapshot={} elements={} incomplete={} http_requests={} diagnostics_omitted={}", data.code, data.http, data.session_token, data.received, data.matched, data.items.len(), data.more, data.prefix_fallback, data.catalog_cached, data.catalog_pages, !data.user_id.is_empty(), data.snapshot.is_some(), data.elements.len(), data.incomplete, data.http_requests, data.diagnostics_omitted),
+            Ok(data) => format!("code={} http={} session_token={} received={} matched={} results={} more={} prefix_fallback={} metadata_fallback={} catalog_cached={} catalog_pages={} identity_detected={} snapshot={} elements={} incomplete={} http_requests={} diagnostics_omitted={}", data.code, data.http, data.session_token, data.received, data.matched, data.items.len(), data.more, data.prefix_fallback, data.metadata_fallback, data.catalog_cached, data.catalog_pages, !data.user_id.is_empty(), data.snapshot.is_some(), data.elements.len(), data.incomplete, data.http_requests, data.diagnostics_omitted),
             Err(_) => format!("code={bridge_code}"),
         };
         perf_log(&format!("polarion: search_end request={id} kind={kind} page={page} {detail}"), started.elapsed());

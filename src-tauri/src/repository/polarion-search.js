@@ -2,7 +2,7 @@
 // Only bounded allowlisted data leaves it; never credentials or raw HTML.
 (async () => {
   const args = __DDT_ARGUMENTS__;
-  let session_token = false, prefix_fallback = false;
+  let session_token = false, prefix_fallback = false, metadata_fallback = false;
   let http_requests = 0, diagnostics_omitted = 0;
   const diagnostics = [];
   let server_metadata;
@@ -14,7 +14,8 @@
   const reply = data => {
     const target = new URL('https://polarion.vitesco.io/polarion/__ddt_search_result');
     target.searchParams.set('request', args.request);
-    const serialize = () => JSON.stringify({ session_token, prefix_fallback, diagnostics, diagnostics_omitted, http_requests, server_metadata, ...data });
+    const compatibility = () => metadata_fallback ? { metadata_fallback: true } : {};
+    const serialize = () => JSON.stringify({ session_token, prefix_fallback, ...compatibility(), diagnostics, diagnostics_omitted, http_requests, server_metadata, ...data });
     const oversized = value => value.length > 20000 && encodeURIComponent(value).replace(/%[0-9A-F]{2}/g, 'x').length > 60000;
     let payload = serialize();
     // Stay below the native bridge's UTF-8 limit. Return a useful error
@@ -30,7 +31,7 @@
     if (oversized(payload)) {
       // At the exact old size boundary even the diagnostic counters may not
       // fit. Preserve the legacy reply instead of breaking a successful read.
-      const legacy = JSON.stringify({ session_token, prefix_fallback, ...data });
+      const legacy = JSON.stringify({ session_token, prefix_fallback, ...compatibility(), ...data });
       payload = !oversized(legacy) ? legacy : JSON.stringify({ code: 'response_limit', session_token, diagnostics, diagnostics_omitted, http_requests });
     }
     target.searchParams.set('data', payload);
@@ -97,6 +98,7 @@
       if (a[key] != null) fields[key] = enumValue(a[key]);
     }
     if (item.revision) fields.revision = text(item.revision, 120);
+    if (metadata_fallback && kind === 'document') fields.compatibilityNote = 'This server rejected optional metadata fields. The document was read with title only; unavailable fields are not inferred.';
     const assignee = item.relationships?.assignee;
     if (assignee?.meta?.totalCount > (assignee?.data?.length || 0)) fields.assigneeNote = 'The server returned only part of the assignee list.';
     const raw = summary ? '' : text(a.description?.value ?? a.description ?? '', 12000);
@@ -216,7 +218,8 @@
     try { data = await request(args.url); }
     catch (error) {
       if (error.http !== 400 || !args.fallbackUrl || args.fallbackUrl === args.url) throw error;
-      prefix_fallback = true; data = await request(args.fallbackUrl, 'prefix_fallback');
+      if (args.readFallback) { metadata_fallback = true; data = await request(args.fallbackUrl, 'metadata_fallback'); }
+      else { prefix_fallback = true; data = await request(args.fallbackUrl, 'prefix_fallback'); }
     }
     if (args.kind === 'user') {
       if (data.data?.type !== 'users' || typeof data.data.id !== 'string' || !/^[\w.@-]{1,120}$/.test(data.data.id) || hasErrors(data.data)) throw { code: 'invalid_response' };

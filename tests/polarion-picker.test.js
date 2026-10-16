@@ -9,8 +9,13 @@ function harness() {
     constructor() { this.handlers = {}; this.dataset = {}; this.children = []; this.value = ''; this.checked = false; this.textContent = ''; }
     addEventListener(event, fn) { this.handlers[event] = fn; }
     setAttribute() {}
-    append(...children) { this.children.push(...children); }
-    replaceChildren() { this.children = []; }
+    append(...children) {
+      for (const child of children) {
+        if (child.parent) child.parent.children = child.parent.children.filter(c => c !== child);
+        child.parent = this; this.children.push(child);
+      }
+    }
+    replaceChildren() { for (const child of this.children) child.parent = null; this.children = []; }
     focus() {}
     showModal() { this.open = true; }
     close() { this.open = false; this.handlers.close?.(); }
@@ -167,7 +172,9 @@ test('saved StructDoc elements are not rendered during ordinary task searches', 
 });
 
 test('diagnostics are explicit, preserve associations and never replace normal search results or commit messages', async () => {
-  const h = harness(); await selectedTask(h);
+  const h = harness(); await inProject(h); h.el('TabDocuments').handlers.click();
+  h.search(async () => ({ code: 'ok', items: [{ id: 'P/S/D', title: 'Document', item_type: 'structureDocument' }] }));
+  await h.el('DocumentSearchButton').handlers.click(); h.el('Results').children[0].handlers.click();
   const before = h.calls.length, selected = h.el('Results').children[0];
   h.el('DiagnosticUrl').value = 'https://polarion.vitesco.io/polarion/#/project/P/wiki/S/D';
   h.overrides.polarion_diagnostics = async () => ({ code: 'ok', server_metadata: { version: '3.25.12' }, diagnostics: [
@@ -177,7 +184,9 @@ test('diagnostics are explicit, preserve associations and never replace normal s
   assert.equal(h.calls.length, before + 1); assert.equal(h.calls.at(-1).name, 'polarion_diagnostics');
   assert.equal(h.calls.at(-1).args.project, 'P'); assert.equal(h.calls.at(-1).args.query, '');
   assert.equal(h.el('Results').children[0], selected); assert.equal(h.messages.length, 0);
-  assert.match(h.el('Status').textContent, /1\/2 accepted/); assert.match(h.el('Status').textContent, /404 alone does not prove/);
+  assert.match(h.el('Status').textContent, /1\/2 accepted/);
+  const html = fs.readFileSync(path.join(__dirname, '../frontend/index.html'), 'utf8');
+  assert.match(html, /404 alone does not prove/);
   assert.equal(h.el('Diagnostics').disabled, false);
 });
 test('work-item diagnostics test the current fragment only in that mode', async () => {
@@ -190,11 +199,102 @@ test('work-item diagnostics test the current fragment only in that mode', async 
   assert.equal(h.calls.at(-1).args.query, '');
 });
 test('late diagnostic replies cannot change a reopened dialog and do not trigger sign-in automatically', async () => {
-  const h = harness(); await inProject(h);
+  const h = harness(); await inProject(h); h.el('TabDocuments').handlers.click();
   let finish; h.overrides.polarion_diagnostics = () => new Promise(r => { finish = r; });
   const pending = h.el('Diagnostics').handlers.click();
   h.dialog.close(); await h.picker.open('/another');
   finish({ code: 'ok', diagnostics: [{ step: 'current_user', code: 'auth_required', http: 401 }] }); await pending;
   assert.equal(h.el('Connection').dataset.state, 'unknown'); assert.equal(h.el('DiagnosticReport').children.length, 0);
   assert.equal(h.calls.filter(c => c.name === 'polarion_connect').length, 0);
+});
+
+const docLink = 'https://polarion.vitesco.io/polarion/#/project/P/wiki/Structure%20Information/Structure_2_0';
+const docSnapshot = () => ({ ...task('P/Structure Information/Structure_2_0'), kind: 'document', item_type: 'structureDocument' });
+test('opening a LiveDoc link bypasses catalogs without automatically saving or reading its elements', async () => {
+  const h = harness(); await inProject(h); h.el('TabDocuments').handlers.click();
+  h.overrides.polarion_read = async args => {
+    assert.equal(args.kind, 'document_link'); assert.equal(args.resourceId, docLink);
+    return { code: 'ok', snapshot: docSnapshot() };
+  };
+  const before = h.calls.length;
+  h.el('DiagnosticUrl').value = docLink; h.el('DiagnosticUrl').handlers.input();
+  assert.equal(h.el('OpenDocument').disabled, false);
+  await h.el('OpenDocument').handlers.click();
+  assert.equal(h.calls.length, before + 1); assert.equal(h.calls.at(-1).name, 'polarion_read');
+  assert.equal(h.el('Detail').hidden, false); assert.equal(h.el('Associate').disabled, false);
+  assert.equal(h.el('Results').hidden, true); assert.equal(h.el('DocumentElements').hidden, true);
+  assert.match(h.el('Status').textContent, /Document opened/); assert.match(h.el('DocumentHint').textContent, /Catalog access is not required/);
+  assert.equal(h.el('Detail').parent, h.el('DocumentWorkspace')); assert.equal(h.messages.length, 0);
+});
+test('a link can be opened without selecting or silently changing a project', async () => {
+  const h = harness(); await h.picker.open('/repo'); h.el('TabDocuments').handlers.click();
+  h.overrides.polarion_read = async () => ({ code: 'ok', snapshot: docSnapshot() });
+  h.el('DiagnosticUrl').value = docLink; await h.el('OpenDocument').handlers.click();
+  assert.equal(h.calls.filter(c => c.name === 'polarion_project_context').length, 1);
+  assert.match(h.el('ChosenProject').textContent, /No project selected/);
+  assert.equal(h.el('Detail').hidden, false); assert.equal(h.el('Associate').disabled, false);
+});
+test('link association uses the existing local workspace and paginated element reader', async () => {
+  const h = harness(); await inProject(h); h.el('TabDocuments').handlers.click();
+  h.overrides.polarion_read = async args => args.kind === 'elements'
+    ? { code: 'ok', received: 1, page_key: 'part' + args.page, more: args.page < 2, elements: [task('P/P-' + args.page, args.page === 1 ? 'architecturalElement' : 'solutionElement')] }
+    : { code: 'ok', snapshot: docSnapshot() };
+  h.el('DiagnosticUrl').value = docLink; await h.el('OpenDocument').handlers.click();
+  await h.el('Associate').handlers.click();
+  assert.equal(h.calls.filter(c => c.args?.action === 'document').length, 1);
+  await cardButton(h, 'Document', 'Read all elements').handlers.click();
+  assert.equal(h.el('Elements').children.length, 2); assert.equal(h.el('DocumentElements').hidden, false);
+  assert.equal(h.calls.filter(c => c.name === 'polarion_search').length, 0);
+  assert.ok(h.calls.filter(c => c.args?.kind === 'elements').every(c => c.args.revision === '42'));
+});
+test('unavailable catalog guides users to the link without triggering retries or claiming authentication failed', async () => {
+  const h = harness(); await inProject(h); h.el('TabDocuments').handlers.click();
+  h.el('DocumentSource').value = 'documents'; h.el('DocumentQuery').value = 'errm';
+  h.search(async () => ({ code: 'api_unavailable', http: 404, session_token: true }));
+  await h.el('DocumentSearchButton').handlers.click();
+  assert.equal(h.calls.filter(c => c.name === 'polarion_search').length, 1);
+  assert.equal(h.el('Connection').dataset.state, 'unknown');
+  assert.match(h.el('Status').textContent, /Open document by link/);
+  assert.equal(h.el('Results').hidden, true); assert.equal(h.calls.filter(c => c.name === 'polarion_connect').length, 0);
+});
+test('StructDoc content and messages remain in that tab while shared inspection components follow the active tab', async () => {
+  const h = harness(); await inProject(h); h.el('TabDocuments').handlers.click();
+  h.overrides.polarion_read = async () => ({ code: 'ok', snapshot: docSnapshot() });
+  h.el('DiagnosticUrl').value = docLink; await h.el('OpenDocument').handlers.click();
+  h.el('TabBody').scrollTop = 500; h.el('TabTasks').handlers.click();
+  assert.equal(h.el('PanelDocuments').hidden, true); assert.equal(h.el('TabBody').scrollTop, 0);
+  assert.equal(h.el('Detail').hidden, true); assert.equal(h.el('Detail').parent, h.el('TaskWorkspace'));
+  assert.ok(!h.el('DocumentWorkspace').children.includes(h.el('Detail')));
+  assert.doesNotMatch(h.el('Status').textContent, /Document opened/);
+  assert.equal(h.el('SelectionActions').hidden, true); assert.equal(h.el('Associate').hidden, true);
+  h.el('TabDocuments').handlers.click();
+  assert.equal(h.el('PanelDocuments').hidden, false); assert.equal(h.el('DiagnosticUrl').value, docLink);
+  assert.equal(h.el('Detail').parent, h.el('DocumentWorkspace'));
+});
+test('a late or failed link read cannot replace a saved association or reopen stale details', async () => {
+  const h = harness(); h.setWorkspace({ document: { ...docSnapshot(), id: 'P/S/Original' } }); await inProject(h); h.el('TabDocuments').handlers.click();
+  h.el('DiagnosticUrl').value = docLink;
+  h.overrides.polarion_read = async () => ({ code: 'forbidden', http: 403 });
+  await h.el('OpenDocument').handlers.click();
+  assert.match(h.el('Document').children[0].children[1].textContent, /P\/S\/Original/);
+  assert.equal(h.calls.filter(c => c.args?.action === 'document').length, 0);
+  let finish; h.overrides.polarion_read = () => new Promise(r => { finish = r; });
+  const pending = h.el('OpenDocument').handlers.click(); h.dialog.close(); await h.picker.open('/other');
+  finish({ code: 'ok', snapshot: docSnapshot() }); await pending;
+  assert.equal(h.el('Detail').hidden, true); assert.equal(h.el('DiagnosticUrl').value, '');
+});
+test('Polarion layout has one stable viewport and keeps all StructDoc-specific controls inside its tab', () => {
+  const html = fs.readFileSync(path.join(__dirname, '../frontend/index.html'), 'utf8');
+  const css = fs.readFileSync(path.join(__dirname, '../frontend/polarion.css'), 'utf8');
+  const start = html.indexOf('<section id="polarionPanelDocuments"');
+  const end = html.indexOf('<div class="polarion-status-area">', start);
+  const doc = html.slice(start, end);
+  for (const id of ['polarionDiagnosticUrl', 'polarionOpenDocument', 'polarionDocumentSource', 'polarionDocumentElements', 'polarionDiagnostics', 'polarionDiagnosticReport']) {
+    assert.ok(doc.includes('id="' + id + '"'), id);
+    assert.equal(html.split('id="' + id + '"').length - 1, 1, id + ' is unique');
+  }
+  assert.match(css, /height: min\(780px, 90vh\)/);
+  assert.match(css, /\.polarion-task-dialog > form \{ height: 100%/);
+  assert.match(css, /\.polarion-task-dialog \[hidden\] \{ display: none !important/);
+  assert.match(css, /scrollbar-gutter: stable/);
 });
