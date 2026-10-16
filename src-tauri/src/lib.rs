@@ -22,6 +22,7 @@ pub fn run() {
             repository::polarion::polarion_search,
             repository::polarion::polarion_project_context,
             repository::polarion::polarion_read,
+            repository::polarion::polarion_diagnostics,
             repository::polarion::polarion_workspace,
             repository::build_info,
             notes::load_drill_down_notes,

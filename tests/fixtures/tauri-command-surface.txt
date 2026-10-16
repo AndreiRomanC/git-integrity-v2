@@ -140,6 +140,7 @@ unstage_files
 write_local_text_file
 write_text_file
 polarion_connect
+polarion_diagnostics
 polarion_search
 polarion_project_context
 polarion_read

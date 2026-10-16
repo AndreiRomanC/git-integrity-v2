@@ -165,3 +165,36 @@ test('saved StructDoc elements are not rendered during ordinary task searches', 
   h.el('TabDocuments').handlers.click(); assert.equal(h.el('Elements').children.length, 1);
   h.el('TabTasks').handlers.click(); assert.equal(h.el('Elements').children.length, 0);
 });
+
+test('diagnostics are explicit, preserve associations and never replace normal search results or commit messages', async () => {
+  const h = harness(); await selectedTask(h);
+  const before = h.calls.length, selected = h.el('Results').children[0];
+  h.el('DiagnosticUrl').value = 'https://polarion.vitesco.io/polarion/#/project/P/wiki/S/D';
+  h.overrides.polarion_diagnostics = async () => ({ code: 'ok', server_metadata: { version: '3.25.12' }, diagnostics: [
+    { step: 'tasks_baseline', code: 'ok', http: 200, duration_ms: 50 }, { step: 'document_exact', code: 'api_unavailable', http: 404, reason: 'not_found' },
+  ] });
+  await h.el('Diagnostics').handlers.click();
+  assert.equal(h.calls.length, before + 1); assert.equal(h.calls.at(-1).name, 'polarion_diagnostics');
+  assert.equal(h.calls.at(-1).args.project, 'P'); assert.equal(h.calls.at(-1).args.query, '');
+  assert.equal(h.el('Results').children[0], selected); assert.equal(h.messages.length, 0);
+  assert.match(h.el('Status').textContent, /1\/2 accepted/); assert.match(h.el('Status').textContent, /404 alone does not prove/);
+  assert.equal(h.el('Diagnostics').disabled, false);
+});
+test('work-item diagnostics test the current fragment only in that mode', async () => {
+  const h = harness(); await inProject(h);
+  h.overrides.polarion_diagnostics = async () => ({ code: 'ok', diagnostics: [] });
+  h.el('TabDocuments').handlers.click(); h.el('DocumentSource').value = 'containers'; h.el('DocumentQuery').value = 'errm';
+  await h.el('Diagnostics').handlers.click();
+  assert.equal(h.calls.at(-1).args.query, 'errm');
+  h.el('DocumentSource').value = 'documents'; await h.el('Diagnostics').handlers.click();
+  assert.equal(h.calls.at(-1).args.query, '');
+});
+test('late diagnostic replies cannot change a reopened dialog and do not trigger sign-in automatically', async () => {
+  const h = harness(); await inProject(h);
+  let finish; h.overrides.polarion_diagnostics = () => new Promise(r => { finish = r; });
+  const pending = h.el('Diagnostics').handlers.click();
+  h.dialog.close(); await h.picker.open('/another');
+  finish({ code: 'ok', diagnostics: [{ step: 'current_user', code: 'auth_required', http: 401 }] }); await pending;
+  assert.equal(h.el('Connection').dataset.state, 'unknown'); assert.equal(h.el('DiagnosticReport').children.length, 0);
+  assert.equal(h.calls.filter(c => c.name === 'polarion_connect').length, 0);
+});

@@ -55,7 +55,8 @@ function createPolarionTaskPicker({ invoke, addMessage }) {
       el('Tab' + name).setAttribute('aria-selected', String(mode === section));
       el('Tab' + name).disabled = busy;
     }
-    for (const name of ['ProjectSearchButton', 'AllProjects', 'DetectUser', 'OtherUser', 'UseMe']) el(name).disabled = busy || !context;
+    for (const name of ['ProjectSearchButton', 'AllProjects', 'DetectUser', 'OtherUser', 'UseMe', 'Diagnostics']) el(name).disabled = busy || !context;
+    el('DiagnosticUrl').disabled = busy;
     el('TaskSearchButton').disabled = el('DocumentSearchButton').disabled = busy || !project || !context;
     el('TaskQuery').disabled = el('DocumentQuery').disabled = el('Assigned').disabled = !project || busy;
     el('Connect').disabled = busy;
@@ -259,6 +260,34 @@ function createPolarionTaskPicker({ invoke, addMessage }) {
     catch (error) { if (generation === ticket) say(String(error)); }
   });
   el('DetectUser').addEventListener('click', () => action(async ticket => { if (await detectUser(ticket)) say('Signed-in user detected and remembered on this computer.'); }));
+  const runDiagnostics = () => action(async ticket => {
+    el('DiagnosticReport').replaceChildren();
+    say('Checking read-only Polarion endpoints · up to 25 seconds. No associations or data will be changed.');
+    const result = checked(await invoke('polarion_diagnostics', {
+      project: project?.id || '', resourceUrl: el('DiagnosticUrl').value.trim(),
+      query: mode === 'documents' && el('DocumentSource').value === 'containers' ? el('DocumentQuery').value.trim() : '',
+    }));
+    if (!current(ticket)) return;
+    const rows = result.diagnostics || [], ok = rows.filter(d => d.code === 'ok'), skipped = rows.filter(d => d.code === 'not_run');
+    const names = { metadata:'Server version', current_user:'Current user', project_access:'Project access', tasks_baseline:'Task query baseline', documents_catalog:'Project document catalog', spaces:'Project spaces', document_exact:'Exact LiveDoc', page_exact:'Exact page', space_documents:'Space document catalog', space_pages:'Space page catalog', document_parts:'LiveDoc elements', query_current:'Current work-item query', query_prefix:'Prefix query with id:*', query_without_id_star:'Prefix query without id:*' };
+    const report = el('DiagnosticReport');
+    if (result.server_metadata?.version) report.append(make('strong', 'Polarion ' + result.server_metadata.version + (result.server_metadata.build ? ' · build ' + result.server_metadata.build : '')));
+    for (const row of rows) {
+      const line = make('div', '', 'polarion-diagnostic-result'); line.dataset.state = row.code;
+      line.append(make('span', names[row.step] || 'Read check'), make('small',
+        (row.code === 'ok' ? 'GET accepted' : row.code.replace(/_/g, ' ')) + (row.http ? ' · HTTP ' + row.http : '') +
+        (row.reason ? ' · ' + row.reason.replace(/_/g, ' ') : '') + ' · ' + (row.duration_ms || 0) + ' ms'));
+      report.append(line);
+    }
+    if (ok.length) connection('connected', 'Partial read access verified · see individual checks');
+    else if (rows.some(d => d.code === 'auth_required')) connection('required', 'Sign-in required · open Polarion and retry');
+    say('Checks completed: ' + ok.length + '/' + rows.length + ' accepted' + (skipped.length ? ' · ' + skipped.length + ' not run' : '') +
+      '. Details saved in the application log. A 404 alone does not prove a permission problem. No data or associations changed.');
+  });
+  el('Diagnostics').addEventListener('click', runDiagnostics);
+  el('DiagnosticUrl').addEventListener('keydown', event => {
+    if (event.key === 'Enter' && !event.isComposing) { event.preventDefault(); runDiagnostics(); }
+  });
   el('OtherUser').addEventListener('click', () => { otherUser = true; el('Assigned').checked = true; el('User').value = ''; update(); el('User').focus(); });
   el('UseMe').addEventListener('click', () => { otherUser = false; el('User').value = ''; update(); });
   el('Assigned').addEventListener('change', update);
@@ -289,6 +318,7 @@ function createPolarionTaskPicker({ invoke, addMessage }) {
       identity = polarionRememberedUser(storage) || identity; otherUser = false; mode = 'projects';
       connection('unknown', 'Connection not checked · Search verifies access');
       for (const id of ['ProjectQuery','TaskQuery','DocumentQuery','ElementQuery','User']) el(id).value = '';
+      el('DiagnosticUrl').value = ''; el('DiagnosticReport').replaceChildren();
       el('Context').textContent = ''; el('ElementType').value = ''; clearResults(); clearDetail(); renderSaved(); renderElements();
       dialog.showModal(); say('Reading local Polarion associations…');
       try {

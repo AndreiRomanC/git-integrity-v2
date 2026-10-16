@@ -4,19 +4,20 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 const { polarionCommitMessage, polarionSearchExplanation } = require('../frontend/polarion.js');
 const source = fs.readFileSync(require('node:path').join(__dirname, '../src-tauri/src/repository/polarion-search.js'), 'utf8');
-async function portal({ status = 200, origin = 'https://polarion.vitesco.io', contentType = 'application/json', type = 'basic', data = { data: [] }, error = null, token = 'SECRET', kind = 'tasks', fallbackUrl = null, statuses = null, pages = null, query = '', page = 1, portalWindow = {}, resourceId = '', project = 'P' } = {}) {
+async function portal({ status = 200, origin = 'https://polarion.vitesco.io', contentType = 'application/json', type = 'basic', data = { data: [] }, error = null, token = 'SECRET', kind = 'tasks', fallbackUrl = null, statuses = null, pages = null, query = '', page = 1, portalWindow = {}, resourceId = '', project = 'P', probes = [], url = null, responseHeaders = {}, body = null, clock = null } = {}) {
   let request = null, reply = null;
   const requests = [];
   const location = { origin, set href(value) { reply = JSON.parse(new URL(value).searchParams.get('data')); } };
   portalWindow.getRestApiToken = () => token;
-  const sandbox = { URL, AbortController, setTimeout, clearTimeout, location, window: portalWindow, fetch: async (url, options) => {
+  const sandbox = { URL, AbortController, TextDecoder, setTimeout, clearTimeout, location, window: portalWindow, fetch: async (url, options) => {
     request = { url, options };
     requests.push(request);
     const code = statuses ? statuses[requests.length - 1] : status;
     if (error) throw error;
-    return { status: code, type, ok: code >= 200 && code < 300, headers: { get: () => contentType }, json: async () => pages ? pages[requests.length - 1] : data };
+    return { status: code, type, ok: code >= 200 && code < 300, body, headers: { get: key => key === 'content-type' ? contentType : responseHeaders[key] || '' }, json: async () => pages ? pages[requests.length - 1] : data };
   } };
-  await vm.runInNewContext(source.replace('__DDT_ARGUMENTS__', JSON.stringify({ url: kind === 'projects' ? 'https://polarion.vitesco.io/polarion/rest/v1/projects?fields[projects]=id,name,trackerPrefix&page[size]=100' : 'https://polarion.vitesco.io/polarion/rest/v1/projects/P/workitems', fallbackUrl, project, resourceId, kind, query, page, request: '1' })), sandbox);
+  if (clock) sandbox.Date = class extends Date { static now() { return clock(); } };
+  await vm.runInNewContext(source.replace('__DDT_ARGUMENTS__', JSON.stringify({ url: url || (kind === 'projects' ? 'https://polarion.vitesco.io/polarion/rest/v1/projects?fields[projects]=id,name,trackerPrefix&page[size]=100' : 'https://polarion.vitesco.io/polarion/rest/v1/projects/P/workitems'), fallbackUrl, project, resourceId, kind, query, page, probes, request: '1' })), sandbox);
   return { request, reply, requests };
 }
 test('fragment rejection falls back once to legacy prefix search, not on authentication or empty results', async () => {
@@ -202,4 +203,110 @@ test('oversized UTF-8 detail replies report a bridge limit instead of timing out
     relationships: { assignee: { data: Array.from({ length: 100 }, () => ({ id: '界'.repeat(100) })) } },
   } } });
   assert.equal(reply.code, 'response_limit'); assert.equal(reply.snapshot, undefined);
+});
+
+const api = 'https://polarion.vitesco.io/polarion/rest/v1';
+test('per-request diagnostics distinguish original query from fallback without leaking queries or bodies', async () => {
+  const { reply } = await portal({ statuses: [400, 400], pages: [
+    { errors: [{ title: 'SECRET', detail: 'Leading wildcard is not allowed: PRIVATE_SEARCH', source: { parameter: 'query' } }] },
+    { errors: [{ title: 'SECRET', detail: 'Lucene parse exception PRIVATE_SEARCH', source: { parameter: 'query' } }] },
+  ], url: api + '/projects/P/workitems?query=id:*%20AND%20(id:(*PRIVATE_SEARCH*))', fallbackUrl: api + '/projects/P/workitems?query=id:*%20AND%20(id:(PRIVATE_SEARCH*))', responseHeaders: { allow: 'GET, POST, SECRET, Bearer SECRET' } });
+  assert.equal(reply.http_requests, 2);
+  assert.equal(reply.diagnostics[0].route, 'workitems'); assert.equal(reply.diagnostics[0].reason, 'leading_wildcard');
+  assert.equal(reply.diagnostics[0].parameter, 'query'); assert.equal(reply.diagnostics[0].id_star, true); assert.equal(reply.diagnostics[0].leading_wildcard, true);
+  assert.equal(reply.diagnostics[1].step, 'prefix_fallback'); assert.equal(reply.diagnostics[1].id_star, true); assert.equal(reply.diagnostics[1].leading_wildcard, false);
+  assert.equal(reply.diagnostics[1].reason, 'query_syntax');
+  assert.deepEqual(reply.diagnostics[0].allow, ['GET', 'POST']);
+  assert.doesNotMatch(JSON.stringify(reply), /SECRET|PRIVATE_SEARCH|Bearer|X-Polarion/);
+});
+test('HTTP error diagnostics classify fields, permissions and missing resources without declaring every 404 a permission failure', async () => {
+  for (const [status, detail, parameter, reason] of [
+    [400, 'Unknown field privateFieldName', 'fields[documents]', 'unknown_field'],
+    [403, 'You do not have permission to view privateDoc', '', 'permission_denied'],
+    [404, 'Private document does not exist', '', 'not_found'],
+    [400, 'Unsupported parameter privateValue', 'secretParameter', 'unsupported_parameter'],
+  ]) {
+    const { reply } = await portal({ status, data: { errors: [{ detail, source: { parameter } }] } });
+    assert.equal(reply.diagnostics[0].reason, reason);
+    assert.doesNotMatch(JSON.stringify(reply), /privateFieldName|privateDoc|secretParameter|privateValue/);
+  }
+});
+test('error bodies are bounded and non-JSON pages are never parsed or exported', async () => {
+  let cancelled = false;
+  const body = { getReader: () => ({ read: async () => ({ value: new Uint8Array(8193), done: false }), cancel: async () => { cancelled = true; } }) };
+  const bounded = await portal({ status: 400, body });
+  assert.equal(bounded.reply.diagnostics[0].reason, 'error_body_limit'); assert.equal(cancelled, true);
+  let sent = false;
+  const small = { getReader: () => ({ read: async () => sent ? { done: true } : (sent = true, { value: new TextEncoder().encode(JSON.stringify({ errors: [{ detail: 'Leading wildcard PRIVATE_BODY not allowed' }] })), done: false }), cancel: async () => {} }) };
+  const streamed = await portal({ status: 400, body: small });
+  assert.equal(streamed.reply.diagnostics[0].reason, 'leading_wildcard'); assert.doesNotMatch(JSON.stringify(streamed.reply), /PRIVATE_BODY/);
+  const html = await portal({ status: 404, contentType: 'text/html', data: { secret: 'NEVER_EXPORTED' } });
+  assert.equal(html.reply.diagnostics[0].media, 'html'); assert.equal(html.reply.diagnostics[0].reason, '');
+  assert.doesNotMatch(JSON.stringify(html.reply), /NEVER_EXPORTED/);
+});
+test('diagnostic bytes do not displace a large snapshot that still fits the bridge', async () => {
+  const data = { data: { id: 'P/P-1', type: 'workitems',
+    attributes: { title: 'Base', description: { value: '界'.repeat(11600) } },
+    relationships: { assignee: { data: Array.from({ length: 100 }, () => ({ id: '界'.repeat(80) })) } },
+  } };
+  const { reply } = await portal({ kind: 'workitem', resourceId: 'P/P-1', data });
+  assert.equal(reply.code, 'ok'); assert.equal(reply.snapshot.description.length, 11600);
+  assert.ok(Buffer.byteLength(JSON.stringify(reply)) <= 60000);
+  const legacy = { session_token: true, prefix_fallback: false, code: 'ok', http: 200, snapshot: reply.snapshot };
+  const spare = 59995 - Buffer.byteLength(JSON.stringify(legacy));
+  assert.ok(spare >= 0 && spare < 896, 'controlled snapshot can reach the old UTF-8 boundary');
+  const descriptionPadding = Math.min(spare, 400);
+  data.data.attributes.description.value += 'x'.repeat(descriptionPadding);
+  data.data.attributes.title += 'x'.repeat(spare - descriptionPadding);
+  const boundary = await portal({ kind: 'workitem', resourceId: 'P/P-1', data });
+  assert.equal(boundary.reply.code, 'ok'); assert.equal(Buffer.byteLength(JSON.stringify(boundary.reply)), 59995);
+});
+test('catalog diagnostics stay bounded and retain the latest request without changing pagination', async () => {
+  const pages = Array.from({ length: 30 }, (_, i) => ({ data: [projectItem('P' + i)], links: i === 29 ? {} : { next: 'next' } }));
+  const { reply } = await portal({ kind: 'projects', pages });
+  assert.equal(reply.http_requests, 30); assert.equal(reply.diagnostics.length, 24); assert.equal(reply.diagnostics_omitted, 6);
+  assert.equal(reply.diagnostics.at(-1).page, 30); assert.equal(reply.received, 30); assert.equal(reply.catalog_pages, 30);
+});
+test('explicit diagnostics read only, export safe version fields and never claim user data as metadata', async () => {
+  const { reply, requests } = await portal({ kind: 'diagnostics', probes: [
+    { step: 'metadata', url: api + '/metadata' }, { step: 'current_user', url: api + '/user' },
+  ], pages: [
+    { data: { type: 'metadata', attributes: { version: '3.25.12', build: '20250613-1404-master-e594c717', node: 'PRIVATE_NODE', apiProperties: { maxPageSize: 200, password: 'SECRET' } } } },
+    { data: { type: 'users', id: 'PRIVATE_USER', attributes: { email: 'PRIVATE_EMAIL' } } },
+  ] });
+  assert.equal(reply.code, 'ok'); assert.equal(requests.length, 2); assert.ok(requests.every(r => r.options.method === 'GET'));
+  assert.deepEqual(reply.server_metadata, { version: '3.25.12', build: '20250613-1404-master-e594c717', max_page_size: 200 });
+  assert.equal(reply.diagnostics[1].resource_type, 'users'); assert.equal(reply.snapshot, undefined); assert.equal(reply.items, undefined);
+  assert.doesNotMatch(JSON.stringify(reply), /PRIVATE_|SECRET/);
+  const invalid = await portal({ kind: 'diagnostics', probes: [{ step: 'metadata', url: api + '/metadata' }], data: { data: { type: 'metadata', attributes: { version: 'SECRET', build: 'SECRET' } } } });
+  assert.equal(invalid.reply.server_metadata.version, ''); assert.equal(invalid.reply.server_metadata.build, '');
+});
+test('exact LiveDoc reads bypass a missing catalog and gate the parts probe on the actual resource', async () => {
+  const probes = [
+    { step: 'documents_catalog', url: api + '/projects/P/documents?page[size]=1' },
+    { step: 'document_exact', url: api + '/projects/P/spaces/S/documents/D' },
+    { step: 'page_exact', url: api + '/projects/P/spaces/S/pages/D' },
+    { step: 'document_parts', url: api + '/projects/P/spaces/S/documents/D/parts?page[size]=1', requires: 'document_exact' },
+  ];
+  const found = await portal({ kind: 'diagnostics', resourceId: 'P/S/D', probes, statuses: [404,200,404,200], pages: [
+    {}, { data: { id: 'P/S/D', type: 'documents', attributes: { title: 'PRIVATE_TITLE' } } }, {}, { data: [], links: { next: 'next' } },
+  ] });
+  assert.deepEqual(found.reply.diagnostics.map(d => d.code), ['api_unavailable','ok','api_unavailable','ok']);
+  assert.equal(found.reply.diagnostics[3].more, true); assert.equal(found.requests.length, 4);
+  assert.doesNotMatch(JSON.stringify(found.reply), /PRIVATE_TITLE|P\/S\/D/);
+  for (const data of [{ data: { id: 'P/S/Other', type: 'documents' } }, { data: { id: 'P/S/D', type: 'pages' } }, { data: [] }]) {
+    const invalid = await portal({ kind: 'diagnostics', resourceId: 'P/S/D', probes: probes.slice(1).filter(p => p.step !== 'page_exact'), data });
+    assert.equal(invalid.requests.length, 1); assert.equal(invalid.reply.diagnostics[0].code, 'invalid_response');
+    assert.equal(invalid.reply.diagnostics[1].reason, 'prerequisite_missing');
+  }
+});
+test('diagnostic alternatives remain independent and budget exhaustion reports checks not run', async () => {
+  const probes = ['query_current', 'query_prefix', 'query_without_id_star'].map(step => ({ step, url: api + '/projects/P/workitems?page[size]=1' }));
+  const { reply } = await portal({ kind: 'diagnostics', probes, statuses: [400,400,200], data: { data: [] } });
+  assert.deepEqual(reply.diagnostics.map(d => d.code), ['query_rejected','query_rejected','ok']);
+  let now = 0;
+  const budget = await portal({ kind: 'diagnostics', probes: [...probes, ...probes], clock: () => (now += 6000), data: { data: [] } });
+  assert.ok(budget.requests.length < 6); assert.ok(budget.reply.diagnostics.some(d => d.code === 'not_run' && d.reason === 'budget'));
+  const wrongOrigin = await portal({ kind: 'diagnostics', probes, origin: 'https://identity.example' });
+  assert.equal(wrongOrigin.requests.length, 0); assert.equal(wrongOrigin.reply.code, 'wrong_origin');
 });

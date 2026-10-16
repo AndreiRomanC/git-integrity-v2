@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Git DrillDown</title>
   <link rel="icon" type="image/png" href="assets/git-drilldown-mark.png">
-  <link rel="stylesheet" href="styles.css?v=20261016-polarion-workspace">
-  <link rel="stylesheet" href="polarion.css?v=20261016-polarion-workspace">
+  <link rel="stylesheet" href="styles.css?v=20261016-polarion-diagnostics">
+  <link rel="stylesheet" href="polarion.css?v=20261016-polarion-diagnostics">
 </head>
 <body>
   <div class="app-shell">
@@ -774,6 +774,13 @@
       <div class="polarion-task-body">
         <div class="polarion-connect-row"><div><strong id="polarionConnection" role="status" data-state="unknown">Connection not checked</strong><small>This Polarion window keeps its own session; Edge sign-in is separate.</small></div><button type="button" id="polarionConnect">Open Polarion ↗</button></div>
         <p id="polarionChosenProject" class="polarion-project-choice"></p>
+        <details class="polarion-diagnostics"><summary>Read access diagnostics</summary>
+          <small>Explicit GET checks only · up to 25 seconds. Logs endpoint templates, timings and error categories, never tokens or task contents. A StructDoc link also checks its exact Document/Page location. On “StructDoc work item”, the current query is tested with alternative syntax.</small>
+          <label for="polarionDiagnosticUrl">StructDoc link (optional)</label>
+          <div class="polarion-search-row"><input id="polarionDiagnosticUrl" inputmode="url" placeholder="https://polarion.vitesco.io/polarion/#/project/…/wiki/…" autocomplete="off"><button type="button" id="polarionDiagnostics">Check read access</button></div>
+          <small>The link's project is used for these checks only; your selected project and saved associations stay unchanged. No automatic sign-in or background probes.</small>
+          <div id="polarionDiagnosticReport" aria-label="Polarion read access checks"></div>
+        </details>
         <nav class="polarion-workspace-tabs" aria-label="Polarion sections"><button type="button" id="polarionTabProjects">Projects</button><button type="button" id="polarionTabTasks">Tasks</button><button type="button" id="polarionTabDocuments">StructDocs</button></nav>
         <section id="polarionPanelProjects">
           <label for="polarionProjectQuery">Find or change project</label>
@@ -805,16 +812,16 @@
       <footer><span>Read-only on Polarion. Snapshots stay outside Git. No automatic commit.</span><button value="cancel">Close</button><button type="button" id="polarionAdd" class="confirm" disabled>Add to Commit List</button></footer>
     </form>
   </dialog>
-  <script src="polarion.js?v=20261016-polarion-workspace"></script>
-  <script src="console-context.js?v=20261016-polarion-workspace"></script>
-  <script src="graph-model.js?v=20261016-polarion-workspace"></script>
-  <script src="submodule-state.js?v=20261016-polarion-workspace"></script>
-  <script src="submodule-versions.js?v=20261016-polarion-workspace"></script>
-  <script src="local-diff.js?v=20261016-polarion-workspace"></script>
-  <script src="local-drive.js?v=20261016-polarion-workspace"></script>
-  <script src="pr-status.js?v=20261016-polarion-workspace"></script>
-  <script src="refresh-coordinator.js?v=20261016-polarion-workspace"></script>
-  <script src="comparison-authors.js?v=20261016-polarion-workspace"></script>
-  <script src="app.js?v=20261016-polarion-workspace"></script>
+  <script src="polarion.js?v=20261016-polarion-diagnostics"></script>
+  <script src="console-context.js?v=20261016-polarion-diagnostics"></script>
+  <script src="graph-model.js?v=20261016-polarion-diagnostics"></script>
+  <script src="submodule-state.js?v=20261016-polarion-diagnostics"></script>
+  <script src="submodule-versions.js?v=20261016-polarion-diagnostics"></script>
+  <script src="local-diff.js?v=20261016-polarion-diagnostics"></script>
+  <script src="local-drive.js?v=20261016-polarion-diagnostics"></script>
+  <script src="pr-status.js?v=20261016-polarion-diagnostics"></script>
+  <script src="refresh-coordinator.js?v=20261016-polarion-diagnostics"></script>
+  <script src="comparison-authors.js?v=20261016-polarion-diagnostics"></script>
+  <script src="app.js?v=20261016-polarion-diagnostics"></script>
 </body>
 </html>

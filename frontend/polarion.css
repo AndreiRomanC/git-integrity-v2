@@ -30,4 +30,11 @@
 .polarion-element small { font-size: 10px; text-align: right; }
 .polarion-element-filters { margin-top: 14px; }
 .polarion-task-dialog #polarionStatus { font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; padding: 8px 0; min-height: 32px; }
+.polarion-diagnostics { margin: 10px 0; border: 1px solid var(--border); border-radius: 7px; padding: 10px 12px; }
+.polarion-diagnostics summary { cursor: pointer; color: var(--muted); font-size: 12px; }
+.polarion-diagnostics > small { display: block; line-height: 1.6; margin: 10px 0; }
+.polarion-diagnostics > label { display: block; font-size: 12px; margin: 10px 0 6px; }
+.polarion-diagnostic-result { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 4px 12px; padding: 7px 0; border-bottom: 1px solid var(--border); font-size: 12px; overflow-wrap: anywhere; }
+.polarion-diagnostic-result small { color: var(--muted); }
+.polarion-diagnostic-result[data-state=ok] small { color: var(--green, var(--text)); }
 @media (max-width: 650px) { .polarion-task-dialog .polarion-search-row select { max-width: none; flex: 1 1 100%; } .polarion-detail dl { grid-template-columns: 1fr; gap: 3px; } .polarion-detail dd { margin-bottom: 8px; } }
