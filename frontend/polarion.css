@@ -1,0 +1,33 @@
+/* Scoped to the optional P workspace. No global app layout changes. */
+.polarion-task-dialog { width: min(880px, 94vw); }
+.polarion-workspace-tabs { display: flex; gap: 6px; border-bottom: 1px solid var(--border); padding-bottom: 10px; margin: 10px 0 16px; }
+.polarion-workspace-tabs button[aria-selected=true] { color: var(--blue); border-color: var(--blue); background: var(--surface); }
+.polarion-task-body section[hidden], .polarion-task-dialog button[hidden], .polarion-task-dialog input[hidden] { display: none; }
+.polarion-task-body section > label { display: block; margin: 12px 0 7px; font-size: 12px; }
+.polarion-task-body section > small { margin: 8px 0 12px; line-height: 1.55; }
+.polarion-task-dialog select { min-width: 0; height: 34px; max-width: 230px; font-size: 12px; background: var(--surface); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 4px 8px; }
+.polarion-task-dialog select:focus-visible { outline: 2px solid var(--blue); outline-offset: 1px; }
+.polarion-task-dialog .polarion-search-row { flex-wrap: wrap; }
+.polarion-task-dialog .polarion-search-row input { flex: 1 1 180px; }
+.polarion-assignee > span { color: var(--muted); overflow-wrap: anywhere; }
+.polarion-task-dialog .polarion-assignee button { height: 28px; padding: 3px 7px; font-size: 11px; }
+.polarion-saved-card { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 12px; margin: 0 0 16px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); }
+.polarion-saved-card > div { flex: 1 1 260px; min-width: 0; overflow-wrap: anywhere; }
+.polarion-saved-card strong { font-size: 12px; }
+.polarion-saved-card small { line-height: 1.6; margin-top: 3px; }
+.polarion-saved-card .polarion-card-actions { display: flex; flex: 1 1 100%; gap: 6px; flex-wrap: wrap; }
+.polarion-task-dialog .polarion-card-actions button { font-size: 11px; height: 28px; }
+.polarion-selection-actions { display: flex; flex-wrap: wrap; gap: 7px; margin: 10px 0; }
+.polarion-detail { border: 1px solid var(--border); border-radius: 8px; padding: 14px; margin: 14px 0; }
+.polarion-detail h3 { font-size: 14px; line-height: 1.5; overflow-wrap: anywhere; margin: 0 0 6px; }
+.polarion-detail dl { display: grid; grid-template-columns: minmax(110px, 1fr) minmax(0, 3fr); gap: 7px 16px; font-size: 12px; margin: 14px 0; }
+.polarion-detail dt { color: var(--muted); }
+.polarion-detail dd { margin: 0; overflow-wrap: anywhere; }
+.polarion-detail p { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; line-height: 1.6; max-height: 240px; overflow: auto; }
+.polarion-elements { max-height: 260px; overflow: auto; display: flex; flex-direction: column; gap: 4px; }
+.polarion-task-dialog .polarion-element { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; height: auto; min-height: 42px; gap: 6px; text-align: left; white-space: normal; }
+.polarion-element span { min-width: 0; overflow-wrap: anywhere; font-size: 12px; }
+.polarion-element small { font-size: 10px; text-align: right; }
+.polarion-element-filters { margin-top: 14px; }
+.polarion-task-dialog #polarionStatus { font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; padding: 8px 0; min-height: 32px; }
+@media (max-width: 650px) { .polarion-task-dialog .polarion-search-row select { max-width: none; flex: 1 1 100%; } .polarion-detail dl { grid-template-columns: 1fr; gap: 3px; } .polarion-detail dd { margin-bottom: 8px; } }

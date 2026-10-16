@@ -1,146 +1,307 @@
-// Optional, read-only portal search. Commit history/storage remain owned by app.js.
+// Optional Polarion workspace. No Git mutations or background portal requests.
 function polarionCommitMessage(task) {
   if (!/^[A-Za-z0-9][A-Za-z0-9_]*-\d+$/.test(task?.id || '')) throw new Error('This task ID does not match the supported P:PROJECT-123 reference format. No message was added.');
-  return `P:${task.id} - ${String(task.title || '').replace(/[\r\n\t]+/g, ' ').trim()}`;
+  return 'P:' + task.id + ' - ' + String(task.title || '').replace(/[\r\n\t]+/g, ' ').trim();
 }
 function polarionSearchExplanation(result) {
   const hints = {
-    auth_required: 'Sign in in the Polarion window, then retry Search.',
-    forbidden: 'Polarion refused API access. Your account permissions or portal REST-token configuration may prevent this search.',
-    api_unavailable: 'The Polarion REST API is unavailable on this server.',
-    query_rejected: 'Polarion rejected the search query, possibly because this server does not allow fragment wildcards. Diagnostics include the matching mode; no broad fallback search was run.',
-    not_json: 'The server returned a page instead of API results. Complete sign-in in the Polarion window, then retry.',
-    network_error: 'The browser could not complete the API request. Check the Polarion window and connection.',
-    timeout: 'Polarion search timed out. You can retry; no commit or message was added.',
-    catalog_limit: 'The project catalog is too large to load within this search limit. No incomplete results were shown. Diagnostics are in the log.',
-    wrong_origin: 'Finish signing in and return to the Polarion portal in its window, then retry Search.',
-    invalid_response: 'The API response did not have the expected format.',
+    auth_required: 'Sign in in the Polarion window, then retry.',
+    forbidden: 'Polarion refused access. Check account permissions or the portal REST configuration.',
+    api_unavailable: 'This resource or REST endpoint is unavailable on this Polarion server.',
+    query_rejected: 'Polarion rejected the query. No broad fallback search was run.',
+    not_json: 'The server returned a page instead of API results. Complete sign-in in the Polarion window.',
+    network_error: 'The browser could not complete the request. Check the connection.',
+    timeout: 'Polarion timed out. No partial catalog or element snapshot was applied.',
+    wrong_origin: 'Finish sign-in and return to the Polarion portal in its window.',
+    invalid_response: 'The response was incomplete or had an unexpected format. Existing snapshots were preserved.',
+    catalog_limit: 'The accessible catalog exceeded the safe loading limit. No partial catalog was displayed.',
+    response_limit: 'The Polarion reply is too large for this local overview. Existing snapshots were preserved.',
     http_error: 'Polarion returned an unexpected HTTP response.',
   };
-  return `${hints[result.code] || 'Search failed.'}${result.http ? ` HTTP ${result.http}.` : ''} ${result.session_token ? 'Portal session token detected.' : 'No portal REST session token detected.'} Diagnostics are in the application log (no credentials).`;
+  return (hints[result.code] || 'Search failed.') + (result.http ? ' HTTP ' + result.http + '.' : '') +
+    (result.session_token ? ' Portal session token detected.' : ' No portal REST session token detected.') + ' Diagnostics are in the application log (no credentials).';
+}
+function polarionFilterElements(elements, query = '', type = '') {
+  const words = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
+  return (elements || []).filter(item => (!type || (item.item_type || '(unknown)') === type) &&
+    words.every(word => (item.id + ' ' + item.title + ' ' + item.item_type + ' ' + item.status).toLowerCase().includes(word)));
+}
+function polarionRememberedUser(storage, user = null) {
+  const key = 'ddt-polarion-user-polarion.vitesco.io';
+  try {
+    if (user && /^[\w.@-]{1,120}$/.test(user.id)) storage?.setItem(key, JSON.stringify({ id: user.id, name: String(user.name || '').slice(0, 500), source: user.source === 'portal' ? 'portal' : 'manual' }));
+    const saved = JSON.parse(storage?.getItem(key) || 'null');
+    return saved && /^[\w.@-]{1,120}$/.test(saved.id) ? saved : null;
+  } catch { return user || null; }
 }
 function createPolarionTaskPicker({ invoke, addMessage }) {
   const dialog = document.querySelector('#polarionTaskDialog');
-  const el = id => dialog.querySelector(`#polarion${id}`);
-  let generation = 0, context = null, project = null, selected = null, busy = false;
-  let lastSearch = null, page = 1, more = false;
+  const el = id => dialog.querySelector('#polarion' + id);
+  const storage = typeof localStorage === 'undefined' ? null : localStorage;
+  let identity = polarionRememberedUser(storage), otherUser = false;
+  let generation = 0, context = null, project = null, selected = null, detail = null, busy = false;
+  let mode = 'projects', lastSearch = null, page = 1, more = false, workspace = {};
   const say = text => { el('Status').textContent = text; };
+  const make = (tag, text, className = '') => { const node = document.createElement(tag); node.textContent = text; node.className = className; return node; };
+  const button = (text, action) => { const node = make('button', text); node.type = 'button'; node.disabled = busy; node.addEventListener('click', action); return node; };
+  const current = ticket => ticket === generation && dialog.open && context;
   const connection = (state, text) => {
-    el('Connection').dataset.state = state;
-    el('Connection').textContent = text;
+    el('Connection').dataset.state = state; el('Connection').textContent = text;
     el('Connect').textContent = state === 'required' ? 'Sign in to Polarion ↗' : 'Open Polarion ↗';
   };
   const update = () => {
-    el('ProjectSearchButton').disabled = busy || !context;
-    el('TaskSearchButton').disabled = busy || !project || !context;
-    el('TaskQuery').disabled = !project;
-    el('Assigned').disabled = !project;
+    for (const [name, section] of [['Projects','projects'], ['Tasks','tasks'], ['Documents','documents']]) {
+      el('Panel' + name).hidden = mode !== section;
+      el('Tab' + name).setAttribute('aria-selected', String(mode === section));
+      el('Tab' + name).disabled = busy;
+    }
+    for (const name of ['ProjectSearchButton', 'AllProjects', 'DetectUser', 'OtherUser', 'UseMe']) el(name).disabled = busy || !context;
+    el('TaskSearchButton').disabled = el('DocumentSearchButton').disabled = busy || !project || !context;
+    el('TaskQuery').disabled = el('DocumentQuery').disabled = el('Assigned').disabled = !project || busy;
     el('Connect').disabled = busy;
-    el('Add').disabled = busy || !selected;
-    el('Previous').disabled = busy || !lastSearch || page <= 1;
-    el('Next').disabled = busy || !lastSearch || !more;
+    el('View').disabled = busy || !selected;
+    el('PrimaryButton').hidden = mode !== 'tasks'; el('PrimaryButton').disabled = busy || selected?.kind !== 'tasks';
+    el('Associate').hidden = mode !== 'documents'; el('Associate').disabled = busy || !['documents', 'containers'].includes(selected?.kind);
+    el('Add').hidden = mode !== 'tasks'; el('Add').disabled = busy || selected?.kind !== 'tasks';
+    el('Previous').disabled = busy || !lastSearch || page <= 1; el('Next').disabled = busy || !lastSearch || !more;
     el('Pages').hidden = !lastSearch || (page <= 1 && !more);
-    el('User').hidden = !el('Assigned').checked;
-    el('ChosenProject').textContent = project ? `Selected: ${project.id} · ${project.name}` : 'Choose a project from the search results to enable task search.';
+    el('User').hidden = !otherUser && (!el('Assigned').checked || !!identity?.id);
+    el('UseMe').hidden = !otherUser; el('OtherUser').hidden = otherUser;
+    el('Identity').textContent = otherUser ? 'Filtering another user' : identity ? (identity.name || identity.id) + ' · ' + (identity.source === 'portal' ? 'detected / remembered' : 'remembered user ID') : 'User not detected yet';
+    el('ChosenProject').textContent = project ? 'Project: ' + project.id + ' · ' + project.name : 'Choose a project to search tasks and StructDocs.';
   };
-  const clearResults = () => { selected = null; el('Results').replaceChildren(); more = false; update(); };
+  const clearResults = () => { selected = null; lastSearch = null; el('Results').replaceChildren(); more = false; update(); };
+  const clearDetail = () => { detail = null; el('Detail').hidden = true; el('Detail').replaceChildren(); };
+  function switchMode(next) { if (busy) return; ++generation; mode = next; clearResults(); clearDetail(); update(); renderElements(); }
+  async function action(work) {
+    if (busy || !context) return;
+    const ticket = ++generation; busy = true; update(); renderSaved();
+    try { await work(ticket); }
+    catch (error) { if (current(ticket)) { if (['auth_required', 'wrong_origin', 'not_json'].includes(error.polarionCode)) connection('required', 'Sign-in required · open Polarion and retry'); say(String(error)); } }
+    finally { if (current(ticket)) { busy = false; update(); renderSaved(); renderElements(); } }
+  }
+  function checked(result) {
+    if (result.code !== 'ok') {
+      const error = new Error(polarionSearchExplanation(result)); error.polarionCode = result.code; throw error;
+    }
+    return result;
+  }
+  const read = async (kind, resourceId = '', page = 1, revision = null) => checked(await invoke('polarion_read', { kind, resourceId, page, revision }));
+  const save = async (kind, snapshot = null, elements = null, documentId = null) => invoke('polarion_workspace', { repositoryPath: context.repository_path, action: kind, snapshot, elements, documentId });
+  function showDetail(snapshot) {
+    detail = snapshot; const pane = el('Detail'); pane.hidden = false; pane.replaceChildren();
+    pane.append(make('h3', snapshot.title), make('small', snapshot.id + ' · Local snapshot read ' + (snapshot.fetched_at || 'at an unknown time') + '. Refresh explicitly for current data.'));
+    const list = make('dl', '');
+    const fields = { Type: snapshot.item_type || 'Not returned', Status: snapshot.status || 'Not returned', Assignee: snapshot.assignees?.join(', ') || 'Not returned / unassigned', ...(snapshot.fields || {}) };
+    for (const [key, value] of Object.entries(fields)) list.append(make('dt', key.replace(/([a-z])([A-Z])/g, '$1 $2')), make('dd', value));
+    pane.append(list, make('p', snapshot.description || 'No description in this saved overview. Read details for live data.'));
+  }
+  function selectSnapshot(snapshot) {
+    selected = { id: snapshot.id.split('/').pop(), title: snapshot.title, resourceId: snapshot.id,
+      kind: snapshot.kind === 'document' ? 'documents' : snapshot.item_type === 'task' ? 'tasks' : 'containers' };
+    showDetail(snapshot); update();
+  }
+  function savedCard(target, title, snapshot, isDoc) {
+    target.replaceChildren();
+    const copy = make('div', ''); copy.append(make('strong', title), make('small', snapshot ? snapshot.id + ' · ' + snapshot.title + ' · ' + (snapshot.status || 'Status not returned') : 'Nothing associated yet.'));
+    target.append(copy); if (!snapshot) return;
+    const actions = make('div', '', 'polarion-card-actions');
+    actions.append(button('View saved', () => { if (!busy) selectSnapshot(snapshot); }),
+      button('Refresh info', () => action(async ticket => {
+        const result = await read(snapshot.kind, snapshot.id); if (!current(ticket)) return;
+        connection('connected', 'Connected · Polarion read access verified');
+        const saved = await save(isDoc ? 'document' : 'primary', result.snapshot); if (!current(ticket)) return;
+        workspace = saved; showDetail(result.snapshot); say('Snapshot refreshed and saved locally. Polarion unchanged.');
+      })));
+    if (isDoc) actions.append(button('Read all elements', loadElements));
+    actions.append(button('Remove association', () => action(async ticket => {
+      const saved = await save(isDoc ? 'document' : 'primary'); if (!current(ticket)) return;
+      workspace = saved; clearDetail(); if (isDoc) renderElements(); say('Local association removed. Nothing deleted in Polarion.');
+    })));
+    target.append(actions);
+  }
+  function renderSaved() {
+    savedCard(el('Primary'), 'Primary task · local association', workspace.primary_task, false);
+    savedCard(el('Document'), 'StructDoc · local association', workspace.document, true);
+  }
+  function renderElements() {
+    // Task/project searches must not rebuild a potentially large hidden
+    // StructDoc list. Its saved data is rendered only when that tab is used.
+    if (mode !== 'documents') { el('Elements').replaceChildren(); return; }
+    const query = el('ElementQuery').value || '', type = el('ElementType').value || '';
+    const all = workspace.elements || [];
+    const types = [...new Set(all.map(item => item.item_type || '(unknown)'))].sort();
+    el('ElementType').replaceChildren();
+    for (const value of ['', ...types]) { const option = make('option', value || 'All types'); option.value = value; el('ElementType').append(option); }
+    el('ElementType').value = types.includes(type) ? type : '';
+    const rows = polarionFilterElements(all, query, el('ElementType').value);
+    el('Elements').replaceChildren();
+    for (const item of rows) {
+      const row = button('', () => { if (!busy) selectSnapshot(item); }); row.className = 'polarion-element';
+      row.append(make('span', item.id + ' · ' + item.title), make('small', (item.item_type || 'Type unavailable') + ' · ' + (item.status || 'Status unavailable')));
+      el('Elements').append(row);
+    }
+    el('ElementSummary').textContent = workspace.document ? rows.length + ' shown / ' + all.length + ' saved elements · ' +
+      (workspace.elements_complete ? 'All source pages read ' + workspace.elements_saved_at : 'Elements not loaded yet') +
+      (workspace.elements_revision ? ' · source revision ' + workspace.elements_revision : '') +
+      (workspace.elements_complete && workspace.elements_revision !== (workspace.document.fields?.revision || '') ? '. Document metadata changed; Read all elements to refresh the saved list.' : '') +
+      (workspace.document.kind === 'workitem' ? '. Direct outgoing linked items only; not a recursive hierarchy.' : '. Document work-item order is preserved.') +
+      ' Types come from Polarion; unavailable details are not silently excluded.' : 'Associate a document, then read its elements.';
+  }
+  async function loadElements() {
+    if (!workspace.document) return;
+    const documentSnapshot = { ...workspace.document };
+    await action(async ticket => {
+      const all = [], seen = new Set(); let incomplete = 0;
+      for (let page = 1; ; page++) {
+        if (page > 200) throw new Error('Element loading exceeded 200 pages. Previous saved elements were preserved.');
+        say('Reading StructDoc elements · page ' + page + ' · ' + all.length + ' loaded…');
+        const result = await read(documentSnapshot.kind === 'document' ? 'elements' : 'links', documentSnapshot.id, page, documentSnapshot.fields?.revision || null);
+        if (!current(ticket)) return;
+        // IDs may legitimately repeat in documents; preserve every occurrence.
+        // Detect a server ignoring pagination using stable resource IDs instead.
+        const pageKey = result.page_key || (result.elements || []).map(s => s.id).join('|') + ':' + result.received;
+        if (result.more && seen.has(pageKey)) throw new Error('Polarion repeated an element page. Previous saved elements were preserved.');
+        if (pageKey) seen.add(pageKey);
+        all.push(...(result.elements || [])); incomplete += result.incomplete || 0;
+        if (all.length > 5000) throw new Error('More than 5000 elements. Previous saved elements were preserved.');
+        if (!result.more) break;
+      }
+      documentSnapshot.fetched_at = new Date().toISOString();
+      const saved = await save('elements', documentSnapshot, all); if (!current(ticket)) return;
+      workspace = saved; renderElements();
+      connection('connected', 'Connected · Polarion read access verified');
+      say('Saved ' + all.length + ' elements outside Git.' + (incomplete ? ' ' + incomplete + ' entries have unavailable details; select and Read details.' : '') +
+        (!documentSnapshot.fields?.revision ? ' The server did not supply a revision; concurrent edits cannot be ruled out.' : ' Source revision: ' + documentSnapshot.fields.revision));
+    });
+  }
+  async function detectUser(ticket) {
+    const result = await read('user'); if (!current(ticket)) return false;
+    connection('connected', 'Connected · signed-in Polarion user verified');
+    identity = { id: result.user_id, name: result.user_name, source: 'portal' };
+    polarionRememberedUser(storage, identity); update(); return true;
+  }
   async function chooseProject(item) {
-    const ticket = ++generation;
-    project = { id: item.id, name: item.title }; lastSearch = null; clearResults();
-    busy = true; update(); say('Saving the project association outside Git…');
-    try {
-      await invoke('polarion_project_context', { repositoryPath: context.repository_path, relativePath: '', project });
-      if (generation === ticket) say('Project remembered. Search tasks below.');
-    } catch (error) { if (generation === ticket) say(`Project selected for this session, but could not be saved: ${error}`); }
-    finally { if (generation === ticket) { busy = false; update(); el('TaskQuery').focus(); } }
+    await action(async ticket => {
+      project = { id: item.id, name: item.title }; clearResults(); clearDetail();
+      const loaded = await invoke('polarion_project_context', { repositoryPath: context.repository_path, relativePath: '', project });
+      if (!current(ticket)) return;
+      project = loaded.project || project; mode = 'tasks'; say('Project remembered. Search tasks, or open StructDocs.');
+    });
   }
   function render(items, kind) {
     el('Results').replaceChildren();
-    if (!items.length) {
-      const empty = document.createElement('p'); empty.className = 'polarion-empty';
-      empty.textContent = kind === 'projects' ? 'No matching projects. Try another part of the name or ID.' : 'No matching tasks in this project.';
-      el('Results').append(empty);
-    }
+    if (!items.length) el('Results').append(make('p', 'No matching ' + (kind === 'projects' ? 'projects' : kind === 'tasks' ? 'tasks' : 'StructDocs') + '. Try another fragment.', 'polarion-empty'));
     for (const item of items) {
-      const row = document.createElement('button'); row.type = 'button'; row.className = 'polarion-result';
-      row.setAttribute('aria-pressed', 'false');
-      const id = document.createElement('strong'); id.textContent = item.id;
-      const title = document.createElement('span'); title.textContent = item.title;
-      row.append(id, title);
-      row.addEventListener('click', () => {
+      const row = button('', () => {
         if (busy) return;
         if (kind === 'projects') { chooseProject(item); return; }
-        selected = item;
+        selected = { ...item, kind, resourceId: kind === 'documents' ? item.id : project.id + '/' + item.id };
+        clearDetail();
         for (const sibling of el('Results').children) sibling.setAttribute('aria-pressed', String(sibling === row));
         update();
       });
+      // Results remain selectable after the operation's busy state ends.
+      row.disabled = false; row.className = 'polarion-result'; row.setAttribute('aria-pressed', 'false');
+      row.append(make('strong', item.id), make('span', item.title + (item.item_type ? ' · ' + item.item_type : '')));
       el('Results').append(row);
     }
   }
-  async function search(kind, requestedPage = 1, saved = null) {
-    if (busy || !context) return;
-    const params = saved || { kind, project: project?.id || '', query: el(kind === 'projects' ? 'ProjectQuery' : 'TaskQuery').value.trim(), user: kind === 'tasks' && el('Assigned').checked ? el('User').value.trim() : '' };
-    if (kind === 'tasks' && !project) return;
-    if (kind === 'tasks' && !saved && el('Assigned').checked && !params.user) { say('Enter your Polarion user ID for “Assigned to me”. It is not inferred from Git.'); el('User').focus(); return; }
-    const ticket = ++generation;
-    busy = true; clearResults(); say('Searching Polarion…');
-    try {
-      const result = await invoke('polarion_search', { ...params, page: requestedPage });
-      if (generation !== ticket || !dialog.open) return;
-      if (result.code !== 'ok') {
-        lastSearch = null;
-        if (['auth_required', 'wrong_origin', 'not_json'].includes(result.code)) connection('required', 'Sign-in required · open Polarion, then retry the search');
-        else connection('unknown', 'Access could not be verified · see details below');
-        say(polarionSearchExplanation(result)); return;
+  async function search(kind, requestedPage = 1, previous = null) {
+    await action(async ticket => {
+      if (kind !== 'projects' && !project) return;
+      const params = previous || { kind, project: project?.id || '', query: el(kind === 'projects' ? 'ProjectQuery' : kind === 'tasks' ? 'TaskQuery' : 'DocumentQuery').value.trim(), user: '' };
+      if (kind === 'tasks' && !previous && el('Assigned').checked) {
+        if (!otherUser && !identity?.id && !el('User').value.trim()) await detectUser(ticket);
+        if (!current(ticket)) return;
+        params.user = otherUser ? el('User').value.trim() : identity?.id || el('User').value.trim();
+        if (!params.user) throw new Error('Enter your Polarion user ID once, or Detect signed-in user. It is not inferred from Git.');
       }
-      connection('connected', result.catalog_cached ? 'Using projects from this session · cached for up to 2 minutes' : 'Connected · Polarion search access verified');
-      lastSearch = params; page = requestedPage; more = result.more;
-      render(result.items, kind);
-      say(`${kind === 'projects' ? 'Projects' : 'Tasks'} · page ${page} · ${result.items.length} results${more ? ' · more available' : ''}. ${result.prefix_fallback ? 'The server rejected fragment search; using prefix search. Enter the beginning of the ID or name. ' : ''}${kind === 'projects' ? 'Select a project.' : 'Select a task to add it to the saved commit messages.'}`);
-    } catch (error) { if (generation === ticket) { lastSearch = null; connection('unknown', 'Connection not verified · open Polarion if sign-in is needed'); say(String(error)); } }
-    finally { if (generation === ticket) { busy = false; update(); } }
+      clearResults(); clearDetail(); say('Searching Polarion…');
+      const response = await invoke('polarion_search', { ...params, page: requestedPage });
+      if (!current(ticket)) return;
+      const result = checked(response);
+      connection('connected', 'Connected · Polarion read access verified');
+      if (kind === 'tasks' && params.user && !otherUser && !identity) {
+        identity = { id: params.user, source: 'manual' }; polarionRememberedUser(storage, identity);
+      }
+      lastSearch = params; page = requestedPage; more = result.more; render(result.items, kind);
+      say((kind === 'projects' || kind === 'documents' ? result.matched + ' matches / ' + result.received + ' accessible entries · ' : '') +
+        'Page ' + page + ' · ' + result.items.length + ' shown' + (more ? ' · Next shows more' : '') +
+        (result.prefix_fallback ? '. Server rejected contains search; prefix fallback was used.' : '') +
+        (result.catalog_cached ? '. Complete catalog cached for up to 2 minutes.' : '') +
+        (kind === 'projects' ? '. Select a project.' : '. Select a result to read details or associate it locally.'));
+    });
   }
+  async function readSelected(saveAs = '') {
+    if (!selected) return;
+    const choice = { ...selected };
+    await action(async ticket => {
+      const result = await read(choice.kind === 'documents' ? 'document' : 'workitem', choice.resourceId);
+      if (!current(ticket)) return;
+      connection('connected', 'Connected · Polarion read access verified');
+      if (saveAs === 'primary' && result.snapshot.item_type !== 'task') throw new Error('The selected work item is not a task; no primary task was changed.');
+      let write = saveAs;
+      if (!write && workspace.primary_task?.id === result.snapshot.id) write = 'primary';
+      if (!write && workspace.document?.id === result.snapshot.id) write = 'document';
+      if (!write && workspace.elements?.some(s => s.id === result.snapshot.id)) write = 'element';
+      if (write) {
+        const saved = await save(write, result.snapshot, null, workspace.document?.id || null); if (!current(ticket)) return;
+        workspace = saved; if (write === 'document') renderElements();
+      }
+      showDetail(result.snapshot); say(write ? 'Snapshot saved outside Git. Polarion unchanged.' : 'Read-only details loaded. Use Set primary task / Associate StructDoc to save the association.');
+    });
+  }
+  for (const [name, next] of [['Projects','projects'], ['Tasks','tasks'], ['Documents','documents']]) el('Tab' + name).addEventListener('click', () => switchMode(next));
   el('Connect').addEventListener('click', async () => {
     const ticket = generation;
-    try { await invoke('polarion_connect'); if (generation === ticket) { connection('unknown', 'Polarion opened · run a search to verify access'); say('Complete sign-in if requested, then return here and search. An existing session in this Polarion window is reused; Edge sign-in is separate.'); } }
+    try { await invoke('polarion_connect'); if (generation === ticket && dialog.open) { connection('unknown', 'Portal opened · complete sign-in if needed'); say('Sign in, then Detect signed-in user or Search. Edge sign-in is separate.'); } }
     catch (error) { if (generation === ticket) say(String(error)); }
   });
-  el('ProjectSearchButton').addEventListener('click', () => search('projects'));
-  el('TaskSearchButton').addEventListener('click', () => search('tasks'));
-  for (const [id, kind] of [['ProjectQuery', 'projects'], ['TaskQuery', 'tasks']]) {
-    el(id).addEventListener('keydown', event => { if (event.key === 'Enter') { event.preventDefault(); search(kind); } });
-  }
+  el('DetectUser').addEventListener('click', () => action(async ticket => { if (await detectUser(ticket)) say('Signed-in user detected and remembered on this computer.'); }));
+  el('OtherUser').addEventListener('click', () => { otherUser = true; el('Assigned').checked = true; el('User').value = ''; update(); el('User').focus(); });
+  el('UseMe').addEventListener('click', () => { otherUser = false; el('User').value = ''; update(); });
   el('Assigned').addEventListener('change', update);
-  el('User').addEventListener('keydown', event => { if (event.key === 'Enter') { event.preventDefault(); search('tasks'); } });
-  el('Previous').addEventListener('click', () => search(lastSearch.kind, page - 1, lastSearch));
-  el('Next').addEventListener('click', () => search(lastSearch.kind, page + 1, lastSearch));
+  el('ProjectSearchButton').addEventListener('click', () => search('projects'));
+  el('AllProjects').addEventListener('click', () => { el('ProjectQuery').value = ''; search('projects'); });
+  el('TaskSearchButton').addEventListener('click', () => search('tasks'));
+  el('DocumentSearchButton').addEventListener('click', () => search(el('DocumentSource').value || 'documents'));
+  el('DocumentSource').addEventListener('change', () => { if (!busy) { ++generation; clearResults(); clearDetail(); } });
+  for (const [id, kind] of [['ProjectQuery','projects'], ['TaskQuery','tasks'], ['User','tasks'], ['DocumentQuery',null]]) el(id).addEventListener('keydown', event => {
+    if (event.key === 'Enter') { event.preventDefault(); search(kind || el('DocumentSource').value || 'documents'); }
+  });
+  el('ElementQuery').addEventListener('input', renderElements); el('ElementType').addEventListener('change', renderElements);
+  el('Previous').addEventListener('click', () => { if (lastSearch) search(lastSearch.kind, page - 1, lastSearch); });
+  el('Next').addEventListener('click', () => { if (lastSearch) search(lastSearch.kind, page + 1, lastSearch); });
+  el('View').addEventListener('click', () => readSelected());
+  el('PrimaryButton').addEventListener('click', () => readSelected('primary'));
+  el('Associate').addEventListener('click', () => readSelected('document'));
   el('Add').addEventListener('click', () => {
-    if (!selected || busy) return;
-    try { addMessage(polarionCommitMessage(selected)); dialog.close(); }
-    catch (error) { say(String(error)); }
+    if (selected?.kind !== 'tasks' || busy) return;
+    try { addMessage(polarionCommitMessage(selected)); dialog.close(); } catch (error) { say(String(error)); }
   });
-  dialog.addEventListener('close', () => {
-    // Native close events are queued: an immediate reopen owns a new context.
-    if (dialog.open) return;
-    ++generation; context = null; selected = null;
-  });
+  dialog.addEventListener('close', () => { if (!dialog.open) { ++generation; context = null; selected = null; } });
   return {
     async open(repositoryPath, relativePath = '') {
       if (!repositoryPath || dialog.open) return;
       const ticket = ++generation;
-      context = null; project = null; selected = null; busy = true; lastSearch = null;
+      context = null; project = null; selected = null; detail = null; workspace = {}; busy = true; lastSearch = null;
+      identity = polarionRememberedUser(storage) || identity; otherUser = false; mode = 'projects';
       connection('unknown', 'Connection not checked · Search verifies access');
-      el('ProjectQuery').value = ''; el('TaskQuery').value = ''; el('Context').textContent = ''; clearResults();
-      dialog.showModal(); say('Reading the repository’s saved Polarion project…');
+      for (const id of ['ProjectQuery','TaskQuery','DocumentQuery','ElementQuery','User']) el(id).value = '';
+      el('Context').textContent = ''; el('ElementType').value = ''; clearResults(); clearDetail(); renderSaved(); renderElements();
+      dialog.showModal(); say('Reading local Polarion associations…');
       try {
         const loaded = await invoke('polarion_project_context', { repositoryPath, relativePath, project: null });
-        if (generation !== ticket) return;
-        context = loaded; project = loaded.project;
-        el('Context').textContent = loaded.repository_path;
-        say(project ? 'Project remembered. Search tasks, or search above to change the project.' : 'Search for any part of a project name or ID, regardless of capitalization. If sign-in is needed, open Polarion first.');
+        if (generation !== ticket || !dialog.open) return;
+        context = loaded; project = loaded.project; mode = project ? 'tasks' : 'projects'; el('Context').textContent = loaded.repository_path;
+        const loadedWorkspace = await invoke('polarion_workspace', { repositoryPath: loaded.repository_path, action: 'load', snapshot: null, elements: null, documentId: null });
+        if (!current(ticket)) return;
+        workspace = loadedWorkspace;
+        say('Local snapshots loaded; no server request made. Search tasks, choose a project or open StructDocs.');
       } catch (error) { if (generation === ticket) say(String(error)); }
-      finally { if (generation === ticket) { busy = false; update(); el(project ? 'TaskQuery' : 'ProjectQuery').focus(); } }
+      finally { if (generation === ticket && dialog.open) { busy = false; update(); renderSaved(); renderElements(); el(project ? 'TaskQuery' : 'ProjectQuery').focus(); } }
     },
   };
 }
-if (typeof module !== 'undefined' && module.exports) module.exports = { polarionCommitMessage, polarionSearchExplanation };
+if (typeof module !== 'undefined' && module.exports) module.exports = { polarionCommitMessage, polarionSearchExplanation, polarionFilterElements, polarionRememberedUser };

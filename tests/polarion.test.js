@@ -4,7 +4,7 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 const { polarionCommitMessage, polarionSearchExplanation } = require('../frontend/polarion.js');
 const source = fs.readFileSync(require('node:path').join(__dirname, '../src-tauri/src/repository/polarion-search.js'), 'utf8');
-async function portal({ status = 200, origin = 'https://polarion.vitesco.io', contentType = 'application/json', type = 'basic', data = { data: [] }, error = null, token = 'SECRET', kind = 'tasks', fallbackUrl = null, statuses = null, pages = null, query = '', page = 1, portalWindow = {} } = {}) {
+async function portal({ status = 200, origin = 'https://polarion.vitesco.io', contentType = 'application/json', type = 'basic', data = { data: [] }, error = null, token = 'SECRET', kind = 'tasks', fallbackUrl = null, statuses = null, pages = null, query = '', page = 1, portalWindow = {}, resourceId = '', project = 'P' } = {}) {
   let request = null, reply = null;
   const requests = [];
   const location = { origin, set href(value) { reply = JSON.parse(new URL(value).searchParams.get('data')); } };
@@ -16,7 +16,7 @@ async function portal({ status = 200, origin = 'https://polarion.vitesco.io', co
     if (error) throw error;
     return { status: code, type, ok: code >= 200 && code < 300, headers: { get: () => contentType }, json: async () => pages ? pages[requests.length - 1] : data };
   } };
-  await vm.runInNewContext(source.replace('__DDT_ARGUMENTS__', JSON.stringify({ url: kind === 'projects' ? 'https://polarion.vitesco.io/polarion/rest/v1/projects?fields[projects]=id,name&page[size]=100' : 'https://polarion.vitesco.io/polarion/rest/v1/projects/P/workitems', fallbackUrl, project: 'P', kind, query, page, request: '1' })), sandbox);
+  await vm.runInNewContext(source.replace('__DDT_ARGUMENTS__', JSON.stringify({ url: kind === 'projects' ? 'https://polarion.vitesco.io/polarion/rest/v1/projects?fields[projects]=id,name,trackerPrefix&page[size]=100' : 'https://polarion.vitesco.io/polarion/rest/v1/projects/P/workitems', fallbackUrl, project, resourceId, kind, query, page, request: '1' })), sandbox);
   return { request, reply, requests };
 }
 test('fragment rejection falls back once to legacy prefix search, not on authentication or empty results', async () => {
@@ -139,4 +139,67 @@ test('task selection uses the same saved-message storage and preserves manual en
   assert.deepEqual(JSON.parse(storage.get('git-integrity-default-commit-message-history')), ['P:P-123 - Task title', 'My manual checkpoint']);
   assert.equal(sandbox.refs.defaultCommitMessage.value, 'P:P-123 - Task title');
   assert.equal(inputEvents, 2);
+});
+
+test('AQ4 also matches only the tracker prefix; All projects keeps explicit display pagination', async () => {
+  const data = { data: [{ ...projectItem('Platform', 'Different name'), attributes: { name: 'Different name', trackerPrefix: 'VWAQ4' } }, projectItem('Other')] };
+  const fragment = await portal({ kind: 'projects', query: 'aQ4', data });
+  assert.deepEqual(fragment.reply.items.map(i => i.id), ['Platform']);
+  assert.equal(fragment.reply.matched, 1); assert.equal(fragment.reply.received, 2);
+  assert.equal((await portal({ kind: 'projects', query: '', data })).reply.items.length, 2);
+});
+test('identity comes from /user response, never Git credentials or token contents', async () => {
+  const { reply } = await portal({ kind: 'user', data: { data: { type: 'users', id: 'sg123', attributes: { name: 'A User', email: 'private@example.test' } } } });
+  assert.equal(reply.user_id, 'sg123'); assert.equal(reply.user_name, 'A User');
+  assert.ok(!JSON.stringify(reply).includes('private@example.test')); assert.ok(!JSON.stringify(reply).includes('SECRET'));
+});
+test('task snapshot returns bounded plain text, assignees and dates but no raw HTML or arbitrary fields', async () => {
+  const { reply, request } = await portal({ kind: 'workitem', resourceId: 'P/P-1', data: { data: { type: 'workitems', id: 'P/P-1', revision: '42',
+    attributes: { title: 'Title', status: 'inprogress', type: 'task', description: { type: 'text/html', value: '<script>evil()</script><p>Details &amp; dates</p>' }, plannedStart: '2026-10-16', dueDate: '2026-11-01', password: 'MUST_NOT_LEAVE' },
+    relationships: { assignee: { data: [{ type: 'users', id: 'sg123' }] } } } } });
+  assert.equal(reply.snapshot.description, 'Details & dates\n');
+  assert.deepEqual(reply.snapshot.assignees, ['sg123']);
+  assert.equal(reply.snapshot.fields.plannedStart, '2026-10-16'); assert.equal(reply.snapshot.fields.revision, '42');
+  assert.equal(request.options.method, 'GET');
+  assert.doesNotMatch(JSON.stringify(reply), /MUST_NOT_LEAVE|evil|<script/);
+});
+test('document search covers every space and page, matching path and title fragments', async () => {
+  const doc = (id, title) => ({ id, type: 'documents', attributes: { title, type: 'structureDocument' } });
+  const { reply } = await portal({ kind: 'documents', query: 'structure', pages: [
+    { data: [doc('P/Other/Doc', 'Unrelated')], links: { next: 'https://evil.test' } },
+    { data: [doc('P/30 Development/Structure Information', 'Architecture')] },
+  ] });
+  assert.equal(reply.items.length, 1); assert.equal(reply.items[0].id, 'P/30 Development/Structure Information');
+  assert.equal(reply.catalog_pages, 2); assert.equal(reply.matched, 1);
+});
+test('LiveDoc elements preserve real parts and types; inaccessible details stay visible', async () => {
+  const part = (id, workitem) => ({ type: 'document_parts', id: 'P/Space/Doc/' + id, attributes: { type: 'workitem', level: 2 }, relationships: { workItem: { data: { type: 'workitems', id: workitem } } } });
+  const { reply } = await portal({ kind: 'elements', resourceId: 'P/Space/Doc', data: {
+    data: [part('one', 'P/P-1'), part('two', 'Other/O-2')],
+    included: [{ type: 'workitems', id: 'P/P-1', attributes: { title: 'Architecture', type: 'architecturalElement', status: 'approved' } }],
+    links: { next: 'page2' },
+  } });
+  assert.equal(reply.code, 'ok', JSON.stringify(reply));
+  assert.equal(reply.elements.length, 2); assert.equal(reply.elements[0].item_type, 'architecturalElement');
+  assert.equal(reply.elements[1].id, 'Other/O-2'); assert.match(reply.elements[1].fields.details, /not returned/);
+  assert.equal(reply.incomplete, 1); assert.equal(reply.more, true); assert.match(reply.page_key, /\/one/);
+});
+test('StructDoc work-item links use actual relationship targets, not guessed type IDs', async () => {
+  const { reply } = await portal({ kind: 'links', resourceId: 'P/P-1', data: { data: [
+    { type: 'linkedworkitems', id: 'P/P-1/contains/P/P-2', attributes: { role: 'contains' }, relationships: { sourceWorkItem: { data: { id: 'P/P-1' } }, workItem: { data: { id: 'P/P-2', type: 'workitems' } } } },
+  ], included: [{ id: 'P/P-2', type: 'workitems', attributes: { type: 'solutionElement', title: 'Solution' } }] } });
+  assert.equal(reply.code, 'ok', JSON.stringify(reply));
+  assert.equal(reply.elements[0].item_type, 'solutionElement'); assert.equal(reply.elements[0].fields.linkRole, 'contains');
+});
+test('wrong resources, partial metadata errors and oversized element pages fail closed', async () => {
+  assert.equal((await portal({ kind: 'workitem', resourceId: 'P/P-1', data: { data: { type: 'workitems', id: 'Other/O-1' } } })).reply.code, 'invalid_response');
+  assert.equal((await portal({ kind: 'projects', data: { data: [projectItem('P')], meta: { errors: [{ detail: 'DO_NOT_LOG' }] } } })).reply.code, 'invalid_response');
+  assert.equal((await portal({ kind: 'elements', resourceId: 'P/S/D', data: { data: Array(26).fill({}) } })).reply.code, 'invalid_response');
+});
+test('oversized UTF-8 detail replies report a bridge limit instead of timing out', async () => {
+  const { reply } = await portal({ kind: 'workitem', resourceId: 'P/P-1', data: { data: { id: 'P/P-1', type: 'workitems',
+    attributes: { description: { value: '界'.repeat(12000) }, title: 'Large detail' },
+    relationships: { assignee: { data: Array.from({ length: 100 }, () => ({ id: '界'.repeat(100) })) } },
+  } } });
+  assert.equal(reply.code, 'response_limit'); assert.equal(reply.snapshot, undefined);
 });

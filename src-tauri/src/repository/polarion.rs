@@ -15,8 +15,30 @@ fn pending() -> &'static Mutex<Pending> { PENDING.get_or_init(|| Mutex::new(None
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Project { id: String, name: String }
-#[derive(Debug, Serialize, Deserialize)]
-pub struct SearchItem { id: String, title: String }
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SearchItem {
+    id: String, title: String,
+    #[serde(default)] item_type: String,
+}
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Snapshot {
+    id: String, title: String, kind: String,
+    #[serde(default)] item_type: String,
+    #[serde(default)] status: String,
+    #[serde(default)] assignees: Vec<String>,
+    #[serde(default)] fields: std::collections::BTreeMap<String, String>,
+    #[serde(default)] description: String,
+    #[serde(default)] fetched_at: String,
+}
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Workspace {
+    #[serde(default)] primary_task: Option<Snapshot>,
+    #[serde(default)] document: Option<Snapshot>,
+    #[serde(default)] elements: Vec<Snapshot>,
+    #[serde(default)] elements_complete: bool,
+    #[serde(default)] elements_saved_at: String,
+    #[serde(default)] elements_revision: String,
+}
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SearchResult {
     code: String,
@@ -27,6 +49,13 @@ pub struct SearchResult {
     #[serde(default)] prefix_fallback: bool,
     #[serde(default)] catalog_cached: bool,
     #[serde(default)] catalog_pages: usize,
+    #[serde(default)] matched: usize,
+    #[serde(default)] snapshot: Option<Snapshot>,
+    #[serde(default)] user_id: String,
+    #[serde(default)] user_name: String,
+    #[serde(default)] incomplete: usize,
+    #[serde(default)] page_key: String,
+    #[serde(default)] elements: Vec<Snapshot>,
     #[serde(default)] items: Vec<SearchItem>,
 }
 #[derive(Serialize)]
@@ -50,29 +79,149 @@ fn term(value: &str) -> Result<String, String> {
 }
 fn search_url(kind: &str, project: &str, query: &str, user: &str, page: usize) -> Result<String, String> {
     if page == 0 || page > 1000 { return Err("Invalid search page".into()); }
-    let words = term(query)?;
+    let words = if kind == "documents" {
+        if query.len() > 240 || query.chars().any(char::is_control) { return Err("Use a short document name or path.".into()); }
+        String::new()
+    } else { term(query)? };
     let mut url = reqwest::Url::parse("https://polarion.vitesco.io/polarion/rest/v1/projects").unwrap();
     let filter;
     if kind == "projects" {
-        if words.is_empty() { return Err("Type part of a project name or ID first.".into()); }
         // Display pages are applied after case-insensitive substring matching.
         // The portal reads all accessible catalog pages on explicit search.
-        url.query_pairs_mut().append_pair("fields[projects]", "id,name")
+        url.query_pairs_mut().append_pair("fields[projects]", "id,name,trackerPrefix")
             .append_pair("page[size]", "100").append_pair("page[number]", "1").append_pair("sort", "id");
         return Ok(url.to_string());
-    } else if kind == "tasks" && identifier(project) {
+    } else if (kind == "tasks" || kind == "containers") && identifier(project) {
+        if kind == "containers" && query.trim().chars().count() < 3 { return Err("Type at least three characters to find a StructDoc work item.".into()); }
         url.set_path(&format!("/polarion/rest/v1/projects/{project}/workitems"));
-        filter = format!("type:task{}{}",
+        filter = format!("{}{}{}", if kind == "tasks" { "type:task" } else { "id:*" },
             if words.is_empty() { String::new() } else { format!(" AND (id:({words}) OR title:({words}))") },
             if user.is_empty() { String::new() } else {
                 if user.len() > 120 || !user.bytes().all(|c| c.is_ascii_alphanumeric() || b"_.@-".contains(&c)) { return Err("Enter your Polarion user ID to filter assigned tasks.".into()); }
                 format!(" AND assignee.id:\"{user}\"")
             });
         url.query_pairs_mut().append_pair("fields[workitems]", "id,title,type");
+    } else if kind == "documents" && identifier(project) {
+        url.set_path(&format!("/polarion/rest/v1/projects/{project}/documents"));
+        url.query_pairs_mut().append_pair("fields[documents]", "moduleName,moduleFolder,title,type")
+            .append_pair("page[size]", "100").append_pair("page[number]", "1").append_pair("sort", "id");
+        return Ok(url.to_string());
     } else { return Err("Select a valid Polarion project first.".into()); }
     url.query_pairs_mut().append_pair("query", &filter).append_pair("page[size]", "25")
         .append_pair("page[number]", &page.to_string()).append_pair("sort", "id");
     Ok(url.to_string())
+}
+
+fn resource_segments(id: &str, expected: usize) -> Result<Vec<&str>, String> {
+    let parts: Vec<_> = id.split('/').collect();
+    if parts.len() != expected || !identifier(parts[0]) || parts.iter().any(|part| part.is_empty() || part.len() > 240 || *part == "." || *part == ".." || part.chars().any(|c| c.is_control() || c == '\\')) {
+        return Err("Invalid Polarion resource identifier".into());
+    }
+    Ok(parts)
+}
+
+fn read_url(kind: &str, id: &str, page: usize) -> Result<String, String> {
+    if page == 0 || page > 200 { return Err("Invalid Polarion page".into()); }
+    let mut url = reqwest::Url::parse("https://polarion.vitesco.io/polarion/rest/v1/").unwrap();
+    if kind == "user" { url.set_path("/polarion/rest/v1/user"); url.query_pairs_mut().append_pair("fields[users]", "id,name"); return Ok(url.to_string()); }
+    let is_doc = kind == "document" || kind == "elements";
+    let parts = resource_segments(id, if is_doc { 3 } else { 2 })?;
+    let mut segments = url.path_segments_mut().map_err(|_| "Invalid Polarion URL")?;
+    segments.pop_if_empty().push("projects").push(parts[0]);
+    if is_doc { segments.push("spaces").push(parts[1]).push("documents").push(parts[2]); }
+    else { segments.push("workitems").push(parts[1]); }
+    match kind {
+        "elements" => { segments.push("parts"); },
+        "links" => { segments.push("linkedworkitems"); },
+        "workitem" | "document" => {},
+        _ => return Err("Unsupported Polarion read operation".into()),
+    }
+    drop(segments);
+    match kind {
+        "document" => { url.query_pairs_mut().append_pair("fields[documents]", "title,type,status,moduleName,moduleFolder,created,updated"); },
+        "workitem" => { url.query_pairs_mut().append_pair("fields[workitems]", "@all"); },
+        "elements" | "links" => {
+            url.query_pairs_mut().append_pair("page[size]", "25").append_pair("page[number]", &page.to_string())
+                .append_pair("include", "workItem").append_pair("fields[workitems]", "id,title,type,status");
+            if kind == "elements" { url.query_pairs_mut().append_pair("fields[document_parts]", "id,type,level,workItem"); }
+            else { url.query_pairs_mut().append_pair("fields[linkedworkitems]", "role,workItem,sourceWorkItem"); }
+        },
+        _ => {},
+    }
+    Ok(url.to_string())
+}
+
+fn valid_snapshot(snapshot: &Snapshot) -> bool {
+    let count = match snapshot.kind.as_str() { "workitem" => 2, "document" => 3, _ => return false };
+    resource_segments(&snapshot.id, count).is_ok() && snapshot.title.len() <= 2000 && snapshot.item_type.len() <= 240 && snapshot.status.len() <= 240
+        && snapshot.description.len() <= 40_000 && snapshot.fetched_at.len() <= 80 && snapshot.assignees.len() <= 100
+        && snapshot.assignees.iter().all(|s| s.len() <= 240) && snapshot.fields.len() <= 25
+        && snapshot.fields.iter().all(|(k,v)| k.len() <= 80 && v.len() <= 1000)
+}
+
+fn workspace_file(path: &str) -> Result<PathBuf, String> { Ok(crate::notes::polarion_project_path(path)?.with_extension("workspace.json")) }
+fn load_workspace(path: &Path) -> Result<Workspace, String> {
+    if !path.exists() { return Ok(Workspace::default()); }
+    if fs::metadata(path).map_err(|_| "Cannot read Polarion workspace")?.len() > 8_000_000 { return Err("Polarion workspace exceeds its safe size limit".into()); }
+    let workspace: Workspace = serde_json::from_slice(&fs::read(path).map_err(|_| "Cannot read Polarion workspace")?).map_err(|_| "Invalid Polarion workspace; existing file was preserved")?;
+    validate_workspace(&workspace)?;
+    Ok(workspace)
+}
+fn validate_workspace(workspace: &Workspace) -> Result<(), String> {
+    if workspace.primary_task.as_ref().is_some_and(|s| !valid_snapshot(s) || s.kind != "workitem" || s.item_type != "task")
+        || workspace.document.as_ref().is_some_and(|s| !valid_snapshot(s)) || workspace.elements.len() > 5000
+        || workspace.elements.iter().any(|s| !valid_snapshot(s) || s.kind != "workitem") || workspace.elements_saved_at.len() > 80 || workspace.elements_revision.len() > 120 {
+        return Err("Invalid Polarion workspace snapshot".into());
+    }
+    Ok(())
+}
+#[tauri::command]
+pub async fn polarion_workspace(repository_path: String, action: String, snapshot: Option<Snapshot>, elements: Option<Vec<Snapshot>>, document_id: Option<String>) -> Result<Workspace, String> {
+    off_main_thread(move || {
+        let root = context_repository(&repository_path, "")?;
+        let file = workspace_file(&root)?;
+        let _guard = METADATA.lock().map_err(|_| "Metadata lock unavailable")?;
+        update_workspace(&file, &action, snapshot, elements, document_id.as_deref())
+    }).await
+}
+fn update_workspace(file: &Path, action: &str, snapshot: Option<Snapshot>, elements: Option<Vec<Snapshot>>, document_id: Option<&str>) -> Result<Workspace, String> {
+        let mut workspace = load_workspace(file)?;
+        match action {
+            "load" => return Ok(workspace),
+            "primary" => { workspace.primary_task = snapshot; },
+            "document" => {
+                if workspace.document.as_ref().map(|s| (&s.id, &s.kind)) != snapshot.as_ref().map(|s| (&s.id, &s.kind)) {
+                    workspace.elements.clear(); workspace.elements_complete = false; workspace.elements_saved_at.clear(); workspace.elements_revision.clear();
+                }
+                workspace.document = snapshot;
+            },
+            "elements" => {
+                let selected = snapshot.as_ref().ok_or("Missing StructDoc identity")?;
+                if workspace.document.as_ref().map(|s| (&s.id, &s.kind)) != Some((&selected.id, &selected.kind)) { return Err("StructDoc changed while its elements were loading; previous snapshot was preserved".into()); }
+                if workspace.document.as_ref().and_then(|s| s.fields.get("revision")) != selected.fields.get("revision") { return Err("StructDoc revision changed while its elements were loading; previous snapshot was preserved".into()); }
+                workspace.elements = elements.ok_or("Missing StructDoc elements")?;
+                workspace.elements_complete = true;
+                workspace.elements_saved_at = selected.fetched_at.clone();
+                workspace.elements_revision = selected.fields.get("revision").cloned().unwrap_or_default();
+            },
+            "element" => {
+                if workspace.document.as_ref().map(|s| s.id.as_str()) != document_id { return Err("StructDoc changed while item details were loading; previous snapshot was preserved".into()); }
+                let snapshot = snapshot.ok_or("Missing element snapshot")?;
+                let mut found = false;
+                for item in &mut workspace.elements { if item.id == snapshot.id { *item = snapshot.clone(); found = true; } }
+                if !found { return Err("This item is not in the saved StructDoc; no snapshot was changed".into()); }
+            },
+            _ => return Err("Unsupported Polarion workspace action".into()),
+        }
+        validate_workspace(&workspace)?;
+        let bytes = serde_json::to_vec_pretty(&workspace).map_err(|_| "Cannot encode Polarion workspace")?;
+        if bytes.len() > 8_000_000 { return Err("Polarion workspace exceeds its safe size limit; previous snapshot was preserved".into()); }
+        fs::create_dir_all(file.parent().ok_or("Missing Polarion metadata directory")?).map_err(|_| "Cannot create Polarion metadata directory")?;
+        let tmp = file.with_extension("json.tmp");
+        fs::write(&tmp, bytes).map_err(|_| "Cannot save Polarion workspace")?;
+        fs::rename(tmp, file).map_err(|_| "Cannot replace Polarion workspace; previous snapshot was preserved")?;
+        perf_log(&format!("polarion: workspace_saved action={action} elements={} outside_git=true", workspace.elements.len()), Duration::ZERO);
+        Ok(workspace)
 }
 
 fn prefix_fallback_url(url: &str) -> Result<String, String> {
@@ -161,8 +310,10 @@ pub async fn polarion_connect(app: tauri::AppHandle) -> Result<(), String> {
 
 fn validate_result(raw: &str) -> Result<SearchResult, String> {
     let result: SearchResult = serde_json::from_str(raw).map_err(|_| "Invalid Polarion search response")?;
-    if !["ok", "auth_required", "forbidden", "api_unavailable", "query_rejected", "http_error", "not_json", "network_error", "timeout", "wrong_origin", "invalid_response", "catalog_limit"].contains(&result.code.as_str())
-        || result.items.len() > 25 || result.items.iter().any(|item| !identifier(&item.id) || item.title.len() > 2000) {
+    if !["ok", "auth_required", "forbidden", "api_unavailable", "query_rejected", "http_error", "not_json", "network_error", "timeout", "wrong_origin", "invalid_response", "catalog_limit", "response_limit"].contains(&result.code.as_str())
+        || result.items.len() > 25 || result.items.iter().any(|item| (!identifier(&item.id) && resource_segments(&item.id, 3).is_err() && resource_segments(&item.id, 2).is_err()) || item.title.len() > 2000 || item.item_type.len() > 240)
+        || result.elements.len() > 25 || result.elements.iter().any(|s| !valid_snapshot(s))
+        || result.snapshot.as_ref().is_some_and(|s| !valid_snapshot(s)) || result.user_id.len() > 120 || result.user_name.len() > 500 || result.page_key.len() > 30_000 {
         return Err("Invalid Polarion result; no entries were added".into());
     }
     Ok(result)
@@ -171,6 +322,7 @@ fn validate_result(raw: &str) -> Result<SearchResult, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
     fn pairs(url: &str) -> HashMap<String, String> { reqwest::Url::parse(url).unwrap().query_pairs().into_owned().collect() }
     #[test]
     fn project_search_uses_catalog_without_server_wildcard_filter() {
@@ -179,8 +331,8 @@ mod tests {
         assert_eq!(params["page[size]"], "100");
         assert_eq!(params["page[number]"], "1");
         assert!(!params.contains_key("query"));
-        assert_eq!(params["fields[projects]"], "id,name");
-        assert!(search_url("projects", "", "", "", 1).is_err());
+        assert_eq!(params["fields[projects]"], "id,name,trackerPrefix");
+        assert!(search_url("projects", "", "", "", 1).is_ok(), "All projects is explicit and paginated");
     }
     #[test]
     fn fragment_search_matches_inside_identifiers_and_keeps_short_terms_bounded() {
@@ -224,6 +376,52 @@ mod tests {
         assert!(validate_result("<html>login</html>").is_err());
     }
     #[test]
+    fn read_urls_are_read_only_precise_and_encode_document_names() {
+        assert_eq!(reqwest::Url::parse(&read_url("user", "", 1).unwrap()).unwrap().path(), "/polarion/rest/v1/user");
+        let url = read_url("document", "P/30 Development/Structure Information", 1).unwrap();
+        assert!(url.contains("/spaces/30%20Development/documents/Structure%20Information"));
+        let parts = pairs(&read_url("elements", "P/S/D", 2).unwrap());
+        assert_eq!(parts["include"], "workItem"); assert_eq!(parts["page[number]"], "2");
+        assert!(read_url("workitem", "P/P-1", 1).unwrap().contains("/projects/P/workitems/P-1?"));
+        for id in ["P/../Doc", "P/S/D/extra", "P/S/..", "P/space\\bad/Doc"] { assert!(read_url("document", id, 1).is_err()); }
+        assert!(read_url("delete", "P/P-1", 1).is_err());
+        assert!(read_url("elements", "P/S/D", 201).is_err());
+        assert!(search_url("containers", "P", "ab", "", 1).is_err());
+        assert!(search_url("documents", "P", "30 Development/Structure", "", 1).is_ok());
+    }
+    fn sample_snapshot(id: &str, kind: &str, item_type: &str) -> Snapshot {
+        Snapshot { id: id.into(), title: "Saved title".into(), kind: kind.into(), item_type: item_type.into(), fetched_at: "2026-10-16T12:00:00Z".into(), ..Snapshot::default() }
+    }
+    #[test]
+    fn workspace_roundtrip_is_separate_from_project_and_rejects_stale_or_invalid_updates() {
+        let root = std::env::temp_dir().join(format!("ddt-polarion-workspace-{}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+        fs::create_dir_all(&root).unwrap();
+        let file = root.join("workspace.json");
+        assert!(load_workspace(&file).unwrap().primary_task.is_none());
+        let task = sample_snapshot("P/P-1", "workitem", "task");
+        let doc = sample_snapshot("P/S/D", "document", "structureDocument");
+        update_workspace(&file, "primary", Some(task.clone()), None, None).unwrap();
+        update_workspace(&file, "document", Some(doc.clone()), None, None).unwrap();
+        let element = sample_snapshot("P/P-2", "workitem", "architecturalElement");
+        update_workspace(&file, "elements", Some(doc.clone()), Some(vec![element.clone()]), None).unwrap();
+        let loaded = load_workspace(&file).unwrap();
+        assert_eq!(loaded.primary_task.unwrap().id, task.id);
+        assert_eq!(loaded.elements[0].item_type, "architecturalElement"); assert!(loaded.elements_complete);
+        let previous = fs::read(&file).unwrap();
+        assert!(update_workspace(&file, "elements", Some(sample_snapshot("P/S/Other", "document", "")), Some(Vec::new()), None).is_err());
+        assert!(update_workspace(&file, "primary", Some(element.clone()), None, None).is_err());
+        assert!(update_workspace(&file, "element", Some(element.clone()), None, Some("P/S/Other")).is_err());
+        assert_eq!(fs::read(&file).unwrap(), previous);
+        let mut refreshed = element; refreshed.status = "approved".into();
+        let updated = update_workspace(&file, "element", Some(refreshed), None, Some("P/S/D")).unwrap();
+        assert_eq!(updated.elements[0].status, "approved");
+        update_workspace(&file, "document", Some(sample_snapshot("P/S/Other", "document", "")), None, None).unwrap();
+        let final_state = load_workspace(&file).unwrap();
+        assert!(final_state.elements.is_empty()); assert!(!final_state.elements_complete);
+        assert!(final_state.primary_task.is_some(), "StructDoc association must not reset the primary task");
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
     fn context_resolves_folder_file_and_nested_repository_without_status() {
         let root = std::env::temp_dir().join(format!("ddt-polarion-context-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
         let repo = Repository::init(&root).unwrap();
@@ -255,6 +453,22 @@ mod tests {
 pub async fn polarion_search(app: tauri::AppHandle, kind: String, project: String, query: String, user: String, page: usize) -> Result<SearchResult, String> {
     let url = search_url(&kind, &project, &query, &user, page)?;
     let fallback = prefix_fallback_url(&url)?;
+    portal_request(app, serde_json::json!({"url":url,"fallbackUrl":fallback,"kind":kind,"project":project,"query":query,"page":page,"assigned":!user.is_empty()})).await
+}
+
+#[tauri::command]
+pub async fn polarion_read(app: tauri::AppHandle, kind: String, resource_id: String, page: usize, revision: Option<String>) -> Result<SearchResult, String> {
+    let mut url = read_url(&kind, &resource_id, page)?;
+    if let Some(revision) = revision.filter(|r| !r.is_empty()) {
+        if revision.len() > 120 || !revision.bytes().all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c)) { return Err("Invalid Polarion revision".into()); }
+        let mut parsed = reqwest::Url::parse(&url).map_err(|_| "Invalid Polarion URL")?;
+        parsed.query_pairs_mut().append_pair("revision", &revision);
+        url = parsed.to_string();
+    }
+    portal_request(app, serde_json::json!({"url":url,"kind":kind,"resourceId":resource_id,"page":page})).await
+}
+
+async fn portal_request(app: tauri::AppHandle, mut args: serde_json::Value) -> Result<SearchResult, String> {
     off_main_thread(move || {
         let started = Instant::now();
         let window = app.get_webview_window(WINDOW).ok_or_else(|| {
@@ -270,22 +484,27 @@ pub async fn polarion_search(app: tauri::AppHandle, kind: String, project: Strin
         }
         // Project matching uses the paginated accessible catalog in the portal,
         // independent of server wildcard/case rules. Task search is unchanged.
-        let script = include_str!("polarion-search.js")
-            .replace("__DDT_ARGUMENTS__", &serde_json::json!({"url":url,"fallbackUrl":fallback.as_str(),"kind":kind,"project":project,"query":query,"page":page,"request":id}).to_string());
+        args["request"] = serde_json::Value::String(id.clone());
+        let kind = args["kind"].as_str().unwrap_or("");
+        let page = args["page"].as_u64().unwrap_or(1);
+        let query = args["query"].as_str().unwrap_or("");
+        let script = include_str!("polarion-search.js").replace("__DDT_ARGUMENTS__", &args.to_string());
         let contains_terms = query.split_whitespace().filter(|word| word.chars().count() >= 3).count();
-        perf_log(&format!("polarion: search_start request={id} kind={kind} page={page} query_len={} assigned_filter={} match={} contains_terms={contains_terms}", query.len(), !user.is_empty(), if kind == "projects" { "catalog_case_insensitive_contains" } else { "contains_3plus" }), Duration::ZERO);
+        perf_log(&format!("polarion: search_start request={id} kind={kind} page={page} query_len={} assigned_filter={} match={} contains_terms={contains_terms}", query.len(), args["assigned"].as_bool().unwrap_or(false), if kind == "projects" || kind == "documents" { "catalog_case_insensitive_contains" } else { "contains_3plus" }), Duration::ZERO);
         let mut bridge_code = "eval_failed";
         let result = if window.eval(script).is_err() { Err("Polarion browser could not start the search".into()) }
             else {
                 bridge_code = "bridge_timeout_or_closed";
-                receive.recv_timeout(Duration::from_secs(35)).map_err(|_| "Polarion search timed out. Sign in in its window, return here and retry. Check the log for diagnostics.".to_string()).and_then(|raw| {
+                receive.recv_timeout(Duration::from_secs(if kind == "projects" || kind == "documents" { 95 } else { 35 })).map_err(|_| "Polarion search timed out. Sign in in its window, return here and retry. Check the log for diagnostics.".to_string()).and_then(|raw| {
                     bridge_code = "invalid_response";
-                    validate_result(&raw)
+                    let result = validate_result(&raw)?;
+                    if result.snapshot.as_ref().is_some_and(|s| Some(s.id.as_str()) != args["resourceId"].as_str()) { return Err("Polarion returned a different resource; no snapshot was applied".into()); }
+                    Ok(result)
                 })
             };
         if let Ok(mut slot) = pending().lock() { if slot.as_ref().is_some_and(|(key, _)| key == &id) { *slot = None; } }
         let detail = match &result {
-            Ok(data) => format!("code={} http={} session_token={} received={} results={} more={} prefix_fallback={} catalog_cached={} catalog_pages={}", data.code, data.http, data.session_token, data.received, data.items.len(), data.more, data.prefix_fallback, data.catalog_cached, data.catalog_pages),
+            Ok(data) => format!("code={} http={} session_token={} received={} matched={} results={} more={} prefix_fallback={} catalog_cached={} catalog_pages={} identity_detected={} snapshot={} elements={} incomplete={}", data.code, data.http, data.session_token, data.received, data.matched, data.items.len(), data.more, data.prefix_fallback, data.catalog_cached, data.catalog_pages, !data.user_id.is_empty(), data.snapshot.is_some(), data.elements.len(), data.incomplete),
             Err(_) => format!("code={bridge_code}"),
         };
         perf_log(&format!("polarion: search_end request={id} kind={kind} page={page} {detail}"), started.elapsed());

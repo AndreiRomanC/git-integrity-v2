@@ -142,3 +142,5 @@ write_text_file
 polarion_connect
 polarion_search
 polarion_project_context
+polarion_read
+polarion_workspace
