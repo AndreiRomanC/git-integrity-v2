@@ -6358,7 +6358,11 @@ fn submodule_versions_inner(repository_path: String, relative_path: String) -> R
             versions.push(SubmoduleVersion { name: oid.to_string()[..8].into(), revision: oid.to_string(), kind: "commit".into(), current: oid.to_string() == current_revision, subject: commit.summary().unwrap_or("").into(), author: commit.author().name().unwrap_or("Unknown").into(), date: short_date(commit.time().seconds()), attached_branch: None, upstream: None, ahead: None, behind: None, contains_current: false, commits_after_current: None, containing_branches });
         }
     }
-    perf_log(&format!("submodule_versions: TOTAL ({} refs/commits, {} containing branches)", versions.len(), current_containing_branches.len()), started.elapsed());
+    perf_log(&format!("submodule_versions: TOTAL path={relative_path} local_branches={} remote_branches={} tags={} history_commits={} history_context={} history_start={} checkout={} ({} refs/commits, {} containing branches; local refs only)",
+        versions.iter().filter(|v| v.kind == "branch").count(), versions.iter().filter(|v| v.kind == "remote").count(),
+        versions.iter().filter(|v| v.kind == "tag").count(), versions.iter().filter(|v| v.kind == "commit").count(),
+        history_context_branch, history_start.map(|oid| oid.to_string()).unwrap_or_default(), current_revision,
+        versions.len(), current_containing_branches.len()), started.elapsed());
     Ok(SubmoduleVersions { path: relative_path, current_revision, current_branch, parent_revision, parent_committed_revision, current_containing_branches, history_context_branch, history_limit: HISTORY_LIMIT, versions })
 }
 
@@ -6811,47 +6815,113 @@ fn add_submodule_inner_with_revision(repository_path: String, parent_path: Strin
     let configured_url = portable_submodule_configured_url(url);
     let clone_url = resolved_submodule_io_url(&repo, &configured_url)?;
     let destination = Path::new(&repository_path).join(&relative);
-    let indexed = cached_index_metadata(&repository_path).0.contains(&relative_string);
+    // This decision must use the current index, not a cached pre-deletion
+    // snapshot. Reject conflicts/occupied paths before touching any metadata.
+    let mut index = repo.index().map_err(|error| error.message().to_string())?;
+    index.read(true).map_err(|error| error.message().to_string())?;
+    if (1..=3).any(|stage| index.get_path(&relative, stage).is_some() || index.get_path(Path::new(".gitmodules"), stage).is_some()) {
+        return Err("Resolve the submodule or .gitmodules conflict before adding this submodule".into());
+    }
+    if index.get_path(&relative, 0).is_some() || index.find_prefix(format!("{relative_string}/")).is_ok() {
+        return Err("This path is already tracked. Remove it from Git before adding it again".into());
+    }
+    drop(index);
+    let replacing_staged_deletion = repo.head().ok().and_then(|head| head.peel_to_commit().ok())
+        .and_then(|commit| commit.tree().ok()).and_then(|tree| tree.get_path(&relative).ok().map(|entry| entry.filemode() == 0o160000))
+        .unwrap_or(false);
+    if destination.exists() {
+        let empty_orphan = destination.is_dir() && fs::read_dir(&destination).map(|mut entries| entries.next().is_none()).unwrap_or(false);
+        if !empty_orphan { return Err("The submodule destination already exists".into()); }
+    }
     let stale_name = repo.submodules().ok().and_then(|items| items.into_iter()
         .find(|item| normalized(item.path()) == relative_string)
         .map(|item| item.name().unwrap_or(&relative_string).to_string()));
+    let started = Instant::now();
+    perf_log(&format!("add_submodule: prepare {relative_string} replacing_staged_deletion={replacing_staged_deletion} stale_registration={}", stale_name.is_some()), started.elapsed());
+    invalidate_git_metadata(&repository_path);
+    invalidate_submodule_sync(&repository_path);
     // A failed/deleted uncommitted submodule may leave .gitmodules, config and
     // .git/modules entries behind. They must not prevent adding the same path again.
-    if let Some(name) = stale_name {
-        if indexed { return Err("This submodule is already tracked. Remove it from Git before adding it again".into()); }
-        cleanup_submodule_registration(&repo, &name, &relative)?;
-        for storage in [repo.path().join("modules").join(&relative), repo.path().join("modules").join(safe_relative_path(&name)?)] {
+    if let Some(ref name) = stale_name {
+        cleanup_submodule_registration(&repo, name, &relative)?;
+        for storage in [repo.path().join("modules").join(&relative), repo.path().join("modules").join(safe_relative_path(name)?)] {
             if storage.is_dir() { fs::remove_dir_all(&storage).map_err(|error| format!("Cannot clean previous submodule metadata: {error}"))?; }
         }
     }
     if destination.exists() {
-        let empty_orphan = destination.is_dir() && fs::read_dir(&destination).map(|mut entries| entries.next().is_none()).unwrap_or(false)
-            && repo.submodules().map(|items| !items.into_iter().any(|item| normalized(item.path()) == relative_string)).unwrap_or(true);
-        if !empty_orphan { return Err("The submodule destination already exists".into()); }
         fs::remove_dir(&destination).map_err(|error| format!("Cannot remove the previous empty attempt: {error}"))?;
         let old_storage = repo.path().join("modules").join(&relative);
         if old_storage.is_dir() { fs::remove_dir_all(old_storage).map_err(|error| format!("Cannot clean the previous failed attempt: {error}"))?; }
     }
-    let mut submodule = repo.submodule(&clone_url, &relative, true)
-        .map_err(|error| format!("Cannot prepare submodule: {}", error.message()))?;
+    let registration_name = stale_name.as_deref().unwrap_or(&relative_string);
+    if replacing_staged_deletion {
+        // libgit2's add_setup rejects a gitlink still present in HEAD even
+        // when it has been removed from the index. Register that one path
+        // explicitly, then reuse the normal libgit2 clone/finalize pipeline.
+        // HEAD and all unrelated index entries remain unchanged.
+        let gitmodules = Path::new(&repository_path).join(".gitmodules");
+        fs::OpenOptions::new().create(true).append(true).open(&gitmodules).map_err(|error| format!("Cannot prepare .gitmodules: {error}"))?;
+        let registration = git2::Config::open(&gitmodules).and_then(|mut config| {
+            config.set_str(&format!("submodule.{registration_name}.path"), &relative_string)?;
+            config.set_str(&format!("submodule.{registration_name}.url"), &clone_url)
+        });
+        if let Err(error) = registration {
+            let _ = cleanup_submodule_registration(&repo, registration_name, &relative);
+            return Err(format!("Cannot register replacement submodule: {}", error.message()));
+        }
+    }
+    // Discard libgit2's old HEAD/config submodule lookup after cleanup.
+    repo = internal_repository(&repository_path)?;
+    let mut submodule = {
+        let prepared = if replacing_staged_deletion {
+            repo.find_submodule(registration_name).and_then(|mut submodule| {
+                submodule.init(false)?;
+                submodule.repo_init(true)?;
+                Ok(submodule)
+            })
+        } else { repo.submodule(&clone_url, &relative, true) };
+        match prepared {
+            Ok(submodule) => submodule,
+            Err(error) => {
+                perf_log(&format!("add_submodule: prepare failed code={:?} class={:?}", error.code(), error.class()), started.elapsed());
+                let _ = cleanup_submodule_registration(&repo, registration_name, &relative);
+                invalidate_git_metadata(&repository_path);
+                return Err(format!("Cannot prepare submodule: {}", error.message()));
+            }
+        }
+    };
     let mut options = git2::SubmoduleUpdateOptions::new();
     options.fetch(authenticated_fetch_options(username, access_token));
     let name = submodule.name().unwrap_or(&relative_string).to_string();
+    let storage_by_name = repo.path().join("modules").join(safe_relative_path(&name)?);
     let rollback = |message: String| {
-        let _ = cleanup_submodule_registration(&repo, &name, &relative);
-        if destination.is_dir() { let _ = fs::remove_dir_all(&destination); }
-        let storage = repo.path().join("modules").join(&relative); if storage.is_dir() { let _ = fs::remove_dir_all(storage); }
-        Err(message)
+        perf_log("add_submodule: rollback after clone/checkout/finalize failure", started.elapsed());
+        let mut incomplete = cleanup_submodule_registration(&repo, &name, &relative).is_err();
+        if destination.is_dir() { incomplete |= fs::remove_dir_all(&destination).is_err(); }
+        for storage in [repo.path().join("modules").join(&relative), storage_by_name.clone()] {
+            if storage.is_dir() { incomplete |= fs::remove_dir_all(storage).is_err(); }
+        }
+        perf_log(&format!("add_submodule: rollback complete={} (no credentials logged)", !incomplete), started.elapsed());
+        invalidate_git_metadata(&repository_path);
+        Err(if incomplete { format!("{message}\nCleanup was incomplete. Check the submodule destination before retrying.") } else { message })
     };
-    let cloned = match submodule.clone(Some(&mut options)) { Ok(cloned) => cloned, Err(error) => { let detail = error.message(); let message = if detail.contains("username/password") || detail.contains("authentication") { "Authentication required. Open ‘Private repository credentials’ and enter your Git server username plus a Personal Access Token (not your account password).".to_string() } else { format!("Cannot clone submodule: {detail}") }; return rollback(message); } };
-    if cloned.head().ok().and_then(|head| head.target()).is_none() { return rollback("The server repository has no default commit to check out".into()); }
+    perf_log("add_submodule: clone START", started.elapsed());
+    let cloned = match submodule.clone(Some(&mut options)) { Ok(cloned) => cloned, Err(error) => { perf_log(&format!("add_submodule: clone failed code={:?} class={:?}", error.code(), error.class()), started.elapsed()); let detail = error.message(); let message = if detail.contains("username/password") || detail.contains("authentication") { "Authentication required. Open ‘Private repository credentials’ and enter your Git server username plus a Personal Access Token (not your account password).".to_string() } else { format!("Cannot clone submodule: {detail}") }; return rollback(message); } };
+    perf_log("add_submodule: clone completed", started.elapsed());
+    let has_head = cloned.head().ok().and_then(|head| head.target()).is_some();
+    if !has_head { drop(cloned); return rollback("The server repository has no default commit to check out".into()); }
     let mut checkout = git2::build::CheckoutBuilder::new(); checkout.safe();
-    if let Err(error) = cloned.checkout_head(Some(&mut checkout)) { return rollback(format!("Cannot check out submodule files: {}", error.message())); }
+    let checked_out = cloned.checkout_head(Some(&mut checkout));
+    // Release object/pack handles before a possible cleanup on Windows.
+    drop(cloned);
+    if let Err(error) = checked_out { return rollback(format!("Cannot check out submodule files: {}", error.message())); }
     if let Some((revision, kind, name)) = selected_submodule_revision(initial_revision, initial_revision_kind, initial_revision_name) {
         if let Err(error) = checkout_added_submodule_revision(&destination, &revision, &kind, &name) {
+            perf_log("add_submodule: selected revision checkout failed", started.elapsed());
             return rollback(format!("Cannot check out the selected submodule revision: {error}"));
         }
     }
+    perf_log("add_submodule: checkout completed; staging gitlink", started.elapsed());
     if let Err(error) = submodule.add_finalize() { return rollback(format!("Cannot stage submodule: {}", error.message())); }
     if let Err(error) = submodule.add_to_index(true) { return rollback(format!("Cannot add the submodule link to the parent index: {}", error.message())); }
     drop(submodule);
@@ -6871,6 +6941,7 @@ fn add_submodule_inner_with_revision(repository_path: String, parent_path: Strin
     } }
     invalidate_git_metadata(&repository_path);
     invalidate_submodule_sync(&repository_path); // this app just changed a submodule's registration/version
+    perf_log(&format!("add_submodule: completed {relative_string} replacing_staged_deletion={replacing_staged_deletion}"), started.elapsed());
     Ok(relative_string)
 }
 
@@ -9276,15 +9347,22 @@ pub async fn fetch_submodule(repository_path: String, relative_path: String) -> 
 }
 
 fn fetch_submodule_inner(repository_path: String, relative_path: String) -> Result<(), String> {
+    let started = Instant::now();
     validate_path(&repository_path)?;
     let absolute = validate_submodule(&repository_path, &relative_path)?;
     let sub_path = absolute.to_string_lossy().into_owned();
     let repo = internal_submodule_repository(&absolute)?;
     repo.find_remote("origin").map_err(|_| "No 'origin' remote configured for this submodule".to_string())?;
-    git(&sub_path, &["fetch", "origin"])?;
+    let count_refs = |pattern| repo.references_glob(pattern).map(|refs| refs.filter_map(Result::ok).count()).unwrap_or(0);
+    perf_log(&format!("fetch_submodule: START {relative_path} origin_branches={} tags={} mode=all-origin-branches-and-tags no-checkout", count_refs("refs/remotes/origin/*"), count_refs("refs/tags/*")), started.elapsed());
+    // An explicit version refresh must not depend on a narrow/single-branch
+    // clone's fetch refspec or tag auto-follow. Only origin tracking refs and
+    // tags are updated; local branches, HEAD and the parent gitlink stay put.
+    let fetched = git(&sub_path, &["fetch", "--no-recurse-submodules", "--tags", "origin", "+refs/heads/*:refs/remotes/origin/*"]);
     invalidate_git_metadata(&sub_path);
-    invalidate_submodule_sync(&repository_path); // this app just changed the submodule's own commit
-    Ok(())
+    invalidate_submodule_sync(&repository_path);
+    perf_log(&format!("fetch_submodule: END {relative_path} success={} origin_branches={} tags={}", fetched.is_ok(), count_refs("refs/remotes/origin/*"), count_refs("refs/tags/*")), started.elapsed());
+    fetched.map(|_| ())
 }
 
 #[derive(Serialize)]
@@ -10507,6 +10585,204 @@ mod tests {
         let content = fs::read_to_string(&gitmodules_path).unwrap();
         let updated: String = content.lines().filter(|line| !line.trim_start().starts_with("url =")).collect::<Vec<_>>().join("\n") + "\n";
         fs::write(&gitmodules_path, updated).unwrap();
+    }
+
+    #[test]
+    fn submodule_can_be_readded_at_another_revision_while_deletion_is_staged() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-submodule-readd-{suffix}"));
+        let parent = base.join("parent");
+        let dependency = base.join("dependency");
+        create_libgit2_repository(&parent, "README.md");
+        create_libgit2_repository(&dependency, "module.txt");
+        let original = run_git_capture(&dependency, &["rev-parse", "HEAD"]);
+        fs::write(dependency.join("module.txt"), "second version").unwrap();
+        create_commit(dependency.to_string_lossy().into_owned(), "Second version".into()).unwrap();
+        let second = run_git_capture(&dependency, &["rev-parse", "HEAD"]);
+        let path = parent.to_string_lossy().into_owned();
+        add_submodule_inner_with_revision(path.clone(), "modules".into(), dependency.to_string_lossy().into_owned(), "engine".into(), String::new(), String::new(), Some(original), Some("commit".into()), None).unwrap();
+        create_commit(path.clone(), "Add original engine".into()).unwrap();
+        let head = run_git_capture(&parent, &["rev-parse", "HEAD"]);
+        fs::write(parent.join("README.md"), "unrelated staged work").unwrap();
+        run_git(&parent, &["add", "README.md"]);
+        fs::write(parent.join("README.md"), "unrelated unstaged work").unwrap();
+        let staged_readme = run_git_capture(&parent, &["show", ":README.md"]);
+        remove_git_path_inner(&path, "modules/engine").unwrap();
+        assert_eq!(run_git_capture(&parent, &["diff", "--cached", "--name-status", "--", "modules/engine"]), "D\tmodules/engine");
+        add_submodule_inner_with_revision(path.clone(), "modules".into(), dependency.to_string_lossy().into_owned(), "engine".into(), String::new(), String::new(), Some(second.clone()), Some("commit".into()), None).unwrap();
+        assert_eq!(run_git_capture(&parent, &["rev-parse", "HEAD"]), head);
+        assert_eq!(run_git_capture(&parent, &["rev-parse", ":modules/engine"]), second);
+        assert_eq!(run_git_capture(&parent.join("modules/engine"), &["rev-parse", "HEAD"]), second);
+        assert_eq!(run_git_capture(&parent, &["diff", "--cached", "--name-status", "--", "modules/engine"]), "M\tmodules/engine");
+        assert_eq!(run_git_capture(&parent, &["show", ":README.md"]), staged_readme);
+        assert_eq!(fs::read_to_string(parent.join("README.md")).unwrap(), "unrelated unstaged work");
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn submodule_readd_failure_keeps_staged_deletion_and_allows_retry() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-submodule-readd-failure-{suffix}"));
+        let parent = base.join("parent");
+        let dependency = base.join("dependency");
+        create_libgit2_repository(&parent, "README.md");
+        create_libgit2_repository(&dependency, "module.txt");
+        let path = parent.to_string_lossy().into_owned();
+        let url = dependency.to_string_lossy().into_owned();
+        add_submodule_inner(path.clone(), "modules".into(), url.clone(), "engine".into(), String::new(), String::new()).unwrap();
+        // Exercise a pre-existing registration whose name differs from its path.
+        run_git(&parent, &["config", "-f", ".gitmodules", "--rename-section", "submodule.modules/engine", "submodule.old-engine"]);
+        create_commit(path.clone(), "Add engine".into()).unwrap();
+        let head = run_git_capture(&parent, &["rev-parse", "HEAD"]);
+        remove_git_path_inner(&path, "modules/engine").unwrap();
+        let deletion = run_git_capture(&parent, &["diff", "--cached"]);
+        let error = add_submodule_inner_with_revision(path.clone(), "modules".into(), url.clone(), "engine".into(), String::new(), String::new(), Some("missing-revision".into()), Some("commit".into()), None).unwrap_err();
+        assert!(error.contains("selected submodule revision"), "{error}");
+        assert_eq!(run_git_capture(&parent, &["diff", "--cached"]), deletion);
+        assert_eq!(run_git_capture(&parent, &["rev-parse", "HEAD"]), head);
+        assert!(!parent.join("modules/engine").exists());
+        assert!(!parent.join(".gitmodules").exists());
+        assert!(!parent.join(".git/modules/old-engine").exists());
+        // Retry at the original version cancels the deletion without a commit.
+        add_submodule_inner(path.clone(), "modules".into(), url, "engine".into(), String::new(), String::new()).unwrap();
+        assert!(run_git_capture(&parent, &["diff", "--cached"]).is_empty());
+        assert_eq!(run_git_capture(&parent, &["rev-parse", "HEAD"]), head);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn submodule_readd_refuses_existing_files_before_cleaning_metadata() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-submodule-readd-occupied-{suffix}"));
+        let parent = base.join("parent");
+        let dependency = base.join("dependency");
+        create_libgit2_repository(&parent, "README.md");
+        create_libgit2_repository(&dependency, "module.txt");
+        let path = parent.to_string_lossy().into_owned();
+        let url = dependency.to_string_lossy().into_owned();
+        add_submodule_inner(path.clone(), "".into(), url.clone(), "engine".into(), String::new(), String::new()).unwrap();
+        create_commit(path.clone(), "Add engine".into()).unwrap();
+        // Stage removal only: the working directory still contains local work.
+        run_git(&parent, &["rm", "--cached", "engine"]);
+        fs::write(parent.join("engine/module.txt"), "keep local work").unwrap();
+        let modules = fs::read(parent.join(".gitmodules")).unwrap();
+        let error = add_submodule_inner(path.clone(), "".into(), url, "engine".into(), String::new(), String::new()).unwrap_err();
+        assert!(error.contains("destination already exists"), "{error}");
+        assert_eq!(fs::read(parent.join(".gitmodules")).unwrap(), modules);
+        assert_eq!(fs::read_to_string(parent.join("engine/module.txt")).unwrap(), "keep local work");
+        assert!(parent.join(".git/modules/engine/HEAD").exists());
+        assert_eq!(run_git_capture(&parent, &["diff", "--cached", "--name-status", "--", "engine"]), "D\tengine");
+        // Even if files were deleted from disk, staged descendants must not
+        // be replaced by a gitlink through the staged-deletion fallback.
+        fs::remove_dir_all(parent.join("engine")).unwrap();
+        let blob = run_git_capture(&parent, &["rev-parse", "HEAD:README.md"]);
+        run_git(&parent, &["update-index", "--add", "--cacheinfo", "100644", &blob, "engine/local.txt"]);
+        let error = add_submodule_inner(path, "".into(), dependency.to_string_lossy().into_owned(), "engine".into(), String::new(), String::new()).unwrap_err();
+        assert!(error.contains("already tracked"), "{error}");
+        assert_eq!(run_git_capture(&parent, &["rev-parse", ":engine/local.txt"]), blob);
+        assert_eq!(fs::read(parent.join(".gitmodules")).unwrap(), modules);
+        assert!(parent.join(".git/modules/engine/HEAD").exists());
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn submodule_uncommitted_add_can_be_removed_and_readded() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-submodule-readd-uncommitted-{suffix}"));
+        let parent = base.join("parent");
+        let dependency = base.join("dependency");
+        create_libgit2_repository(&parent, "README.md");
+        create_libgit2_repository(&dependency, "module.txt");
+        let path = parent.to_string_lossy().into_owned();
+        let url = dependency.to_string_lossy().into_owned();
+        for _ in 0..2 {
+            add_submodule_inner(path.clone(), "".into(), url.clone(), "engine".into(), String::new(), String::new()).unwrap();
+            assert_eq!(run_git_capture(&parent, &["diff", "--cached", "--name-status", "--", "engine"]), "A\tengine");
+            remove_git_path_inner(&path, "engine").unwrap();
+            assert!(run_git_capture(&parent, &["diff", "--cached"]).is_empty());
+        }
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn add_submodule_can_select_a_tag_not_reachable_from_any_branch() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-submodule-tag-only-{suffix}"));
+        let parent = base.join("parent");
+        let dependency = base.join("dependency");
+        create_libgit2_repository(&parent, "README.md");
+        create_libgit2_repository(&dependency, "module.txt");
+        let oid = {
+            let repo = Repository::open(&dependency).unwrap();
+            let signature = repo.signature().unwrap();
+            let tree = repo.head().unwrap().peel_to_commit().unwrap().tree().unwrap();
+            let oid = repo.commit(None, &signature, &signature, "Tag-only release", &tree, &[]).unwrap();
+            repo.tag_lightweight("tag-only-release", repo.find_commit(oid).unwrap().as_object(), false).unwrap();
+            oid.to_string()
+        };
+        let path = parent.to_string_lossy().into_owned();
+        add_submodule_inner_with_revision(path.clone(), "".into(), dependency.to_string_lossy().into_owned(), "engine".into(), String::new(), String::new(), Some(oid.clone()), Some("tag".into()), Some("tag-only-release".into())).unwrap();
+        let versions = submodule_versions_inner(path, "engine".into()).unwrap();
+        assert_eq!(versions.current_revision, oid);
+        assert!(versions.versions.iter().any(|v| v.kind == "tag" && v.name == "tag-only-release" && v.revision == oid));
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn fetch_submodule_loads_all_new_branches_and_tags_without_changing_checkout() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-submodule-new-versions-{suffix}"));
+        let parent = base.join("parent");
+        let dependency = base.join("dependency");
+        create_libgit2_repository(&parent, "README.md");
+        create_libgit2_repository(&dependency, "module.txt");
+        run_git(&dependency, &["branch", "-M", "main"]);
+        let path = parent.to_string_lossy().into_owned();
+        add_submodule_inner(path.clone(), "".into(), dependency.to_string_lossy().into_owned(), "engine".into(), String::new(), String::new()).unwrap();
+        create_commit(path.clone(), "Add engine".into()).unwrap();
+        let local = parent.join("engine");
+        // A narrow refspec and disabled tag auto-follow must not hide versions
+        // from an explicit Fetch versions action.
+        run_git(&local, &["config", "remote.origin.fetch", "+refs/heads/main:refs/remotes/origin/main"]);
+        run_git(&local, &["config", "remote.origin.tagOpt", "--no-tags"]);
+        let head = run_git_capture(&local, &["rev-parse", "HEAD"]);
+        let gitlink = run_git_capture(&parent, &["rev-parse", ":engine"]);
+        let parent_head = run_git_capture(&parent, &["rev-parse", "HEAD"]);
+        fs::write(local.join("module.txt"), "local staged").unwrap();
+        run_git(&local, &["add", "module.txt"]);
+        fs::write(local.join("module.txt"), "local unstaged").unwrap();
+        let staged = run_git_capture(&local, &["diff", "--cached"]);
+        let unstaged = run_git_capture(&local, &["diff"]);
+        fs::write(dependency.join("module.txt"), "new server version").unwrap();
+        create_commit(dependency.to_string_lossy().into_owned(), "New server version".into()).unwrap();
+        let new_head = run_git_capture(&dependency, &["rev-parse", "HEAD"]);
+        let tag_only = {
+            let remote = Repository::open(&dependency).unwrap();
+            let commit = remote.head().unwrap().peel_to_commit().unwrap();
+            for i in 0..32 { remote.branch(&format!("feature/{i}"), &commit, false).unwrap(); }
+            for i in 0..88 { remote.tag_lightweight(&format!("v{i}"), commit.as_object(), false).unwrap(); }
+            let signature = remote.signature().unwrap();
+            let oid = remote.commit(None, &signature, &signature, "Tag-only history", &commit.tree().unwrap(), &[]).unwrap();
+            remote.tag_lightweight("tag-only", remote.find_commit(oid).unwrap().as_object(), false).unwrap();
+            oid.to_string()
+        };
+        let before = submodule_versions_inner(path.clone(), "engine".into()).unwrap();
+        assert!(!before.versions.iter().any(|v| v.revision == new_head));
+        fetch_submodule_inner(path.clone(), "engine".into()).unwrap();
+        let after = submodule_versions_inner(path.clone(), "engine".into()).unwrap();
+        assert_eq!(after.versions.iter().filter(|v| v.kind == "remote").count(), 33);
+        assert_eq!(after.versions.iter().filter(|v| v.kind == "tag").count(), 89);
+        assert!(after.versions.iter().any(|v| v.name == "origin/feature/31" && v.revision == new_head));
+        assert!(after.versions.iter().any(|v| v.name == "tag-only" && v.revision == tag_only));
+        let graph = submodule_repository_inner(path, "engine".into()).unwrap();
+        assert!(graph.commits.iter().any(|c| c.id == new_head));
+        assert!(graph.commits.iter().any(|c| c.id == tag_only));
+        assert_eq!(run_git_capture(&local, &["rev-parse", "HEAD"]), head);
+        assert_eq!(run_git_capture(&parent, &["rev-parse", ":engine"]), gitlink);
+        assert_eq!(run_git_capture(&parent, &["rev-parse", "HEAD"]), parent_head);
+        assert_eq!(run_git_capture(&local, &["diff", "--cached"]), staged);
+        assert_eq!(run_git_capture(&local, &["diff"]), unstaged);
+        fs::remove_dir_all(base).unwrap();
     }
 
     #[test]

@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Git DrillDown</title>
   <link rel="icon" type="image/png" href="assets/git-drilldown-mark.png">
-  <link rel="stylesheet" href="styles.css?v=20261015-snapshot-download">
+  <link rel="stylesheet" href="styles.css?v=20261016-submodule-readd">
 </head>
 <body>
   <div class="app-shell">
@@ -43,7 +43,7 @@
       </div>
     </header>
 
-    <main class="main-layout">
+    <main class="main-layout details-empty-state">
       <aside class="sidebar">
         <button class="nav-item active" id="navExplorer"><span class="nav-icon">▰</span><span>Project Explorer</span></button>
         <button class="nav-item" id="navCommander"><span class="nav-icon">⇄</span><span>Compare & Sync</span></button>
@@ -237,7 +237,8 @@
     <section id="submoduleMenu" class="submodule-menu" hidden aria-label="Submodule versions">
       <header>
         <div><span>SUBMODULE VERSION</span><strong id="submoduleMenuName">Submodule</strong></div>
-        <button id="refreshSubmoduleMenu" title="Refresh branches, tags and current submodule state">↻</button>
+        <button id="fetchSubmoduleVersions" class="version-fetch-button" title="Fetch all origin branches and tags, then refresh this list. Does not change checkout or the project's selected version.">↓ Fetch versions</button>
+        <button id="refreshSubmoduleMenu" title="Refresh local branches, tags and current submodule state from disk. Does not contact the server.">↻</button>
         <button id="closeSubmoduleMenu">×</button>
       </header>
       <div class="version-current"><span>Current</span><code id="currentSubmoduleVersion">—</code><button id="submoduleMenuNewBranch" title="Create a new branch in this submodule, from its current commit">＋ New branch…</button></div>
@@ -370,9 +371,16 @@
       <strong id="compareActionStatus" role="status" class="compare-status-line">Ready — choose one action for this file.</strong>
       <div class="compare-diff-nav" aria-label="Difference navigation">
         <span id="compareDiffStatus">No differences loaded yet.</span>
+        <label class="compare-find" title="Find text in either loaded version">
+          <span class="sr-only">Find in comparison</span>
+          <input id="compareSearch" type="search" placeholder="Find in file…" autocomplete="off" spellcheck="false">
+          <output id="compareSearchStatus" aria-live="polite"></output>
+        </label>
+        <button type="button" id="previousCompareSearch" class="compare-find-step" title="Previous text match (Shift+Enter)" aria-label="Previous text match" disabled>↑</button>
+        <button type="button" id="nextCompareSearch" class="compare-find-step" title="Next text match (Enter)" aria-label="Next text match" disabled>↓</button>
         <button type="button" id="compareDownload" class="snapshot-download" title="Download both loaded text versions into left and right folders" aria-label="Download both file versions" disabled>⇩</button>
-        <button type="button" id="previousCompareDifference" disabled>↑ Previous difference</button>
-        <button type="button" id="nextCompareDifference" disabled>↓ Next difference</button>
+        <button type="button" id="previousCompareDifference" disabled>↑ Previous block</button>
+        <button type="button" id="nextCompareDifference" disabled>↓ Next block</button>
       </div>
       <div class="compare-head"><span>LOCAL</span><span>REMOTE</span></div>
       <div class="compare-content"><pre id="localCompare"></pre><pre id="remoteCompare"></pre></div>
@@ -408,9 +416,16 @@
           <button type="button" id="editLocalDriveDiff" role="tab">Aligned editor</button>
         </div>
         <div class="local-drive-difference-tools">
+          <label class="local-drive-compare-find" title="Find text in either side">
+            <span class="sr-only">Find in comparison</span>
+            <input id="localDriveCompareSearch" type="search" placeholder="Find in files…" autocomplete="off" spellcheck="false">
+            <output id="localDriveCompareSearchStatus" aria-live="polite"></output>
+          </label>
+          <button type="button" id="previousLocalDriveSearch" title="Previous text match (Shift+Enter)" aria-label="Previous text match" disabled>↑</button>
+          <button type="button" id="nextLocalDriveSearch" title="Next text match (Enter)" aria-label="Next text match" disabled>↓</button>
           <button type="button" id="downloadLocalDriveComparison" class="snapshot-download" title="Download both displayed texts, including unsaved prepared edits, without saving to the originals" aria-label="Download both displayed file versions" disabled>⇩</button>
-          <button type="button" id="previousLocalDriveDifference" title="Go to the previous important difference">↑ Previous</button>
-          <button type="button" id="nextLocalDriveDifference" title="Go to the next important difference">↓ Next</button>
+          <button type="button" id="previousLocalDriveDifference" title="Go to the previous changed block">↑ Previous block</button>
+          <button type="button" id="nextLocalDriveDifference" title="Go to the next changed block">↓ Next block</button>
           <label title="Changes ignored by this rule remain visible but are not treated as merge blocks">Rules
             <select id="localDriveComparisonRules" aria-label="Text comparison rules">
               <option value="exact">Exact text</option>
@@ -772,16 +787,16 @@
       <footer><span>Adds a saved message only — no commit.</span><button value="cancel">Cancel</button><button type="button" id="polarionAdd" class="confirm" disabled>Add to Commit List</button></footer>
     </form>
   </dialog>
-  <script src="polarion.js?v=20261015-snapshot-download"></script>
-  <script src="console-context.js?v=20261015-snapshot-download"></script>
-  <script src="graph-model.js?v=20261015-snapshot-download"></script>
-  <script src="submodule-state.js?v=20261015-snapshot-download"></script>
-  <script src="submodule-versions.js?v=20261015-snapshot-download"></script>
-  <script src="local-diff.js?v=20261015-snapshot-download"></script>
-  <script src="local-drive.js?v=20261015-snapshot-download"></script>
-  <script src="pr-status.js?v=20261015-snapshot-download"></script>
-  <script src="refresh-coordinator.js?v=20261015-snapshot-download"></script>
-  <script src="comparison-authors.js?v=20261015-snapshot-download"></script>
-  <script src="app.js?v=20261015-snapshot-download"></script>
+  <script src="polarion.js?v=20261016-submodule-readd"></script>
+  <script src="console-context.js?v=20261016-submodule-readd"></script>
+  <script src="graph-model.js?v=20261016-submodule-readd"></script>
+  <script src="submodule-state.js?v=20261016-submodule-readd"></script>
+  <script src="submodule-versions.js?v=20261016-submodule-readd"></script>
+  <script src="local-diff.js?v=20261016-submodule-readd"></script>
+  <script src="local-drive.js?v=20261016-submodule-readd"></script>
+  <script src="pr-status.js?v=20261016-submodule-readd"></script>
+  <script src="refresh-coordinator.js?v=20261016-submodule-readd"></script>
+  <script src="comparison-authors.js?v=20261016-submodule-readd"></script>
+  <script src="app.js?v=20261016-submodule-readd"></script>
 </body>
 </html>

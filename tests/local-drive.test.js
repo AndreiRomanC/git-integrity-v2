@@ -49,6 +49,7 @@ function fakeComparisonDocument() {
     'localDriveCompareRightContent', 'showLocalDriveDiff', 'editLocalDriveDiff', 'copyAllLocalDriveRight',
     'localDriveAlignedEditors', 'localDriveResultPreview', 'localDriveResultStats', 'undoLocalDriveResult',
     'previousLocalDriveDifference', 'nextLocalDriveDifference', 'localDriveComparisonRules',
+    'localDriveCompareSearch', 'localDriveCompareSearchStatus', 'previousLocalDriveSearch', 'nextLocalDriveSearch',
     'resetLocalDriveResult', 'saveLocalDriveCompareLeft', 'saveLocalDriveCompareRight', 'localDriveCompareState',
     'closeLocalDriveCompare', 'cancelLocalDriveCompare',
     'localFolderMergeDialog', 'localFolderMergeTitle', 'localFolderMergeSummary', 'localFolderCompareMode', 'localFolderGuidedMode',
@@ -213,6 +214,39 @@ test('F2 compares the selected file from each pane with two reads and no filesys
   assert.equal(calls.some(call => call.command === 'write_local_text_file'), false);
   assert.match(document.nodes.localDriveCompareSummary.textContent, /^Identical text/);
   assert.equal(document.nodes.localDriveCompareDialog.open, true);
+});
+
+test('file comparison searches both sides and navigates complete changed blocks', async () => {
+  const dom = fakeLocalDriveDom();
+  const document = fakeComparisonDocument();
+  document.nodes.localDriveComparisonRules.value = 'exact';
+  const invoke = async (command, args) => {
+    if (command === 'list_local_directory') return { path: args.path, parent: '/', entries: [{ name: 'file.txt', path: `${args.path}/file.txt`, kind: 'file' }] };
+    if (command === 'read_local_text_file') return args.path === '/repo/file.txt'
+      ? { content: 'same\nneedle right\nright block\nsame again\nlast right\n', encoding: 'utf-8' }
+      : { content: 'same\nneedle left\nleft block\nsame again\nlast left\n', encoding: 'utf-8' };
+    throw new Error(command);
+  };
+  const workspace = create({ root: dom.root, document, invoke, diff: require('../frontend/local-diff.js') });
+  await workspace.activate('/repo');
+  for (const side of ['left', 'right']) {
+    const row = { dataset: { driveEntry: '0' }, classList: classList() };
+    dom.panes[side].entryButtons = [row];
+    dom.listeners.click({ target: { closest: selector => selector === '[data-drive-side]' ? dom.panes[side] : selector === '[data-drive-entry]' ? row : null } });
+  }
+  dom.listeners.click({ target: { closest: selector => selector === '[data-drive-shortcut]' ? { dataset: { driveShortcut: 'compare' } } : null } });
+  await new Promise(resolve => setImmediate(resolve));
+
+  document.nodes.nextLocalDriveDifference.listeners.click();
+  assert.equal(document.nodes.localDriveCompareState.textContent, 'Changed block 1 of 2');
+  assert.equal((document.nodes.localDriveDiffRows.innerHTML.match(/active-difference/g) || []).length, 2, 'the complete first block is highlighted');
+
+  document.nodes.localDriveCompareSearch.value = 'needle';
+  document.nodes.localDriveCompareSearch.listeners.input();
+  assert.match(document.nodes.localDriveDiffRows.innerHTML, /<mark>needle<\/mark>/i);
+  assert.equal(document.nodes.localDriveCompareSearchStatus.textContent, '1');
+  document.nodes.nextLocalDriveSearch.listeners.click();
+  assert.equal(document.nodes.localDriveCompareSearchStatus.textContent, '1/1');
 });
 
 test('the comparison line action preserves unrelated result lines and writes only after Save', async () => {

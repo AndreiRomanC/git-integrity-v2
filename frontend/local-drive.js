@@ -89,6 +89,10 @@
       showEdit: documentRef?.querySelector('#editLocalDriveDiff'),
       previousDifference: documentRef?.querySelector('#previousLocalDriveDifference'),
       nextDifference: documentRef?.querySelector('#nextLocalDriveDifference'),
+      search: documentRef?.querySelector('#localDriveCompareSearch'),
+      searchStatus: documentRef?.querySelector('#localDriveCompareSearchStatus'),
+      previousSearch: documentRef?.querySelector('#previousLocalDriveSearch'),
+      nextSearch: documentRef?.querySelector('#nextLocalDriveSearch'),
       rules: documentRef?.querySelector('#localDriveComparisonRules'),
       copyAllRight: documentRef?.querySelector('#copyAllLocalDriveRight'),
       undoResult: documentRef?.querySelector('#undoLocalDriveResult'),
@@ -102,7 +106,7 @@
       leftText: '', rightText: '', leftEncoding: 'utf-8', rightEncoding: 'utf-8',
       leftFingerprint: '', rightFingerprint: '', mergeRows: [], resultHistory: [],
       mode: 'diff', generation: 0, loading: false, returnToFolderMerge: false,
-      activeDifferenceRow: -1, readOnly: false,
+      activeDifferenceRow: -1, activeDifferenceHunk: -1, searchRows: [], activeSearchRow: -1, readOnly: false,
     };
     const folderMerge = {
       download: documentRef?.querySelector('#downloadLocalFolderComparison'),
@@ -500,8 +504,10 @@
       if (comparison.copyAllRight) comparison.copyAllRight.disabled = comparison.readOnly || comparison.loading;
       if (comparison.undoResult) comparison.undoResult.disabled = comparison.readOnly || comparison.loading || !comparison.resultHistory.length;
       if (comparison.resetResult) comparison.resetResult.disabled = comparison.readOnly || comparison.loading || !rightDirty;
-      if (comparison.previousDifference) comparison.previousDifference.disabled = comparison.loading;
-      if (comparison.nextDifference) comparison.nextDifference.disabled = comparison.loading;
+      if (comparison.previousDifference) comparison.previousDifference.disabled = comparison.loading || !comparison.diff?.hunks?.length;
+      if (comparison.nextDifference) comparison.nextDifference.disabled = comparison.loading || !comparison.diff?.hunks?.length;
+      if (comparison.previousSearch) comparison.previousSearch.disabled = comparison.loading || !comparison.searchRows.length;
+      if (comparison.nextSearch) comparison.nextSearch.disabled = comparison.loading || !comparison.searchRows.length;
       if (!comparison.stateNode) return;
       if (message) comparison.stateNode.textContent = message;
       else if (comparison.readOnly) comparison.stateNode.textContent = 'Folder comparison · read-only';
@@ -515,16 +521,40 @@
       return comparison.rules?.value || 'exact';
     }
 
-    function renderDiffLine(text, lineNumber, side, same, ignored = false) {
+    function highlightedComparisonText(text, query = '') {
+      const value = String(text ?? '');
+      const needle = String(query || '').trim();
+      if (!needle) return escapeHtml(value) || ' ';
+      const lower = value.toLocaleLowerCase();
+      const lowerNeedle = needle.toLocaleLowerCase();
+      let cursor = 0, html = '', count = 0;
+      while (count < 200) {
+        const index = lower.indexOf(lowerNeedle, cursor);
+        if (index < 0) break;
+        html += escapeHtml(value.slice(cursor, index));
+        html += `<mark>${escapeHtml(value.slice(index, index + needle.length))}</mark>`;
+        cursor = index + needle.length;
+        count++;
+      }
+      return html + escapeHtml(value.slice(cursor)) || ' ';
+    }
+
+    function renderDiffLine(text, lineNumber, side, same, ignored = false, query = '') {
       const kind = text === null ? 'filler' : ignored ? `ignored ${side}` : same ? 'same' : `changed ${side}`;
       const number = lineNumber === null ? '' : lineNumber;
-      return `<code class="local-drive-diff-line ${kind}"><i>${number}</i><span>${text === null ? '' : escapeHtml(text) || ' '}</span></code>`;
+      return `<code class="local-drive-diff-line ${kind}"><i>${number}</i><span>${text === null ? '' : highlightedComparisonText(text, query)}</span></code>`;
     }
 
     function renderComparison() {
       if (!diffEngine || !comparison.diffRows) return;
       const diff = diffEngine.buildLineDiff(comparison.leftText, comparison.rightText, undefined, comparisonRules());
+      comparison.diff = diff;
       const previewRows = diff.rows.slice(0, maxDiffPreviewRows);
+      const query = comparison.search?.value.trim() || '';
+      const lowerQuery = query.toLocaleLowerCase();
+      comparison.searchRows = previewRows.map((row, rowIndex) => lowerQuery && [row.left, row.right].some(text => text !== null && String(text).toLocaleLowerCase().includes(lowerQuery)) ? rowIndex : -1).filter(rowIndex => rowIndex >= 0);
+      if (!comparison.searchRows.includes(comparison.activeSearchRow)) comparison.activeSearchRow = -1;
+      if (comparison.activeDifferenceHunk >= diff.hunks.length) comparison.activeDifferenceHunk = -1;
       comparison.diffRows.innerHTML = previewRows.map((row, rowIndex) => {
         const multiRowBlock = row.hunkFirst && diff.hunks[row.hunkIndex]?.rowCount > 1;
         const lineTitle = row.left === null
@@ -535,7 +565,8 @@
         const mergeButtons = row.same || comparison.readOnly
           ? '<div class="local-drive-hunk-actions"><i title="Lines match under the selected rules"></i></div>'
           : `<div class="local-drive-hunk-actions"><button type="button" class="line-merge ${row.left === null ? 'delete-line' : ''}" data-local-diff-row="${rowIndex}" title="${lineTitle}">${row.left === null ? 'Delete' : '→'}</button>${multiRowBlock ? `<button type="button" class="block-merge" data-local-diff-block="${row.hunkIndex}" title="Replace this complete changed section on the right">Block →</button>` : ''}</div>`;
-        return `<div class="local-drive-diff-row ${comparison.activeDifferenceRow === rowIndex ? 'active-difference' : ''}" data-diff-row="${rowIndex}">${renderDiffLine(row.left, row.leftNumber, 'left', row.same, row.ignored)}${mergeButtons}${renderDiffLine(row.right, row.rightNumber, 'right', row.same, row.ignored)}</div>`;
+        const rowClasses = [row.hunkIndex === comparison.activeDifferenceHunk ? 'active-difference' : '', rowIndex === comparison.activeSearchRow ? 'active-search-match' : ''].filter(Boolean).join(' ');
+        return `<div class="local-drive-diff-row ${rowClasses}" data-diff-row="${rowIndex}" data-diff-hunk="${row.hunkIndex ?? ''}">${renderDiffLine(row.left, row.leftNumber, 'left', row.same, row.ignored, query)}${mergeButtons}${renderDiffLine(row.right, row.rightNumber, 'right', row.same, row.ignored, query)}</div>`;
       }).join('') || '<div class="local-drive-diff-empty">Both files are empty and identical.</div>';
       if (diff.rows.length > maxDiffPreviewRows) {
         comparison.diffRows.insertAdjacentHTML('beforeend', `<div class="local-drive-diff-limit">Preview stopped after ${maxDiffPreviewRows.toLocaleString()} aligned rows. Editing and saving still use the complete files.</div>`);
@@ -549,6 +580,9 @@
           ? `Equivalent with selected rules · ${diff.ignoredDifferences.toLocaleString()} ignored line difference${diff.ignoredDifferences === 1 ? '' : 's'}${encodings}`
           : `${diff.hunks.length.toLocaleString()} changed block${diff.hunks.length === 1 ? '' : 's'}${diff.ignoredDifferences ? ` · ${diff.ignoredDifferences.toLocaleString()} ignored` : ''}${qualifier}${encodings}`);
       comparison.summary.classList.toggle('identical', diff.equivalent);
+      if (comparison.searchStatus) comparison.searchStatus.textContent = query
+        ? comparison.searchRows.length ? comparison.activeSearchRow >= 0 ? `${comparison.searchRows.indexOf(comparison.activeSearchRow) + 1}/${comparison.searchRows.length}` : `${comparison.searchRows.length}` : '0'
+        : '';
       updateComparisonState();
     }
 
@@ -596,6 +630,11 @@
       comparison.mergeRows = [];
       comparison.resultHistory = [];
       comparison.activeDifferenceRow = -1;
+      comparison.activeDifferenceHunk = -1;
+      comparison.searchRows = [];
+      comparison.activeSearchRow = -1;
+      if (comparison.search) comparison.search.value = '';
+      if (comparison.searchStatus) comparison.searchStatus.textContent = '';
       comparison.readOnly = readOnly;
       comparison.returnToFolderMerge = returnToFolderMerge;
       const leftDisplayPath = pair.left.displayPath || pair.left.path || '(missing on left)';
@@ -670,6 +709,7 @@
       comparison.leftText = merged.leftText;
       comparison.rightText = merged.rightText;
       comparison.activeDifferenceRow = -1;
+      comparison.activeDifferenceHunk = -1;
       renderComparison();
       updateComparisonState('One aligned line prepared on the right · all other lines were preserved · not saved yet');
     }
@@ -677,18 +717,30 @@
     function navigateComparisonDifference(direction) {
       if (comparison.loading) return;
       const diff = diffEngine.buildLineDiff(comparison.leftText, comparison.rightText, undefined, comparisonRules());
-      const rows = diff.rows.slice(0, maxDiffPreviewRows).map((row, index) => row.same ? -1 : index).filter(index => index >= 0);
-      if (!rows.length) {
+      const hunks = diff.hunks.map((hunk, index) => ({ ...hunk, index, startRow: diff.rows.findIndex(row => row.hunkIndex === index) })).filter(hunk => hunk.startRow >= 0 && hunk.startRow < maxDiffPreviewRows);
+      if (!hunks.length) {
         comparison.activeDifferenceRow = -1;
+        comparison.activeDifferenceHunk = -1;
         updateComparisonState('No important differences under the selected rules');
         return;
       }
-      const current = comparison.activeDifferenceRow;
-      if (direction < 0) comparison.activeDifferenceRow = [...rows].reverse().find(index => index < current) ?? rows.at(-1);
-      else comparison.activeDifferenceRow = rows.find(index => index > current) ?? rows[0];
+      const current = hunks.findIndex(hunk => hunk.index === comparison.activeDifferenceHunk);
+      const next = current < 0 ? (direction < 0 ? hunks.length - 1 : 0) : (current + direction + hunks.length) % hunks.length;
+      const hunk = hunks[next];
+      comparison.activeDifferenceHunk = hunk.index;
+      comparison.activeDifferenceRow = hunk.startRow;
       renderComparison();
       comparison.diffRows.querySelector?.(`[data-diff-row="${comparison.activeDifferenceRow}"]`)?.scrollIntoView?.({ block: 'center' });
-      updateComparisonState(`Difference ${rows.indexOf(comparison.activeDifferenceRow) + 1} of ${rows.length}`);
+      updateComparisonState(`Changed block ${next + 1} of ${hunks.length}`);
+    }
+
+    function navigateComparisonSearch(direction) {
+      if (comparison.loading || !comparison.searchRows.length) return;
+      const current = comparison.searchRows.indexOf(comparison.activeSearchRow);
+      const next = current < 0 ? (direction < 0 ? comparison.searchRows.length - 1 : 0) : (current + direction + comparison.searchRows.length) % comparison.searchRows.length;
+      comparison.activeSearchRow = comparison.searchRows[next];
+      renderComparison();
+      comparison.diffRows.querySelector?.(`[data-diff-row="${comparison.activeSearchRow}"]`)?.scrollIntoView?.({ block: 'center' });
     }
 
     function copyWholeComparison(direction) {
@@ -1175,6 +1227,18 @@
     comparison.showEdit?.addEventListener('click', () => setComparisonMode('edit'));
     comparison.previousDifference?.addEventListener('click', () => navigateComparisonDifference(-1));
     comparison.nextDifference?.addEventListener('click', () => navigateComparisonDifference(1));
+    comparison.previousSearch?.addEventListener('click', () => navigateComparisonSearch(-1));
+    comparison.nextSearch?.addEventListener('click', () => navigateComparisonSearch(1));
+    comparison.search?.addEventListener('input', () => {
+      comparison.activeSearchRow = -1;
+      if (comparison.mode === 'diff') renderComparison();
+    });
+    comparison.search?.addEventListener('keydown', event => {
+      if (event.key === 'Enter') { event.preventDefault(); navigateComparisonSearch(event.shiftKey ? -1 : 1); }
+      else if (event.key === 'Escape' && comparison.search.value) {
+        event.preventDefault(); comparison.search.value = ''; comparison.activeSearchRow = -1; renderComparison();
+      }
+    });
     comparison.download?.addEventListener('click', async () => {
       if (comparison.loading) return;
       syncComparisonEditors();
@@ -1196,6 +1260,7 @@
     });
     comparison.rules?.addEventListener('change', () => {
       comparison.activeDifferenceRow = -1;
+      comparison.activeDifferenceHunk = -1;
       if (comparison.mode === 'diff') renderComparison();
     });
     comparison.copyAllRight?.addEventListener('click', () => copyWholeComparison('left-to-right'));

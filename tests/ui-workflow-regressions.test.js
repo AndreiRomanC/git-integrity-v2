@@ -302,7 +302,7 @@ test('a selected submodule can be promoted to the normal full repository context
   assert.match(css, /\.parent-repository-button/);
   assert.match(css, /\.recent-repo-btn\.submodule-recent/);
   assert.match(css, /\.recent-repos-bar \{[^}]*height: 24px/);
-  assert.match(css, /\.recent-repo-btn \{[^}]*max-width: 108px/);
+  assert.match(css, /\.recent-repo-btn \{[^}]*max-width: 156px/);
   assert.match(css, /button\[data-detail-action="subopenfull"\] \{ flex: 1 1 100%;/);
   assert.doesNotMatch(css, /button\[data-detail-action="subopenfull"\]::before/);
 });
@@ -792,8 +792,8 @@ test('detached dirty submodules ask for a branch before commit or push', () => {
   assert.match(app, /Detached HEAD/);
   assert.match(app, /Commit\/Push needs a local branch/);
   assert.match(app, /data-detail-action="subnewbranch">Create branch here…/);
-  assert.match(css, /\.detached-work-banner \{ display: grid; grid-template-columns: 10px minmax\(0, 1fr\)/);
-  assert.match(css, /\.detached-work-banner button \{ grid-column: 2;/);
+  assert.match(css, /\.submodule-guidance \{ min-height: 34px; display: grid;/);
+  assert.match(css, /\.submodule-guidance button \{/);
   assert.match(app, /Commit requires an attached local branch/);
   assert.match(app, /Push requires an attached local branch/);
 });
