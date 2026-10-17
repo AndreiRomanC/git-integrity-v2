@@ -47,6 +47,7 @@
   const hasErrors = item => Boolean(item?.meta?.errors?.length);
   const route = url => {
     const p = url.pathname.split('/').slice(4);
+    if (p.length === 2 && p[0] === 'all' && p[1] === 'documents') return 'all_documents';
     if (p.length === 1 && ['metadata', 'user', 'projects'].includes(p[0])) return p[0];
     if (p[0] !== 'projects' || !p[1]) return 'unknown';
     if (p.length === 2) return 'project';
@@ -58,6 +59,34 @@
     return p.length === 7 && p[4] === 'documents' && p[6] === 'parts' ? 'parts' : 'unknown';
   };
   const resourceTypes = ['metadata', 'users', 'projects', 'workitems', 'documents', 'pages', 'spaces', 'document_parts', 'linkedworkitems'];
+  const safeFields = ['id','name','title','type','status','moduleName','moduleFolder','created','updated','description','assignee','module','workItem','sourceWorkItem','level','revision','role','nextPart','previousPart','@all'];
+  const safeRelationships = ['assignee','module','workItem','sourceWorkItem','nextPart','previousPart'];
+  const technicalType = value => {
+    const id = value && typeof value === 'object' ? value.id : value;
+    return typeof id === 'string' && /^[A-Za-z][A-Za-z0-9_.-]{0,79}$/.test(id) ? id : '';
+  };
+  const responseFacts = data => {
+    const rows = (Array.isArray(data.data) ? data.data : data.data ? [data.data] : []).slice(0, 10);
+    const included = Array.isArray(data.included) ? data.included.slice(0, 10) : [];
+    const fields = new Set(), relationships = new Set(), types = new Set();
+    let module_links = 0, workitem_links = 0;
+    for (const row of [...rows, ...included]) {
+      if (!resourceTypes.includes(row?.type)) continue;
+      for (const key of Object.keys(row.attributes || {})) if (safeFields.includes(key)) fields.add(row.type + '.' + key);
+      for (const key of Object.keys(row.relationships || {})) if (safeRelationships.includes(key)) relationships.add(row.type + '.' + key);
+      if (['workitems', 'documents', 'document_parts'].includes(row.type)) {
+        const type = technicalType(row.attributes?.type); if (type) types.add(type);
+      }
+    }
+    for (const row of rows) {
+      if (row?.relationships?.module?.data?.type === 'documents') module_links++;
+      if (row?.relationships?.workItem?.data?.type === 'workitems') workitem_links++;
+    }
+    return { shape: Array.isArray(data.data) ? 'list' : data.data ? 'single' : 'missing', sample_rows: rows.length,
+      returned_fields: [...fields].sort().slice(0, 32), relationship_fields: [...relationships].sort().slice(0, 32),
+      item_types: [...types].sort().slice(0, 12), module_links, workitem_links,
+      included_workitems: included.filter(row => row?.type === 'workitems' && !hasErrors(row)).length };
+  };
   // Error bodies are used only to derive fixed categories. No message, URL,
   // header value, query text or response content is sent to the desktop log.
   const errorInfo = async response => {
@@ -120,6 +149,13 @@
       if (parsed.origin !== location.origin || !parsed.pathname.startsWith('/polarion/rest/v1/')) throw { code: 'invalid_response' };
       const started = Date.now(), query = parsed.searchParams.get('query') || '';
       const entry = { step, route: route(parsed), code: 'network_error', http: 0, page: Number(parsed.searchParams.get('page[number]') || 1), query: Boolean(query), id_star: /\bid:\*/.test(query), leading_wildcard: /\(\*|AND \*/.test(query), media: '', reason: '', parameter: '', resource_type: '', count: 0, more: false, allow: [] };
+      entry.query_kind = !query ? 'none' : /^module\.id:/.test(query) ? 'module_name' : /^project\.id:/.test(query) ? 'project_scope' : /(?:id|title):/.test(query) ? 'work_item_search' : 'other';
+      entry.requested_fields = [];
+      for (const [key, value] of parsed.searchParams) {
+        const resource = /^fields\[([a-z_]+)\]$/.exec(key)?.[1];
+        if (resourceTypes.includes(resource)) for (const field of value.split(',')) if (safeFields.includes(field)) entry.requested_fields.push(resource + '.' + field);
+      }
+      entry.requested_fields = [...new Set(entry.requested_fields)].sort().slice(0, 32);
       const controller = new AbortController(), cancel = () => controller.abort();
       abort.signal.addEventListener('abort', cancel, { once: true });
       if (abort.signal.aborted) controller.abort();
@@ -133,6 +169,7 @@
         if (response.type === 'opaqueredirect') throw { http, code: 'auth_required' };
         if (!response.ok) {
           Object.assign(entry, await errorInfo(response));
+          if (http === 405) entry.reason = 'method_not_allowed';
           throw { http, code: http === 401 ? 'auth_required' : http === 403 ? 'forbidden' : [404,405,501,503].includes(http) ? 'api_unavailable' : http === 400 ? 'query_rejected' : 'http_error' };
         }
         if (entry.media !== 'json') throw { http, code: 'not_json' };
@@ -141,6 +178,7 @@
         entry.resource_type = resourceTypes.includes(resource?.type) ? resource.type : '';
         entry.count = Array.isArray(data.data) ? data.data.length : data.data ? 1 : 0;
         entry.more = Boolean(data.links?.next);
+        Object.assign(entry, responseFacts(data));
         if (hasErrors(data)) { entry.reason = 'partial_errors'; throw { http, code: 'invalid_response' }; }
         entry.code = 'ok';
         return data;
@@ -153,23 +191,42 @@
       }
     };
     if (args.kind === 'diagnostics') {
-      const started = Date.now(), confirmed = new Set();
+      const started = Date.now(), confirmed = new Set(); let sampleId = '';
       for (const probe of args.probes || []) {
+        let probeUrl = probe.url;
+        if (probe.step === 'workitem_sample' && sampleId) {
+          const url = new URL(probe.url), [project, item] = sampleId.split('/');
+          url.pathname = '/polarion/rest/v1/projects/' + encodeURIComponent(project) + '/workitems/' + encodeURIComponent(item); probeUrl = url.href;
+        }
         if (Date.now() - started >= 25000 || abort.signal.aborted || (probe.requires && !confirmed.has(probe.requires))) {
-          const parsed = new URL(probe.url);
+          const parsed = new URL(probeUrl);
           trace({ step: probe.step, route: route(parsed), code: 'not_run', reason: probe.requires && !confirmed.has(probe.requires) ? 'prerequisite_missing' : 'budget', duration_ms: 0 }); continue;
         }
+        if (probe.step === 'workitem_sample' && !sampleId) {
+          trace({ step: probe.step, route: 'workitem', code: 'not_run', reason: 'sample_missing', duration_ms: 0 }); continue;
+        }
         try {
-          const data = await request(probe.url, probe.step, true), last = diagnostics[diagnostics.length - 1];
-          const expected = ['document_exact', 'document_parts', 'page_exact', 'metadata', 'current_user', 'project_access'].includes(probe.step)
-            ? ({ document_exact:'documents', document_parts:'document_parts', page_exact:'pages', metadata:'metadata', current_user:'users', project_access:'projects' })[probe.step]
-            : ['documents_catalog','space_documents'].includes(probe.step) ? 'documents' : probe.step === 'space_pages' ? 'pages' : probe.step === 'spaces' ? 'spaces' : 'workitems';
-          const single = ['document_exact', 'page_exact', 'metadata', 'current_user', 'project_access'].includes(probe.step);
+          const data = await request(probeUrl, probe.step, true), last = diagnostics[diagnostics.length - 1];
+          const expected = ['document_exact', 'document_parts', 'document_parts_expanded', 'page_exact', 'metadata', 'current_user', 'project_access'].includes(probe.step)
+            ? ({ document_exact:'documents', document_parts:'document_parts', document_parts_expanded:'document_parts', page_exact:'pages', metadata:'metadata', current_user:'users', project_access:'projects' })[probe.step]
+            : ['documents_catalog','documents_global','space_documents'].includes(probe.step) ? 'documents' : probe.step === 'space_pages' ? 'pages' : probe.step === 'spaces' ? 'spaces' : 'workitems';
+          const single = ['document_exact', 'page_exact', 'metadata', 'current_user', 'project_access', 'workitem_sample'].includes(probe.step);
           const rows = Array.isArray(data.data) ? data.data : data.data ? [data.data] : null;
           if (!rows || single === Array.isArray(data.data) || rows.some(item => item.type !== expected || hasErrors(item))) { last.code = 'invalid_response'; last.reason = 'unexpected_resource'; continue; }
+          if (['workitem_modules', 'document_name_query'].includes(probe.step) && rows.some(row => !validId(row.id, 2) || !row.id.startsWith(args.project + '/') ||
+            !row.relationships?.module?.data || row.relationships.module.data.type !== 'documents' || !validId(row.relationships.module.data.id, 3))) {
+            last.code = 'invalid_response'; last.reason = 'relationship_missing'; continue;
+          }
           if (['document_exact', 'page_exact'].includes(probe.step)) {
             if (data.data?.id !== args.resourceId) { last.code = 'invalid_response'; last.reason = 'unexpected_resource'; continue; }
             if (probe.step === 'document_exact') confirmed.add(probe.step);
+          }
+          if (probe.step === 'workitem_sample' && data.data?.id !== sampleId) { last.code = 'invalid_response'; last.reason = 'unexpected_resource'; continue; }
+          if (probe.step === 'document_parts_expanded') {
+            if (rows.length > 10 || rows.some(row => !row.id?.startsWith(args.resourceId + '/'))) { last.code = 'invalid_response'; last.reason = 'unexpected_resource'; continue; }
+            confirmed.add(probe.step);
+            sampleId = rows.map(row => row.attributes?.type === 'workitem' ? row.relationships?.workItem?.data : null)
+              .find(ref => ref?.type === 'workitems' && validId(ref.id, 2) && ref.id.startsWith(args.project + '/'))?.id || '';
           }
           if (probe.step === 'metadata') {
             const a = data.data?.attributes || {};
@@ -182,6 +239,72 @@
         } catch { /* Each failed GET is reported independently; never try a write. */ }
       }
       return reply({ code: 'ok' }); // Completed checks, NOT a claim that every endpoint is supported.
+    }
+    if (args.kind === 'documents') {
+      // Collection GETs are absent on some older Polarion servers, although
+      // exact Document reads and Work Item -> module relationships work.
+      // All fallbacks remain project-scoped GETs in this same browser session.
+      const key = '__ddtDocumentSearchV2_' + args.project, token = headers['X-Polarion-REST-Token'];
+      const queryKey = String(args.query || '').trim().toLowerCase(), cached = window[key];
+      const catalog_cached = Boolean(token && cached?.token === token && Date.now() - cached.time < 120000 &&
+        (cached.source !== 'work_item_modules' || cached.query === queryKey));
+      let items = catalog_cached ? cached.items : [], catalog_source = catalog_cached ? cached.source : '', catalog_pages = 0;
+      if (!catalog_cached) {
+        delete window[key];
+        const sources = [{ source: 'project_documents', url: args.url, step: 'catalog_page' },
+          { source: 'all_documents', url: args.documentGlobalUrl, step: 'document_global' },
+          { source: 'work_item_modules', url: args.documentModulesUrl, step: 'document_modules' }].filter(s => s.url);
+        for (let index = 0; index < sources.length; index++) {
+          const source = sources[index], modules = source.source === 'work_item_modules';
+          const seenRows = new Set(), documents = new Map();
+          let unavailable = false;
+          for (let page = 1; ; page++) {
+            if (page > 200) throw { code: 'catalog_limit' };
+            const url = new URL(source.url); url.searchParams.set('page[number]', String(page));
+            let data;
+            try { data = await request(url.href, source.step); }
+            catch (error) {
+              // Do not retry authentication/permission errors, transient server
+              // failures, invalid responses or a later failed catalog page.
+              if (page === 1 && [404, 405, 501].includes(error.http) && index < sources.length - 1) { unavailable = true; break; }
+              throw error;
+            }
+            catalog_pages++;
+            if (!Array.isArray(data.data) || data.data.length > 100) throw { code: 'invalid_response' };
+            let added = 0;
+            for (const row of data.data) {
+              if (hasErrors(row) || row.type !== (modules ? 'workitems' : 'documents') || !validId(row.id, modules ? 2 : 3) ||
+                (source.source !== 'all_documents' && !row.id.startsWith(args.project + '/'))) throw { code: 'invalid_response' };
+              if (seenRows.has(row.id)) continue;
+              seenRows.add(row.id); added++;
+              let doc = row;
+              if (modules) {
+                const relationship = row.relationships?.module;
+                // A name query returned matching Work Items but the requested
+                // relationship was omitted: don't claim there are no documents.
+                if (!relationship || hasErrors(relationship) || !relationship.data) throw { code: 'invalid_response' };
+                doc = relationship.data;
+                if (doc.type !== 'documents' || !validId(doc.id, 3)) throw { code: 'invalid_response' };
+              }
+              if (!doc.id.startsWith(args.project + '/')) continue;
+              const a = doc.attributes || {};
+              documents.set(doc.id, { id: doc.id, title: text(a.title || a.moduleName || doc.id.split('/').pop()), prefix: '', item_type: enumValue(a.type) });
+            }
+            if (!data.links?.next) break;
+            // Many consecutive pages can legitimately refer to the same
+            // document. Detect loops using Work Item IDs, not Document IDs.
+            if (!added) throw { code: 'invalid_response' };
+          }
+          if (unavailable) continue;
+          catalog_source = source.source; items = [...documents.values()].sort((a, b) => a.id.localeCompare(b.id)); break;
+        }
+        if (token) window[key] = { token, time: Date.now(), items, source: catalog_source, query: queryKey };
+      }
+      const words = queryKey.split(/\s+/).filter(Boolean);
+      const matches = items.filter(item => words.every(word => (item.id + ' ' + item.title).toLowerCase().includes(word)));
+      const start = ((args.page || 1) - 1) * 25;
+      return reply({ code: 'ok', http: 200, catalog_source, catalog_cached, catalog_pages, received: items.length, matched: matches.length,
+        items: matches.slice(start, start + 25).map(({ id, title, item_type }) => ({ id, title, item_type })), more: matches.length > start + 25 });
     }
     if (catalog) {
       const isProject = args.kind === 'projects', key = isProject ? '__ddtProjectCatalog' : '__ddtDocumentCatalog_' + args.project;

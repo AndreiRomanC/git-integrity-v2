@@ -43,7 +43,7 @@ function createPolarionTaskPicker({ invoke, addMessage }) {
   let mode = 'projects', lastSearch = null, page = 1, more = false, workspace = {};
   let mountedMode = '';
   const statusByMode = {};
-  const modeHint = () => mode === 'projects' ? 'Find a project, then select it to continue.' : mode === 'tasks' ? 'Find tasks in the selected project. Add a selected task to your commit list explicitly.' : 'Open a StructDoc using its Polarion link. Catalog search and diagnostics are optional.';
+  const modeHint = () => mode === 'projects' ? 'Find a project, then select it to continue.' : mode === 'tasks' ? 'Find tasks in the selected project. Add a selected task to your commit list explicitly.' : 'Find a StructDoc by name in the selected project, or open an exact Polarion document link.';
   const say = text => { statusByMode[mode] = text; el('Status').textContent = text; };
   const make = (tag, text, className = '') => { const node = document.createElement(tag); node.textContent = text; node.className = className; return node; };
   const button = (text, action) => { const node = make('button', text); node.type = 'button'; node.disabled = busy; node.addEventListener('click', action); return node; };
@@ -234,12 +234,16 @@ function createPolarionTaskPicker({ invoke, addMessage }) {
         params.user = otherUser ? el('User').value.trim() : identity?.id || el('User').value.trim();
         if (!params.user) throw new Error('Enter your Polarion user ID once, or Detect signed-in user. It is not inferred from Git.');
       }
-      clearResults(); clearDetail(); say('Searching Polarion…');
+      if (kind === 'documents' && params.query.length < 3) {
+        clearResults(); clearDetail(); throw new Error('Type at least three characters of the document name or path.');
+      }
+      clearResults(); clearDetail(); say(kind === 'documents' ? 'Finding documents · checking compatible read-only search…' : 'Searching Polarion…');
       const response = await invoke('polarion_search', { ...params, page: requestedPage });
       if (!current(ticket)) return;
       if (kind === 'documents' && ['api_unavailable', 'forbidden'].includes(response.code)) {
-        el('DocumentHint').textContent = 'The document catalog is unavailable for this server/session. Open a document by its exact Polarion link above; this does not require catalog access.';
-        say('Catalog search unavailable' + (response.http ? ' · HTTP ' + response.http : '') + '. Use Open document by link. Diagnostics can check access without changing anything.');
+        el('DocumentHint').textContent = 'Document search could not complete for this server/session. You can still try opening an exact Polarion document link.';
+        say((response.code === 'forbidden' ? 'Polarion refused search access; no further route was tried' : 'Document search unavailable') +
+          (response.http ? ' · HTTP ' + response.http : '') + '. Use Open document by link. The log records each attempted search route.');
         return;
       }
       const result = checked(response);
@@ -248,10 +252,15 @@ function createPolarionTaskPicker({ invoke, addMessage }) {
         identity = { id: params.user, source: 'manual' }; polarionRememberedUser(storage, identity);
       }
       lastSearch = params; page = requestedPage; more = result.more; render(result.items, kind);
+      const moduleSearch = kind === 'documents' && result.catalog_source === 'work_item_modules';
+      if (kind === 'documents') el('DocumentHint').textContent = moduleSearch
+        ? 'Compatibility search: document name/path fragments via Work Item → Document links. Empty documents and title-only matches may be missing. Select a result to read its full details.'
+        : 'Search covers accessible documents in the selected project. Select a result to read its full details; an exact link is optional.';
       say((kind === 'projects' || kind === 'documents' ? result.matched + ' matches / ' + result.received + ' accessible entries · ' : '') +
         'Page ' + page + ' · ' + result.items.length + ' shown' + (more ? ' · Next shows more' : '') +
         (result.prefix_fallback ? '. Server rejected contains search; prefix fallback was used.' : '') +
-        (result.catalog_cached ? '. Complete catalog cached for up to 2 minutes.' : '') +
+        (result.catalog_cached ? kind === 'documents' ? '. Search data cached for up to 2 minutes.' : '. Complete catalog cached for up to 2 minutes.' : '') +
+        (moduleSearch ? '. Compatibility search via linked work items; empty documents and title-only matches may be missing.' : '') +
         (kind === 'projects' ? '. Select a project.' : '. Select a result to read details or associate it locally.'));
     });
   }
@@ -302,24 +311,28 @@ function createPolarionTaskPicker({ invoke, addMessage }) {
     const result = checked(await invoke('polarion_diagnostics', {
       project: project?.id || '', resourceUrl: el('DiagnosticUrl').value.trim(),
       query: mode === 'documents' && el('DocumentSource').value === 'containers' ? el('DocumentQuery').value.trim() : '',
+      documentQuery: el('DocumentSource').value !== 'containers' && el('DocumentQuery').value.trim().length >= 3 ? el('DocumentQuery').value.trim() : '',
     }));
     if (!current(ticket)) return;
     const rows = result.diagnostics || [], ok = rows.filter(d => d.code === 'ok'), skipped = rows.filter(d => d.code === 'not_run');
-    const names = { metadata:'Server version', current_user:'Current user', project_access:'Project access', tasks_baseline:'Task query baseline', documents_catalog:'Project document catalog', spaces:'Project spaces', document_exact:'Exact LiveDoc', page_exact:'Exact page', space_documents:'Space document catalog', space_pages:'Space page catalog', document_parts:'LiveDoc elements', query_current:'Current work-item query', query_prefix:'Prefix query with id:*', query_without_id_star:'Prefix query without id:*' };
+    const names = { metadata:'Server version', current_user:'Current user', project_access:'Project access', tasks_baseline:'Task query baseline', documents_catalog:'Project document catalog', documents_global:'Global catalog · selected project', workitem_modules:'Work Item → Document links', document_name_query:'Current document name query', document_parts_expanded:'LiveDoc sample · first 10 parts + linked items', workitem_sample:'One linked work item · direct read', spaces:'Project spaces', document_exact:'Exact LiveDoc', page_exact:'Exact page', space_documents:'Space document catalog', space_pages:'Space page catalog', document_parts:'LiveDoc elements endpoint', query_current:'Current work-item query', query_prefix:'Prefix query with id:*', query_without_id_star:'Prefix query without id:*' };
     const report = el('DiagnosticReport');
     if (result.server_metadata?.version) report.append(make('strong', 'Polarion ' + result.server_metadata.version + (result.server_metadata.build ? ' · build ' + result.server_metadata.build : '')));
     for (const row of rows) {
       const line = make('div', '', 'polarion-diagnostic-result'); line.dataset.state = row.code;
       line.append(make('span', names[row.step] || 'Read check'), make('small',
         (row.code === 'ok' ? 'GET accepted' : row.code.replace(/_/g, ' ')) + (row.http ? ' · HTTP ' + row.http : '') +
-        (row.reason ? ' · ' + row.reason.replace(/_/g, ' ') : '') + ' · ' + (row.duration_ms || 0) + ' ms'));
+        (row.reason ? ' · ' + row.reason.replace(/_/g, ' ') : '') + ' · ' + (row.duration_ms || 0) + ' ms' +
+        (row.item_types?.length ? ' · types: ' + row.item_types.join(', ') : '') +
+        (row.step === 'document_parts_expanded' && row.code === 'ok' ? ' · ' + (row.workitem_links || 0) + ' work-item links / ' + (row.included_workitems || 0) + ' included details (sample only)' : '')));
       report.append(line);
     }
     if (ok.length) connection('connected', 'Connected · read access verified');
     else if (rows.some(d => d.code === 'auth_required')) connection('required', 'Sign-in required · open Polarion and retry');
     const exact = rows.some(d => d.step === 'document_exact' && d.code === 'ok');
     const parts = rows.some(d => d.step === 'document_parts' && d.code === 'ok');
-    el('DiagnosticSummary').textContent = exact ? 'Exact LiveDoc readable' + (parts ? ' · elements endpoint readable' : '') + '. Use Open document above; these checks do not associate it.' : ok.length + '/' + rows.length + ' read checks accepted. Expand the results for individual failures.';
+    el('DiagnosticSummary').textContent = (exact ? 'Exact LiveDoc readable' + (parts ? ' · elements endpoint readable' : '') + '. ' : ok.length + '/' + rows.length + ' read checks accepted. ') +
+      'Element checks sample at most 10 parts and one linked work item; they do not verify the whole document. No association is changed.';
     say('Read checks: ' + ok.length + '/' + rows.length + ' accepted' + (skipped.length ? ' · ' + skipped.length + ' not run' : '') + '. Details are in this tab and the application log. No data or associations changed.');
   });
   el('Diagnostics').addEventListener('click', runDiagnostics);
@@ -361,7 +374,7 @@ function createPolarionTaskPicker({ invoke, addMessage }) {
       for (const id of ['ProjectQuery','TaskQuery','DocumentQuery','ElementQuery','User']) el(id).value = '';
       el('DiagnosticUrl').value = ''; el('DiagnosticReport').replaceChildren();
       el('DiagnosticSummary').textContent = 'Optional, explicit GET checks. Results stay in this tab and the log.';
-      el('DocumentHint').textContent = 'Paste a LiveDoc link to open it directly, even when the server does not support catalog search.';
+      el('DocumentHint').textContent = 'Search by name above, or paste an exact LiveDoc link to open it directly.';
       el('Context').textContent = ''; el('ElementType').value = ''; clearResults(); clearDetail(); renderSaved(); renderElements();
       dialog.showModal(); say('Reading local Polarion associations…');
       try {

@@ -173,6 +173,7 @@ test('saved StructDoc elements are not rendered during ordinary task searches', 
 
 test('diagnostics are explicit, preserve associations and never replace normal search results or commit messages', async () => {
   const h = harness(); await inProject(h); h.el('TabDocuments').handlers.click();
+  h.el('DocumentQuery').value = 'Doc';
   h.search(async () => ({ code: 'ok', items: [{ id: 'P/S/D', title: 'Document', item_type: 'structureDocument' }] }));
   await h.el('DocumentSearchButton').handlers.click(); h.el('Results').children[0].handlers.click();
   const before = h.calls.length, selected = h.el('Results').children[0];
@@ -183,6 +184,7 @@ test('diagnostics are explicit, preserve associations and never replace normal s
   await h.el('Diagnostics').handlers.click();
   assert.equal(h.calls.length, before + 1); assert.equal(h.calls.at(-1).name, 'polarion_diagnostics');
   assert.equal(h.calls.at(-1).args.project, 'P'); assert.equal(h.calls.at(-1).args.query, '');
+  assert.equal(h.calls.at(-1).args.documentQuery, 'Doc');
   assert.equal(h.el('Results').children[0], selected); assert.equal(h.messages.length, 0);
   assert.match(h.el('Status').textContent, /1\/2 accepted/);
   const html = fs.readFileSync(path.join(__dirname, '../frontend/index.html'), 'utf8');
@@ -195,8 +197,24 @@ test('work-item diagnostics test the current fragment only in that mode', async 
   h.el('TabDocuments').handlers.click(); h.el('DocumentSource').value = 'containers'; h.el('DocumentQuery').value = 'errm';
   await h.el('Diagnostics').handlers.click();
   assert.equal(h.calls.at(-1).args.query, 'errm');
+  assert.equal(h.calls.at(-1).args.documentQuery, '');
   h.el('DocumentSource').value = 'documents'; await h.el('Diagnostics').handlers.click();
   assert.equal(h.calls.at(-1).args.query, '');
+  assert.equal(h.calls.at(-1).args.documentQuery, 'errm');
+});
+test('diagnostic UI shows observed element types and sample limits, not a claim of full document access', async () => {
+  const h = harness(); await inProject(h); h.el('TabDocuments').handlers.click();
+  h.overrides.polarion_diagnostics = async () => ({ code: 'ok', diagnostics: [
+    { step: 'document_exact', code: 'ok', http: 200 },
+    { step: 'document_parts_expanded', code: 'ok', http: 200, workitem_links: 3, included_workitems: 2, item_types: ['architecturalElement','designElement'] },
+    { step: 'workitem_sample', code: 'forbidden', http: 403 },
+  ] });
+  await h.el('Diagnostics').handlers.click();
+  assert.match(h.el('DiagnosticReport').children[1].children[1].textContent, /architecturalElement, designElement/);
+  assert.match(h.el('DiagnosticReport').children[1].children[1].textContent, /sample only/);
+  assert.match(h.el('DiagnosticSummary').textContent, /do not verify the whole document/);
+  assert.equal(h.calls.filter(c => c.name === 'polarion_connect' || c.name === 'polarion_read').length, 0);
+  assert.equal(h.calls.filter(c => c.name === 'polarion_workspace' && c.args.action !== 'load').length, 0);
 });
 test('late diagnostic replies cannot change a reopened dialog and do not trigger sign-in automatically', async () => {
   const h = harness(); await inProject(h); h.el('TabDocuments').handlers.click();
@@ -256,6 +274,37 @@ test('unavailable catalog guides users to the link without triggering retries or
   assert.equal(h.el('Connection').dataset.state, 'unknown');
   assert.match(h.el('Status').textContent, /Open document by link/);
   assert.equal(h.el('Results').hidden, true); assert.equal(h.calls.filter(c => c.name === 'polarion_connect').length, 0);
+});
+test('compatible document name search stays selectable and explains incomplete coverage without saving anything', async () => {
+  const h = harness(); await inProject(h); h.el('TabDocuments').handlers.click();
+  h.el('DocumentSource').value = 'documents'; h.el('DocumentQuery').value = 'errm';
+  h.search(async () => ({ code: 'ok', catalog_source: 'work_item_modules', matched: 1, received: 1,
+    items: [{ id: 'P/Structure Information/P_ERRM_StructDoc', title: 'P_ERRM_StructDoc' }] }));
+  await h.el('DocumentSearchButton').handlers.click();
+  assert.equal(h.calls.at(-1).args.query, 'errm');
+  assert.match(h.el('DocumentHint').textContent, /Empty documents and title-only matches may be missing/);
+  assert.match(h.el('Status').textContent, /Compatibility search/);
+  h.el('Results').children[0].handlers.click();
+  assert.equal(h.el('Associate').disabled, false);
+  h.overrides.polarion_read = async args => {
+    assert.equal(args.kind, 'document'); assert.equal(args.resourceId, 'P/Structure Information/P_ERRM_StructDoc');
+    return { code: 'ok', snapshot: { ...docSnapshot(), id: args.resourceId } };
+  };
+  await h.el('View').handlers.click();
+  assert.equal(h.calls.filter(c => c.name === 'polarion_workspace' && c.args.action !== 'load').length, 0);
+  assert.equal(h.calls.filter(c => c.name === 'polarion_connect').length, 0);
+});
+test('name search rejects too-short fragments without HTTP and discards a result after closing and reopening', async () => {
+  const h = harness(); await inProject(h); h.el('TabDocuments').handlers.click();
+  h.el('DocumentSource').value = 'documents'; h.el('DocumentQuery').value = 'er';
+  await h.el('DocumentSearchButton').handlers.click();
+  assert.equal(h.calls.filter(c => c.name === 'polarion_search').length, 0);
+  assert.match(h.el('Status').textContent, /at least three/);
+  let finish; h.search(() => new Promise(resolve => { finish = resolve; }));
+  h.el('DocumentQuery').value = 'errm'; const pending = h.el('DocumentSearchButton').handlers.click();
+  h.dialog.close(); await h.picker.open('/other');
+  finish({ code: 'ok', catalog_source: 'work_item_modules', items: [{ id: 'P/S/ERRM', title: 'Stale document' }] }); await pending;
+  assert.equal(h.el('Results').children.length, 0); assert.equal(h.el('Connection').dataset.state, 'unknown');
 });
 test('StructDoc content and messages remain in that tab while shared inspection components follow the active tab', async () => {
   const h = harness(); await inProject(h); h.el('TabDocuments').handlers.click();

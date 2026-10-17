@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Git DrillDown</title>
   <link rel="icon" type="image/png" href="assets/git-drilldown-mark.png">
-  <link rel="stylesheet" href="styles.css?v=20261016-polarion-structdoc-link">
-  <link rel="stylesheet" href="polarion.css?v=20261016-polarion-structdoc-link">
+  <link rel="stylesheet" href="styles.css?v=20261017-submodule-tag-refresh">
+  <link rel="stylesheet" href="polarion.css?v=20261017-submodule-tag-refresh">
 </head>
 <body>
   <div class="app-shell">
@@ -238,7 +238,7 @@
     <section id="submoduleMenu" class="submodule-menu" hidden aria-label="Submodule versions">
       <header>
         <div><span>SUBMODULE VERSION</span><strong id="submoduleMenuName">Submodule</strong></div>
-        <button id="fetchSubmoduleVersions" class="version-fetch-button" title="Fetch all origin branches and tags, then refresh this list. Does not change checkout or the project's selected version.">↓ Fetch versions</button>
+        <button id="fetchSubmoduleVersions" class="version-fetch-button" title="Fetch all origin branches and tags, including moved server tags, then refresh this list. Previous tag targets are preserved for recovery. Does not change checkout or the project's selected version.">↓ Fetch versions</button>
         <button id="refreshSubmoduleMenu" title="Refresh local branches, tags and current submodule state from disk. Does not contact the server.">↻</button>
         <button id="closeSubmoduleMenu">×</button>
       </header>
@@ -799,18 +799,18 @@
           <div id="polarionTaskWorkspace"></div>
         </section>
         <section id="polarionPanelDocuments" role="tabpanel" aria-labelledby="polarionTabDocuments" hidden>
-          <div class="polarion-section-heading"><h3>Structure documents</h3><small>Open a LiveDoc, associate it locally, then read its elements.</small></div>
+          <div class="polarion-section-heading"><h3>Structure documents</h3><small>Find a LiveDoc by name, read its details and associate it locally.</small></div>
+          <div class="polarion-catalog-search">
+            <label for="polarionDocumentQuery">Find a StructDoc</label>
+            <div class="polarion-search-row"><select id="polarionDocumentSource" aria-label="StructDoc source"><option value="documents">LiveDoc / Document</option><option value="containers">StructDoc work item</option></select><input id="polarionDocumentQuery" placeholder="At least 3 characters · e.g. errm" autocomplete="off"><button type="button" id="polarionDocumentSearchButton">Search</button></div>
+            <small>Searches the selected project. On older servers, compatible search uses document links from work items; its coverage is shown with the results.</small>
+          </div>
           <div class="polarion-open-document">
-            <label for="polarionDiagnosticUrl">Polarion StructDoc link</label>
+            <label for="polarionDiagnosticUrl">Or open a Polarion StructDoc link</label>
             <div class="polarion-search-row"><input id="polarionDiagnosticUrl" inputmode="url" placeholder="https://polarion.vitesco.io/polarion/#/project/…/wiki/…" autocomplete="off"><button type="button" id="polarionOpenDocument" disabled>Open document</button></div>
-            <small id="polarionDocumentHint">Paste a LiveDoc link to open it directly, even when the server does not support catalog search.</small>
+            <small id="polarionDocumentHint">Search by name above, or paste an exact LiveDoc link to open it directly.</small>
           </div>
           <div id="polarionDocument" class="polarion-saved-card"></div>
-          <details class="polarion-catalog-search"><summary>Find by name or work item</summary>
-            <label for="polarionDocumentQuery">Optional catalog search</label>
-            <div class="polarion-search-row"><select id="polarionDocumentSource" aria-label="StructDoc source"><option value="documents">LiveDoc / Document</option><option value="containers">StructDoc work item</option></select><input id="polarionDocumentQuery" placeholder="Name, space or path…" autocomplete="off"><button type="button" id="polarionDocumentSearchButton">Search</button></div>
-            <small>Requires catalog access on the server. If unavailable, use the document link above. Custom StructDocs may instead be work items.</small>
-          </details>
           <div id="polarionDocumentWorkspace"></div>
           <section id="polarionDocumentElements" class="polarion-document-elements" hidden aria-label="Saved StructDoc elements">
             <h4>Saved document elements</h4>
@@ -821,7 +821,7 @@
           <details class="polarion-diagnostics"><summary>Troubleshooting · read access</summary>
             <small id="polarionDiagnosticSummary">Optional, explicit GET checks. Results stay in this tab and the log.</small>
             <div class="polarion-diagnostic-actions"><button type="button" id="polarionDiagnostics">Check read access</button><small>Uses the link above · up to 25 seconds · no automatic sign-in</small></div>
-            <small>The link's project scopes these checks only. Saved associations stay unchanged. For work-item search, the current query is tested with alternative syntax. A 404 alone does not prove a permission problem.</small>
+            <small>The link's project scopes these checks only. Samples up to 10 document parts and one linked work item; logs technical fields and type IDs, not titles, task IDs or document contents. The current search is checked when provided. A 404 alone does not prove a permission problem; 405 means GET is not allowed at that location. Saved associations stay unchanged.</small>
             <div id="polarionDiagnosticReport" aria-label="Polarion read access checks"></div>
           </details>
         </section>
@@ -830,16 +830,16 @@
       <footer><span>Read-only on Polarion · local snapshots outside Git</span><button value="cancel">Close</button><button type="button" id="polarionAdd" class="confirm" disabled>Add to Commit List</button></footer>
     </form>
   </dialog>
-  <script src="polarion.js?v=20261016-polarion-structdoc-link"></script>
-  <script src="console-context.js?v=20261016-polarion-structdoc-link"></script>
-  <script src="graph-model.js?v=20261016-polarion-structdoc-link"></script>
-  <script src="submodule-state.js?v=20261016-polarion-structdoc-link"></script>
-  <script src="submodule-versions.js?v=20261016-polarion-structdoc-link"></script>
-  <script src="local-diff.js?v=20261016-polarion-structdoc-link"></script>
-  <script src="local-drive.js?v=20261016-polarion-structdoc-link"></script>
-  <script src="pr-status.js?v=20261016-polarion-structdoc-link"></script>
-  <script src="refresh-coordinator.js?v=20261016-polarion-structdoc-link"></script>
-  <script src="comparison-authors.js?v=20261016-polarion-structdoc-link"></script>
-  <script src="app.js?v=20261016-polarion-structdoc-link"></script>
+  <script src="polarion.js?v=20261017-submodule-tag-refresh"></script>
+  <script src="console-context.js?v=20261017-submodule-tag-refresh"></script>
+  <script src="graph-model.js?v=20261017-submodule-tag-refresh"></script>
+  <script src="submodule-state.js?v=20261017-submodule-tag-refresh"></script>
+  <script src="submodule-versions.js?v=20261017-submodule-tag-refresh"></script>
+  <script src="local-diff.js?v=20261017-submodule-tag-refresh"></script>
+  <script src="local-drive.js?v=20261017-submodule-tag-refresh"></script>
+  <script src="pr-status.js?v=20261017-submodule-tag-refresh"></script>
+  <script src="refresh-coordinator.js?v=20261017-submodule-tag-refresh"></script>
+  <script src="comparison-authors.js?v=20261017-submodule-tag-refresh"></script>
+  <script src="app.js?v=20261017-submodule-tag-refresh"></script>
 </body>
 </html>

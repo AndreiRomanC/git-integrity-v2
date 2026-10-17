@@ -101,14 +101,57 @@ test('leaving during graph refresh rejects its late response', async () => {
   assert.equal(h.state.view, 'explorer');
 });
 
-test('failed fetch preserves the existing graph and releases its busy control', async () => {
+test('failed fetch recaptures partial ref updates and keeps the original error', async () => {
   const h = harness();
   const pending = h.context.fetchSubmodule(h.entry, {});
-  h.calls[0].reject(new Error('network unavailable')); await pending;
+  const error = new Error('one ref failed after other refs were updated');
+  h.calls[0].reject(error); await turn();
+  assert.equal(h.calls[1].command, 'submodule_repository');
+  h.calls[1].resolve(data()); await turn();
+  assert.equal(h.calls[2].command, 'submodule_versions');
+  h.calls[2].resolve({ versions: [{ name: 'updated-tag', revision: 'new' }] }); await pending;
   assert.equal(h.errors.length, 1);
+  assert.equal(h.errors[0], error);
   assert.equal(h.state.submoduleGraph, h.graph);
+  assert.equal(h.graph.commits[0].id, 'new');
+  assert.equal(h.context.submoduleMenuData.versions[0].revision, 'new');
   assert.ok(h.events.includes('button-finished'));
-  assert.equal(h.calls.length, 1);
+  assert.equal(h.calls.length, 3);
+  assert.ok(!h.events.some(event => /branches and tags fetched/.test(event)), 'failure must not become a success notice');
+});
+
+test('updated server tags are explained without suggesting a checkout', async () => {
+  const h = harness();
+  const pending = h.context.fetchSubmodule(h.entry);
+  h.calls[0].resolve({ updated_tags: 1 }); await turn();
+  h.calls[1].resolve(data()); await turn();
+  h.calls[2].resolve({ versions: [{ name: 'moved-tag', revision: 'new' }] }); await pending;
+  assert.ok(h.events.some(event => /1 existing tag updated from the server; previous targets saved as recovery refs/.test(event)));
+  assert.ok(h.events.some(event => /Checkout unchanged/.test(event)));
+  assert.equal(h.errors.length, 0);
+});
+
+for (const navigation of ['repository', 'submodule', 'leave']) {
+  test(`failed fetch cannot refresh its old graph after changing ${navigation}`, async () => {
+    const h = harness(); h.context.refs.submoduleMenu.hidden = true;
+    const pending = h.context.fetchSubmodule(h.entry);
+    if (navigation === 'repository') h.state.repository = { path: 'other', current_branch: 'main' };
+    if (navigation === 'submodule') h.state.submoduleGraph = { ...h.graph, relativePath: 'modules/other' };
+    if (navigation === 'leave') h.context.leaveSubmoduleGraph();
+    h.calls[0].reject(new Error('old fetch failed')); await pending;
+    assert.equal(h.calls.length, 1);
+    assert.notEqual(h.state.submoduleGraph?.commits?.[0]?.id, 'new');
+  });
+}
+
+test('a failed fetch without an open graph still refreshes the same version menu', async () => {
+  const h = harness(); h.state.submoduleGraph = null;
+  const pending = h.context.fetchSubmodule(h.entry);
+  h.calls[0].reject('partial fetch'); await turn();
+  assert.equal(h.calls[1].command, 'submodule_versions');
+  h.calls[1].resolve({ versions: [{ name: 'new-tag' }] }); await pending;
+  assert.equal(h.context.submoduleMenuData.versions[0].name, 'new-tag');
+  assert.deepEqual(h.errors, ['partial fetch']);
 });
 
 test('older local version requests cannot replace newer results', async () => {

@@ -4,7 +4,7 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 const { polarionCommitMessage, polarionSearchExplanation } = require('../frontend/polarion.js');
 const source = fs.readFileSync(require('node:path').join(__dirname, '../src-tauri/src/repository/polarion-search.js'), 'utf8');
-async function portal({ status = 200, origin = 'https://polarion.vitesco.io', contentType = 'application/json', type = 'basic', data = { data: [] }, error = null, token = 'SECRET', kind = 'tasks', fallbackUrl = null, readFallback = false, statuses = null, pages = null, query = '', page = 1, portalWindow = {}, resourceId = '', project = 'P', probes = [], url = null, responseHeaders = {}, body = null, clock = null } = {}) {
+async function portal({ status = 200, origin = 'https://polarion.vitesco.io', contentType = 'application/json', type = 'basic', data = { data: [] }, error = null, token = 'SECRET', kind = 'tasks', fallbackUrl = null, readFallback = false, documentGlobalUrl = null, documentModulesUrl = null, statuses = null, pages = null, query = '', page = 1, portalWindow = {}, resourceId = '', project = 'P', probes = [], url = null, responseHeaders = {}, body = null, clock = null } = {}) {
   let request = null, reply = null;
   const requests = [];
   const location = { origin, set href(value) { reply = JSON.parse(new URL(value).searchParams.get('data')); } };
@@ -17,7 +17,7 @@ async function portal({ status = 200, origin = 'https://polarion.vitesco.io', co
     return { status: code, type, ok: code >= 200 && code < 300, body, headers: { get: key => key === 'content-type' ? contentType : responseHeaders[key] || '' }, json: async () => pages ? pages[requests.length - 1] : data };
   } };
   if (clock) sandbox.Date = class extends Date { static now() { return clock(); } };
-  await vm.runInNewContext(source.replace('__DDT_ARGUMENTS__', JSON.stringify({ url: url || (kind === 'projects' ? 'https://polarion.vitesco.io/polarion/rest/v1/projects?fields[projects]=id,name,trackerPrefix&page[size]=100' : 'https://polarion.vitesco.io/polarion/rest/v1/projects/P/workitems'), fallbackUrl, readFallback, project, resourceId, kind, query, page, probes, request: '1' })), sandbox);
+  await vm.runInNewContext(source.replace('__DDT_ARGUMENTS__', JSON.stringify({ url: url || (kind === 'projects' ? 'https://polarion.vitesco.io/polarion/rest/v1/projects?fields[projects]=id,name,trackerPrefix&page[size]=100' : kind === 'documents' ? 'https://polarion.vitesco.io/polarion/rest/v1/projects/P/documents?page[size]=100' : 'https://polarion.vitesco.io/polarion/rest/v1/projects/P/workitems'), fallbackUrl, readFallback, documentGlobalUrl, documentModulesUrl, project, resourceId, kind, query, page, probes, request: '1' })), sandbox);
   return { request, reply, requests };
 }
 test('fragment rejection falls back once to legacy prefix search, not on authentication or empty results', async () => {
@@ -172,6 +172,110 @@ test('document search covers every space and page, matching path and title fragm
   ] });
   assert.equal(reply.items.length, 1); assert.equal(reply.items[0].id, 'P/30 Development/Structure Information');
   assert.equal(reply.catalog_pages, 2); assert.equal(reply.matched, 1);
+});
+const documentRoutes = {
+  documentGlobalUrl: 'https://polarion.vitesco.io/polarion/rest/v1/all/documents?query=project.id:%22P%22&page[size]=100',
+  documentModulesUrl: 'https://polarion.vitesco.io/polarion/rest/v1/projects/P/workitems?query=module.id:(*errm*)&fields[workitems]=id,module&page[size]=100',
+};
+const documentItem = (id, title = id) => ({ id, type: 'documents', attributes: { title } });
+const moduleItem = (id, doc) => ({ id: 'P/' + id, type: 'workitems', relationships: { module: { data: { id: doc, type: 'documents' } } } });
+test('missing project catalog tries the global document catalog, keeps project scope and does not fetch server next URLs', async () => {
+  const { reply, requests } = await portal({ kind: 'documents', query: 'eRrM', ...documentRoutes, statuses: [404, 200, 200], pages: [
+    {}, { data: [documentItem('Other/S/ERRM')], links: { next: 'https://unsafe.example' } },
+    { data: [documentItem('P/Structure Information/P_ERRM_StructDoc'), documentItem('P/S/Unrelated')] },
+  ] });
+  assert.equal(reply.code, 'ok'); assert.equal(reply.catalog_source, 'all_documents');
+  assert.deepEqual(reply.items.map(i => i.id), ['P/Structure Information/P_ERRM_StructDoc']);
+  assert.equal(new URL(requests[2].url).pathname, '/polarion/rest/v1/all/documents');
+  assert.equal(new URL(requests[2].url).searchParams.get('query'), 'project.id:"P"');
+  assert.equal(new URL(requests[2].url).searchParams.get('page[number]'), '2');
+  assert.ok(requests.every(r => r.options.method === 'GET' && new URL(r.url).origin === 'https://polarion.vitesco.io'));
+  assert.equal(reply.diagnostics[1].route, 'all_documents'); assert.equal(reply.diagnostics[1].step, 'document_global');
+});
+test('legacy document search derives actual module paths, deduplicates documents across work-item pages and excludes other projects', async () => {
+  const doc = 'P/Structure Information/P_ERRM_StructDoc';
+  const { reply, requests } = await portal({ kind: 'documents', query: 'errm', ...documentRoutes, statuses: [404, 405, 200, 200, 200], pages: [
+    {}, {}, { data: [moduleItem('P-1', doc)], links: { next: 'next' } },
+    { data: [moduleItem('P-2', doc)], links: { next: 'next' } },
+    { data: [moduleItem('P-3', 'P/S/ERRM_2'), moduleItem('P-4', 'Other/S/ERRM')] },
+  ] });
+  assert.equal(reply.code, 'ok'); assert.equal(reply.catalog_source, 'work_item_modules'); assert.equal(reply.items.length, 2);
+  assert.ok(reply.items.some(i => i.id === doc)); assert.equal(reply.catalog_pages, 3);
+  assert.equal(reply.diagnostics.at(-1).step, 'document_modules');
+  assert.ok(requests.slice(2).every(r => new URL(r.url).searchParams.get('query') === 'module.id:(*errm*)'));
+  assert.doesNotMatch(JSON.stringify(reply), /SECRET|X-Polarion|module\.id|Other\/S/);
+});
+test('a successful empty document catalog never triggers another search strategy', async () => {
+  const { reply, requests } = await portal({ kind: 'documents', query: 'errm', ...documentRoutes });
+  assert.equal(reply.code, 'ok'); assert.equal(reply.items.length, 0); assert.equal(requests.length, 1);
+  assert.equal(reply.catalog_source, 'project_documents');
+});
+test('document compatibility never retries authentication, permissions, transient failures or a failed later page', async () => {
+  for (const status of [400, 401, 403, 500, 503]) {
+    const result = await portal({ kind: 'documents', query: 'errm', ...documentRoutes, status });
+    assert.notEqual(result.reply.code, 'ok'); assert.equal(result.requests.length, 1);
+  }
+  const portalWindow = {};
+  const result = await portal({ kind: 'documents', query: 'errm', ...documentRoutes, portalWindow, statuses: [200, 404], pages: [
+    { data: [documentItem('P/S/ERRM')], links: { next: 'next' } }, {},
+  ] });
+  assert.equal(result.requests.length, 2); assert.notEqual(result.reply.code, 'ok'); assert.equal(result.reply.items, undefined);
+  assert.equal(portalWindow.__ddtDocumentSearchV2_P, undefined);
+});
+test('global document search permission failure stops instead of disguising it as an empty result', async () => {
+  const result = await portal({ kind: 'documents', query: 'errm', ...documentRoutes, statuses: [404, 403], pages: [{}, {}] });
+  assert.equal(result.reply.code, 'forbidden'); assert.equal(result.requests.length, 2); assert.equal(result.reply.items, undefined);
+});
+test('legacy search caches only a completed query in the same session, while full catalogs permit new local filters', async () => {
+  const portalWindow = {}, data = { data: Array.from({ length: 30 }, (_, i) => moduleItem('P-' + i, 'P/S/ERRM_' + i)) };
+  const first = await portal({ kind: 'documents', query: 'errm', ...documentRoutes, portalWindow, statuses: [404, 404, 200], pages: [{}, {}, data] });
+  assert.equal(first.reply.items.length, 25); assert.equal(first.reply.more, true);
+  const next = await portal({ kind: 'documents', query: 'ERRM', page: 2, ...documentRoutes, portalWindow });
+  assert.equal(next.requests.length, 0); assert.equal(next.reply.items.length, 5); assert.equal(next.reply.catalog_source, 'work_item_modules');
+  const changed = await portal({ kind: 'documents', query: 'other', ...documentRoutes, portalWindow, status: 403 });
+  assert.equal(changed.requests.length, 1); assert.equal(changed.reply.code, 'forbidden');
+  assert.equal(portalWindow.__ddtDocumentSearchV2_P, undefined);
+  await portal({ kind: 'documents', query: 'errm', portalWindow, data: { data: [documentItem('P/S/ERRM'), documentItem('P/S/OTHER')] } });
+  const other = await portal({ kind: 'documents', query: 'other', portalWindow });
+  assert.equal(other.requests.length, 0); assert.equal(other.reply.items[0].id, 'P/S/OTHER');
+  const session = await portal({ kind: 'documents', query: 'errm', portalWindow, token: 'OTHER', status: 401 });
+  assert.equal(session.requests.length, 1); assert.equal(session.reply.code, 'auth_required');
+});
+test('missing module relationships, looping work-item pages and partial errors never produce a false successful empty search', async () => {
+  for (const data of [{ data: [{ id: 'P/P-1', type: 'workitems' }] },
+    { data: [moduleItem('P-1', 'P/S/ERRM')], links: { next: 'same' } },
+    { data: [{ ...moduleItem('P-1', 'P/S/ERRM'), meta: { errors: [{}] } }] }]) {
+    const portalWindow = {};
+    const result = await portal({ kind: 'documents', query: 'errm', ...documentRoutes, portalWindow,
+      statuses: [404, 404, 200, 200], pages: [{}, {}, data, data] });
+    assert.equal(result.reply.code, 'invalid_response'); assert.equal(result.reply.items, undefined);
+    assert.equal(portalWindow.__ddtDocumentSearchV2_P, undefined);
+  }
+});
+test('legacy search limits and failed module reads preserve no partial cache or results', async () => {
+  const portalWindow = {};
+  const pages = [{}, {}, ...Array.from({ length: 200 }, (_, i) => ({
+    data: [moduleItem('P-' + i, 'P/S/ERRM_' + i)], links: { next: 'next' },
+  }))];
+  const result = await portal({ kind: 'documents', query: 'errm', ...documentRoutes, portalWindow,
+    statuses: [404, 404, ...Array(200).fill(200)], pages });
+  assert.equal(result.reply.code, 'catalog_limit'); assert.equal(result.reply.items, undefined);
+  assert.equal(result.requests.length, 202); assert.equal(portalWindow.__ddtDocumentSearchV2_P, undefined);
+  for (const status of [400, 401, 403, 404, 500]) {
+    const failed = await portal({ kind: 'documents', query: 'errm', ...documentRoutes,
+      statuses: [404, 404, status], pages: [{}, {}, {}] });
+    assert.notEqual(failed.reply.code, 'ok'); assert.equal(failed.reply.items, undefined); assert.equal(failed.requests.length, 3);
+  }
+});
+test('document cache expiry and a missing portal token force fresh scoped reads', async () => {
+  const portalWindow = {}, data = { data: [documentItem('P/S/ERRM')] };
+  await portal({ kind: 'documents', query: 'errm', portalWindow, data });
+  portalWindow.__ddtDocumentSearchV2_P.time = Date.now() - 121000;
+  const expired = await portal({ kind: 'documents', query: 'errm', portalWindow, data });
+  assert.equal(expired.requests.length, 1); assert.equal(expired.reply.catalog_cached, false);
+  const missing = await portal({ kind: 'documents', query: 'errm', portalWindow, data, token: null });
+  assert.equal(missing.requests.length, 1); assert.equal(missing.reply.catalog_cached, false);
+  assert.equal(portalWindow.__ddtDocumentSearchV2_P, undefined);
 });
 test('LiveDoc elements preserve real parts and types; inaccessible details stay visible', async () => {
   const part = (id, workitem) => ({ type: 'document_parts', id: 'P/Space/Doc/' + id, attributes: { type: 'workitem', level: 2 }, relationships: { workItem: { data: { type: 'workitems', id: workitem } } } });
@@ -331,4 +435,58 @@ test('compatible element reads preserve actual work-item relationships and never
   assert.equal(reply.code, 'ok'); assert.equal(reply.elements.length, 1); assert.equal(reply.elements[0].id, 'P/P-1');
   assert.equal(reply.incomplete, 1); assert.match(reply.elements[0].fields.details, /not returned/);
   assert.equal(reply.metadata_fallback, true); assert.equal(reply.prefix_fallback, false);
+});
+test('response facts describe technical fields and types without exporting values, IDs or unknown fields', async () => {
+  const result = await portal({ kind: 'diagnostics', project: 'P', probes: [{ step: 'workitem_modules', url: api + '/projects/P/workitems?query=module.id:*&fields[workitems]=id,type,status,module,SECRET_FIELD' }],
+    data: { data: [{ ...moduleItem('PRIVATE_ID', 'P/PRIVATE_SPACE/PRIVATE_DOC'), attributes: { type: 'architecturalElement', title: 'PRIVATE_TITLE', description: 'PRIVATE_BODY', status: 'PRIVATE_STATUS', password: 'PRIVATE_PASSWORD', SECRET_FIELD: 'SECRET_VALUE' } }] } });
+  const facts = result.reply.diagnostics[0];
+  assert.equal(facts.code, 'ok'); assert.equal(facts.query_kind, 'module_name'); assert.equal(facts.shape, 'list');
+  assert.deepEqual(facts.item_types, ['architecturalElement']); assert.equal(facts.module_links, 1);
+  assert.deepEqual(facts.requested_fields, ['workitems.id','workitems.module','workitems.status','workitems.type']);
+  assert.deepEqual(facts.returned_fields, ['workitems.description','workitems.status','workitems.title','workitems.type']);
+  assert.deepEqual(facts.relationship_fields, ['workitems.module']);
+  assert.doesNotMatch(JSON.stringify(result.reply), /PRIVATE_|SECRET|X-Polarion/);
+  const malformed = await portal({ kind: 'diagnostics', probes: [{ step: 'workitem_modules', url: api + '/projects/P/workitems' }], data: { data: [{ type: 'workitems', id: 'P/P-1' }] } });
+  assert.equal(malformed.reply.diagnostics[0].code, 'invalid_response'); assert.equal(malformed.reply.diagnostics[0].reason, 'relationship_missing');
+});
+test('explicit document sample follows only one actual same-project work item, without saving or exposing its data', async () => {
+  const probes = [
+    { step: 'document_exact', url: api + '/projects/P/spaces/S/documents/D' },
+    { step: 'document_parts_expanded', url: api + '/projects/P/spaces/S/documents/D/parts?page[size]=10&include=workItem&fields[workitems]=id,type,status', requires: 'document_exact' },
+    { step: 'workitem_sample', url: api + '/projects/P/workitems?fields[workitems]=id,title,type,status,module', requires: 'document_parts_expanded' },
+  ];
+  const part = (id, target) => ({ id: 'P/S/D/' + id, type: 'document_parts', attributes: { type: 'workitem' }, relationships: { workItem: { data: { id: target, type: 'workitems' } } } });
+  const pages = [{ data: { id: 'P/S/D', type: 'documents', attributes: { title: 'PRIVATE_DOCUMENT', type: 'Structure_doc' } } },
+    { data: [part('one', 'Other/PRIVATE_ID'), part('two', 'P/PRIVATE_ID'), part('three', 'P/NOT_FOLLOWED')],
+      included: [{ id: 'P/PRIVATE_ID', type: 'workitems', attributes: { type: 'designElement', status: 'PRIVATE_STATUS' } }], links: { next: 'https://unsafe.example/never-follow' } },
+    { data: { id: 'P/PRIVATE_ID', type: 'workitems', attributes: { type: 'designElement', title: 'PRIVATE_TITLE', status: 'PRIVATE_STATUS' } } },
+  ];
+  const { reply, requests } = await portal({ kind: 'diagnostics', resourceId: 'P/S/D', project: 'P', probes, pages });
+  assert.equal(requests.length, 3); assert.equal(new URL(requests[2].url).pathname, '/polarion/rest/v1/projects/P/workitems/PRIVATE_ID');
+  assert.ok(requests.every(r => r.options.method === 'GET'));
+  assert.deepEqual(reply.diagnostics.map(d => d.code), ['ok','ok','ok']);
+  assert.equal(reply.diagnostics[1].workitem_links, 3); assert.equal(reply.diagnostics[1].included_workitems, 1);
+  assert.deepEqual(reply.diagnostics[1].item_types, ['designElement','workitem']);
+  assert.equal(reply.diagnostics[2].shape, 'single'); assert.equal(reply.snapshot, undefined); assert.equal(reply.items, undefined);
+  assert.doesNotMatch(JSON.stringify(reply), /PRIVATE_|NOT_FOLLOWED|unsafe\.example|SECRET|P\/S\/D/);
+  const denied = await portal({ kind: 'diagnostics', resourceId: 'P/S/D', project: 'P', probes, pages: [pages[0], pages[1], {}], statuses: [200,200,403] });
+  assert.equal(denied.reply.diagnostics[2].code, 'forbidden');
+  const noSample = await portal({ kind: 'diagnostics', resourceId: 'P/S/D', project: 'P', probes, pages: [pages[0], { data: [part('one', 'Other/PRIVATE_ID')] }] });
+  assert.equal(noSample.requests.length, 2); assert.equal(noSample.reply.diagnostics[2].reason, 'sample_missing');
+  const incompatible = await portal({ kind: 'diagnostics', resourceId: 'P/S/D', project: 'P', probes, pages: [pages[0], {}], statuses: [200,400] });
+  assert.equal(incompatible.requests.length, 2); assert.equal(incompatible.reply.diagnostics[2].reason, 'prerequisite_missing');
+  const ignoresSize = await portal({ kind: 'diagnostics', resourceId: 'P/S/D', project: 'P', probes, pages: [pages[0], { data: Array.from({ length: 11 }, (_, i) => part('part' + i, 'P/PRIVATE_ID')) }] });
+  assert.equal(ignoresSize.requests.length, 2); assert.equal(ignoresSize.reply.diagnostics[1].code, 'invalid_response');
+  assert.equal(ignoresSize.reply.diagnostics[2].reason, 'prerequisite_missing');
+});
+test('HTTP 405 is method-not-allowed even when the server error text mentions permissions', async () => {
+  const { reply } = await portal({ status: 405, data: { errors: [{ detail: 'User is not allowed to use this method PRIVATE_SECRET' }] } });
+  assert.equal(reply.diagnostics[0].reason, 'method_not_allowed'); assert.equal(reply.http, 405);
+  assert.doesNotMatch(JSON.stringify(reply), /PRIVATE_SECRET/);
+});
+test('technical response facts stay bounded on normal large reads without adding HTTP calls', async () => {
+  const { reply, requests } = await portal({ kind: 'projects', data: { data: Array.from({ length: 100 }, (_, i) => projectItem('P' + i, 'PRIVATE_NAME')) } });
+  assert.equal(requests.length, 1); assert.equal(reply.diagnostics[0].sample_rows, 10);
+  assert.ok(reply.diagnostics[0].returned_fields.length <= 32); assert.ok(reply.diagnostics[0].item_types.length <= 12);
+  assert.doesNotMatch(JSON.stringify(reply.diagnostics), /PRIVATE_NAME|SECRET/);
 });

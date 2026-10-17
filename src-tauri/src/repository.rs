@@ -9342,11 +9342,46 @@ fn force_push_submodule_inner(repository_path: String, relative_path: String) ->
 }
 
 #[tauri::command]
-pub async fn fetch_submodule(repository_path: String, relative_path: String) -> Result<(), String> {
+pub async fn fetch_submodule(repository_path: String, relative_path: String) -> Result<FetchSubmoduleResult, String> {
     off_main_thread(move || fetch_submodule_inner(repository_path, relative_path)).await
 }
 
-fn fetch_submodule_inner(repository_path: String, relative_path: String) -> Result<(), String> {
+#[derive(Serialize)]
+pub struct FetchSubmoduleResult {
+    updated_tags: usize,
+}
+
+// Preserve the exact tag objects before an explicit version refresh can
+// replace them. This includes annotated-tag metadata, not only peeled commits.
+// Stable, content-addressed backup refs are reused on subsequent fetches and
+// live outside heads/remotes/tags, so they never become rows in the history UI.
+// Hashing the full ref name also avoids collisions between hierarchical names
+// and keeps recovery paths short on Windows. No index/worktree scan is needed.
+fn backup_submodule_tag_refs(repo: &Repository) -> Result<Vec<(String, Oid, String)>, String> {
+    let references = repo.references_glob("refs/tags/*").map_err(|error| error.message().to_string())?;
+    let mut originals = Vec::new();
+    for reference in references {
+        let reference = reference.map_err(|error| error.message().to_string())?;
+        let name = reference.name().ok_or("Could not read a local tag name; fetch was not started.")?.to_string();
+        let target = reference.resolve().and_then(|resolved| resolved.target().ok_or_else(|| git2::Error::from_str("Tag has no target")))
+            .map_err(|error| format!("Could not preserve tag {name}; fetch was not started: {}", error.message()))?;
+        let name_id = Oid::hash_object(ObjectType::Blob, name.as_bytes()).map_err(|error| error.message().to_string())?;
+        let backup = format!("refs/git-drilldown/tag-backups/{name_id}/{target}");
+        match repo.find_reference(&backup) {
+            Ok(existing) if existing.target() == Some(target) => {},
+            Ok(_) => return Err(format!("Tag recovery reference {backup} has an unexpected target; fetch was not started.")),
+            Err(error) if error.code() == git2::ErrorCode::NotFound => {
+                repo.reference(&backup, target, false, &format!("preserve {name} before fetching server versions"))
+                    .map_err(|error| format!("Could not preserve tag {name}; fetch was not started: {}", error.message()))?;
+            }
+            Err(error) => return Err(format!("Could not read tag recovery reference; fetch was not started: {}", error.message())),
+        }
+        originals.push((name, target, backup));
+    }
+    Ok(originals)
+}
+
+fn fetch_submodule_inner(repository_path: String, relative_path: String) -> Result<FetchSubmoduleResult, String> {
     let started = Instant::now();
     validate_path(&repository_path)?;
     let absolute = validate_submodule(&repository_path, &relative_path)?;
@@ -9355,14 +9390,48 @@ fn fetch_submodule_inner(repository_path: String, relative_path: String) -> Resu
     repo.find_remote("origin").map_err(|_| "No 'origin' remote configured for this submodule".to_string())?;
     let count_refs = |pattern| repo.references_glob(pattern).map(|refs| refs.filter_map(Result::ok).count()).unwrap_or(0);
     perf_log(&format!("fetch_submodule: START {relative_path} origin_branches={} tags={} mode=all-origin-branches-and-tags no-checkout", count_refs("refs/remotes/origin/*"), count_refs("refs/tags/*")), started.elapsed());
+    let originals = backup_submodule_tag_refs(&repo).map_err(|error| {
+        perf_log(&format!("fetch_submodule: END {relative_path} success=false category=tag-backup-failed fetch_started=false"), started.elapsed());
+        error
+    })?;
     // An explicit version refresh must not depend on a narrow/single-branch
-    // clone's fetch refspec or tag auto-follow. Only origin tracking refs and
-    // tags are updated; local branches, HEAD and the parent gitlink stay put.
-    let fetched = git(&sub_path, &["fetch", "--no-recurse-submodules", "--tags", "origin", "+refs/heads/*:refs/remotes/origin/*"]);
+    // clone's fetch refspec or tag auto-follow. Server tags may have been
+    // retargeted since the last fetch: update them explicitly, with their old
+    // exact objects already protected above. Do not prune local-only tags.
+    // Only origin tracking refs and tags are updated; local branches, HEAD,
+    // index, worktree and the parent gitlink stay put.
+    let fetched = git(&sub_path, &["fetch", "--no-recurse-submodules", "--tags", "--force", "origin", "+refs/heads/*:refs/remotes/origin/*"]);
     invalidate_git_metadata(&sub_path);
     invalidate_submodule_sync(&repository_path);
-    perf_log(&format!("fetch_submodule: END {relative_path} success={} origin_branches={} tags={}", fetched.is_ok(), count_refs("refs/remotes/origin/*"), count_refs("refs/tags/*")), started.elapsed());
-    fetched.map(|_| ())
+    // Reopen after the subprocess so diagnostics read the new refs, including
+    // partial updates when Git eventually exits with an error. Never log raw
+    // stderr here: it can contain credential-bearing URLs.
+    let refreshed = internal_submodule_repository(&absolute);
+    let mut updated_tags = 0;
+    if let Ok(refreshed) = &refreshed {
+        for (name, old, backup) in &originals {
+            if let Ok(reference) = refreshed.find_reference(name) {
+                if let Some(new) = reference.target().filter(|new| new != old) {
+                    updated_tags += 1;
+                    perf_log(&format!("fetch_submodule: tag_updated name={name} old={old} new={new} backup={backup}"), started.elapsed());
+                }
+            }
+        }
+    }
+    let category = fetched.as_ref().err().map(|error| {
+        let error = error.to_ascii_lowercase();
+        if error.contains("would clobber existing tag") { "tag-rejected" }
+        else if error.contains("authentication") || error.contains("credential") { "authentication" }
+        else { "git-error" }
+    }).unwrap_or(if refreshed.is_ok() { "ok" } else { "ref-read-failed" });
+    let counts = refreshed.as_ref().ok().map(|repository| {
+        let count = |pattern| repository.references_glob(pattern).map(|refs| refs.filter_map(Result::ok).count()).unwrap_or(0);
+        (count("refs/remotes/origin/*"), count("refs/tags/*"))
+    }).unwrap_or((0, 0));
+    perf_log(&format!("fetch_submodule: END {relative_path} success={} category={category} origin_branches={} tags={} updated_tags={updated_tags} checkout=unchanged", fetched.is_ok() && refreshed.is_ok(), counts.0, counts.1), started.elapsed());
+    fetched?;
+    refreshed?;
+    Ok(FetchSubmoduleResult { updated_tags })
 }
 
 #[derive(Serialize)]
@@ -10782,6 +10851,155 @@ mod tests {
         assert_eq!(run_git_capture(&parent, &["rev-parse", "HEAD"]), parent_head);
         assert_eq!(run_git_capture(&local, &["diff", "--cached"]), staged);
         assert_eq!(run_git_capture(&local, &["diff"]), unstaged);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn fetch_submodule_updates_retargeted_tags_on_an_unused_branch_and_preserves_local_work() {
+        for (annotated, annotation_only) in [(false, false), (true, false), (true, true)] {
+            let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+            let base = std::env::temp_dir().join(format!("git-integrity-retargeted-tag-{annotated}-{suffix}"));
+            let parent = base.join("parent");
+            let dependency = base.join("dependency");
+            create_libgit2_repository(&parent, "README.md");
+            create_libgit2_repository(&dependency, "module.txt");
+            run_git(&dependency, &["branch", "-M", "main"]);
+            run_git(&dependency, &["branch", "unused-release"]);
+            let tag = "IMS.VITESCO.IO_VWPT_MPB02S04.00A";
+            let old_tag = {
+                let repo = Repository::open(&dependency).unwrap();
+                let commit = repo.head().unwrap().peel_to_commit().unwrap();
+                if annotated {
+                    let signature = git2::Signature::now("Release User", "release@example.com").unwrap();
+                    repo.tag(tag, commit.as_object(), &signature, "Original annotation", false).unwrap()
+                } else {
+                    repo.tag_lightweight(tag, commit.as_object(), false).unwrap()
+                }
+            };
+            let path = parent.to_string_lossy().into_owned();
+            add_submodule_inner(path.clone(), "".into(), dependency.to_string_lossy().into_owned(), "engine".into(), String::new(), String::new()).unwrap();
+            create_commit(path.clone(), "Add engine".into()).unwrap();
+            let local = parent.join("engine");
+            let head = run_git_capture(&local, &["rev-parse", "HEAD"]);
+            let head_state = fs::read(Repository::open(&local).unwrap().path().join("HEAD")).unwrap();
+            let parent_head = run_git_capture(&parent, &["rev-parse", "HEAD"]);
+            let gitlink = run_git_capture(&parent, &["rev-parse", ":engine"]);
+            let branches = run_git_capture(&local, &["for-each-ref", "--format=%(refname) %(objectname)", "refs/heads/"]);
+            run_git(&local, &["tag", "local-only", &head]);
+            run_git(&local, &["pack-refs", "--all"]);
+            fs::write(local.join("module.txt"), "staged local content").unwrap();
+            run_git(&local, &["add", "module.txt"]);
+            fs::write(local.join("module.txt"), "unstaged local content").unwrap();
+            fs::write(local.join("untracked.txt"), "untracked local content").unwrap();
+            let index = fs::read(Repository::open(&local).unwrap().path().join("index")).unwrap();
+            let staged = run_git_capture(&local, &["diff", "--cached"]);
+            let unstaged = run_git_capture(&local, &["diff"]);
+
+            // The checked-out main branch remains at its original commit.
+            // Only a never-checked-out remote branch and its release tag move.
+            run_git(&dependency, &["checkout", "unused-release"]);
+            if !annotation_only {
+                fs::write(dependency.join("module.txt"), "new server release content").unwrap();
+                create_commit(dependency.to_string_lossy().into_owned(), "New tag target on unused branch".into()).unwrap();
+            }
+            let new_head = run_git_capture(&dependency, &["rev-parse", "HEAD"]);
+            let new_tag = {
+                let repo = Repository::open(&dependency).unwrap();
+                let commit = repo.head().unwrap().peel_to_commit().unwrap();
+                if annotated {
+                    let signature = git2::Signature::now("Release User", "release@example.com").unwrap();
+                    repo.tag(tag, commit.as_object(), &signature, "Updated annotation", true).unwrap()
+                } else {
+                    repo.tag_lightweight(tag, commit.as_object(), true).unwrap()
+                }
+            };
+            let result = fetch_submodule_inner(path.clone(), "engine".into()).unwrap();
+            assert_eq!(result.updated_tags, 1);
+            let versions = submodule_versions_inner(path.clone(), "engine".into()).unwrap();
+            let displayed_tag = versions.versions.iter().find(|version| version.kind == "tag" && version.name == tag).unwrap();
+            assert_eq!(displayed_tag.revision, new_head);
+            assert_eq!(displayed_tag.subject, if annotation_only { "Initial commit" } else { "New tag target on unused branch" });
+            assert_eq!(versions.current_revision, head);
+            let repo = Repository::open(&local).unwrap();
+            assert_eq!(repo.find_reference(&format!("refs/tags/{tag}")).unwrap().target(), Some(new_tag));
+            let backups: Vec<_> = repo.references_glob("refs/git-drilldown/tag-backups/*").unwrap().flatten().collect();
+            assert!(backups.iter().any(|reference| reference.target() == Some(old_tag)), "the original tag object, including annotation, must remain recoverable");
+            let old_object = repo.find_object(old_tag, None).unwrap();
+            assert_eq!(old_object.kind(), Some(if annotated { ObjectType::Tag } else { ObjectType::Commit }));
+            if annotated {
+                assert_eq!(old_object.as_tag().unwrap().message(), Some("Original annotation"));
+                assert_eq!(repo.find_tag(new_tag).unwrap().message(), Some("Updated annotation"));
+            }
+            assert_eq!(run_git_capture(&local, &["rev-parse", "refs/tags/local-only"]), head);
+            let graph = submodule_repository_inner(path.clone(), "engine".into()).unwrap();
+            assert!(graph.commits.iter().any(|commit| commit.id == new_head && commit.refs.iter().any(|reference| reference.kind == "tag" && reference.name == tag)));
+            assert!(graph.commits.iter().flat_map(|commit| &commit.refs).all(|reference| !reference.name.contains("tag-backups")));
+            assert_eq!(run_git_capture(&local, &["rev-parse", "HEAD"]), head);
+            assert_eq!(fs::read(repo.path().join("HEAD")).unwrap(), head_state);
+            assert_eq!(run_git_capture(&parent, &["rev-parse", "HEAD"]), parent_head);
+            assert_eq!(run_git_capture(&parent, &["rev-parse", ":engine"]), gitlink);
+            assert_eq!(run_git_capture(&local, &["for-each-ref", "--format=%(refname) %(objectname)", "refs/heads/"]), branches);
+            assert_eq!(fs::read(repo.path().join("index")).unwrap(), index);
+            assert_eq!(run_git_capture(&local, &["diff", "--cached"]), staged);
+            assert_eq!(run_git_capture(&local, &["diff"]), unstaged);
+            assert_eq!(fs::read_to_string(local.join("module.txt")).unwrap(), "unstaged local content");
+            assert_eq!(fs::read_to_string(local.join("untracked.txt")).unwrap(), "untracked local content");
+            assert_eq!(fetch_submodule_inner(path.clone(), "engine".into()).unwrap().updated_tags, 0);
+            let backups_before = run_git_capture(&local, &["for-each-ref", "--format=%(refname) %(objectname)", "refs/git-drilldown/tag-backups/"]);
+            assert_eq!(fetch_submodule_inner(path, "engine".into()).unwrap().updated_tags, 0);
+            assert_eq!(run_git_capture(&local, &["for-each-ref", "--format=%(refname) %(objectname)", "refs/git-drilldown/tag-backups/"]), backups_before);
+            drop(backups); drop(old_object); drop(repo);
+            fs::remove_dir_all(base).unwrap();
+        }
+    }
+
+    #[test]
+    fn fetch_submodule_refuses_to_replace_tags_if_the_recovery_ref_is_invalid() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-tag-backup-failure-{suffix}"));
+        let parent = base.join("parent");
+        let dependency = base.join("dependency");
+        create_libgit2_repository(&parent, "README.md");
+        create_libgit2_repository(&dependency, "module.txt");
+        run_git(&dependency, &["tag", "release"]);
+        let path = parent.to_string_lossy().into_owned();
+        add_submodule_inner(path.clone(), "".into(), dependency.to_string_lossy().into_owned(), "engine".into(), String::new(), String::new()).unwrap();
+        let local = parent.join("engine");
+        let repo = Repository::open(&local).unwrap();
+        let originals = backup_submodule_tag_refs(&repo).unwrap();
+        let (_, original, backup) = &originals[0];
+        let commit = repo.head().unwrap().peel_to_commit().unwrap();
+        let signature = git2::Signature::now("Test User", "test@example.com").unwrap();
+        let other = repo.commit(None, &signature, &signature, "Other object", &commit.tree().unwrap(), &[&commit]).unwrap();
+        repo.reference(backup, other, true, "simulate damaged recovery ref").unwrap();
+        let error = fetch_submodule_inner(path, "engine".into()).err().unwrap();
+        assert!(error.contains("unexpected target; fetch was not started"), "{error}");
+        assert_eq!(repo.find_reference("refs/tags/release").unwrap().target(), Some(*original));
+        assert_eq!(repo.head().unwrap().target(), Some(commit.id()));
+        drop(commit); drop(repo);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn fetch_submodule_failure_keeps_existing_tags_and_their_recovery_refs() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-tag-fetch-failure-{suffix}"));
+        let parent = base.join("parent");
+        let dependency = base.join("dependency");
+        create_libgit2_repository(&parent, "README.md");
+        create_libgit2_repository(&dependency, "module.txt");
+        run_git(&dependency, &["tag", "release"]);
+        let path = parent.to_string_lossy().into_owned();
+        add_submodule_inner(path.clone(), "".into(), dependency.to_string_lossy().into_owned(), "engine".into(), String::new(), String::new()).unwrap();
+        let local = parent.join("engine");
+        let repo = Repository::open(&local).unwrap();
+        let original = repo.find_reference("refs/tags/release").unwrap().target().unwrap();
+        repo.remote_set_url("origin", &base.join("missing-origin.git").to_string_lossy()).unwrap();
+        assert!(fetch_submodule_inner(path, "engine".into()).is_err());
+        assert_eq!(repo.find_reference("refs/tags/release").unwrap().target(), Some(original));
+        assert_eq!(repo.head().unwrap().target(), Some(original));
+        assert!(repo.references_glob("refs/git-drilldown/tag-backups/*").unwrap().flatten().any(|reference| reference.target() == Some(original)));
+        drop(repo);
         fs::remove_dir_all(base).unwrap();
     }
 

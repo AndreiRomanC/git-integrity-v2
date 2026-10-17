@@ -4870,15 +4870,24 @@ async function fetchSubmodule(entry, button = null) {
   const finishButton = beginButtonOperation(button, 'Fetching…');
   try {
     status(`Fetching branches and tags for ${entry.name}…`, 'busy');
-    await invoke('fetch_submodule', { repositoryPath, relativePath });
+    let result, fetchError, fetchFailed = false;
+    try { result = await invoke('fetch_submodule', { repositoryPath, relativePath }); }
+    catch (error) { fetchFailed = true; fetchError = error; }
+    // Git can update some refs before another ref/network operation fails.
+    // Recapture the actual local state in both cases, retaining the original
+    // error instead of presenting a partial fetch as a successful one.
     // Refresh only the view the request belongs to. A slow fetch must not
     // reopen this module after navigation to another module/repository.
     if (state.repository?.path !== repositoryPath) return;
     if (graph && state.submoduleGraph === graph && graph.relativePath === relativePath) await openSubmoduleGraph(entry, { refresh: true });
     if (state.repository?.path !== repositoryPath) return;
     if (!refs.submoduleMenu.hidden && submoduleMenuEntry === menuEntry && menuEntry?.relative_path === relativePath) await refreshSubmoduleMenu();
-    status(`${entry.name}: branches and tags fetched. Checkout unchanged.`);
-    showOperationToast(`${entry.name}: branches and tags fetched. Checkout unchanged.`, 'success');
+    if (fetchFailed) throw fetchError;
+    const updatedTags = Number(result?.updated_tags) || 0;
+    const tagNotice = updatedTags > 0 ? ` ${updatedTags} existing tag${updatedTags === 1 ? '' : 's'} updated from the server; previous targets saved as recovery refs.` : '';
+    const message = `${entry.name}: branches and tags fetched.${tagNotice} Checkout unchanged.`;
+    status(message);
+    showOperationToast(message, 'success');
   }
   catch (error) { const message = handleError(error); showOperationToast(message, 'error'); }
   finally { finishButton(); }
