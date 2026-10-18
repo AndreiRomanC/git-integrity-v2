@@ -202,6 +202,27 @@ test('work-item diagnostics test the current fragment only in that mode', async 
   assert.equal(h.calls.at(-1).args.query, '');
   assert.equal(h.calls.at(-1).args.documentQuery, 'errm');
 });
+test('explicit diagnostics can reuse the same-project saved StructDoc, but never change associations or probe automatically', async () => {
+  const h = harness(); h.setWorkspace({ document: { ...task('P/Structure Information/PRIVATE_DOC'), kind: 'document' } }); await inProject(h);
+  h.el('TabDocuments').handlers.click();
+  assert.equal(h.calls.filter(c => c.name === 'polarion_diagnostics').length, 0);
+  h.overrides.polarion_diagnostics = async () => ({ code: 'ok', diagnostics: [
+    { step: 'known_document_query', query_variant: 'known_module_exact', code: 'ok', http: 200, count: 0, known_match: false },
+    { step: 'document_query', query_variant: 'location_tokens_prefix', code: 'ok', http: 200, count: 1, known_match: true },
+  ] });
+  await h.el('Diagnostics').handlers.click();
+  assert.equal(h.calls.at(-1).args.resourceUrl, 'https://polarion.vitesco.io/polarion/#/project/P/wiki/Structure%20Information/PRIVATE_DOC');
+  assert.match(h.el('DiagnosticReport').children[0].children[1].textContent, /0 rows in sample.*known reference not in sample/);
+  assert.match(h.el('DiagnosticReport').children[1].children[0].textContent, /location tokens prefix/);
+  assert.match(h.el('DiagnosticReport').children[1].children[1].textContent, /known reference found/);
+  h.el('DiagnosticUrl').value = 'https://polarion.vitesco.io/polarion/#/project/Other/wiki/S/Explicit';
+  await h.el('Diagnostics').handlers.click(); assert.equal(h.calls.at(-1).args.resourceUrl, h.el('DiagnosticUrl').value);
+  assert.equal(h.calls.filter(c => c.name === 'polarion_workspace' && c.args.action !== 'load').length, 0);
+  const { polarionDiagnosticDocumentLink } = require('../frontend/polarion.js');
+  assert.equal(polarionDiagnosticDocumentLink('', { kind: 'document', id: 'Other/S/D' }, 'P'), '');
+  assert.equal(polarionDiagnosticDocumentLink('', { kind: 'document', id: 'P/../D' }, 'P'), '');
+  assert.equal(polarionDiagnosticDocumentLink('', { kind: 'workitem', id: 'P/P-1' }, 'P'), '');
+});
 test('diagnostic UI shows observed element types and sample limits, not a claim of full document access', async () => {
   const h = harness(); await inProject(h); h.el('TabDocuments').handlers.click();
   h.overrides.polarion_diagnostics = async () => ({ code: 'ok', diagnostics: [
@@ -282,8 +303,8 @@ test('compatible document name search stays selectable and explains incomplete c
     items: [{ id: 'P/Structure Information/P_ERRM_StructDoc', title: 'P_ERRM_StructDoc' }] }));
   await h.el('DocumentSearchButton').handlers.click();
   assert.equal(h.calls.at(-1).args.query, 'errm');
-  assert.match(h.el('DocumentHint').textContent, /Empty documents and title-only matches may be missing/);
-  assert.match(h.el('Status').textContent, /Compatibility search/);
+  assert.match(h.el('DocumentHint').textContent, /Empty documents, reference-only documents and title-only matches may be missing/);
+  assert.match(h.el('Status').textContent, /Limited document discovery/);
   h.el('Results').children[0].handlers.click();
   assert.equal(h.el('Associate').disabled, false);
   h.overrides.polarion_read = async args => {
@@ -293,6 +314,16 @@ test('compatible document name search stays selectable and explains incomplete c
   await h.el('View').handlers.click();
   assert.equal(h.calls.filter(c => c.name === 'polarion_workspace' && c.args.action !== 'load').length, 0);
   assert.equal(h.calls.filter(c => c.name === 'polarion_connect').length, 0);
+});
+test('token-based document discovery explicitly explains narrower matching, including zero results', async () => {
+  const h = harness(); await inProject(h); h.el('TabDocuments').handlers.click();
+  h.el('DocumentSource').value = 'documents'; h.el('DocumentQuery').value = 'errm';
+  h.search(async () => ({ code: 'ok', catalog_source: 'work_item_modules', document_query_variant: 'location_tokens_prefix',
+    document_search_limited: true, matched: 0, received: 0, items: [] }));
+  await h.el('DocumentSearchButton').handlers.click();
+  assert.match(h.el('DocumentHint').textContent, /not unrestricted substring matching/);
+  assert.match(h.el('Status').textContent, /Limited document discovery.*token\/prefix or exact lookup/);
+  assert.equal(h.el('Associate').disabled, true);
 });
 test('name search rejects too-short fragments without HTTP and discards a result after closing and reopening', async () => {
   const h = harness(); await inProject(h); h.el('TabDocuments').handlers.click();

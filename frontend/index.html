@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Git DrillDown</title>
   <link rel="icon" type="image/png" href="assets/git-drilldown-mark.png">
-  <link rel="stylesheet" href="styles.css?v=20261017-submodule-tag-refresh">
-  <link rel="stylesheet" href="polarion.css?v=20261017-submodule-tag-refresh">
+  <link rel="stylesheet" href="styles.css?v=20261017-polarion-query-compat">
+  <link rel="stylesheet" href="polarion.css?v=20261017-polarion-query-compat">
 </head>
 <body>
   <div class="app-shell">
@@ -820,8 +820,8 @@
           </section>
           <details class="polarion-diagnostics"><summary>Troubleshooting · read access</summary>
             <small id="polarionDiagnosticSummary">Optional, explicit GET checks. Results stay in this tab and the log.</small>
-            <div class="polarion-diagnostic-actions"><button type="button" id="polarionDiagnostics">Check read access</button><small>Uses the link above · up to 25 seconds · no automatic sign-in</small></div>
-            <small>The link's project scopes these checks only. Samples up to 10 document parts and one linked work item; logs technical fields and type IDs, not titles, task IDs or document contents. The current search is checked when provided. A 404 alone does not prove a permission problem; 405 means GET is not allowed at that location. Saved associations stay unchanged.</small>
+            <div class="polarion-diagnostic-actions"><button type="button" id="polarionDiagnostics">Check read access</button><small>Uses the link or same-project saved StructDoc · up to 25 seconds · no automatic sign-in</small></div>
+            <small>Checks targeted search syntax and exact known references. The link's project scopes these checks only. Samples up to 10 document parts and one linked work item; logs technical fields and type IDs, not search values, titles, task IDs or document contents. Accepted queries with no matches are distinguished from rejected queries. A 404 alone does not prove a permission problem; 405 means GET is not allowed at that location. Saved associations stay unchanged.</small>
             <div id="polarionDiagnosticReport" aria-label="Polarion read access checks"></div>
           </details>
         </section>
@@ -830,16 +830,16 @@
       <footer><span>Read-only on Polarion · local snapshots outside Git</span><button value="cancel">Close</button><button type="button" id="polarionAdd" class="confirm" disabled>Add to Commit List</button></footer>
     </form>
   </dialog>
-  <script src="polarion.js?v=20261017-submodule-tag-refresh"></script>
-  <script src="console-context.js?v=20261017-submodule-tag-refresh"></script>
-  <script src="graph-model.js?v=20261017-submodule-tag-refresh"></script>
-  <script src="submodule-state.js?v=20261017-submodule-tag-refresh"></script>
-  <script src="submodule-versions.js?v=20261017-submodule-tag-refresh"></script>
-  <script src="local-diff.js?v=20261017-submodule-tag-refresh"></script>
-  <script src="local-drive.js?v=20261017-submodule-tag-refresh"></script>
-  <script src="pr-status.js?v=20261017-submodule-tag-refresh"></script>
-  <script src="refresh-coordinator.js?v=20261017-submodule-tag-refresh"></script>
-  <script src="comparison-authors.js?v=20261017-submodule-tag-refresh"></script>
-  <script src="app.js?v=20261017-submodule-tag-refresh"></script>
+  <script src="polarion.js?v=20261017-polarion-query-compat"></script>
+  <script src="console-context.js?v=20261017-polarion-query-compat"></script>
+  <script src="graph-model.js?v=20261017-polarion-query-compat"></script>
+  <script src="submodule-state.js?v=20261017-polarion-query-compat"></script>
+  <script src="submodule-versions.js?v=20261017-polarion-query-compat"></script>
+  <script src="local-diff.js?v=20261017-polarion-query-compat"></script>
+  <script src="local-drive.js?v=20261017-polarion-query-compat"></script>
+  <script src="pr-status.js?v=20261017-polarion-query-compat"></script>
+  <script src="refresh-coordinator.js?v=20261017-polarion-query-compat"></script>
+  <script src="comparison-authors.js?v=20261017-polarion-query-compat"></script>
+  <script src="app.js?v=20261017-polarion-query-compat"></script>
 </body>
 </html>

@@ -65,6 +65,10 @@ pub struct HttpDiagnostic {
     #[serde(default)] module_links: usize,
     #[serde(default)] workitem_links: usize,
     #[serde(default)] included_workitems: usize,
+    #[serde(default)] query_variant: String,
+    #[serde(default)] query_fields: Vec<String>,
+    #[serde(default)] error_class: String,
+    #[serde(default)] known_match: Option<bool>,
 }
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct ServerMetadata {
@@ -84,6 +88,8 @@ pub struct SearchResult {
     #[serde(default)] catalog_cached: bool,
     #[serde(default)] catalog_pages: usize,
     #[serde(default)] catalog_source: String,
+    #[serde(default)] document_query_variant: String,
+    #[serde(default)] document_search_limited: bool,
     #[serde(default)] matched: usize,
     #[serde(default)] snapshot: Option<Snapshot>,
     #[serde(default)] user_id: String,
@@ -151,29 +157,52 @@ fn search_url(kind: &str, project: &str, query: &str, user: &str, page: usize) -
     Ok(url.to_string())
 }
 
+fn escaped_query_literal(value: &str) -> String {
+    let mut escaped = String::new();
+    for c in value.chars() {
+        if !c.is_alphanumeric() && c != '_' && c != '.' { escaped.push('\\'); }
+        escaped.push(c);
+    }
+    escaped
+}
+
+fn workitem_query_url(project: &str, expression: &str, page_size: usize) -> String {
+    let mut url = reqwest::Url::parse(&format!("https://{HOST}/polarion/rest/v1/projects/{project}/workitems")).unwrap();
+    url.query_pairs_mut().append_pair("query", expression).append_pair("fields[workitems]", "id,module")
+        .append_pair("page[size]", &page_size.to_string()).append_pair("page[number]", "1").append_pair("sort", "id");
+    url.to_string()
+}
+
+// Keep the existing contains query first. Older installations may reject its
+// leading wildcard or nested reference field. The SDK also defines Work Item
+// index fields `module` and `location.tokenized`: try only targeted expressions
+// on these fields, never an unfiltered project-wide Work Item discovery scan.
+fn document_query_variants(project: &str, query: &str, page_size: usize) -> Vec<serde_json::Value> {
+    let words: Vec<_> = query.split_whitespace().map(escaped_query_literal).collect();
+    let contains = words.iter().map(|word| format!("*{word}*")).collect::<Vec<_>>().join(" AND ");
+    let prefix = |field: &str| words.iter().map(|word| format!("{field}:{word}*")).collect::<Vec<_>>().join(" AND ");
+    let mut variants = vec![("module_id_contains", format!("module.id:({contains})"))];
+    let tokens: Vec<_> = query.split(|c: char| !c.is_alphanumeric()).filter(|word| word.chars().count() >= 3).take(12).collect();
+    if !tokens.is_empty() {
+        variants.push(("location_tokens_prefix", tokens.iter().map(|token| format!("location.tokenized:{}*", escaped_query_literal(token))).collect::<Vec<_>>().join(" AND ")));
+    }
+    variants.extend([
+        ("module_contains", format!("module:({contains})")),
+        ("module_prefix", prefix("module")),
+        ("module_id_prefix", prefix("module.id")),
+        ("module_exact", format!("module:\"{}\"", query.replace('\\', "\\\\").replace('"', "\\\""))),
+    ]);
+    variants.into_iter().map(|(variant, expression)| serde_json::json!({"variant":variant,"url":workitem_query_url(project, &expression, page_size)})).collect()
+}
+
 fn document_search_args(project: &str, query: &str, page: usize) -> Result<serde_json::Value, String> {
     let url = search_url("documents", project, query, "", page)?;
     if query.trim().chars().count() < 3 { return Err("Type at least three characters of the document name or path.".into()); }
     let mut global = reqwest::Url::parse(&url).unwrap();
     global.set_path("/polarion/rest/v1/all/documents");
     global.query_pairs_mut().append_pair("query", &format!("project.id:\"{project}\""));
-    // Older servers expose individual Documents and Work Item -> module
-    // relationships, but not the Document collection GETs. Query that real
-    // relationship, never invent document paths or scan every project item.
-    // Treat user input as literal fragments, not Lucene query operators.
-    let words = query.split_whitespace().map(|word| {
-        let mut escaped = String::new();
-        for c in word.chars() {
-            if !c.is_alphanumeric() && c != '_' && c != '.' { escaped.push('\\'); }
-            escaped.push(c);
-        }
-        format!("*{escaped}*")
-    }).collect::<Vec<_>>().join(" AND ");
-    let mut modules = reqwest::Url::parse(&format!("https://{HOST}/polarion/rest/v1/projects/{project}/workitems")).unwrap();
-    modules.query_pairs_mut().append_pair("query", &format!("module.id:({words})"))
-        .append_pair("fields[workitems]", "id,module").append_pair("page[size]", "100")
-        .append_pair("page[number]", "1").append_pair("sort", "id");
-    Ok(serde_json::json!({"url":url,"documentGlobalUrl":global.to_string(),"documentModulesUrl":modules.to_string(),
+    let variants = document_query_variants(project, query, 100);
+    Ok(serde_json::json!({"url":url,"documentGlobalUrl":global.to_string(),"documentModulesUrl":variants[0]["url"],"documentModuleQueries":variants,
         "kind":"documents","project":project,"query":query,"page":page}))
 }
 
@@ -390,7 +419,7 @@ fn diagnostic_args(project: &str, link: &str, query: &str, document_query: &str)
         add("documents_global", limited(global.to_string())?);
         // One indexed match, not a project-wide Work Item scan. Only technical
         // response facts leave the portal during diagnostics.
-        add("workitem_modules", format!("{root}/projects/{project}/workitems?query=module.id:*&page[size]=1&page[number]=1&fields[workitems]=id,type,status,module"));
+        add("workitem_modules", workitem_query_url(project, "HAS_VALUE:module", 1));
         add("spaces", format!("{root}/projects/{project}/spaces?page[size]=1&page[number]=1"));
         if let Some(id) = resource.as_deref() {
             // Minimal sparse fields isolate endpoint access from optional
@@ -402,10 +431,10 @@ fn diagnostic_args(project: &str, link: &str, query: &str, document_query: &str)
             page.set_query(Some("fields[pages]=title"));
             add("document_exact", document.to_string());
             add("page_exact", page.to_string());
-            let parts = resource_segments(id, 3)?;
+            let segments = resource_segments(id, 3)?;
             for (step, collection) in [("space_documents", "documents"), ("space_pages", "pages")] {
                 let mut url = reqwest::Url::parse(&root).unwrap();
-                url.path_segments_mut().unwrap().push("projects").push(project).push("spaces").push(parts[1]).push(collection);
+                url.path_segments_mut().unwrap().push("projects").push(project).push("spaces").push(segments[1]).push(collection);
                 url.query_pairs_mut().append_pair("page[size]", "1").append_pair("page[number]", "1");
                 add(step, url.to_string());
             }
@@ -418,10 +447,23 @@ fn diagnostic_args(project: &str, link: &str, query: &str, document_query: &str)
             // The portal substitutes one actual, validated Work Item relation
             // from the sampled parts; it never exports that item's ID or data.
             probes.push(serde_json::json!({ "step":"workitem_sample", "url":format!("{root}/projects/{project}/workitems?fields[workitems]=id,title,type,status,module"), "requires":"document_parts_expanded" }));
+            // Exact controls contain no wildcard. The known document/sample
+            // stays inside the authenticated portal; only match booleans are
+            // logged, never the Work Item ID, document path or query values.
+            for (variant, expression) in [
+                ("known_module_exact", format!("module:\"{}\"", id.replace('\\', "\\\\").replace('"', "\\\""))),
+                ("known_module_id_exact", format!("module.id:\"{}\"", id.replace('\\', "\\\\").replace('"', "\\\""))),
+                ("known_module_name_exact", format!("module.id:\"{}\"", segments[2].replace('\\', "\\\\").replace('"', "\\\""))),
+            ] {
+                probes.push(serde_json::json!({"step":"known_document_query","variant":variant,"url":workitem_query_url(project, &expression, 1),"requires":"document_exact","known":"document"}));
+            }
+            probes.push(serde_json::json!({"step":"known_item_query","variant":"known_item_exact","url":workitem_query_url(project, "", 1),"requires":"workitem_sample","known":"item"}));
         }
         if !document_query.trim().is_empty() {
-            let search = document_search_args(project, document_query, 1)?;
-            probes.push(serde_json::json!({ "step":"document_name_query", "url":limited(search["documentModulesUrl"].as_str().unwrap().to_string())? }));
+            document_search_args(project, document_query, 1)?; // Same validation as normal search.
+            for candidate in document_query_variants(project, document_query, 1) {
+                probes.push(serde_json::json!({"step":"document_query","variant":candidate["variant"],"url":candidate["url"]}));
+            }
         }
         if !query.trim().is_empty() {
             let current = limited(search_url("containers", project, query, "", 1)?)?;
@@ -442,7 +484,8 @@ fn diagnostic_args(project: &str, link: &str, query: &str, document_query: &str)
         // before optional catalogs that may not exist on this server.
         probes.sort_by_key(|probe| match probe["step"].as_str().unwrap_or("") {
             "project_access" => 0, "document_exact" => 1, "document_parts" => 2,
-            "document_parts_expanded" => 3, "workitem_sample" => 4, _ => 5,
+            "document_parts_expanded" => 3, "workitem_sample" => 4, "known_item_query" => 5,
+            "known_document_query" | "document_query" => 6, _ => 7,
         });
     }
     Ok(serde_json::json!({ "kind":"diagnostics", "project":project, "resourceId":resource, "query":query, "probes":probes, "page":1 }))
@@ -528,9 +571,10 @@ fn validate_result(raw: &str) -> Result<SearchResult, String> {
         || result.items.len() > 25 || result.items.iter().any(|item| (!identifier(&item.id) && resource_segments(&item.id, 3).is_err() && resource_segments(&item.id, 2).is_err()) || item.title.len() > 2000 || item.item_type.len() > 240)
         || result.elements.len() > 25 || result.elements.iter().any(|s| !valid_snapshot(s))
         || result.snapshot.as_ref().is_some_and(|s| !valid_snapshot(s)) || result.user_id.len() > 120 || result.user_name.len() > 500 || result.page_key.len() > 30_000
-        || result.diagnostics.len() > 24 || result.http_requests > 210 || result.diagnostics_omitted > 210
+        || result.diagnostics.len() > 40 || result.http_requests > 210 || result.diagnostics_omitted > 210
         || result.diagnostics.iter().any(|d| !valid_diagnostic(d))
         || !["", "project_documents", "all_documents", "work_item_modules"].contains(&result.catalog_source.as_str())
+        || !valid_query_variant(&result.document_query_variant)
         || result.server_metadata.as_ref().is_some_and(|m| {
             (!m.version.is_empty() && (m.version.len() > 40 || !m.version.contains('.') || !m.version.bytes().all(|b| b.is_ascii_digit() || b == b'.')))
                 || (!m.build.is_empty() && (m.build.len() > 90 || !m.build.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') || m.build.get(..8).is_none_or(|v| !v.bytes().all(|b| b.is_ascii_digit())))) || m.max_page_size > 1_000_000
@@ -552,8 +596,12 @@ fn diagnostic_endpoint(route: &str) -> Option<&'static str> {
     })
 }
 
+fn valid_query_variant(value: &str) -> bool {
+    ["", "module_id_contains", "location_tokens_prefix", "module_contains", "module_prefix", "module_id_prefix", "module_exact", "known_module_exact", "known_module_id_exact", "known_module_name_exact", "known_item_exact"].contains(&value)
+}
+
 fn valid_diagnostic(d: &HttpDiagnostic) -> bool {
-    ["primary", "prefix_fallback", "metadata_fallback", "catalog_page", "document_global", "document_modules", "metadata", "current_user", "project_access", "tasks_baseline", "documents_catalog", "documents_global", "workitem_modules", "document_name_query", "document_parts_expanded", "workitem_sample", "spaces", "document_exact", "page_exact", "space_documents", "space_pages", "document_parts", "query_current", "query_prefix", "query_without_id_star"].contains(&d.step.as_str())
+    ["primary", "prefix_fallback", "metadata_fallback", "catalog_page", "document_global", "document_modules", "metadata", "current_user", "project_access", "tasks_baseline", "documents_catalog", "documents_global", "workitem_modules", "document_name_query", "document_query", "known_document_query", "known_item_query", "document_parts_expanded", "workitem_sample", "spaces", "document_exact", "page_exact", "space_documents", "space_pages", "document_parts", "query_current", "query_prefix", "query_without_id_star"].contains(&d.step.as_str())
         && diagnostic_endpoint(&d.route).is_some() && d.duration_ms <= 600_000 && d.http <= 599 && d.page <= 1000 && d.count <= 100_000
         && ["ok", "auth_required", "forbidden", "api_unavailable", "query_rejected", "http_error", "not_json", "network_error", "timeout", "invalid_response", "not_run"].contains(&d.code.as_str())
         && ["", "leading_wildcard", "unknown_field", "query_syntax", "unsupported_parameter", "permission_denied", "authentication_required", "not_found", "method_not_allowed", "unclassified", "error_body_limit", "partial_errors", "unexpected_resource", "relationship_missing", "prerequisite_missing", "sample_missing", "budget"].contains(&d.reason.as_str())
@@ -563,6 +611,9 @@ fn valid_diagnostic(d: &HttpDiagnostic) -> bool {
         && d.allow.len() <= 7 && d.allow.iter().all(|v| ["GET", "HEAD", "OPTIONS", "POST", "PATCH", "PUT", "DELETE"].contains(&v.as_str()))
         && ["", "none", "module_name", "project_scope", "work_item_search", "other"].contains(&d.query_kind.as_str())
         && ["", "list", "single", "missing"].contains(&d.shape.as_str())
+        && valid_query_variant(&d.query_variant)
+        && ["", "clause_limit", "query_parser", "unsupported_operation", "invalid_argument"].contains(&d.error_class.as_str())
+        && d.query_fields.len() <= 10 && d.query_fields.iter().all(|field| ["id","title","type","module","module.id","location","location.tokenized","project.id","assignee.id","HAS_VALUE"].contains(&field.as_str()))
         && d.sample_rows <= 10 && d.module_links <= 10 && d.workitem_links <= 10 && d.included_workitems <= 10
         && [&d.requested_fields, &d.returned_fields, &d.relationship_fields].iter().all(|fields| fields.len() <= 32 && fields.iter().all(|field| {
             let Some((resource, field)) = field.split_once('.') else { return false; };
@@ -575,9 +626,16 @@ fn valid_diagnostic(d: &HttpDiagnostic) -> bool {
 fn log_diagnostics(id: &str, result: &SearchResult) {
     for (i, d) in result.diagnostics.iter().enumerate() {
         perf_log(&format!("polarion: http request={id} event={} step={} method=GET endpoint={} code={} http={} media={} reason={} parameter={} page={} query_present={} id_star={} leading_wildcard={} resource_type={} count={} more={} allow={}", i + 1, d.step, diagnostic_endpoint(&d.route).unwrap_or("unknown"), d.code, d.http, d.media, d.reason, d.parameter, d.page, d.query, d.id_star, d.leading_wildcard, d.resource_type, d.count, d.more, d.allow.join(",")), Duration::from_millis(d.duration_ms));
+        if d.query || !d.query_variant.is_empty() {
+            let known = d.known_match.map(|value| if value { "found_in_sample" } else { "not_in_sample" }).unwrap_or("not_checked");
+            perf_log(&format!("polarion: query_capability request={id} event={} variant={} fields={} syntax_accepted={} response_usable={} rows={} known_match={known} leading_wildcard={} id_star={} error_class={} no_query_values_logged=true", i + 1, d.query_variant, d.query_fields.join(","), d.http == 200, d.code == "ok", d.count, d.leading_wildcard, d.id_star, d.error_class), Duration::ZERO);
+        }
         if !d.shape.is_empty() || !d.requested_fields.is_empty() {
             perf_log(&format!("polarion: response_facts request={id} event={} query_kind={} shape={} requested_fields={} returned_fields={} relationships={} sampled_rows={} item_types={} module_links={} workitem_links={} included_workitems={} sample_only=true no_content_logged=true", i + 1, d.query_kind, d.shape, d.requested_fields.join(","), d.returned_fields.join(","), d.relationship_fields.join(","), d.sample_rows, d.item_types.join(","), d.module_links, d.workitem_links, d.included_workitems), Duration::ZERO);
         }
+    }
+    if result.catalog_source == "work_item_modules" {
+        perf_log(&format!("polarion: document_search_coverage request={id} variant={} matched={} limited={} source=owning_module_relationships no_complete_catalog_claim=true", result.document_query_variant, result.matched, result.document_search_limited), Duration::ZERO);
     }
     if let Some(m) = &result.server_metadata {
         perf_log(&format!("polarion: server_metadata request={id} version={} build={} max_page_size={}", m.version, m.build, m.max_page_size), Duration::ZERO);
@@ -624,6 +682,27 @@ mod tests {
             assert!(document_search_args(project, query, page).is_err());
         }
         assert!(document_search_args("P", &"x".repeat(241), 1).is_err());
+    }
+    #[test]
+    fn document_query_alternatives_are_targeted_escaped_and_use_documented_index_fields() {
+        let args = document_search_args("P", "ERRM StructDoc", 1).unwrap();
+        let variants = args["documentModuleQueries"].as_array().unwrap();
+        assert_eq!(variants.len(), 6);
+        let queries: Vec<_> = variants.iter().map(|v| {
+            assert!(valid_query_variant(v["variant"].as_str().unwrap()));
+            let url = reqwest::Url::parse(v["url"].as_str().unwrap()).unwrap();
+            assert_eq!(url.host_str(), Some(HOST)); assert_eq!(url.path(), "/polarion/rest/v1/projects/P/workitems");
+            let params = pairs(url.as_str());
+            assert_eq!(params["page[size]"], "100"); assert_eq!(params["fields[workitems]"], "id,module");
+            assert_eq!(params["sort"], "id"); params["query"].clone()
+        }).collect();
+        assert_eq!(queries, vec!["module.id:(*ERRM* AND *StructDoc*)", "location.tokenized:ERRM* AND location.tokenized:StructDoc*",
+            "module:(*ERRM* AND *StructDoc*)", "module:ERRM* AND module:StructDoc*", "module.id:ERRM* AND module.id:StructDoc*", "module:\"ERRM StructDoc\""]);
+        let literal = document_query_variants("P", "ERRM\" OR module:*", 1);
+        assert_eq!(pairs(literal.last().unwrap()["url"].as_str().unwrap())["query"], "module:\"ERRM\\\" OR module:*\"");
+        let short_tokens = document_query_variants("P", "ab_12", 1);
+        assert_eq!(short_tokens.len(), 5, "no token shorter than three characters may trigger indexed discovery");
+        assert!(short_tokens.iter().all(|v| !pairs(v["url"].as_str().unwrap())["query"].is_empty()));
     }
     #[test]
     fn compatible_document_search_diagnostics_and_source_are_safe_allowlisted_values() {
@@ -691,7 +770,7 @@ mod tests {
         assert_eq!(args["project"], "VWAQ4", "the link scopes checks, not saved project associations");
         assert_eq!(args["resourceId"], "VWAQ4/Structure Information/VWAQ4-SW_ERRM_StructDoc_2_0_0");
         let probes = args["probes"].as_array().unwrap();
-        assert_eq!(probes.len(), 18);
+        assert_eq!(probes.len(), 22);
         for probe in probes {
             let url = reqwest::Url::parse(probe["url"].as_str().unwrap()).unwrap();
             assert_eq!(url.host_str(), Some(HOST)); assert!(!url.path().contains("/actions/"));
@@ -721,7 +800,7 @@ mod tests {
         assert!(validate_result(&bad.to_string()).is_err());
         bad = good.clone(); bad["diagnostics"][0]["duration_ms"] = 600001.into();
         assert!(validate_result(&bad.to_string()).is_err());
-        bad = good.clone(); bad["diagnostics"] = serde_json::json!(vec![good["diagnostics"][0].clone(); 25]);
+        bad = good.clone(); bad["diagnostics"] = serde_json::json!(vec![good["diagnostics"][0].clone(); 41]);
         assert!(validate_result(&bad.to_string()).is_err());
         bad = good.clone(); bad["server_metadata"] = serde_json::json!({"version":"SECRET"});
         assert!(validate_result(&bad.to_string()).is_err());
@@ -743,16 +822,36 @@ mod tests {
     #[test]
     fn diagnostic_name_search_is_explicit_and_sampling_is_gated_and_read_only() {
         let args = diagnostic_args("P", "https://polarion.vitesco.io/polarion/#/project/P/wiki/S/D", "", "errm").unwrap();
-        let probes = args["probes"].as_array().unwrap(); assert!(probes.len() < 24);
+        let probes = args["probes"].as_array().unwrap(); assert!(probes.len() < 40);
         assert_eq!(probes[1]["step"], "document_exact"); assert_eq!(probes[4]["step"], "workitem_sample");
-        let name = probes.iter().find(|p| p["step"] == "document_name_query").unwrap()["url"].as_str().unwrap();
+        let name = probes.iter().find(|p| p["step"] == "document_query" && p["variant"] == "module_id_contains").unwrap()["url"].as_str().unwrap();
         assert_eq!(pairs(name)["query"], "module.id:(*errm*)"); assert_eq!(pairs(name)["page[size]"], "1");
         let expanded = probes.iter().find(|p| p["step"] == "document_parts_expanded").unwrap();
         assert_eq!(expanded["requires"], "document_exact"); assert_eq!(pairs(expanded["url"].as_str().unwrap())["page[size]"], "10");
         let item = probes.iter().find(|p| p["step"] == "workitem_sample").unwrap();
         assert_eq!(item["requires"], "document_parts_expanded");
         assert!(!item["url"].as_str().unwrap().contains("PRIVATE_ID"));
-        assert!(diagnostic_args("P", "", "", "").unwrap()["probes"].as_array().unwrap().iter().all(|p| p["step"] != "document_name_query"));
+        assert!(diagnostic_args("P", "", "", "").unwrap()["probes"].as_array().unwrap().iter().all(|p| p["step"] != "document_query"));
+        let known = probes.iter().find(|p| p["variant"] == "known_module_exact").unwrap();
+        assert_eq!(known["requires"], "document_exact"); assert_eq!(pairs(known["url"].as_str().unwrap())["query"], "module:\"P/S/D\"");
+        let known_item = probes.iter().find(|p| p["variant"] == "known_item_exact").unwrap();
+        assert_eq!(known_item["requires"], "workitem_sample"); assert_eq!(pairs(known_item["url"].as_str().unwrap())["query"], "");
+        let presence = probes.iter().find(|p| p["step"] == "workitem_modules").unwrap();
+        assert_eq!(pairs(presence["url"].as_str().unwrap())["query"], "HAS_VALUE:module");
+    }
+    #[test]
+    fn query_capability_diagnostics_export_only_fixed_technical_categories() {
+        let good = serde_json::json!({"code":"ok", "document_query_variant":"location_tokens_prefix", "document_search_limited":true,
+            "diagnostics":[{"step":"known_document_query","query_variant":"known_module_exact","route":"workitems","code":"ok","http":200,
+                "query_fields":["module"],"error_class":"query_parser","known_match":false}]});
+        assert!(validate_result(&good.to_string()).is_ok());
+        for (key, value) in [("query_variant", serde_json::json!("PRIVATE_QUERY")), ("query_fields", serde_json::json!(["module:PRIVATE_NAME"])),
+            ("error_class", serde_json::json!("Raw secret server exception")), ("known_match", serde_json::json!("PRIVATE_ID"))] {
+            let mut bad = good.clone(); bad["diagnostics"][0][key] = value;
+            assert!(validate_result(&bad.to_string()).is_err(), "{key}");
+        }
+        let mut bad = good; bad["document_query_variant"] = "raw query".into();
+        assert!(validate_result(&bad.to_string()).is_err());
     }
     #[test]
     fn read_urls_are_read_only_precise_and_encode_document_names() {

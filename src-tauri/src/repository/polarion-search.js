@@ -8,7 +8,7 @@
   let server_metadata;
   const trace = entry => {
     // Keep the first context and the latest failure even in long catalogs.
-    if (diagnostics.length === 24) { diagnostics.pop(); diagnostics_omitted++; }
+    if (diagnostics.length === 40) { diagnostics.pop(); diagnostics_omitted++; }
     diagnostics.push(entry);
   };
   const reply = data => {
@@ -118,7 +118,11 @@
       : /(?:permission|forbidden|not allowed|access denied)/.test(words) ? 'permission_denied'
       : /(?:unauthoriz|authentication|sign.in)/.test(words) ? 'authentication_required'
       : /(?:not found|does not exist|no such)/.test(words) ? 'not_found' : 'unclassified';
-    return { reason, parameter };
+    const error_class = /toomanyclauses|too many clauses/.test(words) ? 'clause_limit'
+      : /parse\s*exception|queryparser|query parse|parse error|syntax error/.test(words) ? 'query_parser'
+      : /unsupportedoperationexception|unsupported operation/.test(words) ? 'unsupported_operation'
+      : /illegalargumentexception/.test(words) ? 'invalid_argument' : '';
+    return { reason, parameter, error_class };
   };
   const snapshot = (item, summary = false) => {
     const a = item.attributes || {}, kind = item.type === 'documents' ? 'document' : 'workitem';
@@ -144,12 +148,15 @@
       if (token) { headers['X-Polarion-REST-Token'] = token; session_token = true; }
     }
     const options = { method: 'GET', headers, credentials: 'same-origin', redirect: 'manual', signal: abort.signal };
-    const request = async (url, step = 'primary', bounded = false) => {
+    const request = async (url, step = 'primary', bounded = false, query_variant = '') => {
       const parsed = new URL(url);
       if (parsed.origin !== location.origin || !parsed.pathname.startsWith('/polarion/rest/v1/')) throw { code: 'invalid_response' };
+      if (http_requests >= 210) throw { code: 'catalog_limit' };
       const started = Date.now(), query = parsed.searchParams.get('query') || '';
-      const entry = { step, route: route(parsed), code: 'network_error', http: 0, page: Number(parsed.searchParams.get('page[number]') || 1), query: Boolean(query), id_star: /\bid:\*/.test(query), leading_wildcard: /\(\*|AND \*/.test(query), media: '', reason: '', parameter: '', resource_type: '', count: 0, more: false, allow: [] };
-      entry.query_kind = !query ? 'none' : /^module\.id:/.test(query) ? 'module_name' : /^project\.id:/.test(query) ? 'project_scope' : /(?:id|title):/.test(query) ? 'work_item_search' : 'other';
+      const entry = { step, route: route(parsed), code: 'network_error', http: 0, page: Number(parsed.searchParams.get('page[number]') || 1), query: Boolean(query), id_star: /(?:^|[\s(])id:\s*\*/.test(query), leading_wildcard: /(?:^|[\s(:])[*?]/.test(query), media: '', reason: '', parameter: '', resource_type: '', count: 0, more: false, allow: [], query_variant, query_fields: [] };
+      const queryFields = ['id','title','type','module','module.id','location','location.tokenized','project.id','assignee.id','HAS_VALUE'];
+      entry.query_fields = [...new Set([...query.matchAll(/\b([A-Za-z][A-Za-z0-9_.]*)\s*:/g)].map(match => match[1]).filter(field => queryFields.includes(field)))].sort();
+      entry.query_kind = !query ? 'none' : /^(?:module(?:\.id)?|location(?:\.tokenized)?|HAS_VALUE):/.test(query) ? 'module_name' : /^project\.id:/.test(query) ? 'project_scope' : /(?:id|title):/.test(query) ? 'work_item_search' : 'other';
       entry.requested_fields = [];
       for (const [key, value] of parsed.searchParams) {
         const resource = /^fields\[([a-z_]+)\]$/.exec(key)?.[1];
@@ -170,7 +177,7 @@
         if (!response.ok) {
           Object.assign(entry, await errorInfo(response));
           if (http === 405) entry.reason = 'method_not_allowed';
-          throw { http, code: http === 401 ? 'auth_required' : http === 403 ? 'forbidden' : [404,405,501,503].includes(http) ? 'api_unavailable' : http === 400 ? 'query_rejected' : 'http_error' };
+          throw { http, parameter: entry.parameter, code: http === 401 ? 'auth_required' : http === 403 ? 'forbidden' : [404,405,501,503].includes(http) ? 'api_unavailable' : http === 400 ? 'query_rejected' : 'http_error' };
         }
         if (entry.media !== 'json') throw { http, code: 'not_json' };
         const data = await response.json();
@@ -184,7 +191,7 @@
         return data;
       } catch (error) {
         entry.code = error?.code || (error?.name === 'AbortError' ? 'timeout' : 'network_error');
-        throw { code: entry.code, http: entry.http };
+        throw { code: entry.code, http: entry.http, parameter: entry.parameter };
       } finally {
         clearTimeout(timer); abort.signal.removeEventListener('abort', cancel);
         entry.duration_ms = Math.min(600000, Math.max(0, Date.now() - started)); trace(entry);
@@ -198,22 +205,29 @@
           const url = new URL(probe.url), [project, item] = sampleId.split('/');
           url.pathname = '/polarion/rest/v1/projects/' + encodeURIComponent(project) + '/workitems/' + encodeURIComponent(item); probeUrl = url.href;
         }
+        if (probe.step === 'known_item_query' && sampleId) {
+          const url = new URL(probe.url), item = sampleId.split('/')[1];
+          url.searchParams.set('query', 'id:"' + item.replace(/[\\"]/g, '\\$&') + '"'); probeUrl = url.href;
+        }
         if (Date.now() - started >= 25000 || abort.signal.aborted || (probe.requires && !confirmed.has(probe.requires))) {
           const parsed = new URL(probeUrl);
-          trace({ step: probe.step, route: route(parsed), code: 'not_run', reason: probe.requires && !confirmed.has(probe.requires) ? 'prerequisite_missing' : 'budget', duration_ms: 0 }); continue;
+          trace({ step: probe.step, route: route(parsed), query_variant: probe.variant || '', code: 'not_run', reason: probe.requires && !confirmed.has(probe.requires) ? 'prerequisite_missing' : 'budget', duration_ms: 0 }); continue;
         }
         if (probe.step === 'workitem_sample' && !sampleId) {
           trace({ step: probe.step, route: 'workitem', code: 'not_run', reason: 'sample_missing', duration_ms: 0 }); continue;
         }
         try {
-          const data = await request(probeUrl, probe.step, true), last = diagnostics[diagnostics.length - 1];
+          const data = await request(probeUrl, probe.step, true, probe.variant || ''), last = diagnostics[diagnostics.length - 1];
           const expected = ['document_exact', 'document_parts', 'document_parts_expanded', 'page_exact', 'metadata', 'current_user', 'project_access'].includes(probe.step)
             ? ({ document_exact:'documents', document_parts:'document_parts', document_parts_expanded:'document_parts', page_exact:'pages', metadata:'metadata', current_user:'users', project_access:'projects' })[probe.step]
             : ['documents_catalog','documents_global','space_documents'].includes(probe.step) ? 'documents' : probe.step === 'space_pages' ? 'pages' : probe.step === 'spaces' ? 'spaces' : 'workitems';
           const single = ['document_exact', 'page_exact', 'metadata', 'current_user', 'project_access', 'workitem_sample'].includes(probe.step);
           const rows = Array.isArray(data.data) ? data.data : data.data ? [data.data] : null;
           if (!rows || single === Array.isArray(data.data) || rows.some(item => item.type !== expected || hasErrors(item))) { last.code = 'invalid_response'; last.reason = 'unexpected_resource'; continue; }
-          if (['workitem_modules', 'document_name_query'].includes(probe.step) && rows.some(row => !validId(row.id, 2) || !row.id.startsWith(args.project + '/') ||
+          if (['workitem_modules', 'document_name_query', 'document_query', 'known_document_query', 'known_item_query'].includes(probe.step) && rows.some(row => !validId(row.id, 2) || !row.id.startsWith(args.project + '/'))) {
+            last.code = 'invalid_response'; last.reason = 'unexpected_resource'; continue;
+          }
+          if (['workitem_modules', 'document_name_query', 'document_query'].includes(probe.step) && probe.variant !== 'location_tokens_prefix' && rows.some(row =>
             !row.relationships?.module?.data || row.relationships.module.data.type !== 'documents' || !validId(row.relationships.module.data.id, 3))) {
             last.code = 'invalid_response'; last.reason = 'relationship_missing'; continue;
           }
@@ -222,6 +236,9 @@
             if (probe.step === 'document_exact') confirmed.add(probe.step);
           }
           if (probe.step === 'workitem_sample' && data.data?.id !== sampleId) { last.code = 'invalid_response'; last.reason = 'unexpected_resource'; continue; }
+          if (probe.step === 'workitem_sample') confirmed.add(probe.step);
+          if (probe.known === 'item') last.known_match = rows.some(row => row.id === sampleId);
+          if (probe.known === 'document') last.known_match = rows.some(row => row.relationships?.module?.data?.type === 'documents' && row.relationships.module.data.id === args.resourceId);
           if (probe.step === 'document_parts_expanded') {
             if (rows.length > 10 || rows.some(row => !row.id?.startsWith(args.resourceId + '/'))) { last.code = 'invalid_response'; last.reason = 'unexpected_resource'; continue; }
             confirmed.add(probe.step);
@@ -249,11 +266,22 @@
       const catalog_cached = Boolean(token && cached?.token === token && Date.now() - cached.time < 120000 &&
         (cached.source !== 'work_item_modules' || cached.query === queryKey));
       let items = catalog_cached ? cached.items : [], catalog_source = catalog_cached ? cached.source : '', catalog_pages = 0;
+      let document_query_variant = catalog_cached ? cached.variant || '' : '';
+      const words = queryKey.split(/\s+/).filter(Boolean);
+      const matchesQuery = item => words.every(word => (item.id + ' ' + item.title).toLowerCase().includes(word));
       if (!catalog_cached) {
         delete window[key];
+        const moduleQueries = Array.isArray(args.documentModuleQueries) ? args.documentModuleQueries.slice(0, 6)
+          : args.documentModulesUrl ? [{ url: args.documentModulesUrl, variant: 'module_id_contains' }] : [];
         const sources = [{ source: 'project_documents', url: args.url, step: 'catalog_page' },
           { source: 'all_documents', url: args.documentGlobalUrl, step: 'document_global' },
-          { source: 'work_item_modules', url: args.documentModulesUrl, step: 'document_modules' }].filter(s => s.url);
+          ...moduleQueries.map(candidate => ({ source: 'work_item_modules', url: candidate.url, variant: candidate.variant, step: 'document_modules' }))].filter(s => s.url);
+        const invalidDocumentResponse = reason => {
+          const last = diagnostics[diagnostics.length - 1];
+          if (last) { last.code = 'invalid_response'; last.reason = reason; }
+          throw { code: 'invalid_response' };
+        };
+        let acceptedModuleLookup = false;
         for (let index = 0; index < sources.length; index++) {
           const source = sources[index], modules = source.source === 'work_item_modules';
           const seenRows = new Set(), documents = new Map();
@@ -262,29 +290,36 @@
             if (page > 200) throw { code: 'catalog_limit' };
             const url = new URL(source.url); url.searchParams.set('page[number]', String(page));
             let data;
-            try { data = await request(url.href, source.step); }
+            try { data = await request(url.href, source.step, false, source.variant || ''); }
             catch (error) {
               // Do not retry authentication/permission errors, transient server
               // failures, invalid responses or a later failed catalog page.
-              if (page === 1 && [404, 405, 501].includes(error.http) && index < sources.length - 1) { unavailable = true; break; }
+              if (page === 1 && !modules && [404, 405, 501].includes(error.http) && index < sources.length - 1) { unavailable = true; break; }
+              // Retry only a first-page query rejection. Fields/auth/transport
+              // errors and failed later pages never become partial success.
+              if (page === 1 && modules && error.http === 400 && error.parameter !== 'fields'
+                && (index < sources.length - 1 || acceptedModuleLookup)) { unavailable = true; break; }
               throw error;
             }
             catalog_pages++;
-            if (!Array.isArray(data.data) || data.data.length > 100) throw { code: 'invalid_response' };
+            if (!Array.isArray(data.data) || data.data.length > 100) invalidDocumentResponse('unexpected_resource');
             let added = 0;
             for (const row of data.data) {
               if (hasErrors(row) || row.type !== (modules ? 'workitems' : 'documents') || !validId(row.id, modules ? 2 : 3) ||
-                (source.source !== 'all_documents' && !row.id.startsWith(args.project + '/'))) throw { code: 'invalid_response' };
+                (source.source !== 'all_documents' && !row.id.startsWith(args.project + '/'))) invalidDocumentResponse('unexpected_resource');
               if (seenRows.has(row.id)) continue;
               seenRows.add(row.id); added++;
               let doc = row;
               if (modules) {
                 const relationship = row.relationships?.module;
+                // A location index may also match standalone Work Items.
+                // Never invent a Document association for those rows.
+                if (source.variant === 'location_tokens_prefix' && relationship?.data === null && !hasErrors(relationship)) continue;
                 // A name query returned matching Work Items but the requested
                 // relationship was omitted: don't claim there are no documents.
-                if (!relationship || hasErrors(relationship) || !relationship.data) throw { code: 'invalid_response' };
+                if (!relationship || hasErrors(relationship) || !relationship.data) invalidDocumentResponse('relationship_missing');
                 doc = relationship.data;
-                if (doc.type !== 'documents' || !validId(doc.id, 3)) throw { code: 'invalid_response' };
+                if (doc.type !== 'documents' || !validId(doc.id, 3)) invalidDocumentResponse('unexpected_resource');
               }
               if (!doc.id.startsWith(args.project + '/')) continue;
               const a = doc.attributes || {};
@@ -293,17 +328,24 @@
             if (!data.links?.next) break;
             // Many consecutive pages can legitimately refer to the same
             // document. Detect loops using Work Item IDs, not Document IDs.
-            if (!added) throw { code: 'invalid_response' };
+            if (!added) invalidDocumentResponse('unexpected_resource');
           }
           if (unavailable) continue;
-          catalog_source = source.source; items = [...documents.values()].sort((a, b) => a.id.localeCompare(b.id)); break;
+          catalog_source = source.source; items = [...documents.values()].sort((a, b) => a.id.localeCompare(b.id));
+          if (modules) {
+            acceptedModuleLookup = true; document_query_variant = source.variant || 'module_id_contains';
+            // A valid zero-result prefix does not disprove another targeted
+            // index representation. Do not label discovery as a full catalog.
+            if (!items.some(matchesQuery) && index < sources.length - 1) continue;
+          }
+          break;
         }
-        if (token) window[key] = { token, time: Date.now(), items, source: catalog_source, query: queryKey };
+        if (token) window[key] = { token, time: Date.now(), items, source: catalog_source, query: queryKey, variant: document_query_variant };
       }
-      const words = queryKey.split(/\s+/).filter(Boolean);
-      const matches = items.filter(item => words.every(word => (item.id + ' ' + item.title).toLowerCase().includes(word)));
+      const matches = items.filter(matchesQuery);
       const start = ((args.page || 1) - 1) * 25;
-      return reply({ code: 'ok', http: 200, catalog_source, catalog_cached, catalog_pages, received: items.length, matched: matches.length,
+      return reply({ code: 'ok', http: 200, catalog_source, catalog_cached, catalog_pages, document_query_variant,
+        document_search_limited: catalog_source === 'work_item_modules', received: items.length, matched: matches.length,
         items: matches.slice(start, start + 25).map(({ id, title, item_type }) => ({ id, title, item_type })), more: matches.length > start + 25 });
     }
     if (catalog) {
