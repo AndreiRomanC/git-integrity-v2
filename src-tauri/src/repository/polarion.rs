@@ -186,6 +186,10 @@ fn document_query_variants(project: &str, query: &str, page_size: usize) -> Vec<
     if !tokens.is_empty() {
         variants.push(("location_tokens_prefix", tokens.iter().map(|token| format!("location.tokenized:{}*", escaped_query_literal(token))).collect::<Vec<_>>().join(" AND ")));
     }
+    // The module relationship can be readable while module-name indexes are
+    // unavailable. Discover owning documents via matching element titles;
+    // this is targeted and deliberately not advertised as a full catalog.
+    variants.push(("workitem_title_prefix", prefix("title")));
     variants.extend([
         ("module_contains", format!("module:({contains})")),
         ("module_prefix", prefix("module")),
@@ -599,7 +603,7 @@ fn diagnostic_endpoint(route: &str) -> Option<&'static str> {
 }
 
 fn valid_query_variant(value: &str) -> bool {
-    ["", "module_id_contains", "location_tokens_prefix", "module_contains", "module_prefix", "module_id_prefix", "module_exact", "known_module_exact", "known_module_id_exact", "known_module_name_exact", "known_item_exact"].contains(&value)
+    ["", "module_id_contains", "location_tokens_prefix", "workitem_title_prefix", "module_contains", "module_prefix", "module_id_prefix", "module_exact", "known_module_exact", "known_module_id_exact", "known_module_name_exact", "known_item_exact"].contains(&value)
 }
 
 fn valid_diagnostic(d: &HttpDiagnostic) -> bool {
@@ -689,7 +693,7 @@ mod tests {
     fn document_query_alternatives_are_targeted_escaped_and_use_documented_index_fields() {
         let args = document_search_args("P", "ERRM StructDoc", 1).unwrap();
         let variants = args["documentModuleQueries"].as_array().unwrap();
-        assert_eq!(variants.len(), 6);
+        assert_eq!(variants.len(), 7);
         let queries: Vec<_> = variants.iter().map(|v| {
             assert!(valid_query_variant(v["variant"].as_str().unwrap()));
             let url = reqwest::Url::parse(v["url"].as_str().unwrap()).unwrap();
@@ -699,11 +703,11 @@ mod tests {
             assert_eq!(params["sort"], "id"); params["query"].clone()
         }).collect();
         assert_eq!(queries, vec!["module.id:(*ERRM* AND *StructDoc*)", "location.tokenized:ERRM* AND location.tokenized:StructDoc*",
-            "module:(*ERRM* AND *StructDoc*)", "module:ERRM* AND module:StructDoc*", "module.id:ERRM* AND module.id:StructDoc*", "module:\"ERRM StructDoc\""]);
+            "title:ERRM* AND title:StructDoc*", "module:(*ERRM* AND *StructDoc*)", "module:ERRM* AND module:StructDoc*", "module.id:ERRM* AND module.id:StructDoc*", "module:\"ERRM StructDoc\""]);
         let literal = document_query_variants("P", "ERRM\" OR module:*", 1);
         assert_eq!(pairs(literal.last().unwrap()["url"].as_str().unwrap())["query"], "module:\"ERRM\\\" OR module:*\"");
         let short_tokens = document_query_variants("P", "ab_12", 1);
-        assert_eq!(short_tokens.len(), 5, "no token shorter than three characters may trigger indexed discovery");
+        assert_eq!(short_tokens.len(), 6, "no token shorter than three characters may trigger location-token discovery");
         assert!(short_tokens.iter().all(|v| !pairs(v["url"].as_str().unwrap())["query"].is_empty()));
     }
     #[test]
@@ -1014,7 +1018,7 @@ async fn portal_request(app: tauri::AppHandle, mut args: serde_json::Value) -> R
         let result = if window.eval(script).is_err() { Err("Polarion browser could not start the search".into()) }
             else {
                 bridge_code = "bridge_timeout_or_closed";
-                receive.recv_timeout(Duration::from_secs(if kind == "projects" || kind == "documents" { 95 } else { 35 })).map_err(|_| "Polarion did not reply before the time limit (or its window was closed). Check the log and portal window, then retry; this does not by itself prove authentication failed.".to_string()).and_then(|raw| {
+                receive.recv_timeout(Duration::from_secs(if kind == "projects" { 95 } else { 35 })).map_err(|_| "Polarion did not reply before the time limit (or its window was closed). Check the log and portal window, then retry; this does not by itself prove authentication failed.".to_string()).and_then(|raw| {
                     bridge_code = "invalid_response";
                     let result = validate_result(&raw)?;
                     if result.snapshot.as_ref().is_some_and(|s| Some(s.id.as_str()) != args["resourceId"].as_str()) { return Err("Polarion returned a different resource; no snapshot was applied".into()); }

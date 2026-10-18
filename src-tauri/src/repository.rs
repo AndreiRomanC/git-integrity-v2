@@ -11,6 +11,7 @@ pub mod command_console;
 pub mod remotes;
 pub mod snapshot_export;
 pub mod navigation;
+mod perf_logging;
 #[cfg(test)]
 use stash::{abort_stash_conflict, drop_stash, list_stashes, list_submodule_stashes, pop_stash, restore_stash_paths, stash_changes, stash_entry_files, stash_file};
 #[cfg(test)]
@@ -23,10 +24,9 @@ use remotes::fetch_all_remotes_inner;
 #[cfg(test)]
 use remotes::{list_remotes, sync_repository_inner};
 
-// Temporary performance diagnostics: appends "<label>: <ms>ms" lines to a log
-// file so real-world slowness can be diagnosed without guessing. Safe to leave
-// in — each write is a single cheap append, guarded so a logging failure never
-// breaks the actual operation. Log path is printed once by `perf_log_path()`.
+// Performance diagnostics stay outside repositories and signed app bundles.
+// Keep one ~10 MiB current log and one previous file; logging errors never
+// change the outcome of a Git operation.
 fn perf_log_path() -> PathBuf {
     // A macOS `.app` is a signed bundle. Writing beside its executable means
     // writing inside `Contents/MacOS`, which invalidates the bundle seal after
@@ -58,22 +58,7 @@ fn perf_log_path() -> PathBuf {
     std::env::temp_dir().join("git-integrity-perf.log")
 }
 
-// Logged once per process, before the first real perf_log line — answers
-// "which build produced this log" without cross-referencing the UI's footer
-// separately (the exact confusion that let a stale exe go untested for hours
-// earlier), directly in the artifact that actually gets copied off a
-// Windows machine and sent back.
-static PERF_LOG_SESSION_HEADER_WRITTEN: OnceLock<()> = OnceLock::new();
-
-fn perf_log_session_header() {
-    PERF_LOG_SESSION_HEADER_WRITTEN.get_or_init(|| {
-        use std::io::Write;
-        let line = format!("=== session start: build={} ===\n", env!("GIT_DRILLDOWN_BUILD_SHA"));
-        if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(perf_log_path()) {
-            let _ = file.write_all(line.as_bytes());
-        }
-    });
-}
+static PERF_LOG_WRITER: OnceLock<Mutex<perf_logging::RotatingLog>> = OnceLock::new();
 
 // A short, stable, non-reversible stand-in for a repository's real disk path
 // — repository paths often contain project/customer names the log shouldn't
@@ -93,12 +78,11 @@ fn anonymized_repository_id(repository_path: &str) -> String {
 }
 
 fn perf_log(label: &str, elapsed: Duration) {
-    perf_log_session_header();
-    use std::io::Write;
-    let line = format!("[{:>7.1}ms] {}\n", elapsed.as_secs_f64() * 1000.0, label);
-    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(perf_log_path()) {
-        let _ = file.write_all(line.as_bytes());
-    }
+    // This mutex protects only a short log append/rotation, never a status
+    // scan or Git write. The location is resolved once rather than probing
+    // the executable folder on every Windows log line.
+    let writer = PERF_LOG_WRITER.get_or_init(|| Mutex::new(perf_logging::RotatingLog::new(perf_log_path())));
+    let _ = writer.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).append(label, elapsed);
 }
 
 #[derive(Clone, Default)]
@@ -417,7 +401,9 @@ fn cached_full_statuses(repository: &Repository, repository_path: &str) -> Resul
     // and re-checks the cache before deciding whether a real scan is still
     // needed.
     let lock_handle = status_scan_lock(repository_path);
+    let queued = Instant::now();
     let _guard = lock_handle.lock().unwrap();
+    log_status_scan_wait(repository_path, "cached_full_statuses", queued);
     if let Some((cached_at, statuses)) = full_status_cache().lock().unwrap().get(&key) {
         if cached_at.elapsed() < GIT_METADATA_TTL {
             perf_log("cached_full_statuses: HIT (after a concurrent scan)", Duration::ZERO);
@@ -458,6 +444,13 @@ fn status_scan_lock(repository: &str) -> Arc<Mutex<()>> {
     locks.entry(repo_lock_key(repository)).or_insert_with(|| Arc::new(Mutex::new(()))).clone()
 }
 
+fn log_status_scan_wait(repository: &str, caller: &str, queued: Instant) {
+    let waited = queued.elapsed();
+    if waited >= Duration::from_millis(50) {
+        perf_log(&format!("status_scan_wait: repo={} caller={caller}", anonymized_repository_id(repository)), waited);
+    }
+}
+
 fn recent_full_statuses(repository: &Repository, repository_path: &str) -> Result<Vec<(String, String, bool)>, String> {
     let key = repo_lock_key(repository_path);
     // Fast path — no lock needed if a scan from a moment ago is still fresh
@@ -475,7 +468,9 @@ fn recent_full_statuses(repository: &Repository, repository_path: &str) -> Resul
     // the first caller will have just populated — before ever falling
     // through to an actual second scan.
     let lock_handle = status_scan_lock(repository_path);
+    let queued = Instant::now();
     let _guard = lock_handle.lock().unwrap();
+    log_status_scan_wait(repository_path, "recent_full_statuses", queued);
     if let Some((cached_at, statuses)) = full_status_cache().lock().unwrap().get(&key) {
         if cached_at.elapsed() < FRESH_STATUS_REUSE_WINDOW {
             perf_log("recent_full_statuses: HIT (reuse window, after a concurrent scan)", Duration::ZERO);
@@ -492,7 +487,9 @@ fn recent_full_statuses(repository: &Repository, repository_path: &str) -> Resul
 
 fn fresh_full_statuses(repository: &Repository, repository_path: &str, label: &str) -> Result<Vec<(String, String, bool)>, String> {
     let lock_handle = status_scan_lock(repository_path);
+    let queued = Instant::now();
     let _guard = lock_handle.lock().unwrap();
+    log_status_scan_wait(repository_path, label, queued);
     let captured_epoch = capture_status_cache_epoch(repository_path, label);
     let step = Instant::now();
     let statuses = internal_statuses(repository, None)?;
@@ -599,34 +596,58 @@ fn submodule_unpushed_lock(sub_path: &str) -> Arc<Mutex<()>> {
 }
 
 fn remote_relation(repo: &Repository, head_oid: Oid) -> SubmoduleRemoteRelation {
-    if repo.find_remote("origin").is_err() { return SubmoduleRemoteRelation::NoOrigin; }
-    if repo.head_detached().unwrap_or(true) {
-        let on_origin = repo.references_glob("refs/remotes/origin/*").ok().is_some_and(|references| references.flatten().any(|reference| {
-            reference.target().is_some_and(|remote_oid| remote_oid == head_oid || repo.graph_descendant_of(remote_oid, head_oid).unwrap_or(false))
-        }));
-        return if on_origin { SubmoduleRemoteRelation::OnOrigin } else { SubmoduleRemoteRelation::DetachedNeedsBranch };
-    }
-    let branch = match repo.head().ok().and_then(|head| head.shorthand().map(str::to_string)) {
-        Some(branch) => branch,
-        None => return SubmoduleRemoteRelation::Unknown,
-    };
-    let remote_oid = match repo.find_reference(&format!("refs/remotes/origin/{branch}")).ok().and_then(|reference| reference.target()) {
-        Some(oid) => oid,
-        None => return SubmoduleRemoteRelation::PushNeeded,
-    };
-    match repo.graph_ahead_behind(head_oid, remote_oid) {
-        Ok((0, 0)) => SubmoduleRemoteRelation::OnOrigin,
-        Ok((ahead, 0)) if ahead > 0 => SubmoduleRemoteRelation::PushNeeded,
-        Ok(_) => SubmoduleRemoteRelation::SyncNeeded,
-        Err(_) => SubmoduleRemoteRelation::Unknown,
-    }
+    let started = Instant::now();
+    let mut refs_seen = 0; let mut ancestry_checks = 0; let mut ahead_behind_checks = 0;
+    let mut exact_tip_match = false; let mut mode = "unknown";
+    let result = (|| {
+        if repo.find_remote("origin").is_err() { return SubmoduleRemoteRelation::NoOrigin; }
+        if repo.head_detached().unwrap_or(true) {
+            mode = "detached";
+            let on_origin = repo.references_glob("refs/remotes/origin/*").ok().is_some_and(|references| references.flatten().any(|reference| {
+                refs_seen += 1;
+                reference.target().is_some_and(|remote_oid| {
+                    if remote_oid == head_oid { exact_tip_match = true; true }
+                    else { ancestry_checks += 1; repo.graph_descendant_of(remote_oid, head_oid).unwrap_or(false) }
+                })
+            }));
+            return if on_origin { SubmoduleRemoteRelation::OnOrigin } else { SubmoduleRemoteRelation::DetachedNeedsBranch };
+        }
+        mode = "attached";
+        let branch = match repo.head().ok().and_then(|head| head.shorthand().map(str::to_string)) {
+            Some(branch) => branch,
+            None => return SubmoduleRemoteRelation::Unknown,
+        };
+        let remote_oid = match repo.find_reference(&format!("refs/remotes/origin/{branch}")).ok().and_then(|reference| reference.target()) {
+            Some(oid) => oid,
+            None => return SubmoduleRemoteRelation::PushNeeded,
+        };
+        ahead_behind_checks += 1;
+        match repo.graph_ahead_behind(head_oid, remote_oid) {
+            Ok((0, 0)) => SubmoduleRemoteRelation::OnOrigin,
+            Ok((ahead, 0)) if ahead > 0 => SubmoduleRemoteRelation::PushNeeded,
+            Ok(_) => SubmoduleRemoteRelation::SyncNeeded,
+            Err(_) => SubmoduleRemoteRelation::Unknown,
+        }
+    })();
+    perf_log(&format!("submodule_remote_relation: repo={} mode={mode} result={result:?} refs_seen={refs_seen} ancestry_checks={ancestry_checks} ahead_behind_checks={ahead_behind_checks} exact_tip_match={exact_tip_match}",
+        anonymized_repository_id(&repo.workdir().unwrap_or_else(|| repo.path()).to_string_lossy())), started.elapsed());
+    result
 }
 
 fn inspect_submodule_state_in(repo: &Repository) -> SubmoduleStateSnapshot {
+    let started = Instant::now();
     let head_oid = repo.head().ok().and_then(|head| head.target());
-    let dirty = !internal_statuses(repo, None).unwrap_or_default().is_empty();
+    let step = Instant::now();
+    let statuses = internal_statuses(repo, None);
+    let status_ok = statuses.is_ok();
+    let dirty = !statuses.unwrap_or_default().is_empty();
+    let status_ms = step.elapsed().as_secs_f64() * 1000.0;
+    let step = Instant::now();
     let remote_relation = head_oid.map(|oid| remote_relation(repo, oid)).unwrap_or(SubmoduleRemoteRelation::Unknown);
+    let relation_ms = step.elapsed().as_secs_f64() * 1000.0;
     let attached_branch = if repo.head_detached().unwrap_or(true) { None } else { repo.head().ok().and_then(|head| head.shorthand().map(str::to_string)) };
+    perf_log(&format!("submodule_state: repo={} status_ok={status_ok} status_ms={status_ms:.1} remote_ms={relation_ms:.1} dirty={dirty} attached={}",
+        anonymized_repository_id(&repo.workdir().unwrap_or_else(|| repo.path()).to_string_lossy()), attached_branch.is_some()), started.elapsed());
     SubmoduleStateSnapshot { dirty, head_oid, remote_relation, attached_branch }
 }
 
@@ -1490,6 +1511,7 @@ fn internal_submodule_repository(absolute_path: &Path) -> Result<Repository, Str
 
 fn internal_statuses(repository: &Repository, scope: Option<&str>) -> Result<Vec<(String, String, bool)>, String> {
     let total_started = Instant::now();
+    let repo_id = anonymized_repository_id(&repository.workdir().unwrap_or_else(|| repository.path()).to_string_lossy());
     let mut options = StatusOptions::new();
     // Correctness over saved time here: not recursing into wholly-untracked
     // directories was a deliberate speed trade that backfired — copying a new,
@@ -1522,7 +1544,11 @@ fn internal_statuses(repository: &Repository, scope: Option<&str>) -> Result<Vec
     // size instead of the entire repository's.
     if let Some(scope) = scope { if !scope.is_empty() { options.pathspec(scope); } }
     let query_started = Instant::now();
-    let statuses = repository.statuses(Some(&mut options)).map_err(|error| error.message().to_string())?;
+    let statuses = repository.statuses(Some(&mut options)).map_err(|error| {
+        perf_log(&format!("status_scan: repo={repo_id} result=error code={:?} scope={} scope_id={}", error.code(),
+            if scope.is_some_and(|value| !value.is_empty()) { "scoped" } else { "full" }, anonymized_repository_id(scope.unwrap_or(""))), query_started.elapsed());
+        error.message().to_string()
+    })?;
     let query_elapsed = query_started.elapsed();
     let collect_started = Instant::now();
     let result = statuses.iter().filter_map(|entry| {
@@ -1537,10 +1563,11 @@ fn internal_statuses(repository: &Repository, scope: Option<&str>) -> Result<Vec
     let scope_kind = if scope.is_some_and(|value| !value.is_empty()) { "scoped" } else { "full" };
     perf_log(
         &format!(
-            "status_scan: scope={scope_kind} changes={} untracked={untracked} staged={staged} query_ms={:.1} collect_ms={:.1}",
+            "status_scan: scope={scope_kind} changes={} untracked={untracked} staged={staged} query_ms={:.1} collect_ms={:.1} repo={repo_id} scope_id={} result=ok",
             result.len(),
             query_elapsed.as_secs_f64() * 1000.0,
             collect_elapsed.as_secs_f64() * 1000.0,
+            anonymized_repository_id(scope.unwrap_or("")),
         ),
         total_started.elapsed(),
     );
@@ -2589,14 +2616,20 @@ fn collect_ref_seeds_and_badges(repo: &Repository) -> (Vec<git2::Oid>, HashMap<S
 }
 
 fn tags_pointing_at_commit(repo: &Repository, target: git2::Oid) -> Vec<String> {
+    let started = Instant::now();
+    let mut scanned = 0; let mut peeled = 0;
     let mut tags = Vec::new();
     let Ok(names) = repo.tag_names(None) else { return tags };
     for name in names.iter().flatten() {
+        scanned += 1;
         let Ok(reference) = repo.find_reference(&format!("refs/tags/{name}")) else { continue };
         let Ok(object) = reference.peel(ObjectType::Commit) else { continue };
+        peeled += 1;
         if object.id() == target { tags.push(name.to_string()); }
     }
     tags.sort();
+    perf_log(&format!("submodule_head_tags: repo={} scanned={scanned} peeled={peeled} matches={}",
+        anonymized_repository_id(&repo.workdir().unwrap_or_else(|| repo.path()).to_string_lossy()), tags.len()), started.elapsed());
     tags
 }
 
@@ -2664,7 +2697,11 @@ fn open_repository_fast_inner(path: String) -> Result<FastRepositoryData, String
     // on every navigation click, without asking the backend each time (see
     // submodule_navigation_status, used only when this list disagrees with
     // what the frontend already believes, e.g. a submodule added since).
-    let submodule_paths: Vec<String> = cached_index_metadata(&path).1.iter().cloned().collect();
+    let step = Instant::now();
+    let (tracked_paths, submodules) = cached_index_metadata(&path);
+    let submodule_paths: Vec<String> = submodules.iter().cloned().collect();
+    perf_log(&format!("open_repository_fast: index_metadata repo={} tracked_count={} submodule_count={}",
+        anonymized_repository_id(&path), tracked_paths.len(), submodule_paths.len()), step.elapsed());
     let gitdir = repo.path().to_string_lossy().into_owned();
     perf_log("open_repository_fast: TOTAL", started.elapsed());
     Ok(FastRepositoryData { repository: RepositoryInfo { path, name, current_branch, head_oid, head_detached, gitdir, submodule_url: None }, branches, commits, stashes, submodule_paths, commits_truncated })
@@ -3138,11 +3175,34 @@ pub fn create_commit(path: String, message: String) -> Result<(), String> {
 
 #[tauri::command]
 pub fn read_text_file(repository_path: String, relative_path: String) -> Result<TextFile, String> {
-    validate_path(&repository_path)?;
-    let relative = safe_relative_path(&relative_path)?;
-    let bytes = fs::read(Path::new(&repository_path).join(&relative)).map_err(|error| error.to_string())?;
-    if bytes.len() > 2_000_000 || bytes.contains(&0) { return Err("Only text files up to 2 MB can be edited".into()); }
-    Ok(TextFile { relative_path, content: String::from_utf8(bytes).map_err(|_| "The file is not valid UTF-8 text")? })
+    let started = Instant::now();
+    let mut category = "validation";
+    let mut byte_count = 0;
+    let result = (|| {
+        validate_path(&repository_path)?;
+        let relative = safe_relative_path(&relative_path)?;
+        let bytes = fs::read(Path::new(&repository_path).join(&relative)).map_err(|error| {
+            category = match error.kind() {
+                std::io::ErrorKind::NotFound => "not-found",
+                std::io::ErrorKind::PermissionDenied => "permission-denied",
+                _ => "io-read",
+            };
+            format!("Cannot read the selected file: {error}")
+        })?;
+        byte_count = bytes.len();
+        if byte_count > 2_000_000 { category = "size-limit"; return Err("Only text files up to 2 MB can be edited".into()); }
+        if bytes.contains(&0) { category = "binary-or-nul"; return Err("This file contains NUL bytes (binary or UTF-16). The editor accepts UTF-8 text only; no conversion was made.".into()); }
+        let content = String::from_utf8(bytes).map_err(|_| {
+            category = "unsupported-encoding";
+            "The file is not valid UTF-8 text. Open it in an editor supporting its original encoding; no conversion was made.".to_string()
+        })?;
+        category = "ok";
+        Ok(TextFile { relative_path: relative_path.clone(), content })
+    })();
+    // Never log contents, raw OS errors or absolute paths.
+    perf_log(&format!("editor_read: repo={} file={} result={} category={category} bytes={byte_count}",
+        anonymized_repository_id(&repository_path), anonymized_repository_id(&relative_path), if result.is_ok() { "ok" } else { "error" }), started.elapsed());
+    result
 }
 
 #[tauri::command]
@@ -6026,16 +6086,26 @@ fn load_directory_inner(repository_path: String, relative_path: String, force: O
 
 #[tauri::command]
 pub async fn entry_details(repository_path: String, relative_path: String) -> Result<EntryDetails, String> {
-    off_main_thread(move || entry_details_inner(repository_path, relative_path)).await
+    let queued = Instant::now();
+    off_main_thread(move || {
+        perf_log(&format!("entry_details: phase=worker_queue repo={} entry={}", anonymized_repository_id(&repository_path), anonymized_repository_id(&relative_path)), queued.elapsed());
+        entry_details_inner(repository_path, relative_path)
+    }).await
 }
 
 fn entry_details_inner(repository_path: String, relative_path: String) -> Result<EntryDetails, String> {
+    let started = Instant::now();
+    let diagnostic_context = format!("repo={} entry={}", anonymized_repository_id(&repository_path), anonymized_repository_id(&relative_path));
+    let log_phase = |phase: &str, since: Instant| perf_log(&format!("entry_details: phase={phase} {diagnostic_context}"), since.elapsed());
+    let step = Instant::now();
     validate_path(&repository_path)?;
     let relative = safe_relative_path(&relative_path)?;
     if relative.as_os_str().is_empty() { return Err("Select a file or folder".into()); }
     let absolute = Path::new(&repository_path).join(&relative);
     let metadata = fs::symlink_metadata(&absolute).map_err(|error| error.to_string())?;
     let relative_string = normalized(&relative);
+    log_phase("filesystem", step);
+    let step = Instant::now();
     // Same reasoning as `load_directory`: an item strictly inside a submodule
     // needs status/tracked/history from the submodule's own repository, not
     // the parent's (which only knows the submodule as one opaque gitlink).
@@ -6062,6 +6132,7 @@ fn entry_details_inner(repository_path: String, relative_path: String) -> Result
     let unpushed = if kind == "folder" { git_metadata.unpushed.contains(status_scope) || has_sorted_prefix(&sorted_lookups.unpushed, &prefix) } else { git_metadata.unpushed.contains(status_scope) };
     let modified = metadata.modified().ok().and_then(|time| time.duration_since(UNIX_EPOCH).ok()).map(|value| value.as_secs()).unwrap_or(0);
     let item_count = metadata.is_dir().then(|| fs::read_dir(&absolute).map(|items| items.count()).unwrap_or(0));
+    log_phase("metadata", step);
 
     // "Last commit touching this path" walks history diffing every commit
     // against its parent until it finds a match — up to 2000 commits, each a
@@ -6081,18 +6152,32 @@ fn entry_details_inner(repository_path: String, relative_path: String) -> Result
     // here and share it; the parent-side url/branch lookup is now a single
     // scan too (submodule_url_and_branch), not two.
     let (submodule_url, submodule_web_url, submodule_branch, submodule_push_status, submodule_unpushed_commits, submodule_commit, submodule_commit_tags, submodule_snapshot) = if kind == "submodule" {
+        let step = Instant::now();
         let (url, branch) = submodule_url_and_branch(&repository_path, &relative_string);
         let web_url = submodule_browser_base(&repository_path, &relative_string).ok();
+        log_phase("submodule_urls", step);
+        let step = Instant::now();
         match internal_submodule_repository(&absolute) {
             Ok(sub_repo) => {
+                log_phase("submodule_open", step);
+                let step = Instant::now();
                 let snapshot = inspect_submodule_state_in(&sub_repo);
+                log_phase("state_and_remote_relation", step);
+                let step = Instant::now();
                 let push_status = submodule_push_status_in(&sub_repo);
+                log_phase("push_summary", step);
+                let step = Instant::now();
                 let unpushed_commits = submodule_unpushed_commits_in(&sub_repo);
+                log_phase("unpushed_commits", step);
+                let step = Instant::now();
                 let commit = sub_repo.head().ok().and_then(|head| head.peel_to_commit().ok()).map(|commit| {
                     let author_name = commit.author().name().unwrap_or("Unknown").to_string();
                     (commit.id().to_string(), commit.summary().unwrap_or("No message").to_string(), author_name, short_date(commit.time().seconds()))
                 });
+                log_phase("head_commit", step);
+                let step = Instant::now();
                 let commit_tags = sub_repo.head().ok().and_then(|head| head.target()).map(|oid| tags_pointing_at_commit(&sub_repo, oid)).unwrap_or_default();
+                log_phase("head_tags", step);
                 (url, web_url, branch, push_status, unpushed_commits, commit, commit_tags, Some(snapshot))
             }
             Err(_) => (url, web_url, branch, None, Vec::new(), None, Vec::new(), None),
@@ -6108,6 +6193,9 @@ fn entry_details_inner(repository_path: String, relative_path: String) -> Result
         }
     } else { String::new() };
 
+    perf_log(&format!("entry_details: result_facts {diagnostic_context} kind={kind} initialized={submodule_initialized} dirty={submodule_is_dirty} attached={} unpushed_count={} tags_count={}",
+        submodule_current_branch.is_some(), submodule_unpushed_commits.len(), submodule_commit_tags.len()), Duration::ZERO);
+    log_phase("total", started);
     Ok(EntryDetails {
         name: absolute.file_name().and_then(|name| name.to_str()).unwrap_or(&relative_string).to_string(), relative_path: relative_string,
         kind, status, tracked, unpushed, size: if metadata.is_file() { metadata.len() } else { 0 }, modified, item_count, submodule_url, submodule_web_url, submodule_branch, submodule_push_status, submodule_unpushed_commits, submodule_is_dirty, submodule_state, submodule_initialized, submodule_current_branch,
@@ -6126,7 +6214,11 @@ fn entry_details_inner(repository_path: String, relative_path: String) -> Result
 // walk on every single click.
 #[tauri::command]
 pub async fn entry_last_commit(repository_path: String, relative_path: String) -> Result<Option<PublishCommit>, String> {
-    off_main_thread(move || entry_last_commit_inner(repository_path, relative_path)).await
+    let queued = Instant::now();
+    off_main_thread(move || {
+        perf_log(&format!("entry_last_commit: phase=worker_queue repo={} entry={}", anonymized_repository_id(&repository_path), anonymized_repository_id(&relative_path)), queued.elapsed());
+        entry_last_commit_inner(repository_path, relative_path)
+    }).await
 }
 
 fn entry_last_commit_inner(repository_path: String, relative_path: String) -> Result<Option<PublishCommit>, String> {
@@ -8077,20 +8169,31 @@ fn path_restore_with_staging(repository_path: String, relative_path: String, sou
 // "selecting anything is slow, and it gets worse the deeper you navigate" feeling
 // — every single click paid for a full history walk regardless of depth.
 fn last_commit_touching_path(repository_path: &str, relative: &Path) -> Option<(String, String, String, String)> {
-    let repo = internal_repository(repository_path).ok()?;
-    let mut walk = repo.revwalk().ok()?; walk.push_head().ok()?; let _ = walk.set_sorting(Sort::TOPOLOGICAL | Sort::TIME);
-    for oid in walk.flatten().take(2000) {
-        let Ok(commit) = repo.find_commit(oid) else { continue };
-        let matches = if relative.as_os_str().is_empty() { true } else {
-            let parent_tree = commit.parent(0).ok().and_then(|parent| parent.tree().ok());
-            let mut options = git2::DiffOptions::new(); options.pathspec(relative);
-            commit.tree().ok().and_then(|tree| repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), Some(&mut options)).ok()).map(|diff| diff.deltas().next().is_some()).unwrap_or(false)
-        };
-        if matches {
-            return Some((oid.to_string(), commit.summary().unwrap_or("No message").to_string(), commit.author().name().unwrap_or("Unknown").to_string(), short_date(commit.time().seconds())));
+    let started = Instant::now();
+    let mut examined = 0; let mut diff_queries = 0;
+    let result = (|| {
+        let repo = internal_repository(repository_path).ok()?;
+        let mut walk = repo.revwalk().ok()?; walk.push_head().ok()?; let _ = walk.set_sorting(Sort::TOPOLOGICAL | Sort::TIME);
+        for oid in walk.flatten().take(2000) {
+            examined += 1;
+            let Ok(commit) = repo.find_commit(oid) else { continue };
+            let matches = if relative.as_os_str().is_empty() { true } else {
+                let parent_tree = commit.parent(0).ok().and_then(|parent| parent.tree().ok());
+                let mut options = git2::DiffOptions::new(); options.pathspec(relative);
+                commit.tree().ok().and_then(|tree| {
+                    diff_queries += 1;
+                    repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), Some(&mut options)).ok()
+                }).map(|diff| diff.deltas().next().is_some()).unwrap_or(false)
+            };
+            if matches {
+                return Some((oid.to_string(), commit.summary().unwrap_or("No message").to_string(), commit.author().name().unwrap_or("Unknown").to_string(), short_date(commit.time().seconds())));
+            }
         }
-    }
-    None
+        None
+    })();
+    perf_log(&format!("last_commit_touching_path: repo={} entry={} examined={examined} diff_queries={diff_queries} found={} at_walk_limit={}",
+        anonymized_repository_id(repository_path), anonymized_repository_id(&relative.to_string_lossy()), result.is_some(), examined == 2000), started.elapsed());
+    result
 }
 
 #[tauri::command]
@@ -9559,15 +9662,28 @@ pub struct BlameLine { author: String, date: String, message: String }
 pub struct FileBlame { lines: Vec<BlameLine> }
 
 #[tauri::command]
-pub fn file_blame(repository_path: String, relative_path: String) -> Result<FileBlame, String> {
+pub async fn file_blame(repository_path: String, relative_path: String) -> Result<FileBlame, String> {
+    off_main_thread(move || file_blame_inner(repository_path, relative_path)).await
+}
+
+fn file_blame_inner(repository_path: String, relative_path: String) -> Result<FileBlame, String> {
     validate_path(&repository_path)?;
     let relative = safe_relative_path(&relative_path)?;
+    // Explorer paths are relative to the superproject, but Git only tracks
+    // a gitlink there. Reuse the existing cached boundary resolution, including
+    // nested submodules, and blame against the file's actual owning repository.
+    if let Some((owner, inner)) = resolve_submodule_boundary(&repository_path, &relative_path).filter(|(_, inner)| !inner.is_empty()) {
+        return file_blame_inner(owner, inner);
+    }
     let repo = internal_repository(&repository_path)?;
-    let content = fs::read_to_string(Path::new(&repository_path).join(&relative)).unwrap_or_default();
+    let content = fs::read_to_string(Path::new(&repository_path).join(&relative)).map_err(|_| "Cannot read this file for line authors".to_string())?;
     let line_count = content.lines().count();
     let empty = BlameLine { author: String::new(), date: String::new(), message: String::new() };
     let mut lines: Vec<BlameLine> = vec![empty; line_count];
-    let blame = repo.blame_file(&relative, None).map_err(|error| error.message().to_string())?;
+    let committed_blame = repo.blame_file(&relative, None).map_err(|error| error.message().to_string())?;
+    // Align committed attribution with the current file. Inserted/edited local
+    // lines have zero OIDs and must not inherit the next committed line's author.
+    let blame = committed_blame.blame_buffer(content.as_bytes()).map_err(|error| error.message().to_string())?;
     for hunk in blame.iter() {
         if let Ok(commit) = repo.find_commit(hunk.final_commit_id()) {
             let author = commit.author().name().unwrap_or("Unknown").to_string();
@@ -11123,6 +11239,68 @@ mod tests {
         assert_eq!(browser_repository_url("git@github.com:team/project.git").as_deref(), Some("https://github.com/team/project"));
         assert_eq!(browser_repository_url("https://gitlab.example/team/project.git").as_deref(), Some("https://gitlab.example/team/project"));
 
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn editor_read_preserves_bytes_and_reports_unsupported_formats_without_writing() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-editor-formats-{suffix}"));
+        create_libgit2_repository(&base, "file.txt");
+        let repository = base.to_string_lossy().into_owned();
+        let head = git(&repository, &["rev-parse", "HEAD"] ).unwrap();
+        let cases: &[(&[u8], &str)] = &[
+            (b"\xfflegacy", "UTF-8"), (b"a\0b", "NUL"),
+        ];
+        for (bytes, expected_error) in cases {
+            fs::write(base.join("file.txt"), bytes).unwrap();
+            assert!(read_text_file(repository.clone(), "file.txt".into()).err().unwrap().contains(expected_error));
+            assert_eq!(fs::read(base.join("file.txt")).unwrap(), *bytes);
+        }
+        let large = vec![b'x'; 2_000_001];
+        fs::write(base.join("file.txt"), &large).unwrap();
+        assert!(read_text_file(repository.clone(), "file.txt".into()).err().unwrap().contains("2 MB"));
+        assert_eq!(fs::read(base.join("file.txt")).unwrap(), large);
+        let windows_text = "\u{feff}first\r\nsecond\r\n";
+        fs::write(base.join("file.txt"), windows_text).unwrap();
+        assert_eq!(read_text_file(repository.clone(), "file.txt".into()).unwrap().content, windows_text);
+        assert!(read_text_file(repository.clone(), "missing.txt".into()).err().unwrap().contains("Cannot read"));
+        assert!(read_text_file(repository.clone(), "../outside.txt".into()).is_err());
+        assert_eq!(git(&repository, &["rev-parse", "HEAD"]).unwrap(), head);
+        assert!(git(&repository, &["diff", "--cached", "--name-only"]).unwrap().is_empty());
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn editor_blame_routes_into_submodules_and_does_not_change_git_state() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-editor-blame-{suffix}"));
+        let parent = base.join("parent"); let dependency = base.join("dependency"); let nested = base.join("nested");
+        create_libgit2_repository(&parent, "README.md"); create_libgit2_repository(&dependency, "module.txt"); create_libgit2_repository(&nested, "nested.txt");
+        let parent_string = parent.to_string_lossy().into_owned();
+        let added = add_submodule_inner(parent_string.clone(), "".into(), dependency.to_string_lossy().into_owned(), "dep".into(), String::new(), String::new()).unwrap();
+        let dep_path = parent.join(&added).to_string_lossy().into_owned();
+        let nested_added = add_submodule_inner(dep_path.clone(), "".into(), nested.to_string_lossy().into_owned(), "child".into(), String::new(), String::new()).unwrap();
+        let head = git(&parent_string, &["rev-parse", "HEAD"]).unwrap();
+        let index = git(&parent_string, &["ls-files", "--stage"]).unwrap();
+        let direct = file_blame_inner(parent_string.clone(), "README.md".into()).unwrap();
+        let sub = file_blame_inner(parent_string.clone(), format!("{added}/module.txt")).unwrap();
+        let child = file_blame_inner(parent_string.clone(), format!("{added}/{nested_added}/nested.txt")).unwrap();
+        for result in [direct, sub, child] {
+            assert_eq!(result.lines.len(), 1);
+            assert_eq!(result.lines[0].author, "Test User");
+            assert_eq!(result.lines[0].message, "Initial commit");
+        }
+        fs::write(parent.join(&added).join("module.txt"), "new local line\ncontent").unwrap();
+        let dirty_blame = file_blame_inner(parent_string.clone(), format!("{added}/module.txt")).unwrap();
+        assert_eq!(dirty_blame.lines.len(), 2);
+        assert!(dirty_blame.lines[0].author.is_empty(), "uncommitted lines must not be assigned to the committed author");
+        assert_eq!(dirty_blame.lines[1].author, "Test User");
+        fs::write(parent.join(&added).join("untracked.txt"), "local only").unwrap();
+        assert!(file_blame_inner(parent_string.clone(), format!("{added}/untracked.txt")).is_err());
+        assert_eq!(git(&parent_string, &["rev-parse", "HEAD"]).unwrap(), head);
+        assert_eq!(git(&parent_string, &["ls-files", "--stage"]).unwrap(), index);
+        assert_eq!(fs::read_to_string(parent.join(&added).join("untracked.txt")).unwrap(), "local only");
         fs::remove_dir_all(base).unwrap();
     }
 

@@ -794,7 +794,7 @@ test('detached dirty submodules ask for a branch before commit or push', () => {
   assert.match(app, /data-detail-action="subnewbranch">Create branch here…/);
   assert.match(css, /\.submodule-guidance \{ min-height: 34px; display: grid;/);
   assert.match(css, /\.submodule-guidance button \{/);
-  assert.match(app, /Commit requires an attached local branch/);
+  assert.match(app, /Detached HEAD — you can inspect the commit message and StructDoc references here, but committing requires a local branch/);
   assert.match(app, /Push requires an attached local branch/);
 });
 

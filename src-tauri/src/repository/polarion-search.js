@@ -40,7 +40,9 @@
   if (location.origin !== 'https://polarion.vitesco.io') return reply({ code: 'wrong_origin' });
   const abort = new AbortController();
   const catalog = args.kind === 'projects' || args.kind === 'documents';
-  const timeout = setTimeout(() => abort.abort(), catalog ? 90000 : 25000);
+  const timeout = setTimeout(() => abort.abort(), args.kind === 'projects' ? 90000 : 25000);
+  const failureCode = error => error?.name === 'AbortError' ? 'timeout'
+    : ['auth_required','forbidden','api_unavailable','query_rejected','http_error','not_json','network_error','timeout','wrong_origin','invalid_response','catalog_limit','response_limit'].includes(error?.code) ? error.code : 'network_error';
   const text = (value, limit = 500) => String(value ?? '').slice(0, limit);
   const enumValue = value => text(value && typeof value === 'object' ? value.id || value.name : value, 240);
   const validId = (id, count) => typeof id === 'string' && id.split('/').length === count && id.split('/').every(p => p && p !== '.' && p !== '..' && p.length <= 240 && !/[\x00-\x1f\\]/.test(p));
@@ -190,7 +192,9 @@
         entry.code = 'ok';
         return data;
       } catch (error) {
-        entry.code = error?.code || (error?.name === 'AbortError' ? 'timeout' : 'network_error');
+        // DOMException AbortError has a numeric code (20), not our protocol
+        // string. Never let it turn a timeout into an invalid bridge reply.
+        entry.code = failureCode(error);
         throw { code: entry.code, http: entry.http, parameter: entry.parameter };
       } finally {
         clearTimeout(timer); abort.signal.removeEventListener('abort', cancel);
@@ -242,7 +246,7 @@
           if (probe.step === 'document_parts_expanded') {
             if (rows.length > 10 || rows.some(row => !row.id?.startsWith(args.resourceId + '/'))) { last.code = 'invalid_response'; last.reason = 'unexpected_resource'; continue; }
             confirmed.add(probe.step);
-            sampleId = rows.map(row => row.attributes?.type === 'workitem' ? row.relationships?.workItem?.data : null)
+            sampleId = rows.filter(row => !hasErrors(row.relationships?.workItem)).map(row => row.relationships?.workItem?.data)
               .find(ref => ref?.type === 'workitems' && validId(ref.id, 2) && ref.id.startsWith(args.project + '/'))?.id || '';
           }
           if (probe.step === 'metadata') {
@@ -263,15 +267,15 @@
       // All fallbacks remain project-scoped GETs in this same browser session.
       const key = '__ddtDocumentSearchV2_' + args.project, token = headers['X-Polarion-REST-Token'];
       const queryKey = String(args.query || '').trim().toLowerCase(), cached = window[key];
-      const catalog_cached = Boolean(token && cached?.token === token && Date.now() - cached.time < 120000 &&
-        (cached.source !== 'work_item_modules' || cached.query === queryKey));
-      let items = catalog_cached ? cached.items : [], catalog_source = catalog_cached ? cached.source : '', catalog_pages = 0;
-      let document_query_variant = catalog_cached ? cached.variant || '' : '';
       const words = queryKey.split(/\s+/).filter(Boolean);
       const matchesQuery = item => words.every(word => (item.id + ' ' + item.title).toLowerCase().includes(word));
+      const catalog_cached = Boolean(token && cached?.token === token && Date.now() - cached.time < 120000 &&
+        (cached.source !== 'work_item_modules' || (cached.query === queryKey && cached.items?.some(matchesQuery))));
+      let items = catalog_cached ? cached.items : [], catalog_source = catalog_cached ? cached.source : '', catalog_pages = 0;
+      let document_query_variant = catalog_cached ? cached.variant || '' : '';
       if (!catalog_cached) {
         delete window[key];
-        const moduleQueries = Array.isArray(args.documentModuleQueries) ? args.documentModuleQueries.slice(0, 6)
+        const moduleQueries = Array.isArray(args.documentModuleQueries) ? args.documentModuleQueries.slice(0, 7)
           : args.documentModulesUrl ? [{ url: args.documentModulesUrl, variant: 'module_id_contains' }] : [];
         const sources = [{ source: 'project_documents', url: args.url, step: 'catalog_page' },
           { source: 'all_documents', url: args.documentGlobalUrl, step: 'document_global' },
@@ -314,7 +318,8 @@
                 const relationship = row.relationships?.module;
                 // A location index may also match standalone Work Items.
                 // Never invent a Document association for those rows.
-                if (source.variant === 'location_tokens_prefix' && relationship?.data === null && !hasErrors(relationship)) continue;
+                if (!hasErrors(relationship) && (source.variant === 'workitem_title_prefix' && !relationship?.data
+                  || source.variant === 'location_tokens_prefix' && relationship?.data === null)) continue;
                 // A name query returned matching Work Items but the requested
                 // relationship was omitted: don't claim there are no documents.
                 if (!relationship || hasErrors(relationship) || !relationship.data) invalidDocumentResponse('relationship_missing');
@@ -340,7 +345,7 @@
           }
           break;
         }
-        if (token) window[key] = { token, time: Date.now(), items, source: catalog_source, query: queryKey, variant: document_query_variant };
+        if (token && (catalog_source !== 'work_item_modules' || items.some(matchesQuery))) window[key] = { token, time: Date.now(), items, source: catalog_source, query: queryKey, variant: document_query_variant };
       }
       const matches = items.filter(matchesQuery);
       const start = ((args.page || 1) - 1) * 25;
@@ -423,6 +428,6 @@
       .map(item => ({ id: item.id.split('/').pop(), title: text(item.attributes?.title || item.id), item_type: enumValue(item.attributes?.type) }));
     reply({ code: data.data.length && !items.length ? 'invalid_response' : 'ok', http: 200, received: data.data.length, items, more: Boolean(data.links?.next) });
   } catch (error) {
-    reply({ code: error?.code || (error?.name === 'AbortError' ? 'timeout' : 'network_error'), http: error?.http || 0, catalog_pages: error?.catalog_pages || 0 });
+    reply({ code: failureCode(error), http: error?.http || 0, catalog_pages: error?.catalog_pages || 0 });
   } finally { clearTimeout(timeout); }
 })();

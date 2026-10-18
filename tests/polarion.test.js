@@ -184,6 +184,54 @@ const moduleQueries = [
   ['location_tokens_prefix', 'location.tokenized:errm*'],
   ['module_prefix', 'module:errm*'],
 ].map(([variant, query]) => ({ variant, url: 'https://polarion.vitesco.io/polarion/rest/v1/projects/P/workitems?fields[workitems]=id,module&page[size]=100&query=' + encodeURIComponent(query) }));
+test('DOM AbortError numeric codes are classified as timeout, never an invalid bridge response', async () => {
+  for (const kind of ['documents', 'tasks']) {
+    const { reply } = await portal({ kind, error: { name: 'AbortError', code: 20 } });
+    assert.equal(reply.code, 'timeout'); assert.equal(reply.diagnostics[0].code, 'timeout');
+    assert.equal(typeof reply.code, 'string');
+  }
+  const unknown = await portal({ error: { code: 'PRIVATE_UNTRUSTED_MESSAGE' } });
+  assert.equal(unknown.reply.code, 'network_error'); assert.doesNotMatch(JSON.stringify(unknown.reply), /PRIVATE_/);
+});
+test('document discovery can follow actual owning-document links from matching element titles without module-name indexes', async () => {
+  const queries = [{ variant: 'workitem_title_prefix', url: 'https://polarion.vitesco.io/polarion/rest/v1/projects/P/workitems?query=title:errm*&fields[workitems]=id,module&page[size]=100' }];
+  const { reply, requests } = await portal({ kind: 'documents', query: 'errm', ...documentRoutes, documentModuleQueries: queries,
+    statuses: [404, 404, 200], pages: [{}, {}, { data: [moduleItem('P-1', 'P/Structure Information/ERRM_StructDoc'),
+      moduleItem('P-2', 'P/Structure Information/ERRM_StructDoc'), { id: 'P/P-3', type: 'workitems' },
+      moduleItem('P-4', 'Other/S/ERRM'), moduleItem('P-5', 'P/S/Unrelated')] }] });
+  assert.equal(reply.code, 'ok'); assert.equal(reply.document_query_variant, 'workitem_title_prefix');
+  assert.equal(reply.document_search_limited, true);
+  assert.deepEqual(reply.items.map(i => i.id), ['P/Structure Information/ERRM_StructDoc']);
+  assert.ok(requests.every(r => r.options.method === 'GET')); assert.equal(requests.length, 3);
+});
+test('empty compatibility searches are not cached and the next explicit search really queries the server', async () => {
+  const portalWindow = {}, options = { kind: 'documents', query: 'errm', ...documentRoutes, portalWindow };
+  const first = await portal({ ...options, statuses: [404,404,200] });
+  assert.equal(first.reply.matched, 0); assert.equal(portalWindow.__ddtDocumentSearchV2_P, undefined);
+  // Reject even an old negative cache left by the previous app version.
+  portalWindow.__ddtDocumentSearchV2_P = { token: 'SECRET', time: Date.now(), source: 'work_item_modules', query: 'errm', items: [] };
+  const second = await portal({ ...options, statuses: [404,404,200], pages: [{},{},{ data: [moduleItem('P-1', 'P/S/ERRM')] }] });
+  assert.equal(second.requests.length, 3); assert.equal(second.reply.catalog_cached, false); assert.equal(second.reply.items.length, 1);
+});
+test('nonmatching owning documents do not turn a zero-match compatibility search into a cached negative result', async () => {
+  const portalWindow = {}, options = { kind: 'documents', query: 'errm', ...documentRoutes, portalWindow };
+  const first = await portal({ ...options, statuses: [404,404,200], pages: [{},{},{ data: [moduleItem('P-1', 'P/S/Unrelated')] }] });
+  assert.equal(first.reply.matched, 0); assert.equal(first.reply.received, 1); assert.equal(portalWindow.__ddtDocumentSearchV2_P, undefined);
+  portalWindow.__ddtDocumentSearchV2_P = { token: 'SECRET', time: Date.now(), source: 'work_item_modules', query: 'errm', items: [{ id: 'P/S/Unrelated', title: 'Other' }] };
+  const second = await portal({ ...options, statuses: [404,404,200], pages: [{},{},{ data: [moduleItem('P-2', 'P/S/ERRM')] }] });
+  assert.equal(second.requests.length, 3); assert.equal(second.reply.matched, 1); assert.equal(second.reply.catalog_cached, false);
+});
+test('title-based StructDoc discovery reads all matching pages, then serves later display pages from a positive cache', async () => {
+  const portalWindow = {}, titleQuery = { variant: 'workitem_title_prefix', url: 'https://polarion.vitesco.io/polarion/rest/v1/projects/P/workitems?query=title:errm*&fields[workitems]=id,module&page[size]=100' };
+  const options = { kind: 'documents', query: 'errm', ...documentRoutes, portalWindow, documentModuleQueries: [titleQuery] };
+  const docs = Array.from({ length: 32 }, (_, i) => moduleItem('P-' + i, 'P/Structure Information/ERRM_' + i));
+  const first = await portal({ ...options, statuses: [404,404,200,200], pages: [{},{},{ data: docs.slice(0,20), links: { next: 'ignored' } },{ data: docs.slice(20) }] });
+  assert.equal(first.reply.matched, 32); assert.equal(first.reply.items.length, 25); assert.equal(first.reply.more, true);
+  assert.equal(new URL(first.requests[3].url).searchParams.get('query'), 'title:errm*');
+  const second = await portal({ ...options, page: 2 });
+  assert.equal(second.requests.length, 0); assert.equal(second.reply.items.length, 7); assert.equal(second.reply.catalog_cached, true);
+  assert.equal(second.reply.document_query_variant, 'workitem_title_prefix');
+});
 test('rejected document contains query tries targeted token lookup, paginates and reuses its limited cache', async () => {
   const portalWindow = {}, documentModuleQueries = moduleQueries;
   const options = { kind: 'documents', query: 'errm', ...documentRoutes, documentModuleQueries, portalWindow };
@@ -536,7 +584,7 @@ test('explicit known-document controls verify query matches against real resourc
   ];
   const pages = [
     { data: { id: 'P/S/PRIVATE_DOC', type: 'documents' } },
-    { data: [{ id: 'P/S/PRIVATE_DOC/part', type: 'document_parts', attributes: { type: 'workitem' }, relationships: { workItem: { data: { id: 'P/PRIVATE_ITEM', type: 'workitems' } } } }] },
+    { data: [{ id: 'P/S/PRIVATE_DOC/part', type: 'document_parts', attributes: { type: 'normal' }, relationships: { workItem: { data: { id: 'P/PRIVATE_ITEM', type: 'workitems' } } } }] },
     { data: moduleItem('PRIVATE_ITEM', 'P/S/PRIVATE_DOC') },
     { data: [moduleItem('PRIVATE_ITEM', 'P/S/PRIVATE_DOC')] },
     { data: [moduleItem('PRIVATE_ITEM', 'P/S/PRIVATE_DOC')] }, { data: [] },

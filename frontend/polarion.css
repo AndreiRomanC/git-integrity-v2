@@ -34,6 +34,8 @@
 .polarion-selection-actions { display: flex; flex-wrap: wrap; gap: 7px; margin: 10px 0; }
 .polarion-task-dialog .polarion-results { max-height: 280px; margin-top: 14px; }
 .polarion-open-document { padding: 14px; border: 1px solid var(--border); border-radius: 8px; margin-bottom: 14px; background: var(--surface); }
+.polarion-open-document > summary { cursor: pointer; color: var(--muted); font-size: 12px; line-height: 1.5; }
+.polarion-open-document[open] > summary { margin-bottom: 12px; color: var(--text); }
 .polarion-open-document > label { display: block; font-size: 12px; font-weight: 600; margin-bottom: 8px; }
 .polarion-open-document > small { line-height: 1.6; margin-top: 8px; }
 .polarion-task-dialog #polarionOpenDocument { border-color: var(--blue); color: var(--blue); }
@@ -41,6 +43,12 @@
 .polarion-catalog-search > summary { font-size: 12px; color: var(--muted); cursor: pointer; padding: 5px 0; }
 .polarion-catalog-search > label { display: block; margin: 10px 0 7px; font-size: 12px; }
 .polarion-catalog-search > small { margin: 8px 0; line-height: 1.6; }
+.polarion-document-hint { margin: 8px 0 12px; line-height: 1.5; }
+.polarion-result-summary { margin: 10px 0 6px; font-size: 12px; color: var(--muted); line-height: 1.5; }
+.polarion-task-dialog .polarion-result-origin { font-size: 10px; letter-spacing: .3px; color: var(--blue); }
+.polarion-task-dialog .polarion-result-origin.local { color: #c4b2ed; }
+.polarion-task-dialog .polarion-result-origin.cache { color: #b6c5d2; }
+.polarion-detail-origin { margin-bottom: 7px; font-size: 10px; letter-spacing: .4px; }
 .polarion-document-elements { padding-top: 14px; margin-top: 16px; border-top: 1px solid var(--border); }
 .polarion-document-elements h4 { margin: 0 0 10px; font-size: 13px; }
 .polarion-element-toolbar { position: sticky; top: -18px; z-index: 1; background: var(--surface); padding: 10px 0; }
@@ -59,6 +67,8 @@
 .polarion-commit-preview { padding: 7px 9px; background: var(--surface); border: 1px solid var(--border); border-radius: 5px; }
 .polarion-commit-preview small { margin: 0 0 5px; }
 .polarion-commit-preview code { display: block; font-size: 11px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.commit-dialog-blocker[hidden] { display: none !important; }
+#appPromptBlocker { margin: 10px 0; padding: 9px 11px; border-left: 2px solid #c18c3f; background: #30261a; color: #e9c798; font-size: 12px; line-height: 1.5; text-align: left; }
 .polarion-detail { border: 1px solid var(--border); border-radius: 8px; padding: 14px; margin: 14px 0; }
 .polarion-detail h3 { font-size: 14px; line-height: 1.5; overflow-wrap: anywhere; margin: 0 0 6px; }
 .polarion-detail dl { display: grid; grid-template-columns: minmax(110px, 1fr) minmax(0, 3fr); gap: 7px 16px; font-size: 12px; margin: 14px 0; }

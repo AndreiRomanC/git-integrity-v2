@@ -174,7 +174,7 @@ test('StructDoc reads every page, preserves all actual types and filters only lo
   h.el('TabDocuments').handlers.click();
   h.overrides.polarion_read = async args => ({ code: 'ok', received: 1, page_key: 'part' + args.page, more: args.page < 3,
     elements: [task('P/P-' + args.page, ['architecturalElement','designElement','solutionElement'][args.page - 1])] });
-  await cardButton(h, 'Document', 'Read all elements').handlers.click();
+  await cardButton(h, 'Document', 'Load elements · server').handlers.click();
   assert.equal(h.el('Elements').children.length, 3);
   assert.equal(h.calls.filter(c => c.name === 'polarion_read').length, 3);
   assert.ok(h.calls.filter(c => c.name === 'polarion_read').every(c => c.args.revision === '42'));
@@ -187,7 +187,7 @@ test('failed element page preserves the previous complete local snapshot', async
   const h = harness(); h.setWorkspace({ document: { ...task('P/S/D'), kind: 'document' }, elements: [task('P/OLD')], elements_complete: true }); await inProject(h);
   h.el('TabDocuments').handlers.click();
   h.overrides.polarion_read = async args => args.page === 1 ? { code: 'ok', received: 1, more: true, elements: [task('P/NEW')] } : { code: 'forbidden', http: 403 };
-  await cardButton(h, 'Document', 'Read all elements').handlers.click();
+  await cardButton(h, 'Document', 'Refresh elements · server').handlers.click();
   assert.equal(h.calls.filter(c => c.args?.action === 'elements').length, 0);
   assert.match(h.el('Elements').children[0].children[0].textContent, /OLD/);
   assert.match(h.el('Status').textContent, /refused/);
@@ -277,15 +277,70 @@ test('late diagnostic replies cannot change a reopened dialog and do not trigger
 
 const docLink = 'https://polarion.vitesco.io/polarion/#/project/P/wiki/Structure%20Information/Structure_2_0';
 const docSnapshot = () => ({ ...task('P/Structure Information/Structure_2_0'), kind: 'document', item_type: 'structureDocument' });
-test('a matching saved StructDoc is found locally even without a working server catalog; explicit server search remains available', async () => {
+test('Search always checks the server and keeps a clearly marked saved match when the server catalog returns nothing', async () => {
   const h = harness(); h.setWorkspace({ document: { ...docSnapshot(), id: 'P/Structure Information/VWAQ4-SW_ERRM_StructDoc_2_0_0', title: 'VWAQ4-SW_ERRM_StructDoc_2.0.0' } });
   await inProject(h); h.el('TabDocuments').handlers.click(); h.el('DocumentSource').value = 'documents'; h.el('DocumentQuery').value = 'eRrM';
   const before = h.calls.length; await h.el('DocumentSearchButton').handlers.click();
-  assert.equal(h.calls.length, before); assert.equal(h.el('Results').children.length, 1);
-  assert.equal(h.el('SearchServer').hidden, false); assert.match(h.el('DocumentHint').textContent, /local association, not a complete server catalog/);
-  assert.equal(h.el('Connection').dataset.state, 'unknown', 'a saved match is not proof of current authentication');
-  await h.el('SearchServer').handlers.click(); assert.equal(h.calls.at(-1).name, 'polarion_search');
+  assert.equal(h.calls.length, before + 1); assert.equal(h.el('Results').children.length, 1);
+  assert.equal(h.el('Results').children[0].dataset.origin, 'local');
+  assert.match(h.el('Results').children[0].children[2].textContent, /LOCAL · saved snapshot/);
+  assert.match(h.el('Status').textContent, /1 saved locally/);
+  assert.equal(h.el('Connection').dataset.state, 'connected', 'only the actual successful server request verifies access');
+  await h.el('DocumentSearchButton').handlers.click(); assert.equal(h.calls.filter(c => c.name === 'polarion_search').length, 2);
   h.el('ElementQuery').value = 'errm'; h.el('ClearElements').handlers.click(); assert.equal(h.el('ElementQuery').value, '');
+});
+test('local document actions display saved data without sign-in or server calls, with explicit server refresh buttons', async () => {
+  const h = harness(); h.setWorkspace({ document: docSnapshot(), elements: [task()], elements_complete: true, elements_revision: '42' });
+  await inProject(h); h.el('TabDocuments').handlers.click(); const before = h.calls.length;
+  cardButton(h, 'Document', 'View local snapshot').handlers.click();
+  assert.equal(h.calls.length, before); assert.equal(h.el('Connection').dataset.state, 'unknown');
+  assert.match(h.el('Detail').children[0].textContent, /LOCAL SNAPSHOT · no server request/);
+  assert.match(h.el('Status').textContent, /No server request/);
+  assert.ok(cardButton(h, 'Document', 'Refresh details · server'));
+  assert.ok(cardButton(h, 'Document', 'Refresh elements · server'));
+  assert.ok(cardButton(h, 'Document', 'Unlink locally'));
+  h.el('ElementQuery').value = 'P-1'; h.el('ElementQuery').handlers.input();
+  assert.equal(h.calls.length, before, 'local element filtering never searches Polarion');
+});
+test('server, server cache and local result origins stay distinct; changing tabs clears the source summary', async () => {
+  const h = harness(); h.setWorkspace({ document: { ...docSnapshot(), id: 'P/S/ERRM_LOCAL' } }); await inProject(h);
+  h.el('TabDocuments').handlers.click(); h.el('DocumentSource').value = 'documents'; h.el('DocumentQuery').value = 'errm';
+  const remote = { id: 'P/S/ERRM_SERVER', title: 'ERRM server document' };
+  h.search(async () => ({ code: 'ok', items: [remote], catalog_cached: true, received: 1, matched: 1 }));
+  await h.el('DocumentSearchButton').handlers.click();
+  assert.deepEqual(h.el('Results').children.map(row => row.dataset.origin), ['cache','local']);
+  assert.match(h.el('ResultSummary').textContent, /1 cached server results · 1 local matches/);
+  const before = h.calls.length; h.el('Results').children[1].handlers.click();
+  assert.equal(h.calls.length, before); assert.match(h.el('Detail').children[0].textContent, /LOCAL SNAPSHOT/);
+  h.search(async () => ({ code: 'ok', items: [remote], received: 1, matched: 1 }));
+  await h.el('DocumentSearchButton').handlers.click(); assert.equal(h.el('Results').children[0].dataset.origin, 'server');
+  assert.match(h.el('SearchScope').textContent, /document names.*in P/);
+  h.el('DocumentSource').value = 'containers'; h.el('DocumentSource').handlers.change();
+  assert.match(h.el('SearchScope').textContent, /work-item IDs and titles/);
+  h.el('TabTasks').handlers.click(); assert.equal(h.el('ResultSummary').hidden, true);
+});
+test('failed server search never presents a saved local match as a successful or still-pending server result', async () => {
+  const h = harness(); h.setWorkspace({ document: { ...docSnapshot(), id: 'P/S/ERRM_LOCAL' } }); await inProject(h);
+  h.el('TabDocuments').handlers.click(); h.el('DocumentSource').value = 'documents'; h.el('DocumentQuery').value = 'errm';
+  h.search(async () => ({ code: 'auth_required' })); await h.el('DocumentSearchButton').handlers.click();
+  assert.match(h.el('ResultSummary').textContent, /Server search did not complete/);
+  assert.doesNotMatch(h.el('ResultSummary').textContent, /searching Polarion…/);
+  assert.equal(h.el('Results').children[0].dataset.origin, 'local'); assert.equal(h.el('Connection').dataset.state, 'required');
+});
+test('a document element can be inspected and refreshed but cannot replace the StructDoc or erase its saved elements', async () => {
+  const h = harness(), doc = docSnapshot(), element = { ...task('P/P-85586', 'designelement'), title: 'errm_adpdg 2.0.0' };
+  h.setWorkspace({ document: doc, elements: [element], elements_complete: true }); await inProject(h); h.el('TabDocuments').handlers.click();
+  h.el('Elements').children[0].handlers.click();
+  assert.equal(h.el('Associate').disabled, true);
+  await h.el('Associate').handlers.click();
+  assert.match(h.el('Status').textContent, /document element, not a selected StructDoc/);
+  assert.equal(h.calls.filter(c => c.name === 'polarion_read').length, 0);
+  h.overrides.polarion_read = async () => ({ code: 'ok', snapshot: element });
+  await h.el('View').handlers.click();
+  assert.equal(h.calls.filter(c => c.args?.action === 'document').length, 0);
+  assert.equal(h.calls.filter(c => c.args?.action === 'element').length, 1);
+  assert.match(h.el('Document').children[0].children[1].textContent, /P\/Structure Information\/Structure_2_0/);
+  assert.equal(h.el('Elements').children.length, 1);
 });
 test('element filtering refreshes locally across text/type/clear changes without server requests', async () => {
   const h = harness(); h.setWorkspace({ document: docSnapshot(), elements_complete: true, elements: [
@@ -327,7 +382,7 @@ test('link association uses the existing local workspace and paginated element r
   h.el('DiagnosticUrl').value = docLink; await h.el('OpenDocument').handlers.click();
   await h.el('Associate').handlers.click();
   assert.equal(h.calls.filter(c => c.args?.action === 'document').length, 1);
-  await cardButton(h, 'Document', 'Read all elements').handlers.click();
+  await cardButton(h, 'Document', 'Load elements · server').handlers.click();
   assert.equal(h.el('Elements').children.length, 2); assert.equal(h.el('DocumentElements').hidden, false);
   assert.equal(h.calls.filter(c => c.name === 'polarion_search').length, 0);
   assert.ok(h.calls.filter(c => c.args?.kind === 'elements').every(c => c.args.revision === '42'));
@@ -363,7 +418,7 @@ test('compatible document name search stays selectable and explains incomplete c
   await h.el('DocumentSearchButton').handlers.click();
   assert.equal(h.calls.at(-1).args.query, 'errm');
   assert.match(h.el('DocumentHint').textContent, /Empty documents, reference-only documents and title-only matches may be missing/);
-  assert.match(h.el('Status').textContent, /Limited document discovery/);
+  assert.match(h.el('DocumentHint').textContent, /No complete catalog is implied/);
   h.el('Results').children[0].handlers.click();
   assert.equal(h.el('Associate').disabled, false);
   h.overrides.polarion_read = async args => {
@@ -381,7 +436,8 @@ test('token-based document discovery explicitly explains narrower matching, incl
     document_search_limited: true, matched: 0, received: 0, items: [] }));
   await h.el('DocumentSearchButton').handlers.click();
   assert.match(h.el('DocumentHint').textContent, /not unrestricted substring matching/);
-  assert.match(h.el('Status').textContent, /Limited document discovery.*token\/prefix or exact lookup/);
+  assert.match(h.el('DocumentHint').textContent, /token\/prefix or exact-name lookup/);
+  assert.match(h.el('Status').textContent, /Server search: 0 matches/);
   assert.equal(h.el('Associate').disabled, true);
 });
 test('name search rejects too-short fragments without HTTP and discards a result after closing and reopening', async () => {
@@ -436,4 +492,8 @@ test('Polarion layout has one stable viewport and keeps all StructDoc-specific c
   assert.match(css, /\.polarion-task-dialog > form \{ height: 100%/);
   assert.match(css, /\.polarion-task-dialog \[hidden\] \{ display: none !important/);
   assert.match(css, /scrollbar-gutter: stable/);
+  assert.ok(doc.indexOf('id="polarionDocument"') < doc.indexOf('Find on Polarion'), 'local selection is clearly separate from server search');
+  assert.match(doc, /<details class="polarion-open-document">/);
+  assert.match(doc, /<h4>Local elements<\/h4>/);
+  assert.match(doc, /This does not search Polarion or require sign-in/);
 });

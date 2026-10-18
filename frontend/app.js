@@ -37,7 +37,7 @@ const RECOVER_ON_MUTATION_ERROR = new Set(['merge_branch', 'resolve_conflict', '
 // command is slow. frontend_perf_log itself is excluded to avoid recursive
 // logging.
 const SLOW_INVOKE_LOG_THRESHOLD_MS = 250;
-const DIAGNOSTIC_COMMANDS = new Set(['commit_staged', 'commit_files', 'commit_path', 'stage_files', 'unstage_files', 'stage_all', 'refresh_status', 'compare_file_contents']);
+const DIAGNOSTIC_COMMANDS = new Set(['commit_staged', 'commit_files', 'commit_path', 'stage_files', 'unstage_files', 'stage_all', 'refresh_status', 'compare_file_contents', 'entry_details', 'entry_last_commit', 'open_repository_fast', 'load_repository']);
 let diagnosticRequestSequence = 0;
 let inFlightRepositoryWrites = 0;
 function diagnosticErrorCategory(error) {
@@ -762,11 +762,12 @@ function customPrompt(message, defaultValue = '', options = {}) {
     input.value = defaultValue;
     const okButton = $('#appPromptOk'); const cancelButton = $('#appPromptCancel');
     okButton.textContent = options.okLabel || 'OK';
-    okButton.disabled = false;
-    const references = createPolarionCommitReferences({ host: $('#appPromptPolarionRefs'), invoke, log: text => jsPerfLog(text, 0), onChange: () => { okButton.disabled = !references.canSubmit(); } });
+    const blocker = $('#appPromptBlocker'); blocker.hidden = !options.blockingReason; blocker.textContent = options.blockingReason || '';
+    okButton.disabled = Boolean(options.blockingReason);
+    const references = createPolarionCommitReferences({ host: $('#appPromptPolarionRefs'), invoke, log: text => jsPerfLog(text, 0), onChange: () => { okButton.disabled = Boolean(options.blockingReason) || !references.canSubmit(); } });
     references.setContext(options.polarionContext || null);
     const cleanup = (result) => { references.dispose(); dialog.close(); okButton.removeEventListener('click', onOk); cancelButton.removeEventListener('click', onCancel); input.removeEventListener('keydown', onKeydown); dialog.removeEventListener('cancel', onCancel); resolve(result); };
-    const onOk = () => { if (references.canSubmit()) cleanup(input.value.trim() ? references.message(input.value) : input.value); };
+    const onOk = () => { if (!options.blockingReason && references.canSubmit()) cleanup(input.value.trim() ? references.message(input.value) : input.value); };
     const onCancel = () => cleanup(null);
     const onKeydown = (event) => { if (event.key === 'Enter' && (!options.multiline || event.metaKey || event.ctrlKey)) { event.preventDefault(); onOk(); } };
     okButton.addEventListener('click', onOk); cancelButton.addEventListener('click', onCancel); input.addEventListener('keydown', onKeydown); dialog.addEventListener('cancel', onCancel);
@@ -1496,17 +1497,12 @@ document.addEventListener('drop', (e) => {
   e.preventDefault();
   if (!e.dataTransfer?.files?.length) return;
   const files = Array.from(e.dataTransfer.files);
-  files.forEach(file => {
+  files.slice(0, 1).forEach(file => {
     if (file.type.startsWith('text/') || file.name.endsWith('.md') || file.name.endsWith('.txt')) {
       const reader = new FileReader();
-      reader.onload = (event) => {
-        state.editingPath = file.name;
-        state.editorOriginal = event.target.result;
-        $('#editorTitle').textContent = `Edit ${file.name}`;
-        $('#editorPath').textContent = file.name;
-        $('#editorContent').value = event.target.result;
-        $('#editorDialog').showModal();
-      };
+      // A dropped browser File has no verified repository-relative path.
+      // Never save its basename over an unrelated file in the current repo.
+      reader.onload = event => openEditorDocument({ title: `View ${file.name}`, relativePath: file.name, readOnly: true, previewContent: event.target.result });
       reader.readAsText(file);
     }
   });
@@ -2788,6 +2784,7 @@ function gitState(entry) {
 
 function entryGitSummary(entry) {
   if (!entry) return 'Unknown';
+  if (entry.details_loading) return entry.details_error ? 'Unavailable' : 'Checking…';
   if (entry.status_known === false) return 'Loading Git status…';
   if (!entry.tracked) return `${untrackedItemLabel(entry)} — not tracked yet`;
   if (entry.kind === 'submodule') {
@@ -3353,14 +3350,24 @@ async function discardSubmoduleBranchAndUseUpstream({ name, upstream, ahead, beh
 // the double-click handler that navigates into a folder can cancel a
 // still-pending one before it ever calls the backend.
 let pendingEntryDetailsTimeout = null;
+let entryDetailsTraceSequence = 0;
+const selectEntryGuard = createRequestGuard();
 
 async function selectEntry(path, options = {}) {
   state.selectedEntry = state.entries.find(entry => entry.relative_path === path);
+  const selected = state.selectedEntry;
+  const selectionTrace = ++entryDetailsTraceSequence, selectionStarted = performance.now();
+  const traceSelection = phase => jsPerfLog(`entry_details_ui: selection=${selectionTrace} phase=${phase} kind=${selected?.kind || 'none'}`, performance.now() - selectionStarted);
+  const repositoryPath = state.repository?.path, repositoryGeneration = repoOpenGeneration;
+  const contextCurrent = selectEntryGuard();
+  const stillCurrent = () => contextCurrent() && repoOpenGeneration === repositoryGeneration &&
+    state.view === 'explorer' && state.selectedEntry === selected;
+  if (pendingEntryDetailsTimeout) { clearTimeout(pendingEntryDetailsTimeout); pendingEntryDetailsTimeout = null; }
+  if (!selected) { clearDetails('Select a file or folder'); return; }
   if (state.selectedEntry?.kind === 'file' && refs.editorDialog.open) {
     openEditor(state.selectedEntry);
   }
   render();
-  if (pendingEntryDetailsTimeout) { clearTimeout(pendingEntryDetailsTimeout); pendingEntryDetailsTimeout = null; }
   // Deleted tracked paths are intentionally present as synthetic Explorer
   // rows (load_directory cannot discover them through read_dir because they
   // no longer exist). Do not ask entry_details to stat a path known to be
@@ -3369,38 +3376,56 @@ async function selectEntry(path, options = {}) {
   if (['deleted', 'deleted-folder', 'deleted-submodule'].includes(state.selectedEntry?.kind)) {
     const deletedEntry = { ...state.selectedEntry, item_count: null, last_commit_id: undefined };
     renderEntryDetails(deletedEntry);
-    if (invoke) invoke('entry_last_commit', { repositoryPath: state.repository.path, relativePath: path })
+    if (invoke) invoke('entry_last_commit', { repositoryPath, relativePath: path })
       .then(last => {
-        if (state.selectedEntry?.relative_path !== path) return;
+        if (!stillCurrent()) return;
         const section = $('#entryLastCommitSection'); if (!section) return;
         section.innerHTML = renderEntryLastCommitInner({ ...deletedEntry, last_commit_id: last?.id ?? null, last_commit_subject: last?.subject ?? null, last_commit_author: last?.author ?? null, last_commit_date: last?.date ?? null });
       })
-      .catch(() => { const section = $('#entryLastCommitSection'); if (section && state.selectedEntry?.relative_path === path) section.innerHTML = renderEntryLastCommitInner({ ...deletedEntry, last_commit_id: null }); });
+      .catch(() => { const section = $('#entryLastCommitSection'); if (section && stillCurrent()) section.innerHTML = renderEntryLastCommitInner({ ...deletedEntry, last_commit_error: true }); });
     else renderEntryDetails({ ...deletedEntry, last_commit_id: null });
     return;
   }
   if (!invoke) return renderEntryDetails({ ...state.selectedEntry, item_count: state.selectedEntry.kind === 'folder' ? 12 : null, submodule_url: state.selectedEntry.kind === 'submodule' ? 'git@example.com:platform/diagnostics-core.git' : null, submodule_branch: state.selectedEntry.kind === 'submodule' ? 'main' : null, last_commit_id: 'a39f21d', last_commit_subject: 'P:423421431 test', last_commit_author: 'Andrei Pop', last_commit_date: '2026-08-14' });
+  // Stage 1 is the listing we already have: no extra IPC, scan or cache.
+  // Missing fields are explicitly pending, never inferred as clean/detached.
+  renderEntryDetails({ ...selected, details_loading: true, last_commit_id: undefined });
+  traceSelection('basic_dom_ready');
   const fetchDetails = async () => {
+    if (!stillCurrent()) return;
     try {
-      const details = await invoke('entry_details', { repositoryPath: state.repository.path, relativePath: path });
-      // Same staleness guard already used below for entry_last_commit: the user
-      // may have already clicked a different entry by the time this resolves —
-      // don't let an older selection's details overwrite what's now showing.
-      if (state.selectedEntry?.relative_path !== path) return;
+      traceSelection('request_started');
+      const result = await invoke('entry_details', { repositoryPath, relativePath: path });
+      if (!stillCurrent()) { traceSelection('details_discarded'); return; }
+      // Stage 2 uses the unchanged complete response. Stage 3 is the existing
+      // separate history lookup, which must not show "No commit" while pending.
+      const details = { ...result, last_commit_id: undefined };
       renderEntryDetails(details);
+      traceSelection('details_dom_ready');
       // "Last commit touching this path" is fetched separately — it can be a
       // genuinely heavy history walk on a large repository, and blocking the
       // whole details panel on it made clicking around a large folder feel
       // stuck. Only patch it in if this is still the selected entry — the
       // user may well have already clicked elsewhere by the time it resolves.
-      invoke('entry_last_commit', { repositoryPath: state.repository.path, relativePath: path })
+      invoke('entry_last_commit', { repositoryPath, relativePath: path })
         .then(last => {
-          if (state.selectedEntry?.relative_path !== path) return;
+          if (!stillCurrent()) { traceSelection('history_discarded'); return; }
           const section = $('#entryLastCommitSection'); if (!section) return;
           section.innerHTML = renderEntryLastCommitInner({ ...details, last_commit_id: last?.id ?? null, last_commit_subject: last?.subject ?? null, last_commit_author: last?.author ?? null, last_commit_date: last?.date ?? null });
+          traceSelection('history_dom_ready');
         })
-        .catch(() => { const section = $('#entryLastCommitSection'); if (section && state.selectedEntry?.relative_path === path) section.innerHTML = renderEntryLastCommitInner({ ...details, last_commit_id: null }); });
-    } catch (error) { handleError(error); }
+        .catch(() => {
+          if (!stillCurrent()) { traceSelection('history_error_discarded'); return; }
+          const section = $('#entryLastCommitSection');
+          if (section) section.innerHTML = renderEntryLastCommitInner({ ...details, last_commit_error: true });
+          traceSelection('history_failed');
+        });
+    } catch (error) {
+      if (!stillCurrent()) { traceSelection('error_discarded'); return; }
+      renderEntryDetails({ ...selected, details_loading: true, details_error: true, last_commit_error: true });
+      handleError(error);
+      traceSelection('details_failed');
+    }
   };
   // Selecting a folder/submodule this way happens on the *first* click of
   // what's very often actually a double-click to navigate into it — without
@@ -3528,6 +3553,7 @@ function submoduleRepositoryLinkHtml(entry) {
   return `<a href="${esc(href)}" class="submodule-repository-link" data-submodule-path="${esc(entry.relative_path)}" title="${esc(href)}">${esc(remote)} ↗</a>`;
 }
 function submoduleRepositoryRowsHtml(entry) {
+  if (entry.details_loading) return `<span>Remote</span><strong>${entry.details_error ? 'Unavailable' : 'Checking…'}</strong>`;
   const remote = entry.submodule_web_url ? submoduleRepositoryLinkHtml(entry) : esc(entry.submodule_url || 'Not configured');
   return `<span>Remote</span><strong>${remote}</strong>`;
 }
@@ -3545,12 +3571,14 @@ function tagListHtml(tags = []) {
 // from "loaded, no commit".
 function renderEntryLastCommitInner(entry) {
   const title = entry.kind === 'submodule' ? 'PROJECT COMMIT (gitlink update)' : 'LAST COMMIT';
+  if (entry.last_commit_error) return `<h3>${title}</h3><div class="detail-grid"><span>Commit</span><strong>History unavailable · select again to retry</strong></div>`;
   if (entry.last_commit_id === undefined) return `<h3>${title}</h3><div class="detail-grid"><span>Commit</span><strong><i class="spinner"></i> Loading…</strong></div>`;
   return `<h3>${title}</h3><div class="detail-grid"><span>Commit</span><strong>${entry.last_commit_id ? `<a href="#" class="commit-server-link" data-commit-id="${esc(entry.last_commit_id)}" title="Open this commit on the server">${esc(entry.last_commit_id.slice(0, 8))} ↗</a>` : 'No commit'}</strong><span>Message</span><strong>${commitSubjectHtml(entry.last_commit_subject || '—')}</strong>${specDetailRows(entry.last_commit_subject)}<span>Author</span><strong>${esc(entry.last_commit_author || '—')}</strong><span>Date</span><strong>${esc(entry.last_commit_date || '—')}</strong></div>`;
 }
 
 function submoduleCheckoutBadgeHtml(entry) {
   if (entry.kind !== 'submodule') return '';
+  if (entry.details_loading) return `<span class="submodule-checkout-pill pending">${entry.details_error ? 'Checkout unavailable' : 'Checking checkout…'}</span>`;
   if (entry.submodule_initialized === false) return '<span class="submodule-checkout-pill not-initialized">Not initialized</span>';
   const branch = entry.submodule_current_branch || '';
   return branch
@@ -3566,12 +3594,14 @@ function contextActionSectionHtml(label, actionsHtml, extraClass = '') {
 
 function renderEntryDetails(entry) {
   refs.details.closest?.('.main-layout')?.classList.remove('details-empty-state');
+  const pending = entry.details_loading === true;
+  const waiting = entry.details_error ? 'Unavailable' : 'Checking…';
   const deletedEntry = ['deleted', 'deleted-folder', 'deleted-submodule'].includes(entry.kind);
   const kindLabel = entry.kind === 'submodule' ? 'Git submodule' : entry.kind === 'deleted-submodule' ? 'Deleted Git submodule' : entry.kind === 'deleted-folder' ? 'Deleted tracked folder' : entry.kind === 'deleted' ? 'Deleted tracked file' : entry.kind.charAt(0).toUpperCase() + entry.kind.slice(1);
-  const submoduleState = entry.kind === 'submodule' ? SubmoduleStateModel.presentation(entry.submodule_initialized === false ? 'not_initialized' : entry.submodule_state) : null;
+  const submoduleState = entry.kind === 'submodule' ? pending ? { short: waiting, actionable: false } : SubmoduleStateModel.presentation(entry.submodule_initialized === false ? 'not_initialized' : entry.submodule_state) : null;
   const submoduleBranchName = entry.kind === 'submodule' ? (entry.submodule_current_branch || '') : '';
   const detachedDirtySubmodule = entry.kind === 'submodule' && entry.submodule_initialized !== false && !submoduleBranchName && entry.submodule_is_dirty;
-  const changeBanner = submoduleState?.actionable
+  const changeBanner = pending ? '' : submoduleState?.actionable
     ? detachedDirtySubmodule
       ? `<div class="submodule-guidance" title="${esc(`${submoduleState.detail} Local changes remain safe on disk.`)}"><i></i><div><strong>Local changes · Detached HEAD</strong><span>Commit/Push needs a local branch.</span></div><button data-detail-action="subnewbranch">Create branch here…</button></div>`
       : `<div class="submodule-guidance" title="${esc(submoduleState.detail)}"><i></i><div><strong>${esc(submoduleState.short)}</strong><span>${esc(submoduleState.detail)}</span></div></div>`
@@ -3580,14 +3610,12 @@ function renderEntryDetails(entry) {
     : entry.status || !entry.tracked
       ? `<div class="local-change-banner"><i></i><div><strong>${entry.tracked ? 'Modified locally' : untrackedItemLabel(entry)}</strong><span>${entry.tracked ? 'This item differs from the committed repository state.' : 'This item is new on disk. Stage it to include it in the next commit.'}</span></div></div>`
       : '';
-  const canCommitInsideSubmodule = entry.kind === 'submodule' && entry.submodule_state === 'changes_inside' && Boolean(submoduleBranchName);
+  const canCommitInsideSubmodule = entry.kind === 'submodule' && entry.submodule_initialized !== false;
   const canStashInsideSubmodule = entry.kind === 'submodule' && entry.submodule_is_dirty;
   const canPushSubmodule = entry.kind === 'submodule' && entry.submodule_initialized !== false && Boolean(submoduleBranchName);
   const submoduleCommitTooltip = canCommitInsideSubmodule
-    ? `Commit uncommitted changes inside the checked-out branch "${submoduleBranchName}"`
-    : entry.kind === 'submodule' && entry.submodule_state === 'changes_inside'
-      ? 'Commit requires an attached local branch. Use New branch or Change version first; detached HEAD commits are blocked.'
-      : 'No uncommitted files inside this submodule';
+    ? 'Open the commit message and optional StructDoc references. A local branch is required to create the commit.'
+    : 'Initialize this submodule before opening its commit dialog';
   const submodulePushTooltip = canPushSubmodule
     ? `Push the checked-out branch "${submoduleBranchName}" to this submodule's own remote`
     : 'Push requires an attached local branch. Create or switch to a branch first; detached HEAD commits are blocked.';
@@ -3617,16 +3645,23 @@ function renderEntryDetails(entry) {
     : `${contextActionSectionHtml('', `${editAction}${navigationActions}${folderActions}${fileRestoreAction}${commitAction}${deletedRestoreAction}${fileGitActions}${deleteAction}`)}`;
   refs.details.innerHTML = `<div class="entry-details"><div class="entry-preview ${esc(entry.kind)}">${entry.kind === 'submodule' ? '◇' : entry.kind === 'folder' ? '▰' : '▤'}</div>
     <h2>${esc(entry.name)}</h2><div class="entry-path">${esc(entry.relative_path)}</div>${entry.kind === 'submodule' ? `<div class="submodule-badges"><span class="submodule-badge">◇ Git submodule</span>${submoduleCheckoutBadgeHtml(entry)}</div>` : ''}
+    ${pending ? `<div class="entry-details-loading ${entry.details_error ? 'failed' : ''}" role="status">${entry.details_error ? 'Details could not be verified. Select this item again to retry.' : '<i class="spinner"></i> Checking current Git details…'}<small>${entry.details_error ? 'Actions remain unavailable.' : 'Basic information is from the folder listing. Actions become available after verification.'}</small></div>` : ''}
     ${changeBanner}
     ${detailActions}
     <div class="detail-section"><h3>GENERAL</h3><div class="detail-grid"><span>Type</span><strong>${kindLabel}</strong><span>Git</span><strong>${esc(entryGitSummary(entry))}</strong>
-    ${entry.item_count != null ? `<span>Items</span><strong>${entry.item_count}</strong>` : `<span>Size</span><strong>${formatSize(entry.size)}</strong>`}<span>Modified</span><strong>${formatModified(entry.modified)}</strong></div></div>
+    ${pending && ['folder', 'submodule'].includes(entry.kind) ? `<span>Items</span><strong>${waiting}</strong>` : entry.item_count != null ? `<span>Items</span><strong>${entry.item_count}</strong>` : `<span>Size</span><strong>${formatSize(entry.size)}</strong>`}<span>Modified</span><strong>${formatModified(entry.modified)}</strong></div></div>
     ${renderPersonalNoteSection(entry)}
-    ${entry.kind === 'submodule' ? `<div class="detail-section"><h3>SUBMODULE</h3><div class="detail-grid">${submoduleRepositoryRowsHtml(entry)}<span>Current checkout</span><strong>${submoduleBranchName ? `On branch ${esc(submoduleBranchName)}` : entry.submodule_initialized === false ? 'Not initialized' : 'Detached HEAD'}</strong><span>Default branch</span><strong>${esc(entry.submodule_branch || 'Default')}</strong><span>Status</span><strong>${esc(submoduleState.short)}</strong></div>
+    ${entry.kind === 'submodule' ? `<div class="detail-section"><h3>SUBMODULE</h3><div class="detail-grid">${submoduleRepositoryRowsHtml(entry)}<span>Current checkout</span><strong>${pending ? waiting : submoduleBranchName ? `On branch ${esc(submoduleBranchName)}` : entry.submodule_initialized === false ? 'Not initialized' : 'Detached HEAD'}</strong><span>Default branch</span><strong>${esc(pending ? waiting : entry.submodule_branch || 'Default')}</strong><span>Status</span><strong>${esc(submoduleState.short)}</strong></div>
     ${entry.submodule_unpushed_commits?.length ? `<div class="submodule-push-banner"><i></i><span>${entry.submodule_unpushed_commits.length} commit${entry.submodule_unpushed_commits.length === 1 ? '' : 's'} not yet pushed to its own remote:</span></div><div class="submodule-unpushed-list">${entry.submodule_unpushed_commits.map(commit => `<div class="submodule-unpushed-commit"><strong>${commitSubjectHtml(commit.subject)}</strong><small>${esc(commit.id.slice(0, 8))} · ${esc(commit.author)} · ${esc(commit.date)}</small></div>`).join('')}</div>` : entry.submodule_push_status ? `<div class="submodule-push-banner"><i></i><span>${esc(entry.submodule_push_status)}</span></div>` : ''}</div>` : ''}
-    ${entry.kind === 'submodule' ? `<div class="detail-section"><h3>SUBMODULE COMMIT (actual change)</h3><div class="detail-grid"><span>Commit</span><strong>${entry.submodule_commit_id ? `<a href="#" class="commit-server-link" data-commit-id="${esc(entry.submodule_commit_id)}" data-submodule-path="${esc(entry.relative_path)}" title="Open this commit on the submodule's own server">${esc(entry.submodule_commit_id.slice(0, 8))} ↗</a>` : 'No commit'}</strong>${entry.submodule_commit_tags?.length ? `<span>Tags</span><strong class="spec-list">${tagListHtml(entry.submodule_commit_tags)}</strong>` : ''}<span>Message</span><strong>${commitSubjectHtml(entry.submodule_commit_subject || '—')}</strong>${specDetailRows(entry.submodule_commit_subject, ...(entry.submodule_commit_tags || []))}<span>Author</span><strong>${esc(entry.submodule_commit_author || '—')}</strong><span>Date</span><strong>${esc(entry.submodule_commit_date || '—')}</strong></div></div>` : ''}
+    ${entry.kind === 'submodule' ? `<div class="detail-section"><h3>SUBMODULE COMMIT (actual change)</h3><div class="detail-grid"><span>Commit</span><strong>${pending ? waiting : entry.submodule_commit_id ? `<a href="#" class="commit-server-link" data-commit-id="${esc(entry.submodule_commit_id)}" data-submodule-path="${esc(entry.relative_path)}" title="Open this commit on the submodule's own server">${esc(entry.submodule_commit_id.slice(0, 8))} ↗</a>` : 'No commit'}</strong>${entry.submodule_commit_tags?.length ? `<span>Tags</span><strong class="spec-list">${tagListHtml(entry.submodule_commit_tags)}</strong>` : ''}<span>Message</span><strong>${commitSubjectHtml(entry.submodule_commit_subject || '—')}</strong>${specDetailRows(entry.submodule_commit_subject, ...(entry.submodule_commit_tags || []))}<span>Author</span><strong>${esc(entry.submodule_commit_author || '—')}</strong><span>Date</span><strong>${esc(entry.submodule_commit_date || '—')}</strong></div></div>` : ''}
     <div class="detail-section" id="entryLastCommitSection">${renderEntryLastCommitInner(entry)}</div></div>`;
-  refs.details.querySelectorAll('[data-detail-action]').forEach(button => button.addEventListener('click', () => { Promise.resolve(handleDetailAction(button.dataset.detailAction, entry, button)).catch(error => handleError(error)); }));
+  refs.details.querySelectorAll('[data-detail-action]').forEach(button => {
+    if (pending) {
+      button.disabled = true; button.title = entry.details_error ? 'Details unavailable — select again to retry' : 'Checking current Git details';
+      button.setAttribute('data-tooltip', button.title);
+    }
+    button.addEventListener('click', () => { if (button.disabled) return; Promise.resolve(handleDetailAction(button.dataset.detailAction, entry, button)).catch(error => handleError(error)); });
+  });
   refs.details.querySelectorAll('[data-note-action]').forEach(button => button.addEventListener('click', () => { Promise.resolve(button.dataset.noteAction === 'delete' ? deleteEntryPersonalNote(entry) : editEntryPersonalNote(entry)).catch(error => handleError(error)); }));
 }
 
@@ -4093,8 +4128,13 @@ async function replaceSubmoduleLocation(entry) {
 async function commitSubmoduleChanges(entry) {
   if (entry.kind !== 'submodule') return;
   const repositoryPath = state.repository.path;
-  const message = await customPrompt(`Commit message for changes in ${entry.name}:`, '', { title: 'Commit submodule', multiline: true, polarionContext: submoduleCommitReferenceContext(entry) });
+  const message = await customPrompt(`Commit message for changes in ${entry.name}:`, refs.defaultCommitMessage.value.trim(), {
+    title: 'Commit submodule', okLabel: 'Commit', multiline: true, polarionContext: submoduleCommitReferenceContext(entry),
+    blockingReason: !entry.submodule_current_branch
+      ? 'Detached HEAD — you can inspect the commit message and StructDoc references here, but committing requires a local branch. Close this dialog and use Create branch here… or Change version to switch to a branch. Your local files are unchanged.' : '',
+  });
   if (!message?.trim()) return;
+  if (!entry.submodule_current_branch) return; // Inspection-only on detached HEAD; backend also verifies the live checkout.
   if (state.repository?.path !== repositoryPath) return;
   if (!invoke) return status(`Preview: committed changes in ${entry.name}`);
   try {
@@ -4723,15 +4763,7 @@ refs.refreshConflictsButton.addEventListener('click', () => {
 
 function editConflictFile(target, path) {
   const joined = target.targetPath ? `${target.targetPath}/${path}` : path;
-  state.editingConflict = { target, path };
-  refs.editorTitle.textContent = `Resolve ${path}`;
-  refs.editorPath.textContent = path;
-  refs.editorContent.value = 'Loading…';
-  refs.editorDialog.showModal();
-  if (!invoke) { refs.editorContent.value = '<<<<<<< HEAD\n(your version)\n=======\n(their version)\n>>>>>>> branch\n'; return; }
-  invoke('read_text_file', { repositoryPath: conflictRepositoryPath(target), relativePath: joined })
-    .then(file => { refs.editorContent.value = file.content; refs.editorContent.focus(); })
-    .catch(error => { refs.editorDialog.close(); handleError(error); });
+  return openEditorDocument({ title: `Resolve ${path}`, repositoryPath: conflictRepositoryPath(target), relativePath: joined, conflict: { target, path } });
 }
 
 refs.confirmCompleteMerge.addEventListener('click', async () => {
@@ -5049,66 +5081,186 @@ async function runEntryFileAction(entry, action) {
   } catch (error) { const message = handleError(error); showOperationToast(`Failed: ${message}`, 'error'); }
 }
 
-async function openEditor(entry) {
-  state.editingPath = entry.relative_path; state.editorOriginal = ''; refs.editorTitle.textContent = `Edit ${entry.name}`; refs.editorPath.textContent = entry.relative_path; refs.editorContent.value = 'Loading…'; refs.editorDialog.showModal();
-  if (!invoke) { refs.editorContent.value = 'Preview editor\n'; state.editorOriginal = refs.editorContent.value; addEditorBlameHints(); return; }
-  try { const file = await invoke('read_text_file', { repositoryPath: state.repository.path, relativePath: entry.relative_path }); refs.editorContent.value = file.content; state.editorOriginal = file.content; updateEditorSaveState(); refs.editorContent.focus(); addEditorBlameHints(); }
-  catch (error) { refs.editorDialog.close(); handleError(error); }
+// Each read/save/blame response belongs to one immutable editor session.
+// Closing/reopening or changing repositories cannot retarget it to another file.
+let editorSession = null;
+let editorOpenSequence = 0;
+function editorSessionCurrent(session) {
+  return !!session && editorSession === session && refs.editorDialog.open &&
+    (session.readOnly || (session.workspacePath === state.repository?.path && session.repositoryGeneration === repoOpenGeneration));
 }
-
-function addEditorBlameHints() {
-  if (state.editingConflict) return;
-  setTimeout(() => {
-    const content = refs.editorContent;
-    const lines = content.value.split('\n');
-    const hints = lines.map((line, i) => `<span data-line="${i}" data-tooltip="Loading blame info…" style="color:#6b7f96;font-size:10px;">${String(i+1).padStart(4)}</span>`).join('\n');
-
-    if (!invoke) return;
-    try {
-      invoke('file_blame', { repositoryPath: state.repository.path, relativePath: state.editingPath })
-        .then(blame => {
-          const blameByLine = {};
-          if (blame && blame.lines) {
-            blame.lines.forEach((info, i) => {
-              blameByLine[i] = info;
-            });
-          }
-          document.querySelectorAll('[data-line]').forEach(lineEl => {
-            const lineNum = parseInt(lineEl.dataset.line);
-            const info = blameByLine[lineNum];
-            if (info) {
-              const tooltip = `${info.author || '?'} · ${info.date || '?'} · ${info.message || '?'}`;
-              lineEl.setAttribute('data-tooltip', tooltip);
-            }
-          });
-        })
-        .catch(() => {});
-    } catch (e) {}
-  }, 300);
+function closeEditorSession(session) {
+  if (editorSession !== session) return;
+  editorSession = null; state.editingConflict = null; state.editingPath = ''; state.editorOriginal = '';
+  refs.editorDialog.close();
 }
-
+async function requestEditorClose() {
+  const session = editorSession;
+  if (!session) { refs.editorDialog.close(); return true; }
+  if (session.saving || session.confirmingClose) return false;
+  if (session.ready && !session.readOnly && refs.editorContent.value !== session.original) {
+    session.confirmingClose = true;
+    let discard;
+    try { discard = await customConfirm('Discard the unsaved edits in this editor? The file on disk will not be changed.', { title: 'Unsaved edits', okLabel: 'Discard edits', danger: true }); }
+    finally { session.confirmingClose = false; }
+    if (!discard || editorSession !== session) return false;
+  }
+  closeEditorSession(session); return true;
+}
+function openEditor(entry) {
+  return openEditorDocument({ title: `Edit ${entry.name}`, repositoryPath: state.repository?.path, relativePath: entry.relative_path });
+}
+async function openEditorDocument(options) {
+  const sequence = ++editorOpenSequence;
+  const workspacePath = state.repository?.path, repositoryGeneration = repoOpenGeneration;
+  if (refs.editorDialog.open && !await requestEditorClose()) return;
+  if (sequence !== editorOpenSequence || workspacePath !== state.repository?.path || repositoryGeneration !== repoOpenGeneration) return;
+  const session = { ...options, workspacePath, repositoryGeneration, ready: false, saving: false, original: '', blame: [], matches: [], matchIndex: -1, lineEnding: '\n' };
+  editorSession = session; state.editingPath = session.relativePath; state.editingConflict = session.conflict || null; state.editorOriginal = '';
+  refs.editorTitle.textContent = session.title; refs.editorPath.textContent = session.relativePath;
+  refs.editorContent.value = ''; refs.editorContent.placeholder = 'Loading file…'; refs.editorContent.disabled = true; refs.editorContent.readOnly = !!session.readOnly;
+  $('#editorError').hidden = true; $('#editorSearch').value = ''; $('#editorSearchStatus').textContent = '';
+  $('#editorSearchPrevious').disabled = true; $('#editorSearchNext').disabled = true;
+  $('#editorBlame').textContent = ''; $('#editorPosition').textContent = 'Ln 1, Col 1';
+  refs.editorDialog.showModal(); updateEditorSaveState();
+  try {
+    const file = session.previewContent != null ? { content: String(session.previewContent) } : !invoke ? { content: 'Preview editor\n' } :
+      await invoke('read_text_file', { repositoryPath: session.repositoryPath, relativePath: session.relativePath });
+    if (!editorSessionCurrent(session)) return;
+    // Textareas normalize CRLF to LF. Preserve uniform Windows line endings on save.
+    session.lineEnding = file.content.includes('\r\n') && !file.content.replaceAll('\r\n', '').includes('\n') ? '\r\n' : '\n';
+    refs.editorContent.value = file.content; session.original = refs.editorContent.value; state.editorOriginal = session.original;
+    session.ready = true; refs.editorContent.disabled = false; refs.editorContent.placeholder = '';
+    updateEditorSaveState(); updateEditorSearch(); updateEditorPosition(); refs.editorContent.focus(); addEditorBlameHints(session);
+  } catch (error) {
+    if (!editorSessionCurrent(session)) return;
+    refs.editorContent.placeholder = 'File could not be loaded.';
+    $('#editorError').textContent = `Cannot open this file: ${String(error?.message || error)}`; $('#editorError').hidden = false;
+    jsPerfLog(`editor_read: result=error category=${editorErrorCategory(error)} session=${sequence}`, 0);
+    updateEditorSaveState();
+  }
+}
+function editorErrorCategory(error) {
+  const message = String(error?.message || error).toLowerCase();
+  if (/nul|binary/.test(message)) return 'binary-or-nul';
+  if (/2 mb|too large/.test(message)) return 'size-limit';
+  if (/utf-8/.test(message)) return 'unsupported-encoding';
+  return diagnosticErrorCategory(error);
+}
+async function addEditorBlameHints(session = editorSession) {
+  if (!invoke || !editorSessionCurrent(session) || session.conflict || session.readOnly) return;
+  try {
+    const blame = await invoke('file_blame', { repositoryPath: session.repositoryPath, relativePath: session.relativePath });
+    if (!editorSessionCurrent(session)) return;
+    session.blame = blame?.lines || []; updateEditorPosition();
+  } catch (error) {
+    if (!editorSessionCurrent(session)) return;
+    $('#editorBlame').textContent = 'Line authors unavailable';
+    jsPerfLog(`editor_blame: result=error category=${editorErrorCategory(error)}`, 0);
+  }
+}
+function updateEditorPosition() {
+  const before = refs.editorContent.value.slice(0, refs.editorContent.selectionStart || 0);
+  const line = before.split('\n').length, column = before.length - before.lastIndexOf('\n');
+  $('#editorPosition').textContent = `Ln ${line}, Col ${column}`;
+  const session = editorSession;
+  const info = session?.ready && refs.editorContent.value === session.original ? session.blame[line - 1] : null;
+  $('#editorBlame').textContent = info?.author ? `${info.author} · ${info.date}` : '';
+  $('#editorBlame').title = info?.message || '';
+}
+function updateEditorSearch() {
+  const session = editorSession;
+  if (!session) return;
+  const query = $('#editorSearch').value, matchCase = $('#editorMatchCase').checked;
+  session.matches = []; session.matchIndex = -1;
+  // Bound bookkeeping for repeated single-character queries in large files.
+  if (query) {
+    // Escape literal text; native case-insensitive matching keeps offsets in
+    // the original string even for characters whose lowercase form expands.
+    const pattern = new RegExp(query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), matchCase ? 'g' : 'gi');
+    let match;
+    while (session.matches.length < 10000 && (match = pattern.exec(refs.editorContent.value))) session.matches.push(match.index);
+  }
+  session.searchQuery = query; session.matchCase = matchCase;
+  const count = session.matches.length;
+  $('#editorSearchStatus').textContent = !query ? '' : count ? `${count}${count === 10000 ? '+' : ''} matches` : 'No matches';
+  $('#editorSearchPrevious').disabled = !session.ready || !count; $('#editorSearchNext').disabled = !session.ready || !count;
+}
+function moveEditorSearch(direction = 1) {
+  const session = editorSession;
+  if (!session?.ready) return;
+  if (session.searchQuery !== $('#editorSearch').value || session.matchCase !== $('#editorMatchCase').checked) updateEditorSearch();
+  if (!session.matches.length) return;
+  session.matchIndex = session.matchIndex < 0 ? (direction < 0 ? session.matches.length - 1 : 0) :
+    (session.matchIndex + direction + session.matches.length) % session.matches.length;
+  const offset = session.matches[session.matchIndex];
+  const keepSearchFocus = document.activeElement === $('#editorSearch');
+  refs.editorContent.focus(); refs.editorContent.setSelectionRange(offset, offset + session.searchQuery.length);
+  // Keep the selected match visible without changing text or the undo history.
+  const line = refs.editorContent.value.slice(0, offset).split('\n').length - 1;
+  const lineHeight = parseFloat(getComputedStyle(refs.editorContent).lineHeight) || 19;
+  refs.editorContent.scrollTop = Math.max(0, line * lineHeight - refs.editorContent.clientHeight / 2);
+  $('#editorSearchStatus').textContent = `${session.matchIndex + 1} / ${session.matches.length}${session.matches.length === 10000 ? '+' : ''}`;
+  updateEditorPosition();
+  if (keepSearchFocus) $('#editorSearch').focus();
+}
+function updateEditorSaveState() {
+  const session = editorSession, dirty = !!session?.ready && refs.editorContent.value !== session.original;
+  const current = editorSessionCurrent(session);
+  $('#saveFile').disabled = !current || !session.ready || session.readOnly || session.saving || (!dirty && !session.conflict);
+  refs.editorContent.disabled = !session?.ready || !!session.saving;
+  $('#editorSearch').disabled = !session?.ready;
+  $('#closeEditor').disabled = !!session?.saving; $('#cancelEditor').disabled = !!session?.saving;
+  $('#saveFile').textContent = session?.saving ? 'Saving…' : session?.conflict ? 'Save & mark resolved' : 'Save file';
+  $('#editorSaveState').textContent = !current ? 'Repository changed — reopen this file before saving.' : session.readOnly ? 'Read-only preview · no repository path verified' :
+    session.saving ? 'Saving locally…' : !session.ready ? ($('#editorError').hidden ? 'Loading file…' : 'File not loaded · saving disabled') :
+    dirty ? 'Unsaved local edits' : `Saved locally · UTF-8 · ${session.lineEnding === '\r\n' ? 'CRLF' : 'LF'} · maximum 2 MB`;
+  $('#editorSaveState').classList.toggle('warning', dirty || !current);
+}
 async function saveEditor(event) {
   event?.preventDefault();
-  if (state.editingConflict) {
-    const { target, path } = state.editingConflict;
-    const joined = target.targetPath ? `${target.targetPath}/${path}` : path;
-    try {
-      status(`Saving ${path}…`, 'busy');
-      await invoke('write_text_file', { repositoryPath: conflictRepositoryPath(target), relativePath: joined, content: refs.editorContent.value });
-      await invoke('resolve_conflict', { repositoryPath: conflictRepositoryPath(target), targetPath: target.targetPath, relativePath: path, resolution: 'manual' });
-      refs.editorDialog.close(); state.editingConflict = null;
-      status(`${path}: marked resolved.`); showOperationToast(`${path}: marked resolved.`, 'success');
-      await refreshConflictsDialog(target);
-    } catch (error) { handleError(error); }
-    return;
-  }
+  const session = editorSession;
+  updateEditorSaveState();
+  if ($('#saveFile').disabled) return;
   const folder = state.currentPath;
-  try { status(`Saving ${state.editingPath}…`, 'busy'); await saveEditorContent(); refs.editorDialog.close(); directoryCache.clear(); await loadRepository(state.repository.path, { reopenPath: folder }); status(`Saved ${state.editingPath}`); }
-  catch (error) { handleError(error); }
+  session.saving = true; $('#editorError').hidden = true; updateEditorSaveState();
+  try {
+    await saveEditorContent(session);
+    if (!editorSessionCurrent(session)) return;
+    if (session.conflict && invoke) {
+      const { target, path } = session.conflict;
+      await invoke('resolve_conflict', { repositoryPath: session.repositoryPath, targetPath: target.targetPath, relativePath: path, resolution: 'manual' });
+      if (!editorSessionCurrent(session)) return;
+    }
+    closeEditorSession(session);
+    if (session.conflict) {
+      status(`${session.conflict.path}: marked resolved.`); showOperationToast(`${session.conflict.path}: marked resolved.`, 'success');
+      await refreshConflictsDialog(session.conflict.target);
+    } else if (invoke) {
+      directoryCache.clear(); await loadRepository(session.workspacePath, { reopenPath: folder }); status(`Saved ${session.relativePath}`);
+    }
+  } catch (error) {
+    if (!editorSessionCurrent(session)) {
+      // The write already succeeded and the editor closed; an error in the
+      // existing post-save refresh must still be visible, not mistaken for
+      // a failed write or silently swallowed as a stale editor response.
+      if (!editorSession && state.repository?.path === session.workspacePath) handleError(error);
+      return;
+    }
+    $('#editorError').textContent = `Could not complete save: ${String(error?.message || error)}`; $('#editorError').hidden = false;
+    jsPerfLog(`editor_save: result=error category=${editorErrorCategory(error)}`, 0);
+  } finally {
+    session.saving = false;
+    if (editorSession === session) updateEditorSaveState();
+  }
 }
-
-async function saveEditorContent() { if (!invoke) { state.editorOriginal = refs.editorContent.value; updateEditorSaveState(); return; } await invoke('write_text_file', { repositoryPath: state.repository.path, relativePath: state.editingPath, content: refs.editorContent.value }); state.editorOriginal = refs.editorContent.value; updateEditorSaveState(); }
-function updateEditorSaveState() { const dirty = refs.editorContent.value !== state.editorOriginal; $('#editorSaveState').textContent = dirty ? 'Unsaved local edits' : 'Saved locally · UTF-8 · maximum 2 MB'; $('#editorSaveState').classList.toggle('warning', dirty); }
+async function saveEditorContent(session = editorSession) {
+  if (!editorSessionCurrent(session) || !session.ready || session.readOnly) throw new Error('File is not ready for saving. Reopen it and retry.');
+  const content = refs.editorContent.value;
+  if (invoke) await invoke('write_text_file', { repositoryPath: session.repositoryPath, relativePath: session.relativePath,
+    content: session.lineEnding === '\r\n' ? content.replaceAll('\n', '\r\n') : content });
+  if (editorSessionCurrent(session)) { session.original = content; state.editorOriginal = content; }
+}
 
 // Deliberately never touches state.repository/branches/commits/changes/
 // stashes — those stay the parent repository throughout, so Explorer,
@@ -8141,8 +8293,31 @@ if (typeof ResizeObserver !== 'undefined') { new ResizeObserver(() => scheduleGr
     arrow.textContent = isExpanded ? '▾' : '▸';
   });
 })();
-$('#saveFile').addEventListener('click', saveEditor); $('#closeEditor').addEventListener('click', () => refs.editorDialog.close()); $('#cancelEditor').addEventListener('click', () => refs.editorDialog.close());
-refs.editorContent.addEventListener('input', updateEditorSaveState);
+$('#saveFile').addEventListener('click', saveEditor);
+$('#closeEditor').addEventListener('click', requestEditorClose); $('#cancelEditor').addEventListener('click', requestEditorClose);
+refs.editorDialog.addEventListener('cancel', event => { event.preventDefault(); requestEditorClose(); });
+refs.editorDialog.addEventListener('close', () => {
+  // Native close events are queued: an old close must not invalidate a newly opened editor.
+  if (!refs.editorDialog.open) { editorSession = null; state.editingConflict = null; state.editingPath = ''; }
+});
+refs.editorContent.addEventListener('input', () => { updateEditorSaveState(); updateEditorSearch(); updateEditorPosition(); });
+['click', 'keyup', 'select'].forEach(type => refs.editorContent.addEventListener(type, updateEditorPosition));
+$('#editorSearch').addEventListener('input', updateEditorSearch);
+$('#editorMatchCase').addEventListener('change', updateEditorSearch);
+$('#editorSearchPrevious').addEventListener('click', () => moveEditorSearch(-1));
+$('#editorSearchNext').addEventListener('click', () => moveEditorSearch(1));
+$('#editorSearch').addEventListener('keydown', event => {
+  if (event.key === 'Enter' && !event.isComposing) { event.preventDefault(); moveEditorSearch(event.shiftKey ? -1 : 1); }
+});
+$('#editorWrap').addEventListener('change', () => {
+  refs.editorContent.classList.toggle('editor-wrap', $('#editorWrap').checked);
+  refs.editorContent.wrap = $('#editorWrap').checked ? 'soft' : 'off';
+});
+refs.editorDialog.addEventListener('keydown', event => {
+  if (event.isComposing || !(event.ctrlKey || event.metaKey)) return;
+  if (event.key.toLowerCase() === 'f') { event.preventDefault(); $('#editorSearch').focus(); $('#editorSearch').select(); }
+  if (event.key.toLowerCase() === 's') { event.preventDefault(); saveEditor(event); }
+});
 $('#fetchCurrent').addEventListener('click', event => {
   if (state.submoduleGraph) {
     const graph = state.submoduleGraph;

@@ -121,7 +121,7 @@ function createPolarionCommitReferences({ host, invoke, onChange = () => {}, log
       source = workspace.document ? { id: workspace.document.id, title: workspace.document.title } : null;
       if (!workspace.document) throw new Error('No StructDoc is associated with the parent project.');
       if (!workspace.elements_complete || workspace.elements_revision !== (workspace.document.fields?.revision || '')) {
-        throw new Error('The saved element list is missing or outdated. Read all elements in P → StructDocs first.');
+        throw new Error('The saved element list is missing or outdated. Load or refresh elements from the server in P → StructDocs first.');
       }
       sourceTime = workspace.elements_saved_at || workspace.document.fetched_at || '';
       rows = polarionModuleElements(workspace.elements, target.moduleName);
@@ -165,7 +165,7 @@ function createPolarionTaskPicker({ invoke, addMessage, log = () => {} }) {
   const storage = typeof localStorage === 'undefined' ? null : localStorage;
   let identity = polarionRememberedUser(storage), otherUser = false;
   let generation = 0, context = null, project = null, selected = null, detail = null, busy = false;
-  let mode = 'projects', lastSearch = null, page = 1, more = false, workspace = {};
+  let mode = 'projects', lastSearch = null, page = 1, more = false, workspace = {}, documentSearchPending = false;
   let mountedMode = '';
   const statusByMode = {};
   const modeHint = () => mode === 'projects' ? 'Find a project, then select it to continue.' : mode === 'tasks' ? 'Find tasks in the selected project. Add a selected task to your commit list explicitly.' : 'Find a StructDoc by name in the selected project, or open an exact Polarion document link.';
@@ -187,7 +187,7 @@ function createPolarionTaskPicker({ invoke, addMessage, log = () => {} }) {
       // Reuse the existing result/detail components, but keep them physically
       // inside the active tab. No StructDoc content leaks into Tasks/Projects.
       const host = el(mode === 'projects' ? 'ProjectWorkspace' : mode === 'tasks' ? 'TaskWorkspace' : 'DocumentWorkspace');
-      host.append(el('Results'), el('Pages'), el('SelectionActions'), el('Detail'));
+      host.append(el('ResultSummary'), el('Results'), el('Pages'), el('SelectionActions'), el('Detail'));
       mountedMode = mode; el('TabBody').scrollTop = 0;
     }
     for (const [name, section] of [['Projects','projects'], ['Tasks','tasks'], ['Documents','documents']]) {
@@ -199,13 +199,17 @@ function createPolarionTaskPicker({ invoke, addMessage, log = () => {} }) {
     el('DiagnosticUrl').disabled = busy;
     el('OpenDocument').disabled = busy || !context || !el('DiagnosticUrl').value.trim();
     el('DocumentSource').disabled = busy;
+    el('SearchScope').textContent = !project ? 'Select a project in Projects to search Polarion. Saved local data remains available.'
+      : (el('DocumentSource').value === 'containers' ? 'Searches work-item IDs and titles' : 'Searches document names; older servers may use matching element titles') +
+        ' in ' + project.id + '. Explicit search only; successful results may be cached for 2 minutes.';
     el('TaskSearchButton').disabled = el('DocumentSearchButton').disabled = busy || !project || !context;
     el('TaskQuery').disabled = el('DocumentQuery').disabled = el('Assigned').disabled = !project || busy;
     el('Connect').disabled = busy;
     el('View').disabled = busy || !selected;
+    el('View').textContent = mode === 'documents' ? 'Read details · server' : 'Read details';
     el('SelectionActions').hidden = !selected || mode === 'projects';
     el('PrimaryButton').hidden = mode !== 'tasks'; el('PrimaryButton').disabled = busy || selected?.kind !== 'tasks';
-    el('Associate').hidden = mode !== 'documents'; el('Associate').disabled = busy || !['documents', 'containers'].includes(selected?.kind);
+    el('Associate').hidden = mode !== 'documents'; el('Associate').disabled = busy || !selected?.associationEligible;
     el('Add').hidden = mode !== 'tasks'; el('Add').disabled = busy || selected?.kind !== 'tasks';
     el('Previous').disabled = busy || !lastSearch || page <= 1; el('Next').disabled = busy || !lastSearch || !more;
     el('Pages').hidden = !lastSearch || (page <= 1 && !more);
@@ -214,7 +218,7 @@ function createPolarionTaskPicker({ invoke, addMessage, log = () => {} }) {
     el('Identity').textContent = otherUser ? 'Filtering another user' : identity ? (identity.name || identity.id) + ' · ' + (identity.source === 'portal' ? 'detected / remembered' : 'remembered user ID') : 'User not detected yet';
     el('ChosenProject').textContent = project ? project.id + ' · ' + project.name : 'No project selected · choose one in Projects';
   };
-  const clearResults = () => { selected = null; lastSearch = null; el('Results').replaceChildren(); el('Results').hidden = true; el('SearchServer').hidden = true; more = false; update(); };
+  const clearResults = () => { selected = null; lastSearch = null; documentSearchPending = false; el('ResultSummary').hidden = true; el('ResultSummary').textContent = ''; el('Results').replaceChildren(); el('Results').hidden = true; more = false; update(); };
   const clearDetail = () => { detail = null; el('Detail').hidden = true; el('Detail').replaceChildren(); };
   function switchMode(next) { if (busy) return; ++generation; mode = next; clearResults(); clearDetail(); update(); renderElements(); el('Status').textContent = statusByMode[mode] || modeHint(); }
   async function action(work) {
@@ -223,6 +227,10 @@ function createPolarionTaskPicker({ invoke, addMessage, log = () => {} }) {
     try { await work(ticket); }
     catch (error) {
       if (current(ticket)) {
+        if (documentSearchPending) {
+          documentSearchPending = false;
+          el('ResultSummary').hidden = false; el('ResultSummary').textContent = 'Server search did not complete. Any Local result is a saved snapshot, not a verified server match.';
+        }
         if (['auth_required', 'wrong_origin', 'not_json'].includes(error?.polarionCode)) {
           connection('required', 'Not connected to Polarion · sign-in required');
         } else if (String(error).includes('Open Polarion, sign in if needed, then retry Search.')) {
@@ -241,33 +249,38 @@ function createPolarionTaskPicker({ invoke, addMessage, log = () => {} }) {
   }
   const read = async (kind, resourceId = '', page = 1, revision = null) => checked(await invoke('polarion_read', { kind, resourceId, page, revision }));
   const save = async (kind, snapshot = null, elements = null, documentId = null) => invoke('polarion_workspace', { repositoryPath: context.repository_path, action: kind, snapshot, elements, documentId });
-  function showDetail(snapshot) {
+  function showDetail(snapshot, origin = 'server') {
     detail = snapshot; const pane = el('Detail'); pane.hidden = false; pane.replaceChildren();
-    pane.append(make('h3', snapshot.title), make('small', snapshot.id + ' · Local snapshot read ' + (snapshot.fetched_at || 'at an unknown time') + '. Refresh explicitly for current data.'));
+    if (mode === 'documents') pane.append(make('small', origin === 'local' ? 'LOCAL SNAPSHOT · no server request' : 'READ FROM POLARION · read-only preview', 'polarion-detail-origin'));
+    pane.append(make('h3', snapshot.title), make('small', snapshot.id + (mode === 'documents' ? ' · Last read: ' + (snapshot.fetched_at || 'unknown') : ' · Local snapshot read ' + (snapshot.fetched_at || 'at an unknown time')) + '. Refresh explicitly for current data.'));
     const list = make('dl', '');
     const fields = { Type: snapshot.item_type || 'Not returned', Status: snapshot.status || 'Not returned', ...(snapshot.kind === 'workitem' ? { Assignee: snapshot.assignees?.join(', ') || 'Not returned / unassigned' } : {}), ...(snapshot.fields || {}) };
     for (const [key, value] of Object.entries(fields)) list.append(make('dt', key.replace(/([a-z])([A-Z])/g, '$1 $2')), make('dd', value));
-    pane.append(list, make('p', snapshot.description || (snapshot.kind === 'document' ? 'Read the document elements from its saved association below.' : 'No description in this saved overview. Read details for live data.')));
+    pane.append(list, make('p', snapshot.description || (snapshot.kind === 'document' ? 'Select this document for commits, then load its elements using the saved document card above.' : 'No description in this saved overview. Read details for live data.')));
   }
-  function selectSnapshot(snapshot) {
+  function selectSnapshot(snapshot, associationEligible = false, origin = 'local') {
     selected = { id: snapshot.id.split('/').pop(), title: snapshot.title, resourceId: snapshot.id,
-      kind: snapshot.kind === 'document' ? 'documents' : snapshot.item_type === 'task' ? 'tasks' : 'containers' };
-    showDetail(snapshot); update();
+      kind: snapshot.kind === 'document' ? 'documents' : snapshot.item_type === 'task' ? 'tasks' : 'containers',
+      associationEligible: snapshot.kind === 'document' || associationEligible };
+    showDetail(snapshot, origin); update();
   }
   function savedCard(target, title, snapshot, isDoc) {
     target.replaceChildren();
     const copy = make('div', ''); copy.append(make('strong', title), make('small', snapshot ? snapshot.id + ' · ' + snapshot.title + ' · ' + (snapshot.status || 'Status not returned') : isDoc ? 'No StructDoc associated. Open a document to preview and associate it.' : 'No primary task yet. Select a task to save its details.'));
+    if (isDoc) copy.append(make('small', snapshot ? (workspace.elements_complete ? (workspace.elements?.length || 0) + ' elements saved · last read ' + (workspace.elements_saved_at || 'unknown') : 'Elements not loaded yet.') +
+      (workspace.elements_complete && workspace.elements_revision !== (snapshot.fields?.revision || '') ? ' Document revision changed; refresh elements before using them in commits.' : '') +
+      ' Local data is available without sign-in. Only the server buttons refresh it.' : 'Find a document below, preview it, then choose Use this StructDoc. Nothing is downloaded automatically.'));
     target.append(copy); if (!snapshot) return;
     const actions = make('div', '', 'polarion-card-actions');
-    actions.append(button('View saved', () => { if (!busy) selectSnapshot(snapshot); }),
-      button('Refresh info', () => action(async ticket => {
+    actions.append(button(isDoc ? 'View local snapshot' : 'View saved', () => { if (!busy) { selectSnapshot(snapshot, isDoc); if (isDoc) say('Showing saved document details. No server request; this does not verify the connection.'); } }),
+      button(isDoc ? 'Refresh details · server' : 'Refresh info', () => action(async ticket => {
         const result = await read(snapshot.kind, snapshot.id); if (!current(ticket)) return;
         connection('connected', 'Connected · Polarion read access verified');
         const saved = await save(isDoc ? 'document' : 'primary', result.snapshot); if (!current(ticket)) return;
         workspace = saved; showDetail(result.snapshot); say('Snapshot refreshed and saved locally. Polarion unchanged.');
       })));
-    if (isDoc) actions.append(button('Read all elements', loadElements));
-    actions.append(button('Remove association', () => action(async ticket => {
+    if (isDoc) actions.append(button(workspace.elements_complete ? 'Refresh elements · server' : 'Load elements · server', loadElements));
+    actions.append(button(isDoc ? 'Unlink locally' : 'Remove association', () => action(async ticket => {
       const saved = await save(isDoc ? 'document' : 'primary'); if (!current(ticket)) return;
       workspace = saved; clearDetail(); if (isDoc) renderElements(); say('Local association removed. Nothing deleted in Polarion.');
     })));
@@ -276,7 +289,7 @@ function createPolarionTaskPicker({ invoke, addMessage, log = () => {} }) {
   function renderSaved() {
     if (context) polarionRememberDocument(context.repository_path, workspace);
     savedCard(el('Primary'), 'Primary task · local association', workspace.primary_task, false);
-    savedCard(el('Document'), workspace.document ? 'Selected StructDoc · source for submodule commit references' : 'StructDoc for submodule commit references', workspace.document, true);
+    savedCard(el('Document'), workspace.document ? 'Selected StructDoc · local source for submodule commit references' : 'Saved on this computer · no StructDoc selected', workspace.document, true);
     el('DocumentElements').hidden = !workspace.document;
   }
   function renderElements() {
@@ -299,7 +312,7 @@ function createPolarionTaskPicker({ invoke, addMessage, log = () => {} }) {
     el('ElementSummary').textContent = workspace.document ? rows.length + ' shown / ' + all.length + ' saved elements · ' +
       (workspace.elements_complete ? 'All source pages read ' + workspace.elements_saved_at : 'Elements not loaded yet') +
       (workspace.elements_revision ? ' · source revision ' + workspace.elements_revision : '') +
-      (workspace.elements_complete && workspace.elements_revision !== (workspace.document.fields?.revision || '') ? '. Document metadata changed; Read all elements to refresh the saved list.' : '') +
+      (workspace.elements_complete && workspace.elements_revision !== (workspace.document.fields?.revision || '') ? '. Document metadata changed; Refresh elements · server to update the saved list.' : '') +
       (workspace.document.kind === 'workitem' ? '. Direct outgoing linked items only; not a recursive hierarchy.' : '. Document work-item order is preserved.') +
       ' Types come from Polarion; unavailable details are not silently excluded.' : 'Associate a document, then read its elements.';
   }
@@ -347,14 +360,21 @@ function createPolarionTaskPicker({ invoke, addMessage, log = () => {} }) {
       say('Project selected: ' + project.id + '. Stay here to change it, or open Tasks / StructDocs when ready.');
     });
   }
-  function render(items, kind) {
+  function render(items, kind, { cached = false, pending = false } = {}) {
     el('Results').replaceChildren(); el('Results').hidden = false;
-    if (!items.length) el('Results').append(make('p', 'No matching ' + (kind === 'projects' ? 'projects' : kind === 'tasks' ? 'tasks' : 'StructDocs') + '. Try another fragment.', 'polarion-empty'));
+    if (mode === 'documents') {
+      const local = items.filter(item => item.local).length;
+      el('ResultSummary').hidden = false; el('ResultSummary').textContent = pending ? 'Saved match below · searching Polarion…'
+        : (items.length - local) + (cached ? ' cached server results' : ' server results') + ' · ' + local + ' local matches. Local snapshots are not server search results.';
+    }
+    if (!items.length) el('Results').append(make('p', mode === 'documents' ? 'No server matches returned. Your selected local document, if any, remains available above. Try another fragment or open its exact link.' :
+      'No matching ' + (kind === 'projects' ? 'projects' : 'tasks') + '. Try another fragment.', 'polarion-empty'));
     for (const item of items) {
       const row = button('', () => {
         if (busy) return;
         if (kind === 'projects') { chooseProject(item); return; }
-        selected = { ...item, kind, resourceId: kind === 'documents' ? item.id : project.id + '/' + item.id };
+        if (item.local && workspace.document?.id === item.id) { selectSnapshot(workspace.document, true); say('Showing the local document snapshot. Read details · server refreshes it explicitly.'); return; }
+        selected = { ...item, kind, resourceId: kind === 'documents' ? item.id : project.id + '/' + item.id, associationEligible: ['documents', 'containers'].includes(kind) };
         clearDetail();
         for (const sibling of el('Results').children) sibling.setAttribute('aria-pressed', String(sibling === row));
         update();
@@ -362,6 +382,10 @@ function createPolarionTaskPicker({ invoke, addMessage, log = () => {} }) {
       // Results remain selectable after the operation's busy state ends.
       row.disabled = false; row.className = 'polarion-result'; row.setAttribute('aria-pressed', 'false');
       row.append(make('strong', item.id), make('span', item.title + (item.item_type ? ' · ' + item.item_type : '')));
+      if (mode === 'documents') {
+        row.dataset.origin = item.local ? 'local' : cached ? 'cache' : 'server';
+        row.append(make('small', item.local ? 'LOCAL · saved snapshot' : cached ? 'SERVER CACHE · up to 2 minutes' : 'SERVER · search result', 'polarion-result-origin ' + row.dataset.origin));
+      }
       el('Results').append(row);
     }
   }
@@ -378,39 +402,46 @@ function createPolarionTaskPicker({ invoke, addMessage, log = () => {} }) {
       if (kind === 'documents' && params.query.length < 3) {
         clearResults(); clearDetail(); throw new Error('Type at least three characters of the document name or path.');
       }
-      el('SearchServer').hidden = true;
-      const savedDocuments = kind === 'documents' && requestedPage === 1 && !params.serverOnly ? polarionSavedDocumentMatches(workspace, params.project, params.query) : [];
+      const savedDocuments = kind === 'documents' && requestedPage === 1 ? polarionSavedDocumentMatches(workspace, params.project, params.query) : [];
+      clearResults(); clearDetail();
       if (savedDocuments.length) {
-        clearResults(); clearDetail(); render(savedDocuments, kind);
-        el('DocumentHint').textContent = 'Matching saved StructDoc · local association, not a complete server catalog. Read details refreshes it from Polarion.';
-        say('Found the saved document locally. No server search was needed. Use Search server to look for other documents.');
-        el('SearchServer').hidden = false;
-        log(`polarion: document_search source=saved_association matches=${savedDocuments.length} no_http_requests=true`);
-        return;
+        render(savedDocuments, kind, { pending: true });
+        el('DocumentHint').textContent = 'Saved match shown while the server is searched. A saved snapshot does not verify current access.';
       }
-      clearResults(); clearDetail(); say(kind === 'documents' ? 'Finding documents · checking compatible read-only search…' : 'Searching Polarion…');
-      const { serverOnly, ...request } = params;
-      const response = await invoke('polarion_search', { ...request, page: requestedPage });
+      say(kind === 'documents' ? 'Searching Polarion for documents…' : 'Searching Polarion…');
+      if (mode === 'documents') { documentSearchPending = true; el('ResultSummary').hidden = false; el('ResultSummary').textContent = 'Searching Polarion… Local snapshots remain available above.'; }
+      const response = await invoke('polarion_search', { ...params, page: requestedPage });
       if (!current(ticket)) return;
       if (kind === 'documents' && ['api_unavailable', 'forbidden'].includes(response.code)) {
+        documentSearchPending = false; el('ResultSummary').textContent = 'Server search unavailable. Local matches, if shown, are saved snapshots only.';
         el('DocumentHint').textContent = 'Document search could not complete for this server/session. You can still try opening an exact Polarion document link.';
         say((response.code === 'forbidden' ? 'Polarion refused search access; no further route was tried' : 'Document search unavailable') +
           (response.http ? ' · HTTP ' + response.http : '') + '. Use Open document by link. The log records each attempted search route.');
         return;
       }
       const result = checked(response);
+      documentSearchPending = false;
       connection('connected', 'Connected · Polarion read access verified');
       if (kind === 'tasks' && params.user && !otherUser && !identity) {
         identity = { id: params.user, source: 'manual' }; polarionRememberedUser(storage, identity);
       }
-      lastSearch = params; page = requestedPage; more = result.more; render(result.items, kind);
+      const rows = [...(result.items || [])], ids = new Set(rows.map(item => item.id));
+      const localOnly = savedDocuments.filter(item => !ids.has(item.id));
+      rows.push(...localOnly);
+      lastSearch = params; page = requestedPage; more = result.more; render(rows, kind, { cached: Boolean(result.catalog_cached) });
       const moduleSearch = kind === 'documents' && result.catalog_source === 'work_item_modules';
       const tokenSearch = moduleSearch && result.document_query_variant && !['module_id_contains', 'module_contains'].includes(result.document_query_variant);
       if (kind === 'documents') el('DocumentHint').textContent = moduleSearch
-        ? 'Compatibility search via owning Work Item → Document links.' + (tokenSearch ? ' This server used a token/prefix or exact-name lookup, not unrestricted substring matching.' : '') + ' Empty documents, reference-only documents and title-only matches may be missing. No complete catalog is implied.'
+        ? 'Compatibility search via owning Work Item → Document links.' + (result.document_query_variant === 'workitem_title_prefix' ? ' Matched element titles, then verified their actual Document links.' : tokenSearch ? ' This server used a token/prefix or exact-name lookup, not unrestricted substring matching.' : '') + ' Empty documents, reference-only documents and title-only matches may be missing. No complete catalog is implied.'
         : 'Search covers accessible documents in the selected project. Select a result to read its full details; an exact link is optional.';
+      if (kind === 'documents') {
+        log(`polarion: document_search source=server cached=${Boolean(result.catalog_cached)} server_matches=${result.matched || 0} saved_only=${localOnly.length} variant=${result.document_query_variant || 'catalog'}`);
+        say('Server search: ' + (result.matched || 0) + ' matches' + (localOnly.length ? ' · ' + localOnly.length + ' saved locally' : '') +
+          (result.catalog_cached ? ' · server cache, up to 2 minutes' : '') + '. Select a result; Use this StructDoc selects the commit source.');
+        return;
+      }
       say((kind === 'projects' || kind === 'documents' ? result.matched + ' matches / ' + result.received + ' accessible entries · ' : '') +
-        'Page ' + page + ' · ' + result.items.length + ' shown' + (more ? ' · Next shows more' : '') +
+        'Page ' + page + ' · ' + (result.items || []).length + ' server results' + (localOnly.length ? ' + ' + localOnly.length + ' saved locally' : '') + (more ? ' · Next shows more' : '') +
         (result.prefix_fallback ? '. Server rejected contains search; prefix fallback was used.' : '') +
         (result.catalog_cached ? kind === 'documents' ? '. Search data cached for up to 2 minutes.' : '. Complete catalog cached for up to 2 minutes.' : '') +
         (moduleSearch ? '. Limited document discovery' + (tokenSearch ? ' · token/prefix or exact lookup' : '') + '; zero matches do not prove the document is absent' : '') +
@@ -426,15 +457,18 @@ function createPolarionTaskPicker({ invoke, addMessage, log = () => {} }) {
       const result = await read('document_link', link);
       if (!current(ticket)) return;
       if (result.snapshot?.kind !== 'document') throw new Error('Polarion did not return the requested LiveDoc; no association was changed.');
-      selectSnapshot(result.snapshot);
+      selectSnapshot(result.snapshot, true, 'server');
       connection('connected', 'Connected · read access verified');
       el('DocumentHint').textContent = 'Exact LiveDoc read successfully. Catalog access is not required for this document.';
-      say('Document opened for preview. Use this StructDoc to select it for submodule commits, then Read all elements.' + (result.metadata_fallback ? ' Only basic metadata was available on this server.' : '') + ' Nothing changed in Polarion.');
+      say('Document opened for preview. Use this StructDoc to select it for submodule commits, then Load elements · server.' + (result.metadata_fallback ? ' Only basic metadata was available on this server.' : '') + ' Nothing changed in Polarion.');
     });
   }
   async function readSelected(saveAs = '') {
     if (!selected) return;
     const choice = { ...selected };
+    if (saveAs === 'document' && !choice.associationEligible) {
+      say('This is a document element, not a selected StructDoc. The saved document and its elements were preserved.'); return;
+    }
     await action(async ticket => {
       const result = await read(choice.kind === 'documents' ? 'document' : 'workitem', choice.resourceId);
       if (!current(ticket)) return;
@@ -449,7 +483,7 @@ function createPolarionTaskPicker({ invoke, addMessage, log = () => {} }) {
         workspace = saved; if (write === 'document') renderElements();
       }
       showDetail(result.snapshot); say(write === 'document'
-        ? 'Selected StructDoc for submodule commits: ' + (result.snapshot.title || result.snapshot.id) + '. Read all elements before including references. Polarion unchanged.'
+        ? 'Selected StructDoc for submodule commits: ' + (result.snapshot.title || result.snapshot.id) + '. Load or refresh its elements before including references. Polarion unchanged.'
         : write ? 'Snapshot saved outside Git. Polarion unchanged.' : 'Read-only details loaded. Use Set primary task / Use this StructDoc to save the association.');
     });
   }
@@ -505,8 +539,14 @@ function createPolarionTaskPicker({ invoke, addMessage, log = () => {} }) {
   el('AllProjects').addEventListener('click', () => { el('ProjectQuery').value = ''; search('projects'); });
   el('TaskSearchButton').addEventListener('click', () => search('tasks'));
   el('DocumentSearchButton').addEventListener('click', () => search(el('DocumentSource').value || 'documents'));
-  el('SearchServer').addEventListener('click', () => search('documents', 1, { kind: 'documents', project: project?.id || '', query: el('DocumentQuery').value.trim(), user: '', serverOnly: true }));
-  el('DocumentSource').addEventListener('change', () => { if (!busy) { ++generation; clearResults(); clearDetail(); } });
+  el('DocumentSource').addEventListener('change', () => {
+    if (!busy) {
+      ++generation; clearResults(); clearDetail();
+      el('DocumentHint').textContent = el('DocumentSource').value === 'containers'
+        ? 'Searches work items used as custom StructDocs, not the LiveDoc catalog. Selecting a result does not change the saved association.'
+        : 'Search by name, or open an exact link. Previewing a document does not select it for commits.';
+    }
+  });
   for (const [id, kind] of [['ProjectQuery','projects'], ['TaskQuery','tasks'], ['User','tasks'], ['DocumentQuery',null]]) el(id).addEventListener('keydown', event => {
     if (event.key === 'Enter') { event.preventDefault(); search(kind || el('DocumentSource').value || 'documents'); }
   });
@@ -533,7 +573,6 @@ function createPolarionTaskPicker({ invoke, addMessage, log = () => {} }) {
       connection('unknown', 'Connection not checked · Search verifies access');
       for (const id of ['ProjectQuery','TaskQuery','DocumentQuery','ElementQuery','User']) el(id).value = '';
       el('DiagnosticUrl').value = ''; el('DiagnosticReport').replaceChildren();
-      el('SearchServer').hidden = true;
       el('DiagnosticSummary').textContent = 'Optional, explicit GET checks. Results stay in this tab and the log.';
       el('DocumentHint').textContent = 'Search by name above, or paste an exact LiveDoc link to open it directly.';
       el('Context').textContent = ''; el('ElementType').value = ''; clearResults(); clearDetail(); renderSaved(); renderElements();
