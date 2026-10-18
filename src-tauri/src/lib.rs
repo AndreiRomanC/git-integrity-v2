@@ -41,6 +41,8 @@ pub fn run() {
             repository::load_older_commits,
             repository::tag_details,
             repository::refresh_status,
+            repository::navigation::capture_repository_return,
+            repository::navigation::resume_repository_return,
             repository::stage_files,
             repository::stage_all,
             repository::unstage_files,

@@ -5,6 +5,7 @@ apply_submodule_merge_revision
 branch_creation_context
 branch_story_creation
 build_info
+capture_repository_return
 change_submodule_url
 checkout_commit
 combine_local_commits
@@ -114,6 +115,7 @@ restore_folder
 restore_path_history
 restore_remote_file
 restore_stash_paths
+resume_repository_return
 run_git_command
 run_terminal_command
 run_utrud

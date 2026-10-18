@@ -10,6 +10,7 @@ pub mod polarion;
 pub mod command_console;
 pub mod remotes;
 pub mod snapshot_export;
+pub mod navigation;
 #[cfg(test)]
 use stash::{abort_stash_conflict, drop_stash, list_stashes, list_submodule_stashes, pop_stash, restore_stash_paths, stash_changes, stash_entry_files, stash_file};
 #[cfg(test)]

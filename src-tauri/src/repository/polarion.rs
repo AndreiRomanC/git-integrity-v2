@@ -378,7 +378,9 @@ fn diagnostic_resource(link: &str) -> Result<Option<String>, String> {
     if link.trim().is_empty() { return Ok(None); }
     if link.len() > 2000 { return Err("StructDoc link is too long".into()); }
     let url = reqwest::Url::parse(link.trim()).map_err(|_| "Paste a Polarion StructDoc link")?;
-    if url.scheme() != "https" || url.host_str() != Some(HOST) || url.port().is_some()
+    // This URL is an identity input, never a network destination. Legacy
+    // company links copied as http are resolved to the same fixed HTTPS API.
+    if !["https", "http"].contains(&url.scheme()) || url.host_str() != Some(HOST) || url.port().is_some()
         || !url.username().is_empty() || url.password().is_some() || url.query().is_some() || url.path() != "/polarion/" {
         return Err("Use a document link from https://polarion.vitesco.io/polarion/ without credentials or query parameters".into());
     }
@@ -759,7 +761,9 @@ mod tests {
         let link = "https://polarion.vitesco.io/polarion/#/project/VWAQ4/wiki/Structure%20Information/VWAQ4-SW_ERRM_StructDoc_2_0_0";
         assert_eq!(diagnostic_resource(link).unwrap().unwrap(), "VWAQ4/Structure Information/VWAQ4-SW_ERRM_StructDoc_2_0_0");
         assert_eq!(diagnostic_resource("").unwrap(), None);
-        for bad in ["https://evil.test/polarion/#/project/P/wiki/S/D", "https://polarion.vitesco.io.evil.test/polarion/#/project/P/wiki/S/D", "https://user:password@polarion.vitesco.io/polarion/#/project/P/wiki/S/D", "https://polarion.vitesco.io/polarion/?token=secret#/project/P/wiki/S/D", "http://polarion.vitesco.io/polarion/#/project/P/wiki/S/D", "https://polarion.vitesco.io:444/polarion/#/project/P/wiki/S/D", "https://polarion.vitesco.io/polarion/#/project/P/wiki/%2E%2E/D", "https://polarion.vitesco.io/polarion/#/project/P/wiki/S/D%2Fextra", "https://polarion.vitesco.io/polarion/#/project/P/wiki/S/%zz", "https://polarion.vitesco.io/polarion/#/project/P/wiki/S/D?token=secret"] {
+        let legacy = read_args("document_link", &link.replacen("https:", "http:", 1), 1, None).unwrap();
+        assert!(legacy["url"].as_str().unwrap().starts_with("https://"), "no insecure request may be made for an http identity link");
+        for bad in ["https://evil.test/polarion/#/project/P/wiki/S/D", "https://polarion.vitesco.io.evil.test/polarion/#/project/P/wiki/S/D", "https://user:password@polarion.vitesco.io/polarion/#/project/P/wiki/S/D", "https://polarion.vitesco.io/polarion/?token=secret#/project/P/wiki/S/D", "ftp://polarion.vitesco.io/polarion/#/project/P/wiki/S/D", "http://polarion.vitesco.io:8080/polarion/#/project/P/wiki/S/D", "https://polarion.vitesco.io:444/polarion/#/project/P/wiki/S/D", "https://polarion.vitesco.io/polarion/#/project/P/wiki/%2E%2E/D", "https://polarion.vitesco.io/polarion/#/project/P/wiki/S/D%2Fextra", "https://polarion.vitesco.io/polarion/#/project/P/wiki/S/%zz", "https://polarion.vitesco.io/polarion/#/project/P/wiki/S/D?token=secret"] {
             assert!(diagnostic_resource(bad).is_err(), "{bad}");
         }
     }

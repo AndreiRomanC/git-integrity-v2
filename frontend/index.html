@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Git DrillDown</title>
   <link rel="icon" type="image/png" href="assets/git-drilldown-mark.png">
-  <link rel="stylesheet" href="styles.css?v=20261017-polarion-query-compat">
-  <link rel="stylesheet" href="polarion.css?v=20261017-polarion-query-compat">
+  <link rel="stylesheet" href="styles.css?v=20261018-polarion-commit-source">
+  <link rel="stylesheet" href="polarion.css?v=20261018-polarion-commit-source">
 </head>
 <body>
   <div class="app-shell">
@@ -229,6 +229,7 @@
         <div id="changes" class="change-list"></div>
         <div class="commit-area">
           <textarea id="commitMessage" placeholder="Describe your changes…"></textarea>
+          <section id="commitPolarionRefs" class="polarion-commit-references" hidden aria-label="Polarion references for this submodule commit"></section>
           <button type="button" data-polarion-search="drawer" class="polarion-search-button">P⌕ Find task</button>
           <div><span id="selectionText">0 files staged</span><button id="commitButton" disabled>Commit changes</button></div>
         </div>
@@ -329,6 +330,7 @@
     <p id="appPromptMessage"></p>
     <input type="text" id="appPromptInput" style="width:100%;height:38px;margin-top:6px;border:1px solid #405263;border-radius:6px;padding:0 10px;background:#0d151c;color:#d4e0ea;font:13px ui-monospace, monospace;">
     <textarea id="appPromptTextarea" hidden style="width:100%;height:130px;margin-top:6px;border:1px solid #405263;border-radius:6px;padding:9px 10px;background:#0d151c;color:#d4e0ea;font:12px/1.45 ui-monospace, monospace;resize:vertical;"></textarea>
+    <section id="appPromptPolarionRefs" class="polarion-commit-references" hidden aria-label="Polarion references for this submodule commit"></section>
     <div class="commit-dialog-actions" style="justify-content:center;margin-top:16px;">
       <button type="button" id="appPromptCancel">Cancel</button>
       <button type="button" id="appPromptOk" class="confirm">OK</button>
@@ -772,7 +774,7 @@
     <form method="dialog">
       <header><div><h2>Polarion workspace</h2><small id="polarionContext"></small></div><button value="cancel" aria-label="Close Polarion search">×</button></header>
       <div class="polarion-workspace-chrome">
-        <div class="polarion-connect-row"><div><strong id="polarionConnection" role="status" data-state="unknown">Connection not checked</strong><small>This Polarion window keeps its own session; Edge sign-in is separate.</small></div><button type="button" id="polarionConnect">Open Polarion ↗</button></div>
+        <div class="polarion-connect-row" id="polarionConnectionPanel" data-state="unknown"><div><strong id="polarionConnection" role="status" data-state="unknown">Connection not checked</strong><small id="polarionConnectionHint">Access has not been verified. Saved snapshots do not prove a connection.</small></div><button type="button" id="polarionConnect">Open Polarion ↗</button></div>
         <p id="polarionChosenProject" class="polarion-project-choice"></p>
         <nav class="polarion-workspace-tabs" role="tablist" aria-label="Polarion sections"><button type="button" role="tab" aria-controls="polarionPanelProjects" id="polarionTabProjects">Projects</button><button type="button" role="tab" aria-controls="polarionPanelTasks" id="polarionTabTasks">Tasks</button><button type="button" role="tab" aria-controls="polarionPanelDocuments" id="polarionTabDocuments">StructDocs</button></nav>
       </div>
@@ -785,7 +787,7 @@
           <div id="polarionProjectWorkspace">
             <div id="polarionResults" class="polarion-results" aria-label="Polarion search results" hidden></div>
             <div id="polarionPages" class="polarion-pages" hidden><button type="button" id="polarionPrevious" disabled>← Previous</button><button type="button" id="polarionNext" disabled>Next →</button></div>
-            <div id="polarionSelectionActions" class="polarion-selection-actions" hidden><button type="button" id="polarionView" disabled>Read details</button><button type="button" id="polarionPrimaryButton" disabled>Set primary task</button><button type="button" id="polarionAssociate" hidden disabled>Associate StructDoc</button></div>
+            <div id="polarionSelectionActions" class="polarion-selection-actions" hidden><button type="button" id="polarionView" disabled>Read details</button><button type="button" id="polarionPrimaryButton" disabled>Set primary task</button><button type="button" id="polarionAssociate" hidden disabled>Use this StructDoc</button></div>
             <section id="polarionDetail" class="polarion-detail" hidden aria-label="Polarion item details"></section>
           </div>
         </section>
@@ -802,7 +804,7 @@
           <div class="polarion-section-heading"><h3>Structure documents</h3><small>Find a LiveDoc by name, read its details and associate it locally.</small></div>
           <div class="polarion-catalog-search">
             <label for="polarionDocumentQuery">Find a StructDoc</label>
-            <div class="polarion-search-row"><select id="polarionDocumentSource" aria-label="StructDoc source"><option value="documents">LiveDoc / Document</option><option value="containers">StructDoc work item</option></select><input id="polarionDocumentQuery" placeholder="At least 3 characters · e.g. errm" autocomplete="off"><button type="button" id="polarionDocumentSearchButton">Search</button></div>
+            <div class="polarion-search-row"><select id="polarionDocumentSource" aria-label="StructDoc source"><option value="documents">LiveDoc / Document</option><option value="containers">StructDoc work item</option></select><input id="polarionDocumentQuery" placeholder="At least 3 characters · e.g. errm" autocomplete="off"><button type="button" id="polarionDocumentSearchButton">Search</button><button type="button" id="polarionSearchServer" hidden>Search server</button></div>
             <small>Searches the selected project. On older servers, compatible search uses document links from work items; its coverage is shown with the results.</small>
           </div>
           <div class="polarion-open-document">
@@ -813,8 +815,8 @@
           <div id="polarionDocument" class="polarion-saved-card"></div>
           <div id="polarionDocumentWorkspace"></div>
           <section id="polarionDocumentElements" class="polarion-document-elements" hidden aria-label="Saved StructDoc elements">
-            <h4>Saved document elements</h4>
-            <div class="polarion-search-row polarion-element-filters"><input id="polarionElementQuery" placeholder="Filter loaded elements locally…" aria-label="Filter StructDoc elements"><select id="polarionElementType" aria-label="Element type"><option value="">All types</option></select></div>
+            <div class="polarion-element-toolbar"><h4>Saved document elements · local filter</h4>
+            <div class="polarion-search-row polarion-element-filters"><input id="polarionElementQuery" placeholder="Module name or item ID · e.g. errm_adpdg" aria-label="Filter StructDoc elements"><select id="polarionElementType" aria-label="Element type"><option value="">All types</option></select><button type="button" id="polarionClearElements">Clear</button></div></div>
             <small id="polarionElementSummary">Associate a document, then read its elements.</small>
             <div id="polarionElements" class="polarion-elements"></div>
           </section>
@@ -830,16 +832,16 @@
       <footer><span>Read-only on Polarion · local snapshots outside Git</span><button value="cancel">Close</button><button type="button" id="polarionAdd" class="confirm" disabled>Add to Commit List</button></footer>
     </form>
   </dialog>
-  <script src="polarion.js?v=20261017-polarion-query-compat"></script>
-  <script src="console-context.js?v=20261017-polarion-query-compat"></script>
-  <script src="graph-model.js?v=20261017-polarion-query-compat"></script>
-  <script src="submodule-state.js?v=20261017-polarion-query-compat"></script>
-  <script src="submodule-versions.js?v=20261017-polarion-query-compat"></script>
-  <script src="local-diff.js?v=20261017-polarion-query-compat"></script>
-  <script src="local-drive.js?v=20261017-polarion-query-compat"></script>
-  <script src="pr-status.js?v=20261017-polarion-query-compat"></script>
-  <script src="refresh-coordinator.js?v=20261017-polarion-query-compat"></script>
-  <script src="comparison-authors.js?v=20261017-polarion-query-compat"></script>
-  <script src="app.js?v=20261017-polarion-query-compat"></script>
+  <script src="polarion.js?v=20261018-polarion-commit-source"></script>
+  <script src="console-context.js?v=20261018-polarion-commit-source"></script>
+  <script src="graph-model.js?v=20261018-polarion-commit-source"></script>
+  <script src="submodule-state.js?v=20261018-polarion-commit-source"></script>
+  <script src="submodule-versions.js?v=20261018-polarion-commit-source"></script>
+  <script src="local-diff.js?v=20261018-polarion-commit-source"></script>
+  <script src="local-drive.js?v=20261018-polarion-commit-source"></script>
+  <script src="pr-status.js?v=20261018-polarion-commit-source"></script>
+  <script src="refresh-coordinator.js?v=20261018-polarion-commit-source"></script>
+  <script src="comparison-authors.js?v=20261018-polarion-commit-source"></script>
+  <script src="app.js?v=20261018-polarion-commit-source"></script>
 </body>
 </html>

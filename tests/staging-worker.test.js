@@ -12,7 +12,7 @@ function harness() {
   let id = 0;
   const state = { repository: { path: 'repo' }, currentPath: '', changes: [{ path: 'a', staged: false }] };
   const buttons = {};
-  const context = { state, performance, jsPerfLog() {}, renderChanges() {}, status() {}, showOperationToast() {},
+  const context = { state, drawerPolarionReferences: null, commitWriteRunning: false, performance, jsPerfLog() {}, renderChanges() {}, status() {}, showOperationToast() {},
     handleError: error => String(error), diagnosticErrorCategory: () => 'test-error',
     setTimeout(fn, ms) { timers.set(++id, { fn, ms }); return id; }, clearTimeout(key) { timers.delete(key); },
     $: selector => buttons[selector] ||= { textContent: selector, disabled: false },
@@ -91,6 +91,19 @@ test('actual Commit handler proceeds after a late empty debounce and refreshes a
   assert.equal(h.events.at(-1), 'load');
   assert.equal(h.context.refs.commitMessage.value, '');
   assert.equal(h.context.refs.commitButton.textContent, 'Commit changes');
+});
+test('actual submodule-workspace Commit adds references only to its outgoing message and resets them after success', async () => {
+  const h = harness(); let clickCommit, resets = 0;
+  h.context.blockDetachedHeadWork = () => false;
+  h.context.drawerPolarionReferences = { message: base => base + '\n\nPolarion: VWAQ4-85585', reset: () => { resets++; } };
+  h.context.refs = { commitButton: { addEventListener: (_, handler) => { clickCommit = handler; } }, commitMessage: { value: 'Checkpoint' }, defaultCommitMessage: { value: 'Global default' } };
+  h.state.changes[0].staged = true;
+  vm.runInContext('let diagnosticRequestSequence = 0;\n' +
+    app.slice(app.indexOf("refs.commitButton.addEventListener('click'"), app.indexOf('// Actions and Terminal —')), h.context);
+  const pending = clickCommit(); await tick();
+  assert.equal(h.calls[0].command, 'commit_staged'); assert.equal(h.calls[0].args.message, 'Checkpoint\n\nPolarion: VWAQ4-85585');
+  assert.equal(h.context.refs.commitMessage.value, 'Checkpoint'); assert.equal(h.context.refs.defaultCommitMessage.value, 'Global default');
+  h.calls[0].resolve(); await pending; assert.equal(resets, 1); assert.equal(h.context.refs.defaultCommitMessage.value, 'Global default');
 });
 
 test('rapid checkbox changes drain in order; Commit barrier waits for the final unstage', async () => {

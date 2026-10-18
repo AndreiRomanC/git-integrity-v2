@@ -22,9 +22,126 @@ function polarionSearchExplanation(result) {
     (result.session_token ? ' Portal session token detected.' : ' No portal REST session token detected.') + ' Diagnostics are in the application log (no credentials).';
 }
 function polarionFilterElements(elements, query = '', type = '') {
-  const words = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
-  return (elements || []).filter(item => (!type || (item.item_type || '(unknown)') === type) &&
-    words.every(word => (item.id + ' ' + item.title + ' ' + item.item_type + ' ' + item.status).toLowerCase().includes(word)));
+  const words = polarionSearchText(query).split(/\s+/).filter(Boolean);
+  return (elements || []).filter(item => {
+    if (type && (item.item_type || '(unknown)').toLowerCase() !== type.toLowerCase()) return false;
+    if (!words.length) return true;
+    const text = polarionSearchText([item.id, item.title, item.item_type, item.status].filter(Boolean).join(' '));
+    return words.every(word => text.includes(word));
+  });
+}
+function polarionSearchText(value) { return String(value || '').normalize('NFKC').toLowerCase().replace(/[_\-\/]+/g, ' ').replace(/\s+/g, ' ').trim(); }
+function polarionSavedDocumentMatches(workspace, project, query) {
+  const doc = workspace?.document;
+  if (doc?.kind !== 'document' || !doc.id?.startsWith(project + '/') || !query.trim()) return [];
+  const text = polarionSearchText(doc.id + ' ' + doc.title);
+  return polarionSearchText(query).split(' ').every(word => text.includes(word))
+    ? [{ id: doc.id, title: doc.title, item_type: doc.item_type, local: true }] : [];
+}
+// Metadata only, reused from existing local reads/saves. No portal request or
+// workspace reload just to label a commit dialog; opting in verifies it again.
+const polarionDocumentSources = new Map();
+function polarionRememberDocument(repositoryPath, workspace) {
+  if (!repositoryPath) return;
+  polarionDocumentSources.delete(repositoryPath);
+  const doc = workspace?.document;
+  polarionDocumentSources.set(repositoryPath, doc ? { id: doc.id, title: doc.title } : null);
+  if (polarionDocumentSources.size > 32) polarionDocumentSources.delete(polarionDocumentSources.keys().next().value);
+}
+function polarionReferenceId(id) { return typeof id === 'string' && id.length <= 240 && /^[A-Za-z0-9][A-Za-z0-9_-]*-\d+$/.test(id); }
+function polarionModuleElements(elements, moduleName) {
+  const module = polarionSearchText(moduleName);
+  if (!module) return [];
+  const seen = new Set();
+  return (elements || []).filter(item => {
+    const id = String(item.id || '').split('/').pop();
+    const title = polarionSearchText(item.title);
+    if (!polarionReferenceId(id) || seen.has(id) || !(title === module || title.startsWith(module + ' '))) return false;
+    seen.add(id); return true;
+  });
+}
+function polarionElementRole(type) {
+  const key = String(type || '').toLowerCase().replace(/[_\s-]/g, '');
+  if (['architecturalelement','architectureelement','simulinkitem'].includes(key)) return 'architecture';
+  if (key === 'designelement') return 'design';
+  if (key === 'solutionelement') return 'solution';
+  return key;
+}
+function polarionCommitMessageWithReferences(message, ids) {
+  const added = [...new Set(ids)].filter(id => polarionReferenceId(id) &&
+    !String(message).split(/[^A-Za-z0-9_-]+/).includes(id));
+  return added.length ? String(message).trimEnd() + '\n\nPolarion: ' + added.join(', ') : message;
+}
+
+// Explicit opt-in only. This controller never modifies the shared/default
+// commit message, project associations or saved commit-message history.
+function createPolarionCommitReferences({ host, invoke, onChange = () => {}, log = () => {} }) {
+  let context = null, generation = 0, enabled = false, pending = false, failure = '', source = null, sourceTime = '', rows = [], selected = new Set();
+  const make = (tag, text = '') => { const node = document.createElement(tag); node.textContent = text; return node; };
+  function render() {
+    host.hidden = !context; host.replaceChildren(); if (!context) return;
+    const label = make('label'), toggle = make('input'); toggle.type = 'checkbox'; toggle.checked = enabled;
+    toggle.addEventListener('change', () => { enabled = toggle.checked; ++generation; failure = ''; pending = false; source = null; sourceTime = ''; rows = []; selected.clear(); render(); onChange(); if (enabled) load(); });
+    label.append(toggle, make('span', 'Include StructDoc references for ' + context.moduleName)); host.append(label);
+    const known = source || polarionDocumentSources.get(context.repositoryPath), identity = make('div'); identity.className = 'polarion-commit-source';
+    if (known) {
+      identity.append(make('strong', 'StructDoc: ' + (known.title || known.id)), make('small', known.id +
+        (source ? ' · saved source verified for this selection' : ' · remembered selection; verified when checked')));
+    } else identity.append(make('small', 'StructDoc: use the parent project’s selected document in P → StructDocs. Its name is loaded when checked.'));
+    host.append(identity, make('small', 'Only this submodule commit · matching saved elements · no server search.'));
+    if (!enabled) return;
+    if (pending) { host.append(make('small', 'Finding matching document elements…')); return; }
+    if (failure) {
+      host.append(make('small', failure + ' Uncheck this option to commit without references.'));
+      const retry = make('button', 'Retry'); retry.type = 'button'; retry.addEventListener('click', load); host.append(retry); return;
+    }
+    if (!rows.length) { host.append(make('small', 'No matching saved elements. Open P → StructDocs and associate/read the document first. No references will be added.')); return; }
+    const list = make('div'); list.className = 'polarion-commit-reference-list';
+    const preview = make('div'), summary = make('small'), ids = make('code'); preview.className = 'polarion-commit-preview'; preview.append(summary, ids);
+    const updatePreview = () => {
+      summary.textContent = selected.size + ' selected / ' + rows.length + ' matching elements · appended below the commit description';
+      ids.textContent = selected.size ? 'Polarion: ' + [...selected].join(', ') : 'No references selected. The original commit message stays unchanged.';
+    };
+    for (const item of rows) {
+      const id = item.id.split('/').pop(), row = make('label'), choice = make('input'); choice.type = 'checkbox'; choice.checked = selected.has(id);
+      choice.addEventListener('change', () => { if (choice.checked) selected.add(id); else selected.delete(id); updatePreview(); onChange(); });
+      row.append(choice, make('span', id + ' · ' + item.title), make('small', (item.item_type || 'Unknown type') + ' · ' + (item.status || 'Unknown status'))); list.append(row);
+    }
+    updatePreview();
+    host.append(list, preview, make('small', 'Saved snapshot: ' + (sourceTime || 'date unavailable') + '. Refresh in P → StructDocs when needed. Review obsolete items; multiple candidates of the same type are not selected automatically.'));
+  }
+  async function load() {
+    if (!context || !enabled) return;
+    const ticket = ++generation, target = { ...context }; pending = true; failure = ''; render(); onChange();
+    const current = () => ticket === generation && enabled && context?.key === target.key;
+    try {
+      const workspace = await invoke('polarion_workspace', { repositoryPath: target.repositoryPath, action: 'load', snapshot: null, elements: null, documentId: null });
+      if (!current()) return;
+      polarionRememberDocument(target.repositoryPath, workspace);
+      source = workspace.document ? { id: workspace.document.id, title: workspace.document.title } : null;
+      if (!workspace.document) throw new Error('No StructDoc is associated with the parent project.');
+      if (!workspace.elements_complete || workspace.elements_revision !== (workspace.document.fields?.revision || '')) {
+        throw new Error('The saved element list is missing or outdated. Read all elements in P → StructDocs first.');
+      }
+      sourceTime = workspace.elements_saved_at || workspace.document.fetched_at || '';
+      rows = polarionModuleElements(workspace.elements, target.moduleName);
+      const counts = new Map(); rows.forEach(item => { const role = polarionElementRole(item.item_type); if (role) counts.set(role, (counts.get(role) || 0) + 1); });
+      selected = new Set(rows.filter(item => { const role = polarionElementRole(item.item_type); return role && counts.get(role) === 1; }).map(item => item.id.split('/').pop()));
+      log(`polarion: commit_references source=saved_elements candidates=${rows.length} selected=${selected.size} no_http_requests=true`);
+    } catch (error) { if (current()) { failure = String(error?.message || error); log('polarion: commit_references failed source=saved_elements no_http_requests=true'); } }
+    finally { if (current()) { pending = false; render(); onChange(); } }
+  }
+  return {
+    setContext(next) {
+      const key = next ? JSON.stringify([next.repositoryPath, next.moduleName, next.commitKey || '']) : '';
+      if ((context?.key || '') === key) return;
+      ++generation; context = next ? { ...next, key } : null; enabled = false; pending = false; failure = ''; source = null; sourceTime = ''; rows = []; selected.clear(); render();
+    },
+    canSubmit: () => !enabled || (!pending && !failure),
+    message(base) { if (enabled && (pending || failure)) throw new Error('StructDoc references are not ready. Retry or uncheck the option.'); return enabled ? polarionCommitMessageWithReferences(base, [...selected]) : base; },
+    reset() { ++generation; enabled = false; pending = false; failure = ''; source = null; sourceTime = ''; rows = []; selected.clear(); render(); },
+    dispose() { ++generation; context = null; host.replaceChildren(); host.hidden = true; },
+  };
 }
 function polarionRememberedUser(storage, user = null) {
   const key = 'ddt-polarion-user-polarion.vitesco.io';
@@ -42,7 +159,7 @@ function polarionDiagnosticDocumentLink(link, document, projectId) {
     parts.some(part => !part || part === '.' || part === '..' || part.length > 240 || /[\x00-\x1f\\]/.test(part))) return '';
   return 'https://polarion.vitesco.io/polarion/#/project/' + encodeURIComponent(parts[0]) + '/wiki/' + parts.slice(1).map(encodeURIComponent).join('/');
 }
-function createPolarionTaskPicker({ invoke, addMessage }) {
+function createPolarionTaskPicker({ invoke, addMessage, log = () => {} }) {
   const dialog = document.querySelector('#polarionTaskDialog');
   const el = id => dialog.querySelector('#polarion' + id);
   const storage = typeof localStorage === 'undefined' ? null : localStorage;
@@ -57,8 +174,13 @@ function createPolarionTaskPicker({ invoke, addMessage }) {
   const button = (text, action) => { const node = make('button', text); node.type = 'button'; node.disabled = busy; node.addEventListener('click', action); return node; };
   const current = ticket => ticket === generation && dialog.open && context;
   const connection = (state, text) => {
-    el('Connection').dataset.state = state; el('Connection').textContent = text;
+    el('Connection').dataset.state = state; el('ConnectionPanel').dataset.state = state; el('Connection').textContent = text;
     el('Connect').textContent = state === 'required' ? 'Sign in to Polarion ↗' : 'Open Polarion ↗';
+    el('ConnectionHint').textContent = state === 'required'
+      ? 'Open the Polarion window, complete sign-in there, then retry. Being signed in to Edge does not connect this window.'
+      : state === 'closed' ? 'Open the Polarion window to reconnect, then retry. Sign in there only if asked; Edge has a separate session.'
+      : state === 'connected' ? 'The last read request succeeded. This Polarion window has its own session; Edge sign-in is separate.'
+      : 'Access has not been verified. Open Polarion to sign in, or Search to check an existing session. Saved snapshots do not prove a connection.';
   };
   const update = () => {
     if (mountedMode !== mode) {
@@ -92,14 +214,23 @@ function createPolarionTaskPicker({ invoke, addMessage }) {
     el('Identity').textContent = otherUser ? 'Filtering another user' : identity ? (identity.name || identity.id) + ' · ' + (identity.source === 'portal' ? 'detected / remembered' : 'remembered user ID') : 'User not detected yet';
     el('ChosenProject').textContent = project ? project.id + ' · ' + project.name : 'No project selected · choose one in Projects';
   };
-  const clearResults = () => { selected = null; lastSearch = null; el('Results').replaceChildren(); el('Results').hidden = true; more = false; update(); };
+  const clearResults = () => { selected = null; lastSearch = null; el('Results').replaceChildren(); el('Results').hidden = true; el('SearchServer').hidden = true; more = false; update(); };
   const clearDetail = () => { detail = null; el('Detail').hidden = true; el('Detail').replaceChildren(); };
   function switchMode(next) { if (busy) return; ++generation; mode = next; clearResults(); clearDetail(); update(); renderElements(); el('Status').textContent = statusByMode[mode] || modeHint(); }
   async function action(work) {
     if (busy || !context) return;
     const ticket = ++generation; busy = true; update(); renderSaved();
     try { await work(ticket); }
-    catch (error) { if (current(ticket)) { if (['auth_required', 'wrong_origin', 'not_json'].includes(error.polarionCode)) connection('required', 'Sign-in required · open Polarion and retry'); say(String(error)); } }
+    catch (error) {
+      if (current(ticket)) {
+        if (['auth_required', 'wrong_origin', 'not_json'].includes(error?.polarionCode)) {
+          connection('required', 'Not connected to Polarion · sign-in required');
+        } else if (String(error).includes('Open Polarion, sign in if needed, then retry Search.')) {
+          connection('closed', 'Not connected to Polarion · window is closed');
+        }
+        say(String(error));
+      }
+    }
     finally { if (current(ticket)) { busy = false; update(); renderSaved(); renderElements(); } }
   }
   function checked(result) {
@@ -143,8 +274,9 @@ function createPolarionTaskPicker({ invoke, addMessage }) {
     target.append(actions);
   }
   function renderSaved() {
+    if (context) polarionRememberDocument(context.repository_path, workspace);
     savedCard(el('Primary'), 'Primary task · local association', workspace.primary_task, false);
-    savedCard(el('Document'), 'Saved StructDoc', workspace.document, true);
+    savedCard(el('Document'), workspace.document ? 'Selected StructDoc · source for submodule commit references' : 'StructDoc for submodule commit references', workspace.document, true);
     el('DocumentElements').hidden = !workspace.document;
   }
   function renderElements() {
@@ -156,12 +288,12 @@ function createPolarionTaskPicker({ invoke, addMessage }) {
     const types = [...new Set(all.map(item => item.item_type || '(unknown)'))].sort();
     el('ElementType').replaceChildren();
     for (const value of ['', ...types]) { const option = make('option', value || 'All types'); option.value = value; el('ElementType').append(option); }
-    el('ElementType').value = types.includes(type) ? type : '';
+    el('ElementType').value = types.find(value => value.toLowerCase() === type.toLowerCase()) || '';
     const rows = polarionFilterElements(all, query, el('ElementType').value);
     el('Elements').replaceChildren();
     for (const item of rows) {
       const row = button('', () => { if (!busy) selectSnapshot(item); }); row.className = 'polarion-element';
-      row.append(make('span', item.id + ' · ' + item.title), make('small', (item.item_type || 'Type unavailable') + ' · ' + (item.status || 'Status unavailable')));
+      row.append(make('span', item.id.split('/').pop() + ' · ' + item.title), make('small', (item.item_type || 'Type unavailable') + ' · ' + (item.status || 'Status unavailable')));
       el('Elements').append(row);
     }
     el('ElementSummary').textContent = workspace.document ? rows.length + ' shown / ' + all.length + ' saved elements · ' +
@@ -211,7 +343,8 @@ function createPolarionTaskPicker({ invoke, addMessage }) {
       project = { id: item.id, name: item.title }; clearResults(); clearDetail();
       const loaded = await invoke('polarion_project_context', { repositoryPath: context.repository_path, relativePath: '', project });
       if (!current(ticket)) return;
-      project = loaded.project || project; mode = 'tasks'; say('Project remembered. Search tasks, or open StructDocs.');
+      project = loaded.project || project;
+      say('Project selected: ' + project.id + '. Stay here to change it, or open Tasks / StructDocs when ready.');
     });
   }
   function render(items, kind) {
@@ -245,8 +378,19 @@ function createPolarionTaskPicker({ invoke, addMessage }) {
       if (kind === 'documents' && params.query.length < 3) {
         clearResults(); clearDetail(); throw new Error('Type at least three characters of the document name or path.');
       }
+      el('SearchServer').hidden = true;
+      const savedDocuments = kind === 'documents' && requestedPage === 1 && !params.serverOnly ? polarionSavedDocumentMatches(workspace, params.project, params.query) : [];
+      if (savedDocuments.length) {
+        clearResults(); clearDetail(); render(savedDocuments, kind);
+        el('DocumentHint').textContent = 'Matching saved StructDoc · local association, not a complete server catalog. Read details refreshes it from Polarion.';
+        say('Found the saved document locally. No server search was needed. Use Search server to look for other documents.');
+        el('SearchServer').hidden = false;
+        log(`polarion: document_search source=saved_association matches=${savedDocuments.length} no_http_requests=true`);
+        return;
+      }
       clearResults(); clearDetail(); say(kind === 'documents' ? 'Finding documents · checking compatible read-only search…' : 'Searching Polarion…');
-      const response = await invoke('polarion_search', { ...params, page: requestedPage });
+      const { serverOnly, ...request } = params;
+      const response = await invoke('polarion_search', { ...request, page: requestedPage });
       if (!current(ticket)) return;
       if (kind === 'documents' && ['api_unavailable', 'forbidden'].includes(response.code)) {
         el('DocumentHint').textContent = 'Document search could not complete for this server/session. You can still try opening an exact Polarion document link.';
@@ -269,7 +413,7 @@ function createPolarionTaskPicker({ invoke, addMessage }) {
         'Page ' + page + ' · ' + result.items.length + ' shown' + (more ? ' · Next shows more' : '') +
         (result.prefix_fallback ? '. Server rejected contains search; prefix fallback was used.' : '') +
         (result.catalog_cached ? kind === 'documents' ? '. Search data cached for up to 2 minutes.' : '. Complete catalog cached for up to 2 minutes.' : '') +
-        (moduleSearch ? '. Limited document discovery' + (tokenSearch ? ' · token/prefix or exact lookup' : '') + '; empty/reference-only documents and title-only matches may be missing' : '') +
+        (moduleSearch ? '. Limited document discovery' + (tokenSearch ? ' · token/prefix or exact lookup' : '') + '; zero matches do not prove the document is absent' : '') +
         (kind === 'projects' ? '. Select a project.' : '. Select a result to read details or associate it locally.'));
     });
   }
@@ -285,7 +429,7 @@ function createPolarionTaskPicker({ invoke, addMessage }) {
       selectSnapshot(result.snapshot);
       connection('connected', 'Connected · read access verified');
       el('DocumentHint').textContent = 'Exact LiveDoc read successfully. Catalog access is not required for this document.';
-      say('Document opened. Associate StructDoc to remember it locally, then Read all elements.' + (result.metadata_fallback ? ' Only basic metadata was available on this server.' : '') + ' Nothing changed in Polarion.');
+      say('Document opened for preview. Use this StructDoc to select it for submodule commits, then Read all elements.' + (result.metadata_fallback ? ' Only basic metadata was available on this server.' : '') + ' Nothing changed in Polarion.');
     });
   }
   async function readSelected(saveAs = '') {
@@ -304,7 +448,9 @@ function createPolarionTaskPicker({ invoke, addMessage }) {
         const saved = await save(write, result.snapshot, null, workspace.document?.id || null); if (!current(ticket)) return;
         workspace = saved; if (write === 'document') renderElements();
       }
-      showDetail(result.snapshot); say(write ? 'Snapshot saved outside Git. Polarion unchanged.' : 'Read-only details loaded. Use Set primary task / Associate StructDoc to save the association.');
+      showDetail(result.snapshot); say(write === 'document'
+        ? 'Selected StructDoc for submodule commits: ' + (result.snapshot.title || result.snapshot.id) + '. Read all elements before including references. Polarion unchanged.'
+        : write ? 'Snapshot saved outside Git. Polarion unchanged.' : 'Read-only details loaded. Use Set primary task / Use this StructDoc to save the association.');
     });
   }
   for (const [name, next] of [['Projects','projects'], ['Tasks','tasks'], ['Documents','documents']]) el('Tab' + name).addEventListener('click', () => switchMode(next));
@@ -339,7 +485,7 @@ function createPolarionTaskPicker({ invoke, addMessage }) {
       report.append(line);
     }
     if (ok.length) connection('connected', 'Connected · read access verified');
-    else if (rows.some(d => d.code === 'auth_required')) connection('required', 'Sign-in required · open Polarion and retry');
+    else if (rows.some(d => d.code === 'auth_required')) connection('required', 'Not connected to Polarion · sign-in required');
     const exact = rows.some(d => d.step === 'document_exact' && d.code === 'ok');
     const parts = rows.some(d => d.step === 'document_parts' && d.code === 'ok');
     el('DiagnosticSummary').textContent = (exact ? 'Exact LiveDoc readable' + (parts ? ' · elements endpoint readable' : '') + '. ' : ok.length + '/' + rows.length + ' read checks accepted. ') +
@@ -359,11 +505,14 @@ function createPolarionTaskPicker({ invoke, addMessage }) {
   el('AllProjects').addEventListener('click', () => { el('ProjectQuery').value = ''; search('projects'); });
   el('TaskSearchButton').addEventListener('click', () => search('tasks'));
   el('DocumentSearchButton').addEventListener('click', () => search(el('DocumentSource').value || 'documents'));
+  el('SearchServer').addEventListener('click', () => search('documents', 1, { kind: 'documents', project: project?.id || '', query: el('DocumentQuery').value.trim(), user: '', serverOnly: true }));
   el('DocumentSource').addEventListener('change', () => { if (!busy) { ++generation; clearResults(); clearDetail(); } });
   for (const [id, kind] of [['ProjectQuery','projects'], ['TaskQuery','tasks'], ['User','tasks'], ['DocumentQuery',null]]) el(id).addEventListener('keydown', event => {
     if (event.key === 'Enter') { event.preventDefault(); search(kind || el('DocumentSource').value || 'documents'); }
   });
-  el('ElementQuery').addEventListener('input', renderElements); el('ElementType').addEventListener('change', renderElements);
+  const filterElements = () => { renderElements(); log(`polarion: element_filter query_len=${el('ElementQuery').value.length} type_filter=${!!el('ElementType').value} total=${workspace.elements?.length || 0} matched=${el('Elements').children.length} no_http_requests=true`); };
+  el('ElementQuery').addEventListener('input', filterElements); el('ElementType').addEventListener('change', filterElements);
+  el('ClearElements').addEventListener('click', () => { el('ElementQuery').value = ''; el('ElementType').value = ''; filterElements(); });
   el('Previous').addEventListener('click', () => { if (lastSearch) search(lastSearch.kind, page - 1, lastSearch); });
   el('Next').addEventListener('click', () => { if (lastSearch) search(lastSearch.kind, page + 1, lastSearch); });
   el('View').addEventListener('click', () => readSelected());
@@ -384,6 +533,7 @@ function createPolarionTaskPicker({ invoke, addMessage }) {
       connection('unknown', 'Connection not checked · Search verifies access');
       for (const id of ['ProjectQuery','TaskQuery','DocumentQuery','ElementQuery','User']) el(id).value = '';
       el('DiagnosticUrl').value = ''; el('DiagnosticReport').replaceChildren();
+      el('SearchServer').hidden = true;
       el('DiagnosticSummary').textContent = 'Optional, explicit GET checks. Results stay in this tab and the log.';
       el('DocumentHint').textContent = 'Search by name above, or paste an exact LiveDoc link to open it directly.';
       el('Context').textContent = ''; el('ElementType').value = ''; clearResults(); clearDetail(); renderSaved(); renderElements();
@@ -401,4 +551,4 @@ function createPolarionTaskPicker({ invoke, addMessage }) {
     },
   };
 }
-if (typeof module !== 'undefined' && module.exports) module.exports = { polarionCommitMessage, polarionSearchExplanation, polarionFilterElements, polarionRememberedUser, polarionDiagnosticDocumentLink };
+if (typeof module !== 'undefined' && module.exports) module.exports = { polarionCommitMessage, polarionSearchExplanation, polarionFilterElements, polarionRememberedUser, polarionDiagnosticDocumentLink, polarionSavedDocumentMatches, polarionModuleElements, polarionElementRole, polarionCommitMessageWithReferences, createPolarionCommitReferences };

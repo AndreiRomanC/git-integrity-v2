@@ -39,6 +39,7 @@ const RECOVER_ON_MUTATION_ERROR = new Set(['merge_branch', 'resolve_conflict', '
 const SLOW_INVOKE_LOG_THRESHOLD_MS = 250;
 const DIAGNOSTIC_COMMANDS = new Set(['commit_staged', 'commit_files', 'commit_path', 'stage_files', 'unstage_files', 'stage_all', 'refresh_status', 'compare_file_contents']);
 let diagnosticRequestSequence = 0;
+let inFlightRepositoryWrites = 0;
 function diagnosticErrorCategory(error) {
   const text = String(error?.message || error).toLowerCase();
   if (/binary files|files over 1 mb/.test(text)) return 'binary-or-size-limit';
@@ -57,6 +58,9 @@ const invoke = rawInvoke && ((command, args) => {
   if (!STAGING_COMMANDS.has(command) && (MUTATING_COMMANDS.has(command) || REPO_SWITCH_COMMANDS.has(command)) &&
       (activeStagingOperation || pendingToggleFlight || pendingToggles.size)) {
     return Promise.reject('Stage/Unstage is still pending. Wait for it to finish, then retry this action.');
+  }
+  if (REPO_SWITCH_COMMANDS.has(command) && inFlightRepositoryWrites) {
+    return Promise.reject('A Git write is still running. Wait for it to finish before switching repositories.');
   }
   if (MUTATING_COMMANDS.has(command) && !state.statusReady) {
     const message = 'Still loading status — please wait a moment.';
@@ -87,20 +91,25 @@ const invoke = rawInvoke && ((command, args) => {
   const recoveryContext = RECOVER_ON_MUTATION_ERROR.has(command)
     ? { path: state.repository?.path, generation: repoOpenGeneration } : null;
   let pending;
+  const write = MUTATING_COMMANDS.has(command);
+  if (write) ++inFlightRepositoryWrites;
   try {
     pending = rawInvoke(command, args);
   } catch (error) {
+    if (write) --inFlightRepositoryWrites;
     if (diagnosticId) jsPerfLog(`ipc_trace: request=${diagnosticId} command=${command} event=throw category=${diagnosticErrorCategory(error)}`, performance.now() - startedAt);
     if (command !== 'frontend_perf_log') jsPerfLog(`invoke(${command}) ERROR before promise`, performance.now() - startedAt);
     throw error;
   }
   if (command === 'frontend_perf_log') return pending;
   return Promise.resolve(pending).then(result => {
+    if (write) --inFlightRepositoryWrites;
     const elapsedMs = performance.now() - startedAt;
     if (diagnosticId) jsPerfLog(`ipc_trace: request=${diagnosticId} command=${command} event=success`, elapsedMs);
     if (elapsedMs >= SLOW_INVOKE_LOG_THRESHOLD_MS) jsPerfLog(`invoke(${command}) SUCCESS`, elapsedMs);
     return result;
   }, async error => {
+    if (write) --inFlightRepositoryWrites;
     jsPerfLog(`invoke(${command}) ERROR`, performance.now() - startedAt);
     if (diagnosticId) jsPerfLog(`ipc_trace: request=${diagnosticId} command=${command} event=error category=${diagnosticErrorCategory(error)}`, performance.now() - startedAt);
     if (recoveryContext) await refreshAfterMutationFailure(recoveryContext);
@@ -116,8 +125,11 @@ const palette = [
   '#7ee787', '#d2a8ff', '#ffa657', '#79c0ff', '#a5d6ff', '#b4f1cf',
 ];
 const directoryCache = new Map();
+const parentReturnSnapshots = new Map(); // Session only; at most four nesting contexts.
 let submoduleMenuData = null;
 let submoduleMenuEntry = null;
+let drawerPolarionReferences = null;
+let commitWriteRunning = false;
 let versionFilter = 'branch';
 let submoduleCrossSelected = null;
 let submoduleBrowserState = { repositories: [], selectedRepository: null, allRefs: [], refs: [], selectedRef: null, selectedRefs: [] };
@@ -750,8 +762,11 @@ function customPrompt(message, defaultValue = '', options = {}) {
     input.value = defaultValue;
     const okButton = $('#appPromptOk'); const cancelButton = $('#appPromptCancel');
     okButton.textContent = options.okLabel || 'OK';
-    const cleanup = (result) => { dialog.close(); okButton.removeEventListener('click', onOk); cancelButton.removeEventListener('click', onCancel); input.removeEventListener('keydown', onKeydown); dialog.removeEventListener('cancel', onCancel); resolve(result); };
-    const onOk = () => cleanup(input.value);
+    okButton.disabled = false;
+    const references = createPolarionCommitReferences({ host: $('#appPromptPolarionRefs'), invoke, log: text => jsPerfLog(text, 0), onChange: () => { okButton.disabled = !references.canSubmit(); } });
+    references.setContext(options.polarionContext || null);
+    const cleanup = (result) => { references.dispose(); dialog.close(); okButton.removeEventListener('click', onOk); cancelButton.removeEventListener('click', onCancel); input.removeEventListener('keydown', onKeydown); dialog.removeEventListener('cancel', onCancel); resolve(result); };
+    const onOk = () => { if (references.canSubmit()) cleanup(input.value.trim() ? references.message(input.value) : input.value); };
     const onCancel = () => cleanup(null);
     const onKeydown = (event) => { if (event.key === 'Enter' && (!options.multiline || event.metaKey || event.ctrlKey)) { event.preventDefault(); onOk(); } };
     okButton.addEventListener('click', onOk); cancelButton.addEventListener('click', onCancel); input.addEventListener('keydown', onKeydown); dialog.addEventListener('cancel', onCancel);
@@ -1382,6 +1397,71 @@ async function completeRepositoryOpenStatus(path, generation) {
   } catch (error) { handleError(error); }
 }
 
+async function rememberParentReturn(target) {
+  if (!invoke || !state.statusReady || state.repository?.path !== target.parent_path) return;
+  const generation = repoOpenGeneration;
+  const stamp = await invoke('capture_repository_return', { repositoryPath: target.parent_path });
+  if (generation !== repoOpenGeneration || state.repository?.path !== target.parent_path) return;
+  if (!stamp) { jsPerfLog('repositoryReturn snapshot unavailable: cache is cold/expired or parent has an active Git operation', 0); return; }
+  const keys = ['repository','repositoryOrigin','branches','commits','allCommits','selectedCommit','commits_truncated','changes','stashes','submodule_paths',
+    'currentPath','entries','selectedEntry','remoteRef','remotes','graphPrimaryBranch','branchStartMarker','graphCommitCompareAnchor',
+    'graphBranchCompareAnchor','graphOnlySearchMatches','graphSearchCurrentId','graphSearchQuery','drillDownNotes','drillDownNotesRepositoryPath','drillDownNotesError','changesScope'];
+  const data = {}; keys.forEach(key => { data[key] = state[key]; });
+  const snapshot = { stamp, parentPath: target.parent_path, submodulePath: target.submodule_path, data: structuredClone(data),
+    directories: structuredClone([...directoryCache]), message: refs.commitMessage.value, search: refs.search.value,
+    scroll: refs.fileList.parentElement?.scrollTop || 0 };
+  parentReturnSnapshots.delete(target.path); parentReturnSnapshots.set(target.path, snapshot);
+  while (parentReturnSnapshots.size > 4) parentReturnSnapshots.delete(parentReturnSnapshots.keys().next().value);
+}
+
+async function returnToParentRepository() {
+  const origin = state.repositoryOrigin;
+  if (!origin?.parentPath || state.consoleCommandRunning) return;
+  try {
+    await flushPendingTogglesNow({}, 'the Stage operation');
+    if (state.consoleCommandRunning || commitWriteRunning || inFlightRepositoryWrites || activeStagingOperation || pendingToggleFlight || pendingToggles.size) {
+      throw new Error('A Git write is still running. Wait for it to finish before returning to the parent repository.');
+    }
+    if (state.repositoryOrigin !== origin) return;
+    const snapshot = parentReturnSnapshots.get(state.repository.path);
+    if (!snapshot || snapshot.parentPath !== origin.parentPath || snapshot.submodulePath !== origin.submodulePath) {
+      return openRepositoryFast(origin.parentPath, { reopenPath: parentPathOf(origin.submodulePath) });
+    }
+    parentReturnSnapshots.delete(state.repository.path);
+    const generation = ++repoOpenGeneration;
+    ++explorerRequestSeq; closeSubmoduleGraph(); resetFooterForContextChange();
+    Object.assign(state, snapshot.data); state.view = 'explorer'; state.statusReady = false; state.activeSubmodule = null;
+    state.historyScope = ''; state.historyKind = ''; state.commanderRows = []; state.submoduleCompare = null; state.submoduleMergeReview = null;
+    directoryCache.clear(); snapshot.directories.forEach(([path, entries]) => directoryCache.set(path, entries));
+    refs.commitMessage.value = snapshot.message; refs.search.value = snapshot.search;
+    state.hasStash = state.stashes.length > 0; updateStashUI();
+    render(); clearDetails('Parent repository restored · checking submodule status');
+    if (refs.fileList.parentElement) refs.fileList.parentElement.scrollTop = snapshot.scroll;
+    jsPerfLog('repositoryReturn cached-frame restored; validating parent and one gitlink', 0);
+    const changes = await invoke('resume_repository_return', { repositoryPath: origin.parentPath, submodulePath: origin.submodulePath, stamp: snapshot.stamp });
+    if (generation !== repoOpenGeneration || state.repository?.path !== origin.parentPath) return;
+    if (!changes) {
+      jsPerfLog('repositoryReturn fallback: saved metadata/cache no longer reusable', 0);
+      return openRepositoryFast(origin.parentPath, { reopenPath: snapshot.data.currentPath, origin: snapshot.data.repositoryOrigin });
+    }
+    state.changes = changes; state.statusReady = true;
+    // Only repaint the visible parent folder from the patched backend cache.
+    // No branch/history reload, reconciliation or whole-repository scan.
+    const folder = state.currentPath;
+    if (state.view === 'explorer') await openDirectory(folder, { force: true, explorerOnly: true });
+    else updateChangeBadge();
+    if (generation !== repoOpenGeneration || state.repository?.path !== origin.parentPath) return;
+    if (state.view === 'explorer' && state.currentPath === snapshot.data.currentPath && refs.fileList.parentElement) refs.fileList.parentElement.scrollTop = snapshot.scroll;
+    addRecentRepo(origin.parentPath, state.repository.name); updatePublishIndicator();
+    status('Returned to parent · submodule status updated');
+    jsPerfLog('repositoryReturn complete full_reload=false full_status_scan=false', 0);
+  } catch (error) {
+    handleError(error);
+    // Keep mutation guards closed on an unverified snapshot. Manual Refresh
+    // uses the original complete verification path if this check failed.
+  }
+}
+
 function renderRecentRepos() {
   const list = $('#recentReposList');
   if (recentRepos.length === 0) { $('#recentReposBar').hidden = true; return; }
@@ -1404,10 +1484,7 @@ function renderRecentRepos() {
 
 $('#closeRecentRepos').addEventListener('click', () => $('#recentReposBar').hidden = true);
 refs.parentRepositoryButton.addEventListener('click', () => {
-  const origin = state.repositoryOrigin;
-  if (!origin?.parentPath) return;
-  status(`Opening parent repository ${origin.parentName}…`, 'busy');
-  openRepositoryFast(origin.parentPath, { reopenPath: parentPathOf(origin.submodulePath) });
+  returnToParentRepository();
 });
 
 // Drag & Drop - open files in editor
@@ -2998,8 +3075,8 @@ async function fetchAndRenderDirectory(path, requestId, options) {
     const invokeStarted = performance.now();
     const entries = await invoke('load_directory', { repositoryPath: state.repository.path, relativePath: path, force: !!options.invalidateGit });
     jsPerfLog(`openDirectory invoke(load_directory) (${path || '/'})`, performance.now() - invokeStarted);
-    directoryCache.set(path, entries);
     if (requestId !== explorerRequestSeq) return;
+    directoryCache.set(path, entries);
     const renderStarted = performance.now();
     state.entries = entries;
     if (options.explorerOnly && state.view === 'explorer') renderExplorerAfterStatusRefresh(); else render();
@@ -3867,6 +3944,10 @@ async function openSubmoduleAsFullRepository(entry, button = null, options = {})
   try {
     status(`Opening ${entry.name} as a full repository…`, 'busy');
     const target = options.target || await invoke('resolve_submodule_repository', { repositoryPath: parentRepository.path, relativePath: entry.relative_path });
+    await flushPendingTogglesNow({}, 'the Stage operation');
+    if (state.repository?.path !== parentRepository.path) return false;
+    await rememberParentReturn(target);
+    if (state.repository?.path !== parentRepository.path) return false;
     await openRepositoryFast(target.path, {
       origin: {
         repositoryPath: target.path,
@@ -4011,8 +4092,10 @@ async function replaceSubmoduleLocation(entry) {
 
 async function commitSubmoduleChanges(entry) {
   if (entry.kind !== 'submodule') return;
-  const message = await customPrompt(`Commit message for changes in ${entry.name}:`, '', { title: 'Commit submodule' });
+  const repositoryPath = state.repository.path;
+  const message = await customPrompt(`Commit message for changes in ${entry.name}:`, '', { title: 'Commit submodule', multiline: true, polarionContext: submoduleCommitReferenceContext(entry) });
   if (!message?.trim()) return;
+  if (state.repository?.path !== repositoryPath) return;
   if (!invoke) return status(`Preview: committed changes in ${entry.name}`);
   try {
     status(`Committing changes in ${entry.name}…`, 'busy');
@@ -4023,7 +4106,7 @@ async function commitSubmoduleChanges(entry) {
     // how "Publish main project" could end up shipping a gitlink that
     // pointed at a commit that only ever existed on this machine. Push
     // remains its own separate, explicit action ("Push submodule").
-    const result = await invoke('commit_submodule', { repositoryPath: state.repository.path, relativePath: entry.relative_path, message: message.trim(), alsoPush: false });
+    const result = await invoke('commit_submodule', { repositoryPath, relativePath: entry.relative_path, message: message.trim(), alsoPush: false });
     directoryCache.clear(); await loadRepository(state.repository.path, { reopenPath: state.currentPath });
     const successMsg = `${entry.name}: committed inside the submodule. ${result.push_detail}`;
     status(successMsg); showOperationToast(successMsg);
@@ -6993,6 +7076,7 @@ function changeDisplayState(change) {
 }
 
 function renderChanges() {
+  syncDrawerPolarionReferences();
   updateChangeBadge();
   const scope = state.changesScope === 'folder' ? state.currentPath : ''; const scopedChanges = state.changes.filter(change => !scope || change.path === scope || change.path.startsWith(`${scope}/`));
   refs.drawerScopeTitle.textContent = state.changesScope === 'folder' ? `Changes in folder · /${scope}` : 'Working tree · entire repository';
@@ -7025,7 +7109,7 @@ function renderChanges() {
   refs.selectionText.textContent = detached
     ? `${staged} file${staged === 1 ? '' : 's'} in staging area · checkout/create a branch before commit`
     : `${staged} file${staged === 1 ? '' : 's'} in staging area`;
-  refs.commitButton.disabled = !staged || !refs.commitMessage.value.trim() || detached;
+  refs.commitButton.disabled = !staged || !refs.commitMessage.value.trim() || detached || commitWriteRunning || (drawerPolarionReferences && !drawerPolarionReferences.canSubmit());
   refs.commitButton.title = detached ? detachedHeadWorkMessage('commit') : '';
 }
 
@@ -7754,7 +7838,19 @@ function recordDefaultCommitMessage() {
 }
 renderCommitMessageHistory();
 
-const polarionTaskPicker = createPolarionTaskPicker({ invoke, addMessage(message) {
+function submoduleCommitReferenceContext(entry = null) {
+  if (entry?.kind === 'submodule' && state.repository) return { repositoryPath: state.repository.path, moduleName: entry.name, commitKey: entry.relative_path };
+  const origin = state.repositoryOrigin;
+  if (origin?.repositoryPath === state.repository?.path && origin.parentPath) return { repositoryPath: origin.parentPath, moduleName: origin.submoduleName || submoduleNameFromPath(origin.submodulePath), commitKey: state.repository.path };
+  return null; // Parent-project/global commit messages never receive these IDs.
+}
+function syncDrawerPolarionReferences() {
+  const host = $('#commitPolarionRefs');
+  if (!host) return;
+  if (!drawerPolarionReferences) drawerPolarionReferences = createPolarionCommitReferences({ host, invoke, log: text => jsPerfLog(text, 0), onChange: () => renderChanges() });
+  drawerPolarionReferences.setContext(submoduleCommitReferenceContext());
+}
+const polarionTaskPicker = createPolarionTaskPicker({ invoke, log: text => jsPerfLog(text, 0), addMessage(message) {
   refs.defaultCommitMessage.value = message;
   refs.defaultCommitMessage.dispatchEvent(new Event('input', { bubbles: true }));
   recordDefaultCommitMessage();
@@ -8483,7 +8579,9 @@ refs.confirmNewBranch.addEventListener('click', async () => {
   finally { refs.confirmNewBranch.textContent = 'Create branch'; }
 });
 refs.commitButton.addEventListener('click', async () => {
+  if (commitWriteRunning) return;
   if (blockDetachedHeadWork('commit')) return;
+  commitWriteRunning = true;
   const trace = ++diagnosticRequestSequence;
   const commitStartedAt = performance.now();
   let commitPhase = 'staging-barrier';
@@ -8538,11 +8636,12 @@ refs.commitButton.addEventListener('click', async () => {
     // is a genuine subset, so it still goes through commit_files.
     commitPhase = 'write';
     jsPerfLog(`commit_ui: request=${trace} phase=write event=start`, performance.now() - commitStartedAt);
-    if (folder) await invoke('commit_files', { repositoryPath: state.repository.path, files, message: refs.commitMessage.value });
-    else await invoke('commit_staged', { repositoryPath: state.repository.path, message: refs.commitMessage.value });
+    const message = drawerPolarionReferences ? drawerPolarionReferences.message(refs.commitMessage.value) : refs.commitMessage.value;
+    if (folder) await invoke('commit_files', { repositoryPath: state.repository.path, files, message });
+    else await invoke('commit_staged', { repositoryPath: state.repository.path, message });
     commitPhase = 'refresh-after-successful-write';
     jsPerfLog(`commit_ui: request=${trace} phase=${commitPhase} event=start`, performance.now() - commitStartedAt);
-    refs.commitMessage.value = ''; refs.commitButton.textContent = 'Updating status…'; status(refs.commitButton.textContent, 'busy'); await loadRepository(state.repository.path, { reopenPath: folder });
+    refs.commitMessage.value = ''; drawerPolarionReferences?.reset(); refs.commitButton.textContent = 'Updating status…'; status(refs.commitButton.textContent, 'busy'); await loadRepository(state.repository.path, { reopenPath: folder });
     const successMsg = `Committed ${files.length} file${files.length === 1 ? '' : 's'}${folder ? ` in "${folder}"` : ''}. Push when you're ready to send it to the server.`;
     status(successMsg); showOperationToast(successMsg, 'success');
     commitPhase = 'completed';
@@ -8552,6 +8651,7 @@ refs.commitButton.addEventListener('click', async () => {
     const message = handleError(error); showOperationToast(`Commit failed: ${message}`, 'error');
   }
   finally {
+    commitWriteRunning = false;
     jsPerfLog(`commit_ui: request=${trace} phase=${commitPhase} event=end`, performance.now() - commitStartedAt);
     refs.commitButton.textContent = 'Commit changes'; renderChanges();
   }

@@ -6,6 +6,9 @@
 .polarion-task-dialog #polarionContext { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 11px; }
 .polarion-workspace-chrome { flex: none; padding: 0 20px; border-bottom: 1px solid var(--border); }
 .polarion-workspace-chrome .polarion-connect-row { margin: 0 0 10px; padding: 10px 12px; background: var(--surface); }
+.polarion-workspace-chrome .polarion-connect-row:is([data-state=required], [data-state=closed]) { border-color: #a97932; background: #30261a; }
+.polarion-connect-row:is([data-state=required], [data-state=closed]) #polarionConnection { color: #f3c47d; }
+.polarion-connect-row:is([data-state=required], [data-state=closed]) #polarionConnect { border-color: #a97932; color: #f3c47d; }
 .polarion-workspace-chrome .polarion-project-choice { margin: 0 0 10px; font-size: 12px; }
 .polarion-workspace-tabs { display: flex; gap: 6px; margin: 0; padding-bottom: 12px; }
 .polarion-workspace-tabs button { flex: 1; }
@@ -40,6 +43,22 @@
 .polarion-catalog-search > small { margin: 8px 0; line-height: 1.6; }
 .polarion-document-elements { padding-top: 14px; margin-top: 16px; border-top: 1px solid var(--border); }
 .polarion-document-elements h4 { margin: 0 0 10px; font-size: 13px; }
+.polarion-element-toolbar { position: sticky; top: -18px; z-index: 1; background: var(--surface); padding: 10px 0; }
+.polarion-commit-references[hidden] { display: none !important; }
+.polarion-commit-references { margin: 10px 0; border: 1px solid var(--border, #405263); border-radius: 7px; padding: 10px; text-align: left; font-size: 12px; }
+.polarion-commit-references label { display: flex; align-items: flex-start; gap: 7px; margin: 0; font-size: 12px; }
+.polarion-commit-references input[type=checkbox] { flex: none; width: auto; margin: 2px 0; }
+.polarion-commit-references small { display: block; color: var(--muted); line-height: 1.5; font-size: 11px; margin-top: 5px; }
+.polarion-commit-reference-list { max-height: 170px; overflow: auto; margin: 8px 0; }
+.polarion-commit-reference-list label { flex-wrap: wrap; padding: 5px 0; border-top: 1px solid var(--border); }
+.polarion-commit-reference-list label > span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.polarion-commit-reference-list label > small { flex: 1 1 100%; margin: 0 0 0 20px; }
+.polarion-commit-source { margin: 8px 0 5px; padding-left: 9px; border-left: 2px solid var(--blue, #5daeff); overflow-wrap: anywhere; }
+.polarion-commit-source strong { display: block; font-size: 12px; font-weight: 600; }
+.polarion-commit-source small { margin-top: 2px; }
+.polarion-commit-preview { padding: 7px 9px; background: var(--surface); border: 1px solid var(--border); border-radius: 5px; }
+.polarion-commit-preview small { margin: 0 0 5px; }
+.polarion-commit-preview code { display: block; font-size: 11px; white-space: pre-wrap; overflow-wrap: anywhere; }
 .polarion-detail { border: 1px solid var(--border); border-radius: 8px; padding: 14px; margin: 14px 0; }
 .polarion-detail h3 { font-size: 14px; line-height: 1.5; overflow-wrap: anywhere; margin: 0 0 6px; }
 .polarion-detail dl { display: grid; grid-template-columns: minmax(110px, 1fr) minmax(0, 3fr); gap: 7px 16px; font-size: 12px; margin: 14px 0; }

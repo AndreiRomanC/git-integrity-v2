@@ -55,6 +55,9 @@ test('Polarion flow distinguishes unknown, sign-in required and verified access;
   h.search(async () => ({ code: 'auth_required' }));
   h.el('ProjectSearchButton').handlers.click(); await tick();
   assert.equal(h.el('Connection').dataset.state, 'required');
+  assert.match(h.el('Connection').textContent, /Not connected to Polarion/);
+  assert.match(h.el('ConnectionHint').textContent, /Being signed in to Edge does not connect/);
+  assert.equal(h.el('ConnectionPanel').dataset.state, 'required');
   assert.match(h.el('Connect').textContent, /Sign in/);
   h.search(async () => ({ code: 'ok', items: [{ id: 'VWAQ4', title: 'Platform' }], more: false }));
   h.el('ProjectSearchButton').handlers.click(); await tick();
@@ -63,6 +66,31 @@ test('Polarion flow distinguishes unknown, sign-in required and verified access;
   assert.equal(h.el('TaskSearchButton').disabled, false);
   assert.equal(h.el('Pages').hidden, true);
   assert.match(h.el('ChosenProject').textContent, /VWAQ4/);
+  assert.equal(h.el('PanelProjects').hidden, false, 'choosing a project must not move to another tab');
+  assert.equal(h.el('PanelTasks').hidden, true);
+  assert.match(h.el('Status').textContent, /Project selected: VWAQ4/);
+  const count = h.calls.length;
+  h.el('TabTasks').handlers.click();
+  assert.equal(h.el('PanelTasks').hidden, false);
+  assert.equal(h.calls.length, count, 'explicit tab switches do not search or authenticate');
+});
+
+test('closed portal is clearly disconnected; unrelated network and permission errors do not claim sign-in failed', async () => {
+  const h = harness(); await h.picker.open('/repo');
+  h.search(async () => { throw 'Open Polarion, sign in if needed, then retry Search.'; });
+  await h.el('ProjectSearchButton').handlers.click();
+  assert.equal(h.el('Connection').dataset.state, 'closed');
+  assert.match(h.el('Connection').textContent, /Not connected/);
+  assert.match(h.el('ConnectionHint').textContent, /Sign in there only if asked/);
+  assert.match(h.el('Connect').textContent, /Open Polarion/);
+  assert.equal(h.calls.filter(c => c.name === 'polarion_connect').length, 0, 'no unexpected sign-in or background probes');
+  h.dialog.close(); await h.picker.open('/repo');
+  assert.equal(h.el('Connection').dataset.state, 'unknown');
+  assert.match(h.el('ConnectionHint').textContent, /Saved snapshots do not prove a connection/);
+  for (const code of ['network_error', 'forbidden', 'api_unavailable']) {
+    h.search(async () => ({ code })); await h.el('ProjectSearchButton').handlers.click();
+    assert.equal(h.el('Connection').dataset.state, 'unknown', code + ' does not prove a disconnected session');
+  }
 });
 
 test('closing and reopening Polarion rejects old search and authentication results', async () => {
@@ -161,7 +189,7 @@ test('failed element page preserves the previous complete local snapshot', async
   h.overrides.polarion_read = async args => args.page === 1 ? { code: 'ok', received: 1, more: true, elements: [task('P/NEW')] } : { code: 'forbidden', http: 403 };
   await cardButton(h, 'Document', 'Read all elements').handlers.click();
   assert.equal(h.calls.filter(c => c.args?.action === 'elements').length, 0);
-  assert.match(h.el('Elements').children[0].children[0].textContent, /P\/OLD/);
+  assert.match(h.el('Elements').children[0].children[0].textContent, /OLD/);
   assert.match(h.el('Status').textContent, /refused/);
 });
 test('saved StructDoc elements are not rendered during ordinary task searches', async () => {
@@ -249,6 +277,24 @@ test('late diagnostic replies cannot change a reopened dialog and do not trigger
 
 const docLink = 'https://polarion.vitesco.io/polarion/#/project/P/wiki/Structure%20Information/Structure_2_0';
 const docSnapshot = () => ({ ...task('P/Structure Information/Structure_2_0'), kind: 'document', item_type: 'structureDocument' });
+test('a matching saved StructDoc is found locally even without a working server catalog; explicit server search remains available', async () => {
+  const h = harness(); h.setWorkspace({ document: { ...docSnapshot(), id: 'P/Structure Information/VWAQ4-SW_ERRM_StructDoc_2_0_0', title: 'VWAQ4-SW_ERRM_StructDoc_2.0.0' } });
+  await inProject(h); h.el('TabDocuments').handlers.click(); h.el('DocumentSource').value = 'documents'; h.el('DocumentQuery').value = 'eRrM';
+  const before = h.calls.length; await h.el('DocumentSearchButton').handlers.click();
+  assert.equal(h.calls.length, before); assert.equal(h.el('Results').children.length, 1);
+  assert.equal(h.el('SearchServer').hidden, false); assert.match(h.el('DocumentHint').textContent, /local association, not a complete server catalog/);
+  assert.equal(h.el('Connection').dataset.state, 'unknown', 'a saved match is not proof of current authentication');
+  await h.el('SearchServer').handlers.click(); assert.equal(h.calls.at(-1).name, 'polarion_search');
+  h.el('ElementQuery').value = 'errm'; h.el('ClearElements').handlers.click(); assert.equal(h.el('ElementQuery').value, '');
+});
+test('element filtering refreshes locally across text/type/clear changes without server requests', async () => {
+  const h = harness(); h.setWorkspace({ document: docSnapshot(), elements_complete: true, elements: [
+    { ...task('P/P-1', 'designelement'), title: 'errm_adpdg 2.0.0' }, { ...task('P/P-2', 'solutionelement'), title: 'errm_dcmngai 2.0.0' },
+  ] }); await inProject(h); h.el('TabDocuments').handlers.click(); const before = h.calls.length;
+  h.el('ElementQuery').value = 'ERRM ADPDG'; h.el('ElementQuery').handlers.input(); assert.equal(h.el('Elements').children.length, 1);
+  h.el('ElementType').value = 'solutionelement'; h.el('ElementType').handlers.change(); assert.equal(h.el('Elements').children.length, 0);
+  h.el('ClearElements').handlers.click(); assert.equal(h.el('Elements').children.length, 2); assert.equal(h.calls.length, before);
+});
 test('opening a LiveDoc link bypasses catalogs without automatically saving or reading its elements', async () => {
   const h = harness(); await inProject(h); h.el('TabDocuments').handlers.click();
   h.overrides.polarion_read = async args => {
@@ -285,6 +331,19 @@ test('link association uses the existing local workspace and paginated element r
   assert.equal(h.el('Elements').children.length, 2); assert.equal(h.el('DocumentElements').hidden, false);
   assert.equal(h.calls.filter(c => c.name === 'polarion_search').length, 0);
   assert.ok(h.calls.filter(c => c.args?.kind === 'elements').every(c => c.args.revision === '42'));
+});
+test('document preview does not replace the selected commit source until Use this StructDoc is confirmed', async () => {
+  const h = harness(), old = { ...docSnapshot(), id: 'P/S/Old', title: 'Previous selected document' };
+  h.setWorkspace({ document: old }); await inProject(h); h.el('TabDocuments').handlers.click();
+  h.overrides.polarion_read = async () => ({ code: 'ok', snapshot: { ...docSnapshot(), title: 'New StructDoc' } });
+  h.el('DiagnosticUrl').value = docLink; await h.el('OpenDocument').handlers.click();
+  assert.match(h.el('Document').children[0].children[0].textContent, /Selected StructDoc.*source for submodule commit/);
+  assert.match(h.el('Document').children[0].children[1].textContent, /Previous selected document/);
+  await h.el('Associate').handlers.click();
+  assert.match(h.el('Document').children[0].children[1].textContent, /New StructDoc/);
+  assert.match(h.el('Status').textContent, /Selected StructDoc for submodule commits: New StructDoc/);
+  assert.equal(h.calls.filter(c => c.args?.kind === 'elements').length, 0, 'selection alone must not reread a large document');
+  assert.equal(h.messages.length, 0, 'selecting a document never changes the general commit list');
 });
 test('unavailable catalog guides users to the link without triggering retries or claiming authentication failed', async () => {
   const h = harness(); await inProject(h); h.el('TabDocuments').handlers.click();
