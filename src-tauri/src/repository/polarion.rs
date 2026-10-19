@@ -305,7 +305,11 @@ pub async fn polarion_workspace(repository_path: String, action: String, snapsho
         let root = context_repository(&repository_path, "")?;
         let file = workspace_file(&root)?;
         let _guard = METADATA.lock().map_err(|_| "Metadata lock unavailable")?;
-        update_workspace(&file, &action, snapshot, elements, document_id.as_deref())
+        let result = update_workspace(&file, &action, snapshot, elements, document_id.as_deref());
+        if let Ok(workspace) = &result {
+            perf_log(&format!("polarion: workspace_access repo={} action={action} document_present={} elements={} complete={} revision_present={} outside_git=true", anonymized_repository_id(&root), workspace.document.is_some(), workspace.elements.len(), workspace.elements_complete, !workspace.elements_revision.is_empty()), Duration::ZERO);
+        }
+        result
     }).await
 }
 fn update_workspace(file: &Path, action: &str, snapshot: Option<Snapshot>, elements: Option<Vec<Snapshot>>, document_id: Option<&str>) -> Result<Workspace, String> {

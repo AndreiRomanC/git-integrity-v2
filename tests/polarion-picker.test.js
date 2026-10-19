@@ -23,7 +23,7 @@ function harness() {
   const nodes = new Map();
   const el = id => { if (!nodes.has(id)) nodes.set(id, new Element()); return nodes.get(id); };
   const dialog = new Element(); dialog.querySelector = id => el(id.replace('#polarion', ''));
-  const calls = [], overrides = {}, memory = new Map(), messages = [];
+  const calls = [], overrides = {}, memory = new Map(), messages = [], logs = [], changedSources = [];
   let workspace = {};
   let search = async () => ({ code: 'ok', items: [], more: false });
   const sandbox = { localStorage: { getItem: k => memory.get(k), setItem: (k,v) => memory.set(k,v) }, document: { querySelector: () => dialog, createElement: () => new Element() } };
@@ -35,13 +35,18 @@ function harness() {
     if (name === 'polarion_search') return search();
     if (name === 'polarion_workspace') {
       if (args.action === 'primary') workspace.primary_task = args.snapshot;
-      if (args.action === 'document') { workspace.document = args.snapshot; workspace.elements = []; }
-      if (args.action === 'elements') { workspace.elements = args.elements; workspace.elements_complete = true; }
+      if (args.action === 'document') {
+        if (workspace.document?.id !== args.snapshot?.id || workspace.document?.kind !== args.snapshot?.kind) {
+          workspace.elements = []; workspace.elements_complete = false; workspace.elements_saved_at = ''; workspace.elements_revision = '';
+        }
+        workspace.document = args.snapshot;
+      }
+      if (args.action === 'elements') { workspace.elements = args.elements; workspace.elements_complete = true; workspace.elements_revision = args.snapshot.fields?.revision || ''; workspace.elements_saved_at = args.snapshot.fetched_at; }
       if (args.action === 'element') workspace.elements = workspace.elements.map(i => i.id === args.snapshot.id ? args.snapshot : i);
       return structuredClone(workspace);
     }
-  }, addMessage: message => messages.push(message) });
-  return { el, dialog, calls, picker, overrides, memory, messages, setWorkspace: value => { workspace = value; }, search: fn => { search = fn; } };
+  }, addMessage: message => messages.push(message), log: message => logs.push(message), onDocumentChange: path => changedSources.push(path) });
+  return { el, dialog, calls, picker, overrides, memory, messages, logs, changedSources, setWorkspace: value => { workspace = value; }, search: fn => { search = fn; } };
 }
 const tick = () => new Promise(resolve => setImmediate(resolve));
 
@@ -382,22 +387,154 @@ test('link association uses the existing local workspace and paginated element r
   h.el('DiagnosticUrl').value = docLink; await h.el('OpenDocument').handlers.click();
   await h.el('Associate').handlers.click();
   assert.equal(h.calls.filter(c => c.args?.action === 'document').length, 1);
-  await cardButton(h, 'Document', 'Load elements · server').handlers.click();
   assert.equal(h.el('Elements').children.length, 2); assert.equal(h.el('DocumentElements').hidden, false);
+  assert.equal(h.calls.filter(c => c.args?.action === 'elements').length, 1, 'explicit association loads and saves every page without a second action');
   assert.equal(h.calls.filter(c => c.name === 'polarion_search').length, 0);
   assert.ok(h.calls.filter(c => c.args?.kind === 'elements').every(c => c.args.revision === '42'));
+});
+test('selecting a document with failed element loading keeps its identity but never marks an empty metadata read as complete', async () => {
+  const h = harness(); await inProject(h); h.el('TabDocuments').handlers.click();
+  h.overrides.polarion_read = async args => args.kind === 'elements' ? { code: 'auth_required', http: 401 }
+    : { code: 'ok', snapshot: docSnapshot() };
+  h.el('DiagnosticUrl').value = docLink; await h.el('OpenDocument').handlers.click();
+  await h.el('Associate').handlers.click();
+  assert.equal(h.calls.filter(c => c.args?.action === 'document').length, 1);
+  assert.equal(h.calls.filter(c => c.args?.action === 'elements').length, 0);
+  assert.match(h.el('Status').textContent, /StructDoc selected locally, but elements could not be refreshed/);
+  assert.equal(h.el('Connection').dataset.state, 'required');
+  assert.match(h.el('Document').children[0].children[2].textContent, /Elements not loaded yet/);
+  assert.ok(cardButton(h, 'Document', 'Load elements · server'));
+  assert.match(h.logs.join('\n'), /elements_load outcome=failed/);
+});
+test('failed refresh after reselecting the same document preserves its last complete snapshot', async () => {
+  const h = harness(); h.setWorkspace({ document: docSnapshot(), elements: [task('P/P-10')], elements_complete: true, elements_revision: '42' });
+  await inProject(h); h.el('TabDocuments').handlers.click();
+  cardButton(h, 'Document', 'View local snapshot').handlers.click();
+  h.overrides.polarion_read = async args => args.kind === 'elements' ? { code: 'timeout' } : { code: 'ok', snapshot: docSnapshot() };
+  await h.el('Associate').handlers.click();
+  assert.equal(h.el('Elements').children.length, 1);
+  assert.match(h.el('Elements').children[0].children[0].textContent, /P-10/);
+  assert.match(h.el('Status').textContent, /Previous saved elements.*preserved/);
+});
+test('late element pages cannot save results in a reopened workspace', async () => {
+  const h = harness(); await inProject(h); h.el('TabDocuments').handlers.click();
+  let finish;
+  h.overrides.polarion_read = async args => args.kind === 'elements' ? new Promise(resolve => { finish = resolve; })
+    : { code: 'ok', snapshot: docSnapshot() };
+  h.el('DiagnosticUrl').value = docLink; await h.el('OpenDocument').handlers.click();
+  const pending = h.el('Associate').handlers.click(); await tick();
+  h.dialog.close(); await h.picker.open('/other');
+  finish({ code: 'ok', elements: [task('P/P-20')], received: 1, more: false }); await pending;
+  assert.equal(h.calls.filter(c => c.args?.action === 'elements').length, 0);
+  assert.match(h.logs.join('\n'), /elements_load outcome=stale/);
+});
+test('parent StructDoc source matches submodule commits while task and project associations retain their repository scope', async () => {
+  const h = harness();
+  const doc = docSnapshot(), childTask = task('Child/CHILD-1');
+  const stores = new Map([['/parent', { document: doc, elements: [], elements_complete: false, primary_task: task('Parent/PARENT-1') }],
+    ['/parent/module', { primary_task: childTask, document: { ...doc, id: 'Child/S/Old' } }]]);
+  h.overrides.polarion_project_context = async args => ({ repository_path: args.repositoryPath, project: { id: 'Child', name: 'Module project' } });
+  h.overrides.polarion_workspace = async args => {
+    const data = stores.get(args.repositoryPath);
+    if (args.action === 'document') data.document = args.snapshot;
+    if (args.action === 'elements') Object.assign(data, { elements: args.elements, elements_complete: true, elements_revision: args.snapshot.fields?.revision || '', elements_saved_at: args.snapshot.fetched_at });
+    if (args.action === 'primary') data.primary_task = args.snapshot;
+    return structuredClone(data);
+  };
+  const refs = { repositoryPath: '/parent', moduleName: 'errm_adpdg' };
+  await h.picker.open('/parent/module', '', refs); h.el('TabDocuments').handlers.click();
+  assert.match(h.el('DocumentScope').textContent, /\/parent · parent project/);
+  assert.match(h.el('Document').children[0].children[1].textContent, /P\/Structure Information/);
+  const elements = ['simulinkitem','designelement','solutionelement'].map((type, index) => ({ ...task('VWAQ4/VWAQ4-' + (85585 + index), type), title: 'errm_adpdg 2.0.0' }));
+  h.overrides.polarion_read = async args => args.kind === 'elements' ? { code: 'ok', elements: [...elements, { ...task('P/P-99'), title: 'errm_dcmngai 2.0.0' }], received: 4, more: false }
+    : { code: 'ok', snapshot: doc };
+  cardButton(h, 'Document', 'View local snapshot').handlers.click(); await h.el('Associate').handlers.click();
+  assert.equal(h.el('ElementModule').checked, true);
+  assert.match(h.el('ElementModuleName').textContent, /Only errm_adpdg/);
+  assert.equal(h.el('Elements').children.length, 3);
+  assert.match(h.el('Primary').children[0].children[1].textContent, /CHILD-1/);
+  assert.ok(h.calls.filter(c => ['document','elements'].includes(c.args?.action)).every(c => c.args.repositoryPath === '/parent'));
+  assert.equal(stores.get('/parent/module').document.id, 'Child/S/Old', 'no migration or overwrite of the old independent module association');
+  const noReads = h.calls.length;
+  h.el('Elements').children[0].handlers.click();
+  assert.equal(h.el('ElementDetail').hidden, false);
+  assert.match(h.el('ElementDetail').children[1].textContent, /errm_adpdg/);
+  h.el('ClearElements').handlers.click(); assert.equal(h.el('Elements').children.length, 4); assert.equal(h.calls.length, noReads);
+  h.el('TabTasks').handlers.click();
+  h.search(async () => ({ code: 'ok', items: [{ id: 'CHILD-2', title: 'New child task', item_type: 'task' }] }));
+  await h.el('TaskSearchButton').handlers.click(); h.el('Results').children[0].handlers.click();
+  h.overrides.polarion_read = async () => ({ code: 'ok', snapshot: task('Child/CHILD-2') });
+  await h.el('PrimaryButton').handlers.click();
+  assert.equal(h.calls.filter(c => c.args?.action === 'primary').at(-1).args.repositoryPath, '/parent/module');
+  assert.equal(stores.get('/parent').primary_task.id, 'Parent/PARENT-1');
+  const before = h.calls.filter(c => c.name === 'polarion_read').length;
+  h.dialog.close(); await h.picker.open('/parent/module', '', refs); h.el('TabDocuments').handlers.click();
+  assert.equal(h.el('Elements').children.length, 3, 'all elements survive reopening; the module filter is local');
+  assert.equal(h.calls.filter(c => c.name === 'polarion_read').length, before);
+});
+test('local element inspection has its own usable explicit refresh and never implies write access', async () => {
+  const h = harness(), element = { ...task('P/P-85', 'designelement'), title: 'errm_adpdg 2.0.0' };
+  h.setWorkspace({ document: docSnapshot(), elements: [element], elements_complete: true, elements_revision: '42' });
+  await inProject(h); h.el('TabDocuments').handlers.click();
+  const before = h.calls.length; h.el('Elements').children[0].handlers.click();
+  assert.equal(h.calls.length, before, 'selecting an element only shows the saved snapshot');
+  assert.equal(h.el('ElementDetail').hidden, false);
+  h.overrides.polarion_read = async () => ({ code: 'ok', snapshot: { ...element, description: '<not executed>' } });
+  await h.el('ElementDetail').children.at(-1).handlers.click();
+  assert.equal(h.calls.filter(c => c.name === 'polarion_read').length, 1);
+  assert.equal(h.el('ElementDetail').children.at(-1).disabled, false);
+  assert.equal(h.calls.filter(c => c.args?.action === 'document').length, 0);
+  assert.ok(h.calls.every(c => ['polarion_workspace','polarion_project_context','polarion_read'].includes(c.name)));
+  const html = fs.readFileSync(path.join(__dirname, '../frontend/index.html'), 'utf8');
+  assert.match(html, /Edit access · not verified/);
+  assert.match(html, /No test edits are sent/);
+});
+test('a failed parent workspace read never exposes a child StructDoc as the parent commit source', async () => {
+  const h = harness();
+  h.overrides.polarion_project_context = async () => ({ repository_path: '/child', project: { id: 'P' } });
+  h.overrides.polarion_workspace = async args => {
+    if (args.repositoryPath === '/parent') throw new Error('Cannot read parent workspace');
+    return { document: { ...docSnapshot(), title: 'Wrong child source' }, primary_task: task('Child/CHILD-1') };
+  };
+  await h.picker.open('/child', '', { repositoryPath: '/parent', moduleName: 'errm_adpdg' });
+  h.el('TabDocuments').handlers.click();
+  assert.doesNotMatch(h.el('Document').children[0].children[1].textContent, /Wrong child source/);
+  assert.equal(h.el('DocumentElements').hidden, true);
+  assert.match(h.el('Primary').children[0].children[1].textContent, /CHILD-1/);
+  assert.equal(h.calls.filter(c => c.name === 'polarion_read' || c.name === 'polarion_search').length, 0);
+});
+test('changing a StructDoc invalidates old commit selections once on close; previews and task updates do not', async () => {
+  const h = harness(); await inProject(h); h.el('TabDocuments').handlers.click();
+  h.overrides.polarion_read = async args => args.kind === 'elements' ? { code: 'ok', elements: [task('P/P-1')], received: 1, more: false }
+    : { code: 'ok', snapshot: docSnapshot() };
+  h.el('DiagnosticUrl').value = docLink; await h.el('OpenDocument').handlers.click();
+  h.dialog.close(); assert.equal(h.changedSources.length, 0, 'preview does not change commit references');
+  await inProject(h); h.el('TabDocuments').handlers.click();
+  h.el('DiagnosticUrl').value = docLink; await h.el('OpenDocument').handlers.click();
+  await h.el('Associate').handlers.click();
+  await cardButton(h, 'Document', 'Refresh elements · server').handlers.click();
+  assert.equal(h.changedSources.length, 0, 'do not repeatedly rebuild the underlying drawer during loading');
+  h.dialog.close(); assert.deepEqual(h.changedSources, ['/repo']);
+  await selectedTask(h); h.overrides.polarion_read = async () => ({ code: 'ok', snapshot: task() });
+  await h.el('PrimaryButton').handlers.click(); h.dialog.close();
+  assert.equal(h.changedSources.length, 1, 'task updates do not invalidate StructDoc choices');
+  const app = fs.readFileSync(path.join(__dirname, '../frontend/app.js'), 'utf8');
+  const callback = app.slice(app.indexOf('onDocumentChange()'), app.indexOf('}, addMessage(message)', app.indexOf('onDocumentChange()')));
+  assert.match(callback, /drawerPolarionReferences\?\.reset\(\)/);
+  assert.doesNotMatch(callback, /loadRepository|refreshChangesLightweight|invoke\(/);
 });
 test('document preview does not replace the selected commit source until Use this StructDoc is confirmed', async () => {
   const h = harness(), old = { ...docSnapshot(), id: 'P/S/Old', title: 'Previous selected document' };
   h.setWorkspace({ document: old }); await inProject(h); h.el('TabDocuments').handlers.click();
-  h.overrides.polarion_read = async () => ({ code: 'ok', snapshot: { ...docSnapshot(), title: 'New StructDoc' } });
+  h.overrides.polarion_read = async args => args.kind === 'elements' ? { code: 'ok', elements: [], received: 0, more: false }
+    : { code: 'ok', snapshot: { ...docSnapshot(), title: 'New StructDoc' } };
   h.el('DiagnosticUrl').value = docLink; await h.el('OpenDocument').handlers.click();
   assert.match(h.el('Document').children[0].children[0].textContent, /Selected StructDoc.*source for submodule commit/);
   assert.match(h.el('Document').children[0].children[1].textContent, /Previous selected document/);
   await h.el('Associate').handlers.click();
   assert.match(h.el('Document').children[0].children[1].textContent, /New StructDoc/);
   assert.match(h.el('Status').textContent, /Selected StructDoc for submodule commits: New StructDoc/);
-  assert.equal(h.calls.filter(c => c.args?.kind === 'elements').length, 0, 'selection alone must not reread a large document');
+  assert.equal(h.calls.filter(c => c.args?.kind === 'elements').length, 1, 'Use this StructDoc & load elements explicitly reads the selected document, never the preview alone');
   assert.equal(h.messages.length, 0, 'selecting a document never changes the general commit list');
 });
 test('unavailable catalog guides users to the link without triggering retries or claiming authentication failed', async () => {

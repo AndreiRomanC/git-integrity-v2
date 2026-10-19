@@ -8002,7 +8002,12 @@ function syncDrawerPolarionReferences() {
   if (!drawerPolarionReferences) drawerPolarionReferences = createPolarionCommitReferences({ host, invoke, log: text => jsPerfLog(text, 0), onChange: () => renderChanges() });
   drawerPolarionReferences.setContext(submoduleCommitReferenceContext());
 }
-const polarionTaskPicker = createPolarionTaskPicker({ invoke, log: text => jsPerfLog(text, 0), addMessage(message) {
+const polarionTaskPicker = createPolarionTaskPicker({ invoke, log: text => jsPerfLog(text, 0), onDocumentChange() {
+  // Re-opt in against the updated local source instead of committing IDs
+  // previously checked in an already-open Working Tree drawer. No Git scan.
+  drawerPolarionReferences?.reset();
+  if (refs.changesDrawer.classList.contains('open')) renderChanges();
+}, addMessage(message) {
   refs.defaultCommitMessage.value = message;
   refs.defaultCommitMessage.dispatchEvent(new Event('input', { bubbles: true }));
   recordDefaultCommitMessage();
@@ -8014,7 +8019,10 @@ document.querySelectorAll('[data-polarion-search]').forEach(button => button.add
   const path = mode === 'drawer' ? (state.changesScope === 'folder' ? state.currentPath : '')
     : mode === 'scope' ? selectedScope().path
     : context.isSubmodule ? '' : (state.selectedEntry?.relative_path || state.currentPath);
-  polarionTaskPicker.open(mode === 'context' ? context.path : state.repository?.path, path);
+  const references = mode === 'context' && context.isSubmodule
+    ? { repositoryPath: context.parentPath, moduleName: context.name, commitKey: context.relativePath }
+    : submoduleCommitReferenceContext(state.selectedEntry?.kind === 'submodule' ? state.selectedEntry : null);
+  polarionTaskPicker.open(mode === 'context' ? context.path : state.repository?.path, path, references);
 }));
 
 // Opening the drawer no longer auto-stages everything in it — it used to

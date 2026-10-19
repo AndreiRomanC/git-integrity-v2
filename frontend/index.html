@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Git DrillDown</title>
   <link rel="icon" type="image/png" href="assets/git-drilldown-mark.png">
-  <link rel="stylesheet" href="styles.css?v=20261018-perf-log-rotation">
-  <link rel="stylesheet" href="polarion.css?v=20261018-perf-log-rotation">
+  <link rel="stylesheet" href="styles.css?v=20261019-structdoc-elements">
+  <link rel="stylesheet" href="polarion.css?v=20261019-structdoc-elements">
 </head>
 <body>
   <div class="app-shell">
@@ -799,7 +799,7 @@
             <p id="polarionResultSummary" class="polarion-result-summary" role="status" hidden></p>
             <div id="polarionResults" class="polarion-results" aria-label="Polarion search results" hidden></div>
             <div id="polarionPages" class="polarion-pages" hidden><button type="button" id="polarionPrevious" disabled>← Previous</button><button type="button" id="polarionNext" disabled>Next →</button></div>
-            <div id="polarionSelectionActions" class="polarion-selection-actions" hidden><button type="button" id="polarionView" disabled>Read details</button><button type="button" id="polarionPrimaryButton" disabled>Set primary task</button><button type="button" id="polarionAssociate" hidden disabled>Use this StructDoc</button></div>
+            <div id="polarionSelectionActions" class="polarion-selection-actions" hidden><button type="button" id="polarionView" disabled>Read details</button><button type="button" id="polarionPrimaryButton" disabled>Set primary task</button><button type="button" id="polarionAssociate" hidden disabled>Use this StructDoc &amp; load elements</button></div>
             <section id="polarionDetail" class="polarion-detail" hidden aria-label="Polarion item details"></section>
           </div>
         </section>
@@ -813,7 +813,8 @@
           <div id="polarionTaskWorkspace"></div>
         </section>
         <section id="polarionPanelDocuments" role="tabpanel" aria-labelledby="polarionTabDocuments" hidden>
-          <div class="polarion-section-heading"><h3>Structure documents</h3><small>Find or open a document on Polarion → select it for commits → load its elements.</small></div>
+          <div class="polarion-section-heading"><h3>Structure documents</h3><small>Find or preview a document → Use this StructDoc &amp; load elements → view locally and include references in submodule commits.</small></div>
+          <small id="polarionDocumentScope" class="polarion-document-scope"></small>
           <div id="polarionDocument" class="polarion-saved-card"></div>
           <div class="polarion-catalog-search">
             <label for="polarionDocumentQuery">Find on Polarion</label>
@@ -830,9 +831,13 @@
           <section id="polarionDocumentElements" class="polarion-document-elements" hidden aria-label="Saved StructDoc elements">
             <div class="polarion-element-toolbar"><h4>Local elements</h4><small>Filter the saved elements below. This does not search Polarion or require sign-in.</small>
             <div class="polarion-search-row polarion-element-filters"><input id="polarionElementQuery" placeholder="Module name or item ID · e.g. errm_adpdg" aria-label="Filter StructDoc elements"><select id="polarionElementType" aria-label="Element type"><option value="">All types</option></select><button type="button" id="polarionClearElements">Clear</button></div></div>
+            <label id="polarionElementModuleFilter" class="polarion-module-filter" hidden><input id="polarionElementModule" type="checkbox"><span id="polarionElementModuleName">Only selected submodule</span></label>
             <small id="polarionElementSummary">Select a document, then load its elements from Polarion.</small>
             <div id="polarionElements" class="polarion-elements"></div>
+            <p id="polarionElementEmpty" class="polarion-empty" hidden></p>
+            <section id="polarionElementDetail" class="polarion-detail" hidden aria-label="Selected StructDoc element details"></section>
           </section>
+          <details class="polarion-diagnostics"><summary>Edit access · not verified</summary><small>Successful reads do not establish permission to edit this document or its work items. Git DrillDown currently makes no changes on Polarion. Editing requires both REST endpoint permissions and document/work-item permissions; workflow and field restrictions may also apply. No test edits are sent to check access.</small></details>
           <details class="polarion-diagnostics"><summary>Troubleshooting · read access</summary>
             <small id="polarionDiagnosticSummary">Optional, explicit GET checks. Results stay in this tab and the log.</small>
             <div class="polarion-diagnostic-actions"><button type="button" id="polarionDiagnostics">Check read access</button><small>Uses the link or same-project saved StructDoc · up to 25 seconds · no automatic sign-in</small></div>
@@ -845,16 +850,16 @@
       <footer><span>Read-only on Polarion · local snapshots outside Git</span><button value="cancel">Close</button><button type="button" id="polarionAdd" class="confirm" disabled>Add to Commit List</button></footer>
     </form>
   </dialog>
-  <script src="polarion.js?v=20261018-perf-log-rotation"></script>
-  <script src="console-context.js?v=20261018-perf-log-rotation"></script>
-  <script src="graph-model.js?v=20261018-perf-log-rotation"></script>
-  <script src="submodule-state.js?v=20261018-perf-log-rotation"></script>
-  <script src="submodule-versions.js?v=20261018-perf-log-rotation"></script>
-  <script src="local-diff.js?v=20261018-perf-log-rotation"></script>
-  <script src="local-drive.js?v=20261018-perf-log-rotation"></script>
-  <script src="pr-status.js?v=20261018-perf-log-rotation"></script>
-  <script src="refresh-coordinator.js?v=20261018-perf-log-rotation"></script>
-  <script src="comparison-authors.js?v=20261018-perf-log-rotation"></script>
-  <script src="app.js?v=20261018-perf-log-rotation"></script>
+  <script src="polarion.js?v=20261019-structdoc-elements"></script>
+  <script src="console-context.js?v=20261019-structdoc-elements"></script>
+  <script src="graph-model.js?v=20261019-structdoc-elements"></script>
+  <script src="submodule-state.js?v=20261019-structdoc-elements"></script>
+  <script src="submodule-versions.js?v=20261019-structdoc-elements"></script>
+  <script src="local-diff.js?v=20261019-structdoc-elements"></script>
+  <script src="local-drive.js?v=20261019-structdoc-elements"></script>
+  <script src="pr-status.js?v=20261019-structdoc-elements"></script>
+  <script src="refresh-coordinator.js?v=20261019-structdoc-elements"></script>
+  <script src="comparison-authors.js?v=20261019-structdoc-elements"></script>
+  <script src="app.js?v=20261019-structdoc-elements"></script>
 </body>
 </html>

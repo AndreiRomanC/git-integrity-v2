@@ -51,6 +51,10 @@
 .polarion-detail-origin { margin-bottom: 7px; font-size: 10px; letter-spacing: .4px; }
 .polarion-document-elements { padding-top: 14px; margin-top: 16px; border-top: 1px solid var(--border); }
 .polarion-document-elements h4 { margin: 0 0 10px; font-size: 13px; }
+.polarion-document-scope { display: block; overflow-wrap: anywhere; }
+.polarion-task-body .polarion-module-filter { display: flex; align-items: center; gap: 7px; margin: 8px 0; }
+.polarion-module-filter input { flex: none; }
+.polarion-element[aria-pressed=true] { border-color: var(--blue); background: var(--surface); }
 .polarion-element-toolbar { position: sticky; top: -18px; z-index: 1; background: var(--surface); padding: 10px 0; }
 .polarion-commit-references[hidden] { display: none !important; }
 .polarion-commit-references { margin: 10px 0; border: 1px solid var(--border, #405263); border-radius: 7px; padding: 10px; text-align: left; font-size: 12px; }

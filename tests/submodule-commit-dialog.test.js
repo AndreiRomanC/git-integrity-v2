@@ -68,7 +68,7 @@ test('submodule commit starts with the top message and appends optional StructDo
     await sandbox.commitSubmoduleChanges({ kind: 'submodule', name: 'errm_adpdg', relative_path: 'modules/errm_adpdg', submodule_current_branch: 'feature' });
     assert.equal(calls.length, 1); assert.equal(calls[0].command, 'commit_submodule');
     const base = refs.defaultCommitMessage.value + '\nAdditional module note';
-    assert.equal(calls[0].args.message, withReferences ? base + '\n\nPolarion: ' + ids.join(', ') : base);
+    assert.equal(calls[0].args.message, withReferences ? base + '\n\n' + ids.join('\n') : base);
     assert.equal(refs.defaultCommitMessage.value, 'P:OEM-123 - My base description\nMore detail');
   }
 });

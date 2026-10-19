@@ -46,10 +46,35 @@ test('reference context exists only for a submodule commit, never a general pare
   assert.match(commit, /polarionContext: submoduleCommitReferenceContext\(entry\)/);
   assert.doesNotMatch(commit, /recordDefaultCommitMessage|addMessage|alsoPush: true/);
 });
+test('opening P forwards the same parent StructDoc source as commit, including an independently selected submodule graph', () => {
+  const app = fs.readFileSync(path.join(__dirname, '../frontend/app.js'), 'utf8');
+  const state = { repository: { path: '/parent' }, currentPath: 'modules', selectedEntry: { kind: 'submodule', name: 'errm_confi0', relative_path: 'modules/errm_confi0' } };
+  let handler, opened, active = { isSubmodule: false, path: '/parent' };
+  const context = { state, document: { querySelectorAll: () => [{ dataset: { polarionSearch: 'context' }, addEventListener: (_event, fn) => { handler = fn; } }] },
+    submoduleNameFromPath: value => value.split('/').pop(), activeRepositoryContext: () => active, polarionTaskPicker: { open: (...args) => { opened = args; } } };
+  vm.createContext(context);
+  vm.runInContext(app.match(/function submoduleCommitReferenceContext\([^]*?\n}/)[0], context);
+  const start = app.indexOf("document.querySelectorAll('[data-polarion-search]')");
+  vm.runInContext(app.slice(start, app.indexOf('\n}));', start) + 5), context);
+  handler(); assert.equal(opened[0], '/parent'); assert.equal(opened[1], 'modules/errm_confi0');
+  assert.equal(opened[2].repositoryPath, '/parent'); assert.equal(opened[2].moduleName, 'errm_confi0');
+  active = { isSubmodule: true, path: '/parent/modules/errm_adpdg', parentPath: '/parent', name: 'errm_adpdg', relativePath: 'modules/errm_adpdg' };
+  handler(); assert.equal(opened[0], active.path); assert.equal(opened[1], '');
+  assert.equal(opened[2].repositoryPath, '/parent'); assert.equal(opened[2].moduleName, 'errm_adpdg', 'graph context, not an old explorer selection');
+});
 test('references use short work-item IDs and preserve the base message without adding duplicates', () => {
-  assert.equal(api.polarionCommitMessageWithReferences('Checkpoint', ['VWAQ4-85585','VWAQ4-85586','VWAQ4-85585']), 'Checkpoint\n\nPolarion: VWAQ4-85585, VWAQ4-85586');
+  assert.equal(api.polarionCommitMessageWithReferences('Checkpoint', ['VWAQ4-85585','VWAQ4-85586','VWAQ4-85585']), 'Checkpoint\n\nVWAQ4-85585\nVWAQ4-85586');
   assert.equal(api.polarionCommitMessageWithReferences('P:VWAQ4-85585 - task', ['VWAQ4-85585', 'VWAQ4/VWAQ4-85586', 'bad']), 'P:VWAQ4-85585 - task');
   assert.equal(api.polarionCommitMessageWithReferences('Keep whitespace  ', []), 'Keep whitespace  ');
+  assert.equal(api.polarionCommitMessageWithReferences('P:OEM-42 - Top selected description\nMore detail', ['VWAQ4-85585','VWAQ4-85586','VWAQ4-85587']),
+    'P:OEM-42 - Top selected description\nMore detail\n\nVWAQ4-85585\nVWAQ4-85586\nVWAQ4-85587');
+});
+test('metadata-only selection and changed revisions are distinct from complete or legitimately empty saved elements', () => {
+  assert.equal(api.polarionElementsState({}), 'no_document');
+  assert.equal(api.polarionElementsState({ ...workspace(), elements_complete: false, elements: [] }), 'not_loaded');
+  assert.equal(api.polarionElementsState({ ...workspace(), elements_revision: 'old', document: { ...workspace().document, fields: { revision: 'new' } } }), 'revision_changed');
+  assert.equal(api.polarionElementsState(workspace()), 'ready');
+  assert.equal(api.polarionElementsState({ ...workspace(), elements: [] }), 'ready');
 });
 function fixture(knownWorkspace = null) {
   class Node {
@@ -98,7 +123,7 @@ test('four unique matching types use the exact IDs from any project, not a fixed
   f.calls[0].resolve(data); await tick();
   assert.match(content(f.host), /StructDoc: OEM\/S\/StructDoc/);
   assert.match(content(f.host), /4 selected \/ 4 matching elements/);
-  assert.equal(f.controller.message('My description'), 'My description\n\nPolarion: OEM_PLATFORM-AQ4-100, OEM_PLATFORM-AQ4-101, OEM_PLATFORM-AQ4-102, OEM_PLATFORM-AQ4-103');
+  assert.equal(f.controller.message('My description'), 'My description\n\nOEM_PLATFORM-AQ4-100\nOEM_PLATFORM-AQ4-101\nOEM_PLATFORM-AQ4-102\nOEM_PLATFORM-AQ4-103');
   assert.equal(f.calls.length, 1);
 });
 test('mounting never searches; ticking loads only the saved parent snapshot and applies three references to this message', async () => {
@@ -108,7 +133,7 @@ test('mounting never searches; ticking loads only the saved parent snapshot and 
   assert.equal(f.controller.canSubmit(), false); assert.throws(() => f.controller.message('Base'), /not ready/);
   f.calls[0].resolve(workspace()); await tick();
   assert.equal(f.controller.canSubmit(), true);
-  assert.equal(f.controller.message('Base'), 'Base\n\nPolarion: VWAQ4-85585, VWAQ4-85586, VWAQ4-85587');
+  assert.equal(f.controller.message('Base'), 'Base\n\nVWAQ4-85585\nVWAQ4-85586\nVWAQ4-85587');
   f.controller.setContext({ repositoryPath: '/parent', moduleName: 'errm_adpdg', commitKey: 'modules/errm_adpdg' });
   assert.equal(f.calls.length, 1, 'ordinary re-render must not reload or reset the choice');
   f.toggle(false); assert.equal(f.controller.message('Base'), 'Base');
@@ -117,7 +142,7 @@ test('mounting never searches; ticking loads only the saved parent snapshot and 
 test('ambiguous variants of the same type are not automatically included; obsolete status stays visible', async () => {
   const f = fixture(); f.toggle(true);
   f.calls[0].resolve({ ...workspace(), elements: [...elements, item('VWAQ4-999', 'errm_adpdg 3.0', 'designelement', 'obsolete')] }); await tick();
-  assert.equal(f.controller.message('Base'), 'Base\n\nPolarion: VWAQ4-85585, VWAQ4-85587');
+  assert.equal(f.controller.message('Base'), 'Base\n\nVWAQ4-85585\nVWAQ4-85587');
   const list = f.host.children.find(node => node.className === 'polarion-commit-reference-list');
   assert.ok(list.children.some(row => row.children[2].textContent.includes('obsolete')));
   const extra = list.children.at(-1).children[0]; extra.checked = true; extra.listeners.change();
@@ -132,6 +157,17 @@ test('missing/outdated snapshots and lookup failures never silently produce a co
   }
   const f = fixture(); f.toggle(true); f.calls[0].reject(new Error('Read failed')); await tick();
   assert.equal(f.controller.canSubmit(), false);
+});
+test('diagnostics distinguish an unloaded document from a name mismatch without logging IDs or document contents', async () => {
+  const f = fixture(); f.toggle(true); f.calls[0].resolve({ ...workspace(), elements_complete: false, elements: [] }); await tick();
+  assert.match(content(f.host), /document is selected, but its elements have not been loaded/);
+  assert.match(f.logs.join('\n'), /reason=not_loaded/);
+  f.controller.setContext({ repositoryPath: '/parent', moduleName: 'errm_confi0' }); f.toggle(true);
+  f.calls[1].resolve(workspace()); await tick();
+  assert.match(content(f.host), /No saved element title matches the module name errm_confi0/);
+  assert.equal(f.controller.message('Base description'), 'Base description', 'never reuse adpdg references for confi0');
+  assert.match(f.logs.join('\n'), /total=5 missing_details=0 candidates=0 selected=0/);
+  assert.doesNotMatch(f.logs.join('\n'), /VWAQ4|errm|85585|Base description/);
 });
 test('no match means no invented references; cancel/context changes reject late responses and clear selections after commit', async () => {
   const f = fixture(); f.toggle(true); f.calls[0].resolve({ ...workspace(), elements: [] }); await tick();
