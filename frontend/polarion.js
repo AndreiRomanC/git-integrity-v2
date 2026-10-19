@@ -77,16 +77,51 @@ function polarionCommitMessageWithReferences(message, ids) {
     !String(message).split(/[^A-Za-z0-9_-]+/).includes(id));
   return added.length ? String(message).trimEnd() + '\n\n' + added.join('\n') : message;
 }
+// Track only the unedited block we inserted. A manual edit inside it transfers
+// ownership to the user: never erase their draft while toggling references.
+function createPolarionReferenceEditor(editor) {
+  let previous = editor.value, block = null;
+  function changed() {
+    const value = editor.value;
+    if (block && value !== previous) {
+      let start = 0, tail = 0;
+      while (start < previous.length && start < value.length && previous[start] === value[start]) start++;
+      while (tail < previous.length - start && tail < value.length - start && previous[previous.length - tail - 1] === value[value.length - tail - 1]) tail++;
+      const end = previous.length - tail;
+      if (end <= block.start) block.start += value.length - previous.length;
+      else if (start < block.start + block.text.length) block = null;
+    }
+    previous = value;
+  }
+  function sync(ids) {
+    changed();
+    if (block && editor.value.slice(block.start, block.start + block.text.length) === block.text) {
+      editor.value = editor.value.slice(0, block.start) + block.trailing + editor.value.slice(block.start + block.text.length);
+    }
+    block = null;
+    const base = editor.value, next = polarionCommitMessageWithReferences(base, ids);
+    if (next !== base) {
+      const start = base.trimEnd().length;
+      block = { start, text: next.slice(start), trailing: base.slice(start) };
+      editor.value = next;
+    }
+    previous = editor.value;
+  }
+  editor.addEventListener('input', changed);
+  return { sync, dispose() { editor.removeEventListener('input', changed); } };
+}
 
 // Explicit opt-in only. This controller never modifies the shared/default
 // commit message, project associations or saved commit-message history.
-function createPolarionCommitReferences({ host, invoke, onChange = () => {}, log = () => {} }) {
+function createPolarionCommitReferences({ host, invoke, editor = null, onChange = () => {}, log = () => {} }) {
   let context = null, generation = 0, enabled = false, pending = false, failure = '', source = null, sourceTime = '', rows = [], selected = new Set();
+  const messageEditor = editor ? createPolarionReferenceEditor(editor) : null;
+  const updateMessage = () => messageEditor?.sync(enabled && !pending && !failure ? [...selected] : []);
   const make = (tag, text = '') => { const node = document.createElement(tag); node.textContent = text; return node; };
   function render() {
     host.hidden = !context; host.replaceChildren(); if (!context) return;
     const label = make('label'), toggle = make('input'); toggle.type = 'checkbox'; toggle.checked = enabled;
-    toggle.addEventListener('change', () => { enabled = toggle.checked; ++generation; failure = ''; pending = false; source = null; sourceTime = ''; rows = []; selected.clear(); render(); onChange(); if (enabled) load(); });
+    toggle.addEventListener('change', () => { enabled = toggle.checked; ++generation; failure = ''; pending = false; source = null; sourceTime = ''; rows = []; selected.clear(); updateMessage(); render(); onChange(); if (enabled) load(); });
     label.append(toggle, make('span', 'Include StructDoc references for ' + context.moduleName)); host.append(label);
     const known = source || polarionDocumentSources.get(context.repositoryPath), identity = make('div'); identity.className = 'polarion-commit-source';
     if (known) {
@@ -109,11 +144,11 @@ function createPolarionCommitReferences({ host, invoke, onChange = () => {}, log
     };
     for (const item of rows) {
       const id = item.id.split('/').pop(), row = make('label'), choice = make('input'); choice.type = 'checkbox'; choice.checked = selected.has(id);
-      choice.addEventListener('change', () => { if (choice.checked) selected.add(id); else selected.delete(id); updatePreview(); onChange(); });
+      choice.addEventListener('change', () => { if (choice.checked) selected.add(id); else selected.delete(id); updateMessage(); updatePreview(); onChange(); });
       row.append(choice, make('span', id + ' · ' + item.title), make('small', (item.item_type || 'Unknown type') + ' · ' + (item.status || 'Unknown status'))); list.append(row);
     }
     updatePreview();
-    host.append(list, preview, make('small', 'Saved snapshot: ' + (sourceTime || 'date unavailable') + '. Refresh in P → StructDocs when needed. Review obsolete items; multiple candidates of the same type are not selected automatically.'));
+    host.append(list, preview, make('small', (editor ? 'Selected IDs are in the editable commit message above. Manual edits are preserved. ' : '') + 'Saved snapshot: ' + (sourceTime || 'date unavailable') + '. Refresh in P → StructDocs when needed. Review obsolete items; multiple candidates of the same type are not selected automatically.'));
   }
   async function load() {
     if (!context || !enabled) return;
@@ -135,18 +170,18 @@ function createPolarionCommitReferences({ host, invoke, onChange = () => {}, log
       selected = new Set(rows.filter(item => { const role = polarionElementRole(item.item_type); return role && counts.get(role) === 1; }).map(item => item.id.split('/').pop()));
       log(`polarion: commit_references source=saved_elements total=${workspace.elements.length} missing_details=${workspace.elements.filter(item => item.fields?.details).length} candidates=${rows.length} selected=${selected.size} no_http_requests=true`);
     } catch (error) { if (current()) { failure = String(error?.message || error); log(`polarion: commit_references failed reason=${reason} source=saved_elements no_http_requests=true`); } }
-    finally { if (current()) { pending = false; render(); onChange(); } }
+    finally { if (current()) { pending = false; updateMessage(); render(); onChange(); } }
   }
   return {
     setContext(next) {
       const key = next ? JSON.stringify([next.repositoryPath, next.moduleName, next.commitKey || '']) : '';
       if ((context?.key || '') === key) return;
-      ++generation; context = next ? { ...next, key } : null; enabled = false; pending = false; failure = ''; source = null; sourceTime = ''; rows = []; selected.clear(); render();
+      ++generation; context = next ? { ...next, key } : null; enabled = false; pending = false; failure = ''; source = null; sourceTime = ''; rows = []; selected.clear(); updateMessage(); render();
     },
     canSubmit: () => !enabled || (!pending && !failure),
-    message(base) { if (enabled && (pending || failure)) throw new Error('StructDoc references are not ready. Retry or uncheck the option.'); return enabled ? polarionCommitMessageWithReferences(base, [...selected]) : base; },
-    reset() { ++generation; enabled = false; pending = false; failure = ''; source = null; sourceTime = ''; rows = []; selected.clear(); render(); },
-    dispose() { ++generation; context = null; host.replaceChildren(); host.hidden = true; },
+    message(base) { if (enabled && (pending || failure)) throw new Error('StructDoc references are not ready. Retry or uncheck the option.'); return enabled && !editor ? polarionCommitMessageWithReferences(base, [...selected]) : base; },
+    reset() { ++generation; enabled = false; pending = false; failure = ''; source = null; sourceTime = ''; rows = []; selected.clear(); updateMessage(); render(); },
+    dispose() { ++generation; context = null; messageEditor?.dispose(); host.replaceChildren(); host.hidden = true; },
   };
 }
 function polarionRememberedUser(storage, user = null) {
@@ -216,6 +251,7 @@ function createPolarionTaskPicker({ invoke, addMessage, log = () => {}, onDocume
     el('SelectionActions').hidden = !selected || mode === 'projects';
     el('PrimaryButton').hidden = mode !== 'tasks'; el('PrimaryButton').disabled = busy || selected?.kind !== 'tasks';
     el('Associate').hidden = mode !== 'documents'; el('Associate').disabled = busy || !selected?.associationEligible;
+    el('CheckWriteAccess').disabled = busy || !context || workspace.document?.kind !== 'document';
     el('Add').hidden = mode !== 'tasks'; el('Add').disabled = busy || selected?.kind !== 'tasks';
     el('Previous').disabled = busy || !lastSearch || page <= 1; el('Next').disabled = busy || !lastSearch || !more;
     el('Pages').hidden = !lastSearch || (page <= 1 && !more);
@@ -257,6 +293,7 @@ function createPolarionTaskPicker({ invoke, addMessage, log = () => {}, onDocume
   const save = async (kind, snapshot = null, elements = null, documentId = null) => {
     const previous = workspace, primary = kind === 'primary';
     if (!primary) documentMayHaveChanged = true;
+    if (kind === 'document') { el('WriteReport').replaceChildren(); el('WriteSummary').textContent = 'Permissions not checked for this selection.'; }
     const result = await invoke('polarion_workspace', { repositoryPath: primary ? context.repository_path : documentRepositoryPath, action: kind, snapshot, elements, documentId });
     // Task/project associations keep their original repository scope. Only
     // the StructDoc source is shared with this submodule's commit dialog.
@@ -576,6 +613,44 @@ function createPolarionTaskPicker({ invoke, addMessage, log = () => {}, onDocume
     say('Read checks: ' + ok.length + '/' + rows.length + ' accepted' + (skipped.length ? ' · ' + skipped.length + ' not run' : '') + '. Details are in this tab and the application log. No data or associations changed.');
   });
   el('Diagnostics').addEventListener('click', runDiagnostics);
+  el('CheckWriteAccess').addEventListener('click', () => {
+    if (mode !== 'documents' || workspace.document?.kind !== 'document') return;
+    const source = { ...workspace.document };
+    return action(async ticket => {
+      el('WriteReport').replaceChildren(); el('WriteSummary').textContent = 'Checking the selected document · up to 25 seconds…';
+      say('Checking SOAP availability, its existing session and document permissions. No login or test edits will be sent.');
+      let result;
+      try { result = await read('permissions', source.id); }
+      catch (error) {
+        if (current(ticket)) el('WriteSummary').textContent = 'Permission checks did not complete. Edit rights remain unknown. Open the Polarion window and retry explicitly; no edits were sent.';
+        throw error;
+      }
+      if (!current(ticket)) return;
+      const checks = result.permission_checks || [];
+      const names = { security_wsdl:'Security API methods', tracker_wsdl:'Document / Work Item API methods', session_wsdl:'SOAP session API methods',
+        soap_session:'Existing SOAP session', document_resolve:'Resolve this exact document', document_edit:'Modify document object',
+        document_text:'Edit document text · homePageContent', project_document_content:'Modify document content · project-level permission' };
+      const reasons = { soap_auth_required:'SOAP sign-in required; REST connection is separate', auth_required:'Service sign-in required; REST connection is separate',
+        unsupported_method:'Method not exposed with a supported signature', document_identity_unverified:'Document identity could not be verified',
+        not_run:'Not checked · prerequisite unavailable', forbidden:'Service request denied; this is not a false permission result', api_unavailable:'Service unavailable',
+        invalid_response:'Unexpected XML response', soap_fault:'SOAP fault · category logged', timeout:'Time limit reached', response_limit:'Response exceeded the safe size limit' };
+      for (const check of checks) {
+        const row = make('div', '', 'polarion-diagnostic-result'); row.dataset.state = check.code;
+        const outcome = typeof check.allowed === 'boolean' ? (check.step === 'soap_session' ? check.allowed ? 'Signed in' : 'Not signed in to SOAP' : check.allowed ? 'Allowed by this permission check' : 'Denied by this permission check')
+          : check.code === 'ok' ? 'Read successfully · no permission verdict' : reasons[check.code] || check.code.replace(/_/g, ' ');
+        row.append(make('span', names[check.step] || 'Permission check'), make('small', outcome + (check.http ? ' · HTTP ' + check.http : '') + ' · ' + check.duration_ms + ' ms'));
+        el('WriteReport').append(row);
+        if (check.operations?.length) el('WriteReport').append(make('small', 'Advertised methods, not authorization: ' + check.operations.join(', ')));
+      }
+      const subject = checks.find(check => check.step === 'soap_session'), edit = checks.find(check => check.step === 'document_edit');
+      el('WriteSummary').textContent = (typeof edit?.allowed === 'boolean' ? 'Modify document object: ' + (edit.allowed ? 'allowed' : 'denied') + '. See the separate text/content checks below. '
+        : subject?.allowed === false || checks.some(c => ['soap_auth_required','auth_required'].includes(c.code)) ? 'SOAP has no authenticated session here. Edit rights remain unknown; the REST connection is unchanged. '
+        : 'Edit rights could not be established with the available services/session. ') +
+        'Checked: ' + (source.title || source.id) + '. No edits were sent. These checks do not prove REST POST/PATCH access or permission for every work-item type, field and workflow.';
+      log(`polarion: permissions_ui checks=${checks.length} actual_verdicts=${checks.filter(check => typeof check.allowed === 'boolean' && check.step !== 'soap_session').length} no_server_writes=true`);
+      say('Permission checks finished. See individual results; method availability is not authorization. Technical categories are in the log.');
+    });
+  });
   el('OpenDocument').addEventListener('click', openDocument);
   el('DiagnosticUrl').addEventListener('input', update);
   el('DiagnosticUrl').addEventListener('keydown', event => {
@@ -629,6 +704,7 @@ function createPolarionTaskPicker({ invoke, addMessage, log = () => {}, onDocume
       connection('unknown', 'Connection not checked · Search verifies access');
       for (const id of ['ProjectQuery','TaskQuery','DocumentQuery','ElementQuery','User']) el(id).value = '';
       el('DiagnosticUrl').value = ''; el('DiagnosticReport').replaceChildren();
+      el('WriteReport').replaceChildren(); el('WriteSummary').textContent = 'Permissions not checked. Select a LiveDoc, then run the explicit server check.';
       el('DiagnosticSummary').textContent = 'Optional, explicit GET checks. Results stay in this tab and the log.';
       el('DocumentHint').textContent = 'Search by name above, or paste an exact LiveDoc link to open it directly.';
       el('Context').textContent = ''; el('ElementType').value = ''; clearResults(); clearDetail(); renderSaved(); renderElements();

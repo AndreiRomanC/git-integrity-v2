@@ -77,6 +77,13 @@ pub struct ServerMetadata {
     #[serde(default)] max_page_size: u64,
 }
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PermissionProbe {
+    step: String, code: String, http: u16, duration_ms: u64,
+    #[serde(default)] allowed: Option<bool>,
+    #[serde(default)] operations: Vec<String>,
+}
+#[derive(Debug, Serialize, Deserialize)]
 pub struct SearchResult {
     code: String,
     #[serde(default)] http: u16,
@@ -102,6 +109,7 @@ pub struct SearchResult {
     #[serde(default)] diagnostics_omitted: usize,
     #[serde(default)] http_requests: usize,
     #[serde(default)] server_metadata: Option<ServerMetadata>,
+    #[serde(default)] permission_checks: Vec<PermissionProbe>,
 }
 #[derive(Serialize)]
 pub struct Context { repository_path: String, project: Option<Project> }
@@ -250,6 +258,11 @@ fn read_url(kind: &str, id: &str, page: usize) -> Result<String, String> {
 }
 
 fn read_args(kind: &str, resource: &str, page: usize, revision: Option<&str>) -> Result<serde_json::Value, String> {
+    if kind == "permissions" {
+        resource_segments(resource, 3)?;
+        if page != 1 || revision.is_some_and(|r| !r.is_empty()) { return Err("Permission checks require the current selected LiveDoc".into()); }
+        return Ok(serde_json::json!({ "kind":"permissions", "resourceId":resource, "project":resource.split('/').next().unwrap_or(""), "page":1 }));
+    }
     let from_link = kind == "document_link";
     let resource = if from_link { diagnostic_resource(resource)?.ok_or("Paste a StructDoc link first")? } else { resource.to_string() };
     let kind = if from_link { "document" } else { kind };
@@ -583,6 +596,7 @@ fn validate_result(raw: &str) -> Result<SearchResult, String> {
         || result.snapshot.as_ref().is_some_and(|s| !valid_snapshot(s)) || result.user_id.len() > 120 || result.user_name.len() > 500 || result.page_key.len() > 30_000
         || result.diagnostics.len() > 40 || result.http_requests > 210 || result.diagnostics_omitted > 210
         || result.diagnostics.iter().any(|d| !valid_diagnostic(d))
+        || result.permission_checks.len() > 10 || result.permission_checks.iter().any(|p| !valid_permission_probe(p))
         || !["", "project_documents", "all_documents", "work_item_modules"].contains(&result.catalog_source.as_str())
         || !valid_query_variant(&result.document_query_variant)
         || result.server_metadata.as_ref().is_some_and(|m| {
@@ -592,6 +606,32 @@ fn validate_result(raw: &str) -> Result<SearchResult, String> {
         return Err("Invalid Polarion result; no entries were added".into());
     }
     Ok(result)
+}
+
+fn permission_method(step: &str) -> Option<(&'static str, &'static str, &'static str)> {
+    Some(match step {
+        "security_wsdl" => ("GET", "SecurityWebService?wsdl", "discovery"),
+        "tracker_wsdl" => ("GET", "TrackerWebService?wsdl", "discovery"),
+        "session_wsdl" => ("GET", "SessionWebService?wsdl", "discovery"),
+        "soap_session" => ("POST", "SessionWebService", "hasSubject"),
+        "document_resolve" => ("POST", "TrackerWebService", "getModuleByLocation"),
+        "document_edit" => ("POST", "SecurityWebService", "canModifyInstance"),
+        "document_text" => ("POST", "SecurityWebService", "canModifyKey"),
+        "project_document_content" => ("POST", "SecurityWebService", "hasCurrentUserPermission"),
+        _ => return None,
+    })
+}
+fn valid_permission_probe(p: &PermissionProbe) -> bool {
+    let operations: &[&str] = match p.step.as_str() {
+        "security_wsdl" => &["canModifyInstance", "canModifyKey", "canReadInstance", "hasCurrentUserPermission", "canCreateInstances"],
+        "tracker_wsdl" => &["getModuleByLocation", "getModuleByLocationWithFields", "createWorkItemInModule", "createWorkItem", "updateModule", "updateWorkItem", "addLinkedItem"],
+        "session_wsdl" => &["hasSubject", "logInWithToken"],
+        _ => &[],
+    };
+    permission_method(&p.step).is_some() && p.http <= 599 && p.duration_ms <= 60_000 && p.operations.len() <= operations.len()
+        && p.operations.iter().all(|op| operations.contains(&op.as_str()))
+        && ["ok", "wrong_origin", "network_error", "timeout", "auth_required", "soap_auth_required", "forbidden", "api_unavailable", "invalid_response", "response_limit", "http_error", "soap_fault", "unsupported_method", "not_run", "document_identity_unverified"].contains(&p.code.as_str())
+        && (p.allowed.is_none() || (p.code == "ok" && p.http == 200 && ["soap_session", "document_edit", "document_text", "project_document_content"].contains(&p.step.as_str())))
 }
 
 fn diagnostic_endpoint(route: &str) -> Option<&'static str> {
@@ -634,6 +674,12 @@ fn valid_diagnostic(d: &HttpDiagnostic) -> bool {
 }
 
 fn log_diagnostics(id: &str, result: &SearchResult) {
+    for check in &result.permission_checks {
+        if let Some((method, service, operation)) = permission_method(&check.step) {
+            let verdict = check.allowed.map(|value| match (check.step.as_str(), value) { ("soap_session", true) => "authenticated", ("soap_session", false) => "not_authenticated", (_, true) => "allowed", (_, false) => "denied" }).unwrap_or("unknown");
+            perf_log(&format!("polarion: permission_probe request={id} step={} method={method} endpoint=/ws/services/{service} operation={operation} code={} http={} verdict={verdict} advertised_operations={} advertised_not_authorized=true no_server_writes=true no_content_logged=true", check.step, check.code, check.http, check.operations.join(",")), Duration::from_millis(check.duration_ms));
+        }
+    }
     for (i, d) in result.diagnostics.iter().enumerate() {
         perf_log(&format!("polarion: http request={id} event={} step={} method=GET endpoint={} code={} http={} media={} reason={} parameter={} page={} query_present={} id_star={} leading_wildcard={} resource_type={} count={} more={} allow={}", i + 1, d.step, diagnostic_endpoint(&d.route).unwrap_or("unknown"), d.code, d.http, d.media, d.reason, d.parameter, d.page, d.query, d.id_star, d.leading_wildcard, d.resource_type, d.count, d.more, d.allow.join(",")), Duration::from_millis(d.duration_ms));
         if d.query || !d.query_variant.is_empty() {
@@ -657,6 +703,39 @@ mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
     fn pairs(url: &str) -> HashMap<String, String> { reqwest::Url::parse(url).unwrap().query_pairs().into_owned().collect() }
+    #[test]
+    fn permission_checks_use_only_an_exact_current_document_and_an_isolated_script() {
+        let args = read_args("permissions", "VWAQ4/Structure Information/ERRM", 1, None).unwrap();
+        assert_eq!(args["kind"], "permissions"); assert_eq!(args["project"], "VWAQ4");
+        assert!(args.get("url").is_none(), "no arbitrary endpoint or SOAP operation is accepted from the caller");
+        for invalid in ["P/P-1", "P/../D", "https://elsewhere/S/D", "P/S/D/Other", "P/S\\Other/D"] {
+            assert!(read_args("permissions", invalid, 1, None).is_err());
+        }
+        assert!(read_args("permissions", "P/S/D", 2, None).is_err());
+        assert!(read_args("permissions", "P/S/D", 1, Some("123")).is_err());
+        let script = include_str!("polarion-permissions.js");
+        assert!(script.contains("25000")); assert!(script.contains("credentials: 'same-origin'"));
+        assert!(!script.contains("getRestApiToken("));
+        assert!(permission_method("updateModule").is_none());
+    }
+    #[test]
+    fn permission_bridge_accepts_actual_boolean_verdicts_but_rejects_raw_or_unbounded_metadata() {
+        let good = serde_json::json!({"code":"ok", "permission_checks":[
+            {"step":"document_edit", "code":"ok", "http":200, "duration_ms":9, "allowed":true},
+            {"step":"tracker_wsdl", "code":"ok", "http":200, "duration_ms":5, "operations":["getModuleByLocation","createWorkItemInModule"]}]});
+        assert!(validate_result(&good.to_string()).is_ok());
+        for (field, value) in [("step", serde_json::json!("updateModule")), ("code", serde_json::json!("PRIVATE_SERVER_MESSAGE")),
+            ("uri", serde_json::json!("subterra:PRIVATE_URI")), ("token", serde_json::json!("SECRET")),
+            ("http", serde_json::json!(403)), ("duration_ms", serde_json::json!(60001)),
+            ("operations", serde_json::json!(["arbitraryOperation"]))] {
+            let mut bad = good.clone(); bad["permission_checks"][0][field] = value;
+            assert!(validate_result(&bad.to_string()).is_err(), "{field}");
+        }
+        let mut bad = good.clone(); bad["permission_checks"] = serde_json::json!(vec![good["permission_checks"][0].clone(); 11]);
+        assert!(validate_result(&bad.to_string()).is_err());
+        let denied = serde_json::json!({"code":"ok", "permission_checks":[{"step":"document_text","code":"ok","http":200,"duration_ms":1,"allowed":false}]});
+        assert!(validate_result(&denied.to_string()).is_ok());
+    }
     #[test]
     fn project_search_uses_catalog_without_server_wildcard_filter() {
         let url = search_url("projects", "", "Drive Test", "", 2).unwrap();
@@ -1014,9 +1093,10 @@ async fn portal_request(app: tauri::AppHandle, mut args: serde_json::Value) -> R
         let kind = args["kind"].as_str().unwrap_or("");
         let page = args["page"].as_u64().unwrap_or(1);
         let query = args["query"].as_str().unwrap_or("");
-        let script = include_str!("polarion-search.js").replace("__DDT_ARGUMENTS__", &args.to_string());
+        let source = if kind == "permissions" { include_str!("polarion-permissions.js") } else { include_str!("polarion-search.js") };
+        let script = source.replace("__DDT_ARGUMENTS__", &args.to_string());
         let contains_terms = query.split_whitespace().filter(|word| word.chars().count() >= 3).count();
-        let matching = match kind { "projects" => "catalog_case_insensitive_contains", "documents" => "document_search_compat", "tasks" | "containers" => "contains_3plus", "diagnostics" => "explicit_read_checks", _ => "exact_resource" };
+        let matching = match kind { "projects" => "catalog_case_insensitive_contains", "documents" => "document_search_compat", "tasks" | "containers" => "contains_3plus", "diagnostics" => "explicit_read_checks", "permissions" => "explicit_permission_queries_no_writes", _ => "exact_resource" };
         perf_log(&format!("polarion: search_start request={id} kind={kind} page={page} project={} resource_present={} from_link={} probes={} query_len={} assigned_filter={} match={matching} contains_terms={contains_terms}", args["project"].as_str().filter(|p| identifier(p)).unwrap_or("none"), args["resourceId"].as_str().is_some(), args["fromLink"].as_bool().unwrap_or(false), args["probes"].as_array().map_or(0, |p| p.len()), query.len(), args["assigned"].as_bool().unwrap_or(false)), Duration::ZERO);
         let mut bridge_code = "eval_failed";
         let result = if window.eval(script).is_err() { Err("Polarion browser could not start the search".into()) }

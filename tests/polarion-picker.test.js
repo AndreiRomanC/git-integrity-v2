@@ -486,8 +486,58 @@ test('local element inspection has its own usable explicit refresh and never imp
   assert.equal(h.calls.filter(c => c.args?.action === 'document').length, 0);
   assert.ok(h.calls.every(c => ['polarion_workspace','polarion_project_context','polarion_read'].includes(c.name)));
   const html = fs.readFileSync(path.join(__dirname, '../frontend/index.html'), 'utf8');
-  assert.match(html, /Edit access · not verified/);
+  assert.match(html, /id="polarionCheckWriteAccess"/);
   assert.match(html, /No test edits are sent/);
+});
+test('permission checks are explicit and scoped to the saved document, with no association changes or REST sign-in side effects', async () => {
+  const h = harness(); h.setWorkspace({ document: docSnapshot() }); await inProject(h); h.el('TabDocuments').handlers.click();
+  assert.equal(h.calls.filter(c => c.args?.kind === 'permissions').length, 0);
+  assert.equal(h.el('CheckWriteAccess').disabled, false);
+  h.el('DocumentQuery').value = 'errm'; await h.el('DocumentSearchButton').handlers.click();
+  assert.equal(h.el('Connection').dataset.state, 'connected');
+  h.overrides.polarion_read = async args => {
+    assert.equal(args.kind, 'permissions'); assert.equal(args.resourceId, docSnapshot().id);
+    return { code: 'ok', permission_checks: [
+      { step: 'security_wsdl', code: 'ok', http: 200, duration_ms: 3, operations: ['canModifyInstance','canModifyKey'] },
+      { step: 'soap_session', code: 'ok', http: 200, duration_ms: 1, allowed: false },
+      { step: 'document_edit', code: 'not_run', http: 0, duration_ms: 0 },
+    ] };
+  };
+  const before = h.calls.length; await h.el('CheckWriteAccess').handlers.click();
+  assert.equal(h.calls.length, before + 1);
+  assert.match(h.el('WriteSummary').textContent, /no authenticated session.*rights remain unknown.*REST connection is unchanged/);
+  assert.equal(h.el('Connection').dataset.state, 'connected');
+  assert.match(h.el('WriteReport').children[1].textContent, /Advertised methods, not authorization/);
+  assert.equal(h.calls.filter(c => c.name === 'polarion_workspace' && c.args.action !== 'load').length, 0);
+  assert.equal(h.calls.filter(c => c.name === 'polarion_connect').length, 0);
+  h.dialog.close(); assert.equal(h.changedSources.length, 0);
+});
+test('actual permission results distinguish allowed, denied and unavailable checks, and late results cannot overwrite a reopened window', async () => {
+  const h = harness(); h.setWorkspace({ document: docSnapshot() }); await inProject(h); h.el('TabDocuments').handlers.click();
+  h.overrides.polarion_read = async () => ({ code: 'ok', permission_checks: [
+    { step: 'document_edit', code: 'ok', http: 200, duration_ms: 1, allowed: false },
+    { step: 'document_text', code: 'ok', http: 200, duration_ms: 1, allowed: true },
+    { step: 'project_document_content', code: 'forbidden', http: 403, duration_ms: 1 },
+  ] });
+  await h.el('CheckWriteAccess').handlers.click();
+  assert.match(h.el('WriteSummary').textContent, /Modify document object: denied/);
+  assert.match(h.el('WriteReport').children[1].children[1].textContent, /Allowed by this permission check/);
+  assert.match(h.el('WriteReport').children[2].children[1].textContent, /not a false permission result/);
+  let finish; h.overrides.polarion_read = () => new Promise(resolve => { finish = resolve; });
+  const pending = h.el('CheckWriteAccess').handlers.click();
+  h.dialog.close(); await h.picker.open('/other');
+  finish({ code: 'ok', permission_checks: [{ step: 'document_edit', code: 'ok', http: 200, duration_ms: 1, allowed: true }] }); await pending;
+  assert.equal(h.el('WriteReport').children.length, 0); assert.match(h.el('WriteSummary').textContent, /Permissions not checked/);
+});
+test('permission bridge errors do not leave a stale checking indicator and ordinary task/project use does not run checks', async () => {
+  const h = harness(); await inProject(h);
+  assert.equal(h.el('CheckWriteAccess').disabled, true);
+  assert.equal(h.calls.filter(c => c.name === 'polarion_read').length, 0);
+  h.dialog.close(); h.setWorkspace({ document: docSnapshot() }); await inProject(h); h.el('TabDocuments').handlers.click();
+  h.overrides.polarion_read = async () => { throw Error('Bridge unavailable'); };
+  await h.el('CheckWriteAccess').handlers.click();
+  assert.match(h.el('WriteSummary').textContent, /did not complete.*rights remain unknown/);
+  assert.equal(h.el('CheckWriteAccess').disabled, false);
 });
 test('a failed parent workspace read never exposes a child StructDoc as the parent commit source', async () => {
   const h = harness();

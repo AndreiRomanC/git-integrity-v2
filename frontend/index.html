@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Git DrillDown</title>
   <link rel="icon" type="image/png" href="assets/git-drilldown-mark.png">
-  <link rel="stylesheet" href="styles.css?v=20261019-structdoc-elements">
-  <link rel="stylesheet" href="polarion.css?v=20261019-structdoc-elements">
+  <link rel="stylesheet" href="styles.css?v=20261019-structdoc-message-permissions">
+  <link rel="stylesheet" href="polarion.css?v=20261019-structdoc-message-permissions">
 </head>
 <body>
   <div class="app-shell">
@@ -352,6 +352,7 @@
       <h2>Commit selected changes</h2>
       <p>Only changes inside <strong id="commitScopeName">the current folder</strong> will be staged for this scoped commit. Existing staged changes outside this scope stay staged, but are not included.</p>
       <label><span>Commit message</span><textarea id="scopeCommitMessage" placeholder="Describe this change…"></textarea></label>
+      <section id="scopePolarionRefs" class="polarion-commit-references" hidden aria-label="Polarion references for scoped submodule commits"></section>
       <button type="button" data-polarion-search="scope" class="polarion-search-button">P⌕ Find task</button>
       <div class="commit-dialog-actions"><button value="cancel">Cancel</button><button value="default" id="confirmScopeCommit" class="confirm" disabled>Commit selection</button></div>
     </form>
@@ -799,7 +800,7 @@
             <p id="polarionResultSummary" class="polarion-result-summary" role="status" hidden></p>
             <div id="polarionResults" class="polarion-results" aria-label="Polarion search results" hidden></div>
             <div id="polarionPages" class="polarion-pages" hidden><button type="button" id="polarionPrevious" disabled>← Previous</button><button type="button" id="polarionNext" disabled>Next →</button></div>
-            <div id="polarionSelectionActions" class="polarion-selection-actions" hidden><button type="button" id="polarionView" disabled>Read details</button><button type="button" id="polarionPrimaryButton" disabled>Set primary task</button><button type="button" id="polarionAssociate" hidden disabled>Use this StructDoc &amp; load elements</button></div>
+            <div id="polarionSelectionActions" class="polarion-selection-actions" hidden><button type="button" id="polarionAssociate" class="confirm" hidden disabled>Select this StructDoc &amp; load elements</button><button type="button" id="polarionView" disabled>Read details</button><button type="button" id="polarionPrimaryButton" disabled>Set primary task</button></div>
             <section id="polarionDetail" class="polarion-detail" hidden aria-label="Polarion item details"></section>
           </div>
         </section>
@@ -837,7 +838,12 @@
             <p id="polarionElementEmpty" class="polarion-empty" hidden></p>
             <section id="polarionElementDetail" class="polarion-detail" hidden aria-label="Selected StructDoc element details"></section>
           </section>
-          <details class="polarion-diagnostics"><summary>Edit access · not verified</summary><small>Successful reads do not establish permission to edit this document or its work items. Git DrillDown currently makes no changes on Polarion. Editing requires both REST endpoint permissions and document/work-item permissions; workflow and field restrictions may also apply. No test edits are sent to check access.</small></details>
+          <section class="polarion-diagnostics" aria-label="Selected StructDoc permissions">
+            <div class="polarion-diagnostic-actions"><strong>Document permissions</strong><button type="button" id="polarionCheckWriteAccess" disabled>Check permissions · server</button></div>
+            <p id="polarionWriteSummary" role="status">Permissions not checked. Select a LiveDoc, then run the explicit server check.</p>
+            <small>No test edits are sent. Explicit WSDL GETs and read-only SOAP permission queries only · up to 25 seconds. SOAP may require a separate authenticated session; REST sign-in alone does not prove SOAP access. No automatic login. Methods advertised by the server are not proof of authorization.</small>
+            <div id="polarionWriteReport" aria-label="Document permission check results"></div>
+          </section>
           <details class="polarion-diagnostics"><summary>Troubleshooting · read access</summary>
             <small id="polarionDiagnosticSummary">Optional, explicit GET checks. Results stay in this tab and the log.</small>
             <div class="polarion-diagnostic-actions"><button type="button" id="polarionDiagnostics">Check read access</button><small>Uses the link or same-project saved StructDoc · up to 25 seconds · no automatic sign-in</small></div>
@@ -850,16 +856,16 @@
       <footer><span>Read-only on Polarion · local snapshots outside Git</span><button value="cancel">Close</button><button type="button" id="polarionAdd" class="confirm" disabled>Add to Commit List</button></footer>
     </form>
   </dialog>
-  <script src="polarion.js?v=20261019-structdoc-elements"></script>
-  <script src="console-context.js?v=20261019-structdoc-elements"></script>
-  <script src="graph-model.js?v=20261019-structdoc-elements"></script>
-  <script src="submodule-state.js?v=20261019-structdoc-elements"></script>
-  <script src="submodule-versions.js?v=20261019-structdoc-elements"></script>
-  <script src="local-diff.js?v=20261019-structdoc-elements"></script>
-  <script src="local-drive.js?v=20261019-structdoc-elements"></script>
-  <script src="pr-status.js?v=20261019-structdoc-elements"></script>
-  <script src="refresh-coordinator.js?v=20261019-structdoc-elements"></script>
-  <script src="comparison-authors.js?v=20261019-structdoc-elements"></script>
-  <script src="app.js?v=20261019-structdoc-elements"></script>
+  <script src="polarion.js?v=20261019-structdoc-message-permissions"></script>
+  <script src="console-context.js?v=20261019-structdoc-message-permissions"></script>
+  <script src="graph-model.js?v=20261019-structdoc-message-permissions"></script>
+  <script src="submodule-state.js?v=20261019-structdoc-message-permissions"></script>
+  <script src="submodule-versions.js?v=20261019-structdoc-message-permissions"></script>
+  <script src="local-diff.js?v=20261019-structdoc-message-permissions"></script>
+  <script src="local-drive.js?v=20261019-structdoc-message-permissions"></script>
+  <script src="pr-status.js?v=20261019-structdoc-message-permissions"></script>
+  <script src="refresh-coordinator.js?v=20261019-structdoc-message-permissions"></script>
+  <script src="comparison-authors.js?v=20261019-structdoc-message-permissions"></script>
+  <script src="app.js?v=20261019-structdoc-message-permissions"></script>
 </body>
 </html>

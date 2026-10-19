@@ -45,6 +45,27 @@ test('reference context exists only for a submodule commit, never a general pare
   const commit = app.match(/async function commitSubmoduleChanges\([^]*?\n}/)[0];
   assert.match(commit, /polarionContext: submoduleCommitReferenceContext\(entry\)/);
   assert.doesNotMatch(commit, /recordDefaultCommitMessage|addMessage|alsoPush: true/);
+  const drawer = app.match(/function syncDrawerPolarionReferences\([^]*?\n}/)[0];
+  assert.match(drawer, /editor: refs\.commitMessage/);
+  assert.match(drawer, /setContext\(submoduleCommitReferenceContext\(\)\)/);
+  const css = fs.readFileSync(path.join(__dirname, '../frontend/polarion.css'), 'utf8');
+  assert.match(css, /\.commit-area:has\(> \.polarion-commit-references:not\(\[hidden\]\)\) \{ min-height: 0; overflow-y: auto/);
+});
+test('scoped commits show references inside a submodule and in its full repository, never for a parent gitlink bump or normal folder', () => {
+  const app = fs.readFileSync(path.join(__dirname, '../frontend/app.js'), 'utf8');
+  const state = { repository: { path: '/parent' } };
+  const context = { state, submoduleNameFromPath: value => value.split('/').pop(), submoduleBoundaryFor: path => path.startsWith('modules/errm_adpdg') ? 'modules/errm_adpdg' : null };
+  vm.createContext(context);
+  for (const name of ['submoduleCommitReferenceContext','scopeCommitReferenceContext']) vm.runInContext(app.match(new RegExp('function ' + name + '\\([^]*?\\n}'))[0], context);
+  assert.equal(context.scopeCommitReferenceContext({ path: 'src/file.c' }), null);
+  assert.equal(context.scopeCommitReferenceContext({ path: 'modules/errm_adpdg' }), null, 'root gitlink is a parent commit, not an inner commit');
+  assert.equal(context.scopeCommitReferenceContext({ path: 'modules/errm_adpdg/src/file.c' }).moduleName, 'errm_adpdg');
+  state.repository = { path: '/parent/modules/errm_adpdg' };
+  state.repositoryOrigin = { repositoryPath: state.repository.path, parentPath: '/parent', submoduleName: 'errm_adpdg' };
+  assert.equal(context.scopeCommitReferenceContext({ path: 'src/file.c' }).repositoryPath, '/parent');
+  assert.equal(context.scopeCommitReferenceContext({ path: '' }).moduleName, 'errm_adpdg');
+  assert.match(app.match(/function openScopeCommit\([^]*?\n}/)[0], /editor: refs\.scopeCommitMessage/);
+  assert.match(app.match(/async function commitSelectedScope\([^]*?\n}/)[0], /!scopePolarionReferences\.canSubmit\(\)/);
 });
 test('opening P forwards the same parent StructDoc source as commit, including an independently selected submodule graph', () => {
   const app = fs.readFileSync(path.join(__dirname, '../frontend/app.js'), 'utf8');
@@ -76,7 +97,7 @@ test('metadata-only selection and changed revisions are distinct from complete o
   assert.equal(api.polarionElementsState(workspace()), 'ready');
   assert.equal(api.polarionElementsState({ ...workspace(), elements: [] }), 'ready');
 });
-function fixture(knownWorkspace = null) {
+function fixture(knownWorkspace = null, editor = null) {
   class Node {
     constructor() { this.children = []; this.listeners = {}; this.checked = false; this.hidden = false; }
     append(...nodes) { this.children.push(...nodes); }
@@ -86,7 +107,7 @@ function fixture(knownWorkspace = null) {
   const calls = [], logs = [], host = new Node(); let changes = 0;
   const context = { document: { createElement: () => new Node() } };
   vm.createContext(context); vm.runInContext(fs.readFileSync(path.join(__dirname, '../frontend/polarion.js'), 'utf8'), context);
-  const controller = context.createPolarionCommitReferences({ host, invoke: (command, args) => new Promise((resolve, reject) => calls.push({ command, args, resolve, reject })),
+  const controller = context.createPolarionCommitReferences({ host, editor, invoke: (command, args) => new Promise((resolve, reject) => calls.push({ command, args, resolve, reject })),
     onChange: () => { changes++; }, log: text => logs.push(text) });
   if (knownWorkspace) context.polarionRememberDocument('/parent', knownWorkspace);
   const toggle = checked => { const box = host.children[0].children[0]; box.checked = checked; box.listeners.change(); };
@@ -95,6 +116,48 @@ function fixture(knownWorkspace = null) {
 }
 const tick = () => new Promise(resolve => setImmediate(resolve));
 const content = node => [node.textContent || '', ...(node.children || []).map(content)].join('\n');
+function messageEditor(value = 'My base description') {
+  const listeners = new Map();
+  return { value, addEventListener: (name, fn) => listeners.set(name, fn), removeEventListener: name => listeners.delete(name),
+    type(value) { this.value = value; listeners.get('input')?.(); }, listeners };
+}
+test('selected StructDoc IDs appear in the actual editable commit message, never appended again on submit', async () => {
+  const editor = messageEditor('P:OEM-1 - Selected description\nMy module note'), f = fixture(null, editor);
+  f.toggle(true); f.calls[0].resolve(workspace()); await tick();
+  assert.equal(editor.value, 'P:OEM-1 - Selected description\nMy module note\n\nVWAQ4-85585\nVWAQ4-85586\nVWAQ4-85587');
+  assert.equal(f.controller.message(editor.value), editor.value);
+  editor.type(editor.value.replace('My module note', 'Edited module note'));
+  const list = f.host.children.find(n => n.className === 'polarion-commit-reference-list');
+  const box = list.children[1].children[0]; box.checked = false; box.listeners.change();
+  assert.match(editor.value, /Edited module note/); assert.doesNotMatch(editor.value, /85586/);
+  f.toggle(false); assert.equal(editor.value, 'P:OEM-1 - Selected description\nEdited module note');
+  f.controller.dispose(); assert.equal(editor.listeners.size, 0);
+});
+test('manually edited or removed reference text stays authoritative, including cancel, reset and submit', async () => {
+  const editor = messageEditor(), f = fixture(null, editor);
+  f.toggle(true); f.calls[0].resolve(workspace()); await tick();
+  editor.type(editor.value.replace('VWAQ4-85586', 'OEM-99 - manual note'));
+  const manual = editor.value;
+  assert.equal(f.controller.message(manual), manual, 'do not restore a removed checked ID at submit');
+  f.toggle(false); assert.equal(editor.value, manual, 'uncheck must not erase user edits inside the former inserted block');
+  f.controller.reset(); assert.equal(editor.value, manual);
+});
+test('context changes remove only untouched generated references, and stale local reads cannot inject into another module draft', async () => {
+  const editor = messageEditor(), f = fixture(null, editor);
+  f.toggle(true); f.calls[0].resolve(workspace()); await tick();
+  f.controller.setContext(null); assert.equal(editor.value, 'My base description');
+  f.controller.setContext({ repositoryPath: '/parent', moduleName: 'errm_adpdg' }); f.toggle(true);
+  f.toggle(false); f.calls[1].resolve(workspace()); await tick();
+  assert.equal(editor.value, 'My base description');
+});
+test('unchecking restores original trailing whitespace and preserves notes typed after generated references', async () => {
+  const editor = messageEditor('Base  \n'), f = fixture(null, editor);
+  f.toggle(true); f.calls[0].resolve(workspace()); await tick();
+  f.toggle(false); assert.equal(editor.value, 'Base  \n');
+  editor.type('Base'); f.toggle(true); f.calls[1].resolve(workspace()); await tick();
+  editor.type(editor.value + '\nAdditional manual note');
+  f.toggle(false); assert.equal(editor.value, 'Base\nAdditional manual note');
+});
 test('commit shows the remembered selected StructDoc without IO, then verifies the source and previews IDs on opt-in', async () => {
   const f = fixture(workspace());
   assert.match(content(f.host), /StructDoc: VWAQ4-SW_ERRM_StructDoc_2.0.0/);

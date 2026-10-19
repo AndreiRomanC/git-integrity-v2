@@ -1661,16 +1661,36 @@ fn embedded_git_repo_error(relative: &str) -> String {
     format!("\"{relative}\" contains its own .git and can't be staged as a plain folder. Either delete its .git folder and stage it as regular files, or add it properly as a Git submodule instead (Explorer → right-click the parent folder → Add submodule).")
 }
 
-// Returns (url, branch) from a single `repo.submodules()` scan/find — callers
-// that need both (entry_details did) used to call a single-field version of
-// this twice, each re-parsing .gitmodules/config and re-scanning the
-// submodule list from scratch just to read one field out of the same entry.
+// Look up only the selected submodule. Repository::submodules() materializes
+// every submodule (including workdir/index/HEAD metadata) before a caller
+// can find one path; doing that twice per selection was the URLs bottleneck.
+// Keep libgit2's configuration interpretation rather than parsing URL/branch
+// values ourselves, and allow callers to share an already-open parent.
+fn submodule_url_and_branch_in(repo: &Repository, path: &str) -> (Option<String>, Option<String>) {
+    let submodule = repo.find_submodule(path).ok()
+        .filter(|item| normalized(item.path()) == path && (item.url().is_some() || item.branch().is_some()))
+        .or_else(|| {
+            // Lookup accepts a name OR path. If another registration's name
+            // shadows this path, or an indexed path produces an index-only
+            // placeholder instead of its differently-named registration,
+            // resolve just the name from .gitmodules. Never enumerate repos.
+            let config = git2::Config::open(&repo.workdir()?.join(".gitmodules")).ok()?;
+            let mut entries = config.entries(Some(r"^submodule\..*\.path$")).ok()?;
+            while let Some(entry) = entries.next() {
+                let entry = entry.ok()?;
+                if entry.value() != Some(path) { continue; }
+                let name = entry.name()?.strip_prefix("submodule.")?.strip_suffix(".path")?;
+                return repo.find_submodule(name).ok().filter(|item| normalized(item.path()) == path);
+            }
+            None
+        });
+    submodule.map(|item| (item.url().map(String::from), item.branch().map(String::from)))
+        .unwrap_or((None, None))
+}
+
 fn submodule_url_and_branch(repository: &str, path: &str) -> (Option<String>, Option<String>) {
-    (|| -> Option<(Option<String>, Option<String>)> {
-        let repo = internal_repository(repository).ok()?;
-        let submodule = repo.submodules().ok()?.into_iter().find(|item| normalized(item.path()) == path)?;
-        Some((submodule.url().map(String::from), submodule.branch().map(String::from)))
-    })().unwrap_or((None, None))
+    internal_repository(repository).ok().map(|repo| submodule_url_and_branch_in(&repo, path))
+        .unwrap_or((None, None))
 }
 
 fn submodule_value(repository: &str, path: &str, field: &str) -> Option<String> {
@@ -2411,13 +2431,17 @@ fn submodule_browser_base(parent_repo_path: &str, submodule_rel_path: &str) -> R
     let relative = safe_relative_path(submodule_rel_path)?;
     let wanted = normalized(&relative);
     let parent = internal_repository(parent_repo_path)?;
-    let parent_remote = first_remote_url(&parent);
+    let sub_repo = internal_submodule_repository(&Path::new(parent_repo_path).join(&relative)).ok();
+    let (configured, _) = submodule_url_and_branch_in(&parent, &wanted);
+    submodule_browser_base_in(&parent, sub_repo.as_ref(), configured.as_deref())
+}
 
-    let own_origin = internal_submodule_repository(&Path::new(parent_repo_path).join(&relative)).ok()
-        .and_then(|repo| first_remote_url(&repo));
-    let configured = parent.submodules().ok().into_iter().flatten()
-        .find(|item| normalized(item.path()) == wanted)
-        .and_then(|item| item.url().map(String::from));
+// Same precedence and relative-URL rules as the path-based wrapper, using
+// the selected submodule's already-read configuration and open repository.
+// This is only local URL construction: no fetch, credentials or network I/O.
+fn submodule_browser_base_in(parent: &Repository, sub_repo: Option<&Repository>, configured: Option<&str>) -> Result<String, String> {
+    let parent_remote = first_remote_url(parent);
+    let own_origin = sub_repo.and_then(first_remote_url);
 
     // Deliberately never fall back to the *parent's* own URL here: that is
     // exactly the wrong-destination bug this function exists to prevent. If
@@ -2425,12 +2449,12 @@ fn submodule_browser_base(parent_repo_path: &str, submodule_rel_path: &str) -> R
     let resolved = if let Some(url) = own_origin.as_deref().filter(|u| !is_relative_git_url(u)) {
         url.to_string()
     } else if let Some(cfg) = configured.filter(|u| !u.trim().is_empty()) {
-        if is_relative_git_url(&cfg) {
+        if is_relative_git_url(cfg) {
             let base = parent_remote.as_deref()
                 .ok_or("The parent repository has no remote to resolve this submodule's relative URL against")?;
-            resolve_relative_git_url(base, &cfg)
+            resolve_relative_git_url(base, cfg)
         } else {
-            cfg
+            cfg.to_string()
         }
     } else if let Some(url) = own_origin {
         // Only a relative origin and no .gitmodules entry to cross-check —
@@ -6144,22 +6168,20 @@ fn entry_details_inner(repository_path: String, relative_path: String) -> Result
     // frontend fires only after the rest of the (fast) details are already
     // showing, instead of blocking on it up front.
     let last: Option<(String, String, String, String)> = None;
-    // For a submodule entry, this used to independently open/discover its
-    // repository up to 5 times (url, branch, push status, unpushed commits,
-    // HEAD commit) plus re-scan the parent's .gitmodules twice (url, branch)
-    // — each of those was real, avoidable disk I/O for what's logically one
-    // "describe this submodule" read. Open the submodule's own repo once
-    // here and share it; the parent-side url/branch lookup is now a single
-    // scan too (submodule_url_and_branch), not two.
+    // Share one strict submodule open across URL construction and the
+    // existing state/commit/tag reads. URL/branch are looked up once for
+    // this path, not by enumerating all of the parent's submodules twice.
     let (submodule_url, submodule_web_url, submodule_branch, submodule_push_status, submodule_unpushed_commits, submodule_commit, submodule_commit_tags, submodule_snapshot) = if kind == "submodule" {
         let step = Instant::now();
-        let (url, branch) = submodule_url_and_branch(&repository_path, &relative_string);
-        let web_url = submodule_browser_base(&repository_path, &relative_string).ok();
-        log_phase("submodule_urls", step);
+        let sub_repo = internal_submodule_repository(&absolute);
+        log_phase("submodule_open", step);
         let step = Instant::now();
-        match internal_submodule_repository(&absolute) {
+        let parent = internal_repository(&repository_path).ok();
+        let (url, branch) = parent.as_ref().map(|repo| submodule_url_and_branch_in(repo, &relative_string)).unwrap_or((None, None));
+        let web_url = parent.as_ref().and_then(|repo| submodule_browser_base_in(repo, sub_repo.as_ref().ok(), url.as_deref()).ok());
+        log_phase("submodule_urls", step);
+        match sub_repo {
             Ok(sub_repo) => {
-                log_phase("submodule_open", step);
                 let step = Instant::now();
                 let snapshot = inspect_submodule_state_in(&sub_repo);
                 log_phase("state_and_remote_relation", step);
@@ -12220,6 +12242,168 @@ mod tests {
         assert_eq!(last.unwrap().subject, "Initial commit", "entry_last_commit must still find it correctly when actually asked");
 
         fs::remove_dir_all(repository).unwrap();
+    }
+
+    fn submodule_property_fixture() -> PathBuf {
+        let base = PathBuf::from(unique_status_epoch_test_path("submodule-properties"));
+        create_libgit2_repository(&base, "README.md");
+        create_libgit2_repository(&base.join("vendor/dep"), "module.txt");
+        let parent = Repository::open(&base).unwrap();
+        parent.remote("origin", "git@github.vitesco.io:eng/parent.git").unwrap();
+        let sub = Repository::open(base.join("vendor/dep")).unwrap();
+        sub.remote("origin", "https://github.vitesco.io/tools/effective.git").unwrap();
+        let head = sub.head().unwrap().target().unwrap();
+        let entry = git2::IndexEntry {
+            ctime: git2::IndexTime::new(0, 0), mtime: git2::IndexTime::new(0, 0),
+            dev: 0, ino: 0, mode: 0o160000, uid: 0, gid: 0, file_size: 0,
+            id: head, flags: 0, flags_extended: 0, path: b"vendor/dep".to_vec(),
+        };
+        let mut config = git2::Config::open(&base.join(".gitmodules")).unwrap();
+        config.set_str("submodule.logical-name.path", "vendor/dep").unwrap();
+        config.set_str("submodule.logical-name.url", "../dep.git").unwrap();
+        config.set_str("submodule.logical-name.branch", "release/1.0").unwrap();
+        let mut index = parent.index().unwrap();
+        index.add(&entry).unwrap(); index.add_path(Path::new(".gitmodules")).unwrap(); index.write().unwrap();
+        let tree = parent.find_tree(index.write_tree().unwrap()).unwrap();
+        let previous = parent.head().unwrap().peel_to_commit().unwrap();
+        let signature = git2::Signature::now("Test", "test@example.com").unwrap();
+        parent.commit(Some("HEAD"), &signature, &signature, "Register submodule", &tree, &[&previous]).unwrap();
+        base
+    }
+
+    #[test]
+    fn submodule_properties_targeted_lookup_preserves_config_values_and_is_read_only() {
+        let base = submodule_property_fixture();
+        let parent = Repository::open(&base).unwrap();
+        // Preserve existing precedence, rather than confusing the declared
+        // URL/default branch with the checked-out branch or an effective URL.
+        parent.config().unwrap().set_str("submodule.logical-name.url", "https://local.example/override.git").unwrap();
+        parent.config().unwrap().set_str("submodule.logical-name.branch", "local-override").unwrap();
+        let before: Vec<_> = [".git/HEAD", ".git/index", ".git/config", ".gitmodules", "vendor/dep/.git/config", "vendor/dep/module.txt"]
+            .into_iter().map(|path| (path, fs::read(base.join(path)).unwrap())).collect();
+        let expected = parent.submodules().unwrap().into_iter().find(|item| item.path() == Path::new("vendor/dep"))
+            .map(|item| (item.url().map(String::from), item.branch().map(String::from))).unwrap();
+        assert_eq!(expected, (Some("../dep.git".into()), Some("release/1.0".into())));
+        for _ in 0..3 {
+            assert_eq!(submodule_url_and_branch_in(&parent, "vendor/dep"), expected);
+            let details = entry_details_inner(base.to_string_lossy().into_owned(), "vendor/dep".into()).unwrap();
+            assert_eq!((details.submodule_url, details.submodule_branch), expected);
+            assert_eq!(details.submodule_web_url.as_deref(), Some("https://github.vitesco.io/tools/effective"));
+            assert!(details.submodule_initialized); assert!(!details.submodule_is_dirty);
+        }
+        for (path, content) in before { assert_eq!(fs::read(base.join(path)).unwrap(), content, "properties must not write {path}"); }
+        fs::write(base.join("vendor/dep/module.txt"), "local edit").unwrap();
+        let details = entry_details_inner(base.to_string_lossy().into_owned(), "vendor/dep".into()).unwrap();
+        assert!(details.submodule_is_dirty, "the real local-state check must still execute");
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn submodule_properties_targeted_lookup_does_not_confuse_a_name_with_another_path() {
+        let base = submodule_property_fixture();
+        let mut config = git2::Config::open(&base.join(".gitmodules")).unwrap();
+        config.set_str("submodule.vendor/dep.path", "vendor/other").unwrap();
+        config.set_str("submodule.vendor/dep.url", "../wrong.git").unwrap();
+        config.set_str("submodule.vendor/dep.branch", "wrong-branch").unwrap();
+        let parent = Repository::open(&base).unwrap();
+        assert_eq!(parent.find_submodule("vendor/dep").unwrap().path(), Path::new("vendor/other"), "fixture must exercise the name/path collision");
+        assert_eq!(submodule_url_and_branch_in(&parent, "vendor/dep"), (Some("../dep.git".into()), Some("release/1.0".into())));
+        assert_eq!(submodule_url_and_branch_in(&parent, "vendor/missing"), (None, None));
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn submodule_properties_uninitialized_and_missing_remotes_preserve_url_fallbacks() {
+        let base = submodule_property_fixture();
+        // No submodule repo: keep its declared values and resolve a relative
+        // URL against the parent, without silently opening the parent as it.
+        fs::remove_dir_all(base.join("vendor/dep/.git")).unwrap();
+        let details = entry_details_inner(base.to_string_lossy().into_owned(), "vendor/dep".into()).unwrap();
+        assert!(!details.submodule_initialized); assert!(details.submodule_current_branch.is_none());
+        assert_eq!(details.submodule_url.as_deref(), Some("../dep.git"));
+        assert_eq!(details.submodule_branch.as_deref(), Some("release/1.0"));
+        assert_eq!(details.submodule_web_url.as_deref(), Some("https://github.vitesco.io/eng/dep"));
+        let parent = Repository::open(&base).unwrap(); parent.remote_delete("origin").unwrap();
+        assert!(submodule_browser_base(&base.to_string_lossy(), "vendor/dep").is_err());
+        let mut config = git2::Config::open(&base.join(".gitmodules")).unwrap();
+        config.set_str("submodule.logical-name.url", "https://github.vitesco.io/tools/absolute.git").unwrap();
+        config.set_str("submodule.logical-name.branch", ".").unwrap();
+        assert_eq!(submodule_browser_base(&base.to_string_lossy(), "vendor/dep").unwrap(), "https://github.vitesco.io/tools/absolute");
+        assert_eq!(submodule_url_and_branch_in(&parent, "vendor/dep").1.as_deref(), Some("."));
+        assert!(submodule_browser_base(&base.to_string_lossy(), "../outside").is_err());
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    // Opt-in, local-only before/after measurement. Reuse exactly the same
+    // on-disk fixture across both builds; setup and warm-up are not timed.
+    #[test]
+    #[ignore = "set DDT_SUBMODULE_BENCH_ROOT to a temporary directory; creates 551 local submodules"]
+    fn benchmark_submodule_property_selection() {
+        let base = PathBuf::from(std::env::var("DDT_SUBMODULE_BENCH_ROOT").expect("set DDT_SUBMODULE_BENCH_ROOT"));
+        let parent_path = base.join("parent");
+        if !parent_path.exists() {
+            create_libgit2_repository(&parent_path, "README.md");
+            let parent = Repository::open(&parent_path).unwrap();
+            parent.remote("origin", "https://example.invalid/eng/parent.git").unwrap();
+            let mut modules = String::new();
+            let mut index = parent.index().unwrap();
+            for number in 0..551 {
+                let relative = format!("modules/module-{number:03}");
+                let absolute = parent_path.join(&relative);
+                create_libgit2_repository(&absolute, "module.txt");
+                let sub = Repository::open(&absolute).unwrap();
+                let head = sub.head().unwrap().target().unwrap();
+                sub.remote("origin", &format!("https://example.invalid/eng/module-{number:03}.git")).unwrap();
+                sub.reference("refs/remotes/origin/main", head, true, "fixture").unwrap();
+                let entry = git2::IndexEntry {
+                    ctime: git2::IndexTime::new(0, 0), mtime: git2::IndexTime::new(0, 0),
+                    dev: 0, ino: 0, mode: 0o160000, uid: 0, gid: 0, file_size: 0,
+                    id: head, flags: 0, flags_extended: 0, path: relative.as_bytes().to_vec(),
+                };
+                index.add(&entry).unwrap();
+                // Keep the name distinct from the path, as Git allows.
+                modules.push_str(&format!("[submodule \"dependency-{number:03}\"]\n\tpath = {relative}\n\turl = ../module-{number:03}.git\n\tbranch = main\n"));
+            }
+            fs::write(parent_path.join(".gitmodules"), modules).unwrap();
+            index.add_path(Path::new(".gitmodules")).unwrap();
+            index.write().unwrap();
+            let tree = parent.find_tree(index.write_tree().unwrap()).unwrap();
+            let head = parent.head().unwrap().peel_to_commit().unwrap();
+            let signature = git2::Signature::now("Benchmark", "benchmark@example.invalid").unwrap();
+            parent.commit(Some("HEAD"), &signature, &signature, "Register 551 local submodules", &tree, &[&head]).unwrap();
+        }
+        let parent = parent_path.to_string_lossy().into_owned();
+        assert_eq!(cached_index_metadata(&parent).1.len(), 551);
+        let measure_urls = |path: &str| {
+            let start = Instant::now();
+            let (url, branch) = submodule_url_and_branch(&parent, path);
+            let web = submodule_browser_base(&parent, path).unwrap();
+            assert!(url.is_some()); assert_eq!(branch.as_deref(), Some("main"));
+            assert!(web.starts_with("https://example.invalid/eng/module-"));
+            start.elapsed().as_secs_f64() * 1000.0
+        };
+        let measure_details = |path: &str| {
+            let start = Instant::now();
+            let details = entry_details_inner(parent.clone(), path.into()).unwrap();
+            let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+            assert_eq!(details.kind, "submodule"); assert!(details.submodule_initialized);
+            assert_eq!(details.submodule_branch.as_deref(), Some("main"));
+            assert!(details.submodule_web_url.is_some());
+            elapsed
+        };
+        for mode in ["repeat", "switch"] {
+            measure_urls("modules/module-000"); measure_details("modules/module-000");
+            let mut urls = Vec::new(); let mut details = Vec::new();
+            for sample in 0..7 {
+                let path = format!("modules/module-{:03}", if mode == "repeat" { 0 } else { sample % 3 });
+                // Prime only the existing metadata lookups, not URL data.
+                cached_git_metadata(&parent, &path); cached_sorted_lookups(&parent);
+                urls.push(measure_urls(&path)); details.push(measure_details(&path));
+            }
+            urls.sort_by(f64::total_cmp); details.sort_by(f64::total_cmp);
+            println!("SUBMODULE_BENCH mode={mode} samples=7 modules=551 urls_min_ms={:.3} urls_median_ms={:.3} urls_max_ms={:.3} details_min_ms={:.3} details_median_ms={:.3} details_max_ms={:.3}",
+                urls[0], urls[3], urls[6], details[0], details[3], details[6]);
+        }
     }
 
     #[test]

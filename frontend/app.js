@@ -129,6 +129,7 @@ const parentReturnSnapshots = new Map(); // Session only; at most four nesting c
 let submoduleMenuData = null;
 let submoduleMenuEntry = null;
 let drawerPolarionReferences = null;
+let scopePolarionReferences = null;
 let commitWriteRunning = false;
 let versionFilter = 'branch';
 let submoduleCrossSelected = null;
@@ -764,7 +765,7 @@ function customPrompt(message, defaultValue = '', options = {}) {
     okButton.textContent = options.okLabel || 'OK';
     const blocker = $('#appPromptBlocker'); blocker.hidden = !options.blockingReason; blocker.textContent = options.blockingReason || '';
     okButton.disabled = Boolean(options.blockingReason);
-    const references = createPolarionCommitReferences({ host: $('#appPromptPolarionRefs'), invoke, log: text => jsPerfLog(text, 0), onChange: () => { okButton.disabled = Boolean(options.blockingReason) || !references.canSubmit(); } });
+    const references = createPolarionCommitReferences({ host: $('#appPromptPolarionRefs'), editor: input, invoke, log: text => jsPerfLog(text, 0), onChange: () => { okButton.disabled = Boolean(options.blockingReason) || !references.canSubmit(); } });
     references.setContext(options.polarionContext || null);
     const cleanup = (result) => { references.dispose(); dialog.close(); okButton.removeEventListener('click', onOk); cancelButton.removeEventListener('click', onCancel); input.removeEventListener('keydown', onKeydown); dialog.removeEventListener('cancel', onCancel); resolve(result); };
     const onOk = () => { if (!options.blockingReason && references.canSubmit()) cleanup(input.value.trim() ? references.message(input.value) : input.value); };
@@ -3459,11 +3460,17 @@ function openScopeCommit() {
   const scope = selectedScope();
   if (blockDetachedHeadWork('commit')) return;
   if (!scopeHasChanges(scope)) { const msg = `Nothing to commit — "${scope.name}" has no uncommitted local changes.`; status(msg); showOperationToast(msg, 'error'); return; }
-  refs.commitScopeName.textContent = scope.name; refs.scopeCommitMessage.value = refs.defaultCommitMessage.value.trim(); refs.confirmScopeCommit.disabled = !refs.scopeCommitMessage.value.trim(); refs.commitScopeDialog.showModal(); refs.scopeCommitMessage.focus();
+  refs.commitScopeName.textContent = scope.name; refs.scopeCommitMessage.value = refs.defaultCommitMessage.value.trim();
+  scopePolarionReferences?.dispose();
+  scopePolarionReferences = createPolarionCommitReferences({ host: $('#scopePolarionRefs'), editor: refs.scopeCommitMessage, invoke, log: text => jsPerfLog(text, 0),
+    onChange: () => { refs.confirmScopeCommit.disabled = !refs.scopeCommitMessage.value.trim() || !scopePolarionReferences.canSubmit(); } });
+  scopePolarionReferences.setContext(scopeCommitReferenceContext(scope));
+  refs.confirmScopeCommit.disabled = !refs.scopeCommitMessage.value.trim(); refs.commitScopeDialog.showModal(); refs.scopeCommitMessage.focus();
 }
 
 async function commitSelectedScope(event) {
   event.preventDefault(); const scope = selectedScope(); const message = refs.scopeCommitMessage.value.trim(); if (!message) return;
+  if (scopePolarionReferences && !scopePolarionReferences.canSubmit()) return;
   if (blockDetachedHeadWork('commit')) return;
   if (!invoke) { refs.commitScopeDialog.close(); status(`Preview: committed ${scope.name}`); return; }
   if (!scopeHasChanges(scope)) { const msg = `Nothing to commit — "${scope.name}" has no uncommitted local changes.`; refs.commitScopeDialog.close(); status(msg); showOperationToast(msg, 'error'); return; }
@@ -7996,16 +8003,24 @@ function submoduleCommitReferenceContext(entry = null) {
   if (origin?.repositoryPath === state.repository?.path && origin.parentPath) return { repositoryPath: origin.parentPath, moduleName: origin.submoduleName || submoduleNameFromPath(origin.submodulePath), commitKey: state.repository.path };
   return null; // Parent-project/global commit messages never receive these IDs.
 }
+function scopeCommitReferenceContext(scope) {
+  const boundary = submoduleBoundaryFor(scope.path);
+  // commit_path redirects only paths INSIDE a gitlink. Its root commits the
+  // version pointer in the parent; never attach the inner module's IDs there.
+  if (boundary && scope.path.startsWith(boundary + '/')) return { repositoryPath: state.repository.path, moduleName: submoduleNameFromPath(boundary), commitKey: scope.path };
+  return submoduleCommitReferenceContext();
+}
 function syncDrawerPolarionReferences() {
   const host = $('#commitPolarionRefs');
   if (!host) return;
-  if (!drawerPolarionReferences) drawerPolarionReferences = createPolarionCommitReferences({ host, invoke, log: text => jsPerfLog(text, 0), onChange: () => renderChanges() });
+  if (!drawerPolarionReferences) drawerPolarionReferences = createPolarionCommitReferences({ host, editor: refs.commitMessage, invoke, log: text => jsPerfLog(text, 0), onChange: () => renderChanges() });
   drawerPolarionReferences.setContext(submoduleCommitReferenceContext());
 }
 const polarionTaskPicker = createPolarionTaskPicker({ invoke, log: text => jsPerfLog(text, 0), onDocumentChange() {
   // Re-opt in against the updated local source instead of committing IDs
   // previously checked in an already-open Working Tree drawer. No Git scan.
   drawerPolarionReferences?.reset();
+  scopePolarionReferences?.reset();
   if (refs.changesDrawer.classList.contains('open')) renderChanges();
 }, addMessage(message) {
   refs.defaultCommitMessage.value = message;
@@ -8021,7 +8036,7 @@ document.querySelectorAll('[data-polarion-search]').forEach(button => button.add
     : context.isSubmodule ? '' : (state.selectedEntry?.relative_path || state.currentPath);
   const references = mode === 'context' && context.isSubmodule
     ? { repositoryPath: context.parentPath, moduleName: context.name, commitKey: context.relativePath }
-    : submoduleCommitReferenceContext(state.selectedEntry?.kind === 'submodule' ? state.selectedEntry : null);
+    : mode === 'scope' ? scopeCommitReferenceContext(selectedScope()) : submoduleCommitReferenceContext(state.selectedEntry?.kind === 'submodule' ? state.selectedEntry : null);
   polarionTaskPicker.open(mode === 'context' ? context.path : state.repository?.path, path, references);
 }));
 
@@ -8652,7 +8667,8 @@ document.addEventListener('click', event => {
 });
 refs.commitScope.addEventListener('click', openScopeCommit);
 refs.showPathHistory.addEventListener('click', showSelectedHistory);
-refs.scopeCommitMessage.addEventListener('input', () => { refs.confirmScopeCommit.disabled = !refs.scopeCommitMessage.value.trim(); });
+refs.scopeCommitMessage.addEventListener('input', () => { refs.confirmScopeCommit.disabled = !refs.scopeCommitMessage.value.trim() || Boolean(scopePolarionReferences && !scopePolarionReferences.canSubmit()); });
+refs.commitScopeDialog.addEventListener('close', () => { scopePolarionReferences?.dispose(); scopePolarionReferences = null; });
 refs.confirmScopeCommit.addEventListener('click', commitSelectedScope);
 refs.folderRestoreModeHead.addEventListener('change', () => { refs.folderRestoreCommitPicker.hidden = true; invalidateFolderRestorePreview(); renderFolderRestorePreview(null); });
 refs.folderRestoreModeCommit.addEventListener('change', () => { refs.folderRestoreCommitPicker.hidden = false; invalidateFolderRestorePreview(); renderFolderRestorePreview(null); loadFolderRestoreCommits(); });

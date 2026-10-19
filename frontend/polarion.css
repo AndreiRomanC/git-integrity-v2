@@ -32,6 +32,10 @@
 .polarion-saved-card .polarion-card-actions { display: flex; flex: 1 1 100%; gap: 6px; flex-wrap: wrap; }
 .polarion-task-dialog .polarion-card-actions button { font-size: 11px; height: 28px; }
 .polarion-selection-actions { display: flex; flex-wrap: wrap; gap: 7px; margin: 10px 0; }
+.polarion-task-dialog #polarionAssociate { height: auto; min-height: 38px; padding: 8px 14px; font-weight: 600; white-space: normal; text-align: left; }
+.polarion-task-dialog #polarionAssociate:not(:disabled) { background: #286ca8; color: #fff; border: 1px solid #5ba6ec; box-shadow: 0 1px 3px #0004; }
+.commit-area:has(> .polarion-commit-references:not([hidden])) { min-height: 0; overflow-y: auto; }
+.commit-area:has(> .polarion-commit-references:not([hidden])) textarea { flex: 0 0 96px; min-height: 96px; box-sizing: border-box; }
 .polarion-task-dialog .polarion-results { max-height: 280px; margin-top: 14px; }
 .polarion-open-document { padding: 14px; border: 1px solid var(--border); border-radius: 8px; margin-bottom: 14px; background: var(--surface); }
 .polarion-open-document > summary { cursor: pointer; color: var(--muted); font-size: 12px; line-height: 1.5; }

@@ -13,7 +13,7 @@ function promptHarness() {
   }
   let notify, context, allowed = true, disposed = 0;
   const sandbox = { $, invoke: () => { throw new Error('No Git or server operation expected'); }, jsPerfLog() {},
-    createPolarionCommitReferences(options) { notify = options.onChange; return { setContext(value) { context = value; }, canSubmit: () => allowed,
+    createPolarionCommitReferences(options) { notify = options.onChange; assert.ok(options.editor); return { setContext(value) { context = value; }, canSubmit: () => allowed,
       message: base => base + '\n\nPolarion: OEM-1', dispose: () => { disposed++; } }; } };
   vm.createContext(sandbox); vm.runInContext(app.match(/function customPrompt\([^]*?\n}/)[0], sandbox);
   return { $, sandbox, refs: value => { allowed = value; notify(); }, context: () => context, disposed: () => disposed };

@@ -133,3 +133,15 @@ test('backend only adds phase timings, without splitting the command or adding s
   assert.equal((body.match(/inspect_submodule_state_in\(/g) || []).length, 1);
   assert.doesNotMatch(body, /refresh_status|git\([^\n]*fetch/);
 });
+test('submodule properties reuse one selected lookup and strict open without enumerating every submodule', () => {
+  const lookup = repository.slice(repository.indexOf('fn submodule_url_and_branch_in('), repository.indexOf('fn submodule_value('));
+  const browser = repository.slice(repository.indexOf('fn submodule_browser_base('), repository.indexOf('fn launch_browser('));
+  const details = repository.slice(repository.indexOf('fn entry_details_inner('), repository.indexOf('// The "last commit touching this path" lookup'));
+  assert.doesNotMatch(lookup + browser + details, /\.submodules\(/);
+  assert.match(lookup, /find_submodule\(path\)/);
+  assert.match(lookup, /normalized\(item\.path\(\)\) ===? path/);
+  assert.equal((details.match(/submodule_url_and_branch_in\(/g) || []).length, 1);
+  assert.equal((details.match(/internal_submodule_repository\(/g) || []).length, 1);
+  assert.match(details, /submodule_browser_base_in\(repo, sub_repo\.as_ref\(\)\.ok\(\), url\.as_deref\(\)\)/);
+  assert.doesNotMatch(browser, /git\(|fetch\(|statuses\(|cached_|OnceLock/);
+});
