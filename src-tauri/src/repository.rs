@@ -17,7 +17,7 @@ use stash::{abort_stash_conflict, drop_stash, list_stashes, list_submodule_stash
 #[cfg(test)]
 use branches::{branch_creation_context, checkout_commit, checkout_remote_tracking_branch, create_branch, create_branch_at_commit, create_submodule_branch, delete_branch, graph_branch_divergence, rename_branch, restore_exact_checkpoint_inner, switch_branch};
 #[cfg(test)]
-use branches::merge::{abort_merge, apply_submodule_merge_revision, complete_merge, conflict_sides, list_conflicts, merge_branch, merge_in_progress, resolve_conflict, submodule_merge_review};
+use branches::merge::{abort_merge, apply_submodule_merge_revision, complete_merge_request_inner as complete_merge, conflict_sides, list_conflicts, merge_branch_inner as merge_branch, merge_in_progress, resolve_conflict, submodule_merge_review_request_inner as submodule_merge_review};
 #[cfg(test)]
 use command_console::{is_definitely_read_only_terminal_command, is_read_only_git_subcommand, run_git_command, run_terminal_command_inner, tokenize_git_args};
 use remotes::fetch_all_remotes_inner;
@@ -1232,16 +1232,41 @@ fn configure_git_command(command: &mut Command) {
 // not just slow (the low-speed-limit config above already handles a stalled
 // HTTP transfer; this catches everything else: a wedged credential/OS-level
 // prompt slipping past GIT_TERMINAL_PROMPT, a filesystem lock held forever,
-// an SSH connection that hangs past its own timeout on some networks). Ten
-// minutes is generous enough that even a real, actively-transferring clone
-// or fetch on the 30GB+ monorepo over a slow connection should finish well
-// within it; a git command that hasn't produced anything in that long is
-// not "big data", it's actually stuck. The child is force-killed on timeout
-// so the app itself is never left waiting on it either.
+// an SSH connection that hangs past its own timeout on some networks).
+// This is an absolute wall-clock limit, NOT an inactivity timer. Recursive
+// submodule updates can legitimately exceed ten minutes while making progress;
+// they use the same longer budget as exact checkpoint restoration.
 const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(600);
+const SUBMODULE_UPDATE_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+const SUBMODULE_UPDATE_TIMEOUT_LABEL: &str = "60 minutes";
 
-fn run_with_timeout(command: Command) -> Result<std::process::Output, String> {
-    run_with_timeout_labeled(command, GIT_COMMAND_TIMEOUT, "Git", "10 minutes")
+fn is_submodule_update(args: &[&str]) -> bool {
+    let mut index = 0;
+    // Recognize real Git global options, not arbitrary occurrences of the words
+    // "submodule update" in a commit message, alias definition, or pathspec.
+    while let Some(arg) = args.get(index) {
+        match *arg {
+            "-C" | "-c" | "--git-dir" | "--work-tree" | "--namespace" | "--config-env" => {
+                if args.get(index + 1).is_none() { return false; }
+                index += 2;
+            }
+            "--no-pager" | "--paginate" | "-p" | "--no-optional-locks" | "--literal-pathspecs" => index += 1,
+            arg if arg.starts_with("--git-dir=") || arg.starts_with("--work-tree=")
+                || arg.starts_with("--namespace=") || arg.starts_with("--config-env=")
+                || (arg.starts_with("-C") && arg.len() > 2)
+                || (arg.starts_with("-c") && arg.len() > 2) => index += 1,
+            _ => break,
+        }
+    }
+    if args.get(index) != Some(&"submodule") { return false; }
+    index += 1;
+    while matches!(args.get(index), Some(&"--quiet") | Some(&"-q") | Some(&"--cached")) { index += 1; }
+    args.get(index) == Some(&"update")
+}
+
+fn git_command_timeout(args: &[&str]) -> (Duration, &'static str) {
+    if is_submodule_update(args) { (SUBMODULE_UPDATE_TIMEOUT, SUBMODULE_UPDATE_TIMEOUT_LABEL) }
+    else { (GIT_COMMAND_TIMEOUT, "10 minutes") }
 }
 
 fn run_with_timeout_labeled(mut command: Command, timeout: Duration, program_label: &str, timeout_label: &str) -> Result<std::process::Output, String> {
@@ -1422,11 +1447,15 @@ pub fn recent_git_commands() -> Vec<RecentGitCommand> {
 }
 
 fn git(path: &str, args: &[&str]) -> Result<String, String> {
-    git_with_timeout(path, args, GIT_COMMAND_TIMEOUT, "10 minutes")
+    let (timeout, label) = git_command_timeout(args);
+    git_with_timeout(path, args, timeout, label)
 }
 
 fn git_with_timeout(path: &str, args: &[&str], timeout: Duration, timeout_label: &str) -> Result<String, String> {
     let history_id = begin_git_command(path, args);
+    if is_submodule_update(args) {
+        perf_log(&format!("submodule_update: start repo={} timeout_seconds={} force_requested={}", anonymized_repository_id(path), timeout.as_secs(), args.contains(&"--force")), Duration::ZERO);
+    }
     let mut command = Command::new("git");
     // `-c` overrides must come before the subcommand to be recognized as
     // global git config, not passed through to it — configure_git_command's
@@ -5292,7 +5321,7 @@ fn has_recent_publish_preflight(repository_path: &str, branch: &str, remote: &st
 fn is_local_only_url(url: &str) -> bool {
     let url = url.trim();
     if url.is_empty() { return true; }
-    if url.starts_with("file://") { return true; }
+    if url.get(..7).is_some_and(|prefix| prefix.eq_ignore_ascii_case("file://")) { return true; }
     if let Some((scheme, _)) = url.split_once("://") {
         if !scheme.is_empty() && scheme.chars().all(|value| value.is_ascii_alphanumeric() || value == '+' || value == '-') { return false; }
     }
@@ -5301,7 +5330,9 @@ fn is_local_only_url(url: &str) -> bool {
     // isn't a single-letter Windows drive and doesn't itself look like a path.
     if let Some(colon) = url.find(':') {
         let before = &url[..colon];
-        let looks_like_drive_letter = before.len() == 1 && url[colon + 1..].starts_with(['/', '\\']);
+        // Be conservative for drive-relative Windows paths such as C:repo,
+        // too. They must not masquerade as scp-style server addresses.
+        let looks_like_drive_letter = before.len() == 1 && before.as_bytes()[0].is_ascii_alphabetic();
         if !looks_like_drive_letter && !before.is_empty() && !before.contains('/') && !before.contains('\\') { return false; }
     }
     // No scheme, no scp-shorthand host — an absolute/relative filesystem
@@ -5318,11 +5349,10 @@ fn is_local_only_url(url: &str) -> bool {
 // push_submodule_inner already fetches as part of an explicit push) so a
 // commit pushed moments ago from elsewhere isn't reported as missing just
 // because this app's local remote-tracking refs hadn't caught up yet. A
-// fetch failure (offline, unreachable) only ever leaves the existing local
-// knowledge in place — that can only make this check *more* cautious, never
-// less, which is the right direction to err in for something that decides
-// whether it's safe to publish.
-fn submodule_reference_risks(repository_path: &str, relative_path: &str, oids: &[git2::Oid], refresh_remote: bool) -> (HashMap<git2::Oid, Option<&'static str>>, Option<String>, Option<git2::Oid>) {
+// fetch failure (offline, unreachable) leaves the existing local knowledge
+// in place. Those refs may be stale; this is not proof of current server
+// availability (the Publish explanation discloses this existing limitation).
+fn submodule_reference_risks(repository_path: &str, relative_path: &str, oids: &[git2::Oid], refresh_remote: bool, require_network_origin: bool) -> (HashMap<git2::Oid, Option<&'static str>>, Option<String>, Option<git2::Oid>) {
     let started = Instant::now();
     let all = |risk| oids.iter().copied().map(|oid| (oid, risk)).collect();
     // The *effective* clone source: what .gitmodules itself records for this
@@ -5357,6 +5387,15 @@ fn submodule_reference_risks(repository_path: &str, relative_path: &str, oids: &
         None => return (all(Some("no_remote")), None, current_oid),
         Some(url) if is_local_only_url(url) => return (all(Some("local_only")), configured_url, current_oid),
         Some(_) => {}
+    }
+    // A portable .gitmodules URL does not make refs fetched from a local
+    // mirror evidence of server availability. Report uncertainty rather than
+    // silently accepting them; do not alter either URL or fetch another source.
+    // Keep the existing local Commit guard's reachability behavior unchanged;
+    // the stronger source requirement applies to Publish and its preview.
+    if require_network_origin && local_origin_url.as_deref().is_some_and(is_local_only_url) {
+        perf_log(&format!("publish_safety: submodule={} local origin; server availability unverified", relative_path), started.elapsed());
+        return (all(Some("local_origin")), configured_url, current_oid);
     }
     // Verify only against origin. Fetching every configured remote was both
     // slow and subtly unsafe: a commit available only from an unrelated
@@ -5485,7 +5524,7 @@ fn unpushed_submodule_references(repository_path: &str, branch: &str, remote: &s
                     if let Some(target_oid) = target_submodule_oid {
                         if revision_seen.insert(target_oid) { revisions.push(target_oid); }
                     }
-                    let (mut risks, configured_url, current_oid) = submodule_reference_risks(&repository_path, &path, &revisions, refresh_remotes);
+                    let (mut risks, configured_url, current_oid) = submodule_reference_risks(&repository_path, &path, &revisions, refresh_remotes, true);
                     let current_submodule_oid = current_oid.map(|oid| oid.to_string());
                     let target_is_known_safe = target_submodule_oid.and_then(|oid| risks.get(&oid).copied()).is_some_and(|risk| risk.is_none());
                     let target_submodule_oid_string = target_submodule_oid.map(|oid| oid.to_string());
@@ -5580,9 +5619,10 @@ fn submodule_publish_safety_check(repository_path: &str, branch: &str, remote: &
             }
             "no_remote" => "has no configured remote".to_string(),
             "local_only" => format!("is only reachable from a filesystem path or file:// URL ({})", v.configured_url.as_deref().unwrap_or("?")),
+            "local_origin" => "has a local-filesystem origin; fetching it cannot verify availability on the configured server".to_string(),
             _ => "could not be checked locally".to_string(),
         };
-        format!("Submodule {} {} — its commit {} may exist only on this machine. Other users will not be able to restore it after cloning.", v.relative_path, reason, &v.submodule_oid[..8.min(v.submodule_oid.len())])
+        format!("Submodule {} {} — its commit {} may exist only on this machine. Other users may be unable to restore it after cloning.", v.relative_path, reason, &v.submodule_oid[..8.min(v.submodule_oid.len())])
     }).collect();
     Err(format!("{UNPUSHED_SUBMODULE_OVERRIDABLE_PREFIX}{}", lines.join("\n")))
 }
@@ -6353,10 +6393,11 @@ fn init_submodule_inner(repository_path: String, relative_path: String) -> Resul
     let step = Instant::now();
     let result = git(&repository_path, &["-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive", "--", &normalized_path]);
     perf_log(&format!("init_submodule: update {normalized_path} {}", if result.is_ok() { "ok" } else { "ERROR" }), step.elapsed());
-    result?;
+    // Failed updates may already have cloned or checked out some modules.
+    // Eviction is cheap and must happen before returning either outcome.
     invalidate_git_metadata(&repository_path);
     invalidate_submodule_sync(&repository_path);
-    Ok(())
+    result.map(|_| ()).map_err(|error| format!("{error}\nSubmodule initialization/update is incomplete. Some local files may already have changed; they were not rolled back automatically. Inspect the refreshed working tree before committing."))
 }
 
 // Which of the known branch/remote tips contain `target`, closest tip first.
@@ -7674,8 +7715,13 @@ fn commit_staged_inner(repository_path: String, message: String) -> Result<Strin
     let _lock = lock_handle.lock().unwrap();
     log_repo_write_lock_acquired(&repository_path, "commit_staged", queue_started.elapsed());
     let step = Instant::now();
-    let repo = internal_repository(&repository_path)?;
+    let mut repo = internal_repository(&repository_path)?;
     perf_log("commit_staged: internal_repository (open)", step.elapsed());
+    if repo.state() == git2::RepositoryState::Merge {
+        // A later, explicit Commit must preserve MERGE_HEAD's parent(s) and
+        // validate the prepared merge tree, not create a one-parent checkpoint.
+        return branches::merge::complete_merge_internal(&mut repo, &repository_path, message.trim());
+    }
     let step = Instant::now();
     let mut index = repo.index().map_err(|error| error.message().to_string())?;
     perf_log("commit_staged: repo.index()", step.elapsed());
@@ -7742,7 +7788,7 @@ fn ensure_changed_submodule_gitlinks_are_publishable(repository_path: &str, repo
         if oid.is_zero() { continue; }
         let path = normalized(path);
         if !seen.insert((path.clone(), oid)) { continue; }
-        let (mut risks, _, _) = submodule_reference_risks(repository_path, &path, &[oid], true);
+        let (mut risks, _, _) = submodule_reference_risks(repository_path, &path, &[oid], true, false);
         if risks.remove(&oid).flatten() == Some("unpushed") {
             let short = oid.to_string();
             blocked.push(format!("{path} -> {}", &short[..8.min(short.len())]));
@@ -7765,6 +7811,9 @@ fn commit_selected_internal(repository_path: &str, files: &[String], message: &s
     let _lock = lock_handle.lock().unwrap();
     log_repo_write_lock_acquired(repository_path, "commit_selected_internal", queue_started.elapsed());
     let repo = internal_repository(repository_path)?;
+    if repo.state() == git2::RepositoryState::Merge {
+        return Err("A merge is in progress. Partial file/folder commits cannot finalize a merge safely. Resolve conflicts, review/update submodules, then use the repository-wide Commit or Complete merge to commit the entire prepared merge result with both parents. Nothing was committed.".into());
+    }
     // A submodule folder can be deleted straight from disk (Finder/terminal, or a
     // failed clone) without going through this app's own removal flow, leaving it
     // still registered as a gitlink. In that case `add_to_index` would need to
@@ -10764,28 +10813,46 @@ mod tests {
         fs::remove_dir_all(base).unwrap();
     }
 
-    // Test-only: rewrites .gitmodules' recorded `url =` line(s) to a fake
-    // https:// address, without touching the submodule's own actual "origin"
-    // remote (still whatever local bare repo the test already pushes/fetches
-    // against — there's no real network in these tests). This is exactly the
-    // real-world shape is_local_only_url exists to tell apart:
-    // .gitmodules records the URL a *fresh* clone would use, while this one
-    // checkout's own "origin" can legitimately be reconfigured to something
-    // else entirely (a mirror, a cache — or, here, the local temp dir
-    // standing in for "a real server" for testing purposes). Assumes exactly
-    // one `[submodule]` block, matching every fixture that calls this.
-    fn fake_https_gitmodules_url(repository_path: &Path) {
-        let gitmodules_path = repository_path.join(".gitmodules");
-        let content = fs::read_to_string(&gitmodules_path).unwrap();
-        let updated: String = content.lines().map(|line| {
-            if line.trim_start().starts_with("url =") { "\turl = https://example.test/repo.git".to_string() } else { line.to_string() }
-        }).collect::<Vec<_>>().join("\n") + "\n";
-        fs::write(&gitmodules_path, updated).unwrap();
+    struct PublishTestServer(std::process::Child);
+
+    impl Drop for PublishTestServer {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    // Real Git transport, bound only to loopback and serving only this test's
+    // temporary repositories. A fake HTTPS .gitmodules URL with a filesystem
+    // origin must no longer pass as proof that a commit is on a server.
+    fn network_submodule_test_remote(repository_path: &Path) -> PublishTestServer {
+        let sub_path = repository_path.join("vendor/dep");
+        let source = fs::canonicalize(run_git_capture(&sub_path, &["remote", "get-url", "origin"])).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let mut server = PublishTestServer(Command::new("git")
+            .args(["daemon", "--export-all", "--enable=receive-pack", "--listen=127.0.0.1"])
+            .arg(format!("--port={}", address.port()))
+            .arg(format!("--base-path={}", source.parent().unwrap().display()))
+            .arg(source.parent().unwrap())
+            .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap());
+        let mut ready = false;
+        for _ in 0..100 {
+            if std::net::TcpStream::connect(address).is_ok() { ready = true; break; }
+            assert!(server.0.try_wait().unwrap().is_none(), "test Git server exited early");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(ready, "test Git server did not start");
+        let url = format!("git://{address}/{}", source.file_name().unwrap().to_string_lossy());
+        run_git(&sub_path, &["remote", "set-url", "origin", &url]);
+        run_git(repository_path, &["config", "-f", ".gitmodules", "submodule.vendor/dep.url", &url]);
+        server
     }
 
     // Test-only: deletes .gitmodules' `url =` line(s) entirely, simulating a
     // submodule with no URL recorded there at all (a hand-edited or
-    // malformed .gitmodules) — distinct from fake_https_gitmodules_url above.
+    // malformed .gitmodules).
     // Assumes exactly one `[submodule]` block, matching every fixture that
     // calls this.
     fn remove_gitmodules_url_line(repository_path: &Path) {
@@ -11558,6 +11625,192 @@ mod tests {
         fs::remove_dir_all(base).unwrap();
     }
 
+    fn setup_incoming_submodule_removal(conflict: bool) -> (PathBuf, PathBuf, String, Oid) {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-merge-removal-{suffix}"));
+        let parent = base.join("parent");
+        let dependency = base.join("dependency");
+        create_libgit2_repository(&parent, "README.md");
+        create_libgit2_repository(&dependency, "module.txt");
+        run_git(&parent, &["-c", "protocol.file.allow=always", "submodule", "add", dependency.to_str().unwrap(), "vendor/dep"]);
+        fs::write(parent.join("conflict.txt"), "base\n").unwrap();
+        run_git(&parent, &["add", "."]);
+        run_git(&parent, &["commit", "-m", "Base with dep"]);
+        let pin = parent_gitlink_oid(&Repository::open(&parent).unwrap(), "vendor/dep", false).unwrap();
+        let branch = run_git_capture(&parent, &["branch", "--show-current"]).trim().to_string();
+        run_git(&parent, &["switch", "-c", "feature"]);
+        fs::write(parent.join("feature.txt"), "feature\n").unwrap();
+        if conflict { fs::write(parent.join("conflict.txt"), "feature\n").unwrap(); }
+        run_git(&parent, &["add", "."]);
+        run_git(&parent, &["commit", "-m", "Feature leaves dep unchanged"]);
+        run_git(&parent, &["switch", &branch]);
+        run_git(&parent, &["rm", "-f", "vendor/dep"]);
+        if conflict { fs::write(parent.join("conflict.txt"), "incoming\n").unwrap(); }
+        run_git(&parent, &["commit", "-am", "Incoming removes dep and registration"]);
+        run_git(&parent, &["switch", "feature"]);
+        (base, parent, branch, pin)
+    }
+
+    #[test]
+    fn merge_removes_unchanged_incoming_deleted_submodule_and_later_commit_keeps_both_parents() {
+        let (base, parent, incoming, _) = setup_incoming_submodule_removal(false);
+        let path = parent.to_string_lossy().into_owned();
+        let before = Repository::open(&parent).unwrap().head().unwrap().target().unwrap();
+        let incoming_oid = Repository::open(&parent).unwrap().find_branch(&incoming, BranchType::Local).unwrap().get().target().unwrap();
+        assert_eq!(merge_branch(path.clone(), "".into(), incoming).unwrap().status, "submodule_review");
+        let review = submodule_merge_review(path.clone(), "".into()).unwrap();
+        assert_eq!(review.items.len(), 1);
+        assert_eq!(review.items[0].base, review.items[0].current);
+        assert!(review.items[0].incoming.is_none() && review.items[0].result.is_none());
+        assert!(!review.items[0].registration_issue);
+        assert_eq!(Repository::open(&parent).unwrap().head().unwrap().target(), Some(before));
+        // The ordinary repository-wide Commit is deliberately used later.
+        let oid = commit_staged_inner(path, "Verified merge after submodule update".into()).unwrap();
+        let repo = Repository::open(&parent).unwrap();
+        let commit = repo.find_commit(Oid::from_str(&oid).unwrap()).unwrap();
+        assert_eq!(commit.parent_ids().collect::<Vec<_>>(), vec![before, incoming_oid]);
+        assert!(commit.tree().unwrap().get_path(Path::new("vendor/dep")).is_err());
+        assert_eq!(repo.state(), git2::RepositoryState::Clean);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn merge_removal_survives_resolving_an_unrelated_file_conflict() {
+        let (base, parent, incoming, _) = setup_incoming_submodule_removal(true);
+        let path = parent.to_string_lossy().into_owned();
+        let outcome = merge_branch(path.clone(), "".into(), incoming).unwrap();
+        assert_eq!(outcome.status, "conflicts");
+        assert_eq!(outcome.conflicts.len(), 1);
+        resolve_conflict(path.clone(), "".into(), "conflict.txt".into(), "ours".into()).unwrap();
+        assert!(parent_gitlink_oid(&Repository::open(&parent).unwrap(), "vendor/dep", true).is_none());
+        complete_merge(path, "".into(), "Merge with removal".into()).unwrap();
+        assert!(parent_gitlink_oid(&Repository::open(&parent).unwrap(), "vendor/dep", false).is_none());
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn merge_blocks_a_resurrected_gitlink_against_staged_config_without_changing_head_or_index() {
+        let (base, parent, incoming, _) = setup_incoming_submodule_removal(false);
+        let path = parent.to_string_lossy().into_owned();
+        merge_branch(path.clone(), "".into(), incoming).unwrap();
+        let repo = Repository::open(&parent).unwrap();
+        let before = repo.head().unwrap().target().unwrap();
+        let head_tree = repo.head().unwrap().peel_to_tree().unwrap();
+        let old_config = repo.find_blob(head_tree.get_name(".gitmodules").unwrap().id()).unwrap();
+        // The working copy is valid, but the staged merge configuration removed it.
+        fs::write(parent.join(".gitmodules"), old_config.content()).unwrap();
+        let mut index = repo.index().unwrap();
+        let old = head_tree.get_path(Path::new("vendor/dep")).unwrap();
+        index.add(&git2::IndexEntry { ctime: git2::IndexTime::new(0, 0), mtime: git2::IndexTime::new(0, 0), dev: 0, ino: 0, mode: 0o160000, uid: 0, gid: 0, file_size: 0, id: old.id(), flags: 0, flags_extended: 0, path: b"vendor/dep".to_vec() }).unwrap();
+        index.write().unwrap();
+        let index_before = fs::read(repo.path().join("index")).unwrap();
+        let error = complete_merge(path.clone(), "".into(), "Must not publish orphan".into()).unwrap_err();
+        assert!(error.contains("without a matching path") && error.contains("vendor/dep"), "{error}");
+        assert_eq!(Repository::open(&parent).unwrap().head().unwrap().target(), Some(before));
+        assert_eq!(fs::read(repo.path().join("index")).unwrap(), index_before);
+        let review = submodule_merge_review(path.clone(), "".into()).unwrap();
+        assert!(review.items[0].registration_issue && review.items[0].suspicious);
+        assert!(commit_staged_inner(path.clone(), "Also blocked from normal Commit".into()).is_err());
+        apply_submodule_merge_revision(path.clone(), "".into(), "vendor/dep".into(), String::new()).unwrap();
+        commit_staged_inner(path, "Explicitly remove obsolete pointer".into()).unwrap();
+        assert!(parent_gitlink_oid(&Repository::open(&parent).unwrap(), "vendor/dep", false).is_none());
+        assert_eq!(fs::read(parent.join(".gitmodules")).unwrap(), old_config.content(), "unstaged config must not be changed by validation/commit");
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn merge_review_detects_unchanged_gitlinks_when_only_their_registration_was_removed() {
+        let (base, parent, incoming, pin) = setup_incoming_submodule_removal(false);
+        run_git(&parent, &["switch", &incoming]);
+        run_git(&parent, &["update-index", "--add", "--cacheinfo", &format!("160000,{pin},vendor/dep")]);
+        run_git(&parent, &["commit", "-m", "Incoming accidentally retained dep gitlink"]);
+        run_git(&parent, &["switch", "feature"]);
+        run_git(&parent, &["-c", "protocol.file.allow=always", "submodule", "update", "--init", "vendor/dep"]);
+        let path = parent.to_string_lossy().into_owned();
+        assert_eq!(merge_branch(path.clone(), "".into(), incoming).unwrap().status, "submodule_review");
+        let review = submodule_merge_review(path.clone(), "".into()).unwrap();
+        assert_eq!(review.items.len(), 1);
+        let item = &review.items[0];
+        assert_eq!(item.base, item.current);
+        assert_eq!(item.current, item.incoming);
+        assert_eq!(item.incoming, item.result);
+        assert!(item.registration_issue && item.suspicious);
+        assert!(complete_merge(path, "".into(), "Blocked".into()).is_err());
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn submodule_delete_modify_conflict_can_choose_removal_without_deleting_local_files() {
+        let (base, parent, incoming, _) = setup_incoming_submodule_removal(false);
+        run_git(&parent, &["-c", "protocol.file.allow=always", "submodule", "update", "--init", "vendor/dep"]);
+        let sub = parent.join("vendor/dep");
+        fs::write(sub.join("module.txt"), "feature module work\n").unwrap();
+        run_git(&sub, &["commit", "-am", "New feature pin"]);
+        run_git(&parent, &["add", "vendor/dep"]);
+        run_git(&parent, &["commit", "-m", "Feature updates dep"]);
+        let path = parent.to_string_lossy().into_owned();
+        let outcome = merge_branch(path.clone(), "".into(), incoming).unwrap();
+        assert_eq!(outcome.status, "conflicts");
+        assert!(outcome.conflicts.iter().any(|c| c.path == "vendor/dep" && c.kind == "submodule" && !c.has_theirs));
+        resolve_conflict(path.clone(), "".into(), "vendor/dep".into(), "theirs".into()).unwrap();
+        assert!(list_conflicts(path.clone(), "".into()).unwrap().is_empty());
+        assert!(parent_gitlink_oid(&Repository::open(&parent).unwrap(), "vendor/dep", true).is_none());
+        assert_eq!(fs::read_to_string(sub.join("module.txt")).unwrap(), "feature module work\n");
+        assert!(sub.join(".git").exists());
+        commit_staged_inner(path, "Accept incoming removal".into()).unwrap();
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn partial_commit_during_merge_is_refused_before_any_scratch_index_or_ref_change() {
+        let (base, parent, incoming, _) = setup_incoming_submodule_removal(false);
+        let path = parent.to_string_lossy().into_owned();
+        merge_branch(path.clone(), "".into(), incoming).unwrap();
+        let repo = Repository::open(&parent).unwrap();
+        let head = repo.head().unwrap().target();
+        let index = fs::read(repo.path().join("index")).unwrap();
+        let error = commit_files_inner(path, vec![".gitmodules".into()], "Partial merge commit".into()).unwrap_err();
+        assert!(error.contains("Partial file/folder commits"));
+        assert_eq!(Repository::open(&parent).unwrap().head().unwrap().target(), head);
+        assert_eq!(fs::read(repo.path().join("index")).unwrap(), index);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn merge_validation_uses_staged_config_and_accepts_quoted_paths_with_independent_names() {
+        let (base, parent, incoming, pin) = setup_incoming_submodule_removal(false);
+        let path = parent.to_string_lossy().into_owned();
+        merge_branch(path.clone(), "".into(), incoming).unwrap();
+        // Explicitly retain the pointer AND its matching registration, rather
+        // than retaining the pointer alone. The working copy may differ.
+        let staged_modules = "[submodule \"independent logical name\"]\n path = \"vendor/dep\"\n url = https://example.invalid/dep.git\n";
+        fs::write(parent.join(".gitmodules"), staged_modules).unwrap();
+        run_git(&parent, &["add", ".gitmodules"]);
+        run_git(&parent, &["update-index", "--add", "--cacheinfo", &format!("160000,{pin},vendor/dep")]);
+        fs::write(parent.join(".gitmodules"), "").unwrap();
+        let oid = commit_staged_inner(path, "Explicitly retain registered dep".into()).unwrap();
+        let repo = Repository::open(&parent).unwrap();
+        let tree = repo.find_commit(Oid::from_str(&oid).unwrap()).unwrap().tree().unwrap();
+        assert_eq!(tree.get_path(Path::new("vendor/dep")).unwrap().id(), pin);
+        assert_eq!(repo.find_blob(tree.get_name(".gitmodules").unwrap().id()).unwrap().content(), staged_modules.as_bytes());
+        assert_eq!(fs::read(parent.join(".gitmodules")).unwrap(), b"", "validation must not rewrite the working copy");
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn normal_commit_during_unresolved_merge_keeps_head_and_merge_state() {
+        let (base, parent, incoming, _) = setup_incoming_submodule_removal(true);
+        let path = parent.to_string_lossy().into_owned();
+        merge_branch(path.clone(), "".into(), incoming).unwrap();
+        let before = Repository::open(&parent).unwrap().head().unwrap().target();
+        let error = commit_staged_inner(path, "Not resolved yet".into()).unwrap_err();
+        assert!(error.contains("unresolved conflicts"));
+        let repo = Repository::open(&parent).unwrap();
+        assert_eq!(repo.head().unwrap().target(), before);
+        assert_eq!(repo.state(), git2::RepositoryState::Merge);
+        fs::remove_dir_all(base).unwrap();
+    }
+
     #[test]
     fn submodule_merge_review_can_apply_no_submodule_to_remove_the_gitlink() {
         // The review's "no submodule" choice (empty/"__none__" revision) must
@@ -12217,6 +12470,37 @@ mod tests {
         init_submodule_inner(repository.to_string_lossy().into_owned(), "vendor/dep".into()).unwrap();
         assert_eq!(run_git_capture(&repository.join("vendor/dep"), &["rev-parse", "HEAD"]), recorded);
 
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn failed_submodule_initialization_invalidates_state_without_cleaning_local_files() {
+        let base = PathBuf::from(unique_status_epoch_test_path("submodule-init-failure"));
+        create_libgit2_repository(&base, "README.md");
+        let oid = run_git_capture(&base, &["rev-parse", "HEAD"]);
+        fs::write(base.join(".gitmodules"), format!("[submodule \"dep\"]\n\tpath = vendor/dep\n\turl = {}\n", base.join("missing-remote.git").display())).unwrap();
+        run_git(&base, &["update-index", "--add", "--cacheinfo", &format!("160000,{oid},vendor/dep")]);
+        run_git(&base, &["add", ".gitmodules"]);
+        run_git(&base, &["commit", "-m", "Record submodule with unavailable local remote"]);
+        fs::write(base.join("keep-untracked.txt"), "keep this local file\n").unwrap();
+        let root = base.to_string_lossy().into_owned();
+        let original_head = run_git_capture(&base, &["rev-parse", "HEAD"]);
+        let epoch = status_cache_epoch(&root);
+        // State snapshots are keyed by an existing workdir's canonical path.
+        // Model an empty leftover directory, not a never-existent cache entry.
+        fs::create_dir_all(base.join("vendor/dep")).unwrap();
+        let sub_key = repo_lock_key(&base.join("vendor/dep").to_string_lossy());
+        submodule_state_cache().lock().unwrap().insert(sub_key.clone(), (Instant::now(), SubmoduleStateSnapshot {
+            dirty: false, head_oid: None, remote_relation: SubmoduleRemoteRelation::Unknown, attached_branch: None,
+        }));
+
+        let error = init_submodule_inner(root.clone(), "vendor/dep".into()).unwrap_err();
+        assert!(error.contains("incomplete"));
+        assert!(error.contains("not rolled back automatically"));
+        assert!(status_cache_epoch(&root) > epoch);
+        assert!(!submodule_state_cache().lock().unwrap().contains_key(&sub_key));
+        assert_eq!(run_git_capture(&base, &["rev-parse", "HEAD"]), original_head);
+        assert_eq!(fs::read_to_string(base.join("keep-untracked.txt")).unwrap(), "keep this local file\n");
         fs::remove_dir_all(base).unwrap();
     }
 
@@ -17224,6 +17508,67 @@ mod tests {
     }
 
     #[test]
+    fn failed_mutating_terminal_command_invalidates_the_root_cache_without_undoing_partial_writes() {
+        let base = PathBuf::from(unique_status_epoch_test_path("terminal-partial-failure"));
+        create_libgit2_repository(&base, "README.md");
+        fs::create_dir(base.join("nested")).unwrap();
+        fs::write(base.join("partial.txt"), "a local file staged before Git fails\n").unwrap();
+        fs::write(base.join("keep-untracked.txt"), "never delete me\n").unwrap();
+        let root = base.to_string_lossy().into_owned();
+        let original_head = run_git_capture(&base, &["rev-parse", "HEAD"]);
+        let epoch = status_cache_epoch(&root);
+        let result = run_terminal_command_inner(
+            base.join("nested").to_string_lossy().into_owned(),
+            "git -c alias.ddtpartial=\"!git add partial.txt; exit 17\" ddtpartial".into(),
+        ).unwrap();
+        assert!(!result.success);
+        assert_eq!(result.exit_code, Some(17));
+        assert!(status_cache_epoch(&root) > epoch, "invalidate the real root, not the terminal's nested cwd");
+        assert_eq!(run_git_capture(&base, &["diff", "--cached", "--name-only"]), "partial.txt");
+        assert_eq!(run_git_capture(&base, &["rev-parse", "HEAD"]), original_head);
+        assert!(base.join("keep-untracked.txt").is_file());
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_timeout_invalidates_cached_status_and_preserves_partial_local_state_for_inspection() {
+        let base = PathBuf::from(unique_status_epoch_test_path("terminal-timeout"));
+        create_libgit2_repository(&base, "README.md");
+        fs::write(base.join("keep-untracked.txt"), "never delete me\n").unwrap();
+        let root = base.to_string_lossy().into_owned();
+        let repo = Repository::open(&base).unwrap();
+        let original_head = run_git_capture(&base, &["rev-parse", "HEAD"]);
+        cached_full_statuses(&repo, &root).unwrap();
+        let epoch = status_cache_epoch(&root);
+        let error = command_console::run_terminal_command_with_timeout(
+            root.clone(),
+            "printf 'partial\\n' > partial.txt; git add partial.txt; sleep 30".into(),
+            Duration::from_secs(1), "1 second (test)",
+        ).err().expect("the subprocess must exceed the short test deadline");
+        assert!(error.contains("timed out"));
+        assert!(status_cache_epoch(&root) > epoch);
+        let refreshed = cached_full_statuses(&repo, &root).unwrap();
+        assert!(refreshed.iter().any(|(path, _, staged)| path == "partial.txt" && *staged), "the old cached status must not hide partial writes");
+        assert_eq!(run_git_capture(&base, &["rev-parse", "HEAD"]), original_head);
+        assert_eq!(fs::read_to_string(base.join("partial.txt")).unwrap(), "partial\n");
+        assert!(base.join("keep-untracked.txt").is_file());
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn read_only_terminal_success_does_not_invalidate_repository_status() {
+        let base = PathBuf::from(unique_status_epoch_test_path("terminal-read-only"));
+        create_libgit2_repository(&base, "README.md");
+        let root = base.to_string_lossy().into_owned();
+        let epoch = status_cache_epoch(&root);
+        let result = run_terminal_command_inner(root.clone(), "git status --short".into()).unwrap();
+        assert!(result.success && result.read_only);
+        assert_eq!(status_cache_epoch(&root), epoch);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
     fn commander_view_compares_files_inside_a_submodule_against_its_own_remote() {
         // Reproduces the reported issue: after committing and pushing a change
         // *inside* a submodule (to the submodule's own remote), browsing into that
@@ -17573,12 +17918,7 @@ mod tests {
         run_git(&dep_seed, &["remote", "add", "origin", dep_remote.to_str().unwrap()]);
         run_git(&dep_seed, &["-c", "protocol.file.allow=always", "push", "origin", "HEAD:main"]);
         run_git(&repository, &["-c", "protocol.file.allow=always", "submodule", "add", dep_remote.to_str().unwrap(), "vendor/dep"]);
-        // The report's own point 2: classify by .gitmodules' *effective*
-        // clone source, not by whatever this checkout's local "origin"
-        // happens to be — a real https:// URL here (unlike dep_remote,
-        // fetched via the unchanged local "origin" below) is what makes this
-        // test exercise the genuinely-safe case rather than local_only.
-        fake_https_gitmodules_url(&repository);
+        let _server = network_submodule_test_remote(&repository);
         run_git(&repository, &["commit", "-am", "Add dep submodule"]);
         run_git(&repository, &["remote", "add", "origin", parent_remote.to_str().unwrap()]);
         run_git(&repository, &["-c", "protocol.file.allow=always", "push", "origin", "HEAD:main"]);
@@ -17658,11 +17998,9 @@ mod tests {
         run_git(&dep_seed, &["remote", "add", "origin", dep_remote.to_str().unwrap()]);
         run_git(&dep_seed, &["-c", "protocol.file.allow=always", "push", "origin", "HEAD:main"]);
         run_git(&parent, &["-c", "protocol.file.allow=always", "submodule", "add", dep_remote.to_str().unwrap(), "vendor/dep"]);
-        // A real https:// .gitmodules URL — X2 (fetched via the unchanged
-        // local "origin" below) must come back genuinely safe, not
-        // local_only, so this test actually exercises "unpushed", the risk
-        // it's named for.
-        fake_https_gitmodules_url(&parent);
+        // X2 will be served by a real loopback Git remote, so this exercises
+        // unpublished history rather than the local-filesystem source warning.
+        let _server = network_submodule_test_remote(&parent);
         run_git(&parent, &["commit", "-am", "Add dep submodule"]);
         run_git(&parent, &["remote", "add", "origin", parent_remote.to_str().unwrap()]);
 
@@ -17747,7 +18085,7 @@ mod tests {
         run_git(&dep_seed, &["remote", "add", "origin", dep_remote.to_str().unwrap()]);
         run_git(&dep_seed, &["-c", "protocol.file.allow=always", "push", "origin", "HEAD:main"]);
         run_git(&parent, &["-c", "protocol.file.allow=always", "submodule", "add", dep_remote.to_str().unwrap(), "vendor/dep"]);
-        fake_https_gitmodules_url(&parent);
+        let _server = network_submodule_test_remote(&parent);
         run_git(&parent, &["commit", "-am", "Add dep submodule"]);
 
         let parent_path = parent.to_string_lossy().into_owned();
@@ -17788,10 +18126,66 @@ mod tests {
         assert!(is_local_only_url("./sibling-repo"));
         assert!(is_local_only_url("file:///Users/andrei/repos/some-repo"));
         assert!(is_local_only_url("file://localhost/repos/some-repo"));
+        assert!(is_local_only_url("FILE:///C:/repos/some-repo"), "file schemes are case-insensitive");
         assert!(is_local_only_url(r"C:\Users\andrei\repos\some-repo"), "a Windows drive path is local");
         assert!(is_local_only_url("C:/Users/andrei/repos/some-repo"));
+        assert!(is_local_only_url("C:repos/some-repo"), "a drive-relative Windows path is local");
+        assert!(is_local_only_url(r"\\server\share\repo.git"), "a filesystem share is not a Git server");
         assert!(is_local_only_url(""), "no URL at all can't be reached by anyone");
         assert!(is_local_only_url("   "));
+    }
+
+    #[test]
+    fn publish_safety_does_not_accept_local_origin_refs_as_proof_of_server_availability() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-publish-local-origin-{suffix}"));
+        let parent = base.join("parent");
+        let dependency = base.join("dependency");
+        let parent_remote = base.join("parent-remote.git");
+        create_libgit2_repository(&parent, "README.md");
+        create_libgit2_repository(&dependency, "module.txt");
+        Repository::init_bare(&parent_remote).unwrap();
+        let parent_path = parent.to_string_lossy().into_owned();
+        let added = add_submodule_inner(parent_path.clone(), "".into(), dependency.to_string_lossy().into_owned(), "dep".into(), String::new(), String::new()).unwrap();
+        // A portable server URL, but origin still points at the local clone
+        // source. Its remote-tracking refs already contain the gitlink commit.
+        run_git(&parent, &["config", "-f", ".gitmodules", "submodule.dep.url", "https://example.test/dep.git"]);
+        stage_files_inner(&parent_path, vec![".gitmodules".into()]).unwrap();
+        create_commit(parent_path.clone(), "Add dependency".into()).unwrap();
+        run_git(&parent, &["remote", "add", "origin", parent_remote.to_str().unwrap()]);
+        let repo = Repository::open(&parent).unwrap();
+        let branch = repo.head().unwrap().shorthand().unwrap().to_string();
+        let sub_repo = internal_submodule_repository(&parent.join(&added)).unwrap();
+        let oid = sub_repo.head().unwrap().target().unwrap();
+        let index_before = fs::read(repo.path().join("index")).unwrap();
+        let child_index_before = fs::read(sub_repo.path().join("index")).unwrap();
+        let fetch_before = fs::read(sub_repo.path().join("FETCH_HEAD")).ok();
+        let child_config_before = fs::read(sub_repo.path().join("config")).unwrap();
+        let gitmodules_before = fs::read(parent.join(".gitmodules")).unwrap();
+        let head_before = repo.head().unwrap().target();
+
+        for refresh in [false, true] {
+            let risks = unpushed_submodule_references(&parent_path, &branch, "origin", None, refresh).unwrap();
+            assert_eq!(risks.len(), 1, "{risks:?}");
+            assert_eq!(risks[0].risk, "local_origin");
+            assert_eq!(risks[0].submodule_oid, oid.to_string());
+            assert_eq!(risks[0].configured_url.as_deref(), Some("https://example.test/dep.git"));
+        }
+        let error = submodule_publish_safety_check(&parent_path, &branch, "origin", None, false).unwrap_err();
+        assert!(error.starts_with(UNPUSHED_SUBMODULE_OVERRIDABLE_PREFIX), "{error}");
+        assert!(error.contains("local-filesystem origin"), "{error}");
+        assert!(submodule_publish_safety_check(&parent_path, &branch, "origin", None, true).is_ok(), "retain the existing explicit risk override");
+        assert_eq!(repo.head().unwrap().target(), head_before);
+        assert_eq!(sub_repo.head().unwrap().target(), Some(oid));
+        assert_eq!(fs::read(repo.path().join("index")).unwrap(), index_before);
+        assert_eq!(fs::read(sub_repo.path().join("index")).unwrap(), child_index_before);
+        assert_eq!(fs::read(sub_repo.path().join("FETCH_HEAD")).ok(), fetch_before, "do not fetch a local mirror to prove server availability");
+        assert_eq!(fs::read(sub_repo.path().join("config")).unwrap(), child_config_before);
+        assert_eq!(fs::read(parent.join(".gitmodules")).unwrap(), gitmodules_before);
+        assert_eq!(fs::read_to_string(parent.join(&added).join("module.txt")).unwrap(), "content");
+        let (commit_risks, _, _) = submodule_reference_risks(&parent_path, &added, &[oid], false, false);
+        assert_eq!(commit_risks.get(&oid), Some(&None), "the separate local Commit guard retains its existing reachability semantics");
+        fs::remove_dir_all(base).unwrap();
     }
 
     #[test]
@@ -17944,7 +18338,7 @@ mod tests {
         run_git(&dep_seed, &["remote", "add", "origin", dep_remote.to_str().unwrap()]);
         run_git(&dep_seed, &["-c", "protocol.file.allow=always", "push", "origin", "HEAD:main"]);
         run_git(&parent, &["-c", "protocol.file.allow=always", "submodule", "add", dep_remote.to_str().unwrap(), "vendor/dep"]);
-        fake_https_gitmodules_url(&parent);
+        let _server = network_submodule_test_remote(&parent);
         run_git(&parent, &["commit", "-am", "Add dep submodule"]);
         run_git(&parent, &["remote", "add", "origin", parent_remote.to_str().unwrap()]);
 

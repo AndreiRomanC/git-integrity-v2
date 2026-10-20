@@ -18,7 +18,8 @@ function harness() {
   const calls = [], renders = [], errors = [], histories = [], logs = [], timers = new Map(), section = { innerHTML: '' };
   let timerId = 0;
   const sandbox = { state, repoOpenGeneration: 1, performance: { now: () => 100 }, jsPerfLog: line => logs.push(line), refs: { editorDialog: { open: false } },
-    render() {}, clearDetails: text => renders.push({ empty: text }), renderEntryDetails: model => renders.push(model),
+    render() { assert.fail('Selecting an entry must not rebuild branches, PR panels or the Working Tree'); },
+    renderExplorer() {}, renderCommitScope() {}, clearDetails: text => renders.push({ empty: text }), renderEntryDetails: model => renders.push(model),
     renderEntryLastCommitInner: model => { histories.push(model); return JSON.stringify(model); },
     $: selector => selector === '#entryLastCommitSection' ? section : null,
     invoke(command, args) { const pending = deferred(); calls.push({ command, args, pending }); return pending.promise; },
@@ -32,6 +33,26 @@ function harness() {
     select: name => sandbox.selectEntry(`modules/${name}`),
     details: (index, name) => calls[index].pending.resolve({ ...state.entries.find(e => e.name === name), status_known: true, last_commit_id: null, submodule_current_branch: 'feature' }) };
 }
+test('selection updates only Explorer and the selected commit scope, without rebuilding the shell', async () => {
+  const h = harness(), repaints = [];
+  h.sandbox.renderExplorer = () => repaints.push('explorer');
+  h.sandbox.renderCommitScope = () => repaints.push('scope');
+  for (const name of ['a', 'b', 'a']) {
+    const index = h.calls.length, pending = h.select(name); h.details(index, name); await pending;
+  }
+  assert.deepEqual(repaints, ['explorer','scope','explorer','scope','explorer','scope']);
+  assert.deepEqual(h.calls.map(c => c.command), ['entry_details','entry_last_commit','entry_details','entry_last_commit','entry_details','entry_last_commit']);
+});
+test('selected-scope availability still follows selected files, folders and repository root', () => {
+  const state = { repository: { name: 'repo' }, selectedEntry: { name: 'a', relative_path: 'modules/a' }, currentPath: 'modules', changes: [{ path: 'modules/a/file.c' }] };
+  const button = {}, sandbox = { state, refs: { commitScope: button } };
+  vm.runInNewContext(functionSource('renderCommitScope'), sandbox);
+  sandbox.renderCommitScope(); assert.equal(button.textContent, 'Commit a'); assert.equal(button.disabled, false);
+  state.selectedEntry = { name: 'b', relative_path: 'modules/b' };
+  sandbox.renderCommitScope(); assert.equal(button.disabled, true); assert.match(button.title, /Nothing to commit/);
+  state.selectedEntry = null; sandbox.renderCommitScope(); assert.equal(button.textContent, 'Commit folder'); assert.equal(button.disabled, false);
+  state.currentPath = ''; sandbox.renderCommitScope(); assert.equal(button.textContent, 'Commit repository'); assert.equal(button.disabled, false);
+});
 test('listing appears before details, then history loads separately with no additional commands', async () => {
   const h = harness(), pending = h.select('a');
   assert.equal(h.renders[0].name, 'a'); assert.equal(h.renders[0].details_loading, true);

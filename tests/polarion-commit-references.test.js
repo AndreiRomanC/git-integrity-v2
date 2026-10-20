@@ -76,12 +76,22 @@ test('opening P forwards the same parent StructDoc source as commit, including a
   vm.createContext(context);
   vm.runInContext(app.match(/function submoduleCommitReferenceContext\([^]*?\n}/)[0], context);
   const start = app.indexOf("document.querySelectorAll('[data-polarion-search]')");
+  context.submoduleBoundaryFor = value => value.startsWith('modules/errm_adpdg/') ? 'modules/errm_adpdg' : null;
+  vm.runInContext(app.match(/function scopeCommitReferenceContext\([^]*?\n}/)[0], context);
   vm.runInContext(app.slice(start, app.indexOf('\n}));', start) + 5), context);
   handler(); assert.equal(opened[0], '/parent'); assert.equal(opened[1], 'modules/errm_confi0');
   assert.equal(opened[2].repositoryPath, '/parent'); assert.equal(opened[2].moduleName, 'errm_confi0');
   active = { isSubmodule: true, path: '/parent/modules/errm_adpdg', parentPath: '/parent', name: 'errm_adpdg', relativePath: 'modules/errm_adpdg' };
   handler(); assert.equal(opened[0], active.path); assert.equal(opened[1], '');
   assert.equal(opened[2].repositoryPath, '/parent'); assert.equal(opened[2].moduleName, 'errm_adpdg', 'graph context, not an old explorer selection');
+  active = { isSubmodule: false, path: '/parent' };
+  state.currentPath = 'modules/errm_adpdg/src'; state.selectedEntry = null;
+  handler(); assert.equal(opened[2].repositoryPath, '/parent'); assert.equal(opened[2].moduleName, 'errm_adpdg', 'inside a submodule folder also uses the parent source');
+  state.repository = { path: '/parent/modules/errm_adpdg' }; active.path = state.repository.path;
+  state.repositoryOrigin = { repositoryPath: state.repository.path, parentPath: '/parent', submoduleName: 'errm_adpdg' };
+  state.currentPath = 'src'; state.selectedEntry = { kind: 'file', relative_path: 'src/file.c' };
+  handler(); assert.equal(opened[0], state.repository.path); assert.equal(opened[2].repositoryPath, '/parent');
+  assert.equal(opened[2].moduleName, 'errm_adpdg', 'Open as Full Repository preserves the same source');
 });
 test('references use short work-item IDs and preserve the base message without adding duplicates', () => {
   assert.equal(api.polarionCommitMessageWithReferences('Checkpoint', ['VWAQ4-85585','VWAQ4-85586','VWAQ4-85585']), 'Checkpoint\n\nVWAQ4-85585\nVWAQ4-85586');
@@ -126,6 +136,8 @@ test('selected StructDoc IDs appear in the actual editable commit message, never
   f.toggle(true); f.calls[0].resolve(workspace()); await tick();
   assert.equal(editor.value, 'P:OEM-1 - Selected description\nMy module note\n\nVWAQ4-85585\nVWAQ4-85586\nVWAQ4-85587');
   assert.equal(f.controller.message(editor.value), editor.value);
+  assert.equal(f.host.children.some(n => n.className === 'polarion-commit-preview'), false, 'no duplicate message/ID preview below the real editor');
+  assert.match(content(f.host), /3 selected \/ 3 matching elements · included in the commit message above/);
   editor.type(editor.value.replace('My module note', 'Edited module note'));
   const list = f.host.children.find(n => n.className === 'polarion-commit-reference-list');
   const box = list.children[1].children[0]; box.checked = false; box.listeners.change();

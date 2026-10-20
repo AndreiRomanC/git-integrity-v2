@@ -78,23 +78,32 @@ pub fn run_git_command(repository_path: String, args: String) -> Result<RawGitRe
     let read_only = is_read_only_git_subcommand(&parts[0]);
     let repo_id = anonymized_repository_id(&repository_path);
     let arg_refs = parts.iter().map(String::as_str).collect::<Vec<_>>();
+    let submodule_update = is_submodule_update(&arg_refs);
+    let (timeout, timeout_label) = git_command_timeout(&arg_refs);
     let history_id = begin_git_command(&repository_path, &arg_refs);
     let mut command = Command::new("git");
     configure_git_command(&mut command);
     command.arg("-C").arg(&repository_path).arg("-c").arg("color.ui=false").args(&parts);
-    let output = match run_with_timeout(command) {
+    if submodule_update {
+        perf_log(&format!("run_git_command: submodule_update start ({repo_id}, timeout_seconds={}, automatic_cleanup=false)", timeout.as_secs()), Duration::ZERO);
+    }
+    let output = match run_with_timeout_labeled(command, timeout, "Git", timeout_label) {
         Ok(output) => output,
         Err(error) => {
+            if !read_only { invalidate_git_metadata(&repository_path); }
+            if submodule_update { invalidate_submodule_sync(&repository_path); }
+            let error = submodule_update_error(error, submodule_update);
             finish_git_command(history_id, false, None, "", "", &error);
-            perf_log(&format!("run_git_command: {} ({repo_id}, read_only={read_only}) TIMED_OUT", parts[0]), started.elapsed());
+            perf_log(&format!("run_git_command: {} ({repo_id}, read_only={read_only}) PROCESS_ERROR cache_invalidated={}", parts[0], !read_only), started.elapsed());
             return Err(error);
         }
     };
     perf_log(&format!("run_git_command: {} ({repo_id}, read_only={read_only}) exit_code={:?}", parts[0], output.status.code()), started.elapsed());
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let stderr = submodule_update_error(String::from_utf8_lossy(&output.stderr).into_owned(), submodule_update && !output.status.success());
     finish_git_command(history_id, output.status.success(), output.status.code(), &stdout, &stderr, "");
     invalidate_git_metadata(&repository_path);
+    if submodule_update { invalidate_submodule_sync(&repository_path); }
     Ok(RawGitResult {
         stdout,
         stderr,
@@ -114,7 +123,27 @@ pub(in crate::repository) fn is_definitely_read_only_terminal_command(input: &st
     matches!(program.as_str(), "pwd" | "ls" | "dir" | "whoami" | "hostname" | "which" | "where")
 }
 
+fn terminal_command_timeout(input: &str) -> (Duration, &'static str) {
+    let Ok(parts) = tokenize_git_args(input) else { return (GIT_COMMAND_TIMEOUT, "10 minutes") };
+    let Some(program) = parts.first() else { return (GIT_COMMAND_TIMEOUT, "10 minutes") };
+    let name = program.rsplit(['/', '\\']).next().unwrap_or(program);
+    if !name.eq_ignore_ascii_case("git") && !name.eq_ignore_ascii_case("git.exe") {
+        return (GIT_COMMAND_TIMEOUT, "10 minutes");
+    }
+    git_command_timeout(&parts.iter().skip(1).map(String::as_str).collect::<Vec<_>>())
+}
+
+fn submodule_update_error(error: String, update_incomplete: bool) -> String {
+    if !update_incomplete { return error; }
+    format!("{error}\nSubmodule update is incomplete. Some modules may already have been updated; completed changes were not rolled back automatically. Inspect the refreshed working tree before committing. No automatic reset, clean or forced checkout was run.")
+}
+
 pub(in crate::repository) fn run_terminal_command_inner(repository_path: String, command_text: String) -> Result<TerminalCommandResult, String> {
+    let (timeout, timeout_label) = terminal_command_timeout(&command_text);
+    run_terminal_command_with_timeout(repository_path, command_text, timeout, timeout_label)
+}
+
+pub(in crate::repository) fn run_terminal_command_with_timeout(repository_path: String, command_text: String, timeout: Duration, timeout_label: &str) -> Result<TerminalCommandResult, String> {
     let started = Instant::now();
     validate_path(&repository_path)?;
     let command_text = command_text.trim();
@@ -148,6 +177,7 @@ pub(in crate::repository) fn run_terminal_command_inner(repository_path: String,
         }
     };
     let repo_id = anonymized_repository_id(&repository_root);
+    let submodule_update = terminal_command_timeout(command_text).0 == SUBMODULE_UPDATE_TIMEOUT;
     let terminal_git_args = tokenize_git_args(command_text)
         .ok()
         .and_then(|parts| {
@@ -183,21 +213,28 @@ pub(in crate::repository) fn run_terminal_command_inner(repository_path: String,
         .env("PAGER", "cat")
         .stdin(std::process::Stdio::null());
 
-    let output = match run_with_timeout_labeled(command, GIT_COMMAND_TIMEOUT, "Terminal", "10 minutes") {
+    perf_log(&format!("run_terminal_command: start ({repo_id}, read_only={read_only}, submodule_update={submodule_update}, timeout_seconds={})", timeout.as_secs()), Duration::ZERO);
+    let output = match run_with_timeout_labeled(command, timeout, "Terminal", timeout_label) {
         Ok(output) => output,
         Err(error) => {
+            // Process failure is not a transaction rollback: cloned modules,
+            // indexes and files may already have changed before the timeout.
+            if !read_only { invalidate_git_metadata(&repository_root); }
+            if submodule_update { invalidate_submodule_sync(&repository_root); }
+            let error = submodule_update_error(error, submodule_update);
             if let Some(history_id) = history_id { finish_git_command(history_id, false, None, "", "", &error); }
-            perf_log(&format!("run_terminal_command: ({repo_id}, read_only={read_only}) TIMED_OUT"), started.elapsed());
+            perf_log(&format!("run_terminal_command: ({repo_id}, read_only={read_only}) PROCESS_ERROR cache_invalidated={} submodule_update_incomplete={submodule_update}", !read_only), started.elapsed());
             return Err(error);
         }
     };
     perf_log(&format!("run_terminal_command: ({repo_id}, read_only={read_only}) exit_code={:?}", output.status.code()), started.elapsed());
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let stderr = submodule_update_error(String::from_utf8_lossy(&output.stderr).into_owned(), submodule_update && !output.status.success());
     if let Some(history_id) = history_id {
         finish_git_command(history_id, output.status.success(), output.status.code(), &stdout, &stderr, "");
     }
     if !read_only { invalidate_git_metadata(&repository_root); }
+    if submodule_update { invalidate_submodule_sync(&repository_root); }
     Ok(RawGitResult {
         stdout,
         stderr,
@@ -210,4 +247,50 @@ pub(in crate::repository) fn run_terminal_command_inner(repository_path: String,
 #[tauri::command]
 pub async fn run_terminal_command(repository_path: String, command_text: String) -> Result<TerminalCommandResult, String> {
     off_main_thread(move || run_terminal_command_inner(repository_path, command_text)).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn submodule_update_gets_the_long_budget_only_for_real_update_commands() {
+        for args in [
+            vec!["submodule", "update", "--init", "--recursive"],
+            vec!["-c", "protocol.file.allow=always", "submodule", "update", "--", "vendor/dep"],
+            vec!["-C", "folder with spaces", "--no-pager", "submodule", "--quiet", "update"],
+            vec!["--git-dir=repo.git", "--work-tree=repo", "submodule", "update", "--force"],
+        ] {
+            assert_eq!(git_command_timeout(&args), (Duration::from_secs(3600), "60 minutes"), "{args:?}");
+        }
+        for args in [
+            vec!["status"], vec!["fetch"], vec!["submodule", "status", "--recursive"],
+            vec!["submodule", "sync", "--recursive"], vec!["submodule", "deinit", "--all"],
+            vec!["show", "submodule", "update"], vec!["commit", "-m", "submodule", "update"],
+            vec!["-c", "alias.update=submodule update", "status"], vec!["-C"],
+        ] {
+            assert_eq!(git_command_timeout(&args), (Duration::from_secs(600), "10 minutes"), "{args:?}");
+        }
+        for command in [
+            "git submodule update --init --recursive",
+            "git -C \"folder with spaces\" submodule update --init --recursive",
+            "git -c protocol.file.allow=always submodule update --init --recursive -- vendor/dep",
+            r#""C:\Program Files\Git\cmd\git.exe" submodule update --init --recursive"#,
+        ] {
+            assert_eq!(terminal_command_timeout(command).0, Duration::from_secs(3600), "{command}");
+        }
+        for command in ["git status", "git submodule status", "echo git submodule update", "git log -- submodule update"] {
+            assert_eq!(terminal_command_timeout(command).0, Duration::from_secs(600), "{command}");
+        }
+    }
+
+    #[test]
+    fn incomplete_update_warning_preserves_the_original_error_and_does_not_promise_rollback() {
+        let error = "Terminal command timed out after 60 minutes".to_string();
+        let result = submodule_update_error(error.clone(), true);
+        assert!(result.starts_with(&error));
+        assert!(result.contains("not rolled back automatically"));
+        assert!(result.contains("No automatic reset, clean or forced checkout"));
+        assert_eq!(submodule_update_error(error.clone(), false), error);
+    }
 }

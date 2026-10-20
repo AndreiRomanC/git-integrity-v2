@@ -433,7 +433,8 @@ test('parent StructDoc source matches submodule commits while task and project a
   const doc = docSnapshot(), childTask = task('Child/CHILD-1');
   const stores = new Map([['/parent', { document: doc, elements: [], elements_complete: false, primary_task: task('Parent/PARENT-1') }],
     ['/parent/module', { primary_task: childTask, document: { ...doc, id: 'Child/S/Old' } }]]);
-  h.overrides.polarion_project_context = async args => ({ repository_path: args.repositoryPath, project: { id: 'Child', name: 'Module project' } });
+  h.overrides.polarion_project_context = async args => ({ repository_path: args.repositoryPath, project: args.repositoryPath === '/parent'
+    ? { id: 'P', name: 'Parent project' } : { id: 'Child', name: 'Module project' } });
   h.overrides.polarion_workspace = async args => {
     const data = stores.get(args.repositoryPath);
     if (args.action === 'document') data.document = args.snapshot;
@@ -445,6 +446,9 @@ test('parent StructDoc source matches submodule commits while task and project a
   await h.picker.open('/parent/module', '', refs); h.el('TabDocuments').handlers.click();
   assert.match(h.el('DocumentScope').textContent, /\/parent · parent project/);
   assert.match(h.el('Document').children[0].children[1].textContent, /P\/Structure Information/);
+  assert.match(h.el('ChosenProject').textContent, /P · Parent project · parent StructDocs/);
+  h.el('DocumentQuery').value = 'errm'; await h.el('DocumentSearchButton').handlers.click();
+  assert.equal(h.calls.filter(c => c.name === 'polarion_search').at(-1).args.project, 'P');
   const elements = ['simulinkitem','designelement','solutionelement'].map((type, index) => ({ ...task('VWAQ4/VWAQ4-' + (85585 + index), type), title: 'errm_adpdg 2.0.0' }));
   h.overrides.polarion_read = async args => args.kind === 'elements' ? { code: 'ok', elements: [...elements, { ...task('P/P-99'), title: 'errm_dcmngai 2.0.0' }], received: 4, more: false }
     : { code: 'ok', snapshot: doc };
@@ -463,6 +467,8 @@ test('parent StructDoc source matches submodule commits while task and project a
   h.el('TabTasks').handlers.click();
   h.search(async () => ({ code: 'ok', items: [{ id: 'CHILD-2', title: 'New child task', item_type: 'task' }] }));
   await h.el('TaskSearchButton').handlers.click(); h.el('Results').children[0].handlers.click();
+  assert.equal(h.calls.filter(c => c.name === 'polarion_search').at(-1).args.project, 'Child');
+  assert.match(h.el('ChosenProject').textContent, /Child · Module project/);
   h.overrides.polarion_read = async () => ({ code: 'ok', snapshot: task('Child/CHILD-2') });
   await h.el('PrimaryButton').handlers.click();
   assert.equal(h.calls.filter(c => c.args?.action === 'primary').at(-1).args.repositoryPath, '/parent/module');
@@ -471,6 +477,58 @@ test('parent StructDoc source matches submodule commits while task and project a
   h.dialog.close(); await h.picker.open('/parent/module', '', refs); h.el('TabDocuments').handlers.click();
   assert.equal(h.el('Elements').children.length, 3, 'all elements survive reopening; the module filter is local');
   assert.equal(h.calls.filter(c => c.name === 'polarion_read').length, before);
+});
+test('submodule without its own Polarion project can search parent documents and work-item containers', async () => {
+  const h = harness();
+  h.overrides.polarion_project_context = async args => ({ repository_path: args.repositoryPath,
+    project: args.repositoryPath === '/parent' ? { id: 'P', name: 'Parent' } : null });
+  h.overrides.polarion_workspace = async args => args.repositoryPath === '/parent' ? { document: { ...docSnapshot(), title: 'ERRM Structure' } } : {};
+  await h.picker.open('/parent/module', '', { repositoryPath: '/parent', moduleName: 'errm_adpdg' });
+  assert.ok(h.calls.every(c => ['polarion_project_context', 'polarion_workspace'].includes(c.name)), 'only local metadata is read on open');
+  assert.ok(h.calls.every(c => c.args.project == null && (!c.args.action || c.args.action === 'load')), 'no association is written');
+  h.el('TabDocuments').handlers.click();
+  assert.equal(h.el('DocumentSearchButton').disabled, false);
+  assert.equal(h.el('TaskSearchButton').disabled, true, 'child task project is not silently changed');
+  h.el('DocumentQuery').value = 'errm'; await h.el('DocumentSearchButton').handlers.click();
+  assert.equal(h.calls.filter(c => c.name === 'polarion_search').at(-1).args.project, 'P');
+  assert.ok(h.el('Results').children.some(row => row.dataset.origin === 'local'), 'the parent snapshot matches in the same project');
+  h.el('DocumentSource').value = 'containers';
+  h.search(async () => ({ code: 'ok', items: [{ id: 'P-123', title: 'Structure', item_type: 'structure_doc' }] }));
+  await h.el('DocumentSearchButton').handlers.click(); h.el('Results').children[0].handlers.click();
+  h.overrides.polarion_read = async args => { assert.equal(args.resourceId, 'P/P-123'); return { code: 'ok', snapshot: task('P/P-123') }; };
+  await h.el('View').handlers.click();
+  assert.match(h.el('SearchScope').textContent, /in P · parent/);
+  h.el('DocumentSource').value = 'documents';
+  h.overrides.polarion_diagnostics = async args => { assert.equal(args.project, 'P'); return { code: 'ok', diagnostics: [] }; };
+  await h.el('Diagnostics').handlers.click();
+});
+test('saved parent document supplies the search project if its project association is absent or unavailable', async () => {
+  for (const fails of [false, true]) {
+    const h = harness();
+    h.overrides.polarion_project_context = async args => {
+      if (fails && args.repositoryPath === '/parent') throw new Error('local context unavailable');
+      return { repository_path: args.repositoryPath, project: null };
+    };
+    h.overrides.polarion_workspace = async args => args.repositoryPath === '/parent' ? { document: docSnapshot() } : {};
+    await h.picker.open('/parent/module', '', { repositoryPath: '/parent' }); h.el('TabDocuments').handlers.click();
+    assert.equal(h.el('DocumentSearchButton').disabled, false);
+    h.el('DocumentQuery').value = 'errm'; await h.el('DocumentSearchButton').handlers.click();
+    assert.equal(h.calls.filter(c => c.name === 'polarion_search').at(-1).args.project, 'P');
+    assert.ok(h.logs.some(line => line.includes('source=saved_document')));
+  }
+});
+test('a late parent-project lookup cannot replace the context after closing and reopening P', async () => {
+  const h = harness(); let resolveParent;
+  h.overrides.polarion_project_context = async args => args.repositoryPath === '/parent'
+    ? new Promise(resolve => { resolveParent = resolve; }) : { repository_path: args.repositoryPath, project: { id: 'Other', name: 'Other' } };
+  h.overrides.polarion_workspace = async () => ({});
+  const opening = h.picker.open('/parent/module', '', { repositoryPath: '/parent' }); await tick();
+  h.dialog.close(); await h.picker.open('/other');
+  resolveParent({ repository_path: '/parent', project: { id: 'P', name: 'Parent' } }); await opening;
+  h.el('TabDocuments').handlers.click(); h.el('DocumentQuery').value = 'errm';
+  await h.el('DocumentSearchButton').handlers.click();
+  assert.equal(h.calls.filter(c => c.name === 'polarion_search').at(-1).args.project, 'Other');
+  assert.doesNotMatch(h.el('ChosenProject').textContent, /parent StructDocs/);
 });
 test('local element inspection has its own usable explicit refresh and never implies write access', async () => {
   const h = harness(), element = { ...task('P/P-85', 'designelement'), title: 'errm_adpdg 2.0.0' };

@@ -257,7 +257,7 @@ test('a submodule row shows its attached branch or detached state, only when act
   assert.match(app, /On branch ·/);
   assert.match(app, /Detached HEAD/);
   assert.match(app, /data-detail-action="subinit"/);
-  assert.match(app, /invoke\('init_submodule', \{ repositoryPath: state\.repository\.path, relativePath: entry\.relative_path \}\)/);
+  assert.match(app, /async function initializeSubmodule\([\s\S]*?const repositoryPath = state\.repository\.path;[\s\S]*?invoke\('init_submodule', \{ repositoryPath, relativePath: entry\.relative_path \}\)/);
   assert.match(app, /entry\.submodule_initialized === false[\s\S]*?Initialize submodule/);
 });
 
@@ -444,19 +444,79 @@ test('publish indicator surfaces ahead and behind, not only outgoing commit coun
   assert.match(app, /publishRemoteAheadWarningHtml\(state\.publish\) \+ publishSubmoduleRisksHtml/);
 });
 
-test('Publish dialog defaults to Safe publish and Fast publish asks for confirmation before skipping the submodule safety check', () => {
-  assert.match(html, /id="publishSafeMode" checked/);
-  assert.match(html, /id="publishFastMode"[^>]*>/);
-  assert.doesNotMatch(html, /id="publishFastMode" checked/);
-  assert.match(app, /if \(refs\.publishSafeMode\) refs\.publishSafeMode\.checked = true;/);
+test('Publish dialog defaults to Fast publish and still asks for confirmation before skipping the submodule safety check', () => {
+  assert.match(html, /id="publishFastMode" checked/);
+  assert.doesNotMatch(html, /id="publishSafeMode" checked/);
+  assert.match(app, /if \(refs\.publishFastMode\) refs\.publishFastMode\.checked = true;/);
+  assert.match(repository, /skip_submodule_safety\.unwrap_or\(false\)/, 'omitting the backend flag must still default to Safe');
   assert.match(app, /const skipSubmoduleSafety = !!refs\.publishFastMode\?\.checked;/);
   assert.match(app, /if \(commitMode !== 'combine_only' && skipSubmoduleSafety && !overrideUnpushedSubmodules\) \{/);
-  assert.match(app, /await customConfirm\(\s*\n\s*'Fast publish skips the submodule safety check\./);
+  assert.match(app, /await customConfirm\(\s*\n\s*'Fast publish skips the submodule safety check and its fetches/);
   assert.match(html, /id="publishSafetyExplanation"/);
-  assert.match(app, /Safe publish reads the submodule pointers in the outgoing commits and verifies each referenced SHA on its own remote\./);
-  assert.match(app, /It does not push submodules, merge, checkout, stage, or change local files\./);
-  assert.match(app, /Fast publish skips only the submodule remote-availability check\./);
+  assert.match(app, /checks added or updated submodule pointers across the outgoing commits, including intermediate versions\./);
+  assert.match(html, /if fetch fails, saved local remote refs are used/);
+  assert.match(html, /A tag alone does not establish availability for this check/);
+  assert.match(html, /The safety check does not push submodules, update their checked-out files, merge, stage or commit/);
+  assert.match(app, /Same normal push, without the submodule safety check or its fetches\./);
+  assert.match(app, /Fast publish is not a force push\./);
   assert.match(app, /invoke\('publish_branch', \{ repositoryPath: state\.repository\.path, branch: state\.publish\.branch, remote: state\.publish\.remote, username: \$\('#publishUsername'\)\.value\.trim\(\), accessToken: \$\('#publishToken'\)\.value, uptoCommit: combined \? '' : state\.publishUpto \|\| '', overrideUnpushedSubmodules, skipSubmoduleSafety \}\)/);
+});
+
+test('opening Publish resets Fast as the UI default without starting a push', async () => {
+  const vm = require('node:vm');
+  let opened = 0, refreshed = 0;
+  const refs = { publishFastMode: { checked: false }, publishBranch: {}, publishRemote: {},
+    publishDialog: { showModal() { opened++; } } };
+  const context = { refs, state: { repository: { path: '/fixture' }, remotes: [{ name: 'origin' }], branches: [{ name: 'main', current: true }] },
+    blockDetachedHeadWork: () => false, invoke() { assert.fail('must not push or run preflight when selecting the default'); },
+    esc: String, document: { querySelector: () => ({}) }, $: () => ({}),
+    updatePublishModeUi() { assert.equal(refs.publishFastMode.checked, true); },
+    async refreshPublish() { refreshed++; } };
+  vm.runInNewContext(app.match(/async function openPublish\(\) \{[\s\S]*?\n\}/)[0], context);
+  await context.openPublish();
+  refs.publishFastMode.checked = false;
+  await context.openPublish();
+  assert.equal(opened, 2); assert.equal(refreshed, 2); assert.equal(refs.publishFastMode.checked, true);
+});
+
+test('Publish distinguishes a local origin from the configured server URL', () => {
+  const vm = require('node:vm');
+  const context = { esc: String };
+  vm.runInNewContext(app.match(/function submodulePublishRisksHtml\(risks\) \{[\s\S]*?\n\}/)[0], context);
+  const rendered = context.submodulePublishRisksHtml([{ risk: 'local_origin', relative_path: 'modules/mine',
+    configured_url: 'https://example.test/mine.git', submodule_oid: '123456789abcdef', commit_subject: 'Update my module' }]);
+  assert.match(rendered, /modules\/mine/);
+  assert.match(rendered, /local-filesystem origin/);
+  assert.match(rendered, /cannot verify availability on the configured server/);
+  assert.doesNotMatch(rendered, /is only reachable from a local path or file/);
+});
+
+test('publish explanations follow Safe/Fast selection and disappear for Combine Only without any backend calls', () => {
+  const vm = require('node:vm');
+  const nodes = new Map();
+  const node = id => { if (!nodes.has(id)) nodes.set(id, { hidden: false, classes: new Map(), classList: { toggle(name, enabled) { node(id).classes.set(name, enabled); } } }); return nodes.get(id); };
+  let mode = 'all';
+  const refs = { publishFastMode: { checked: true }, publishCommits: { querySelectorAll: () => [] } };
+  const context = { refs, state: { publish: { ahead: 2, outgoing_count: 2, commits: [{}, {}] } }, $: node,
+    document: { querySelector: () => ({ value: mode }) }, invoke() { assert.fail('changing explanatory text must not call the backend'); } };
+  const fn = app.match(/function updatePublishModeUi\(\) \{[\s\S]*?\n\}/)[0];
+  vm.runInNewContext(fn, context);
+  context.updatePublishModeUi();
+  assert.match(node('#publishSafetyExplanation').textContent, /not a force push/);
+  const initial = html.match(/<p id="publishSafetyExplanation"[^>]*>([^<]*)<\/p>/)[1];
+  assert.equal(initial, node('#publishSafetyExplanation').textContent, 'initial copy matches the live Fast explanation');
+  refs.publishFastMode.checked = false; context.updatePublishModeUi();
+  assert.match(node('#publishSafetyExplanation').textContent, /including intermediate versions/);
+  assert.equal(node('#confirmPublish').textContent, 'Publish safely');
+  refs.publishFastMode.checked = true; context.updatePublishModeUi();
+  assert.match(node('#publishSafetyExplanation').textContent, /not a force push/);
+  assert.equal(node('#publishSafetyExplanation').classes.get('fast'), true);
+  mode = 'combine_only'; context.updatePublishModeUi();
+  assert.equal(node('#publishSafetyMode').hidden, true); assert.equal(node('#publishSafetyExplanation').hidden, true);
+  mode = 'combine_push'; refs.publishFastMode.checked = false; context.updatePublishModeUi();
+  assert.equal(node('#publishSafetyMode').hidden, false); assert.equal(node('#publishSafetyExplanation').hidden, false);
+  assert.equal(node('#publishSafetyExplanation').classes.get('fast'), false);
+  assert.equal(node('#confirmPublish').textContent, 'Combine & push');
 });
 
 test('Combine explains that it rewrites committed history without consuming parent working-tree changes', () => {
@@ -546,7 +606,8 @@ test('graph exposes branch and commit context actions without relying on lane id
   assert.match(app, /data-resolve="manualmark"/);
   assert.match(app, /markConflictResolvedAfterExternalTool/);
   assert.match(app, /Save the resolved file in the merge tool, then use “Mark resolved” or “Recheck conflicts”/);
-  assert.match(app, /All conflicts are resolved and staged\. Complete the merge commit now\?/);
+  assert.match(app, /maybeOfferSubmoduleReviewAfterConflictsResolved/);
+  assert.doesNotMatch(app, /Complete the merge commit now\?/);
   assert.match(app, /await refreshConflictsDialog\(target, \{ focusNext: true \}\)/);
   assert.match(app, /Configured Git merge\.tool = \$\{tool\.trim\(\)\}\. Retrying…/);
   assert.match(app, /Recommended for Beyond Compare: bc/);
@@ -707,7 +768,6 @@ test('main project merges and pulls ask before updating changed submodule workin
   assert.match(app, /Update submodules after \$\{operationLabel\}\?/);
   assert.match(app, /git submodule update --init --recursive/);
   assert.match(app, /await maybeOfferSubmoduleUpdateAfterMerge\(target, beforeHead\)/);
-  assert.match(app, /await maybeOfferSubmoduleUpdateAfterMerge\(target\)/);
   assert.match(app, /await maybeOfferSubmoduleUpdateAfterMerge\(\{ isSubmodule: false \}, beforeHead, 'Pull'\)/);
   assert.match(app, /await initAndUpdateSubmodulesFromActions\(\)/);
 });
@@ -723,27 +783,26 @@ test('main project merge pauses for one consolidated submodule pointer review', 
   assert.match(app, /function openSubmoduleMergeReviewDialog\(target, message = ''\)/);
   assert.match(app, /Keep prepared result/);
   assert.match(app, /function maybeOfferSubmoduleUpdateBeforeMergeCommit/);
-  assert.match(app, /Update submodules before build\?/);
+  assert.match(app, /Update submodules before commit\?/);
   assert.match(app, /Use Current Branch/);
-  assert.match(app, /Use Incoming\/origin/);
+  assert.match(app, /Use Incoming: the pointer from the branch being merged/);
   assert.match(app, /pointerRevisionLabel/);
   assert.match(app, /submoduleReviewResultSource/);
   assert.match(app, /submoduleReviewChoiceSource/);
-  assert.match(app, /const prefix = item\?\.selectedSource === 'result' \? 'Prepared result' : 'Selected'/);
-  assert.match(app, /return `\$\{prefix\}: \$\{submoduleReviewChoiceSource\(item\)\}`/);
+  assert.match(app, /return `Result: \$\{submoduleReviewChoiceSource\(item\)\}`/);
   assert.match(app, /Folder on disk is at/);
   assert.match(app, /Prepared result', item\.result/);
   assert.match(app, /No submodule/);
   assert.match(app, /selectedSource/);
   assert.match(app, /applySubmoduleMergeReviewOnly/);
-  assert.match(html, /Apply choices only/);
-  assert.match(html, /Merge and commit/);
+  assert.match(html, /Apply · update submodules/);
+  assert.match(html, /Commit merge/);
   assert.match(app, /Choose another commit/);
   assert.match(app, /Ready for submodule review \/ merge commit/);
   assert.match(css, /\.submodule-merge-review-dialog/);
   assert.match(css, /\.submodule-review-pointers/);
   assert.match(css, /\.submodule-review-pointers div\.absent/);
-  assert.match(css, /\.submodule-review-pointers div\.selected-choice/);
+  assert.match(css, /\.submodule-review-actions button\.active/);
   assert.match(css, /\.submodule-review-local-note/);
 });
 

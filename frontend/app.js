@@ -688,16 +688,16 @@ $('#gitCompareDownload')?.addEventListener('click', async event => {
 function handleError(error) {
   const msg = String(error).toLowerCase();
   if (msg.includes('timed out')) {
-    // The backend only ever reports this after it has already force-killed
-    // a genuinely stuck git process (10 minutes with zero progress) — by
-    // this point nothing is still running, so it's safe to automatically
-    // bring the repository view back to a clean, known state instead of
-    // leaving it looking frozen. This should be rare: everything short of a
-    // truly wedged process (a stalled network transfer, a held filesystem
-    // lock) finishes on its own well before that backstop ever triggers.
-    const friendly = 'That got stuck and was stopped automatically. Reloading the project…';
+    // The backstop is an absolute deadline, not proof of zero progress.
+    // Stopping Git does not undo writes made before the interruption.
+    const friendly = 'The operation exceeded its time limit. The workspace may be partially updated. Reloading its current state…';
     status(friendly, 'error'); showOperationToast(friendly, 'error');
-    if (state.repository) setTimeout(() => loadRepository(state.repository.path, { keepPath: true }), 300);
+    const repositoryPath = state.repository?.path;
+    if (repositoryPath) setTimeout(() => {
+      if (state.repository?.path !== repositoryPath) return;
+      directoryCache.clear();
+      loadRepository(repositoryPath, { keepPath: true, force: true }).catch(() => status('Could not refresh after the interruption. Refresh the project before continuing.', 'error'));
+    }, 300);
     return friendly;
   }
   if (msg.includes('no changes to commit')) { const friendly = 'Nothing to commit — this selection has no uncommitted local changes.'; status(friendly, 'error'); return friendly; }
@@ -1573,6 +1573,15 @@ function describeBranch(repositoryInfo) {
   return repositoryInfo.current_branch || 'No branch';
 }
 
+function renderCommitScope() {
+  const activeScope = state.selectedEntry?.relative_path || state.currentPath;
+  const activeName = state.selectedEntry?.name || (state.currentPath ? state.currentPath.split('/').pop() : state.repository?.name);
+  refs.commitScope.textContent = state.selectedEntry ? `Commit ${activeName}` : state.currentPath ? 'Commit folder' : 'Commit repository';
+  const scopeChangeCount = state.repository ? state.changes.filter(change => !activeScope || change.path === activeScope || change.path.startsWith(`${activeScope}/`)).length : 0;
+  refs.commitScope.disabled = !scopeChangeCount;
+  refs.commitScope.title = scopeChangeCount ? '' : 'Nothing to commit here — no uncommitted local changes in this scope';
+}
+
 function render() {
   const loaded = Boolean(state.repository);
   document.body.classList.toggle('commander-mode', ['commander','remotes'].includes(state.view));
@@ -1608,12 +1617,7 @@ function render() {
   $('#addSubmodule').hidden = state.view !== 'explorer' || !loaded;
   const folderChangeCount = loaded ? state.changes.filter(change => !state.currentPath || change.path === state.currentPath || change.path.startsWith(`${state.currentPath}/`)).length : 0;
   $('#showFolderChanges').textContent = `Folder changes · ${folderChangeCount}`;
-  const activeScope = state.selectedEntry?.relative_path || state.currentPath;
-  const activeName = state.selectedEntry?.name || (state.currentPath ? state.currentPath.split('/').pop() : state.repository?.name);
-  refs.commitScope.textContent = state.selectedEntry ? `Commit ${activeName}` : state.currentPath ? 'Commit folder' : 'Commit repository';
-  const scopeChangeCount = loaded ? state.changes.filter(change => !activeScope || change.path === activeScope || change.path.startsWith(`${activeScope}/`)).length : 0;
-  refs.commitScope.disabled = !scopeChangeCount;
-  refs.commitScope.title = scopeChangeCount ? '' : 'Nothing to commit here — no uncommitted local changes in this scope';
+  renderCommitScope();
   $('#navExplorer').classList.toggle('active', state.view === 'explorer'); $('#navGraph').classList.toggle('active', state.view === 'graph');
   $('#navCommander').classList.toggle('active', state.view === 'commander');
   $('#navRemotes').classList.toggle('active', state.view === 'remotes');
@@ -3368,7 +3372,10 @@ async function selectEntry(path, options = {}) {
   if (state.selectedEntry?.kind === 'file' && refs.editorDialog.open) {
     openEditor(state.selectedEntry);
   }
-  render();
+  // Selection changes neither repository nor branch/status/PR context. Reuse
+  // Explorer's selected-row fast path instead of rebuilding the whole shell.
+  renderExplorer();
+  renderCommitScope();
   // Deleted tracked paths are intentionally present as synthetic Explorer
   // rows (load_directory cannot discover them through read_dir because they
   // no longer exist). Do not ask entry_details to stat a path known to be
@@ -3957,17 +3964,28 @@ async function confirmFolderRestore() {
 
 async function initializeSubmodule(entry, button = null) {
   if (!state.repository || entry?.kind !== 'submodule') return;
+  const repositoryPath = state.repository.path;
   const finishButton = button ? beginButtonOperation(button, 'Initializing…') : () => {};
   try {
     status(`Initializing submodule ${entry.relative_path}…`, 'busy');
-    await invoke('init_submodule', { repositoryPath: state.repository.path, relativePath: entry.relative_path });
+    await invoke('init_submodule', { repositoryPath, relativePath: entry.relative_path });
+    if (state.repository?.path !== repositoryPath) return;
     directoryCache.clear();
     await refreshStatusAndFolder(state.repository.path, state.currentPath);
     if (state.selectedEntry?.relative_path === entry.relative_path || !state.selectedEntry) await selectEntry(entry.relative_path);
     const message = `Submodule ${entry.name} initialized.`;
     status(message); showOperationToast(message, 'success');
   } catch (error) {
-    handleError(error);
+    // Even a failed clone/update can leave new files or an incomplete index.
+    // Refresh once, without another mutation or a speculative cleanup.
+    if (state.repository?.path === repositoryPath) {
+      directoryCache.clear();
+      try { await refreshStatusAndFolder(repositoryPath, state.currentPath); }
+      catch (_) { jsPerfLog('init_submodule: refresh after failure failed', 0); }
+      if (state.repository?.path !== repositoryPath) return;
+      status(String(error), 'error');
+      showOperationToast('Submodule initialization/update is incomplete. Review its current state before committing.', 'error');
+    }
   } finally {
     finishButton();
   }
@@ -4296,16 +4314,21 @@ async function maybeOfferSubmoduleUpdateAfterMerge(target, beforeHead = '', oper
 }
 async function maybeOfferSubmoduleUpdateBeforeMergeCommit(review) {
   if (!state.repository || review?.target?.isSubmodule) return;
+  if (review?.repositoryPath && review.repositoryPath !== state.repository.path) return;
+  const repositoryPath = state.repository.path;
+  const generation = repoOpenGeneration;
   const items = review?.items || [];
   if (!items.length) return;
   const shown = items.slice(0, 6).map(item => `- ${item.path}`).join('\n');
   const more = items.length > 6 ? `\n- …and ${items.length - 6} more` : '';
   const ok = await customConfirm(
     `The merge result is applied locally, but the merge commit has not been created yet.\n\nSubmodule folders may still be empty or checked out at old commits:\n${shown}${more}\n\nUpdate/init submodule folders now before running the build?\n\nThis runs:\ngit submodule update --init --recursive`,
-    { title: 'Update submodules before build?', okLabel: 'Update submodules' }
+    { title: 'Update submodules before commit?', okLabel: 'Update submodules' }
   );
+  if (state.repository?.path !== repositoryPath || repoOpenGeneration !== generation) return;
   if (ok) {
-    await initAndUpdateSubmodulesFromActions();
+    const result = await initAndUpdateSubmodulesFromActions();
+    if (!result?.success || result.refresh_failed || state.repository?.path !== repositoryPath) return;
     status('Submodules updated. Merge is still pending — run the build, then create the merge commit if it passes.', 'notice');
   } else {
     status('Merge is still pending. Submodule folders were not updated; run “Submodule update --init --recursive” before build if they are empty.', 'notice');
@@ -4332,86 +4355,103 @@ function submoduleReviewResultSource(item, revision = item?.result) {
   const incoming = normalizeReviewRevision(item?.incoming);
   if (sameReviewRevision(selected, current) && sameReviewRevision(selected, incoming)) return selected ? 'same on both sides' : 'no submodule on both sides';
   if (sameReviewRevision(selected, current)) return selected ? 'Current Branch' : 'Current Branch removes it';
-  if (sameReviewRevision(selected, incoming)) return selected ? 'Incoming/origin' : 'Incoming removes it';
+  if (sameReviewRevision(selected, incoming)) return selected ? 'Incoming' : 'Incoming removes it';
   return selected ? 'custom commit' : 'No submodule';
 }
 
 function submoduleReviewChoiceSource(item) {
   if (!item || !Object.prototype.hasOwnProperty.call(item, 'selectedRevision')) return 'No choice yet';
-  if (item.selectedSource === 'result') return submoduleReviewResultSource(item, item.result);
-  if (item.selectedSource === 'current') return 'Current Branch';
-  if (item.selectedSource === 'incoming') return 'Incoming/origin';
-  return normalizeReviewRevision(item.selectedRevision) ? 'Custom Commit' : 'No submodule';
+  // Describe the exact pointer that Apply will use, including an explicit removal.
+  const selected = normalizeReviewRevision(item.selectedRevision);
+  if (!selected) return 'Remove submodule';
+  const current = sameReviewRevision(selected, item.current);
+  const incoming = sameReviewRevision(selected, item.incoming);
+  if (current && incoming) return 'Current = Incoming';
+  if (current) return 'Current';
+  if (incoming) return 'Incoming';
+  return 'Other commit';
 }
 
 function submoduleReviewChoiceLabel(item) {
-  const prefix = item?.selectedSource === 'result' ? 'Prepared result' : 'Selected';
-  return `${prefix}: ${submoduleReviewChoiceSource(item)}`;
+  return `Result: ${submoduleReviewChoiceSource(item)}`;
 }
 
 function submoduleReviewChoiceClass(item) {
-  const source = item?.selectedSource === 'result' ? submoduleReviewResultSource(item, item.result) : submoduleReviewChoiceSource(item);
-  if (/Incoming/.test(source)) return 'incoming';
-  if (/Current/.test(source)) return 'current';
-  if (/Custom/.test(source)) return 'custom';
+  const source = submoduleReviewChoiceSource(item);
+  if (source === 'Remove submodule') return 'removed';
+  if (source === 'Incoming') return 'incoming';
+  if (source === 'Current') return 'current';
+  if (source === 'Other commit') return 'custom';
   return 'neutral';
 }
 
 function submoduleReviewLocalNotice(item, selected) {
   const local = normalizeReviewRevision(item?.local_checkout);
   if (!local || sameReviewRevision(local, selected)) return '';
-  return `<div class="submodule-review-local-note">Folder on disk is at <code>${esc(shortRevision(local))}</code>. The merge commit will record <code>${esc(pointerRevisionLabel(selected))}</code>. Run submodule update when you want the folder to match the chosen pointer.</div>`;
+  return `<div class="submodule-review-local-note">Folder on disk is at <code title="${esc(local)}">${esc(shortRevision(local))}</code>. ${selected ? 'Run update/init after applying to align it with the selected commit.' : 'Removing the gitlink keeps local submodule files.'}</div>`;
 }
 
 function submoduleReviewRowHtml(item) {
   const selected = normalizeReviewRevision(item.selectedRevision);
   const choiceLabel = submoduleReviewChoiceLabel(item);
-  const pointerRow = (label, value, extra = {}) => {
+  const pending = !sameReviewRevision(selected, item.result);
+  const localDiffers = normalizeReviewRevision(item.local_checkout) && !sameReviewRevision(item.local_checkout, selected);
+  const pointerRow = (label, value, absentLabel = 'No submodule') => {
     const revision = normalizeReviewRevision(value);
-    const classes = [
-      revision ? '' : 'absent',
-      extra.result ? 'prepared-result' : '',
-      extra.source && item.selectedSource === extra.source ? 'selected-choice' : '',
-    ].filter(Boolean).join(' ');
-    const badge = extra.badge ? `<em>${esc(extra.badge)}</em>` : '';
-    return `<div class="${classes}"><span>${label}</span><code>${esc(pointerRevisionLabel(value))}</code>${badge}</div>`;
+    return `<div class="${revision ? '' : 'absent'}"><span>${label}</span><code title="${esc(revision || absentLabel)}">${esc(revision ? pointerRevisionLabel(revision) : absentLabel)}</code></div>`;
   };
   const actionButton = (action, label, revision, title = '') => {
     const normalized = normalizeReviewRevision(revision);
     const revisionAttr = normalized ? `data-revision="${esc(normalized)}"` : 'data-revision-none="true"';
-    const active = item.selectedSource === action ? 'active' : '';
-    const removeHint = normalized ? '' : ' · no submodule';
-    return `<button type="button" data-review-action="${action}" ${revisionAttr} class="${active}" title="${esc(`${title || label}${removeHint}`)}">${label}</button>`;
+    const active = item.selectedSource === action;
+    const revisionLabel = normalized ? shortRevision(normalized) : 'Remove';
+    return `<button type="button" data-review-action="${action}" ${revisionAttr} class="${active ? 'active' : ''}" aria-pressed="${active}" title="${esc(`${title || label} · ${normalized || 'No submodule; local files are kept'}`)}"><span class="submodule-review-check" aria-hidden="true">${active ? '✓' : ''}</span>${label}<code>${esc(revisionLabel)}</code></button>`;
   };
+  const registrationNotice = item.registration_issue
+    ? `<div class="submodule-review-registration" role="note">${selected ? 'Blocked: no matching entry in staged .gitmodules. Remove the pointer or restore its registration.' : 'Removal selected to resolve the missing .gitmodules entry. Local files are kept.'}</div>`
+    : '';
   return `<article class="submodule-review-item ${item.suspicious ? 'warning' : 'ok'}" data-path="${esc(item.path)}">
-    <header><div><strong>${esc(item.path)}</strong><span>${esc(item.status)}</span></div><b class="${esc(submoduleReviewChoiceClass(item))}">${esc(choiceLabel)} · ${esc(pointerRevisionLabel(selected))}</b></header>
-    <div class="submodule-review-pointers">
-      ${pointerRow('Merge base', item.base)}
-      ${pointerRow('Current Branch', item.current, { source: 'current' })}
-      ${pointerRow('Incoming/origin', item.incoming, { source: 'incoming' })}
-      ${pointerRow('Prepared result', item.result, { source: 'result', result: true, badge: submoduleReviewResultSource(item, item.result) })}
-    </div>
-    ${submoduleReviewLocalNotice(item, selected)}
-    <p>${esc(item.reason)}</p>
+    <header><strong title="${esc(item.path)}">${esc(item.path)}</strong><div class="submodule-review-result ${esc(submoduleReviewChoiceClass(item))}"><b>${esc(choiceLabel)}</b>${selected ? `<code title="${esc(selected)}">${esc(shortRevision(selected))}</code>` : ''}<small>${pending ? 'Not applied yet' : item.selectedSource === 'result' ? 'Prepared in index' : 'Already matches index'}</small></div></header>
     <div class="submodule-review-actions">
-      ${actionButton('result', `Keep prepared result (${submoduleReviewResultSource(item, item.result)})`, item.result, `Keep prepared result: ${submoduleReviewResultSource(item, item.result)}`)}
-      ${actionButton('current', 'Use Current Branch', item.current, 'Record the submodule pointer from this branch before the merge')}
-      ${actionButton('incoming', 'Use Incoming/origin', item.incoming, 'Record the submodule pointer from the branch being merged')}
-      <button type="button" data-review-action="choose">Choose another commit…</button>
-      <button type="button" data-review-action="history">Open history</button>
+      ${actionButton('result', 'Prepared', item.result, `Keep prepared result: ${submoduleReviewResultSource(item, item.result)}`)}
+      ${actionButton('current', 'Current', item.current, 'Use Current Branch: the pointer before this merge')}
+      ${actionButton('incoming', 'Incoming', item.incoming, 'Use Incoming: the pointer from the branch being merged')}
+      ${item.registration_issue ? actionButton('remove', 'Remove gitlink', null, 'Remove only this parent-repository pointer; keep local submodule files') : ''}
+      <span class="submodule-review-status">Prepared: ${esc(item.status)}</span>
     </div>
+    ${registrationNotice}
+    <details class="submodule-review-details"><summary>Details${localDiffers ? ' · folder on disk differs' : ''}</summary>
+      <div class="submodule-review-pointers">${pointerRow('Merge base', item.base)}${pointerRow('Prepared result', item.result)}${pointerRow('Folder on disk', item.local_checkout, 'Not available')}</div>
+      <p><b>Prepared result review.</b> ${esc(item.reason)}</p>
+      ${submoduleReviewLocalNotice(item, selected)}
+      <div class="submodule-review-actions"><button type="button" data-review-action="choose">Choose another commit…</button><button type="button" data-review-action="history">Open history</button></div>
+    </details>
   </article>`;
 }
 
 function renderSubmoduleMergeReview() {
   const review = state.submoduleMergeReview;
   const items = review?.items || [];
-  refs.submoduleMergeReviewList.innerHTML = items.map(submoduleReviewRowHtml).join('') || '<div class="empty-change">No submodule pointer changes need review.</div>';
+  const list = refs.submoduleMergeReviewList;
+  const scrollTop = list.scrollTop;
+  const expanded = new Set([...list.querySelectorAll('.submodule-review-details[open]')].map(details => details.closest('.submodule-review-item').dataset.path));
+  const active = list.ownerDocument?.activeElement;
+  const focusPath = list.contains?.(active) ? active.closest('.submodule-review-item')?.dataset.path : null;
+  const focusAction = active?.dataset?.reviewAction;
+  list.innerHTML = items.map(submoduleReviewRowHtml).join('') || '<div class="empty-change">No submodule pointer changes need review.</div>';
+  list.querySelectorAll('.submodule-review-item').forEach(row => {
+    row.querySelector('details').open = expanded.has(row.dataset.path);
+    if (row.dataset.path === focusPath) {
+      [...row.querySelectorAll('[data-review-action]')].find(button => button.dataset.reviewAction === focusAction)?.focus({ preventScroll: true });
+    }
+  });
+  list.scrollTop = scrollTop;
   const changed = items.filter(item => !sameReviewRevision(item.selectedRevision, item.result)).length;
   const warnings = items.filter(item => item.suspicious).length;
-  refs.submoduleMergeReviewSummary.textContent = `${items.length} rows · ${changed} changed · ${warnings} review`;
-  refs.submoduleMergeReviewStatus.textContent = review?.summary || '';
-  refs.submoduleMergeReviewList.querySelectorAll('[data-review-action]').forEach(button => button.addEventListener('click', async () => {
+  refs.submoduleMergeReviewSummary.textContent = `${items.length} submodules · ${changed} pending choices · ${warnings} to review`;
+  refs.submoduleMergeReviewStatus.textContent = '';
+  list.querySelectorAll('[data-review-action]').forEach(button => button.addEventListener('click', async () => {
+    if (refs.applySubmoduleMergeReviewOnly.disabled || refs.confirmSubmoduleMergeReview.disabled) return;
     const row = button.closest('.submodule-review-item');
     const item = items.find(candidate => candidate.path === row?.dataset.path);
     if (!item) return;
@@ -4423,6 +4463,7 @@ function renderSubmoduleMergeReview() {
     }
     if (action === 'choose') {
       const value = await customPrompt(`Choose a commit SHA for ${item.path}:\n\nThis only changes the main repository gitlink. It does not push or rewrite the submodule.`, item.selectedRevision || item.result || item.incoming || item.current || '', { title: 'Choose submodule revision', okLabel: 'Use revision' });
+      if (state.submoduleMergeReview !== review) return;
       if (!value?.trim()) return;
       item.selectedRevision = value.trim();
       item.selectedSource = 'custom';
@@ -4436,12 +4477,16 @@ function renderSubmoduleMergeReview() {
 
 async function openSubmoduleMergeReviewDialog(target, message = '') {
   if (!invoke || target?.isSubmodule) return false;
-  const review = await invoke('submodule_merge_review', { repositoryPath: state.repository.path, targetPath: target?.targetPath || '' });
+  const repositoryPath = state.repository.path;
+  const generation = repoOpenGeneration;
+  const review = await invoke('submodule_merge_review', { repositoryPath, targetPath: target?.targetPath || '' });
+  if (state.repository?.path !== repositoryPath || repoOpenGeneration !== generation) return false;
   const items = review?.items || [];
   if (!items.length) return false;
   state.mergeTarget = target;
   state.submoduleMergeReview = {
     target,
+    repositoryPath,
     summary: review.summary,
     items: items.map(item => ({ ...item, selectedRevision: normalizeReviewRevision(item.result), selectedSource: 'result' })),
   };
@@ -4457,32 +4502,39 @@ async function openSubmoduleMergeReviewDialog(target, message = '') {
 async function completeMergeAfterSubmoduleReview() {
   const review = state.submoduleMergeReview;
   if (!review?.target) return;
+  const repositoryPath = review.repositoryPath || state.repository.path;
   const message = refs.submoduleMergeCommitMessage.value.trim();
   if (!message) { refs.submoduleMergeReviewStatus.textContent = 'A merge commit message is required.'; return; }
   refs.confirmSubmoduleMergeReview.disabled = true; refs.confirmSubmoduleMergeReview.textContent = 'Creating…';
   try {
     await applySubmoduleMergeReviewChoices(review);
-    const oid = await invoke('complete_merge', { repositoryPath: state.repository.path, targetPath: review.target.targetPath || '', message });
+    if (state.repository?.path !== repositoryPath) return;
+    const oid = await invoke('complete_merge', { repositoryPath, targetPath: review.target.targetPath || '', message });
     refs.submoduleMergeReviewDialog.close();
     state.submoduleMergeReview = null;
     const msg = `Merge commit created (${String(oid).slice(0, 8)}).`;
     status(msg); showOperationToast(msg, 'success');
     await refreshAfterMerge();
-    await maybeOfferSubmoduleUpdateAfterMerge(review.target);
   } catch (error) {
     refs.submoduleMergeReviewStatus.textContent = String(error);
     handleError(error);
   } finally {
-    refs.confirmSubmoduleMergeReview.disabled = false; refs.confirmSubmoduleMergeReview.textContent = 'Merge and commit';
+    refs.confirmSubmoduleMergeReview.disabled = false; refs.confirmSubmoduleMergeReview.textContent = 'Commit merge';
   }
 }
 
 async function applySubmoduleMergeReviewChoices(review = state.submoduleMergeReview) {
   if (!review?.target) return 0;
+  const repositoryPath = review.repositoryPath || state.repository?.path;
+  const generation = repoOpenGeneration;
+  if (state.repository?.path !== repositoryPath) throw new Error('Repository context changed. Reopen the merge review in the original repository.');
+  const unregistered = review.items.filter(item => item.registration_issue && normalizeReviewRevision(item.selectedRevision));
+  if (unregistered.length) throw new Error(`Submodule pointer(s) have no matching path in the staged .gitmodules: ${unregistered.map(item => item.path).join(', ')}. Choose No submodule / Remove gitlink if removed, or restore the matching registration and reopen this review. Update/init cannot fix this mismatch. No choices were applied.`);
   const changed = review.items.filter(item => !sameReviewRevision(item.selectedRevision, item.result));
   for (const item of changed) {
+    if (state.repository?.path !== repositoryPath || repoOpenGeneration !== generation) throw new Error('Repository context changed while applying merge choices. Inspect the original repository before continuing; no choices were sent to another repository.');
     await invoke('apply_submodule_merge_revision', {
-      repositoryPath: state.repository.path,
+      repositoryPath,
       targetPath: review.target.targetPath || '',
       relativePath: item.path,
       revision: normalizeReviewRevision(item.selectedRevision) || '',
@@ -4496,11 +4548,13 @@ async function applySubmoduleMergeReviewChoices(review = state.submoduleMergeRev
 async function applySubmoduleMergeReviewOnly() {
   const review = state.submoduleMergeReview;
   if (!review?.target) return;
+  const repositoryPath = review.repositoryPath || state.repository.path;
   refs.applySubmoduleMergeReviewOnly.disabled = true;
   refs.confirmSubmoduleMergeReview.disabled = true;
   refs.submoduleMergeReviewStatus.textContent = 'Applying selected submodule pointers…';
   try {
     const changed = await applySubmoduleMergeReviewChoices(review);
+    if (state.repository?.path !== repositoryPath) return;
     refs.submoduleMergeReviewDialog.close();
     state.submoduleMergeReview = null;
     const msg = changed
@@ -4568,7 +4622,7 @@ function startConflictSession(target, conflicts = []) {
   state.conflictSession = {
     key: conflictTargetKey(target),
     items: conflicts.map(conflict => normalizeConflictItem(conflict, false)),
-    completePromptShown: false,
+    updatePromptShown: false,
   };
   return state.conflictSession.items;
 }
@@ -4615,6 +4669,7 @@ function renderConflictsList(target, conflicts = null) {
     const itemLabel = isSubmoduleConflict ? 'submodule version' : 'file';
     const mineTip = isSubmoduleConflict ? 'Keep the submodule commit recorded by the current branch' : 'Keep your version of this file';
     const theirsTip = isSubmoduleConflict ? 'Use the submodule commit recorded by the incoming branch' : "Keep the incoming branch's version of this file";
+    const removeTip = 'This side removes the submodule gitlink. Local submodule files are kept.';
     if (conflict.resolved) return `<div class="conflict-row resolved" data-path="${esc(conflict.path)}">
     <div class="conflict-head"><span class="conflict-path">${esc(conflict.path)}</span><span class="conflict-state done" data-tooltip="This ${esc(itemLabel)} is no longer reported as conflicted by Git">DONE</span></div>
     <div class="conflict-actions"><span class="conflict-resolved-note">Resolved and staged for the merge result.</span></div>
@@ -4622,8 +4677,8 @@ function renderConflictsList(target, conflicts = null) {
     return `<div class="conflict-row" data-path="${esc(conflict.path)}">
     <div class="conflict-head"><span class="conflict-path">${esc(conflict.path)}</span><span class="conflict-state pending" data-tooltip="Git still reports this ${esc(itemLabel)} as unresolved in the index">${isSubmoduleConflict ? 'SUBMODULE VERSION' : 'UNRESOLVED'}</span></div>
     <div class="conflict-actions">
-      <button data-resolve="ours" ${conflict.has_ours ? '' : 'disabled'} data-tooltip="${esc(mineTip)}">↤ Keep mine</button>
-      <button data-resolve="theirs" ${conflict.has_theirs ? '' : 'disabled'} data-tooltip="${esc(theirsTip)}">↦ Keep theirs</button>
+      <button data-resolve="ours" ${conflict.has_ours || isSubmoduleConflict ? '' : 'disabled'} data-tooltip="${esc(isSubmoduleConflict && !conflict.has_ours ? removeTip : mineTip)}">${isSubmoduleConflict && !conflict.has_ours ? 'Remove gitlink · Current' : '↤ Keep mine'}</button>
+      <button data-resolve="theirs" ${conflict.has_theirs || isSubmoduleConflict ? '' : 'disabled'} data-tooltip="${esc(isSubmoduleConflict && !conflict.has_theirs ? removeTip : theirsTip)}">${isSubmoduleConflict && !conflict.has_theirs ? 'Remove gitlink · Incoming' : '↦ Keep theirs'}</button>
       <button data-resolve="mergetool" ${isSubmoduleConflict ? 'disabled' : ''} data-tooltip="Use Git's configured mergetool for this conflicted file">◇ Resolve with Git mergetool</button>
       <button data-resolve="manualmark" ${isSubmoduleConflict ? 'disabled' : ''} data-tooltip="After resolving this file in an external tool, stage it as resolved. Refuses if conflict markers are still present.">✓ Mark resolved</button>
       <button data-resolve="manual" ${isSubmoduleConflict ? 'disabled' : ''} data-tooltip="Open the file (with conflict markers) and edit it yourself">✎ Edit manually</button>
@@ -4665,15 +4720,13 @@ function openConflictsDialog(target, conflicts, introMessage) {
   refs.conflictsDialog.showModal();
 }
 
-async function maybeOfferCompleteMergeAfterConflictsResolved(target, conflicts = []) {
-  if (target.kind === 'stash' || conflicts.length || state.conflictSession?.completePromptShown) return;
-  if (state.conflictSession) state.conflictSession.completePromptShown = true;
+async function maybeOfferSubmoduleReviewAfterConflictsResolved(target, conflicts = []) {
+  if (target.kind === 'stash' || target.isSubmodule || conflicts.length || state.conflictSession?.updatePromptShown) return;
   if (!refs.conflictsDialog.open) return;
-  const ok = await customConfirm(
-    'All conflicts are resolved and staged. Complete the merge commit now?',
-    { title: 'Complete merge?', okLabel: 'Complete merge' }
-  );
-  if (ok && refs.conflictsDialog.open) refs.confirmCompleteMerge.click();
+  if (state.conflictSession) state.conflictSession.updatePromptShown = true;
+  // Review the prepared pointers first, then Apply offers init/update.
+  // Never trigger a commit button automatically when conflicts are resolved.
+  await openSubmoduleMergeReviewDialog(target, refs.conflictsCommitMessage.value.trim());
 }
 async function refreshConflictsDialog(target, options = {}) {
   let finishButton = null;
@@ -4691,7 +4744,7 @@ async function refreshConflictsDialog(target, options = {}) {
       : (isStash ? 'Resolved — no merge commit is required for a stash.' : 'Resolved/staged — ready to complete the merge.');
     await checkForMergeConflicts();
     if (options.focusNext) focusFirstUnresolvedConflict();
-    if (options.offerComplete) await maybeOfferCompleteMergeAfterConflictsResolved(target, conflicts);
+    if (options.offerUpdate) await maybeOfferSubmoduleReviewAfterConflictsResolved(target, conflicts);
     if (finishButton) finishButton();
     return conflicts;
   } catch (error) { if (finishButton) finishButton(); handleError(error); return null; }
@@ -4706,7 +4759,7 @@ async function resolveConflictAction(target, path, kind, button = null) {
       ? `${path}: marked as resolved.`
       : `${path}: kept ${kind === 'ours' ? 'your' : 'the incoming'} version.`;
     status(msg); showOperationToast(msg, 'success');
-    await refreshConflictsDialog(target, { focusNext: true, offerComplete: true });
+    await refreshConflictsDialog(target, { focusNext: true, offerUpdate: true });
   } catch (error) { handleError(error); }
   finally { if (finishButton) finishButton(); }
 }
@@ -4729,7 +4782,7 @@ async function resolveConflictWithMergeTool(target, path, button) {
     status(`Opening Git mergetool for ${path}…`, 'busy');
     const message = await invoke('open_merge_tool', { repositoryPath: conflictRepositoryPath(target), targetPath: target.targetPath, relativePath: path });
     const marked = await markConflictResolvedAfterExternalTool(target, path);
-    await refreshConflictsDialog(target, { focusNext: true, offerComplete: true });
+    await refreshConflictsDialog(target, { focusNext: true, offerUpdate: true });
     if (marked.status === 'still_pending') {
       const detail = `${message}\n\nGit still reports ${path} as unresolved: ${marked.message}\n\nSave the resolved file in the merge tool, then use “Mark resolved” or “Recheck conflicts”.`;
       status(`${path} is still unresolved after mergetool.`, 'error');
@@ -4765,7 +4818,7 @@ async function resolveConflictWithMergeTool(target, path, button) {
 
 refs.refreshConflictsButton.addEventListener('click', () => {
   const target = state.mergeTarget;
-  if (target) refreshConflictsDialog(target, { button: refs.refreshConflictsButton, focusNext: true, offerComplete: true });
+  if (target) refreshConflictsDialog(target, { button: refs.refreshConflictsButton, focusNext: true, offerUpdate: true });
 });
 
 function editConflictFile(target, path) {
@@ -4807,7 +4860,6 @@ refs.confirmCompleteMerge.addEventListener('click', async () => {
     const msg = `Merge completed${target.isSubmodule ? ` in ${target.label}` : ''}.`;
     status(msg); showOperationToast(msg, 'success');
     await refreshAfterMerge();
-    await maybeOfferSubmoduleUpdateAfterMerge(target);
   } catch (error) {
     refs.conflictsStatus.textContent = String(error);
     await refreshConflictsDialog(target, { focusNext: true });
@@ -5948,6 +6000,12 @@ function setActiveGraphPrimaryBranch(name) { if (state.submoduleGraph) state.sub
 // Branch Map-only presentation state. Separate choices preserve the original
 // Full Graph primary/filter settings; new repository contexts default to Full.
 const branchStoryViews = new WeakMap();
+// Diagnostic facts only; no extra Git query or graph traversal.
+function traceGraphStart(event, g, facts) {
+  jsPerfLog(`graph_start: ${JSON.stringify({ event, scope: state.submoduleGraph ? 'submodule' : 'parent',
+    head: g.headOid || null, detached: !!g.headDetached, loaded: g.commits?.length || 0,
+    truncated: !!g.commitsTruncated, ...facts })}`, 0);
+}
 // One small reflog lookup per selected branch/tip and loaded graph generation.
 // No history walk, status scan, ref mutation or fallback to current merge-base.
 function ensureStoryCreation(g, view, kind, branch, tip) {
@@ -5958,7 +6016,12 @@ function ensureStoryCreation(g, view, kind, branch, tip) {
   view.creation = entry;
   invoke('branch_story_creation', { repositoryPath: g.path, branch, tip }).then(id => {
     entry.id = id;
-  }).catch(error => { entry.error = String(error); }).finally(() => {
+    traceGraphStart('creation_result', g, { mode: 'story', source: 'local_reflog', tip, creation: id || null,
+      current_selection: view.creation === entry });
+  }).catch(error => {
+    entry.error = String(error);
+    traceGraphStart('creation_error', g, { mode: 'story', source: 'local_reflog', tip, category: diagnosticErrorCategory(error), current_selection: view.creation === entry });
+  }).finally(() => {
     entry.pending = false;
     if (state.view === 'graph' && activeBranchStoryView() === view && view.creation === entry && view.mode === 'story') {
       const selected = state.selectedCommit?.id;
@@ -6123,11 +6186,17 @@ function ensureHeadMainMergeBase(g) {
     .then(data => {
       headMainMergeBaseFetchKey = null;
       const current = activeGraphData();
-      if (current.path !== g.path || current.headOid !== g.headOid) return;
+      const accepted = current.path === g.path && current.headOid === g.headOid;
+      traceGraphStart('shared_base_result', g, { mode: 'full', source: 'current_head_merge_base',
+        target: data?.oid || null, base_ref: data?.base_ref || null, accepted });
+      if (!accepted) return;
       headMainMergeBaseCache = { key, data };
       if (state.view === 'graph') renderGraph();
     })
-    .catch(() => { headMainMergeBaseFetchKey = null; });
+    .catch(error => {
+      headMainMergeBaseFetchKey = null;
+      traceGraphStart('shared_base_error', g, { mode: 'full', source: 'current_head_merge_base', category: diagnosticErrorCategory(error) });
+    });
   return null;
 }
 
@@ -6256,8 +6325,11 @@ function graphCommitRow(commitId) {
 async function jumpToGraphBranchStart() {
   const initialGraph = activeGraphData();
   const branchStart = ensureHeadMainMergeBase(initialGraph);
+  traceGraphStart('jump_requested', initialGraph, { mode: 'full', source: 'current_head_merge_base',
+    target: branchStart?.oid || null, base_ref: branchStart?.base_ref || null });
   if (!branchStart?.oid) {
     const key = `${initialGraph.path}::${initialGraph.headOid}`;
+    traceGraphStart('jump_unavailable', initialGraph, { mode: 'full', reason: headMainMergeBaseFetchKey === key ? 'lookup_pending' : 'no_shared_base' });
     status(headMainMergeBaseFetchKey === key
       ? 'Shared base is still being calculated. Try again in a moment.'
       : 'Shared base is not available for this checkout.', 'error');
@@ -6274,22 +6346,29 @@ async function jumpToGraphBranchStart() {
 
   const targetContext = state.submoduleGraph;
   const targetPath = initialGraph.path;
+  let pagesLoaded = 0;
   let row = graphCommitRow(branchStart.oid);
   while (!row && activeGraphData().commitsTruncated) {
     const before = activeGraphData().commits.length;
     status(`Loading older history to find shared base ${branchStart.oid.slice(0, 8)}…`, 'busy');
     await loadOlderGraphCommits();
-    if (state.view !== 'graph' || state.submoduleGraph !== targetContext || activeGraphData().path !== targetPath) return;
+    pagesLoaded++;
+    if (state.view !== 'graph' || state.submoduleGraph !== targetContext || activeGraphData().path !== targetPath) {
+      traceGraphStart('jump_discarded', initialGraph, { mode: 'full', target: branchStart.oid, reason: 'context_changed', pages: pagesLoaded });
+      return;
+    }
     if (activeGraphData().commits.length <= before) break;
     row = graphCommitRow(branchStart.oid);
   }
 
   if (!row) {
+    traceGraphStart('jump_unavailable', activeGraphData(), { mode: 'full', target: branchStart.oid, reason: 'target_not_loaded', pages: pagesLoaded });
     status(`Shared base ${branchStart.oid.slice(0, 8)} is not present in the available graph history.`, 'error');
     return;
   }
   row.scrollIntoView({ block: 'center', behavior: 'smooth' });
   selectCommit(branchStart.oid);
+  traceGraphStart('jump_selected', activeGraphData(), { mode: 'full', source: 'current_head_merge_base', target: branchStart.oid, base_ref: branchStart.base_ref, pages: pagesLoaded });
   if (row.animate) row.animate([{ boxShadow: '0 0 0 0 rgba(245, 181, 75, .8)' }, { boxShadow: '0 0 0 12px rgba(245, 181, 75, 0)' }], { duration: 900, easing: 'ease-out' });
   status(`Shared base: ${branchStart.oid.slice(0, 8)} against ${branchStart.base_ref}. This may advance after merges; it is not necessarily the original branch start.`);
 }
@@ -6825,6 +6904,22 @@ function renderGraph() {
   const refFilter = storyMode ? storyView.refFilter : activeGraphRefFilter();
   const filterOptions = [['all', 'All'], ['branches', 'Branches'], ['releases', 'Releases']];
   const headMainBase = storyMode ? null : ensureHeadMainMergeBase(g);
+  const startDiagnostic = {
+    mode: storyMode ? 'story' : 'full', source: storyMode ? 'creation_and_first_parent' : 'current_head_merge_base',
+    selected_kind: primaryKind, selected_tip: primaryTip?.id || null,
+    selected_is_checkout: primaryKind === 'detached' ? !!g.headDetached : primaryKind === 'branch' && primaryName === g.currentBranch,
+    target: (storyMode ? story.start.id : headMainBase?.oid) || null,
+    base_ref: (storyMode ? story.start.baseRef || story.baseRef : headMainBase?.base_ref) || null,
+    story_shared_base: story?.baseId || null, creation: storyMode ? storyView.creation?.id || null : null,
+    lookup_pending: storyMode ? !!storyView.creation?.pending : headMainMergeBaseFetchKey === `${g.path}::${g.headOid}`,
+    reason: storyMode ? story.start.reason : 'Current HEAD merge-base; independent of Primary picker; may advance after merges.',
+  };
+  // Log decisions only when their inputs/results change, not every redraw.
+  const startDiagnosticKey = JSON.stringify([g.headOid, allGraphCommits.length, !!g.commitsTruncated, startDiagnostic]);
+  if (storyView && storyView.startDiagnostic !== startDiagnosticKey) {
+    storyView.startDiagnostic = startDiagnosticKey;
+    traceGraphStart('candidate', g, startDiagnostic);
+  }
   const branchStartVisible = !!(headMainBase?.oid && commits.some(commit => commit.id === headMainBase.oid));
   const branchStartLookupPending = headMainMergeBaseFetchKey === `${g.path}::${g.headOid}`;
   const branchStartTitle = headMainBase?.oid
@@ -6873,7 +6968,10 @@ function renderGraph() {
   refs.laneLegend.querySelectorAll('[data-jump-branch-start]').forEach(button => button.addEventListener('click', jumpToGraphBranchStart));
   refs.laneLegend.querySelector('[data-jump-story-start]')?.addEventListener('click', () => {
     const row = graphCommitRow(story.start.id);
+    traceGraphStart('jump_requested', g, { mode: 'story', source: 'creation_and_first_parent', target: story.start.id,
+      tip: story.tipId, creation: storyView.creation?.id || null, base_ref: story.start.baseRef || null, reason: story.start.reason, visible: !!row });
     if (row) { row.scrollIntoView({ block: 'center', behavior: 'smooth' }); selectCommit(story.start.id); }
+    traceGraphStart(row ? 'jump_selected' : 'jump_unavailable', g, { mode: 'story', target: story.start.id, reason: row ? 'visible_row_selected' : 'target_not_loaded' });
   });
   refs.laneLegend.querySelectorAll('[data-ref-filter]').forEach(button => button.addEventListener('click', () => { if (storyMode) storyView.refFilter = button.dataset.refFilter; else setActiveGraphRefFilter(button.dataset.refFilter); renderGraph(); }));
   refs.laneLegend.querySelectorAll('[data-graph-only-matches]').forEach(button => button.addEventListener('click', () => { state.graphOnlySearchMatches = !state.graphOnlySearchMatches; renderGraph(); }));
@@ -7289,7 +7387,7 @@ async function openPublish() {
   if (!invoke && !state.remotes.length) state.remotes = [{ name: 'origin', fetch_url: 'git@example.com:vehicle-control.git', push_url: 'git@example.com:vehicle-control.git' }];
   const locals = state.branches.filter(branch => !branch.remote); refs.publishBranch.innerHTML = locals.map(branch => `<option value="${esc(branch.name)}" ${branch.current ? 'selected' : ''}>${esc(branch.name)}${branch.current ? ' (current)' : ''}</option>`).join('');
   refs.publishRemote.innerHTML = state.remotes.map(remote => `<option value="${esc(remote.name)}">${esc(remote.name)}</option>`).join('');
-  if (refs.publishSafeMode) refs.publishSafeMode.checked = true;
+  if (refs.publishFastMode) refs.publishFastMode.checked = true;
   document.querySelector('[name="publishCommitMode"][value="all"]').checked = true;
   $('#publishCombinedMessage').value = '';
   $('#publishOperationStatus').textContent = '';
@@ -7318,7 +7416,9 @@ function submodulePublishRisksHtml(risks) {
         ? 'has no remote configured at all'
         : risk.risk === 'local_only'
           ? `is only reachable from a local path or file:// URL (${esc(risk.configured_url || '?')})`
-          : 'could not be checked locally';
+          : risk.risk === 'local_origin'
+            ? 'has a local-filesystem origin; fetching it cannot verify availability on the configured server'
+            : 'could not be checked locally';
   // The outgoing commit being checked can reference an older submodule
   // commit than what's actually checked out right now (the submodule moved
   // on locally after that parent commit was made) — spelled out here so a
@@ -7396,8 +7496,8 @@ function updatePublishModeUi() {
   safetyExplanation.hidden = mode === 'combine_only';
   safetyExplanation.classList.toggle('fast', !!fast);
   safetyExplanation.textContent = fast
-    ? 'Fast publish skips only the submodule remote-availability check. It is quicker, but another clone can fail if an outgoing project commit points to a submodule commit that exists only on this computer.'
-    : 'Safe publish reads the submodule pointers in the outgoing commits and verifies each referenced SHA on its own remote. It does not push submodules, merge, checkout, stage, or change local files.';
+    ? 'Same normal push, without the submodule safety check or its fetches. Publish the referenced submodule commits first; otherwise another clone may receive the project commits but fail to check out those submodule versions. Fast publish is not a force push.'
+    : 'Before pushing, checks added or updated submodule pointers across the outgoing commits, including intermediate versions. Normally fetches each affected submodule\'s origin and checks its remote-branch history. This can take time with many submodules; it does not change their working files.';
   $('#publishCombinedMessageLabel').hidden = mode === 'all';
   $('#publishCombineNotice').textContent = mode === 'all' ? '' : `Combine affects committed history only: ${state.publish?.ahead || state.publish?.commits?.length || 0} local-only commits become one. Existing staged, unstaged and untracked parent-repository changes remain untouched and are not included. A recovery reference is created before the branch moves. Changes inside a submodule must be handled first.`;
   const incompleteList = Number(state.publish?.outgoing_count) > (state.publish?.commits?.length || 0);
@@ -7483,7 +7583,7 @@ async function confirmPublish(event, overrideUnpushedSubmodules = false, already
   const skipSubmoduleSafety = !!refs.publishFastMode?.checked;
   if (commitMode !== 'combine_only' && skipSubmoduleSafety && !overrideUnpushedSubmodules) {
     const proceed = await customConfirm(
-      'Fast publish skips the submodule safety check. If a parent commit references a submodule commit that exists only on your machine, another clone may fail to restore the project.\n\nUse this only when you already know the referenced submodule commits are pushed, or when this publish does not change submodule pointers.',
+      'Fast publish skips the submodule safety check and its fetches, including checks of intermediate versions in the outgoing history. If a project commit references an unpublished submodule commit, another clone may fail to check it out.\n\nUse this only when the referenced submodule commits are already published, or no outgoing commit changes a submodule pointer. This is a normal push, not a force push; authentication, non-fast-forward checks and server rules still apply.',
       { title: 'Fast publish without submodule safety', danger: true, okLabel: 'Fast publish' }
     );
     if (!proceed) return;
@@ -8036,7 +8136,8 @@ document.querySelectorAll('[data-polarion-search]').forEach(button => button.add
     : context.isSubmodule ? '' : (state.selectedEntry?.relative_path || state.currentPath);
   const references = mode === 'context' && context.isSubmodule
     ? { repositoryPath: context.parentPath, moduleName: context.name, commitKey: context.relativePath }
-    : mode === 'scope' ? scopeCommitReferenceContext(selectedScope()) : submoduleCommitReferenceContext(state.selectedEntry?.kind === 'submodule' ? state.selectedEntry : null);
+    : mode === 'scope' ? scopeCommitReferenceContext(selectedScope()) : submoduleCommitReferenceContext(state.selectedEntry?.kind === 'submodule' ? state.selectedEntry : null)
+      || (mode === 'context' ? scopeCommitReferenceContext({ path }) : null);
   polarionTaskPicker.open(mode === 'context' ? context.path : state.repository?.path, path, references);
 }));
 
@@ -8915,10 +9016,11 @@ async function findBranchStartCommit() {
 
 async function initAndUpdateSubmodulesFromActions() {
   if (!state.repository) return status('Open a repository first.', 'error');
-  status('Initializing and updating submodules recursively…', 'busy');
+  status('Initializing and updating submodules recursively… Large projects can take many minutes (up to 60 minutes).', 'busy');
   const result = await runTerminalFromConsole('git submodule update --init --recursive');
-  if (result?.success) status('Submodules initialized/updated. Repository was refreshed.');
-  else status('Submodule init/update failed. See Terminal output.', 'error');
+  if (result?.success && !result.refresh_failed) status('Git submodule update completed. Repository status refreshed; review any remaining local changes.');
+  else if (result?.success) status('Git submodule update completed, but status could not be refreshed. Refresh the project before continuing.', 'error');
+  else status('Submodule update did not complete. Some modules may already have changed; inspect the working tree and Terminal output before committing.', 'error');
   return result;
 }
 
@@ -9382,34 +9484,35 @@ async function runTerminalFromConsole(input, options = {}) {
     entry.result = result;
     entry.elapsedMs = performance.now() - entry.startedAt;
     jsPerfLog(`frontend: runTerminal ${entry.status} (read_only=${!!result.read_only})`, entry.elapsedMs);
-    clearInterval(consoleRunningTicker); consoleRunningTicker = null;
-    state.consoleCommandRunning = false;
-    renderConsoleTranscript();
-    refreshCommandHint();
-    // The strict read-only allowlist (status/log/diff/show/blame/ls-files,
-    // matched on the subcommand alone) is the only case that skips a full
-    // reload — anything else, including a command this app has never heard
-    // of, is treated conservatively as possibly mutating.
-    if (!result.read_only && state.repository?.path === capturedRepositoryPath) {
-      // Force bypasses status caches because an arbitrary shell command can
-      // change files or Git metadata without going through any app command's
-      // normal invalidation path (especially when the selected scope is a
-      // submodule but the parent repository must also notice its new state).
-      directoryCache.clear(); await loadRepository(capturedRepositoryPath, { keepPath: true, force: true });
-    }
-    return result;
   } catch (error) {
     const message = String(error);
     entry.status = message.toLowerCase().includes('timed out') ? 'TIMED_OUT' : 'FAILED';
     entry.result = { success: false, stdout: '', stderr: message, exit_code: null };
     entry.elapsedMs = performance.now() - entry.startedAt;
     jsPerfLog(`frontend: runTerminal ${entry.status}`, entry.elapsedMs);
-    clearInterval(consoleRunningTicker); consoleRunningTicker = null;
-    state.consoleCommandRunning = false;
-    renderConsoleTranscript();
-    refreshCommandHint();
-    return entry.result;
   }
+  clearInterval(consoleRunningTicker); consoleRunningTicker = null;
+  state.consoleCommandRunning = false;
+  renderConsoleTranscript();
+  refreshCommandHint();
+  // Failure/timeout is not rollback. Refresh possibly-mutated state on BOTH
+  // outcomes. An IPC error has no trusted read_only classification, so it is
+  // conservatively refreshed too. Successful read-only commands still skip it.
+  if (!entry.result.read_only && state.repository?.path === capturedRepositoryPath) {
+    directoryCache.clear();
+    jsPerfLog(`frontend: runTerminal refresh after ${entry.status}`, 0);
+    try { await loadRepository(capturedRepositoryPath, { keepPath: true, force: true }); }
+    catch (_) {
+      // Preserve the actual Git result and original error. A failed status
+      // refresh must neither turn a timeout into success nor hide Git's output.
+      entry.result.refresh_failed = true;
+      entry.result.stderr = `${entry.result.stderr || ''}\nRepository status could not be refreshed. Refresh the project before continuing.`;
+      renderConsoleTranscript();
+      jsPerfLog('frontend: runTerminal status refresh failed', 0);
+      status('Could not refresh repository status after the command. Refresh the project before continuing.', 'error');
+    }
+  }
+  return entry.result;
 }
 
 // Live "what comes next" helper while typing a Git command in the Terminal — shows the

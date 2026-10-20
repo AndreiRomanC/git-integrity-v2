@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Git DrillDown</title>
   <link rel="icon" type="image/png" href="assets/git-drilldown-mark.png">
-  <link rel="stylesheet" href="styles.css?v=20261019-structdoc-message-permissions">
-  <link rel="stylesheet" href="polarion.css?v=20261019-structdoc-message-permissions">
+  <link rel="stylesheet" href="styles.css?v=20261020-fast-default">
+  <link rel="stylesheet" href="polarion.css?v=20261020-fast-default">
 </head>
 <body>
   <div class="app-shell">
@@ -554,11 +554,18 @@
       <div class="publish-controls"><label><span>LOCAL BRANCH</span><select id="publishBranch"></select></label><span class="publish-arrow">→</span><label><span>REMOTE</span><select id="publishRemote"></select></label></div>
       <div class="publish-explain"><b id="publishDestination">—</b><span>All commits listed below will be published in order. Select files before Commit; select the destination here before Push.</span></div>
       <fieldset id="publishSafetyMode" class="publish-safety-mode">
-        <legend>Publish mode</legend>
-        <label><input type="radio" name="publishSafetyMode" id="publishSafeMode" checked><span><strong>Safe publish</strong><small>Before Push, verifies that every referenced submodule commit is available on that submodule's remote.</small></span></label>
-        <label><input type="radio" name="publishSafetyMode" id="publishFastMode"><span><strong>Fast publish</strong><small>Pushes without that remote-availability check. Use only when the submodule commits are already published.</small></span></label>
+        <legend>Submodule check before push</legend>
+        <label><input type="radio" name="publishSafetyMode" id="publishSafeMode"><span><strong>Safe publish</strong><small>Check submodule versions introduced by the outgoing commits, then push. Recommended when their publication is uncertain.</small></span></label>
+        <label><input type="radio" name="publishSafetyMode" id="publishFastMode" checked><span><strong>Fast publish</strong><small>Skip that check and use the same normal push. Use when the referenced submodule commits are already published. Not a force push.</small></span></label>
+        <details class="publish-safety-help">
+          <summary>What is checked, and why?</summary>
+          <p><b>Why:</b> a project commit records each submodule's commit ID, not its files. Publishing the project does not by itself publish those submodule commits. If a referenced version is unavailable, another clone may fail to check it out.</p>
+          <p><b>Safe:</b> examines added or updated submodule pointers throughout the outgoing history, including intermediate versions, up to the selected publish cutoff. It checks whether those commits are reachable from each affected submodule's <code>origin</code> branches. Missing remote information, local-only URLs or unavailable submodules can block publishing or require an explicit risk confirmation. An <code>origin</code> pointing to a local folder cannot prove server availability, even when <code>.gitmodules</code> contains a server URL.</p>
+          <p><b>Network and limits:</b> normally fetches each affected submodule's <code>origin</code> once, without tags or nested-submodule recursion. A recent preflight may be reused; if fetch fails, saved local remote refs are used. A tag alone does not establish availability for this check. This is not a guarantee that every clone can restore the project.</p>
+          <p><b>Both modes:</b> use a normal push, not a force push; authentication, non-fast-forward checks and server rules still apply. The safety check does not push submodules, update their checked-out files, merge, stage or commit. It does not validate builds or merge correctness. Combine is a separate option that rewrites local committed history.</p>
+        </details>
       </fieldset>
-      <p id="publishSafetyExplanation" class="publish-safety-explanation">Safe publish reads the submodule pointers in the outgoing commits and verifies each referenced SHA on its own remote. It does not push submodules, merge, checkout, stage, or change local files.</p>
+      <p id="publishSafetyExplanation" class="publish-safety-explanation fast" aria-live="polite">Same normal push, without the submodule safety check or its fetches. Publish the referenced submodule commits first; otherwise another clone may receive the project commits but fail to check out those submodule versions. Fast publish is not a force push.</p>
       <div id="publishCommits" class="publish-commits"></div>
       <fieldset id="publishCommitMode" class="publish-commit-mode" hidden>
         <legend>Local commits</legend>
@@ -658,11 +665,11 @@
   </dialog>
   <dialog id="submoduleMergeReviewDialog" class="publish-dialog submodule-merge-review-dialog">
     <form method="dialog"><header><div><h2>Submodule merge review</h2><p id="submoduleMergeReviewSubtitle">Review submodule pointers before the merge commit is created.</p></div><button value="cancel">×</button></header>
-      <div class="submodule-review-principle">Git already prepared the merge. These rows are submodule <b>commit pointers</b>, not personal file edits. <b>No submodule</b> means that side removes or does not contain that gitlink. Nothing is pushed automatically.</div>
+      <div class="submodule-review-principle"><b>Result</b> shows the pointer to keep. <b>Current</b> = your branch before the merge; <b>Incoming</b> = the branch being merged. <b>Remove</b> removes the pointer, keeping local files.<br>Apply choices → update/init → verify → <b>commit when ready</b>. Apply does not commit or push.</div>
       <div id="submoduleMergeReviewList" class="submodule-merge-review-list"></div>
       <label class="commit-scope-label"><span>MERGE COMMIT MESSAGE</span><input id="submoduleMergeCommitMessage" placeholder="Merge branch …"></label>
       <p id="submoduleMergeReviewStatus" class="submodule-operation-status" role="status"></p>
-      <footer><button type="button" id="abortSubmoduleMergeReview" class="danger-action-soft">Abort merge</button><span id="submoduleMergeReviewSummary">Checking…</span><span style="flex:1"></span><button value="cancel">Review later</button><button type="button" id="applySubmoduleMergeReviewOnly">Apply choices only</button><button type="button" id="confirmSubmoduleMergeReview" class="confirm">Merge and commit</button></footer>
+      <footer><button type="button" id="abortSubmoduleMergeReview" class="danger-action-soft">Abort merge</button><span id="submoduleMergeReviewSummary">Checking…</span><span style="flex:1"></span><button value="cancel">Review later</button><button type="button" id="confirmSubmoduleMergeReview">Commit merge</button><button type="button" id="applySubmoduleMergeReviewOnly" class="confirm">Apply · update submodules…</button></footer>
     </form>
   </dialog>
   <dialog id="helpDialog" class="help-dialog">
@@ -856,16 +863,16 @@
       <footer><span>Read-only on Polarion · local snapshots outside Git</span><button value="cancel">Close</button><button type="button" id="polarionAdd" class="confirm" disabled>Add to Commit List</button></footer>
     </form>
   </dialog>
-  <script src="polarion.js?v=20261019-structdoc-message-permissions"></script>
-  <script src="console-context.js?v=20261019-structdoc-message-permissions"></script>
-  <script src="graph-model.js?v=20261019-structdoc-message-permissions"></script>
-  <script src="submodule-state.js?v=20261019-structdoc-message-permissions"></script>
-  <script src="submodule-versions.js?v=20261019-structdoc-message-permissions"></script>
-  <script src="local-diff.js?v=20261019-structdoc-message-permissions"></script>
-  <script src="local-drive.js?v=20261019-structdoc-message-permissions"></script>
-  <script src="pr-status.js?v=20261019-structdoc-message-permissions"></script>
-  <script src="refresh-coordinator.js?v=20261019-structdoc-message-permissions"></script>
-  <script src="comparison-authors.js?v=20261019-structdoc-message-permissions"></script>
-  <script src="app.js?v=20261019-structdoc-message-permissions"></script>
+  <script src="polarion.js?v=20261020-fast-default"></script>
+  <script src="console-context.js?v=20261020-fast-default"></script>
+  <script src="graph-model.js?v=20261020-fast-default"></script>
+  <script src="submodule-state.js?v=20261020-fast-default"></script>
+  <script src="submodule-versions.js?v=20261020-fast-default"></script>
+  <script src="local-diff.js?v=20261020-fast-default"></script>
+  <script src="local-drive.js?v=20261020-fast-default"></script>
+  <script src="pr-status.js?v=20261020-fast-default"></script>
+  <script src="refresh-coordinator.js?v=20261020-fast-default"></script>
+  <script src="comparison-authors.js?v=20261020-fast-default"></script>
+  <script src="app.js?v=20261020-fast-default"></script>
 </body>
 </html>

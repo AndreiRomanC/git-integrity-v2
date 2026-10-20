@@ -1177,6 +1177,10 @@ dialog form { padding: 28px; text-align: center; }dialog h2 { margin: 0 0 10px; 
 .publish-safety-mode { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 0 18px 12px; padding: 0; border: 0; }.publish-safety-mode legend { grid-column: 1 / -1; margin-bottom: 2px; color: #7f92a3; font-size: 9px; letter-spacing: .8px; text-transform: uppercase; }.publish-safety-mode label { display: grid; grid-template-columns: 18px 1fr; gap: 8px; align-items: start; min-height: 58px; padding: 10px; border: 1px solid #334657; border-radius: 8px; background: #101c26; cursor: pointer; }.publish-safety-mode input { margin-top: 2px; accent-color: var(--blue); }.publish-safety-mode strong { display: block; color: #d6e4ee; font-size: 11px; }.publish-safety-mode small { display: block; margin-top: 4px; color: #8194a5; font-size: 9px; line-height: 1.35; }.publish-safety-mode label:has(input:checked) { border-color: #4c8cc0; background: #14283a; box-shadow: inset 0 0 0 1px rgba(84, 166, 235, .22); }.publish-safety-mode label:has(#publishFastMode:checked) { border-color: #9f6b23; background: #251c12; }
 .publish-commit-mode { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; margin: 12px 18px; padding: 10px; border: 1px solid #384d60; border-radius: 8px; }
 .publish-safety-mode[hidden] { display: none; }
+.publish-safety-help { grid-column: 1 / -1; min-width: 0; color: var(--muted); font-size: 11px; line-height: 1.5; }
+.publish-safety-help summary { cursor: pointer; padding: 4px 0; color: #adc4d6; }
+.publish-safety-help p { margin: 8px 0; overflow-wrap: anywhere; }
+.publish-safety-help b { color: #d6e4ee; }
 .publish-safety-explanation { margin: -4px 18px 12px; padding: 8px 10px; border-left: 2px solid #4c8cc0; border-radius: 0 5px 5px 0; background: rgba(39, 73, 100, .2); color: #91a7b8; font-size: 9px; line-height: 1.45; }
 .publish-safety-explanation.fast { border-left-color: #b47a2b; background: rgba(105, 69, 22, .18); color: #b9a180; }
 .publish-safety-explanation[hidden] { display: none; }
@@ -1283,36 +1287,63 @@ dialog form { padding: 28px; text-align: center; }dialog h2 { margin: 0 0 10px; 
 .conflict-actions button:hover { border-color: #5794c7; background: #20384c; }
 .conflict-resolved-note { color: #8fe8b7; font-size: 10px; }
 .conflicts-local-note { margin: 0 18px 10px; color: #8497a7; font-size: 10px; }
-.submodule-merge-review-dialog { width: min(1160px, 96vw); max-width: 1160px; }
-.submodule-review-principle { margin: 12px 18px; border-left: 3px solid #5aa9e6; padding: 9px 12px; background: #142333; color: #9fb2c2; font-size: 11px; line-height: 1.45; }
-.submodule-merge-review-list { max-height: min(460px, 52vh); overflow: auto; margin: 0 18px 12px; display: flex; flex-direction: column; gap: 8px; }
-.submodule-review-item { border: 1px solid #304658; border-radius: 8px; padding: 9px 10px; background: #101a23; }
-.submodule-review-item.warning { border-color: #8b632d; background: linear-gradient(90deg, #2a1e0e 0, #101a23 12%); }
-.submodule-review-item.ok { border-color: #315f48; }
-.submodule-review-item header { display: flex; gap: 12px; align-items: flex-start; padding: 0 0 7px; border: 0; }
-.submodule-review-item header div { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 3px; }
-.submodule-review-item header strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #d7e5f0; font: 13px ui-monospace, SFMono-Regular, Consolas, monospace; }
-.submodule-review-item header span { color: #ffcc82; font-size: 10px; font-weight: 700; letter-spacing: .6px; text-transform: uppercase; }
-.submodule-review-item header b { flex: 0 0 auto; border: 1px solid #45627a; border-radius: 999px; padding: 3px 8px; color: #b8dbff; background: #16293a; font: 10px ui-monospace, SFMono-Regular, Consolas, monospace; }
-.submodule-review-item header b.current { border-color: #48c7bb; background: #123631; color: #bdf7eb; }.submodule-review-item header b.incoming { border-color: #5aa8ff; background: #122c4a; color: #d5ecff; }.submodule-review-item header b.custom { border-color: #be8dff; background: #281d3d; color: #eadcff; }
-.submodule-review-pointers { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px; }
-.submodule-review-pointers div { min-width: 0; border: 1px solid #25394a; border-radius: 6px; padding: 5px 7px; background: #0c141b; }
-.submodule-review-pointers div.selected-choice { border-color: #62b5ff; background: #142c43; box-shadow: inset 3px 0 0 #62b5ff; }
-.submodule-review-pointers div.prepared-result { border-color: #4a657a; }
-.submodule-review-pointers div.absent { border-style: dashed; background: #15191e; }
-.submodule-review-pointers span { display: block; color: #748899; font-size: 8px; font-weight: 800; letter-spacing: .7px; text-transform: uppercase; }
-.submodule-review-pointers code { display: block; margin-top: 3px; color: #bfe0ff; font: 12px ui-monospace, SFMono-Regular, Consolas, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.submodule-review-pointers em { display: block; margin-top: 3px; color: #91a8b9; font-size: 9px; font-style: normal; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.submodule-review-pointers div.absent code { color: #8d9aa6; font-style: italic; }
-.submodule-review-local-note { margin: 7px 0 0; border: 1px solid #6a5228; border-radius: 6px; padding: 6px 8px; background: #201a0e; color: #d9bf87; font-size: 10px; line-height: 1.4; }.submodule-review-local-note code { color: #ffe1a8; }
-.submodule-review-item p { margin: 8px 0; color: #9cadaf; font-size: 11px; line-height: 1.45; }
-.submodule-review-actions { display: flex; flex-wrap: wrap; gap: 6px; }
-.submodule-review-actions button { width: auto; min-width: 0; min-height: 26px; margin: 0; border: 1px solid #3b5267; border-radius: 6px; padding: 0 8px; background: #182635; color: #c6d9e9; font-size: 10px; }
-.submodule-review-actions button.active { border-color: #62b5ff; background: #244667; color: #eef8ff; }
+.submodule-merge-review-dialog { width: min(1160px, 96vw); max-width: 1160px; max-height: 94vh; }
+.submodule-merge-review-dialog > form { display: flex; flex-direction: column; max-height: 94vh; min-height: 0; }
+.submodule-merge-review-dialog > form > header { flex: none; padding: 12px 18px; }
+.submodule-merge-review-dialog > form > header h2 { font-size: 18px; }
+.submodule-merge-review-dialog > form > header p { font-size: 11px; }
+.submodule-review-principle { flex: none; margin: 8px 18px; color: #9fb2c2; font-size: 11px; line-height: 1.5; }
+.submodule-review-principle b { color: #ccdeec; }
+.submodule-merge-review-list { min-height: 0; max-height: 62vh; overflow: auto; scrollbar-gutter: stable; margin: 0 18px 10px; display: flex; flex-direction: column; gap: 5px; }
+.submodule-review-item { flex: none; border: 1px solid #304151; border-radius: 6px; padding: 8px 10px; background: #101a23; }
+.submodule-review-item.warning { border-left: 3px solid #b58b46; padding-left: 8px; }
+.submodule-review-item header { display: flex; gap: 12px; align-items: center; min-height: 0; padding: 0 0 6px; border: 0; }
+.submodule-review-item header strong { min-width: 0; flex: 1; overflow-wrap: anywhere; color: #d7e5f0; font: 12px/1.4 ui-monospace, SFMono-Regular, Consolas, monospace; }
+.submodule-review-result { flex: none; display: grid; grid-template-columns: auto auto; align-items: center; gap: 2px 8px; border-left: 2px solid #70899d; padding-left: 8px; color: #c4d5e2; }
+.submodule-review-result b { font-size: 12px; font-weight: 650; }
+.submodule-review-result code { font: 11px ui-monospace, SFMono-Regular, Consolas, monospace; }
+.submodule-review-result small { grid-column: 1 / -1; color: #94a7b6; font-size: 10px; }
+.submodule-review-result.current { border-color: #48c7bb; color: #96e2d7; }
+.submodule-review-result.incoming { border-color: #5aa8ff; color: #a8d3ff; }
+.submodule-review-result.custom { border-color: #be8dff; color: #d9bcff; }
+.submodule-review-result.removed { border-color: #e2af63; color: #f0cb91; }
+.submodule-review-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; }
+.submodule-review-actions button { display: inline-flex; align-items: center; gap: 5px; width: auto; min-width: 0; height: 27px; margin: 0; border: 1px solid #344a5b; border-radius: 5px; padding: 0 7px; background: #15222e; color: #c6d9e9; font-size: 11px; }
+.submodule-review-actions button code { font: 10px ui-monospace, SFMono-Regular, Consolas, monospace; color: #98b0c3; }
+.submodule-review-check { width: 10px; color: #c5e5ff; }
+.submodule-review-actions button.active { border-color: #62b5ff; background: #203d55; color: #eef8ff; }
+.submodule-review-actions button.active code { color: #d0e7f9; }
+.submodule-review-actions button:hover { border-color: #7eabc9; }
+.submodule-review-actions button:focus-visible, .submodule-review-details summary:focus-visible { outline: 2px solid #8bc5f2; outline-offset: 2px; }
 .submodule-review-actions button:disabled { opacity: .45; }
-.submodule-merge-review-dialog .commit-scope-label { margin: 0 18px 10px; }
-.submodule-merge-review-dialog footer #submoduleMergeReviewSummary { flex: 0 1 auto; min-width: 220px; }
-.submodule-merge-review-dialog footer button { white-space: nowrap; }
+.submodule-review-status { margin-left: auto; color: #94a7b6; font-size: 11px; }
+.submodule-review-item.warning .submodule-review-status { color: #f0cb91; }
+.submodule-review-registration { margin-top: 5px; color: #f0cb91; font-size: 11px; line-height: 1.4; }
+.submodule-review-details { margin-top: 4px; }
+.submodule-review-details summary { width: fit-content; color: #94a7b6; font-size: 11px; cursor: pointer; }
+.submodule-review-details[open] summary { margin-bottom: 7px; color: #c4d5e2; }
+.submodule-review-pointers { display: flex; flex-wrap: wrap; gap: 8px 20px; padding-top: 6px; border-top: 1px solid #293b49; }
+.submodule-review-pointers div { display: flex; flex-wrap: wrap; gap: 6px; font-size: 11px; }
+.submodule-review-pointers span { color: #94a7b6; }
+.submodule-review-pointers code { color: #bfe0ff; font: 11px ui-monospace, SFMono-Regular, Consolas, monospace; }
+.submodule-review-pointers div.absent code { color: #a1adb8; }
+.submodule-review-local-note { margin: 6px 0; color: #d9bf87; font-size: 11px; line-height: 1.4; }
+.submodule-review-local-note code { color: #ffe1a8; }
+.submodule-review-item p { margin: 6px 0; color: #a1b2be; font-size: 11px; line-height: 1.45; }
+.submodule-merge-review-dialog .commit-scope-label { flex: none; margin: 0 18px 8px; }
+.submodule-merge-review-dialog #submoduleMergeReviewStatus { flex: none; margin: 0 18px 8px; min-height: 0; overflow-wrap: anywhere; max-height: 14vh; overflow: auto; color: #f0cb91; }
+.submodule-merge-review-dialog #submoduleMergeReviewStatus:empty { display: none; }
+.submodule-merge-review-dialog footer { flex: none; flex-wrap: wrap; border-top: 1px solid #304151; padding: 10px 18px; }
+.submodule-merge-review-dialog footer #submoduleMergeReviewSummary { flex: 0 1 auto; min-width: 0; }
+.submodule-merge-review-dialog footer button { white-space: nowrap; height: 32px; padding: 0 10px; border-color: #3b5267; background: #1a2a37; color: #c6d9e9; }
+.submodule-merge-review-dialog footer button.confirm { border-color: #579dde; background: #286ca8; color: white; }
+.submodule-merge-review-dialog footer .danger-action-soft { color: #eca0a6; }
+@media (max-width: 720px) {
+  .submodule-review-item header { flex-wrap: wrap; gap: 5px; }
+  .submodule-review-item header strong { flex-basis: 100%; }
+  .submodule-review-status { margin-left: 0; }
+  .submodule-merge-review-dialog footer #submoduleMergeReviewSummary { flex-basis: 100%; order: -1; }
+}
 .clone-dialog form { text-align: left; }.clone-dialog .dialog-symbol { margin-left: 0; text-align: center; }.clone-dialog p { margin-bottom: 18px; }.clone-dialog label { display: flex; flex-direction: column; gap: 6px; margin: 12px 0; color: #8497a8; font-size: 9px; letter-spacing: .8px; }.clone-dialog input { height: 37px; outline: 0; border: 1px solid #405263; border-radius: 6px; padding: 0 10px; background: #0d151c; color: #d4e0ea; font: 12px ui-monospace, monospace; }.clone-dialog input:focus { border-color: var(--blue); }.clone-dialog select { height: 37px; outline: 0; border: 1px solid #405263; border-radius: 6px; padding: 0 10px; background: #0d151c; color: #d4e0ea; font: 12px ui-monospace, monospace; }.clone-location { display: grid; grid-template-columns: minmax(0, 1fr) 110px; align-items: end; gap: 10px; margin: 12px 0; }.clone-location label { margin: 0; }.clone-location button { width: 110px; height: 37px; margin: 0; padding: 0 13px; border-color: #465b6e; background: #24323e; }.clone-options { margin-top: 8px; border-top: 1px solid #263848; padding-top: 10px; }.clone-options summary { cursor: pointer; color: #8fb2d2; font-size: 10px; font-weight: 700; letter-spacing: .7px; }.clone-dialog label.inline-check { flex-direction: row; align-items: center; gap: 9px; letter-spacing: 0; font-size: 11px; text-transform: none; }.clone-dialog label.inline-check input { width: 16px; height: 16px; padding: 0; }.clone-dialog .commit-dialog-actions { align-items: center; margin-top: 22px; }.clone-dialog .commit-dialog-actions button { height: 38px; margin-top: 0; }
 .submodule-add-result { margin-top: 15px; border-left: 3px solid var(--purple); padding: 9px 11px; background: #211d31; color: #aebac6; font-size: 10px; line-height: 1.5; }.submodule-add-result code { color: #d8caff; }
 .submodule-auth { margin-top: 12px; border: 1px solid #344557; border-radius: 6px; padding: 9px 11px; background: #111a23; }.submodule-auth summary { cursor: pointer; color: #9bb1c4; font-size: 10px; }.submodule-operation-status { min-height: 34px; margin-top: 10px; border-radius: 5px; padding: 9px 10px; background: #111a23; color: #8fa2b4; font-size: 10px; line-height: 1.4; }.submodule-operation-status.busy { color: #8dc9ff; }.submodule-operation-status.success { border: 1px solid #36785b; color: #79d6a4; }.submodule-operation-status.error { border: 1px solid #934d55; color: #ff9ba5; }

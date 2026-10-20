@@ -37,8 +37,8 @@ pub struct RemoteTrackingCheckoutResult {
     pub(super) created: bool,
 }
 
-const RESTORE_SUBMODULE_UPDATE_TIMEOUT: Duration = Duration::from_secs(60 * 60);
-const RESTORE_SUBMODULE_UPDATE_TIMEOUT_LABEL: &str = "60 minutes";
+const RESTORE_SUBMODULE_UPDATE_TIMEOUT: Duration = SUBMODULE_UPDATE_TIMEOUT;
+const RESTORE_SUBMODULE_UPDATE_TIMEOUT_LABEL: &str = SUBMODULE_UPDATE_TIMEOUT_LABEL;
 
 // Computes OID-based divergence independently of the graph renderer.
 #[tauri::command]
@@ -69,6 +69,7 @@ pub fn graph_branch_divergence(repository_path: String, primary_branch: String) 
 // on the graph's "Primary" picker.
 #[tauri::command]
 pub fn graph_head_main_merge_base(repository_path: String) -> Result<Option<GraphBranchStart>, String> {
+    let started = Instant::now();
     validate_path(&repository_path)?;
     let repo = internal_repository(&repository_path)?;
     let head = repo.head().map_err(|error| error.message().to_string())?;
@@ -83,11 +84,19 @@ pub fn graph_head_main_merge_base(repository_path: String) -> Result<Option<Grap
     }
     if main_remote_branch.is_none() { main_remote_branch = default_remote_ref(&repository_path); }
 
-    let Some(base_ref) = main_remote_branch else { return Ok(None); };
+    let Some(base_ref) = main_remote_branch else {
+        perf_log(&format!("graph_start_base: repo={} source=current_head_merge_base head={head_oid} target=none reason=no_base_ref primary_picker_used=false",
+            anonymized_repository_id(&repository_path)), started.elapsed());
+        return Ok(None);
+    };
     let Some(remote_oid) = repo.find_branch(&base_ref, BranchType::Remote).ok().and_then(|branch| branch.get().target()) else {
+        perf_log(&format!("graph_start_base: repo={} source=current_head_merge_base head={head_oid} base_ref={base_ref} target=none reason=base_tip_unavailable primary_picker_used=false",
+            anonymized_repository_id(&repository_path)), started.elapsed());
         return Ok(None);
     };
     let oid = repo.merge_base(head_oid, remote_oid).ok().map(|oid| oid.to_string());
+    perf_log(&format!("graph_start_base: repo={} source=current_head_merge_base head={head_oid} base_ref={base_ref} base_tip={remote_oid} target={} reason={} primary_picker_used=false no_extra_queries=true",
+        anonymized_repository_id(&repository_path), oid.as_deref().unwrap_or("none"), if oid.is_some() { "computed" } else { "no_common_base" }), started.elapsed());
     Ok(oid.map(|oid| GraphBranchStart { base_ref, oid }))
 }
 

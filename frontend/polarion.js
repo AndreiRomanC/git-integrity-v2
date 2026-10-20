@@ -137,10 +137,13 @@ function createPolarionCommitReferences({ host, invoke, editor = null, onChange 
     }
     if (!rows.length) { host.append(make('small', 'No saved element title matches the module name ' + context.moduleName + ' (with an optional version suffix). View or refresh elements in P → StructDocs. No references will be added.')); return; }
     const list = make('div'); list.className = 'polarion-commit-reference-list';
-    const preview = make('div'), summary = make('small'), ids = make('code'); preview.className = 'polarion-commit-preview'; preview.append(summary, ids);
+    const summary = make('small'), preview = editor ? null : make('div'), ids = editor ? null : make('code');
+    // Real commit dialogs already contain these IDs in their editable message.
+    // Only the legacy, editor-less integration needs a separate preview.
+    if (preview) { preview.className = 'polarion-commit-preview'; preview.append(summary, ids); }
     const updatePreview = () => {
-      summary.textContent = selected.size + ' selected / ' + rows.length + ' matching elements · appended below the commit description';
-      ids.textContent = selected.size ? [...selected].join('\n') : 'No references selected. The original commit message stays unchanged.';
+      summary.textContent = selected.size + ' selected / ' + rows.length + ' matching elements · ' + (editor ? 'included in the commit message above' : 'appended below the commit description');
+      if (ids) ids.textContent = selected.size ? [...selected].join('\n') : 'No references selected. The original commit message stays unchanged.';
     };
     for (const item of rows) {
       const id = item.id.split('/').pop(), row = make('label'), choice = make('input'); choice.type = 'checkbox'; choice.checked = selected.has(id);
@@ -148,7 +151,7 @@ function createPolarionCommitReferences({ host, invoke, editor = null, onChange 
       row.append(choice, make('span', id + ' · ' + item.title), make('small', (item.item_type || 'Unknown type') + ' · ' + (item.status || 'Unknown status'))); list.append(row);
     }
     updatePreview();
-    host.append(list, preview, make('small', (editor ? 'Selected IDs are in the editable commit message above. Manual edits are preserved. ' : '') + 'Saved snapshot: ' + (sourceTime || 'date unavailable') + '. Refresh in P → StructDocs when needed. Review obsolete items; multiple candidates of the same type are not selected automatically.'));
+    host.append(list, preview || summary, make('small', (editor ? 'Manual edits to the commit message are preserved. ' : '') + 'Saved snapshot: ' + (sourceTime || 'date unavailable') + '. Refresh in P → StructDocs when needed. Review obsolete items; multiple candidates of the same type are not selected automatically.'));
   }
   async function load() {
     if (!context || !enabled) return;
@@ -208,6 +211,8 @@ function createPolarionTaskPicker({ invoke, addMessage, log = () => {}, onDocume
   let generation = 0, context = null, project = null, selected = null, detail = null, busy = false;
   let mode = 'projects', lastSearch = null, page = 1, more = false, workspace = {}, documentSearchPending = false;
   let mountedMode = '', documentRepositoryPath = '', moduleName = '', documentMayHaveChanged = false;
+  let parentDocumentProject = null;
+  const documentProject = () => documentRepositoryPath !== context?.repository_path ? parentDocumentProject || project : project;
   const statusByMode = {};
   const modeHint = () => mode === 'projects' ? 'Find a project, then select it to continue.' : mode === 'tasks' ? 'Find tasks in the selected project. Add a selected task to your commit list explicitly.' : 'Find a StructDoc by name in the selected project, or open an exact Polarion document link.';
   const say = text => { statusByMode[mode] = text; el('Status').textContent = text; };
@@ -240,11 +245,14 @@ function createPolarionTaskPicker({ invoke, addMessage, log = () => {}, onDocume
     el('DiagnosticUrl').disabled = busy;
     el('OpenDocument').disabled = busy || !context || !el('DiagnosticUrl').value.trim();
     el('DocumentSource').disabled = busy;
-    el('SearchScope').textContent = !project ? 'Select a project in Projects to search Polarion. Saved local data remains available.'
+    const docProject = documentProject();
+    el('SearchScope').textContent = !docProject ? 'Select a project in Projects to search Polarion. Saved local data remains available.'
       : (el('DocumentSource').value === 'containers' ? 'Searches work-item IDs and titles' : 'Searches document names; older servers may use matching element titles') +
-        ' in ' + project.id + '. Explicit search only; successful results may be cached for 2 minutes.';
-    el('TaskSearchButton').disabled = el('DocumentSearchButton').disabled = busy || !project || !context;
-    el('TaskQuery').disabled = el('DocumentQuery').disabled = el('Assigned').disabled = !project || busy;
+        ' in ' + docProject.id + (parentDocumentProject ? ' · parent project’s StructDoc source.' : '.') + ' Explicit search only; successful results may be cached for 2 minutes.';
+    el('TaskSearchButton').disabled = busy || !project || !context;
+    el('DocumentSearchButton').disabled = busy || !docProject || !context;
+    el('TaskQuery').disabled = el('Assigned').disabled = !project || busy;
+    el('DocumentQuery').disabled = !docProject || busy;
     el('Connect').disabled = busy;
     el('View').disabled = busy || !selected;
     el('View').textContent = mode === 'documents' ? 'Read details · server' : 'Read details';
@@ -258,7 +266,8 @@ function createPolarionTaskPicker({ invoke, addMessage, log = () => {}, onDocume
     el('User').hidden = !otherUser && (!el('Assigned').checked || !!identity?.id);
     el('UseMe').hidden = !otherUser; el('OtherUser').hidden = otherUser;
     el('Identity').textContent = otherUser ? 'Filtering another user' : identity ? (identity.name || identity.id) + ' · ' + (identity.source === 'portal' ? 'detected / remembered' : 'remembered user ID') : 'User not detected yet';
-    el('ChosenProject').textContent = project ? project.id + ' · ' + project.name : 'No project selected · choose one in Projects';
+    const shownProject = mode === 'documents' ? docProject : project;
+    el('ChosenProject').textContent = shownProject ? shownProject.id + ' · ' + shownProject.name + (mode === 'documents' && parentDocumentProject ? ' · parent StructDocs' : '') : 'No project selected · choose one in Projects';
   };
   const clearResults = () => { selected = null; lastSearch = null; documentSearchPending = false; el('ResultSummary').hidden = true; el('ResultSummary').textContent = ''; el('Results').replaceChildren(); el('Results').hidden = true; more = false; update(); };
   const clearDetail = () => { detail = null; el('Detail').hidden = true; el('Detail').replaceChildren(); el('ElementDetail').hidden = true; el('ElementDetail').replaceChildren(); };
@@ -451,7 +460,7 @@ function createPolarionTaskPicker({ invoke, addMessage, log = () => {}, onDocume
         if (busy) return;
         if (kind === 'projects') { chooseProject(item); return; }
         if (item.local && workspace.document?.id === item.id) { selectSnapshot(workspace.document, true); say('Showing the local document snapshot. Read details · server refreshes it explicitly.'); return; }
-        selected = { ...item, kind, resourceId: kind === 'documents' ? item.id : project.id + '/' + item.id, associationEligible: ['documents', 'containers'].includes(kind) };
+        selected = { ...item, kind, resourceId: kind === 'documents' ? item.id : (kind === 'containers' ? documentProject() : project).id + '/' + item.id, associationEligible: ['documents', 'containers'].includes(kind) };
         clearDetail();
         for (const sibling of el('Results').children) sibling.setAttribute('aria-pressed', String(sibling === row));
         update();
@@ -468,8 +477,9 @@ function createPolarionTaskPicker({ invoke, addMessage, log = () => {}, onDocume
   }
   async function search(kind, requestedPage = 1, previous = null) {
     await action(async ticket => {
-      if (kind !== 'projects' && !project) return;
-      const params = previous || { kind, project: project?.id || '', query: el(kind === 'projects' ? 'ProjectQuery' : kind === 'tasks' ? 'TaskQuery' : 'DocumentQuery').value.trim(), user: '' };
+      const searchProject = ['documents', 'containers'].includes(kind) ? documentProject() : project;
+      if (kind !== 'projects' && !searchProject) return;
+      const params = previous || { kind, project: searchProject?.id || '', query: el(kind === 'projects' ? 'ProjectQuery' : kind === 'tasks' ? 'TaskQuery' : 'DocumentQuery').value.trim(), user: '' };
       if (kind === 'tasks' && !previous && el('Assigned').checked) {
         if (!otherUser && !identity?.id && !el('User').value.trim()) await detectUser(ticket);
         if (!current(ticket)) return;
@@ -584,7 +594,7 @@ function createPolarionTaskPicker({ invoke, addMessage, log = () => {}, onDocume
     el('DiagnosticReport').replaceChildren();
     say('Checking read-only Polarion endpoints · up to 25 seconds. No associations or data will be changed.');
     const result = checked(await invoke('polarion_diagnostics', {
-      project: project?.id || '', resourceUrl: polarionDiagnosticDocumentLink(el('DiagnosticUrl').value, workspace.document, project?.id),
+      project: documentProject()?.id || '', resourceUrl: polarionDiagnosticDocumentLink(el('DiagnosticUrl').value, workspace.document, documentProject()?.id),
       query: mode === 'documents' && el('DocumentSource').value === 'containers' ? el('DocumentQuery').value.trim() : '',
       documentQuery: el('DocumentSource').value !== 'containers' && el('DocumentQuery').value.trim().length >= 3 ? el('DocumentQuery').value.trim() : '',
     }));
@@ -698,7 +708,7 @@ function createPolarionTaskPicker({ invoke, addMessage, log = () => {}, onDocume
       if (!repositoryPath || dialog.open) return;
       const ticket = ++generation;
       context = null; project = null; selected = null; detail = null; workspace = {}; busy = true; lastSearch = null;
-      documentRepositoryPath = ''; moduleName = references?.moduleName || ''; documentMayHaveChanged = false; el('ElementModule').checked = !!moduleName;
+      documentRepositoryPath = ''; parentDocumentProject = null; moduleName = references?.moduleName || ''; documentMayHaveChanged = false; el('ElementModule').checked = !!moduleName;
       identity = polarionRememberedUser(storage) || identity; otherUser = false; mode = 'projects';
       for (const key of Object.keys(statusByMode)) delete statusByMode[key];
       connection('unknown', 'Connection not checked · Search verifies access');
@@ -718,9 +728,17 @@ function createPolarionTaskPicker({ invoke, addMessage, log = () => {}, onDocume
         if (!current(ticket)) return;
         workspace = documentRepositoryPath === loaded.repository_path ? loadedWorkspace : { primary_task: loadedWorkspace.primary_task };
         if (documentRepositoryPath !== loaded.repository_path) {
-          const parentWorkspace = await invoke('polarion_workspace', { repositoryPath: documentRepositoryPath, action: 'load', snapshot: null, elements: null, documentId: null });
+          // The document source and its search project must agree. Tasks keep
+          // their own repository's project/association. Both reads are local.
+          const [parentWorkspace, parentContext] = await Promise.all([
+            invoke('polarion_workspace', { repositoryPath: documentRepositoryPath, action: 'load', snapshot: null, elements: null, documentId: null }),
+            invoke('polarion_project_context', { repositoryPath: documentRepositoryPath, relativePath: '', project: null }).catch(() => null),
+          ]);
           if (!current(ticket)) return;
           workspace = { ...parentWorkspace, primary_task: loadedWorkspace.primary_task };
+          const savedProjectId = workspace.document?.id?.split('/')[0];
+          parentDocumentProject = parentContext?.project || (savedProjectId ? { id: savedProjectId, name: 'Saved StructDoc project' } : null);
+          log(`polarion: document_search_context scope=parent source=${parentContext?.project ? 'project_association' : savedProjectId ? 'saved_document' : 'current_project_fallback'} local_context_read=${parentContext ? 'ok' : 'unavailable'} no_http_requests=true`);
         }
         log(`polarion: workspace_loaded document_scope=${documentRepositoryPath === loaded.repository_path ? 'current' : 'parent'} elements=${workspace.elements?.length || 0} state=${polarionElementsState(workspace)} no_http_requests=true`);
         say('Local snapshots loaded; no server request made. Search tasks, choose a project or open StructDocs.');

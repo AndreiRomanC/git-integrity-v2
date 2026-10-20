@@ -356,7 +356,7 @@ function rendererHarness() {
     lastGraphRenderContext:null, lastGraphModel:null,lastGraphLanesWidth:0,lastGraphOnlySearchMatches:false,
   };
   vm.createContext(context);
-  const names = ['activeGraphPrimaryBranch','setActiveGraphPrimaryBranch','activeGraphRefFilter','setActiveGraphRefFilter','activeBranchStoryView','resolvePrimarySelection','mergeCommitPresentation','buildCommitRowHtml','graphTruncationStubHtml','renderGraph','appendOlderGraphRows'];
+  const names = ['activeGraphPrimaryBranch','setActiveGraphPrimaryBranch','activeGraphRefFilter','setActiveGraphRefFilter','activeBranchStoryView','traceGraphStart','resolvePrimarySelection','mergeCommitPresentation','buildCommitRowHtml','graphTruncationStubHtml','renderGraph','appendOlderGraphRows'];
   vm.runInContext('const branchStoryViews = new WeakMap();\n'+names.map(appFunction).join('\n'),context);
   return {context,state,refs,graph,annotationCalls:()=>backendAnnotations,interactions:()=>interactions};
 }
@@ -457,6 +457,7 @@ test('Branch Story creation lookup is async, cached and ignores completion after
   let rendered = 0;
   let retained;
   const context = { state: {view:'graph', selectedCommit:{id:'C'}},
+    traceGraphStart: () => {}, diagnosticErrorCategory: () => 'unclassified',
     graphCommitRow: id => ({classList:{add: () => { retained = id; }}}),
     invoke: (_command, args) => new Promise(resolve => pending.push({args, resolve})),
     activeBranchStoryView: () => view, renderGraph: () => { rendered++; } };
@@ -479,6 +480,75 @@ test('Branch Story creation lookup is async, cached and ignores completion after
   context.state.view = 'explorer';
   pending[2].resolve('D'); await new Promise(resolve => setImmediate(resolve));
   assert.equal(rendered, 1, 'Do not redraw a graph after leaving its page');
+});
+
+test('start diagnostics distinguish original creation B from shared base D without adding lookups or changing navigation', async () => {
+  const h = rendererHarness(), lines = [], selected = [];
+  h.state.view = 'graph'; h.graph.commits = originalForkFixture(); h.graph.headOid = 'F1';
+  h.context.jsPerfLog = text => { if (text.startsWith('graph_start: ')) lines.push(JSON.parse(text.slice('graph_start: '.length))); };
+  h.context.ensureHeadMainMergeBase = () => ({oid:'D',base_ref:'origin/main'});
+  h.context.ensureStoryCreation = () => 'B';
+  h.context.renderGraph(); h.context.renderGraph();
+  const existingAnnotationCalls = h.annotationCalls();
+  assert.equal(lines.filter(line => line.event === 'candidate').length, 1, 'identical redraws must not flood logs');
+  assert.equal(lines[0].source, 'current_head_merge_base'); assert.equal(lines[0].target, 'D');
+  h.context.activeBranchStoryView().mode = 'story';
+  let jump;
+  h.refs.laneLegend.querySelector = selector => selector === '[data-jump-story-start]' ? {addEventListener: (_name, fn) => {jump = fn;}} : null;
+  h.context.graphCommitRow = () => ({scrollIntoView(){}});
+  h.context.selectCommit = id => selected.push(id);
+  h.context.renderGraph();
+  const story = lines.filter(line => line.event === 'candidate').at(-1);
+  assert.equal(story.target, 'B'); assert.equal(story.source, 'creation_and_first_parent');
+  assert.equal(story.story_shared_base, 'D'); assert.equal(story.head, 'F1');
+  jump(); assert.deepEqual(selected, ['B']);
+  assert.equal(lines.at(-1).event, 'jump_selected'); assert.equal(lines.at(-1).target, 'B');
+  assert.equal(h.annotationCalls(), existingAnnotationCalls, 'logging must not add Git or status queries');
+  assert.ok(lines.every(line => !JSON.stringify(line).includes('/fixture')));
+
+  vm.runInContext('async ' + appFunction('jumpToGraphBranchStart'), h.context);
+  h.context.status = () => {};
+  await h.context.jumpToGraphBranchStart();
+  assert.deepEqual(selected, ['B', 'D'], 'diagnostics must preserve both existing destinations');
+  assert.equal(lines.at(-1).mode, 'full'); assert.equal(lines.at(-1).target, 'D');
+  h.context.ensureHeadMainMergeBase = () => null;
+  await h.context.jumpToGraphBranchStart();
+  assert.equal(lines.at(-1).event, 'jump_unavailable'); assert.equal(lines.at(-1).reason, 'no_shared_base');
+});
+
+test('start diagnostics expose a Primary selection different from HEAD and unavailable story evidence', () => {
+  const h = rendererHarness(), lines = [];
+  h.graph.commits = originalForkFixture(); h.graph.headOid = 'F1';
+  h.context.jsPerfLog = text => { if (text.startsWith('graph_start: ')) lines.push(JSON.parse(text.slice('graph_start: '.length))); };
+  h.context.ensureHeadMainMergeBase = () => ({oid:'D',base_ref:'origin/main'});
+  h.state.graphPrimaryBranch = 'remote:origin/main';
+  h.context.renderGraph();
+  assert.equal(lines.at(-1).selected_kind, 'remote'); assert.equal(lines.at(-1).selected_tip, 'D');
+  assert.equal(lines.at(-1).selected_is_checkout, false); assert.equal(lines.at(-1).head, 'F1');
+  h.context.activeBranchStoryView().mode = 'story'; h.context.renderGraph();
+  assert.equal(lines.at(-1).target, null); assert.match(lines.at(-1).reason, /creation record is missing/);
+});
+
+test('shared-base diagnostics report rejected late results, cache hits and classified errors without extra requests', async () => {
+  let current = {path:'/repo',headOid:'old',commits:[]}, renders = 0;
+  const pending = [], lines = [];
+  const context = {state:{view:'graph'}, headMainMergeBaseCache:{key:null,data:null}, headMainMergeBaseFetchKey:null,
+    activeGraphData: () => current, renderGraph: () => {renders++;},
+    traceGraphStart: (event, _graph, facts) => lines.push({event,...facts}), diagnosticErrorCategory: () => 'timeout',
+    invoke: (command, args) => new Promise((resolve,reject) => pending.push({command,args,resolve,reject}))};
+  vm.createContext(context); vm.runInContext(appFunction('ensureHeadMainMergeBase'),context);
+  context.ensureHeadMainMergeBase(current); context.ensureHeadMainMergeBase(current);
+  assert.equal(pending.length, 1);
+  current = {...current,headOid:'new'}; context.ensureHeadMainMergeBase(current);
+  pending[0].resolve({oid:'old-base',base_ref:'origin/main'}); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(lines.at(-1).accepted, false); assert.equal(renders, 0);
+  pending[1].resolve({oid:'new-base',base_ref:'origin/main'}); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(lines.at(-1).accepted, true); assert.equal(renders, 1);
+  assert.equal(context.ensureHeadMainMergeBase(current).oid, 'new-base'); assert.equal(pending.length, 2);
+  current = {...current,headOid:'next'}; context.ensureHeadMainMergeBase(current);
+  pending[2].reject('timeout with sensitive path'); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(lines.at(-1).category, 'timeout'); assert.equal(context.headMainMergeBaseCache.data.oid, 'new-base');
+  assert.ok(!JSON.stringify(lines).includes('sensitive path'));
 });
 
 test('Branch Story UI: the original fork supports inspection, compare with HEAD, and compare with any commit', async () => {
