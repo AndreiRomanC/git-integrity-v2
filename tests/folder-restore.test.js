@@ -147,6 +147,8 @@ test('restore passes explicit unstage choice and resets it for the next selectio
   h.context.customConfirm = async message => {
     assert.match(message, /currently staged/);
     assert.match(message, /removed from staging/);
+    assert.match(message, /permanently delete ALL extra items/);
+    assert.match(message, /obsolete nested repositories/);
     return true;
   };
   h.context.changesForPathScope = () => [];
@@ -154,10 +156,28 @@ test('restore passes explicit unstage choice and resets it for the next selectio
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(h.calls[0].command, 'restore_folder');
   assert.equal(h.calls[0].args.leaveUnstaged, true);
+  assert.equal(h.calls[0].args.cleanFolder, true, 'empty preview still authorizes explicit scoped Clean');
   h.calls[0].resolve();
   await pending;
   h.context.openFolderRestoreDialog({ kind: 'folder', name: 'other', relative_path: 'other' });
   assert.equal(h.refs.folderRestoreUnstage.checked, false);
+});
+
+test('Clean off stays off and changing Clean during confirmation prevents restore', async () => {
+  const h = harness();
+  h.state.folderRestore.preview = preview('HEAD');
+  h.refs.folderRestoreClean.checked = false;
+  h.context.customConfirm = async message => { assert.doesNotMatch(message, /Clean is ON/); return true; };
+  h.context.changesForPathScope = () => [];
+  const pending = h.context.confirmFolderRestore();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(h.calls[0].args.cleanFolder, false);
+  h.calls[0].resolve(); await pending;
+
+  const other = harness(); other.state.folderRestore.preview = preview('HEAD');
+  other.context.customConfirm = async () => { other.refs.folderRestoreClean.checked = false; return true; };
+  await other.context.confirmFolderRestore();
+  assert.equal(other.calls.length, 0);
 });
 
 test('changing unstage choice during confirmation cancels the old restore', async () => {

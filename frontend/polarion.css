@@ -37,6 +37,8 @@
 .commit-area:has(> .polarion-commit-references:not([hidden])) { min-height: 0; overflow-y: auto; }
 .commit-area:has(> .polarion-commit-references:not([hidden])) textarea { flex: 0 0 96px; min-height: 96px; box-sizing: border-box; }
 .polarion-task-dialog .polarion-results { max-height: 280px; margin-top: 14px; }
+.polarion-task-dialog .polarion-task-status { display: inline-block; justify-self: start; width: fit-content; padding: 2px 7px; border: 1px solid var(--border); border-radius: 10px; color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
+.polarion-task-dialog .polarion-task-status[data-state=new] { color: #9bd9bd; border-color: #477d65; background: #18362a; }
 .polarion-open-document { padding: 14px; border: 1px solid var(--border); border-radius: 8px; margin-bottom: 14px; background: var(--surface); }
 .polarion-open-document > summary { cursor: pointer; color: var(--muted); font-size: 12px; line-height: 1.5; }
 .polarion-open-document[open] > summary { margin-bottom: 12px; color: var(--text); }

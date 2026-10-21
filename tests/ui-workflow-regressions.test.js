@@ -569,7 +569,7 @@ test('folder restore is an explicit right-panel action with preview and scoped b
   assert.match(app, /const folderActions = entry\.kind === 'folder'[\s\S]*?data-detail-action="restorefolder"/);
   assert.match(app, /if \(action === 'restorefolder'\) return openFolderRestoreDialog\(entry\)/);
   assert.match(app, /invoke\('preview_folder_restore', \{ repositoryPath: state\.repository\.path, relativePath: model\.entry\.relative_path, sourceRevision, cleanUntracked: refs\.folderRestoreClean\.checked, itemKind: model\.isFile \? 'file' : 'folder' \}\)/);
-  assert.match(app, /invoke\('restore_folder', \{ repositoryPath, relativePath: restoredPath, sourceRevision: model\.preview\.source_id, cleanPaths, itemKind: model\.isFile \? 'file' : 'folder', leaveUnstaged \}\)/);
+  assert.match(app, /invoke\('restore_folder', \{ repositoryPath, relativePath: restoredPath, sourceRevision: model\.preview\.source_id, cleanPaths, itemKind: model\.isFile \? 'file' : 'folder', leaveUnstaged, cleanFolder \}\)/);
   assert.match(html, /This does not move HEAD, switch branch, commit or push/);
 });
 

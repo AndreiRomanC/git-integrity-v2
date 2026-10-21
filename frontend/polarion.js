@@ -251,7 +251,7 @@ function createPolarionTaskPicker({ invoke, addMessage, log = () => {}, onDocume
         ' in ' + docProject.id + (parentDocumentProject ? ' · parent project’s StructDoc source.' : '.') + ' Explicit search only; successful results may be cached for 2 minutes.';
     el('TaskSearchButton').disabled = busy || !project || !context;
     el('DocumentSearchButton').disabled = busy || !docProject || !context;
-    el('TaskQuery').disabled = el('Assigned').disabled = !project || busy;
+    el('TaskQuery').disabled = el('Assigned').disabled = el('TaskStatus').disabled = !project || busy;
     el('DocumentQuery').disabled = !docProject || busy;
     el('Connect').disabled = busy;
     el('View').disabled = busy || !selected;
@@ -454,6 +454,7 @@ function createPolarionTaskPicker({ invoke, addMessage, log = () => {}, onDocume
         : (items.length - local) + (cached ? ' cached server results' : ' server results') + ' · ' + local + ' local matches. Local snapshots are not server search results.';
     }
     if (!items.length) el('Results').append(make('p', mode === 'documents' ? 'No server matches returned. Your selected local document, if any, remains available above. Try another fragment or open its exact link.' :
+      kind === 'tasks' && el('TaskStatus').value === 'new' ? 'No tasks with status “new” match this search. Choose All statuses to include other workflow states.' :
       'No matching ' + (kind === 'projects' ? 'projects' : 'tasks') + '. Try another fragment.', 'polarion-empty'));
     for (const item of items) {
       const row = button('', () => {
@@ -468,6 +469,11 @@ function createPolarionTaskPicker({ invoke, addMessage, log = () => {}, onDocume
       // Results remain selectable after the operation's busy state ends.
       row.disabled = false; row.className = 'polarion-result'; row.setAttribute('aria-pressed', 'false');
       row.append(make('strong', item.id), make('span', item.title + (item.item_type ? ' · ' + item.item_type : '')));
+      if (kind === 'tasks') {
+        const badge = make('small', item.status || 'Status unavailable', 'polarion-task-status');
+        badge.dataset.state = item.status === 'new' ? 'new' : 'other';
+        row.append(badge);
+      }
       if (mode === 'documents') {
         row.dataset.origin = item.local ? 'local' : cached ? 'cache' : 'server';
         row.append(make('small', item.local ? 'LOCAL · saved snapshot' : cached ? 'SERVER CACHE · up to 2 minutes' : 'SERVER · search result', 'polarion-result-origin ' + row.dataset.origin));
@@ -480,6 +486,7 @@ function createPolarionTaskPicker({ invoke, addMessage, log = () => {}, onDocume
       const searchProject = ['documents', 'containers'].includes(kind) ? documentProject() : project;
       if (kind !== 'projects' && !searchProject) return;
       const params = previous || { kind, project: searchProject?.id || '', query: el(kind === 'projects' ? 'ProjectQuery' : kind === 'tasks' ? 'TaskQuery' : 'DocumentQuery').value.trim(), user: '' };
+      if (kind === 'tasks' && !previous) params.taskStatus = el('TaskStatus').value;
       if (kind === 'tasks' && !previous && el('Assigned').checked) {
         if (!otherUser && !identity?.id && !el('User').value.trim()) await detectUser(ticket);
         if (!current(ticket)) return;
@@ -516,6 +523,10 @@ function createPolarionTaskPicker({ invoke, addMessage, log = () => {}, onDocume
       const localOnly = savedDocuments.filter(item => !ids.has(item.id));
       rows.push(...localOnly);
       lastSearch = params; page = requestedPage; more = result.more; render(rows, kind, { cached: Boolean(result.catalog_cached) });
+      if (kind === 'tasks') {
+        el('ResultSummary').hidden = false;
+        el('ResultSummary').textContent = (params.taskStatus === 'new' ? 'New tasks only · server status: new' : 'All task statuses') + ' · status read with these search results. Search again to refresh.';
+      }
       const moduleSearch = kind === 'documents' && result.catalog_source === 'work_item_modules';
       const tokenSearch = moduleSearch && result.document_query_variant && !['module_id_contains', 'module_contains'].includes(result.document_query_variant);
       if (kind === 'documents') el('DocumentHint').textContent = moduleSearch
@@ -672,6 +683,14 @@ function createPolarionTaskPicker({ invoke, addMessage, log = () => {}, onDocume
   el('ProjectSearchButton').addEventListener('click', () => search('projects'));
   el('AllProjects').addEventListener('click', () => { el('ProjectQuery').value = ''; search('projects'); });
   el('TaskSearchButton').addEventListener('click', () => search('tasks'));
+  el('TaskStatus').value = 'new';
+  el('TaskStatus').addEventListener('change', () => {
+    if (busy) return;
+    // Repeat the SAME query/assignee at page 1; no result from the previous
+    // filter may stay selected or be added to the commit list while loading.
+    if (lastSearch?.kind === 'tasks') search('tasks', 1, { ...lastSearch, taskStatus: el('TaskStatus').value });
+    else { clearResults(); clearDetail(); }
+  });
   el('DocumentSearchButton').addEventListener('click', () => search(el('DocumentSource').value || 'documents'));
   el('DocumentSource').addEventListener('change', () => {
     if (!busy) {

@@ -3977,7 +3977,7 @@ function renderFolderRestorePreview(preview = state.folderRestore?.preview) {
   const cleanHtml = refs.folderRestoreClean.checked
     ? clean.length
       ? `<ul class="danger-list">${clean.slice(0, 40).map(path => `<li>${esc(path)}</li>`).join('')}${clean.length > 40 ? `<li>…and ${clean.length - 40} more</li>` : ''}</ul>`
-      : '<p>No untracked, non-ignored items would be cleaned.</p>'
+      : '<p>No extra items detected now. Clean also removes items made untracked by restore.</p>'
     : '<p>Clean folder is off. Untracked files will be left in place.</p>';
   refs.folderRestorePreview.innerHTML = `<div class="folder-restore-preview-card"><span>SOURCE</span><strong>${esc(preview.source_revision === 'HEAD' ? 'HEAD' : preview.source_id.slice(0, 8))} · ${commitSubjectHtml(preview.source_subject || 'No message')}</strong><small>${esc(preview.source_author || 'Unknown')} · ${esc(preview.source_date || '—')}</small></div><div class="folder-restore-preview-grid"><section><h4>Tracked paths to restore</h4><p>Index or working-tree differences relative to the source. Restore replaces both with that snapshot.</p>${trackedHtml}</section>${state.folderRestore?.isFile ? '' : `<section><h4>Untracked clean preview</h4>${cleanHtml}</section>`}</div>`;
   updateFolderRestoreActionState();
@@ -4104,13 +4104,15 @@ async function confirmFolderRestore() {
   }
   const preview = model.preview;
   const leaveUnstaged = refs.folderRestoreUnstage.checked;
+  const cleanFolder = !model.isFile && refs.folderRestoreClean.checked;
   const stillCurrent = () => state.folderRestore === model && state.repository?.path === repositoryPath
     && model.preview === preview && folderRestoreSourceRevision() === preview.source_revision
-    && refs.folderRestoreUnstage.checked === leaveUnstaged;
+    && refs.folderRestoreUnstage.checked === leaveUnstaged
+    && (!model.isFile && refs.folderRestoreClean.checked) === cleanFolder;
   if (!stillCurrent()) { finishConfirmButton(); updateFolderRestoreActionState(); return; }
   const cleanPaths = !model.isFile && refs.folderRestoreClean.checked ? (model.preview.clean_candidates || []) : [];
   const sourceLabel = refs.folderRestoreModeCommit.checked ? model.preview.source_id.slice(0, 8) : 'HEAD';
-  const cleanNote = cleanPaths.length ? `\n\nUntracked items to delete:\n${cleanPaths.slice(0, 12).join('\n')}${cleanPaths.length > 12 ? `\n…and ${cleanPaths.length - 12} more` : ''}` : '';
+  const cleanNote = cleanFolder ? `\n\nClean is ON: permanently delete ALL extra items in this folder after restore, including ignored files and obsolete nested repositories, even if they were previously tracked. This cannot be undone by Git. Submodules retained by the source keep their existing restore behavior; Clean does not recursively clean their contents.${cleanPaths.length ? `\n\nDetected extra items:\n${cleanPaths.slice(0, 12).join('\n')}${cleanPaths.length > 12 ? `\n…and ${cleanPaths.length - 12} more` : ''}` : ''}` : '';
   const restoreLabel = model.isFile ? 'Restore file' : 'Restore folder';
   const stagingNote = `${preview.staged_paths?.length ? `\n\nWarning: ${preview.staged_paths.length} selected path(s) are currently staged.` : ''}\n\n${leaveUnstaged ? 'After restore, this selection will be removed from staging. Restored content stays on disk; differences from HEAD remain unstaged.' : 'The restored snapshot will also be written to staging. When restoring HEAD, the selected staged changes are removed; an older snapshot can create staged changes.'}`;
   const ok = await customConfirm(`This will replace only:\n${model.entry.relative_path}\n\nSource: ${sourceLabel} — ${model.preview.source_subject}\n\nLocal staged and unstaged changes in this ${model.isFile ? 'file' : 'folder'} will be overwritten. Index and working tree will both be updated. HEAD, branch and other paths stay unchanged.${stagingNote}${cleanNote}`, { title: restoreLabel, danger: true, okLabel: restoreLabel });
@@ -4124,7 +4126,7 @@ async function confirmFolderRestore() {
   refs.folderRestoreStatus.textContent = `Restoring selected ${model.isFile ? 'file' : 'folder'}…`;
   status(`Restoring ${restoredName} from ${sourceLabel}…`, 'busy');
   try {
-    await invoke('restore_folder', { repositoryPath, relativePath: restoredPath, sourceRevision: model.preview.source_id, cleanPaths, itemKind: model.isFile ? 'file' : 'folder', leaveUnstaged });
+    await invoke('restore_folder', { repositoryPath, relativePath: restoredPath, sourceRevision: model.preview.source_id, cleanPaths, itemKind: model.isFile ? 'file' : 'folder', leaveUnstaged, cleanFolder });
     refs.folderRestoreDialog.close();
     const reopenPath = state.currentPath;
     directoryCache.clear();

@@ -52,6 +52,13 @@ test('portal excludes other types and projects and supports enum task type', asy
   const { reply } = await portal({ data: { data: [item('P/P-1', { id: 'task' }), item('P/P-2', 'package'), item('Other/Other-1', 'task')] } });
   assert.equal(reply.received, 3); assert.equal(reply.items.length, 1); assert.equal(reply.items[0].id, 'P-1');
 });
+
+test('task search returns actual workflow status without per-task requests or guessed defaults', async () => {
+  const data = { data: ['new', { id: 'in_progress', name: 'In Progress' }, null].map((status, i) => ({ type: 'workitems', id: `P/P-${i + 1}`, attributes: { type: 'task', title: 'Task', status } })) };
+  const { reply, requests } = await portal({ data });
+  assert.deepEqual(reply.items.map(item => item.status), ['new', 'in_progress', '']);
+  assert.equal(requests.length, 1);
+});
 test('portal classifies authentication, permissions, API, redirects and non-JSON without raw bodies', async () => {
   for (const [options, code] of [[{ status: 401 }, 'auth_required'], [{ status: 403 }, 'forbidden'], [{ status: 404 }, 'api_unavailable'], [{ type: 'opaqueredirect' }, 'auth_required'], [{ contentType: 'text/html' }, 'not_json'], [{ error: new Error('secret raw response') }, 'network_error'], [{ error: { name: 'AbortError' } }, 'timeout']]) {
     const { reply } = await portal(options); assert.equal(reply.code, code); assert.ok(!JSON.stringify(reply).includes('secret raw'));

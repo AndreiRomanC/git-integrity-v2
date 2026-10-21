@@ -19,6 +19,7 @@ pub struct Project { id: String, name: String }
 pub struct SearchItem {
     id: String, title: String,
     #[serde(default)] item_type: String,
+    #[serde(default)] status: String,
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Snapshot {
@@ -153,7 +154,7 @@ fn search_url(kind: &str, project: &str, query: &str, user: &str, page: usize) -
                 if user.len() > 120 || !user.bytes().all(|c| c.is_ascii_alphanumeric() || b"_.@-".contains(&c)) { return Err("Enter your Polarion user ID to filter assigned tasks.".into()); }
                 format!(" AND assignee.id:\"{user}\"")
             });
-        url.query_pairs_mut().append_pair("fields[workitems]", "id,title,type");
+        url.query_pairs_mut().append_pair("fields[workitems]", if kind == "tasks" { "id,title,type,status" } else { "id,title,type" });
     } else if kind == "documents" && identifier(project) {
         url.set_path(&format!("/polarion/rest/v1/projects/{project}/documents"));
         url.query_pairs_mut().append_pair("fields[documents]", "moduleName,moduleFolder,title,type")
@@ -172,6 +173,22 @@ fn escaped_query_literal(value: &str) -> String {
         escaped.push(c);
     }
     escaped
+}
+
+// Apply on the server BEFORE pagination, not to just the first 25 results.
+// Workflow states are project-specific: only the literal ID `new` is claimed
+// as New. All statuses remains available for custom workflows and older tasks.
+fn task_search_url(project: &str, query: &str, user: &str, page: usize, status: &str) -> Result<String, String> {
+    if !["", "new"].contains(&status) { return Err("Unsupported task status filter".into()); }
+    let mut url = reqwest::Url::parse(&search_url("tasks", project, query, user, page)?).unwrap();
+    if status == "new" {
+        let pairs: Vec<(String, String)> = url.query_pairs().map(|(key, value)| {
+            let value = if key == "query" { format!("{value} AND status:new") } else { value.into_owned() };
+            (key.into_owned(), value)
+        }).collect();
+        url.query_pairs_mut().clear().extend_pairs(pairs);
+    }
+    Ok(url.to_string())
 }
 
 fn workitem_query_url(project: &str, expression: &str, page_size: usize) -> String {
@@ -591,7 +608,7 @@ pub async fn polarion_connect(app: tauri::AppHandle) -> Result<(), String> {
 fn validate_result(raw: &str) -> Result<SearchResult, String> {
     let result: SearchResult = serde_json::from_str(raw).map_err(|_| "Invalid Polarion search response")?;
     if !["ok", "auth_required", "forbidden", "api_unavailable", "query_rejected", "http_error", "not_json", "network_error", "timeout", "wrong_origin", "invalid_response", "catalog_limit", "response_limit"].contains(&result.code.as_str())
-        || result.items.len() > 25 || result.items.iter().any(|item| (!identifier(&item.id) && resource_segments(&item.id, 3).is_err() && resource_segments(&item.id, 2).is_err()) || item.title.len() > 2000 || item.item_type.len() > 240)
+        || result.items.len() > 25 || result.items.iter().any(|item| (!identifier(&item.id) && resource_segments(&item.id, 3).is_err() && resource_segments(&item.id, 2).is_err()) || item.title.len() > 2000 || item.item_type.len() > 240 || item.status.len() > 240)
         || result.elements.len() > 25 || result.elements.iter().any(|s| !valid_snapshot(s))
         || result.snapshot.as_ref().is_some_and(|s| !valid_snapshot(s)) || result.user_id.len() > 120 || result.user_name.len() > 500 || result.page_key.len() > 30_000
         || result.diagnostics.len() > 40 || result.http_requests > 210 || result.diagnostics_omitted > 210
@@ -829,6 +846,23 @@ mod tests {
         assert!(params["query"].contains("assignee.id:\"sg964219\""));
         assert_eq!(pairs(&search_url("tasks", "VWAQ4", "", "", 1).unwrap())["query"], "type:task");
     }
+
+    #[test]
+    fn task_status_filter_is_server_side_and_survives_paging_and_prefix_fallback() {
+        let url = task_search_url("VWAQ4", "errm", "user.name", 3, "new").unwrap();
+        for checked in [url.clone(), prefix_fallback_url(&url).unwrap()] {
+            let params = pairs(&checked);
+            assert!(params["query"].starts_with("type:task AND "));
+            assert!(params["query"].contains("assignee.id:\"user.name\""));
+            assert!(params["query"].ends_with(" AND status:new"));
+            assert_eq!(params["fields[workitems]"], "id,title,type,status");
+            assert_eq!(params["page[number]"], "3");
+        }
+        assert!(!pairs(&task_search_url("P", "", "", 1, "").unwrap())["query"].contains("status:"));
+        assert!(task_search_url("P", "", "", 1, "new OR *").is_err());
+        let result = validate_result(r#"{"code":"ok","items":[{"id":"P-1","title":"Task","item_type":"task","status":"custom_state"}]}"#).unwrap();
+        assert_eq!(result.items[0].status, "custom_state");
+    }
     #[test]
     fn invalid_queries_do_not_reach_browser() {
         for project in ["../secret", "p/a", "p?x", ""] { assert!(search_url("tasks", project, "", "", 1).is_err()); }
@@ -1044,10 +1078,12 @@ mod tests {
 }
 
 #[tauri::command]
-pub async fn polarion_search(app: tauri::AppHandle, kind: String, project: String, query: String, user: String, page: usize) -> Result<SearchResult, String> {
+pub async fn polarion_search(app: tauri::AppHandle, kind: String, project: String, query: String, user: String, page: usize, task_status: Option<String>) -> Result<SearchResult, String> {
     if kind == "documents" { return portal_request(app, document_search_args(&project, &query, page)?).await; }
-    let url = search_url(&kind, &project, &query, &user, page)?;
+    let status = task_status.as_deref().unwrap_or("");
+    let url = if kind == "tasks" { task_search_url(&project, &query, &user, page, status)? } else { search_url(&kind, &project, &query, &user, page)? };
     let fallback = prefix_fallback_url(&url)?;
+    if kind == "tasks" { perf_log(&format!("polarion: task_search status_filter={} page={page} status_field_requested=true", if status.is_empty() { "all" } else { status }), Duration::ZERO); }
     portal_request(app, serde_json::json!({"url":url,"fallbackUrl":fallback,"kind":kind,"project":project,"query":query,"page":page,"assigned":!user.is_empty()})).await
 }
 
@@ -1107,6 +1143,17 @@ async fn portal_request(app: tauri::AppHandle, mut args: serde_json::Value) -> R
                     let result = validate_result(&raw)?;
                     if result.snapshot.as_ref().is_some_and(|s| Some(s.id.as_str()) != args["resourceId"].as_str()) { return Err("Polarion returned a different resource; no snapshot was applied".into()); }
                     log_diagnostics(&id, &result);
+                    if kind == "tasks" {
+                        let mut counts = std::collections::BTreeMap::<&str, usize>::new();
+                        for item in &result.items {
+                            // Technical status IDs and counts only; no titles,
+                            // assignees, task IDs, query text or credentials.
+                            let status = if item.status.is_empty() { "not_returned" }
+                                else if identifier(&item.status) { item.status.as_str() } else { "other_status" };
+                            *counts.entry(status).or_default() += 1;
+                        }
+                        perf_log(&format!("polarion: task_statuses request={id} returned={} counts={counts:?}", result.items.len()), Duration::ZERO);
+                    }
                     Ok(result)
                 })
             };

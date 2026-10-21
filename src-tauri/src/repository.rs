@@ -8179,6 +8179,17 @@ fn validate_path_restore_target(repo: &Repository, repository_path: &str, relati
     let relative_string = normalized(relative);
     let target = Path::new(repository_path).join(relative);
     if !is_file {
+        // A destructive folder scope must not traverse a link or cross into a
+        // different repository. Open that repository explicitly instead.
+        let index = repo.index().map_err(|error| error.message().to_string())?;
+        for ancestor in relative.ancestors().take_while(|path| !path.as_os_str().is_empty()) {
+            let absolute = Path::new(repository_path).join(ancestor);
+            if absolute.join(".git").exists()
+                || fs::symlink_metadata(&absolute).ok().is_some_and(|meta| meta.file_type().is_symlink())
+                || index.get_path(ancestor, 0).is_some_and(|entry| entry.mode == 0o160000) {
+                return Err("Folder restore cannot cross a submodule, nested repository or directory symlink. Open that repository first.".into());
+            }
+        }
         if !target.is_dir() { return Err("Folder restore works only for an existing normal folder".into()); }
         let entry = tree.get_path(relative).map_err(|_| format!("{relative_string} does not exist in {}", source_revision.trim()))?;
         if entry.kind() != Some(ObjectType::Tree) { return Err(format!("{relative_string} is not a folder in {}", source_revision.trim())); }
@@ -8250,7 +8261,21 @@ fn path_restore_preview_inner(repository_path: &str, relative_path: &str, source
     }
     let tracked_changes = tracked_by_path.into_values().collect();
     let clean_candidates = if clean_untracked && !is_file {
-        parse_clean_dry_run(&git(repository_path, &["clean", "-nd", "--", &relative_string])?)?
+        let mut candidates = parse_clean_dry_run(&git(repository_path, &["clean", "-nffdx", "--", &pathspec])?)?;
+        // git clean sees the CURRENT index. A gitlink removed by restore is
+        // still tracked at preview time, but its old worktree will be left on
+        // disk by git restore. Include these future untracked directories too.
+        let index = repo.index().map_err(|error| error.message().to_string())?;
+        for entry in index.iter().filter(|entry| entry.mode == 0o160000) {
+            let path = std::str::from_utf8(&entry.path).map_err(|_| "Cannot preview a non-UTF-8 submodule path")?;
+            if path.starts_with(&format!("{relative_string}/")) && tree.get_path(Path::new(path)).is_err()
+                && Path::new(repository_path).join(path).exists() {
+                candidates.push(path.to_string());
+            }
+        }
+        candidates.sort(); candidates.dedup();
+        perf_log(&format!("restore_folder: clean_preview scope={relative_string:?} source={source_id} candidates={} ignored=true embedded_repositories=true", candidates.len()), Duration::ZERO);
+        candidates
     } else { Vec::new() };
     let source_subject = commit.summary().unwrap_or("No message").to_string();
     let source_author = commit.author().name().unwrap_or("Unknown").to_string();
@@ -8276,9 +8301,9 @@ pub fn preview_folder_restore(repository_path: String, relative_path: String, so
 }
 
 #[tauri::command]
-pub async fn restore_folder(repository_path: String, relative_path: String, source_revision: String, clean_paths: Vec<String>, item_kind: Option<String>, leave_unstaged: Option<bool>) -> Result<(), String> {
+pub async fn restore_folder(repository_path: String, relative_path: String, source_revision: String, clean_paths: Vec<String>, item_kind: Option<String>, leave_unstaged: Option<bool>, clean_folder: Option<bool>) -> Result<(), String> {
     let is_file = restore_item_is_file(item_kind.as_deref())?;
-    off_main_thread(move || path_restore_with_staging(repository_path, relative_path, source_revision, clean_paths, is_file, leave_unstaged.unwrap_or(false))).await
+    off_main_thread(move || path_restore_with_clean(repository_path, relative_path, source_revision, clean_paths, is_file, leave_unstaged.unwrap_or(false), clean_folder.unwrap_or(false))).await
 }
 
 fn restore_folder_inner(repository_path: String, relative_path: String, source_revision: String, clean_paths: Vec<String>) -> Result<(), String> {
@@ -8290,16 +8315,24 @@ fn path_restore_inner(repository_path: String, relative_path: String, source_rev
 }
 
 fn path_restore_with_staging(repository_path: String, relative_path: String, source_revision: String, clean_paths: Vec<String>, is_file: bool, leave_unstaged: bool) -> Result<(), String> {
+    path_restore_with_clean(repository_path, relative_path, source_revision, clean_paths, is_file, leave_unstaged, false)
+}
+
+fn path_restore_with_clean(repository_path: String, relative_path: String, source_revision: String, clean_paths: Vec<String>, is_file: bool, leave_unstaged: bool, clean_folder: bool) -> Result<(), String> {
     let started = Instant::now();
     validate_path(&repository_path)?;
     let relative = safe_relative_path(&relative_path)?;
     if relative.as_os_str().is_empty() { return Err("Select a folder to restore".into()); }
     let relative_string = normalized(&relative);
+    let queue_started = Instant::now();
+    let lock_handle = repo_write_lock(&repository_path);
+    let _lock = lock_handle.lock().unwrap();
+    log_repo_write_lock_acquired(&repository_path, "restore_folder", queue_started.elapsed());
     let repo = internal_repository(&repository_path)?;
     let commit = commit_for_folder_restore(&repo, &source_revision)?;
     let tree = commit.tree().map_err(|error| error.message().to_string())?;
     validate_path_restore_target(&repo, &repository_path, &relative, &tree, &source_revision, is_file)?;
-    if is_file && !clean_paths.is_empty() { return Err("Clean is not available when restoring an individual file".into()); }
+    if is_file && (clean_folder || !clean_paths.is_empty()) { return Err("Clean is not available when restoring an individual file".into()); }
 
     let clean_relative = clean_paths.into_iter().map(|path| {
         let safe = safe_relative_path(path.trim_end_matches(['/', '\\']))?;
@@ -8310,39 +8343,50 @@ fn path_restore_with_staging(repository_path: String, relative_path: String, sou
         Ok(normalized_safe)
     }).collect::<Result<Vec<_>, _>>()?;
 
-    let queue_started = Instant::now();
-    let lock_handle = repo_write_lock(&repository_path);
-    let _lock = lock_handle.lock().unwrap();
-    log_repo_write_lock_acquired(&repository_path, "restore_folder", queue_started.elapsed());
     if leave_unstaged && (repo.state() != git2::RepositoryState::Clean || repo.index().map_err(|error| error.message().to_string())?.has_conflicts()) {
         return Err("Cannot unstage as part of restore while a merge, rebase or other Git operation is in progress. Nothing was restored.".into());
     }
     if is_file { validate_path_restore_target(&repo, &repository_path, &relative, &tree, &source_revision, true)?; }
     let source_id = commit.id().to_string();
     let pathspec = format!(":(top,literal){relative_string}");
-    git(&repository_path, &["restore", "--source", &source_id, "--staged", "--worktree", "--", &pathspec])
-        .map_err(|detail| format!("{} restore failed: {detail}", if is_file { "File" } else { "Folder" }))?;
-    let submodule_status = if is_file { String::new() } else {
-        git(&repository_path, &["submodule", "status", "--recursive", "--", &relative_string]).unwrap_or_default()
-    };
-    if !submodule_status.trim().is_empty() {
-        let _ = git(&repository_path, &["submodule", "sync", "--recursive", "--", &relative_string]);
-        git(&repository_path, &["-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive", "--force", "--", &relative_string])
-            .map_err(|detail| format!("Folder restored, but submodule checkout failed: {detail}"))?;
-    }
-    if !clean_relative.is_empty() {
-        let mut args = vec!["clean".to_string(), "-fd".to_string(), "--".to_string()];
-        args.extend(clean_relative.into_iter().map(|path| format!(":(top,literal){path}")));
-        git_owned(&repository_path, args).map_err(|detail| format!("Folder restored, but clean failed: {detail}"))?;
-    }
-    if leave_unstaged {
-        git(&repository_path, &["restore", "--source", "HEAD", "--staged", "--", &pathspec])
-            .map_err(|detail| { invalidate_git_metadata(&repository_path); format!("Files were restored, but could not be unstaged: {detail}. Check the index before committing.") })?;
-    }
+    perf_log(&format!("restore_folder: START scope={relative_string:?} source={source_id} clean_folder={clean_folder} confirmed_paths={} leave_unstaged={leave_unstaged}", clean_relative.len()), Duration::ZERO);
+    let result = (|| {
+        git(&repository_path, &["restore", "--source", &source_id, "--staged", "--worktree", "--", &pathspec])
+            .map_err(|detail| format!("{} restore failed: {detail}", if is_file { "File" } else { "Folder" }))?;
+        // Clean against the RESTORED index, before optional unstage. Never rely on
+        // a pre-restore candidate list: removed gitlinks only become untracked now.
+        // -x includes ignored leftovers; the second -f permits obsolete nested
+        // repositories. Gitlinks still present in the restored index are protected.
+        if clean_folder {
+            let output = git(&repository_path, &["clean", "-ffdx", "--", &pathspec])
+                .map_err(|detail| format!("Folder restored, but Clean did not complete: {detail}. Some paths may already have been removed."))?;
+            perf_log(&format!("restore_folder: clean_complete scope={relative_string:?} removed_entries={}", output.lines().filter(|line| line.starts_with("Removing ")).count()), started.elapsed());
+        }
+        let submodule_status = if is_file { String::new() } else {
+            git(&repository_path, &["submodule", "status", "--recursive", "--", &relative_string]).unwrap_or_default()
+        };
+        if !submodule_status.trim().is_empty() {
+            let _ = git(&repository_path, &["submodule", "sync", "--recursive", "--", &relative_string]);
+            git(&repository_path, &["-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive", "--force", "--", &relative_string])
+                .map_err(|detail| format!("Folder restored, but submodule checkout failed: {detail}"))?;
+        }
+        if !clean_folder && !clean_relative.is_empty() {
+            let mut args = vec!["clean".to_string(), "-fd".to_string(), "--".to_string()];
+            args.extend(clean_relative.into_iter().map(|path| format!(":(top,literal){path}")));
+            git_owned(&repository_path, args).map_err(|detail| format!("Folder restored, but clean failed: {detail}"))?;
+        }
+        if leave_unstaged {
+            git(&repository_path, &["restore", "--source", "HEAD", "--staged", "--", &pathspec])
+                .map_err(|detail| format!("Files were restored, but could not be unstaged: {detail}. Check the index before committing."))?;
+        }
+        Ok(())
+    })();
+    // A partially failed restore must also invalidate cached state.
     invalidate_git_metadata(&repository_path);
     if !is_file { invalidate_submodule_sync(&repository_path); }
+    if let Err(ref error) = result { perf_log(&format!("restore_folder: FAILED scope={relative_string:?} detail={error}"), started.elapsed()); }
     perf_log("restore_folder: TOTAL", started.elapsed());
-    Ok(())
+    result
 }
 
 // entry_details only needs the single most recent commit that touched a path (for
@@ -10515,6 +10559,76 @@ mod tests {
     }
 
     #[test]
+    fn folder_restore_clean_removes_former_gitlinks_ignored_and_embedded_repos_after_restore() {
+        let (root, path, source, _) = individual_restore_fixture("clean-obsolete-gitlink");
+        let old_module = root.join("folder/old-module");
+        create_libgit2_repository(&old_module, "local.txt");
+        let oid = run_git_capture(&old_module, &["rev-parse", "HEAD"]);
+        run_git(&root, &["update-index", "--add", "--cacheinfo", &format!("160000,{oid},folder/old-module")]);
+        run_git(&root, &["commit", "-m", "Record old module"]);
+        let head = run_git_capture(&root, &["rev-parse", "HEAD"]);
+        let refs = run_git_capture(&root, &["show-ref"]);
+        let nested = root.join("folder/embedded");
+        create_libgit2_repository(&nested, "private.txt");
+        fs::write(root.join(".git/info/exclude"), "folder/ignored/\n").unwrap();
+        fs::create_dir_all(root.join("folder/ignored")).unwrap();
+        fs::write(root.join("folder/ignored/build.bin"), "ignored").unwrap();
+        fs::write(root.join("folder/extra.txt"), "extra").unwrap();
+        fs::write(root.join("outside.txt"), "outside staged\n").unwrap();
+        run_git(&root, &["add", "outside.txt"]);
+        fs::write(root.join("outside.txt"), "outside unstaged\n").unwrap();
+        let outside_index = run_git_capture(&root, &["ls-files", "--stage", "--", "outside.txt"]);
+
+        // Reproduce the old behavior: restore removes the gitlink from the
+        // index but leaves its worktree as a new/untracked directory.
+        restore_folder_inner(path.clone(), "folder".into(), source.clone(), Vec::new()).unwrap();
+        assert!(old_module.join("local.txt").exists());
+        assert!(run_git_capture(&root, &["ls-files", "--others", "--exclude-standard", "--", "folder/old-module"]).contains("old-module"));
+        run_git(&root, &["update-index", "--add", "--cacheinfo", &format!("160000,{oid},folder/old-module")]);
+        let preview = folder_restore_preview_inner(&path, "folder", &source, true).unwrap();
+        for expected in ["folder/old-module", "folder/embedded", "folder/ignored", "folder/extra.txt"] {
+            assert!(preview.clean_candidates.iter().any(|p| p == expected), "missing {expected}: {:?}", preview.clean_candidates);
+        }
+        // New paths appearing after the preview are also covered by the
+        // explicit destructive whole-folder confirmation.
+        fs::write(root.join("folder/late.txt"), "late").unwrap();
+        path_restore_with_clean(path, "folder".into(), source, preview.clean_candidates, false, false, true).unwrap();
+        for extra in ["old-module", "embedded", "ignored", "extra.txt", "late.txt"] { assert!(!root.join("folder").join(extra).exists(), "left {extra}"); }
+        assert_eq!(run_git_capture(&root, &["diff", "--name-only", &run_git_capture(&root, &["rev-parse", "HEAD~1"]), "--", "folder"]), "folder/file.txt");
+        assert_eq!(run_git_capture(&root, &["rev-parse", "HEAD"]), head);
+        assert_eq!(run_git_capture(&root, &["show-ref"]), refs);
+        assert_eq!(run_git_capture(&root, &["ls-files", "--stage", "--", "outside.txt"]), outside_index);
+        assert_eq!(fs::read_to_string(root.join("outside.txt")).unwrap(), "outside unstaged\n");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn folder_restore_full_clean_runs_even_with_empty_preview_and_before_unstage() {
+        let (root, path, source, head) = individual_restore_fixture("clean-before-unstage");
+        path_restore_with_clean(path.clone(), "folder".into(), source.clone(), Vec::new(), false, false, false).unwrap();
+        fs::write(root.join("folder/leftover.txt"), "leftover").unwrap();
+        path_restore_with_clean(path, "folder".into(), source, Vec::new(), false, true, true).unwrap();
+        assert!(!root.join("folder/leftover.txt").exists());
+        assert_eq!(fs::read_to_string(root.join("folder/file.txt")).unwrap(), "old\n");
+        assert!(run_git_capture(&root, &["diff", "--cached", "--name-only", "--", "folder"]).is_empty());
+        assert_eq!(run_git_capture(&root, &["rev-parse", "HEAD"]), head);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn folder_restore_clean_rejects_symlink_scope_before_modification() {
+        let (root, path, _, _) = individual_restore_fixture("clean-symlink");
+        fs::rename(root.join("folder"), root.join("outside-folder")).unwrap();
+        std::os::unix::fs::symlink("outside-folder", root.join("folder")).unwrap();
+        let before = fs::read(root.join(".git/index")).unwrap();
+        assert!(path_restore_with_clean(path, "folder".into(), "HEAD".into(), Vec::new(), false, false, true).unwrap_err().contains("symlink"));
+        assert_eq!(fs::read(root.join(".git/index")).unwrap(), before);
+        assert!(root.join("outside-folder/file.txt").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn folder_restore_clean_removes_only_confirmed_unicode_and_literal_paths() {
         let (root, path, _, head) = individual_restore_fixture("clean-unicode");
         run_git(&root, &["config", "core.quotePath", "true"]);
@@ -11065,17 +11179,17 @@ mod tests {
         let repo_string = repository.to_string_lossy().into_owned();
         let preview = folder_restore_preview_inner(&repo_string, "folder", &commit_a, true).unwrap();
         assert!(preview.clean_candidates.iter().any(|path| path == "folder/temp.txt"), "untracked temp file must be previewed for clean: {:?}", preview.clean_candidates);
-        assert!(!preview.clean_candidates.iter().any(|path| path == "folder/ignored.log"), "ignored files must not be cleaned by default");
+        assert!(preview.clean_candidates.iter().any(|path| path == "folder/ignored.log"), "Clean explicitly includes ignored leftovers");
         assert!(!preview.tracked_changes.iter().any(|change| change.status == "??"), "untracked items belong in clean preview, not tracked changes");
 
-        restore_folder_inner(repo_string, "folder".into(), commit_a, preview.clean_candidates).unwrap();
+        path_restore_with_clean(repo_string, "folder".into(), commit_a, preview.clean_candidates, false, false, true).unwrap();
         assert_eq!(run_git_capture(&repository, &["rev-parse", "HEAD"]), head_before, "restore must not move HEAD");
         assert_eq!(run_git_capture(&repository, &["branch", "--show-current"]), branch_before, "restore must not switch branches");
         assert_eq!(fs::read_to_string(repository.join("folder/file1.txt")).unwrap(), "A1\n");
         assert_eq!(fs::read_to_string(repository.join("folder/file2.txt")).unwrap(), "A2\n");
         assert!(!repository.join("folder/file3.txt").exists(), "tracked files absent in the source snapshot should be removed from the folder");
         assert!(!repository.join("folder/temp.txt").exists(), "confirmed untracked clean candidate should be removed");
-        assert_eq!(fs::read_to_string(repository.join("folder/ignored.log")).unwrap(), "keep me\n", "ignored file must remain untouched");
+        assert!(!repository.join("folder/ignored.log").exists(), "Clean removes ignored files in this folder only");
         assert_eq!(fs::read_to_string(repository.join("outside.txt")).unwrap(), "outside C\n", "unrelated paths must be untouched");
 
         fs::remove_dir_all(repository).unwrap();
@@ -11110,10 +11224,14 @@ mod tests {
         assert_ne!(run_git_capture(&sub_path, &["rev-parse", "HEAD"]), checkpoint_sub);
         assert!(!refresh_status_inner(repository.to_string_lossy().into_owned()).unwrap().is_empty(), "advancing only the submodule checkout should make the parent folder look modified");
 
-        restore_folder_inner(repository.to_string_lossy().into_owned(), "folder".into(), checkpoint, Vec::new()).unwrap();
+        fs::write(sub_path.join("local-extra.txt"), "inside retained submodule\n").unwrap();
+        fs::write(repository.join("folder/extra.txt"), "extra in folder\n").unwrap();
+        path_restore_with_clean(repository.to_string_lossy().into_owned(), "folder".into(), checkpoint, Vec::new(), false, false, true).unwrap();
         assert_eq!(run_git_capture(&sub_path, &["rev-parse", "HEAD"]), checkpoint_sub, "folder restore must move nested submodule worktrees to the gitlink recorded by the selected source");
         assert_eq!(fs::read_to_string(sub_path.join("module.txt")).unwrap(), "dep v1\n");
-        assert!(refresh_status_inner(repository.to_string_lossy().into_owned()).unwrap().is_empty(), "parent repo should be clean after restoring the folder and its nested submodule");
+        assert!(!repository.join("folder/extra.txt").exists());
+        assert!(repository.join(".git/modules/folder/dep").is_dir(), "retained submodule metadata must be protected");
+        assert_eq!(fs::read_to_string(sub_path.join("local-extra.txt")).unwrap(), "inside retained submodule\n", "folder Clean must not silently expand into retained submodules");
 
         fs::remove_dir_all(base).unwrap();
     }

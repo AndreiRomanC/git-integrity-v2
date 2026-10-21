@@ -425,7 +425,7 @@
     if (data.data.length > 25) throw { code: 'invalid_response' };
     const items = data.data.filter(item => item.type === 'workitems' && validId(item.id, 2) && item.id.startsWith(args.project + '/') && !hasErrors(item)
       && (args.kind === 'containers' || enumValue(item.attributes?.type) === 'task'))
-      .map(item => ({ id: item.id.split('/').pop(), title: text(item.attributes?.title || item.id), item_type: enumValue(item.attributes?.type) }));
+      .map(item => ({ id: item.id.split('/').pop(), title: text(item.attributes?.title || item.id), item_type: enumValue(item.attributes?.type), status: enumValue(item.attributes?.status) }));
     reply({ code: data.data.length && !items.length ? 'invalid_response' : 'ok', http: 200, received: data.data.length, items, more: Boolean(data.links?.next) });
   } catch (error) {
     reply({ code: failureCode(error), http: error?.http || 0, catalog_pages: error?.catalog_pages || 0 });

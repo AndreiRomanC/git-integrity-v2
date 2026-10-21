@@ -129,6 +129,44 @@ async function selectedTask(h) {
   await h.el('TaskSearchButton').handlers.click();
   h.el('Results').children[0].handlers.click();
 }
+
+test('task search defaults to New, labels statuses and keeps server filtering through paging', async () => {
+  const h = harness(); await inProject(h);
+  assert.equal(h.el('TaskStatus').value, 'new');
+  assert.equal(h.calls.filter(c => c.name === 'polarion_search').length, 0);
+  h.el('TaskQuery').value = 'errm';
+  h.search(async () => ({ code: 'ok', items: [{ id: 'P-1', title: 'Task', status: 'new' }], more: true }));
+  await h.el('TaskSearchButton').handlers.click();
+  let call = h.calls.filter(c => c.name === 'polarion_search').at(-1);
+  assert.equal(call.args.taskStatus, 'new');
+  assert.equal(h.el('Results').children[0].children.at(-1).textContent, 'new');
+  assert.match(h.el('ResultSummary').textContent, /New tasks only/);
+  h.el('Next').handlers.click(); await tick();
+  call = h.calls.filter(c => c.name === 'polarion_search').at(-1);
+  assert.equal(call.args.page, 2); assert.equal(call.args.taskStatus, 'new');
+
+  let resolve;
+  h.search(() => new Promise(r => { resolve = r; }));
+  h.el('TaskStatus').value = ''; h.el('TaskStatus').handlers.change(); await tick();
+  call = h.calls.filter(c => c.name === 'polarion_search').at(-1);
+  assert.equal(call.args.page, 1); assert.equal(call.args.taskStatus, ''); assert.equal(call.args.query, 'errm');
+  assert.equal(h.el('Results').children.length, 0, 'old results cleared while loading');
+  assert.equal(h.el('Add').disabled, true); assert.equal(h.el('TaskStatus').disabled, true);
+  resolve({ code: 'ok', items: [{ id: 'P-2', title: 'Closed task', status: 'custom_done' }, { id: 'P-3', title: 'No status' }] }); await tick();
+  assert.equal(h.el('Results').children[0].children.at(-1).textContent, 'custom_done');
+  assert.equal(h.el('Results').children[1].children.at(-1).textContent, 'Status unavailable');
+  assert.match(h.el('ResultSummary').textContent, /All task statuses/);
+});
+
+test('empty New search explains scope and closing drops late task results', async () => {
+  const h = harness(); await inProject(h);
+  await h.el('TaskSearchButton').handlers.click();
+  assert.match(h.el('Results').children[0].textContent, /Choose All statuses/);
+  let resolve; h.search(() => new Promise(r => { resolve = r; }));
+  const pending = h.el('TaskSearchButton').handlers.click(); await tick(); h.dialog.close();
+  resolve({ code: 'ok', items: [{ id: 'P-1', title: 'Stale', status: 'new' }] }); await pending;
+  assert.equal(h.el('Results').children.length, 0);
+});
 const cardButton = (h, card, label) => h.el(card).children[1].children.find(b => b.textContent === label);
 
 test('manual assignee is remembered once and survives reopening without another API detection', async () => {

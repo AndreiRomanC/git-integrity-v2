@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Git DrillDown</title>
   <link rel="icon" type="image/png" href="assets/git-drilldown-mark.png">
-  <link rel="stylesheet" href="styles.css?v=20261021-scoped-compare">
-  <link rel="stylesheet" href="polarion.css?v=20261021-scoped-compare">
+  <link rel="stylesheet" href="styles.css?v=20261021-restore-clean-task-status">
+  <link rel="stylesheet" href="polarion.css?v=20261021-restore-clean-task-status">
 </head>
 <body>
   <div class="app-shell">
@@ -573,7 +573,7 @@
           <div id="folderRestoreCommitList" class="folder-restore-commit-list"></div>
           <div class="folder-restore-history-footer"><span id="folderRestoreHistoryStatus" role="status"></span><button type="button" id="loadOlderFolderRestoreCommits" hidden>Load older</button></div>
         </div>
-        <label class="folder-restore-clean"><input type="checkbox" id="folderRestoreClean" checked><span><b>Clean folder</b><small>Preview and remove untracked, non-ignored items inside this folder after restore.</small></span></label>
+        <label class="folder-restore-clean"><input type="checkbox" id="folderRestoreClean" checked><span><b>Clean folder · delete all extra items</b><small>Permanently removes untracked and ignored items, including obsolete nested repositories, after restore. Only this folder; does not recursively clean retained submodules.</small></span></label>
         <div id="folderRestorePreview" class="folder-restore-preview"><p>Choose a restore source, then preview the exact scoped operation.</p></div>
         <p id="folderRestoreStagedNotice" class="restore-staged-notice" role="status" hidden></p>
         <label class="folder-restore-clean"><input type="checkbox" id="folderRestoreUnstage"><span><b>Leave restored changes unstaged</b><small>Restore the selected content, then reset only this selection’s staging to HEAD. Other staged paths stay untouched. Not available during an unfinished merge/rebase.</small></span></label>
@@ -849,6 +849,9 @@
           <div id="polarionPrimary" class="polarion-saved-card"></div>
           <label for="polarionTaskQuery">Find task in the selected project</label>
           <div class="polarion-search-row"><input id="polarionTaskQuery" placeholder="Task ID or title…" autocomplete="off"><button type="button" id="polarionTaskSearchButton">Find tasks</button></div>
+          <label for="polarionTaskStatus">Task status</label>
+          <select id="polarionTaskStatus"><option value="new">New tasks only</option><option value="">All statuses</option></select>
+          <small>“New” uses Polarion status ID <b>new</b>. Choose All statuses for in-progress, completed or custom workflow states.</small>
           <div class="polarion-assignee"><label><input id="polarionAssigned" type="checkbox"> Assigned to me</label><span id="polarionIdentity"></span><button type="button" id="polarionDetectUser">Detect signed-in user</button><button type="button" id="polarionOtherUser">Other user…</button><input id="polarionUser" aria-label="Polarion assignee user ID" placeholder="Polarion user ID" hidden autocomplete="off"><button type="button" id="polarionUseMe" hidden>Use me</button></div>
           <small>Your user ID is remembered on this computer. Filtering another user does not replace it.</small>
           <div id="polarionTaskWorkspace"></div>
@@ -896,18 +899,18 @@
       <footer><span>Read-only on Polarion · local snapshots outside Git</span><button value="cancel">Close</button><button type="button" id="polarionAdd" class="confirm" disabled>Add to Commit List</button></footer>
     </form>
   </dialog>
-  <script src="polarion.js?v=20261021-scoped-compare"></script>
-  <script src="console-context.js?v=20261021-scoped-compare"></script>
-  <script src="graph-model.js?v=20261021-scoped-compare"></script>
-  <script src="submodule-state.js?v=20261021-scoped-compare"></script>
-  <script src="submodule-versions.js?v=20261021-scoped-compare"></script>
-  <script src="local-diff.js?v=20261021-scoped-compare"></script>
-  <script src="local-drive.js?v=20261021-scoped-compare"></script>
-  <script src="pr-status.js?v=20261021-scoped-compare"></script>
-  <script src="refresh-coordinator.js?v=20261021-scoped-compare"></script>
-  <script src="comparison-authors.js?v=20261021-scoped-compare"></script>
-  <script src="git-activity.js?v=20261021-scoped-compare"></script>
-  <script src="comparison-navigation.js?v=20261021-scoped-compare"></script>
-  <script src="app.js?v=20261021-scoped-compare"></script>
+  <script src="polarion.js?v=20261021-restore-clean-task-status"></script>
+  <script src="console-context.js?v=20261021-restore-clean-task-status"></script>
+  <script src="graph-model.js?v=20261021-restore-clean-task-status"></script>
+  <script src="submodule-state.js?v=20261021-restore-clean-task-status"></script>
+  <script src="submodule-versions.js?v=20261021-restore-clean-task-status"></script>
+  <script src="local-diff.js?v=20261021-restore-clean-task-status"></script>
+  <script src="local-drive.js?v=20261021-restore-clean-task-status"></script>
+  <script src="pr-status.js?v=20261021-restore-clean-task-status"></script>
+  <script src="refresh-coordinator.js?v=20261021-restore-clean-task-status"></script>
+  <script src="comparison-authors.js?v=20261021-restore-clean-task-status"></script>
+  <script src="git-activity.js?v=20261021-restore-clean-task-status"></script>
+  <script src="comparison-navigation.js?v=20261021-restore-clean-task-status"></script>
+  <script src="app.js?v=20261021-restore-clean-task-status"></script>
 </body>
 </html>
