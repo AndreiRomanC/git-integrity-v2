@@ -26,6 +26,7 @@ function harness() {
     handleError: error => errors.push(String(error)),
     setTimeout: fn => { const id = ++timerId; timers.set(id, fn); return id; }, clearTimeout: id => timers.delete(id) };
   vm.createContext(sandbox);
+  vm.runInContext('let previousNavigationAt = null;\n' + functionSource('navigationTraceFields'), sandbox);
   vm.runInContext(functionSource('createRequestGuard'), sandbox);
   const start = app.indexOf('let pendingEntryDetailsTimeout = null;');
   vm.runInContext(app.slice(start, app.indexOf('\nfunction selectedScope()', start)), sandbox);

@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Git DrillDown</title>
   <link rel="icon" type="image/png" href="assets/git-drilldown-mark.png">
-  <link rel="stylesheet" href="styles.css?v=20261020-fast-default">
-  <link rel="stylesheet" href="polarion.css?v=20261020-fast-default">
+  <link rel="stylesheet" href="styles.css?v=20261021-scoped-compare">
+  <link rel="stylesheet" href="polarion.css?v=20261021-scoped-compare">
 </head>
 <body>
   <div class="app-shell">
@@ -120,11 +120,34 @@
 
         <div id="commanderView" class="commander-view" hidden>
           <div class="compare-mode-tabs" role="tablist" aria-label="Compare and Sync mode">
-            <button id="compareModeDrive" class="active" type="button" role="tab">Local Drive</button>
-            <button id="compareModeGit" type="button" role="tab">Git Compare</button>
+            <button id="compareModeDrive" class="active" type="button" role="tab">Folder Compare</button>
+            <button id="compareModeGit" type="button" role="tab">Branch Compare</button>
             <button id="compareModeSubmodule" type="button" role="tab">Submodule Compare</button>
+            <button id="compareModeHistory" type="button" role="tab">Folder History</button>
           </div>
+          <div id="compareOrigin" class="compare-origin" aria-live="polite"></div>
           <div id="gitComparePanel" class="compare-panel" hidden>
+            <div id="branchCompareKind" class="compare-kind-controls">
+              <label>Compare <select id="branchCompareKindSelect"><option value="refs">Two branches / revisions</option><option value="workspace">Working tree ↔ cached remote</option></select></label>
+              <small>Remote refs are local snapshots from the last Fetch. Comparing does not contact the server.</small>
+            </div>
+            <div id="folderHistoryControls" class="folder-history-controls" hidden>
+              <div class="folder-history-selectors">
+                <label>LEFT SNAPSHOT<input data-history-left list="folderHistoryOptions" placeholder="Working tree, HEAD, branch or SHA" spellcheck="false"></label>
+                <button type="button" data-history-worktree title="Compare files currently on disk; no checkout">Use working tree</button>
+                <button type="button" data-history-swap title="Swap two committed snapshots; working tree stays on the left">⇄</button>
+                <label>RIGHT SNAPSHOT<input data-history-right list="folderHistoryOptions" placeholder="HEAD, branch or commit SHA" spellcheck="false"></label>
+                <button type="button" data-history-compare>Compare</button>
+                <datalist id="folderHistoryOptions" data-history-options></datalist>
+              </div>
+              <small>Working tree = files on disk now, including local edits. HEAD = current committed snapshot. Select two commits to compare history; nothing is restored.</small>
+              <details class="folder-history-picker">
+                <summary>Choose from commits touching this folder</summary>
+                <div class="folder-history-search"><input data-history-search placeholder="Filter loaded history by message, author or SHA" aria-label="Filter folder history"><button type="button" data-history-refresh>Refresh history</button></div>
+                <div data-history-rows class="folder-history-rows"></div>
+                <div class="folder-history-footer"><small data-history-note aria-live="polite"></small><button type="button" data-history-more hidden>Load older</button></div>
+              </details>
+            </div>
             <div class="commander-toolbar">
               <nav id="commanderBreadcrumbs" class="commander-breadcrumbs"></nav>
               <button type="button" id="gitCompareDownload" class="snapshot-download" title="Download both complete folder snapshots, not only filtered rows" aria-label="Download both folder snapshots" disabled>⇩</button>
@@ -132,12 +155,13 @@
                 <label><span>REMOTE SNAPSHOT</span><select id="remoteRef"></select></label>
               </div>
               <div id="gitBranchCompareControls" class="git-compare-controls branch-ref-compare" hidden>
-                <label><span>START REF</span><select id="branchCompareLeftRef"></select></label>
+                <label><span>LEFT REVISION</span><select id="branchCompareLeftRef"></select></label>
                 <button type="button" id="branchCompareSwap" title="Swap start and compare refs">⇄</button>
-                <label><span>COMPARE WITH</span><select id="branchCompareRightRef"></select></label>
+                <label><span>RIGHT REVISION</span><select id="branchCompareRightRef"></select></label>
                 <button type="button" id="branchCompareRefresh" title="Re-run comparison for these refs">Compare</button>
               </div>
             </div>
+            <div id="compareSnapshotSummary" class="compare-snapshot-summary" aria-live="polite"></div>
             <div id="gitCompareFlatControls" class="compare-flat-controls" hidden>
               <div class="compare-layout-choice" role="group" aria-label="Git comparison layout"><button type="button" id="gitCompareTree" class="active" aria-pressed="true" title="Browse folders side by side; double-click a folder to drill down">Drill-down</button><button type="button" id="gitCompareFlatToggle" aria-pressed="false" title="Show all changed files in a flat list, with optional author filtering">List</button></div>
               <label><span>FILTER</span><select id="gitCompareFlatFilter"><option value="all">All differences</option><option value="modified">Modified</option><option value="local-only">Only left</option><option value="remote-only">Only right</option><option value="type-changed">Type changed</option></select></label>
@@ -272,6 +296,7 @@
     <footer id="statusFooter" title="Double-click to open the full Git command console">
       <span id="statusDot" class="status-dot"></span><span id="statusText">Ready</span>
       <code id="statusCommandHint" class="status-command-hint" hidden></code>
+      <button type="button" id="statusStopCommand" class="status-stop-command" hidden disabled>Stop…</button>
       <span class="footer-spacer"></span><span class="branch-footer">⑂ <b id="currentBranch">No branch</b></span>
       <span class="build-footer" id="buildInfo" title="The exact commit this build was compiled from — check this before reporting a bug as unfixed">build —</span>
     </footer>
@@ -285,6 +310,7 @@
         <button type="button" class="command-tab" data-mode="commands">App actions</button>
         <button type="button" class="command-tab" data-mode="saved">Saved actions</button>
         <span class="command-tabs-spacer"></span>
+        <button type="button" id="consoleStopCommand" class="status-stop-command" hidden disabled>Stop Git…</button>
         <button type="button" id="commandCopyTranscript" class="command-clear" title="Copy the complete terminal transcript" hidden>Copy all</button>
         <button type="button" id="commandClearTranscript" class="command-clear" title="Clear console history" hidden>Clear</button>
         <button type="button" id="closeCommandPalette" class="command-close" title="Close Terminal and App actions" aria-label="Close Terminal and App actions">×</button>
@@ -298,7 +324,14 @@
         <span id="commandScope" class="command-scope"></span>
         <select id="commandScopeSelect" class="command-scope-select" aria-label="Working directory" title="Choose the exact working directory"></select>
       </div>
-      <input id="commandInput" type="text" placeholder="Type a command… (Cmd/Ctrl+K)" autocomplete="off" spellcheck="false">
+      <div id="commandEntry" class="command-entry">
+        <label id="commandInputLabel" for="commandInput">Command</label>
+        <div class="command-entry-line">
+          <span id="commandPrompt" class="command-prompt" aria-hidden="true">$</span>
+          <input id="commandInput" type="text" placeholder="Type a command… (Cmd/Ctrl+K)" autocomplete="off" spellcheck="false">
+          <button id="commandRun" type="button" title="Run this command in the directory shown above">Run ↵</button>
+        </div>
+      </div>
       <div id="terminalQuickCommands" class="terminal-quick-commands" hidden>
         <span>Quick:</span>
         <button type="button" data-terminal-fill="git status --short --branch -- ." title="Limit status to the selected working directory">Status here</button>
@@ -863,16 +896,18 @@
       <footer><span>Read-only on Polarion · local snapshots outside Git</span><button value="cancel">Close</button><button type="button" id="polarionAdd" class="confirm" disabled>Add to Commit List</button></footer>
     </form>
   </dialog>
-  <script src="polarion.js?v=20261020-fast-default"></script>
-  <script src="console-context.js?v=20261020-fast-default"></script>
-  <script src="graph-model.js?v=20261020-fast-default"></script>
-  <script src="submodule-state.js?v=20261020-fast-default"></script>
-  <script src="submodule-versions.js?v=20261020-fast-default"></script>
-  <script src="local-diff.js?v=20261020-fast-default"></script>
-  <script src="local-drive.js?v=20261020-fast-default"></script>
-  <script src="pr-status.js?v=20261020-fast-default"></script>
-  <script src="refresh-coordinator.js?v=20261020-fast-default"></script>
-  <script src="comparison-authors.js?v=20261020-fast-default"></script>
-  <script src="app.js?v=20261020-fast-default"></script>
+  <script src="polarion.js?v=20261021-scoped-compare"></script>
+  <script src="console-context.js?v=20261021-scoped-compare"></script>
+  <script src="graph-model.js?v=20261021-scoped-compare"></script>
+  <script src="submodule-state.js?v=20261021-scoped-compare"></script>
+  <script src="submodule-versions.js?v=20261021-scoped-compare"></script>
+  <script src="local-diff.js?v=20261021-scoped-compare"></script>
+  <script src="local-drive.js?v=20261021-scoped-compare"></script>
+  <script src="pr-status.js?v=20261021-scoped-compare"></script>
+  <script src="refresh-coordinator.js?v=20261021-scoped-compare"></script>
+  <script src="comparison-authors.js?v=20261021-scoped-compare"></script>
+  <script src="git-activity.js?v=20261021-scoped-compare"></script>
+  <script src="comparison-navigation.js?v=20261021-scoped-compare"></script>
+  <script src="app.js?v=20261021-scoped-compare"></script>
 </body>
 </html>

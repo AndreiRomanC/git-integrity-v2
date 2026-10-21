@@ -9,6 +9,17 @@ const app = fs.readFileSync(path.join(root, 'frontend/app.js'), 'utf8');
 const css = fs.readFileSync(path.join(root, 'frontend/styles.css'), 'utf8');
 const repository = fs.readFileSync(path.join(root, 'src-tauri/src/repository.rs'), 'utf8');
 
+test('Clean checkout confirms embedded-repository removal without an extra force mode', () => {
+  const action = app.slice(app.indexOf('async function restoreExactCheckpointFromGraphCommit'), app.indexOf('function showGraphCommitContextMenu'));
+  assert.match(action, /discards staged and unstaged local edits/);
+  assert.match(action, /including nested Git repositories and their local-only commits/);
+  assert.match(action, /including ignored files inside them/);
+  assert.match(action, /Other ignored build artifacts are not removed/);
+  assert.match(action, /nothing is changed on the server/);
+  assert.equal((action.match(/customConfirm\(/g) || []).length, 1);
+  assert.match(action, /if \(!ok\) return;[\s\S]*?await invoke/);
+});
+
 test('slow backend round trips are measured without logging command arguments', () => {
   assert.match(app, /const SLOW_INVOKE_LOG_THRESHOLD_MS = 250/);
   assert.match(app, /if \(command === 'frontend_perf_log'\) return pending/);
@@ -309,12 +320,13 @@ test('a selected submodule can be promoted to the normal full repository context
 
 test('the footer stays one-line while double-click exposes complete Git command results', () => {
   assert.match(app, /function status\(message, kind = ''\) \{[\s\S]*?if \(kind !== 'busy'\) refreshCommandHint\(\);/);
-  assert.match(app, /async function refreshCommandHint\(\)[\s\S]*?invoke\('recent_git_commands'\)/);
-  assert.match(app, /const running = commands\.find\(entry => entry\.running\)/);
+  assert.match(app, /async function refreshCommandHint\(\)[\s\S]*?invoke\('active_git_commands'\)/);
+  assert.match(app, /footerRunningCommands = commands\.filter\(entry => entry\.running\)/);
+  assert.match(app, /const running = currentFooterGitCommand\(\)/);
   assert.doesNotMatch(app, /commands\.find\(entry => entry\.running\) \|\| commands\[0\]/, 'a completed command must stay in double-click history, not masquerade as current footer activity');
   assert.match(app, /generation !== commandHintRefreshGeneration/);
-  assert.match(app, /refs\.statusCommandHint\.textContent = `running · \$\{running\.repo_hint\}: \$\{running\.command\}`/);
-  assert.match(app, /setInterval\(\(\) => \{ if \(refs\.statusDot\.classList\.contains\('busy'\)\) refreshCommandHint\(\); \}, 750\)/);
+  assert.match(app, /refs\.statusCommandHint\.textContent = `\$\{GitActivity\.clock\(running\.started_at_ms\)\} · \$\{running\.repo_hint\}: \$\{running\.command\}/);
+  assert.match(app, /if \(inFlightBackendRequests \|\| footerRunningCommands\.length \|\| refs\.statusDot\.classList\.contains\('busy'\)\) refreshCommandHint\(\)/);
   assert.match(app, /footerStatusResetTimer = setTimeout\([\s\S]*?7_000/);
   assert.match(app, /if \(changedContext\) resetFooterForContextChange\(\)/);
   assert.match(app, /refs\.statusFooter\.addEventListener\('dblclick', openCommandHistoryDialog\)/);
@@ -731,7 +743,7 @@ test('compare views can switch to a filtered flat changed-file overview', () => 
   assert.match(app, /compareFlatMode: false/);
   assert.match(app, /subCompareFlatMode: false/);
   assert.match(app, /function compareRowVisible\(row, query = '', filter = 'all'\)/);
-  assert.match(app, /compare_remote_file_list/);
+  assert.match(app, /invoke\('compare_workspace_revision', \{[^\n]*flat: flatMode/);
   assert.match(app, /compare_git_revisions_file_list/);
   assert.match(app, /compare_submodule_revisions_file_list/);
   assert.match(app, /function flatCompareRowHtml\(row, datasetName\)/);
@@ -892,7 +904,9 @@ test('Remotes page shows a useful fetch-only overview without extra Git scans', 
   assert.match(app, /function remoteTrackingSummary\(remoteName = ''\)/);
   assert.match(app, /Remote overview/);
   assert.match(app, /Fetch downloads refs only\. It never switches branch, merges, stages, commits or pushes\./);
-  assert.match(app, /Tracking\/upstream clue/);
+  assert.match(app, /Upstream \/ tracking/);
+  assert.match(app, /No upstream available/);
+  assert.match(app, /nothing is pushed until you confirm/);
   assert.match(app, /checkout one to create a local tracking branch/);
   assert.match(app, /data-fetch-all-remotes/);
   assert.match(app, /fetchAllRemotes\(event\.currentTarget\)/);

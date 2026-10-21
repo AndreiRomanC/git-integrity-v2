@@ -86,6 +86,7 @@ test('evidence reuses the read-only diff dialog with exact parent and repository
       state:{repository:{path:'current-repo'},branchCompareLeftRevision:'left',branchCompareRightRevision:'right'},
       refs:{compareTitle:{},compareSubtitle:{},localCompare:{},remoteCompare:{},compareDialog:{showModal(){}}},
       openFileCompareGuard: () => () => true, resetCompareDiffNavigation(){},
+      commanderComparisonSpec: () => ({ repositoryPath: 'current-repo', leftRef: 'left', rightRef: 'right' }),
       setCompareReadOnly: value => assert.equal(value,true),
       renderComparisonContents: (...args) => rendered.push(args),
       invoke: async (name,args) => {calls.push({name,args});return {local_content:'before',remote_content:'after'};},

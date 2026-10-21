@@ -214,7 +214,11 @@ pub(in crate::repository) fn run_terminal_command_with_timeout(repository_path: 
         .stdin(std::process::Stdio::null());
 
     perf_log(&format!("run_terminal_command: start ({repo_id}, read_only={read_only}, submodule_update={submodule_update}, timeout_seconds={})", timeout.as_secs()), Duration::ZERO);
-    let output = match run_with_timeout_labeled(command, timeout, "Terminal", timeout_label) {
+    let execution = match history_id {
+        Some(id) => process_control::run(command, timeout, "Terminal", timeout_label, id),
+        None => run_with_timeout_labeled(command, timeout, "Terminal", timeout_label),
+    };
+    let output = match execution {
         Ok(output) => output,
         Err(error) => {
             // Process failure is not a transaction rollback: cloned modules,

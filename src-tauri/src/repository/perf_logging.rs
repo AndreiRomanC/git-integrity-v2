@@ -5,6 +5,21 @@ pub(super) const MAX_LOG_BYTES: u64 = 10 * 1024 * 1024;
 const MAX_ENTRY_BYTES: usize = 64 * 1024;
 const SIZE_RECHECK_INTERVAL: Duration = Duration::from_secs(5);
 
+// Diagnostic only: callers supply an already-computed cache key and age.
+// No canonicalize/stat, Git lookup, cache mutation or background work here.
+pub(super) fn cache_lookup_label(cache: &str, key: &str, scope: Option<&str>, age: Option<Duration>, ttl: Duration, decision: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let id = |value: &str| {
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        value.hash(&mut hash);
+        format!("repo-{:08x}", (hash.finish() & 0xffff_ffff) as u32)
+    };
+    let state = match age { None => "absent", Some(age) if age < ttl => "fresh", Some(_) => "expired" };
+    let age_ms = age.map(|age| age.as_millis().to_string()).unwrap_or_else(|| "none".into());
+    format!("cache_lookup: cache={cache} repo={} scope={} state={state} age_ms={age_ms} ttl_ms={} decision={decision}",
+        id(key), scope.map(id).unwrap_or_else(|| "all".into()), ttl.as_millis())
+}
+
 pub(super) struct RotatingLog {
     path: PathBuf,
     previous: PathBuf,
@@ -89,6 +104,38 @@ fn regular_file_size(path: &Path) -> io::Result<Option<u64>> {
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn cache_diagnostics_distinguish_absent_fresh_and_expired_at_the_exact_ttl() {
+        let ttl = Duration::from_secs(300);
+        for (age, expected) in [
+            (None, "state=absent age_ms=none"),
+            (Some(Duration::from_millis(299999)), "state=fresh age_ms=299999"),
+            (Some(ttl), "state=expired age_ms=300000"),
+            (Some(Duration::from_secs(900)), "state=expired age_ms=900000"),
+        ] {
+            let line = cache_lookup_label("metadata", "/private/repo", Some("private/folder"), age, ttl, "rebuild");
+            assert!(line.contains(expected), "{line}");
+            assert!(line.contains("ttl_ms=300000 decision=rebuild"));
+            assert!(!line.contains("/private"));
+            assert!(!line.contains("private/folder"));
+            assert_eq!(line, cache_lookup_label("metadata", "/private/repo", Some("private/folder"), age, ttl, "rebuild"));
+        }
+    }
+
+    #[test]
+    fn cache_diagnostics_do_not_confuse_fresh_status_window_or_invalidation_with_navigation_ttl() {
+        let age = Some(Duration::from_secs(3));
+        let recent = cache_lookup_label("full_status", "key", None, age, Duration::from_secs(2), "fresh_full_scan");
+        let navigation = cache_lookup_label("full_status", "key", None, age, Duration::from_secs(300), "invalidated");
+        assert!(recent.contains("scope=all state=expired"));
+        assert!(recent.contains("ttl_ms=2000"));
+        assert!(navigation.contains("state=fresh"));
+        assert!(navigation.contains("decision=invalidated"));
+        let absent = cache_lookup_label("full_status", "key", None, None, Duration::from_secs(300), "full_scan");
+        assert!(absent.contains("state=absent"));
+        assert!(!absent.contains("invalidated"), "missing is not proof of invalidation");
+    }
 
     fn fixture() -> (PathBuf, RotatingLog) {
         let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();

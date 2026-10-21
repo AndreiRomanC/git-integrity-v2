@@ -19,6 +19,9 @@ commit_path
 commit_staged
 commit_submodule
 compare_file_contents
+comparison_context
+compare_workspace_revision
+compare_workspace_revision_file
 compare_index_worktree_file
 compare_git_revision_file
 compare_git_revisions_directory
@@ -100,6 +103,8 @@ push_submodule_tag
 read_local_text_file
 read_text_file
 recent_git_commands
+active_git_commands
+stop_git_command
 refresh_status
 remove_git_path
 rename_branch

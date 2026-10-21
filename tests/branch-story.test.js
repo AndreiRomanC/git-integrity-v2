@@ -343,6 +343,7 @@ function rendererHarness() {
   const refs = { search:element(), graphView:element(), laneLegend:element(), graph:element() };
   let backendAnnotations = 0, interactions = 0;
   const context = {
+    GitActivity: require('../frontend/git-activity.js'),
     state, refs, ...require('../frontend/graph-model.js'), activeGraphData:()=>graph,
     performance, jsPerfLog:()=>{}, LANE_WIDTH:24, headMainMergeBaseFetchKey:null,
     ensureStoryCreation:()=>null,
@@ -379,6 +380,18 @@ test('Branch Story UI: Full Graph rows and settings are exactly restored after c
   assert.equal(h.state.graphPrimaryBranch, 'branch:feature');
   assert.equal(h.state.graphRefFilter, 'all');
   assert.equal(h.interactions(), 3, 'Both modes keep existing row interaction wiring');
+});
+
+test('both graph modes show real local date and time without changing commit selection', () => {
+  const h = rendererHarness();
+  const timestamp = new Date(2026, 9, 20, 9, 14, 5).getTime() / 1000;
+  h.graph.commits.forEach(commit => { commit.timestamp = timestamp; });
+  for (const mode of ['full', 'story']) {
+    h.context.activeBranchStoryView().mode = mode;
+    h.context.renderGraph();
+    assert.match(h.refs.graph.innerHTML, /class="commit-date"[^>]*><span>2026-10-20<\/span><time datetime="[^"]+">09:14<\/time>/);
+    assert.match(h.refs.graph.innerHTML, /data-id="tip"/);
+  }
 });
 
 test('Branch Story UI: parent, submodule and reopened repository contexts are isolated', () => {
@@ -558,13 +571,15 @@ test('Branch Story UI: the original fork supports inspection, compare with HEAD,
   h.state.repository.path = context.path;
   Object.assign(h.context, {
     activeRepositoryContext: () => context,
+    setCompareOrigin: () => {},
+    repoOpenGeneration: 1,
     graphBranchRefsForCommit: () => [],
     showFloatingMenu: (_event, items) => { h.context.menuItems = items; },
     selectCommit: id => calls.push(['inspect', id]), status: () => {},
     closeSubmoduleGraph: () => {}, render: () => {},
     openCommanderDirectory: async scope => calls.push(['compare', scope, h.state.branchCompareLeftRef, h.state.branchCompareRightRef]),
   });
-  const names = ['graphCommitCompareAnchorMatches', 'setGraphCommitCompareStart',
+  const names = ['graphCommitCompareAnchorMatches', 'selectedGraphCommitIds', 'refreshGraphCommitSelection', 'handleGraphCommitRowClick', 'setGraphCommitCompareStart',
     'openRepositoryRevisionCompare', 'openGraphRevisionCompare', 'showGraphCommitContextMenu', 'wireGraphRowInteractions'];
   vm.runInContext(names.map(name => `${['openRepositoryRevisionCompare', 'openGraphRevisionCompare'].includes(name) ? 'async ' : ''}${appFunction(name)}`).join('\n'), h.context);
   h.graph.commits = originalForkFixture(); h.graph.headOid = 'F1';

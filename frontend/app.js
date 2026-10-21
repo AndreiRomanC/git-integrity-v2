@@ -37,9 +37,11 @@ const RECOVER_ON_MUTATION_ERROR = new Set(['merge_branch', 'resolve_conflict', '
 // command is slow. frontend_perf_log itself is excluded to avoid recursive
 // logging.
 const SLOW_INVOKE_LOG_THRESHOLD_MS = 250;
-const DIAGNOSTIC_COMMANDS = new Set(['commit_staged', 'commit_files', 'commit_path', 'stage_files', 'unstage_files', 'stage_all', 'refresh_status', 'compare_file_contents', 'entry_details', 'entry_last_commit', 'open_repository_fast', 'load_repository']);
+const DIAGNOSTIC_COMMANDS = new Set(['commit_staged', 'commit_files', 'commit_path', 'stage_files', 'unstage_files', 'stage_all', 'refresh_status', 'compare_file_contents', 'entry_details', 'entry_last_commit', 'open_repository_fast', 'load_repository', 'load_directory', 'capture_repository_return', 'resume_repository_return']);
 let diagnosticRequestSequence = 0;
 let inFlightRepositoryWrites = 0;
+let inFlightBackendRequests = 0;
+const ACTIVITY_OBSERVERS = new Set(['active_git_commands', 'recent_git_commands', 'stop_git_command', 'frontend_perf_log']);
 function diagnosticErrorCategory(error) {
   const text = String(error?.message || error).toLowerCase();
   if (/binary files|files over 1 mb/.test(text)) return 'binary-or-size-limit';
@@ -92,10 +94,13 @@ const invoke = rawInvoke && ((command, args) => {
     ? { path: state.repository?.path, generation: repoOpenGeneration } : null;
   let pending;
   const write = MUTATING_COMMANDS.has(command);
+  const observeActivity = !ACTIVITY_OBSERVERS.has(command);
+  if (observeActivity) ++inFlightBackendRequests;
   if (write) ++inFlightRepositoryWrites;
   try {
     pending = rawInvoke(command, args);
   } catch (error) {
+    if (observeActivity) --inFlightBackendRequests;
     if (write) --inFlightRepositoryWrites;
     if (diagnosticId) jsPerfLog(`ipc_trace: request=${diagnosticId} command=${command} event=throw category=${diagnosticErrorCategory(error)}`, performance.now() - startedAt);
     if (command !== 'frontend_perf_log') jsPerfLog(`invoke(${command}) ERROR before promise`, performance.now() - startedAt);
@@ -103,12 +108,14 @@ const invoke = rawInvoke && ((command, args) => {
   }
   if (command === 'frontend_perf_log') return pending;
   return Promise.resolve(pending).then(result => {
+    if (observeActivity) --inFlightBackendRequests;
     if (write) --inFlightRepositoryWrites;
     const elapsedMs = performance.now() - startedAt;
     if (diagnosticId) jsPerfLog(`ipc_trace: request=${diagnosticId} command=${command} event=success`, elapsedMs);
     if (elapsedMs >= SLOW_INVOKE_LOG_THRESHOLD_MS) jsPerfLog(`invoke(${command}) SUCCESS`, elapsedMs);
     return result;
   }, async error => {
+    if (observeActivity) --inFlightBackendRequests;
     if (write) --inFlightRepositoryWrites;
     jsPerfLog(`invoke(${command}) ERROR`, performance.now() - startedAt);
     if (diagnosticId) jsPerfLog(`ipc_trace: request=${diagnosticId} command=${command} event=error category=${diagnosticErrorCategory(error)}`, performance.now() - startedAt);
@@ -344,7 +351,7 @@ const refs = {
   graphView: $('#graphView'), emptyState: $('#emptyState'), laneLegend: $('#laneLegend'),
   details: $('#detailsPanel'), currentBranch: $('#currentBranch'), statusText: $('#statusText'),
   statusDot: $('#statusDot'), search: $('#search'), graphSubtitle: $('#graphSubtitle'),
-  statusFooter: $('#statusFooter'), statusCommandHint: $('#statusCommandHint'), commandHistoryDialog: $('#commandHistoryDialog'), commandHistoryList: $('#commandHistoryList'),
+  statusFooter: $('#statusFooter'), statusCommandHint: $('#statusCommandHint'), statusStopCommand: $('#statusStopCommand'), consoleStopCommand: $('#consoleStopCommand'), commandHistoryDialog: $('#commandHistoryDialog'), commandHistoryList: $('#commandHistoryList'),
   changeBadge: $('#changeBadge'), workspaceSubtitle: $('#workspaceSubtitle'), changes: $('#changes'),
   changesDrawer: $('#changesDrawer'), changesSummary: $('#changesSummary'), commitMessage: $('#commitMessage'),
   defaultCommitMessage: $('#defaultCommitMessage'), defaultCommitPolarionLink: $('#defaultCommitPolarionLink'),
@@ -403,14 +410,15 @@ function status(message, kind = '') {
   clearTimeout(footerStatusResetTimer); footerStatusResetTimer = null;
   const fullMessage = String(message ?? '');
   const compactMessage = fullMessage.replace(/\s+/g, ' ').trim();
-  refs.statusText.textContent = compactMessage || 'Ready';
+  // Also timestamp high-level work implemented through libgit2, which has no
+  // CLI subprocess to show in the adjacent command hint.
+  refs.statusText.textContent = kind === 'busy' ? `${GitActivity.clock(Date.now())} · ${compactMessage || 'Working…'}` : compactMessage || 'Ready';
   refs.statusText.title = fullMessage !== compactMessage || compactMessage.length > 180 ? fullMessage : '';
   refs.statusDot.className = `status-dot ${kind}`;
   // Completed actions refresh immediately. Busy actions are refreshed by the
-  // lightweight, busy-only ticker below after the backend has registered the
+  // lightweight activity ticker below after the backend has registered the
   // exact Git subprocess; failures here never mask the real operation.
   if (kind !== 'busy') refreshCommandHint();
-  else refs.statusCommandHint.hidden = true;
   // Ordinary completion messages are confirmations, not permanent state.
   // Errors and explicit notices stay until the next action/context change so
   // information that requires a decision is never silently removed.
@@ -497,29 +505,90 @@ function renderPersonalNoteSection(entry) {
   return `<div class="detail-section personal-note-section"><div class="personal-note-header"><h3>NOTES</h3><div class="personal-note-actions"><button data-note-action="edit">Edit</button><button data-note-action="delete">Delete</button></div></div><p>${esc(preview)}</p></div>`;
 }
 
-// The footer remains a single, deliberately quiet line. The richer command,
-// timing and output data lives only in the console opened by double-click.
+// One line of real process activity, with full output available on double-click.
+// Poll only lightweight in-memory metadata; never add a Git/status scan here.
 let commandHintRefreshGeneration = 0;
+let commandHintRefreshPending = false;
+let footerRunningCommands = [];
+let stopConfirmationPending = false;
+function currentFooterGitCommand() {
+  // A short background inspection must not hide the Stop control for the
+  // long foreground update. The text and warning always name the same job.
+  return footerRunningCommands.find(entry => entry.stoppable) || footerRunningCommands[0];
+}
+function renderGitStopControls(running) {
+  // A modal Terminal makes the footer inert, so expose the same confirmed,
+  // exact-ID action there too. Both controls always refer to the shown job.
+  for (const button of [refs.statusStopCommand, refs.consoleStopCommand]) {
+    button.hidden = !running;
+    button.disabled = !running?.stoppable || running.stop_requested || stopConfirmationPending;
+    button.textContent = running?.stop_requested ? 'Stopping…' : button === refs.consoleStopCommand ? 'Stop Git…' : 'Stop…';
+    button.title = !running ? '' : running.stoppable
+      ? `${running.repo_hint}: ${running.command}\nRequest interruption of this command only. Completed changes are not rolled back.`
+      : 'Stop is available for standalone Git Terminal commands and submodule init/update. This workflow cannot be interrupted here.';
+  }
+}
 async function refreshCommandHint() {
   if (!invoke) { refs.statusCommandHint.hidden = true; return; }
+  if (commandHintRefreshPending) return;
+  commandHintRefreshPending = true;
   const generation = ++commandHintRefreshGeneration;
   try {
-    const commands = await invoke('recent_git_commands');
+    const commands = await invoke('active_git_commands');
     // An older response must never overwrite a newer completion refresh. That
     // race previously left a finished command looking active indefinitely.
     if (generation !== commandHintRefreshGeneration) return;
-    const running = commands.find(entry => entry.running);
+    footerRunningCommands = commands.filter(entry => entry.running);
+    const running = currentFooterGitCommand();
+    renderGitStopControls(running);
+    refs.statusFooter.classList.toggle('has-git-activity', !!running);
     if (!running) {
       refs.statusCommandHint.textContent = '';
+      refs.statusCommandHint.title = '';
       refs.statusCommandHint.classList.remove('status-command-running', 'status-command-failed');
       refs.statusCommandHint.hidden = true;
       return;
     }
-    refs.statusCommandHint.textContent = `running · ${running.repo_hint}: ${running.command}`;
+    const others = footerRunningCommands.length > 1 ? ` · +${footerRunningCommands.length - 1} running` : '';
+    refs.statusCommandHint.textContent = `${GitActivity.clock(running.started_at_ms)} · ${running.repo_hint}: ${running.command}${others}`;
+    refs.statusCommandHint.title = footerRunningCommands.map(entry =>
+      `${GitActivity.clock(entry.started_at_ms)} · ${entry.repo_hint}: ${entry.command} · ${commandDurationText(entry)}`).join('\n');
     refs.statusCommandHint.classList.add('status-command-running');
     refs.statusCommandHint.classList.remove('status-command-failed');
     refs.statusCommandHint.hidden = false;
-  } catch { /* quiet by design — never disturb the action this rode along with */ }
+  } catch {
+    // Unknown is not idle, and stale metadata must never enable Stop.
+    footerRunningCommands = [];
+    renderGitStopControls(null);
+    refs.statusCommandHint.hidden = true;
+    refs.statusFooter.classList.remove('has-git-activity');
+  } finally { commandHintRefreshPending = false; }
+}
+
+async function stopFooterGitCommand() {
+  const target = currentFooterGitCommand();
+  if (!target?.stoppable || target.stop_requested || stopConfirmationPending) return;
+  // Freeze the exact command ID before the warning. If it finishes while the
+  // warning is open, the backend refuses that ID, never the next active job.
+  const commandId = target.id;
+  stopConfirmationPending = true;
+  renderGitStopControls(target);
+  try {
+    const confirmed = await customConfirm(
+      `Interrupt "${target.command}" in ${target.repo_hint}, started at ${GitActivity.clock(target.started_at_ms)}?\n\nThis stops the local process and its child processes. It does NOT undo completed changes. A submodule update can remain incomplete, and files, refs or Git lock files may remain. A server may already have accepted a push.\n\nReview repository status before continuing. No automatic reset, clean or rollback will run.`,
+      { title: 'Stop Git command?', danger: true, okLabel: 'Stop command' });
+    if (!confirmed) return;
+    await invoke('stop_git_command', { commandId });
+    showOperationToast('Stop requested. Waiting for the process to exit; completed changes are not rolled back.');
+  } catch (error) { showOperationToast(String(error), 'error'); }
+  finally {
+    stopConfirmationPending = false;
+    await refreshCommandHint();
+  }
+}
+for (const button of [refs.statusStopCommand, refs.consoleStopCommand]) {
+  button.addEventListener('click', event => { event.stopPropagation(); stopFooterGitCommand(); });
+  button.addEventListener('dblclick', event => event.stopPropagation());
 }
 
 function commandDurationText(entry) {
@@ -544,7 +613,7 @@ function commandHistoryRowHtml(entry) {
   const result = streams.length ? streams.join('')
     : `<div class="command-history-empty-output">${entry.running ? 'Waiting for Git to finish…' : entry.success ? 'Completed successfully — no output.' : 'The command failed without additional output.'}</div>`;
   return `<article class="command-history-row ${stateClass}">
-    <div class="command-history-summary"><span class="command-history-state">${stateLabel}</span><span>${esc(entry.repo_hint)} · ${entry.running ? commandDurationText(entry) : `${ago} · ${commandDurationText(entry)}`}${exitText}</span></div>
+    <div class="command-history-summary"><span class="command-history-state">${stateLabel}</span><span>${esc(GitActivity.clock(entry.started_at_ms))} · ${esc(entry.repo_hint)} · ${entry.running ? commandDurationText(entry) : `${ago} · ${commandDurationText(entry)}`}${exitText}</span></div>
     <code class="command-history-command">${esc(entry.command)}</code>
     <div class="command-history-output">${result}</div>
   </article>`;
@@ -560,10 +629,11 @@ async function openCommandHistoryDialog() {
   } catch (error) { const message = handleError(error); showOperationToast(`Could not load command history: ${message}`, 'error'); }
 }
 refs.statusFooter.addEventListener('dblclick', openCommandHistoryDialog);
-// Poll only while an operation is already marked busy. The local class check
-// costs nothing and avoids a permanent backend polling loop while still
-// letting a long Git command replace the previous footer hint with RUNNING.
-setInterval(() => { if (refs.statusDot.classList.contains('busy')) refreshCommandHint(); }, 750);
+// Also observe Terminal/background requests even when an unrelated status()
+// message cleared the busy dot. Once idle, no IPC polling remains.
+setInterval(() => {
+  if (inFlightBackendRequests || footerRunningCommands.length || refs.statusDot.classList.contains('busy')) refreshCommandHint();
+}, 750);
 
 // Keep progress attached to the exact control the user pressed. The global
 // status bar is useful context, but on a busy screen it is too easy to miss
@@ -1165,6 +1235,7 @@ async function openGithubModuleCompareFromBrowser(anchorRef = null) {
   if (!leftRef || !rightRef) return status('Could not resolve the selected revisions.', 'error');
   state.compareMode = 'submodule';
   state.subCompareFlatMode = false;
+  state.comparisonContext = null; // This browser comparison has no local checkout scope.
   state.view = 'commander';
   state.commanderPath = '';
   state.submoduleCompare = {
@@ -1427,6 +1498,7 @@ async function returnToParentRepository() {
     if (state.repositoryOrigin !== origin) return;
     const snapshot = parentReturnSnapshots.get(state.repository.path);
     if (!snapshot || snapshot.parentPath !== origin.parentPath || snapshot.submodulePath !== origin.submodulePath) {
+      jsPerfLog(`repositoryReturn fallback: reason=${snapshot ? 'snapshot-context-mismatch' : 'no-saved-snapshot'} full_reopen=true`, 0);
       return openRepositoryFast(origin.parentPath, { reopenPath: parentPathOf(origin.submodulePath) });
     }
     parentReturnSnapshots.delete(state.repository.path);
@@ -1597,7 +1669,7 @@ function render() {
   // of Message C's point 1 is that a user must never be unsure which of
   // these three they're looking at.
   refs.viewTitle.textContent = state.view === 'explorer' ? 'Project Explorer' : state.view === 'commander' ? 'Compare & Sync' : state.view === 'remotes' ? 'Remotes' : state.submoduleGraph ? `Submodule History · ${state.submoduleGraph.relativePath}` : state.historyKind === 'submodule-refs' ? `Submodule Reference Changes · ${state.historyScope}` : state.historyScope ? `History · ${state.historyScope}` : 'Repository History';
-  refs.graphSubtitle.textContent = !loaded ? 'Navigate folders and inspect every item in your repository.' : state.view === 'explorer' ? `${state.entries.length} items in ${state.currentPath || state.repository.name}` : state.view === 'commander' ? (state.compareMode === 'local-drive' ? 'Two independent local folders. Copy safely without overwriting; delete through Trash/Recycle Bin.' : state.compareMode === 'submodule' ? 'Compare two exact revisions of the same submodule without checking anything out.' : state.gitCompareMode === 'refs' ? 'Compare two repository branches or refs without checking anything out.' : 'Compare the workspace with a cached remote snapshot—no second checkout.') : state.view === 'remotes' ? 'Configured server locations and explicit fetch controls.' : state.historyKind === 'submodule-refs' ? `Parent-repository commits that changed this submodule's recorded version — not ${state.historyScope}'s own history` : state.historyScope ? `Commits touching ${state.historyScope}` : state.submoduleGraph ? 'Commits, branches and release tags for this submodule' : 'Commits, branches and release tags';
+  refs.graphSubtitle.textContent = !loaded ? 'Navigate folders and inspect every item in your repository.' : state.view === 'explorer' ? `${state.entries.length} items in ${state.currentPath || state.repository.name}` : state.view === 'commander' ? (state.compareMode === 'local-drive' ? 'Two independent local folders. Copy safely without overwriting; delete through Trash/Recycle Bin.' : state.compareMode === 'history' ? 'Compare this folder’s local files or historical snapshots. No checkout or restore.' : state.compareMode === 'submodule' ? 'Compare two exact revisions of the same submodule without checking anything out.' : state.gitCompareMode === 'refs' ? 'Compare two repository branches or refs without checking anything out.' : 'Compare the workspace with a cached remote snapshot—no second checkout.') : state.view === 'remotes' ? 'Configured server locations and explicit fetch controls.' : state.historyKind === 'submodule-refs' ? `Parent-repository commits that changed this submodule's recorded version — not ${state.historyScope}'s own history` : state.historyScope ? `Commits touching ${state.historyScope}` : state.submoduleGraph ? 'Commits, branches and release tags for this submodule' : 'Commits, branches and release tags';
   refs.search.placeholder = state.view === 'explorer' ? 'Filter this folder' : state.view === 'commander' ? (state.compareMode === 'local-drive' ? 'Filter both local folders' : state.compareMode === 'submodule' ? 'Filter changed folders/files' : 'Filter comparison') : 'Find commit or author · Enter: next';
   refs.search.closest('label').hidden = state.view === 'remotes';
   const localDriveMode = state.view === 'commander' && state.compareMode === 'local-drive';
@@ -1621,7 +1693,7 @@ function render() {
   $('#navExplorer').classList.toggle('active', state.view === 'explorer'); $('#navGraph').classList.toggle('active', state.view === 'graph');
   $('#navCommander').classList.toggle('active', state.view === 'commander');
   $('#navRemotes').classList.toggle('active', state.view === 'remotes');
-  refs.locationRepository.textContent = state.submoduleGraph?.name || state.repository?.name || '—'; refs.locationBranch.textContent = describeBranch(state.submoduleGraph ? state.submoduleGraph.repository : state.repository); refs.locationPath.textContent = state.view === 'commander' ? (state.compareMode === 'local-drive' ? 'Local Drive' : state.compareMode === 'submodule' ? `Submodule compare /${state.commanderPath}` : state.gitCompareMode === 'refs' ? `Branch compare /${state.commanderPath}` : `/${state.commanderPath}`) : state.view === 'explorer' ? `/${state.currentPath}` : state.view === 'graph' ? 'commit history' : 'remote configuration';
+  refs.locationRepository.textContent = state.submoduleGraph?.name || state.repository?.name || '—'; refs.locationBranch.textContent = describeBranch(state.submoduleGraph ? state.submoduleGraph.repository : state.repository); refs.locationPath.textContent = state.view === 'commander' ? (state.compareMode === 'local-drive' ? 'Folder Compare' : state.compareMode === 'history' ? `Folder history /${state.commanderPath}` : state.compareMode === 'submodule' ? `Submodule compare /${state.commanderPath}` : state.gitCompareMode === 'refs' ? `Branch compare /${state.commanderPath}` : `/${state.commanderPath}`) : state.view === 'explorer' ? `/${state.currentPath}` : state.view === 'graph' ? 'commit history' : 'remote configuration';
   const activeOrigin = loaded && state.repositoryOrigin?.repositoryPath === state.repository?.path ? state.repositoryOrigin : null;
   refs.parentRepositoryButton.hidden = !activeOrigin;
   if (activeOrigin) {
@@ -1653,9 +1725,55 @@ function render() {
   submodulePrStatusPanel?.refreshIfContextChanged();
 }
 
+function comparisonRepository() {
+  return state.comparisonContext?.owner === state.repository?.path
+    ? (state.comparisonContext.repository || { path: state.comparisonContext.repositoryPath, name: state.comparisonContext.name }) : state.repository;
+}
+function comparisonBranches() {
+  return state.comparisonContext?.owner === state.repository?.path ? (state.comparisonContext.branches || []) : state.branches;
+}
+function setCompareOrigin(path = '', submodulePath = '') {
+  const previous = comparisonRepository()?.path;
+  state.comparisonContext = ComparisonNavigation.origin(state.repository, path, submodulePath);
+  if (previous !== state.comparisonContext.repositoryPath) {
+    state.branchCompareLeftRef = ''; state.branchCompareRightRef = ''; state.remoteRef = '';
+  }
+  if (!submodulePath) state.comparisonContext.branches = state.branches || [];
+  state.commanderComparisonResult = null;
+  state.commanderComparisonError = '';
+}
+async function ensureComparisonContext(context) {
+  if (context.ready) return;
+  if (!invoke) { context.ready = true; return; }
+  context.pending ||= invoke('comparison_context', { repositoryPath: context.repositoryPath })
+    .then(data => { context.repository = data.repository; context.branches = data.branches; context.ready = true; })
+    .finally(() => { context.pending = null; });
+  await context.pending;
+}
+function commanderComparisonSpec() {
+  const history = state.compareMode === 'history';
+  const selection = history ? folderHistoryComparison.selection() : null;
+  const workspace = history ? selection.left === ComparisonNavigation.WORKTREE : state.gitCompareMode !== 'refs';
+  return { repositoryPath: comparisonRepository()?.path, workspace,
+    leftRef: history ? selection.left : workspace ? 'Working tree' : state.branchCompareLeftRef,
+    rightRef: history ? selection.right : workspace ? state.remoteRef : state.branchCompareRightRef };
+}
+function renderComparisonLocation() {
+  const context = state.comparisonContext;
+  const node = $('#compareOrigin');
+  if (!node) return;
+  if (state.compareMode === 'submodule' && state.submoduleCompare?.externalFullName) {
+    node.textContent = `External module · ${state.submoduleCompare.externalFullName} · no local checkout selected`;
+    return;
+  }
+  node.textContent = context?.owner === state.repository?.path
+    ? `Starting folder · ${context.name} /${context.originPath || ''} · ${context.repositoryPath}${context.submodulePath ? ' · submodule repository' : ''}`
+    : `Repository · ${state.repository?.path || ''}`;
+}
+
 function renderCommanderBreadcrumbs() {
   const target = state.compareMode === 'submodule' ? refs.subCompareBreadcrumbs : refs.commanderBreadcrumbs;
-  const rootName = state.compareMode === 'submodule' ? (state.submoduleCompare?.name || 'Submodule') : (state.repository?.name || 'Repository');
+  const rootName = state.compareMode === 'submodule' ? (state.submoduleCompare?.name || 'Submodule') : (comparisonRepository()?.name || 'Repository');
   const parts = state.commanderPath ? state.commanderPath.split('/') : []; let accumulated = '';
   target.innerHTML = `<button class="crumb root" data-commander-path="">▰ ${esc(rootName)}</button>` + parts.map(part => {
     accumulated = accumulated ? `${accumulated}/${part}` : part; return `<span class="crumb-separator">›</span><button class="crumb" data-commander-path="${esc(accumulated)}">${esc(part)}</button>`;
@@ -1672,20 +1790,21 @@ function branchCompareRefOptions() {
     seen.add(value);
     options.push({ value, label: value, kind });
   };
-  if (state.repository?.head_oid) add('HEAD', 'current');
-  (state.branches || []).forEach(branch => add(branch.name, branch.remote ? 'remote' : 'branch'));
+  if (comparisonRepository()?.head_oid) add('HEAD', 'current');
+  (comparisonBranches() || []).forEach(branch => add(branch.name, branch.remote ? 'remote' : 'branch'));
   [state.branchCompareLeftRef, state.branchCompareRightRef].forEach(ref => add(ref, 'revision'));
   return options;
 }
 
 function defaultBranchCompareLeftRef() {
-  return state.repository?.current_branch || (state.repository?.head_oid ? 'HEAD' : '') || branchCompareRefOptions()[0]?.value || '';
+  return comparisonRepository()?.current_branch || (comparisonRepository()?.head_oid ? 'HEAD' : '') || branchCompareRefOptions()[0]?.value || '';
 }
 
 function defaultBranchCompareRightRef(leftRef = '') {
   const options = branchCompareRefOptions().map(option => option.value);
   const optionSet = new Set(options);
-  const candidates = ['origin/main', 'main', state.remoteRef, options.find(name => name.startsWith('origin/')), options[0]]
+  const upstream = (comparisonBranches() || []).find(branch => branch.current)?.upstream;
+  const candidates = [upstream, 'origin/main', 'main', state.remoteRef, options.find(name => name.startsWith('origin/')), options[0]]
     .filter(Boolean)
     .filter(name => optionSet.has(name));
   return candidates.find(name => name !== leftRef) || leftRef || '';
@@ -1844,13 +1963,20 @@ function logComparisonAuthorDisplay(model, totalRows, shownRows, otherFilterActi
 
 function renderCommander() {
   if (!state.repository) return;
+  renderComparisonLocation();
   const download = $('#gitCompareDownload');
   if (download) download.disabled = !state.commanderExportSnapshot || !!state.commanderComparisonLoading || !!download.dataset.exporting;
   const localDrive = state.compareMode === 'local-drive';
   const submoduleMode = state.compareMode === 'submodule';
+  const historyMode = state.compareMode === 'history';
   const gitMode = !localDrive && !submoduleMode;
-  refs.compareModeGit.classList.toggle('active', gitMode);
-  refs.compareModeGit.setAttribute('aria-selected', String(gitMode));
+  refs.compareModeGit.classList.toggle('active', gitMode && !historyMode);
+  refs.compareModeGit.setAttribute('aria-selected', String(gitMode && !historyMode));
+  $('#compareModeHistory').classList.toggle('active', historyMode);
+  $('#compareModeHistory').setAttribute('aria-selected', String(historyMode));
+  $('#folderHistoryControls').hidden = !historyMode || !state.comparisonContext?.ready;
+  $('#branchCompareKind').hidden = historyMode;
+  $('#branchCompareKindSelect').value = state.gitCompareMode;
   refs.compareModeDrive.classList.toggle('active', localDrive);
   refs.compareModeDrive.setAttribute('aria-selected', String(localDrive));
   refs.compareModeSubmodule.classList.toggle('active', submoduleMode);
@@ -1859,7 +1985,7 @@ function renderCommander() {
   refs.localDrivePanel.hidden = !localDrive;
   refs.submoduleComparePanel.hidden = !submoduleMode;
   if (localDrive) {
-    localDriveWorkspace?.activate(state.repository.path);
+    localDriveWorkspace?.activate(comparisonRepository().path);
     return;
   }
   localDriveWorkspace?.deactivate();
@@ -1868,9 +1994,10 @@ function renderCommander() {
     return;
   }
   renderCommanderBreadcrumbs();
-  const branchCompareMode = state.gitCompareMode === 'refs';
-  refs.gitWorkspaceCompareControls.hidden = branchCompareMode;
-  refs.gitBranchCompareControls.hidden = !branchCompareMode;
+  const spec = commanderComparisonSpec();
+  const branchCompareMode = !spec.workspace;
+  refs.gitWorkspaceCompareControls.hidden = historyMode || branchCompareMode;
+  refs.gitBranchCompareControls.hidden = historyMode || !branchCompareMode;
   if (refs.gitCompareFlatControls) refs.gitCompareFlatControls.hidden = false;
   if (refs.gitCompareFlatToggle) {
     refs.gitCompareFlatToggle.classList.toggle('active', state.compareFlatMode);
@@ -1882,21 +2009,30 @@ function renderCommander() {
     refs.gitCompareFlatFilter.closest('label').hidden = !state.compareFlatMode;
     refs.gitCompareFlatFilter.value = state.compareFlatFilter;
   }
-  refs.gitCompareLeftLabel.textContent = branchCompareMode ? 'START REF' : 'LOCAL WORKSPACE';
-  refs.gitCompareRightLabel.textContent = branchCompareMode ? 'COMPARE WITH' : 'REMOTE BRANCH';
-  if (branchCompareMode) renderBranchCompareSelectors();
+  refs.gitCompareLeftLabel.textContent = branchCompareMode ? 'LEFT SNAPSHOT' : 'WORKING TREE · FILES ON DISK';
+  refs.gitCompareRightLabel.textContent = historyMode ? 'RIGHT SNAPSHOT' : branchCompareMode ? 'RIGHT SNAPSHOT' : 'CACHED REMOTE SNAPSHOT';
+  if (branchCompareMode && !historyMode) renderBranchCompareSelectors();
+  const resolved = state.commanderComparisonResult;
+  const head = resolved?.local_revision || (spec.leftRef === 'HEAD' ? resolved?.left_revision : spec.rightRef === 'HEAD' ? resolved?.right_revision : null) || comparisonRepository()?.head_oid;
+  $('#compareSnapshotSummary').textContent = state.commanderComparisonLoading ? 'Resolving selected snapshots…' : resolved
+    ? `${spec.leftRef}${spec.workspace ? ' (may include uncommitted changes)' : ` · ${(resolved.left_revision || '').slice(0, 12)}`} ↔ ${spec.rightRef} · ${(resolved.right_revision || resolved.remote_revision || '').slice(0, 12)} · HEAD${resolved.local_revision || spec.leftRef === 'HEAD' || spec.rightRef === 'HEAD' ? '' : ' at context load'} ${head?.slice(0, 12) || 'unknown'} · No checkout`
+    : 'Choose snapshots to compare. HEAD is the committed version, not necessarily the files currently on disk.';
   if (state.commanderComparisonLoading) {
     refs.commanderRows.innerHTML = '<div class="loading-row"><i class="spinner"></i>Loading comparison…</div>';
     return;
   }
+  if (state.commanderComparisonError) {
+    refs.commanderRows.innerHTML = `<div class="loading-row">${esc(state.commanderComparisonError)}</div>`;
+    return;
+  }
   const authorContext = branchCompareMode
     ? (state.branchCompareLeftRevision && state.branchCompareRightRevision
-      ? { repositoryPath: state.repository.path, leftRevision: state.branchCompareLeftRevision, rightRevision: state.branchCompareRightRevision } : null)
+      ? { repositoryPath: spec.repositoryPath, leftRevision: state.branchCompareLeftRevision, rightRevision: state.branchCompareRightRevision } : null)
     : state.workspaceCompareAuthorContext;
   const authorModel = renderComparisonAuthorFilter(refs.gitCompareFlatControls,
     state.compareFlatMode ? authorContext : null,
     { visible: state.compareFlatMode, workspace: !branchCompareMode });
-  const remoteBranches = state.branches.filter(branch => branch.remote);
+  const remoteBranches = (comparisonBranches() || []).filter(branch => branch.remote);
   refs.remoteRef.innerHTML = remoteBranches.map(branch => `<option value="${esc(branch.name)}" ${branch.name === state.remoteRef ? 'selected' : ''}>${esc(branch.name)}</option>`).join('') || '<option value="">No remote refs</option>';
   const flatMode = state.compareFlatMode;
   const query = refs.search.value.trim().toLowerCase(); const rows = state.commanderRows.filter(row => compareRowVisible(row, query, flatMode ? state.compareFlatFilter : 'all') && comparisonAuthorMatches(row, authorModel));
@@ -1913,12 +2049,12 @@ function renderCommander() {
   refs.commanderRows.querySelector('[data-commander-up]')?.addEventListener('click', () => { const parent = state.commanderPath.split('/').slice(0, -1).join('/'); openCommanderDirectory(parent); });
   refs.commanderRows.querySelectorAll('[data-commander-entry]').forEach(rowNode => {
     const row = state.commanderRows.find(item => item.relative_path === rowNode.dataset.commanderEntry);
-    if (flatMode && branchCompareMode && (row?.local?.kind === 'submodule' || row?.remote?.kind === 'submodule')) {
-      rowNode.addEventListener('click', () => openGitRevisionFileCompare(row));
+    if (row?.local?.kind === 'submodule' || row?.remote?.kind === 'submodule') {
+      rowNode.addEventListener('click', () => branchCompareMode ? openGitRevisionFileCompare(row) : openWorkspaceRevisionFileCompare(row));
       return;
     }
     rowNode.addEventListener('dblclick', () => { const entry = row?.local || row?.remote; if (entry?.kind === 'folder') openCommanderDirectory(row.relative_path); });
-    rowNode.addEventListener('click', () => { const localIsFile = !row?.local || row.local.kind === 'file'; const remoteIsFile = !row?.remote || row.remote.kind === 'file'; const eitherIsFile = row?.local?.kind === 'file' || row?.remote?.kind === 'file'; if (eitherIsFile && localIsFile && remoteIsFile) branchCompareMode ? openGitRevisionFileCompare(row) : openFileCompare(row); });
+    rowNode.addEventListener('click', () => { const localIsFile = !row?.local || row.local.kind === 'file'; const remoteIsFile = !row?.remote || row.remote.kind === 'file'; const eitherIsFile = row?.local?.kind === 'file' || row?.remote?.kind === 'file'; if (eitherIsFile && localIsFile && remoteIsFile) branchCompareMode ? openGitRevisionFileCompare(row) : state.compareMode === 'git' && !state.comparisonContext?.submodulePath ? openFileCompare(row) : openWorkspaceRevisionFileCompare(row); });
   });
   const focused = refs.commanderRows.querySelector('.commander-row.focused, .flat-compare-row.focused'); if (focused) requestAnimationFrame(() => focused.scrollIntoView({ block: 'center' }));
 }
@@ -2068,45 +2204,56 @@ function renderSubmoduleCompare() {
 
 const openCommanderDirectoryGuard = createRequestGuard();
 async function openCommanderDirectory(path) {
-  const branchCompareMode = state.gitCompareMode === 'refs';
-  if (branchCompareMode) {
-    ensureBranchCompareRefs();
-    if (!state.branchCompareLeftRef || !state.branchCompareRightRef) { status('Choose both refs before comparing branches.', 'error'); return; }
-  } else if (!state.remoteRef) { status('No remote-tracking branch is available. Fetch the repository first.', 'error'); return; }
+  if (state.compareMode === 'history') folderHistoryComparison.activate(state.comparisonContext, path);
+  else if (state.gitCompareMode === 'refs') ensureBranchCompareRefs();
+  const spec = commanderComparisonSpec();
+  const branchCompareMode = !spec.workspace;
+  const mode = state.compareMode, context = state.comparisonContext, session = state.comparisonSession;
+  // Invalidate even a previous valid request when the new selection is invalid.
+  state.commanderPath = path;
+  // Capture after the folder is updated; a late response belongs to this scope only.
+  const sameRequest = openCommanderDirectoryGuard();
+  state.commanderRows = []; state.commanderExportSnapshot = null;
+  state.commanderComparisonResult = null; state.commanderComparisonError = '';
+  state.branchCompareLeftRevision = ''; state.branchCompareRightRevision = '';
+  if (!spec.leftRef || !spec.rightRef || spec.rightRef === ComparisonNavigation.WORKTREE) {
+    state.commanderComparisonLoading = null;
+    state.commanderComparisonError = spec.workspace && !spec.rightRef ? 'No cached remote ref selected. Fetch explicitly or choose Folder History to compare with HEAD.' : 'Choose both snapshots. Working tree is available on the left only.';
+    render(); return;
+  }
   const loading = {};
   state.commanderComparisonLoading = loading;
-  state.commanderExportSnapshot = null;
   const download = $('#gitCompareDownload');
   if (download) download.disabled = true;
-  state.commanderRows = [];
-  state.commanderPath = path; refs.commanderRows.innerHTML = `<div class="loading-row"><i class="spinner"></i>${branchCompareMode ? 'Comparing repository refs…' : 'Comparing local and remote…'}</div>`;
   if (!branchCompareMode) {
     state.workspaceCompareAuthorContext = null;
     renderComparisonAuthorFilter(refs.gitCompareFlatControls, null, { visible: state.compareFlatMode });
   }
-  // Captured *after* commanderPath/view are updated, so the snapshot reflects
-  // the folder this call is actually for.
-  const sameRequest = openCommanderDirectoryGuard();
+  renderCommander();
   const flatMode = state.compareFlatMode;
-  const leftRef = state.branchCompareLeftRef, rightRef = state.branchCompareRightRef, remoteRef = state.remoteRef;
-  const stillCurrent = () => sameRequest() && state.view === 'commander' && state.compareMode === 'git'
-    && state.compareFlatMode === flatMode && (state.gitCompareMode === 'refs') === branchCompareMode
-    && (branchCompareMode ? state.branchCompareLeftRef === leftRef && state.branchCompareRightRef === rightRef : state.remoteRef === remoteRef);
+  const stillCurrent = () => {
+    const now = commanderComparisonSpec();
+    return sameRequest() && state.view === 'commander' && state.compareMode === mode
+      && state.comparisonContext === context && state.comparisonSession === session
+      && state.compareFlatMode === flatMode && now.workspace === spec.workspace
+      && now.repositoryPath === spec.repositoryPath && now.leftRef === spec.leftRef && now.rightRef === spec.rightRef;
+  };
   if (!invoke) { state.commanderComparisonLoading = null; state.commanderRows = previewCommanderRows(); render(); return; }
   try {
     const result = branchCompareMode
-      ? await invoke(state.compareFlatMode ? 'compare_git_revisions_file_list' : 'compare_git_revisions_directory', { repositoryPath: state.repository.path, relativePath: path, leftRef: state.branchCompareLeftRef, rightRef: state.branchCompareRightRef })
-      : await invoke(state.compareFlatMode ? 'compare_remote_file_list' : 'compare_remote_directory', { repositoryPath: state.repository.path, relativePath: path, remoteRef: state.remoteRef });
+      ? await invoke(flatMode ? 'compare_git_revisions_file_list' : 'compare_git_revisions_directory', { repositoryPath: spec.repositoryPath, relativePath: path, leftRef: spec.leftRef, rightRef: spec.rightRef })
+      : await invoke('compare_workspace_revision', { repositoryPath: spec.repositoryPath, relativePath: path, revision: spec.rightRef, flat: flatMode });
     if (!stillCurrent()) return;
     state.commanderComparisonLoading = null;
     state.commanderRows = result.rows;
-    state.commanderExportSnapshot = commanderDownloadSnapshot(result, state.repository.path, branchCompareMode);
+    state.commanderComparisonResult = result;
+    state.commanderExportSnapshot = commanderDownloadSnapshot(result, spec.repositoryPath, branchCompareMode);
     if (branchCompareMode) {
       state.branchCompareLeftRevision = result.left_revision || result.leftRevision || '';
       state.branchCompareRightRevision = result.right_revision || result.rightRevision || '';
     } else state.workspaceCompareAuthorContext = state.compareFlatMode ? workspaceComparisonAuthorContext(result) : null;
-    render(); status(branchCompareMode ? `Compared ${state.branchCompareLeftRef} with ${state.branchCompareRightRef}` : `Compared with ${state.remoteRef.slice(0, 40)}`);
-  } catch (error) { if (stillCurrent()) { status(String(error), 'error'); refs.commanderRows.innerHTML = `<div class="loading-row">${esc(String(error))}</div>`; } }
+    render(); status(`Compared ${spec.leftRef} with ${spec.rightRef}`);
+  } catch (error) { if (stillCurrent()) { state.commanderComparisonLoading = null; state.commanderComparisonError = String(error); status(String(error), 'error'); render(); } }
   finally { if (state.commanderComparisonLoading === loading) state.commanderComparisonLoading = null; }
 }
 
@@ -2218,6 +2365,7 @@ async function openSubmoduleCompareFromEntry(entry, overrides = {}) {
   const { innerPath = '', presetCurrentRight = false, versionsData = null, ...revisionOverrides } = overrides;
   const hasExplicitLeftRef = Object.prototype.hasOwnProperty.call(revisionOverrides, 'leftRef');
   const hasExplicitRightRef = Object.prototype.hasOwnProperty.call(revisionOverrides, 'rightRef');
+  if (state.comparisonContext?.owner !== state.repository.path || state.comparisonContext?.submodulePath !== entry.relative_path) setCompareOrigin(innerPath, entry.relative_path);
   state.compareMode = 'submodule';
   state.subCompareFlatMode = false;
   state.view = 'commander';
@@ -2237,6 +2385,10 @@ async function openSubmoduleCompareFromEntry(entry, overrides = {}) {
     rightOnlyCommits: [],
   };
   Object.assign(state.submoduleCompare, { name: entry.name, submodulePath: entry.relative_path }, revisionOverrides);
+  const comparison = state.submoduleCompare;
+  const owner = state.repository.path;
+  const request = (comparison.versionRequest || 0) + 1;
+  comparison.versionRequest = request;
   render();
   if (!invoke) {
     const preview = {
@@ -2261,7 +2413,7 @@ async function openSubmoduleCompareFromEntry(entry, overrides = {}) {
   try {
     status(`Loading revisions for ${entry.name}…`, 'busy');
     const data = versionsData || await invoke('submodule_versions', { repositoryPath: state.repository.path, relativePath: entry.relative_path });
-    if (!state.submoduleCompare || state.submoduleCompare.submodulePath !== entry.relative_path) return;
+    if (state.repository?.path !== owner || state.submoduleCompare !== comparison || comparison.versionRequest !== request || state.compareMode !== 'submodule' || state.view !== 'commander') return;
     state.submoduleCompare.revisionOptions = buildSubmoduleCompareOptions(data);
     if (presetCurrentRight) {
       state.submoduleCompare.leftRef = hasExplicitLeftRef ? (revisionOverrides.leftRef || '') : '';
@@ -2326,12 +2478,14 @@ async function openGitRevisionFileCompare(row, evidence = null) {
   const stillCurrent = openFileCompareGuard();
   const leftMissing = evidence ? evidence.touch.change === 'Added' : !row.local;
   const rightMissing = evidence ? evidence.touch.change === 'Deleted' : !row.remote;
-  const leftRef = evidence?.touch.parent || state.branchCompareLeftRevision || state.branchCompareLeftRef;
-  const rightRef = evidence?.touch.commit || state.branchCompareRightRevision || state.branchCompareRightRef;
+  const spec = commanderComparisonSpec();
+  const contextAtStart = state.comparisonContext, session = state.comparisonSession;
+  const leftRef = evidence?.touch.parent || state.branchCompareLeftRevision || spec.leftRef;
+  const rightRef = evidence?.touch.commit || state.branchCompareRightRevision || spec.rightRef;
   refs.compareTitle.textContent = row.name;
   refs.compareSubtitle.textContent = evidence
     ? `Attribution evidence: parent ${leftRef.slice(0, 8)} → commit ${rightRef.slice(0, 8)} · not the complete comparison · read-only`
-    : `${state.branchCompareLeftRef} compared with ${state.branchCompareRightRef} · read-only`;
+    : `${spec.leftRef} compared with ${spec.rightRef} · read-only`;
   refs.localCompare.textContent = refs.remoteCompare.textContent = 'Loading…';
   resetCompareDiffNavigation();
   setCompareReadOnly(true, 'Read-only compare between two repository refs. No file, index or checkout is changed.');
@@ -2342,14 +2496,14 @@ async function openGitRevisionFileCompare(row, evidence = null) {
     const command = context?.owner ? 'compare_github_module_revision_file'
       : context?.submodulePath ? 'compare_submodule_revision_file' : 'compare_git_revision_file';
     const comparison = await invoke(command, {
-      repositoryPath: context?.repositoryPath || state.repository.path,
+      repositoryPath: context?.repositoryPath || spec.repositoryPath,
       ...(context?.owner ? { owner: context.owner, repositoryName: context.repositoryName } : {}),
       ...(context?.submodulePath ? { submodulePath: context.submodulePath } : {}),
       relativePath: evidence?.touch.path || row.relative_path,
       leftRef,
       rightRef,
     });
-    if (!stillCurrent() || state.comparingRow !== row) return;
+    if (!stillCurrent() || state.comparingRow !== row || state.comparisonContext !== contextAtStart || state.comparisonSession !== session) return;
     renderComparisonContents(comparison.local_content || (leftMissing ? '(file does not exist on start ref)' : ''), comparison.remote_content || (rightMissing ? '(file does not exist on compare ref)' : ''), comparison);
   } catch (error) { if (stillCurrent() && state.comparingRow === row) { refs.localCompare.textContent = String(error); refs.remoteCompare.textContent = ''; } }
 }
@@ -2359,6 +2513,28 @@ function previewCommanderRows() {
 }
 
 const openFileCompareGuard = createRequestGuard();
+async function openWorkspaceRevisionFileCompare(row) {
+  const spec = commanderComparisonSpec();
+  const context = state.comparisonContext, session = state.comparisonSession;
+  const revision = state.commanderComparisonResult?.remote_revision || spec.rightRef;
+  state.comparingRow = row;
+  const current = openFileCompareGuard();
+  const stillCurrent = () => current() && state.comparingRow === row && state.comparisonContext === context && state.comparisonSession === session;
+  refs.compareTitle.textContent = row.name;
+  refs.compareSubtitle.textContent = `Working tree ↔ ${spec.rightRef} · ${revision.slice(0, 12)} · read-only`;
+  refs.localCompare.textContent = refs.remoteCompare.textContent = 'Loading…';
+  resetCompareDiffNavigation();
+  setCompareReadOnly(true, 'Compare only. Local files, index, branch and HEAD stay unchanged.');
+  setCompareHeadLabels('WORKING TREE', `${spec.rightRef} · SNAPSHOT`);
+  refs.compareDialog.showModal();
+  if (!invoke) { renderComparisonContents('local preview', 'snapshot preview'); return; }
+  try {
+    const result = await invoke('compare_workspace_revision_file', { repositoryPath: spec.repositoryPath, relativePath: row.relative_path, revision });
+    if (!stillCurrent()) return;
+    renderComparisonContents(result.local_content, result.remote_content, result);
+  } catch (error) { if (stillCurrent()) { refs.localCompare.textContent = String(error); refs.remoteCompare.textContent = ''; } }
+}
+
 async function openFileCompare(row) {
   state.comparingRow = row;
   const stillCurrent = openFileCompareGuard();
@@ -2965,6 +3141,16 @@ function attachFileListDelegation() {
 // mode with no `invoke`) must never affect the actual operation being timed.
 function jsPerfLog(label, elapsedMs) { if (invoke) invoke('frontend_perf_log', { label, elapsedMs }).catch(() => {}); }
 
+// Measures gaps between Explorer requests, not OS focus or user inactivity.
+// Uses wall time across sleep; it never starts a refresh or changes cache age.
+let previousNavigationAt = null;
+function navigationTraceFields() {
+  const now = Date.now();
+  const gap = previousNavigationAt === null ? null : Math.max(0, now - previousNavigationAt);
+  previousNavigationAt = now;
+  return `at=${new Date(now).toISOString()} since_previous_navigation_ms=${gap ?? 'none'} after_navigation_gap=${gap !== null && gap >= 300000}`;
+}
+
 // A full repository path can reveal more than a perf log needs to (usernames
 // in home directory paths, internal project folder structure) — logs that
 // need to identify *which* repository, not spell out exactly where it lives
@@ -3066,6 +3252,7 @@ function currentSubmoduleCompareContext() {
 // backend read even inside a submodule: a previous fast-paint/background-scan
 // experiment caused flicker and unreliable-feeling navigation on Windows.
 async function fetchAndRenderDirectory(path, requestId, options) {
+  jsPerfLog(`navigation_ui: action=folder request=${requestId} source=${!options.force && directoryCache.has(path) ? 'directory_cache' : 'backend'} force=${!!options.force} invalidate_git=${!!options.invalidateGit} status_ready=${!!state.statusReady} ${navigationTraceFields()}`, 0);
   if (!options.force && directoryCache.has(path)) {
     state.entries = directoryCache.get(path);
     if (options.explorerOnly && state.view === 'explorer') renderExplorerAfterStatusRefresh(); else render();
@@ -3362,7 +3549,8 @@ async function selectEntry(path, options = {}) {
   state.selectedEntry = state.entries.find(entry => entry.relative_path === path);
   const selected = state.selectedEntry;
   const selectionTrace = ++entryDetailsTraceSequence, selectionStarted = performance.now();
-  const traceSelection = phase => jsPerfLog(`entry_details_ui: selection=${selectionTrace} phase=${phase} kind=${selected?.kind || 'none'}`, performance.now() - selectionStarted);
+  const navigationTrace = navigationTraceFields();
+  const traceSelection = phase => jsPerfLog(`entry_details_ui: selection=${selectionTrace} phase=${phase} kind=${selected?.kind || 'none'} ${navigationTrace}`, performance.now() - selectionStarted);
   const repositoryPath = state.repository?.path, repositoryGeneration = repoOpenGeneration;
   const contextCurrent = selectEntryGuard();
   const stillCurrent = () => contextCurrent() && repoOpenGeneration === repositoryGeneration &&
@@ -5117,10 +5305,22 @@ async function compareEntryWithRemote(entry) {
   // had just fetched sat hidden behind it — "took me to Compare & Sync and
   // didn't compare the file" from the outside, even though the row
   // lookup below did succeed.
-  state.commanderFocus = entry.relative_path; state.commanderPath = entry.relative_path.split('/').slice(0, -1).join('/'); state.view = 'commander'; state.compareMode = 'git'; state.gitCompareMode = 'workspace'; state.compareFlatMode = false; state.commanderRows = []; render();
+  const submodule = submoduleBoundaryFor(entry.relative_path);
+  const relativePath = submodule ? innerPathForSubmodule(submodule, entry.relative_path) : entry.relative_path;
+  setCompareOrigin(parentPathOf(relativePath), submodule || '');
+  state.comparisonSession = (state.comparisonSession || 0) + 1;
+  const context = state.comparisonContext, session = state.comparisonSession;
+  state.commanderFocus = relativePath; state.commanderPath = parentPathOf(relativePath); state.view = 'commander'; state.compareMode = 'git'; state.gitCompareMode = 'workspace'; state.compareFlatMode = false; state.commanderRows = []; render();
+  try { await ensureComparisonContext(context); }
+  catch (error) { if (state.comparisonContext === context) { state.commanderComparisonError = String(error); render(); } return; }
+  if (state.comparisonContext !== context || state.comparisonSession !== session || state.view !== 'commander') return;
+  if (!comparisonBranches().some(branch => branch.remote && branch.name === state.remoteRef)) {
+    state.remoteRef = comparisonBranches().find(branch => branch.current)?.upstream || comparisonBranches().find(branch => branch.remote)?.name || '';
+  }
   await openCommanderDirectory(state.commanderPath);
-  const row = state.commanderRows.find(item => item.relative_path === entry.relative_path);
-  if (row?.local?.kind === 'file' && row.remote?.kind === 'file') openFileCompare(row); else status('This file is not available on both local and selected remote', 'error');
+  if (state.comparisonContext !== context || state.comparisonSession !== session || state.view !== 'commander') return;
+  const row = state.commanderRows.find(item => item.relative_path === relativePath);
+  if (row?.local?.kind === 'file' && row.remote?.kind === 'file') submodule ? openWorkspaceRevisionFileCompare(row) : openFileCompare(row); else status('This file is not available on both local and selected remote', 'error');
 }
 async function runEntryFileAction(entry, action) {
   const staged = (state.changes || []).some(change => change.path === entry.relative_path && change.staged);
@@ -5588,11 +5788,15 @@ function remoteTrackingSummary(remoteName = '') {
   const current = state.repository?.current_branch || '';
   if (state.repository?.head_detached) return { label: 'Current checkout', value: `Detached HEAD ${(state.repository?.head_oid || '').slice(0, 8)}`, detail: 'Detached HEAD does not track a remote branch.' };
   if (!current) return { label: 'Current checkout', value: 'No branch', detail: 'No local branch is checked out.' };
-  const candidate = remoteCurrentBranchCandidate(remoteName);
+  const local = (state.branches || []).find(branch => !branch.remote && branch.name === current);
+  const upstream = local?.upstream;
   return {
     label: 'Current local branch',
     value: current,
-    detail: candidate ? `${current} can track ${candidate}` : `${current} has no ${remoteName}/${current} remote branch known locally`,
+    detail: upstream ? `Tracks ${upstream}` : local && Object.hasOwn(local, 'upstream') ? 'No upstream available' : 'Upstream information not loaded yet',
+    note: upstream ? '' : local && Object.hasOwn(local, 'upstream')
+      ? 'No tracking branch could be resolved locally. A remote branch with the same name does not automatically establish tracking. Open Publish to choose a remote and review the destination; nothing is pushed until you confirm. If tracking was already configured, its remote reference may need to be fetched.'
+      : '',
   };
 }
 
@@ -5602,22 +5806,18 @@ function renderRemoteUrlRow(label, url) {
 }
 
 function renderRemotes() {
-  if (!state.remotes.length) {
-    refs.remoteCards.innerHTML = '<div class="remote-empty">No remote is configured for this repository.</div>';
-    return;
-  }
   const totalRemoteBranches = (state.branches || []).filter(branch => branch.remote && !branch.name.endsWith('/HEAD')).length;
   const mainRemote = state.remotes[0]?.name || 'origin';
   const currentSummary = remoteTrackingSummary(mainRemote);
   const overview = `<article class="remote-overview">
-    <div><h2>Remote overview</h2><p>Fetch downloads refs only. It never switches branch, merges, stages, commits or pushes.</p></div>
+    <div><h2>Remote overview</h2><p>Fetch downloads refs only. It never switches branch, merges, stages, commits or pushes.</p>${currentSummary.note ? `<p class="remote-tracking-note">${esc(currentSummary.note)}</p>` : ''}</div>
     <div class="remote-overview-grid">
       <span>${esc(currentSummary.label)}</span><strong>${esc(currentSummary.value)}</strong>
-      <span>Tracking/upstream clue</span><strong>${esc(currentSummary.detail)}</strong>
+      <span>Upstream / tracking</span><strong>${esc(currentSummary.detail)}</strong>
       <span>Configured remotes</span><strong>${state.remotes.length}</strong>
       <span>Remote branches known locally</span><strong>${totalRemoteBranches}</strong>
     </div>
-    <button type="button" data-fetch-all-remotes>Fetch all remotes</button>
+    <button type="button" data-fetch-all-remotes ${state.remotes.length ? '' : 'disabled'}>Fetch all remotes</button>
   </article>`;
   refs.remoteCards.innerHTML = overview + state.remotes.map(remote => {
     const trackingBranches = remoteTrackingBranches(remote.name);
@@ -5635,7 +5835,8 @@ function renderRemotes() {
       <div class="remote-card-main">
         <div class="remote-card-head"><h2>${esc(remote.name)}</h2><span>${esc(remoteUrlKind(remote.fetch_url))}</span></div>
         <div class="remote-facts">
-          <span>${esc(remoteSummary.value)} → ${currentCandidate ? esc(currentCandidate) : 'no matching remote branch'}</span>
+          <span>${esc(remoteSummary.value)} · ${esc(remoteSummary.detail)}</span>
+          ${currentCandidate ? `<span>Same-name remote branch: ${esc(currentCandidate)} (not proof of tracking)</span>` : ''}
           <span>${trackingBranches.length} available remote branch${trackingBranches.length === 1 ? '' : 'es'}; checkout one to create a local tracking branch</span>
         </div>
         <div class="remote-branch-strip">${sampleBranches}${moreBranches}</div>
@@ -5643,7 +5844,7 @@ function renderRemotes() {
       </div>
       <button type="button" class="remote-fetch-button" data-fetch-remote="${esc(remote.name)}">Fetch now</button>
     </article>`;
-  }).join('');
+  }).join('') + (state.remotes.length ? '' : '<div class="remote-empty">No remote is configured. Add a remote before publishing; nothing is sent automatically.</div>');
   refs.remoteCards.querySelectorAll('[data-fetch-remote]').forEach(button => button.addEventListener('click', () => fetchRemote(button.dataset.fetchRemote, button)));
   refs.remoteCards.querySelector('[data-fetch-all-remotes]')?.addEventListener('click', event => fetchAllRemotes(event.currentTarget));
   refs.remoteCards.querySelectorAll('[data-copy-remote-url]').forEach(button => button.addEventListener('click', () => copyText(button.dataset.copyRemoteUrl || '', 'Remote URL copied.')));
@@ -6264,6 +6465,7 @@ function buildCommitRowHtml(commit, index, ctx) {
   const matchesFilter = ctx.refFilter === 'all' || isBranchPoint || (ctx.refFilter === 'branches' ? (refKinds.has('local_branch') || refKinds.has('remote_branch')) : refKinds.has('tag'));
   const isFilterDimmed = !matchesFilter;
   const mergePresentation = mergeCommitPresentation(commit, ctx);
+  const commitTime = GitActivity.commitTime(commit);
   const incomingHistory = ctx.story?.mergeParents.get(commit.id)?.map(parent => {
     const names = parent.refs.map(ref => ref.name).join(', ');
     const label = names ? `Current refs: ${names}` : 'Historical Path';
@@ -6288,7 +6490,7 @@ function buildCommitRowHtml(commit, index, ctx) {
     <div class="graph-cell"></div>
     <div class="commit-body">
       <div class="commit-card"><div class="commit-main"><div class="commit-title-line">${structuralBadges}<span class="commit-title">${commitSubjectHtml(commit.subject)}</span></div><div class="commit-ref-line">${refsBadges(node.refs, node.isHead, ctx.currentBranch)}${stashPills}</div></div><span class="commit-id-wrap"><button type="button" class="commit-copy-sha" data-copy-commit-sha="${esc(commit.id)}" title="Copy full commit SHA">${esc(commit.id.slice(0, 8))} ⧉</button></span>
-      <span class="commit-date">${esc(commit.date || '—')}</span><span class="topology-badges">${mergePresentation ? `<b class="merge-badge" data-tooltip="${esc(mergePresentation.tooltip)}">${esc(mergePresentation.label)}</b>` : ''}</span><span class="commit-author">${esc(commit.author)}</span></div>
+      <span class="commit-date" title="${esc(commitTime.title)}"><span>${esc(commitTime.date)}</span>${commitTime.time ? `<time datetime="${esc(commitTime.iso)}">${esc(commitTime.time)}</time>` : ''}</span><span class="topology-badges">${mergePresentation ? `<b class="merge-badge" data-tooltip="${esc(mergePresentation.tooltip)}">${esc(mergePresentation.label)}</b>` : ''}</span><span class="commit-author">${esc(commit.author)}</span></div>
       ${incomingHistory ? `<div class="story-merge-sources">${incomingHistory}</div>` : ''}${ahead ? `<div class="ahead-annotation">${esc(ahead)}</div>` : ''}${stashDetails}
     </div>
   </article>`;
@@ -6540,6 +6742,28 @@ function graphCommitCompareAnchorMatches(context, anchor = state.graphCommitComp
   return Boolean(anchor && context && anchor.path === context.path && anchor.isSubmodule === context.isSubmodule && anchor.relativePath === context.relativePath);
 }
 
+function selectedGraphCommitIds() {
+  const selection = state.graphCommitSelection;
+  if (!selection || selection.generation !== repoOpenGeneration || !graphCommitCompareAnchorMatches(activeRepositoryContext(), selection)) return [];
+  const loaded = new Set(activeGraphData().commits.map(commit => commit.id));
+  return selection.ids.filter(id => loaded.has(id));
+}
+
+function refreshGraphCommitSelection() {
+  const selected = new Set(selectedGraphCommitIds());
+  refs.graph.querySelectorAll('.commit-row').forEach(row => row.classList.toggle('selected', selected.has(row.dataset.id)));
+}
+
+function handleGraphCommitRowClick(event, commitId) {
+  const toggle = !!(event?.ctrlKey || event?.metaKey);
+  selectCommit(commitId, { toggle });
+  if (toggle) {
+    const count = selectedGraphCommitIds().length;
+    status(count === 2 ? '2 commits selected. Right-click either selected row to compare.'
+      : `${count} commit${count === 1 ? '' : 's'} selected. Ctrl/Cmd-click to select exactly two for comparison.`);
+  }
+}
+
 function setGraphBranchCompareStart(branchName) {
   const context = activeRepositoryContext();
   if (!context.path || !branchName) return;
@@ -6606,6 +6830,8 @@ async function openGraphRevisionCompare(leftRef, rightRef = '') {
 
 async function openRepositoryRevisionCompare(leftRef, rightRef, path = '', focus = '') {
   if (!state.repository?.path || !leftRef || !rightRef) return;
+  setCompareOrigin(path);
+  state.comparisonSession = (state.comparisonSession || 0) + 1;
   closeSubmoduleGraph();
   state.view = 'commander';
   state.compareMode = 'git';
@@ -6630,6 +6856,8 @@ async function openGraphBranchCompare(branchName, rightRef = '') {
     const entry = { kind: 'submodule', name: context.name, relative_path: context.relativePath };
     return openSubmoduleCompareFromEntry(entry, { leftRef: branchName, rightRef: rightRef || context.currentBranch || context.headOid || 'HEAD' });
   }
+  setCompareOrigin('');
+  state.comparisonSession = (state.comparisonSession || 0) + 1;
   closeSubmoduleGraph();
   state.view = 'commander';
   state.compareMode = 'git';
@@ -6693,7 +6921,7 @@ async function restoreExactCheckpointFromGraphCommit(commitId, branch = '') {
   if (!context.path) return;
   const shortId = commitId.slice(0, 8);
   const ok = await customConfirm(
-    `Clean checkout ${branch ? `branch ${branch}` : `commit ${shortId}`} in ${context.name}?\n\nThis is stronger than Checkout:\n• ${branch ? `attaches HEAD to local branch ${branch} at ${shortId}` : 'detaches HEAD at this exact commit'}\n• discards tracked local edits\n• removes untracked, non-ignored leftovers\n• forces submodules to the versions recorded by this checkpoint\n\nIgnored build artifacts are not removed. This cannot be undone from the app.`,
+    `Clean checkout ${branch ? `branch ${branch}` : `commit ${shortId}`} in ${context.name}?\n\nThis is stronger than Checkout:\n• ${branch ? `attaches HEAD to local branch ${branch} at ${shortId}` : 'detaches HEAD at this exact commit'}\n• discards staged and unstaged local edits\n• removes untracked, non-ignored leftovers, including nested Git repositories and their local-only commits\n• forces submodules to the versions recorded by this checkpoint\n\nNested repositories being removed are deleted entirely, including ignored files inside them. Other ignored build artifacts are not removed. The selected branch's commits are kept; nothing is changed on the server. This cannot be undone from the app.`,
     { title: branch ? 'Clean checkout branch' : 'Restore exact checkpoint', danger: true, okLabel: branch ? 'Clean checkout branch' : 'Restore exact checkpoint' }
   );
   if (!ok) return;
@@ -6708,6 +6936,9 @@ async function restoreExactCheckpointFromGraphCommit(commitId, branch = '') {
 }
 
 function showGraphCommitContextMenu(event, commitId) {
+  if (!selectedGraphCommitIds().includes(commitId)) selectCommit(commitId);
+  const selectedIds = selectedGraphCommitIds();
+  const selectionContext = { ...activeRepositoryContext(), generation: repoOpenGeneration };
   const branchRefs = graphBranchRefsForCommit(commitId);
   const context = activeRepositoryContext();
   const commitAnchor = graphCommitCompareAnchorMatches(context) ? state.graphCommitCompareAnchor : null;
@@ -6744,6 +6975,17 @@ function showGraphCommitContextMenu(event, commitId) {
   const localNamesAtCommit = new Set(localBranchesAtCommit.map(ref => ref.name));
   const mergeRefs = [...localBranchesAtCommit, ...remoteBranchesAtCommit.filter(ref => !localNamesAtCommit.has(remoteBranchShortName(ref.name)))];
   const menuItems = [
+    ...(selectedIds.length === 2 && selectedIds.includes(commitId) ? [
+      { header: 'Selected commits · read only' },
+      { id: 'compare-selected-commits', label: 'Compare selected commits', detail: `${selectedIds[0].slice(0, 8)} → ${selectedIds[1].slice(0, 8)} · selection order`, kind: 'compare',
+        run: () => {
+          if (selectionContext.generation !== repoOpenGeneration || !graphCommitCompareAnchorMatches(activeRepositoryContext(), selectionContext)) return;
+          const current = selectedGraphCommitIds();
+          if (current.length !== 2 || !current.every((id, index) => id === selectedIds[index])) return;
+          return openGraphRevisionCompare(selectedIds[0], selectedIds[1]);
+        } },
+      { separator: true },
+    ] : []),
     { header: 'Checkout / attach HEAD' },
     ...localBranchesAtCommit.map((ref, index) => graphCheckoutBranchMenuItem(ref.name, ref.kind, `checkout-local-${index}`)),
     ...remoteBranchesAtCommit.map((ref, index) => graphCheckoutBranchMenuItem(ref.name, ref.kind, `checkout-remote-${index}`)),
@@ -6777,7 +7019,10 @@ function showGraphCommitContextMenu(event, commitId) {
 // is exactly what keeping this to one shared function, called once per
 // row per its own lifetime, avoids.
 function wireGraphRowInteractions(rowElements) {
-  rowElements.forEach(row => row.addEventListener('click', () => selectCommit(row.dataset.id)));
+  rowElements.forEach(row => {
+    row.title = 'Click to inspect · Ctrl/Cmd-click to select commits · right-click two selected commits to compare';
+    row.addEventListener('click', event => handleGraphCommitRowClick(event, row.dataset.id));
+  });
   rowElements.forEach(row => row.addEventListener('contextmenu', event => showGraphCommitContextMenu(event, row.dataset.id)));
   rowElements.forEach(row => row.querySelectorAll('[data-story-parent]').forEach(button => button.addEventListener('click', event => {
     event.stopPropagation();
@@ -6789,6 +7034,7 @@ function wireGraphRowInteractions(rowElements) {
   })));
   rowElements.forEach(row => row.querySelectorAll('[data-graph-ref-name]').forEach(pill => pill.addEventListener('click', event => {
     event.stopPropagation();
+    if (event.ctrlKey || event.metaKey) { handleGraphCommitRowClick(event, row.dataset.id); return; }
     handleGraphBranchCompareSelection(pill.dataset.graphRefName).catch(error => handleError(error));
   })));
   rowElements.forEach(row => row.querySelectorAll('[data-tag-name]').forEach(pill => pill.addEventListener('click', event => { event.stopPropagation(); showTagDetails(pill.dataset.tagName); })));
@@ -6815,6 +7061,7 @@ function wireGraphRowInteractions(rowElements) {
     // alignment with every row below it otherwise.
     scheduleGraphOverlayRedraw();
   })));
+  refreshGraphCommitSelection();
 }
 function renderGraph() {
   const modelStarted = performance.now();
@@ -7264,7 +7511,12 @@ function drawGraphOverlay(model, lanesWidth, options = {}) {
   svg.innerHTML = parts.join('');
 }
 
-function selectCommit(id) {
+function selectCommit(id, options = {}) {
+  const commit = activeGraphData().commits.find(commit => commit.id === id);
+  if (!commit) return;
+  const ids = options.toggle ? selectedGraphCommitIds() : [];
+  const selectedIds = options.toggle && ids.includes(id) ? ids.filter(value => value !== id) : [...ids, id];
+  state.graphCommitSelection = { ...activeRepositoryContext(), generation: repoOpenGeneration, ids: selectedIds };
   refs.details.closest?.('.main-layout')?.classList.remove('details-empty-state');
   // Must search whichever repository's history is actually on screen — while
   // a submodule's graph is open, state.commits is still the *parent's* list
@@ -7273,15 +7525,16 @@ function selectCommit(id) {
   // below, or — worse — silently match an unrelated parent commit that
   // happens to share the same id prefix. This was a real, reproducible
   // crash: clicking a row in the Submodule Map's own graph.
-  state.selectedCommit = activeGraphData().commits.find(commit => commit.id === id);
-  refs.graph.querySelectorAll('.commit-row').forEach(row => row.classList.toggle('selected', row.dataset.id === id));
+  state.selectedCommit = commit;
+  refreshGraphCommitSelection();
   const c = state.selectedCommit;
   // .refs is Vec<{name, kind}> now — shown here as "name (kind)" pairs,
   // kind spelled out in plain words rather than the raw wire value.
   const kindLabel = { local_branch: 'local branch', remote_branch: 'remote branch', tag: 'tag' };
   const refsSummary = (c.refs || []).map(r => `${r.name} (${kindLabel[r.kind] || r.kind})`).join(', ') || '—';
+  const commitTime = GitActivity.commitTime(c);
   refs.details.innerHTML = `<div class="commit-details"><div class="large-node"></div><h2>${commitSubjectHtml(c.subject)}</h2><div class="hash"><a href="#" class="commit-server-link" data-commit-id="${esc(c.id)}" title="Open this commit on the server">${esc(c.id)} ↗</a></div>
-    <div class="detail-grid"><span>Author</span><strong>${esc(c.author)}</strong><span>Date</span><strong>${esc(c.date)}</strong>
+    <div class="detail-grid"><span>Author</span><strong>${esc(c.author)}</strong><span>Date / time</span><strong title="${esc(commitTime.title)}">${esc(commitTime.date)} ${esc(commitTime.time)}</strong>
     <span>Parents</span><strong>${esc(c.parents?.join(', ') || 'First commit')}</strong><span>Refs</span><strong>${esc(refsSummary)}</strong></div></div>`;
 }
 
@@ -8350,7 +8603,48 @@ async function returnToProjectNavigator() {
 $('#navExplorer').addEventListener('click', returnToProjectNavigator);
 function syncLocalDriveToCommanderPath() {
   if (state.repository && state.view === 'commander' && state.compareMode === 'local-drive') {
-    localDriveWorkspace?.openRepositoryLocation(state.repository.path, state.commanderPath || '');
+    localDriveWorkspace?.openRepositoryLocation(comparisonRepository().path, state.commanderPath || '');
+  }
+}
+const folderHistoryComparison = ComparisonNavigation.createHistory({
+  root: $('#folderHistoryControls'), invoke,
+  onChange: () => { if (state.view === 'commander' && state.compareMode === 'history') openCommanderDirectory(state.commanderPath); },
+});
+async function switchComparisonMode(mode) {
+  if (!state.repository || (mode === state.compareMode && !state.commanderComparisonError)) return;
+  if (state.compareMode === 'submodule' && state.submoduleCompare?.externalOwner) {
+    status('This comparison uses a remote-only repository. Open a local repository to use the other comparison modes.', 'error'); return;
+  }
+  if (!state.comparisonContext || state.comparisonContext.owner !== state.repository.path) setCompareOrigin(state.commanderPath || '');
+  const context = state.comparisonContext;
+  const session = state.comparisonSession = (state.comparisonSession || 0) + 1;
+  state.compareMode = mode; state.compareFlatMode = false;
+  state.commanderRows = []; state.commanderExportSnapshot = null; state.commanderComparisonResult = null;
+  state.commanderComparisonError = ''; state.commanderComparisonLoading = null;
+  refs.search.value = '';
+  if (mode === 'local-drive') { syncLocalDriveToCommanderPath(); render(); return; }
+  if (mode === 'submodule') {
+    state.subCompareFlatMode = false;
+    if (context.submodulePath) return openSubmoduleCompareFromEntry(submoduleEntryForPath(context.submodulePath), { innerPath: state.commanderPath });
+    state.submoduleCompare = null;
+    render(); return;
+  }
+  // Make the Branch tab deterministic on entry; the explicit selector allows
+  // workspace/remote comparisons without a hidden mode inherited from history.
+  if (mode === 'git') state.gitCompareMode = 'refs';
+  state.commanderComparisonLoading = {};
+  render();
+  try {
+    await ensureComparisonContext(context);
+    if (state.comparisonContext !== context || state.comparisonSession !== session || state.compareMode !== mode || state.view !== 'commander') return;
+    if (!state.remoteRef || !comparisonBranches().some(b => b.remote && b.name === state.remoteRef)) {
+      state.remoteRef = comparisonBranches().find(b => b.current)?.upstream || comparisonBranches().find(b => b.remote)?.name || '';
+    }
+    if (mode === 'history') folderHistoryComparison.activate(context, state.commanderPath);
+    await openCommanderDirectory(state.commanderPath);
+  } catch (error) {
+    if (state.comparisonContext !== context || state.comparisonSession !== session) return;
+    state.commanderComparisonLoading = null; state.commanderComparisonError = String(error); render();
   }
 }
 $('#navCommander').addEventListener('click', () => {
@@ -8360,7 +8654,9 @@ $('#navCommander').addEventListener('click', () => {
   if (state.view !== 'commander') resetFooterForContextChange();
   const selected = state.selectedEntry;
   const nextCommanderPath = selected?.kind === 'file' ? parentPathOf(selected.relative_path) : selected?.kind === 'folder' ? selected.relative_path : state.currentPath;
-  state.commanderFocus = selected?.kind === 'file' ? selected.relative_path : '';
+  setCompareOrigin(submoduleContext ? submoduleContext.innerPath : nextCommanderPath, submoduleContext?.entry.relative_path || '');
+  state.comparisonSession = (state.comparisonSession || 0) + 1;
+  state.commanderFocus = selected?.kind === 'file' ? (submoduleContext ? innerPathForSubmodule(submoduleContext.entry.relative_path, selected.relative_path) : selected.relative_path) : '';
   state.commanderRows = [];
   refs.search.value = '';
   if (submoduleContext) {
@@ -8370,21 +8666,16 @@ $('#navCommander').addEventListener('click', () => {
   state.compareMode = 'local-drive';
   state.commanderPath = nextCommanderPath;
   state.view = 'commander';
-  render();
   syncLocalDriveToCommanderPath();
-});
-refs.compareModeGit.addEventListener('click', () => { if (state.compareMode === 'git') return; if (state.compareMode === 'submodule') state.commanderPath = state.currentPath; state.compareMode = 'git'; state.compareFlatMode = false; state.commanderRows = []; refs.search.value = ''; render(); openCommanderDirectory(state.commanderPath); });
-refs.compareModeDrive.addEventListener('click', () => { if (state.compareMode === 'local-drive') return; state.compareMode = 'local-drive'; refs.search.value = ''; render(); syncLocalDriveToCommanderPath(); });
-refs.compareModeSubmodule.addEventListener('click', () => {
-  if (state.compareMode === 'submodule') return;
-  state.compareMode = 'submodule';
-  state.subCompareFlatMode = false;
-  refs.search.value = '';
-  const submoduleContext = currentSubmoduleCompareContext();
-  if (submoduleContext) return openSubmoduleCompareFromEntry(submoduleContext.entry, { innerPath: submoduleContext.innerPath });
-  state.commanderPath = state.submoduleCompare?.submodulePath ? state.commanderPath : '';
   render();
-  if (state.submoduleCompare?.submodulePath) openSubmoduleCompareDirectory(state.commanderPath);
+});
+refs.compareModeGit.addEventListener('click', () => switchComparisonMode('git'));
+refs.compareModeDrive.addEventListener('click', () => switchComparisonMode('local-drive'));
+refs.compareModeSubmodule.addEventListener('click', () => switchComparisonMode('submodule'));
+$('#compareModeHistory').addEventListener('click', () => switchComparisonMode('history'));
+$('#branchCompareKindSelect').addEventListener('change', () => {
+  state.gitCompareMode = $('#branchCompareKindSelect').value;
+  openCommanderDirectory(state.commanderPath);
 });
 $('#navGraph').addEventListener('click', () => { closeSubmoduleGraph(); if (state.view !== 'graph') resetFooterForContextChange(); state.commits = state.allCommits.length ? state.allCommits : state.commits; state.historyScope = ''; state.historyKind = ''; state.selectedEntry = null; state.selectedCommit = null; state.view = 'graph'; refs.search.value = ''; clearDetails('Select a commit'); render(); });
 $('#navRemotes').addEventListener('click', () => { closeSubmoduleGraph(); loadRemotes(); });
@@ -9382,6 +9673,7 @@ function colorizeGitOutput(text) {
 }
 
 function renderConsoleTranscript() {
+  $('#commandRun').disabled = !!state.consoleCommandRunning;
   const list = $('#commandList'); list.classList.add('console-transcript');
   list.innerHTML = state.consoleTranscript.map((entry, index) => {
     const elapsed = entry.status === 'RUNNING' ? ((performance.now() - entry.startedAt) / 1000).toFixed(1) : (entry.elapsedMs / 1000).toFixed(1);
@@ -9602,6 +9894,9 @@ function setConsoleMode(mode) {
   $('#terminalQuickCommands').hidden = mode !== 'console';
   $('#terminalScopeBar').hidden = !['console', 'saved'].includes(mode);
   $('#commandAddSaved').hidden = mode !== 'saved';
+  $('#commandInputLabel').textContent = mode === 'console' ? 'Command · type here' : mode === 'saved' ? 'Search saved actions' : 'Search app actions';
+  $('#commandRun').hidden = mode !== 'console';
+  $('#commandPrompt').hidden = mode !== 'console';
   if (mode === 'console') {
     $('#commandModeHint').textContent = 'Terminal keeps its own transcript and command draft. Use quick Git buttons or type any command.';
     input.placeholder = 'Type a command… e.g. git status, pwd, gh pr status';
@@ -9615,7 +9910,7 @@ function setConsoleMode(mode) {
   } else {
     activeCommands = buildCommands();
     $('#commandModeHint').textContent = 'App actions include built-in actions plus your Saved actions. Search by name or command.';
-    input.placeholder = 'Type a command… (Cmd/Ctrl+K)';
+    input.placeholder = 'Search app actions… (Cmd/Ctrl+K)';
     $('#commandHelp').textContent = '↑↓ to navigate · Enter to run · Esc to close';
     $('#commandScope').textContent = ''; $('#commandScope').title = ''; $('#commandList').classList.remove('console-transcript'); $('#commandGitHints').hidden = true; $('#commandClearTranscript').hidden = true; $('#commandCopyTranscript').hidden = true; renderCommandList(input.value);
   }
@@ -9633,6 +9928,18 @@ function filterCommands(query) {
   if (isRawGitQuery(query)) { const terminalText = rawGitArgs(query); setConsoleMode('console'); setCommandInputValue(terminalText); renderGitHints(); return; }
   renderCommandList(query);
 }
+function submitTerminalCommand() {
+  if (state.consoleMode !== 'console' || state.consoleCommandRunning) return;
+  const input = $('#commandInput'), command = input.value.trim();
+  if (!command) return;
+  // Both the button and Enter use the existing target resolution,
+  // destructive-command confirmation, execution and refresh flow.
+  setCommandInputValue('');
+  renderGitHints();
+  input.focus();
+  return runTerminalFromConsole(command);
+}
+$('#commandRun').addEventListener('click', submitTerminalCommand);
 $('#commandInput').addEventListener('input', (e) => {
   state.consoleDrafts[state.consoleMode] = e.target.value;
   if (state.consoleMode === 'console') { consoleHistoryPointer = -1; consoleHistoryDraft = e.target.value; renderGitHints(); return; }
@@ -9641,7 +9948,7 @@ $('#commandInput').addEventListener('input', (e) => {
 });
 $('#commandInput').addEventListener('keydown', (e) => {
   if (state.consoleMode === 'console') {
-    if (e.key === 'Enter') { e.preventDefault(); const command = $('#commandInput').value.trim(); if (command) { $('#commandInput').value = ''; renderGitHints(); runTerminalFromConsole(command); } }
+    if (e.key === 'Enter' && !e.isComposing) { e.preventDefault(); submitTerminalCommand(); }
     else if (e.key === 'ArrowUp') { e.preventDefault(); recallConsoleHistory(-1); renderGitHints(); }
     else if (e.key === 'ArrowDown') { e.preventDefault(); recallConsoleHistory(1); renderGitHints(); }
     return;

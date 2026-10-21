@@ -5,6 +5,9 @@ const vm = require('node:vm');
 const app = fs.readFileSync(require('node:path').join(__dirname, '../frontend/app.js'), 'utf8');
 function load(names, context) {
   context.$ ||= () => null;
+  context.ComparisonNavigation = require('../frontend/comparison-navigation.js');
+  context.renderCommander ||= () => {};
+  names = ['comparisonRepository', 'comparisonBranches', 'setCompareOrigin', 'commanderComparisonSpec', 'renderComparisonLocation', ...names];
   if (names.includes('openCommanderDirectory')) names = ['commanderDownloadSnapshot', ...names];
   vm.createContext(context);
   for (const name of names) {
@@ -62,7 +65,7 @@ test('Escape closes menus before the Working tree underneath', () => {
 function navigationFixture(selected, submoduleContext = null, previousMode = 'submodule') {
   let click;
   const context = {
-    state: { view: 'explorer', selectedEntry: selected, currentPath: 'folder', compareMode: previousMode, commanderPath: 'stale-submodule-path' },
+    state: { repository: { path: '/repo' }, view: 'explorer', selectedEntry: selected, currentPath: 'folder', compareMode: previousMode, commanderPath: 'stale-submodule-path' },
     refs: { search: { value: 'old filter' } },
     $: () => ({ addEventListener: (_, fn) => { click = fn; } }),
     currentSubmoduleCompareContext: () => submoduleContext,
@@ -71,7 +74,8 @@ function navigationFixture(selected, submoduleContext = null, previousMode = 'su
     syncLocalDriveToCommanderPath: () => { context.openedDrive = context.state.commanderPath; },
     openSubmoduleCompareFromEntry: (entry, options) => { context.openedModule = { entry, options }; },
   };
-  vm.runInNewContext(app.slice(app.indexOf("$('#navCommander').addEventListener"), app.indexOf('refs.compareModeGit.addEventListener')), context);
+  load([], context);
+  vm.runInContext(app.slice(app.indexOf("$('#navCommander').addEventListener"), app.indexOf('refs.compareModeGit.addEventListener')), context);
   return { context, click: () => click() };
 }
 test('Compare & Sync defaults to Local Drive for files/folders/root, independent of old tab', () => {

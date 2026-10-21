@@ -242,13 +242,14 @@ pub(super) fn restore_exact_checkpoint_inner_with_branch(repository_path: String
     // This is intentionally separate from ordinary "Checkout this commit":
     // it is the destructive "make my workspace exactly this checkpoint"
     // operation. It discards tracked edits, removes untracked non-ignored
-    // leftovers, and forces submodule worktrees to the gitlinks recorded by
-    // the selected parent commit. Ignored build artifacts stay in place.
+    // leftovers (including whole embedded repositories), and forces submodule
+    // worktrees to the gitlinks recorded by the selected parent commit.
+    // Ignored artifacts outside removed embedded repositories stay in place.
     //
     // Never start this with `git clean -fd`. `git clean` is not transactional:
     // it can remove nine files, fail on the tenth (locked/read-only/invalid on
     // Windows), and return an error after the workspace has already been
-    // damaged. Move every ordinary untracked file into the repository's Git
+    // damaged. Move every untracked file or embedded repository into the Git
     // directory first. Renames on the same volume are fast and reversible; if
     // any later step fails we put them back, or retain the clearly-reported
     // quarantine rather than silently deleting user data.
@@ -328,7 +329,7 @@ pub(super) fn restore_exact_checkpoint_inner_with_branch(repository_path: String
     Ok(())
 }
 
-// Temporary, same-repository safety area for non-ignored untracked files.
+// Temporary, same-repository safety area for non-ignored untracked paths.
 // It lives under the real Git directory so Git never sees it as another
 // untracked item and so ordinary repositories keep renames on one volume.
 struct RestoreCheckpointQuarantine {
@@ -356,18 +357,23 @@ impl RestoreCheckpointQuarantine {
             .map_err(|detail| format!("Could not inspect untracked files: {detail}"))?;
         let raw_paths = output.split('\0').filter(|path| !path.is_empty()).collect::<Vec<_>>();
 
-        // Git reports an embedded untracked repository as a trailing-slash
-        // directory even without --directory. Do not silently move/delete an
-        // entire repository; reject before moving anything in this phase.
-        if raw_paths.iter().any(|path| path.ends_with('/')) {
-            return Err("An untracked nested Git repository is present. Move or remove it explicitly, then retry Clean checkout; no files were deleted by this attempt.".into());
-        }
-
+        // Git reports embedded untracked repositories as trailing-slash
+        // directories even without --directory. Clean checkout explicitly
+        // confirms their removal, including local history. Move each WHOLE
+        // directory using the existing quarantine, then discard it on success.
+        // Never follow its .git file to delete external/shared Git metadata.
+        let embedded_count = raw_paths.iter().filter(|path| path.ends_with('/')).count();
         let mut candidates = Vec::with_capacity(raw_paths.len());
         for raw in raw_paths {
             let relative = safe_relative_path(raw)
                 .map_err(|_| "Git reported an unsafe untracked path. Nothing was moved; inspect the repository from a terminal before retrying.".to_string())?;
+            if !matches!(relative.components().next(), Some(Component::Normal(_))) || relative.starts_with(".git") {
+                return Err("Git reported an unsafe untracked path. Nothing was moved.".into());
+            }
             candidates.push((self.workdir.join(&relative), self.root.join(phase).join(relative)));
+        }
+        if embedded_count > 0 {
+            perf_log(&format!("restore_exact_checkpoint: quarantine {phase} embedded_repositories={embedded_count} repo={}", anonymized_repository_id(repository_path)), Duration::ZERO);
         }
 
         let phase_start = self.moved.len();
@@ -383,13 +389,14 @@ impl RestoreCheckpointQuarantine {
             }
             if let Err(error) = fs::rename(&source, &destination) {
                 let rollback = self.rollback_from(phase_start);
-                return Err(format!("A local file could not be moved into the temporary safety area (it may be open, locked or read-only): {error}. {rollback}"));
+                let path = source.strip_prefix(&self.workdir).unwrap_or(&source).display();
+                return Err(format!("Local path \"{path}\" could not be moved into the temporary safety area (it may be open, locked or read-only): {error}. {rollback}"));
             }
             self.moved.push((source, destination));
         }
         let count = self.moved.len() - phase_start;
-        // At this point every non-ignored untracked *file* is recoverable in
-        // the quarantine. Let Git remove only the now-empty directory shells.
+        // At this point every listed untracked path is in the quarantine,
+        // including embedded repositories. Let Git remove empty directory shells.
         // This preserves the previous exact-checkout behavior (notably old,
         // deinitialized submodule folders) without exposing file contents to
         // git-clean's non-transactional deletion.
@@ -442,7 +449,9 @@ fn remove_empty_restore_directories(path: &Path) -> std::io::Result<()> {
     if !path.exists() { return Ok(()); }
     for entry in fs::read_dir(path)? {
         let child = entry?.path();
-        if child.is_dir() { let _ = remove_empty_restore_directories(&child); }
+        // Embedded repositories may contain symlinks/junctions. Cleanup must
+        // never traverse them into another checkout or outside this repository.
+        if child.symlink_metadata()?.file_type().is_dir() { let _ = remove_empty_restore_directories(&child); }
     }
     if fs::read_dir(path)?.next().is_none() { fs::remove_dir(path)?; }
     Ok(())
@@ -671,7 +680,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_checkpoint_quarantine_refuses_nested_repository_before_moving_files() {
+    fn exact_checkpoint_quarantine_removes_embedded_repositories_and_can_roll_back_failure() {
         let suffix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
         let repository = std::env::temp_dir().join(format!("git-integrity-restore-nested-{suffix}"));
         fs::create_dir_all(&repository).unwrap();
@@ -688,14 +697,81 @@ mod tests {
         fs::write(repository.join("loose.txt"), "must survive\n").unwrap();
         fs::create_dir_all(repository.join("nested")).unwrap();
         run(&repository.join("nested"), &["init"]);
+        run(&repository.join("nested"), &["config", "user.email", "test@example.com"]);
+        run(&repository.join("nested"), &["config", "user.name", "Test User"]);
+        fs::write(repository.join("nested/local.txt"), "local-only history\n").unwrap();
+        fs::write(repository.join("nested/.gitignore"), "*.ignored\n").unwrap();
+        run(&repository.join("nested"), &["add", "."]);
+        run(&repository.join("nested"), &["commit", "-m", "Unpublished embedded commit"]);
+        fs::write(repository.join("nested/cache.ignored"), "discard with nested repository\n").unwrap();
+        fs::write(repository.join("nested/local.txt"), "uncommitted nested edit\n").unwrap();
 
         let path = repository.to_string_lossy().into_owned();
         let mut quarantine = RestoreCheckpointQuarantine::new(&path).unwrap();
-        let error = quarantine.move_untracked(&path, "test").unwrap_err();
-        assert!(error.contains("nested Git repository"));
-        assert!(repository.join("loose.txt").exists(), "validation must happen before the first file is moved");
+        assert_eq!(quarantine.move_untracked(&path, "test").unwrap(), 2);
+        assert!(!repository.join("loose.txt").exists());
+        assert!(!repository.join("nested").exists());
+        quarantine.rollback();
+        assert!(repository.join("loose.txt").exists());
         assert!(repository.join("nested/.git").exists());
+        assert_eq!(fs::read_to_string(repository.join("nested/local.txt")).unwrap(), "uncommitted nested edit\n");
+        run(&repository.join("nested"), &["cat-file", "-e", "HEAD:local.txt"]);
+
+        assert_eq!(quarantine.move_untracked(&path, "retry").unwrap(), 2);
+        quarantine.discard().unwrap();
+        assert!(!repository.join("nested").exists(), "confirmed Clean removes the whole embedded repository");
+        assert!(!quarantine.root.exists(), "successful Clean leaves no extra safety copy");
+        run(&repository, &["cat-file", "-e", "HEAD:tracked.txt"]);
         fs::remove_dir_all(repository).unwrap();
+    }
+
+    #[test]
+    fn exact_checkpoint_quarantine_does_not_delete_gitfile_targets() {
+        let suffix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-restore-gitfile-{suffix}"));
+        let repository = base.join("parent");
+        let external = base.join("external-git");
+        let nested = repository.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        let run = |args: &[&str]| {
+            let output = Command::new("git").arg("-C").arg(&repository).args(args).output().unwrap();
+            assert!(output.status.success(), "git failed: {}", String::from_utf8_lossy(&output.stderr));
+        };
+        run(&["init"]);
+        run(&["init", "--separate-git-dir", external.to_str().unwrap(), nested.to_str().unwrap()]);
+        fs::write(nested.join("local.txt"), "discard\n").unwrap();
+        let gitfile = fs::read(nested.join(".git")).unwrap();
+        let external_config = fs::read(external.join("config")).unwrap();
+        let path = repository.to_string_lossy().into_owned();
+        let mut quarantine = RestoreCheckpointQuarantine::new(&path).unwrap();
+        assert_eq!(quarantine.move_untracked(&path, "test").unwrap(), 1);
+        quarantine.rollback();
+        assert_eq!(fs::read(nested.join(".git")).unwrap(), gitfile);
+        assert_eq!(quarantine.move_untracked(&path, "retry").unwrap(), 1);
+        quarantine.discard().unwrap();
+        assert!(!nested.exists());
+        assert_eq!(fs::read(external.join("config")).unwrap(), external_config, "never follow .git to remove external metadata");
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_checkpoint_quarantine_cleanup_does_not_follow_symlinks() {
+        let suffix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-restore-symlink-{suffix}"));
+        let safety = base.join("safety");
+        let outside = base.join("outside");
+        fs::create_dir_all(&safety).unwrap();
+        fs::create_dir_all(outside.join("empty-child")).unwrap();
+        fs::write(outside.join("keep.txt"), "outside checkout\n").unwrap();
+        std::os::unix::fs::symlink(&outside, safety.join("link")).unwrap();
+        remove_empty_restore_directories(&safety).unwrap();
+        assert!(outside.join("empty-child").exists(), "cleanup must not walk into a symlink");
+        let mut quarantine = RestoreCheckpointQuarantine { root: safety, workdir: base.clone(), moved: Vec::new() };
+        quarantine.discard().unwrap();
+        assert!(outside.join("empty-child").exists());
+        assert_eq!(fs::read_to_string(outside.join("keep.txt")).unwrap(), "outside checkout\n");
+        fs::remove_dir_all(base).unwrap();
     }
 
     #[test]

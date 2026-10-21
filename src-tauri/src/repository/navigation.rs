@@ -26,9 +26,15 @@ fn fingerprint(repo: &Repository) -> Result<String, String> {
 fn capture_inner(repository_path: &str) -> Result<Option<String>, String> {
     validate_path(repository_path)?;
     let repo = internal_repository(repository_path)?;
-    if repo.state() != git2::RepositoryState::Clean { return Ok(None); }
-    let warm = full_status_cache().lock().unwrap().get(&repo_lock_key(repository_path))
-        .is_some_and(|(at, _)| at.elapsed() < GIT_METADATA_TTL);
+    if repo.state() != git2::RepositoryState::Clean {
+        perf_log("repository_return: capture refused reason=git-operation-in-progress", Duration::ZERO);
+        return Ok(None);
+    }
+    let key = repo_lock_key(repository_path);
+    let age = full_status_cache().lock().unwrap().get(&key).map(|(at, _)| at.elapsed());
+    let warm = age.is_some_and(|age| age < GIT_METADATA_TTL);
+    perf_log(&perf_logging::cache_lookup_label("parent_return", &key, None, age, GIT_METADATA_TTL,
+        if warm { "validate_metadata" } else { "unavailable" }), Duration::ZERO);
     if !warm { return Ok(None); }
     Ok(Some(format!("{}:{}", status_cache_epoch(repository_path), fingerprint(&repo)?)))
 }
