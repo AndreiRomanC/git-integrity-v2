@@ -17,7 +17,7 @@ function fitWorkingTreeHeight(height, viewportHeight) {
   return Math.min(max, Math.max(Math.min(220, max), height));
 }
 
-function bindPanelResize(handle, { read, resize, reset }, host = window) {
+function bindPanelResize(handle, { read, resize, reset, canStart = () => true }, host = window) {
   let active = null;
   const finish = () => {
     if (!active) return;
@@ -35,7 +35,7 @@ function bindPanelResize(handle, { read, resize, reset }, host = window) {
     resize(active.rect, event.clientX - active.x, event.clientY - active.y);
   };
   handle.addEventListener('pointerdown', event => {
-    if (event.button !== 0) return;
+    if (event.button !== 0 || !canStart(event)) return;
     event.preventDefault(); event.stopPropagation(); finish();
     active = { id: event.pointerId, x: event.clientX, y: event.clientY, rect: read() };
     handle.classList.add('resizing');
@@ -47,10 +47,10 @@ function bindPanelResize(handle, { read, resize, reset }, host = window) {
   });
   handle.addEventListener('lostpointercapture', finish);
   handle.addEventListener('click', event => event.stopPropagation());
-  handle.addEventListener('dblclick', event => { event.preventDefault(); reset(); });
+  handle.addEventListener('dblclick', event => { if (canStart(event)) { event.preventDefault(); reset?.(); } });
   handle.addEventListener('keydown', event => {
     const steps = { ArrowLeft: [-24, 0], ArrowRight: [24, 0], ArrowUp: [0, -24], ArrowDown: [0, 24] };
-    if (!steps[event.key]) return;
+    if (!steps[event.key] || !canStart(event)) return;
     event.preventDefault(); event.stopPropagation();
     resize(read(), ...steps[event.key]);
   });

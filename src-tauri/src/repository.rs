@@ -12,6 +12,7 @@ pub mod remotes;
 pub mod snapshot_export;
 pub mod navigation;
 pub mod comparison;
+pub mod submodule_compare;
 mod perf_logging;
 mod process_control;
 #[cfg(test)]
@@ -1021,6 +1022,7 @@ pub struct RevisionCompareCommit {
 
 #[derive(Serialize)]
 pub struct RevisionCompareDirectory {
+    repository_path: String,
     left_ref: String,
     right_ref: String,
     left_revision: String,
@@ -8653,6 +8655,7 @@ fn compare_git_tree_directory(repository_path: &str, relative_path: &str, left_r
         b_folder.cmp(&a_folder).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
     });
     Ok(RevisionCompareDirectory {
+        repository_path: repository_path.into(),
         left_ref: left_ref.into(),
         right_ref: right_ref.into(),
         left_revision: left_revision.clone(),
@@ -8666,6 +8669,7 @@ fn compare_git_tree_directory(repository_path: &str, relative_path: &str, left_r
 
 fn revision_compare_result(repository_path: &str, relative_path: String, left_ref: &str, right_ref: &str, left_revision: String, right_revision: String, rows: Vec<CommanderRow>) -> RevisionCompareDirectory {
     RevisionCompareDirectory {
+        repository_path: repository_path.into(),
         left_ref: left_ref.into(),
         right_ref: right_ref.into(),
         left_revision: left_revision.clone(),

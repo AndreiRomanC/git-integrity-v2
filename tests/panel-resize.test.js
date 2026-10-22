@@ -57,3 +57,19 @@ test('drag resize uses only geometry, cleans up on release/cancel/blur, and supp
   handle.fire('dblclick');
   assert.equal(calls.at(-1), 'reset');
 });
+
+test('header drag repositions without resizing and leaves header buttons usable', () => {
+  const handle = surface(), host = surface();
+  let rect = { left: 100, top: 120, width: 900, height: 600 };
+  bindPanelResize(handle, { canStart: event => !event.interactive,
+    read: () => rect, resize: (start, dx, dy) => { rect = fitFloatingPanel({ ...start, left: start.left + dx, top: start.top + dy }, { width: 1600, height: 1000 }); },
+  }, host);
+  handle.fire('pointerdown', { interactive: true });
+  host.fire('pointermove', { clientX: 400 });
+  assert.equal(rect.left, 100);
+  handle.fire('pointerdown'); host.fire('pointermove', { clientX: 140, clientY: 230 }); host.fire('pointerup');
+  assert.deepEqual(rect, { left: 140, top: 150, width: 900, height: 600 });
+  handle.fire('keydown', { key: 'ArrowLeft', interactive: true }); assert.equal(rect.left, 140);
+  handle.fire('keydown', { key: 'ArrowLeft' }); assert.equal(rect.left, 116);
+  handle.fire('dblclick'); // header movement does not require a reset callback
+});

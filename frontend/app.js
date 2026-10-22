@@ -2055,13 +2055,41 @@ function renderCommander() {
   refs.commanderRows.querySelectorAll('[data-commander-entry]').forEach(rowNode => {
     const row = state.commanderRows.find(item => item.relative_path === rowNode.dataset.commanderEntry);
     if (row?.local?.kind === 'submodule' || row?.remote?.kind === 'submodule') {
-      rowNode.addEventListener('click', () => branchCompareMode ? openGitRevisionFileCompare(row) : openWorkspaceRevisionFileCompare(row));
+      SubmoduleCompareDetails.bindRow(rowNode, () => openSubmoduleComparisonDetails(row));
       return;
     }
     rowNode.addEventListener('dblclick', () => { const entry = row?.local || row?.remote; if (entry?.kind === 'folder') openCommanderDirectory(row.relative_path); });
     rowNode.addEventListener('click', () => { const localIsFile = !row?.local || row.local.kind === 'file'; const remoteIsFile = !row?.remote || row.remote.kind === 'file'; const eitherIsFile = row?.local?.kind === 'file' || row?.remote?.kind === 'file'; if (eitherIsFile && localIsFile && remoteIsFile) branchCompareMode ? openGitRevisionFileCompare(row) : state.compareMode === 'git' && !state.comparisonContext?.submodulePath ? openFileCompare(row) : openWorkspaceRevisionFileCompare(row); });
   });
   const focused = refs.commanderRows.querySelector('.commander-row.focused, .flat-compare-row.focused'); if (focused) requestAnimationFrame(() => focused.scrollIntoView({ block: 'center' }));
+}
+
+let submoduleDetailsPanel = null;
+function openSubmoduleComparisonDetails(row, nested = false) {
+  const snapshot = nested ? state.submoduleCompare : state.commanderComparisonResult;
+  if (!snapshot || snapshot.loading || (!nested && state.commanderComparisonLoading)) return;
+  const context = state.comparisonContext, session = state.comparisonSession;
+  const spec = nested ? null : commanderComparisonSpec();
+  const repositoryPath = nested ? snapshot.repositoryPath : spec.repositoryPath;
+  const leftRef = nested ? snapshot.leftRevision : spec.workspace ? null : snapshot.left_revision;
+  const rightRef = nested ? snapshot.rightRevision : spec.workspace ? snapshot.remote_revision : snapshot.right_revision;
+  if (!repositoryPath || !rightRef || (!nested && !spec.workspace && !leftRef)) return;
+  const isCurrent = () => state.view === 'commander' && state.comparisonContext === context && state.comparisonSession === session
+    && (nested ? state.compareMode === 'submodule' && state.submoduleCompare === snapshot && !snapshot.loading && snapshot.leftRevision === leftRef && snapshot.rightRevision === rightRef
+      : state.commanderComparisonResult === snapshot && !state.commanderComparisonLoading);
+  if (!submoduleDetailsPanel) submoduleDetailsPanel = SubmoduleCompareDetails.create({
+    dialog: $('#submoduleDetailsDialog'), body: $('#submoduleDetailsBody'), compareButton: $('#submoduleDetailsCompare'),
+    load: args => invoke ? invoke('submodule_comparison_details', args) : Promise.reject('Available in the desktop application.'),
+    onCompare: async (details, isActive) => {
+      const owner = state.repository?.path, context = state.comparisonContext, session = state.comparisonSession;
+      const target = { owner, repositoryPath: details.compare_repository_path, originPath: '', submodulePath: '', name: details.relative_path.split('/').pop() };
+      await ensureComparisonContext(target);
+      if (!isActive() || state.repository?.path !== owner || state.comparisonContext !== context || state.comparisonSession !== session) return;
+      await openRepositoryRevisionCompare(details.left.revision, details.right.revision, '', '', target);
+    },
+  });
+  return submoduleDetailsPanel.open({ repositoryPath, relativePath: row.relative_path, leftRef, rightRef,
+    workspaceRevision: !nested && spec.workspace ? row.local?.revision || null : null }, isCurrent);
 }
 
 function revisionDisplay(value = '') { return value ? value.slice(0, 8) : '—'; }
@@ -2190,6 +2218,10 @@ function renderSubmoduleCompare() {
   refs.subCompareRows.querySelector('[data-commander-up]')?.addEventListener('click', () => { const parent = state.commanderPath.split('/').slice(0, -1).join('/'); openSubmoduleCompareDirectory(parent); });
   refs.subCompareRows.querySelectorAll('[data-sub-compare-entry]').forEach(rowNode => {
     const row = rowsSource.find(item => item.relative_path === rowNode.dataset.subCompareEntry);
+    if (row?.local?.kind === 'submodule' || row?.remote?.kind === 'submodule') {
+      SubmoduleCompareDetails.bindRow(rowNode, () => openSubmoduleComparisonDetails(row, true));
+      return;
+    }
     rowNode.addEventListener('dblclick', () => {
       const left = row?.local, right = row?.remote;
       if (left?.kind === 'folder' || right?.kind === 'folder') openSubmoduleCompareDirectory(row.relative_path);
@@ -2197,9 +2229,6 @@ function renderSubmoduleCompare() {
     });
     rowNode.addEventListener('click', () => {
       const left = row?.local, right = row?.remote;
-      if (state.subCompareFlatMode && (left?.kind === 'submodule' || right?.kind === 'submodule')) {
-        openSubmoduleRevisionFileCompare(row); return;
-      }
       const eitherIsFile = left?.kind === 'file' || right?.kind === 'file';
       if (eitherIsFile && (!left || left.kind === 'file') && (!right || right.kind === 'file')) openSubmoduleRevisionFileCompare(row);
     });
@@ -2307,6 +2336,7 @@ async function openSubmoduleCompareDirectory(path = state.commanderPath || '') {
     if (!stillCurrent()) return;
     compare.loading = null;
     Object.assign(compare, {
+      repositoryPath: result.repository_path,
       rows: result.rows || [],
       leftRevision: result.left_revision || result.leftRevision || '',
       rightRevision: result.right_revision || result.rightRevision || '',
@@ -4002,7 +4032,7 @@ function renderFolderRestoreCommits() {
   refs.folderRestoreCommitList.innerHTML = model.commits.map(commit => {
     const selected = commit.id === model.selectedCommit;
     const isStart = start?.id === commit.id;
-    return `<div class="folder-restore-commit-row ${isStart ? 'compare-start' : ''}"><button type="button" class="folder-restore-commit ${selected ? 'selected' : ''}" data-folder-restore-commit="${esc(commit.id)}" aria-pressed="${selected}" title="Select this snapshot for restore"><span class="folder-restore-commit-marker" aria-hidden="true">${selected ? '●' : '○'}</span><span class="folder-restore-commit-content"><strong>${esc(commit.subject || 'No message')}</strong><span class="folder-restore-commit-meta"><code title="${esc(commit.id)}">${esc(commit.id.slice(0, 8))}</code><span>${esc(commit.author || 'Unknown')}</span><time>${esc(commit.date || '—')}</time></span></span></button><div class="folder-restore-compare-actions" aria-label="Read-only comparison"><button type="button" class="snapshot-download" data-restore-download="${esc(commit.id)}" title="Download this ${model.isFile ? 'file' : 'folder'} snapshot; no restore" aria-label="Download snapshot">⇩</button><button type="button" data-restore-compare-start="${esc(commit.id)}" aria-pressed="${isStart}" title="Set ${esc(commit.id.slice(0, 8))} as comparison start; does not change the restore selection">${isStart ? '✓ Compare start' : 'Set start'}</button>${start && !isStart ? `<button type="button" data-restore-compare-with="${esc(commit.id)}" title="Open Compare & Sync: ${esc(start.id.slice(0, 8))} → ${esc(commit.id.slice(0, 8))}. Nothing will be restored.">Compare with start</button>` : ''}</div></div>`;
+    return `<div class="folder-restore-commit-row ${isStart ? 'compare-start' : ''}"><button type="button" class="folder-restore-commit ${selected ? 'selected' : ''}" data-folder-restore-commit="${esc(commit.id)}" aria-pressed="${selected}" title="Select this snapshot for restore"><span class="folder-restore-commit-marker" aria-hidden="true">${selected ? '●' : '○'}</span><span class="folder-restore-commit-content"><strong>${esc(commit.subject || 'No message')}</strong><span class="folder-restore-commit-meta"><code title="${esc(commit.id)}">${esc(commit.id.slice(0, 8))}</code><span>${esc(commit.author || 'Unknown')}</span><time>${esc(commit.date || '—')}</time></span></span></button><div class="folder-restore-compare-actions" aria-label="Read-only comparison"><button type="button" class="snapshot-download" data-restore-download="${esc(commit.id)}" title="Download this ${model.isFile ? 'file' : 'folder'} snapshot; no restore" aria-label="Download snapshot"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 2v10m-4-4 4 4 4-4M3 13v4h14v-4"/></svg></button><button type="button" data-restore-compare-start="${esc(commit.id)}" aria-pressed="${isStart}" title="Set ${esc(commit.id.slice(0, 8))} as comparison start; does not change the restore selection">${isStart ? '✓ Start' : 'Set start'}</button>${start && !isStart ? `<button type="button" data-restore-compare-with="${esc(commit.id)}" title="Open Compare & Sync: ${esc(start.id.slice(0, 8))} → ${esc(commit.id.slice(0, 8))}. Nothing will be restored.">Compare</button>` : ''}</div></div>`;
   }).join('');
 }
 
@@ -6881,9 +6911,10 @@ async function openGraphRevisionCompare(leftRef, rightRef = '') {
   return openRepositoryRevisionCompare(leftRef, rightRef);
 }
 
-async function openRepositoryRevisionCompare(leftRef, rightRef, path = '', focus = '') {
+async function openRepositoryRevisionCompare(leftRef, rightRef, path = '', focus = '', comparisonContext = null) {
   if (!state.repository?.path || !leftRef || !rightRef) return;
-  setCompareOrigin(path);
+  if (comparisonContext) state.comparisonContext = comparisonContext;
+  else setCompareOrigin(path);
   state.comparisonSession = (state.comparisonSession || 0) + 1;
   closeSubmoduleGraph();
   state.view = 'commander';
@@ -9197,6 +9228,11 @@ refs.subCompareSwap.addEventListener('click', () => {
 });
 $('#closeSubmoduleMenu').addEventListener('click', closeSubmoduleMenu);
 $('#compareSelectedVersions').addEventListener('click', compareSelectedSubmoduleVersions);
+bindPanelResize($('#submoduleMenuDrag'), {
+  canStart: event => !event.target.closest('button, input, select, a'),
+  read: () => refs.submoduleMenu.getBoundingClientRect(),
+  resize: (rect, dx, dy) => placeSubmoduleMenu({ width: rect.width, height: rect.height, left: rect.left + dx, top: rect.top + dy }),
+});
 for (const [id, widthOnly] of [['submoduleWidthResize', true], ['submoduleCornerResize', false]]) {
   bindPanelResize($(`#${id}`), {
     read: () => refs.submoduleMenu.getBoundingClientRect(),

@@ -1034,6 +1034,10 @@ button.pr-reviewer:hover { border-color: #59758e; background: #1b2b38; color: #e
 .version-compare-bar button:hover:not(:disabled) { border-color: var(--blue); background: #203449; }
 .submodule-menu .version-row.version-compare-selected { background: #1b3448; border-top-color: #527a9c; border-right-color: #527a9c; border-bottom-color: #527a9c; }
 .submodule-menu > header { min-height: 58px; display: flex; align-items: center; padding: 10px 13px 10px 16px; border-bottom: 1px solid var(--border); background: #1c2631; }
+.submodule-menu > #submoduleMenuDrag { cursor: grab; touch-action: none; user-select: none; }
+.submodule-menu > #submoduleMenuDrag.resizing { cursor: grabbing; }
+.submodule-menu > #submoduleMenuDrag:focus-visible { outline: 1px solid var(--blue); outline-offset: -3px; }
+.submodule-menu > #submoduleMenuDrag button { cursor: pointer; }
 .submodule-menu > header div { min-width: 0; display: flex; flex-direction: column; gap: 3px; }.submodule-menu > header span { color: #7f92a4; font-size: 9px; letter-spacing: .9px; }.submodule-menu > header strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .submodule-menu > header button { width: 30px; height: 30px; margin-left: 6px; border: 0; border-radius: 6px; background: transparent; color: #9babb9; font-size: 18px; }.submodule-menu > header button:first-of-type { margin-left: auto; }.submodule-menu > header button:hover { background: #2a3642; }
 .submodule-menu > header .version-fetch-button { width: auto; flex-shrink: 0; padding: 0 10px; border: 1px solid var(--border); font-size: 11px; white-space: nowrap; }
@@ -1248,10 +1252,35 @@ dialog form { padding: 28px; text-align: center; }dialog h2 { margin: 0 0 10px; 
 .folder-restore-commit-list { max-height: min(340px, 38vh); overflow: auto; padding: 6px; }
 .folder-restore-commit-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: start; gap: 6px; margin-bottom: 4px; }
 .folder-restore-commit-row.compare-start { border-radius: 5px; box-shadow: inset 3px 0 #52bfc8; background: #143139; }
-.folder-restore-compare-actions { display: grid; gap: 4px; padding: 8px 4px 8px 0; }
+.folder-restore-compare-actions { display: flex; align-items: center; gap: 4px; padding: 10px 5px 8px 0; }
 .folder-restore-compare-actions button, .folder-restore-compare-bar button { width: auto; height: auto; margin: 0; padding: 5px 7px; font-size: 10px; line-height: 1.35; }
-.folder-restore-compare-actions .snapshot-download { justify-self: end; width: 30px; font-size: 16px; }
-.folder-restore-compare-actions button[aria-pressed="true"] { border-color: #52bfc8; color: #94dce2; }
+.folder-restore-dialog .folder-restore-compare-actions button { display: inline-flex; align-items: center; justify-content: center; gap: 4px; min-height: 28px; padding: 4px 7px; border: 1px solid #334553; border-radius: 5px; background: transparent; color: #a7bdce; font-size: 10px; font-weight: 500; white-space: nowrap; }
+.folder-restore-dialog .folder-restore-compare-actions button:hover { background: #213343; border-color: #6b94b3; color: #e0edfa; }
+.folder-restore-dialog .folder-restore-compare-actions button:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
+.folder-restore-dialog .folder-restore-compare-actions .snapshot-download { width: 28px; padding: 5px; border-color: transparent; }
+.folder-restore-compare-actions svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+.folder-restore-dialog .folder-restore-compare-actions button[aria-pressed="true"] { border-color: #478c99; background: #17303a; color: #a7e1e5; }
+.submodule-details-dialog { width: min(1040px, calc(100vw - 40px)); max-height: calc(100vh - 40px); padding: 0; background: #111b24; color: #d2dfea; border: 1px solid #405568; border-radius: 10px; }
+.submodule-details-dialog[open] { display: flex; flex-direction: column; }
+.submodule-details-dialog button { width: auto; height: 32px; margin: 0; cursor: pointer; }
+.submodule-details-dialog button:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
+.submodule-details-dialog > header { display: flex; flex: none; align-items: center; justify-content: space-between; gap: 16px; padding: 18px 22px; border-bottom: 1px solid var(--border); }
+.submodule-details-dialog h2 { margin: 0; font-size: 18px; }.submodule-details-dialog header p { margin: 5px 0 0; color: #91a5b6; font-size: 12px; }
+.submodule-details-dialog header button { width: 32px; flex: none; background: transparent; color: #9fb3c3; border: 0; font-size: 22px; padding: 4px 9px; }
+.submodule-details-body { padding: 18px 22px; overflow: auto; min-height: 100px; }
+.submodule-detail-location { margin-bottom: 16px; overflow-wrap: anywhere; }
+.submodule-details-dialog dl { display: grid; grid-template-columns: 118px minmax(0, 1fr); gap: 7px 10px; margin: 12px 0; font-size: 11px; line-height: 1.5; }
+.submodule-details-dialog dt { color: #859bad; }.submodule-details-dialog dd { margin: 0; overflow-wrap: anywhere; user-select: text; }
+.submodule-detail-sides { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+.submodule-detail-side { min-width: 0; padding: 14px 16px; background: #17232e; border: 1px solid #304353; border-radius: 7px; }
+.submodule-detail-side h3 { margin: 0 0 12px; color: #a7ccef; font-size: 12px; }
+.submodule-detail-message { padding: 12px 0; border-block: 1px solid #304353; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; line-height: 1.6; user-select: text; }
+.submodule-detail-note { margin: 12px 0 0; color: #99adbd; font-size: 11px; line-height: 1.6; overflow-wrap: anywhere; }
+.submodule-details-dialog footer { display: flex; flex: none; justify-content: flex-end; gap: 8px; padding: 14px 22px; border-top: 1px solid var(--border); }
+.submodule-details-dialog footer button { border: 1px solid #456077; border-radius: 5px; padding: 8px 14px; color: #d5e7f7; background: #203446; }
+.submodule-details-dialog footer button:last-child { background: #225d8b; }.submodule-details-dialog footer button:disabled { opacity: .45; cursor: not-allowed; }
+@media (max-width: 720px) { .submodule-detail-sides { grid-template-columns: 1fr; } }
+
 .folder-restore-compare-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 5px 8px; padding: 8px 10px; border-bottom: 1px solid #263744; color: #a7c4d8; font-size: 11px; }
 .folder-restore-compare-bar span { flex: 1; }
 .folder-restore-compare-bar small { flex-basis: 100%; color: #8799a9; font-size: 10px; }

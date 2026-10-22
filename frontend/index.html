@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Git DrillDown</title>
   <link rel="icon" type="image/png" href="assets/git-drilldown-mark.png">
-  <link rel="stylesheet" href="styles.css?v=20261022-submodule-ui">
-  <link rel="stylesheet" href="polarion.css?v=20261022-submodule-ui">
+  <link rel="stylesheet" href="styles.css?v=20261022-submodule-details">
+  <link rel="stylesheet" href="polarion.css?v=20261022-submodule-details">
 </head>
 <body>
   <div class="app-shell">
@@ -261,7 +261,7 @@
     </section>
 
     <section id="submoduleMenu" class="submodule-menu" hidden aria-label="Submodule versions">
-      <header>
+      <header id="submoduleMenuDrag" tabindex="0" aria-label="Move submodule version window" title="Drag to move · arrow keys to reposition">
         <div><span>SUBMODULE VERSION</span><strong id="submoduleMenuName">Submodule</strong></div>
         <button id="fetchSubmoduleVersions" class="version-fetch-button" title="Fetch all origin branches and tags, including moved server tags, then refresh this list. Previous tag targets are preserved for recovery. Does not change checkout or the project's selected version.">↓ Fetch versions</button>
         <button id="refreshSubmoduleMenu" title="Refresh local branches, tags and current submodule state from disk. Does not contact the server.">↻</button>
@@ -394,6 +394,11 @@
       <button type="button" data-polarion-search="scope" class="polarion-search-button">P⌕ Find task</button>
       <div class="commit-dialog-actions"><button value="cancel">Cancel</button><button value="default" id="confirmScopeCommit" class="confirm" disabled>Commit selection</button></div>
     </form>
+  </dialog>
+  <dialog id="submoduleDetailsDialog" class="submodule-details-dialog" aria-labelledby="submoduleDetailsTitle">
+    <header><div><h2 id="submoduleDetailsTitle">Submodule version details</h2><p>Exact pointers · local metadata · read-only</p></div><button type="button" data-submodule-details-close aria-label="Close">×</button></header>
+    <div id="submoduleDetailsBody" class="submodule-details-body"></div>
+    <footer><button type="button" data-submodule-details-close>Close</button><button type="button" id="submoduleDetailsCompare" disabled>Compare contents</button></footer>
   </dialog>
   <dialog id="compareDialog" class="compare-dialog">
     <form method="dialog">
@@ -904,19 +909,20 @@
       <footer><span>Read-only on Polarion · local snapshots outside Git</span><button value="cancel">Close</button><button type="button" id="polarionAdd" class="confirm" disabled>Add to Commit List</button></footer>
     </form>
   </dialog>
-  <script src="polarion.js?v=20261022-submodule-ui"></script>
-  <script src="console-context.js?v=20261022-submodule-ui"></script>
-  <script src="graph-model.js?v=20261022-submodule-ui"></script>
-  <script src="submodule-state.js?v=20261022-submodule-ui"></script>
-  <script src="submodule-versions.js?v=20261022-submodule-ui"></script>
-  <script src="local-diff.js?v=20261022-submodule-ui"></script>
-  <script src="local-drive.js?v=20261022-submodule-ui"></script>
-  <script src="pr-status.js?v=20261022-submodule-ui"></script>
-  <script src="refresh-coordinator.js?v=20261022-submodule-ui"></script>
-  <script src="comparison-authors.js?v=20261022-submodule-ui"></script>
-  <script src="git-activity.js?v=20261022-submodule-ui"></script>
-  <script src="comparison-navigation.js?v=20261022-submodule-ui"></script>
-  <script src="panel-resize.js?v=20261022-submodule-ui"></script>
-  <script src="app.js?v=20261022-submodule-ui"></script>
+  <script src="polarion.js?v=20261022-submodule-details"></script>
+  <script src="console-context.js?v=20261022-submodule-details"></script>
+  <script src="graph-model.js?v=20261022-submodule-details"></script>
+  <script src="submodule-state.js?v=20261022-submodule-details"></script>
+  <script src="submodule-versions.js?v=20261022-submodule-details"></script>
+  <script src="local-diff.js?v=20261022-submodule-details"></script>
+  <script src="local-drive.js?v=20261022-submodule-details"></script>
+  <script src="pr-status.js?v=20261022-submodule-details"></script>
+  <script src="refresh-coordinator.js?v=20261022-submodule-details"></script>
+  <script src="comparison-authors.js?v=20261022-submodule-details"></script>
+  <script src="git-activity.js?v=20261022-submodule-details"></script>
+  <script src="comparison-navigation.js?v=20261022-submodule-details"></script>
+  <script src="panel-resize.js?v=20261022-submodule-details"></script>
+  <script src="submodule-compare-details.js?v=20261022-submodule-details"></script>
+  <script src="app.js?v=20261022-submodule-details"></script>
 </body>
 </html>

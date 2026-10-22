@@ -87,6 +87,7 @@ pub fn run() {
             repository::restore_path_history,
             repository::compare_remote_directory,
             repository::comparison::comparison_context,
+            repository::submodule_compare::submodule_comparison_details,
             repository::comparison::compare_workspace_revision,
             repository::comparison::compare_workspace_revision_file,
             repository::compare_remote_file_list,

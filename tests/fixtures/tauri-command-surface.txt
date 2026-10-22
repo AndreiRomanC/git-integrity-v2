@@ -10,6 +10,7 @@ change_submodule_url
 checkout_commit
 combine_local_commits
 comparison_authors
+submodule_comparison_details
 comparison_author_contributions
 checkout_remote_tracking_branch
 choose_folder

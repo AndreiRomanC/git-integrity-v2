@@ -62,6 +62,9 @@ test('restore history comparison selects two exact commits without changing rest
   assert.equal(model.selectedCommit, 'C1');
   assert.equal(model.preview, oldPreview);
   assert.match(h.refs.folderRestoreCommitList.innerHTML, /data-restore-compare-with="C1"/);
+  assert.match(h.refs.folderRestoreCommitList.innerHTML, /aria-label="Download snapshot"><svg/);
+  assert.match(h.refs.folderRestoreCommitList.innerHTML, />✓ Start<\/button>/);
+  assert.match(h.refs.folderRestoreCommitList.innerHTML, />Compare<\/button>/);
   assert.doesNotMatch(h.refs.folderRestoreCommitList.innerHTML, /data-restore-compare-with="C2"/);
   let args;
   h.context.openRepositoryRevisionCompare = async (...values) => { args = values; };
