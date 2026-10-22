@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Git DrillDown</title>
   <link rel="icon" type="image/png" href="assets/git-drilldown-mark.png">
-  <link rel="stylesheet" href="styles.css?v=20261022-history-navigation">
-  <link rel="stylesheet" href="polarion.css?v=20261022-history-navigation">
+  <link rel="stylesheet" href="styles.css?v=20261022-submodule-ui">
+  <link rel="stylesheet" href="polarion.css?v=20261022-submodule-ui">
 </head>
 <body>
   <div class="app-shell">
@@ -242,7 +242,7 @@
     </main>
 
     <section id="changesDrawer" class="changes-drawer" aria-label="Working tree changes">
-      <div class="drawer-handle"></div>
+      <div id="workingTreeResize" class="drawer-handle" role="separator" aria-orientation="horizontal" aria-label="Resize Working tree" tabindex="0" title="Drag up to enlarge · arrow keys to resize · double-click to reset"></div>
       <div class="drawer-head">
         <div><strong id="drawerScopeTitle">Working directory</strong><span id="changesSummary">No changes</span></div>
         <button id="stageAllButton" title="Stage every change in this view, syncing the index with what's actually on disk">Stage all</button>
@@ -277,7 +277,12 @@
       </div>
       <input id="submoduleVersionSearch" class="version-search" type="text" placeholder="Search branches, SHAs or messages…" autocomplete="off" spellcheck="false">
       <div id="submoduleVersions" class="version-list"></div>
-      <footer id="submoduleVersionHelp" class="version-help">Use Checkout to change version. “Replace with remote…” is a destructive recovery action shown only for a branch that differs from origin.</footer>
+      <footer class="version-help">
+        <div class="version-compare-bar"><span id="submoduleVersionSelection">Ctrl/Cmd-click two commits to compare · right-click for actions</span><button id="compareSelectedVersions" type="button" disabled>Compare commits</button></div>
+        <span id="submoduleVersionHelp">Use Checkout to change version. “Replace with remote…” is a destructive recovery action shown only for a branch that differs from origin.</span>
+      </footer>
+      <div id="submoduleWidthResize" class="panel-resize-edge" role="separator" aria-orientation="vertical" aria-label="Resize version window width" tabindex="0" title="Drag to widen · arrow keys to resize · double-click to reset"></div>
+      <div id="submoduleCornerResize" class="panel-resize-corner" role="button" aria-label="Resize version window" tabindex="0" title="Drag to resize · arrow keys to resize · double-click to reset">◢</div>
     </section>
 
     <dialog id="subCompareRevisionDialog" class="submodule-revision-dialog">
@@ -899,18 +904,19 @@
       <footer><span>Read-only on Polarion · local snapshots outside Git</span><button value="cancel">Close</button><button type="button" id="polarionAdd" class="confirm" disabled>Add to Commit List</button></footer>
     </form>
   </dialog>
-  <script src="polarion.js?v=20261022-history-navigation"></script>
-  <script src="console-context.js?v=20261022-history-navigation"></script>
-  <script src="graph-model.js?v=20261022-history-navigation"></script>
-  <script src="submodule-state.js?v=20261022-history-navigation"></script>
-  <script src="submodule-versions.js?v=20261022-history-navigation"></script>
-  <script src="local-diff.js?v=20261022-history-navigation"></script>
-  <script src="local-drive.js?v=20261022-history-navigation"></script>
-  <script src="pr-status.js?v=20261022-history-navigation"></script>
-  <script src="refresh-coordinator.js?v=20261022-history-navigation"></script>
-  <script src="comparison-authors.js?v=20261022-history-navigation"></script>
-  <script src="git-activity.js?v=20261022-history-navigation"></script>
-  <script src="comparison-navigation.js?v=20261022-history-navigation"></script>
-  <script src="app.js?v=20261022-history-navigation"></script>
+  <script src="polarion.js?v=20261022-submodule-ui"></script>
+  <script src="console-context.js?v=20261022-submodule-ui"></script>
+  <script src="graph-model.js?v=20261022-submodule-ui"></script>
+  <script src="submodule-state.js?v=20261022-submodule-ui"></script>
+  <script src="submodule-versions.js?v=20261022-submodule-ui"></script>
+  <script src="local-diff.js?v=20261022-submodule-ui"></script>
+  <script src="local-drive.js?v=20261022-submodule-ui"></script>
+  <script src="pr-status.js?v=20261022-submodule-ui"></script>
+  <script src="refresh-coordinator.js?v=20261022-submodule-ui"></script>
+  <script src="comparison-authors.js?v=20261022-submodule-ui"></script>
+  <script src="git-activity.js?v=20261022-submodule-ui"></script>
+  <script src="comparison-navigation.js?v=20261022-submodule-ui"></script>
+  <script src="panel-resize.js?v=20261022-submodule-ui"></script>
+  <script src="app.js?v=20261022-submodule-ui"></script>
 </body>
 </html>

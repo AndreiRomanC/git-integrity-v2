@@ -135,6 +135,9 @@ const directoryCache = new Map();
 const parentReturnSnapshots = new Map(); // Session only; at most four nesting contexts.
 let submoduleMenuData = null;
 let submoduleMenuEntry = null;
+let submoduleMenuRepositoryPath = '';
+let submoduleCompareSelection = [];
+let submoduleMenuSize = { width: 1060, height: 760 };
 let drawerPolarionReferences = null;
 let scopePolarionReferences = null;
 let commitWriteRunning = false;
@@ -1829,7 +1832,8 @@ function renderBranchCompareSelectors() {
 
 function commanderSide(entry, side) {
   if (!entry) return `<span class="commander-side empty ${side}">— not present —</span>`;
-  return `<span class="commander-side ${side}">${iconFor(entry)}<span class="commander-file-copy"><strong>${esc(entry.name)}</strong><small>${entry.kind}${entry.kind === 'file' ? ` · ${formatSize(entry.size)}` : ''}</small></span></span>`;
+  const meta = entry.kind === 'submodule' && entry.revision ? `submodule · ${entry.revision.slice(0, 8)}` : `${entry.kind}${entry.kind === 'file' ? ` · ${formatSize(entry.size)}` : ''}`;
+  return `<span class="commander-side ${side}">${iconFor(entry)}<span class="commander-file-copy"><strong>${esc(entry.name)}</strong><small title="${esc(entry.revision || '')}">${esc(meta)}</small></span></span>`;
 }
 function flatCompareSide(entry, side, fallbackPath = '') {
   const sideLabel = side === 'local' ? 'left' : 'right';
@@ -3348,8 +3352,12 @@ async function openDirectoryFast(path) {
 
 const openSubmoduleMenuGuard = createRequestGuard();
 function closeSubmoduleMenu() {
+  openSubmoduleMenuGuard();
   refs.submoduleMenu.hidden = true;
   submoduleMenuData = null;
+  submoduleCompareSelection = [];
+  submoduleMenuRepositoryPath = '';
+  document.querySelectorAll('[data-version-context]').forEach(menu => menu.remove());
 }
 async function refreshSubmoduleMenu(button = null) {
   if (!submoduleMenuEntry || refs.submoduleMenu.hidden) return;
@@ -3363,7 +3371,7 @@ async function refreshSubmoduleMenu(button = null) {
   if (!invoke) { renderSubmoduleVersions(); finishButton(); return; }
   try {
     const data = await invoke('submodule_versions', { repositoryPath, relativePath: entryPath });
-    if (!stillCurrent() || refs.submoduleMenu.hidden || submoduleMenuEntry?.relative_path !== entryPath) return;
+    if (!stillCurrent() || state.repository?.path !== repositoryPath || refs.submoduleMenu.hidden || submoduleMenuEntry?.relative_path !== entryPath) return;
     submoduleMenuData = data;
     renderSubmoduleVersions();
     if (button) status(`${entry.name}: local versions refreshed. Use Fetch versions for new server refs.`);
@@ -3373,16 +3381,14 @@ async function refreshSubmoduleMenu(button = null) {
 }
 async function openSubmoduleMenu(entry, x, y) {
   submoduleMenuEntry = entry;
+  submoduleMenuRepositoryPath = state.repository?.path || '';
   submoduleCrossSelected = null;
+  submoduleMenuData = null;
+  submoduleCompareSelection = [];
+  syncSubmoduleCompareSelection();
   openSubmoduleMenuGuard();
   refs.submoduleMenu.hidden = false;
-  // Keep the wider, readable selector fully inside the viewport. Its old
-  // 440px positioning clamp was left behind after the contents grew, so the
-  // recovery and Checkout buttons could overlap text or extend off-screen.
-  const menuWidth = Math.min(860, innerWidth - 32);
-  const menuHeight = Math.min(760, innerHeight - 32);
-  refs.submoduleMenu.style.left = `${Math.max(16, Math.min(x, innerWidth - menuWidth - 16))}px`;
-  refs.submoduleMenu.style.top = `${Math.max(16, Math.min(y, innerHeight - menuHeight - 16))}px`;
+  placeSubmoduleMenu({ ...submoduleMenuSize, left: x, top: y });
   refs.submoduleMenuName.textContent = entry.name; refs.currentSubmoduleVersion.textContent = 'Loading…';
   refs.submoduleVersionSearch.value = '';
   refs.submoduleVersions.innerHTML = '<div class="version-loading"><i class="spinner"></i>Reading branches, tags and commits…</div>';
@@ -3455,6 +3461,9 @@ function renderSubmoduleVersions() {
       : rows;
   }
   refs.submoduleVersions.innerHTML = html;
+  submoduleCompareSelection = submoduleCompareSelection.filter(id => submoduleMenuData.versions.some(item => item.revision === id));
+  bindSubmoduleVersionSelection();
+  syncSubmoduleCompareSelection();
   refs.submoduleVersions.querySelectorAll('[data-download-version]').forEach(button => button.addEventListener('click', event => {
     event.stopPropagation();
     if (!submoduleMenuEntry || !state.repository) return;
@@ -3499,6 +3508,67 @@ function renderSubmoduleVersions() {
     const row = button.closest('[data-revision]');
     if (submoduleMenuEntry && row) openCreateSubmoduleTagDialog(submoduleMenuEntry, row.dataset.revision, row.querySelector('.version-subject')?.textContent || '');
   }));
+}
+
+function bindSubmoduleVersionSelection() {
+  refs.submoduleVersions.querySelectorAll('.version-row').forEach(row => {
+    const select = event => {
+      if (event.target.closest('button, [role="button"], summary, a')) return;
+      submoduleCompareSelection = selectSubmoduleCompareRevision(submoduleCompareSelection, row.dataset.revision, event.ctrlKey || event.metaKey);
+      syncSubmoduleCompareSelection();
+    };
+    row.addEventListener('click', select);
+    row.addEventListener('keydown', event => {
+      if (event.target !== row || !['Enter', ' '].includes(event.key)) return;
+      event.preventDefault(); event.stopPropagation(); select(event);
+    });
+    row.addEventListener('contextmenu', event => showSubmoduleVersionCompareMenu(event, row.dataset.revision));
+  });
+}
+
+function syncSubmoduleCompareSelection() {
+  refs.submoduleVersions.querySelectorAll('.version-row').forEach(row => {
+    const position = submoduleCompareSelection.indexOf(row.dataset.revision);
+    row.classList.toggle('version-compare-selected', position !== -1);
+    row.setAttribute('aria-label', `${row.dataset.name} · ${row.dataset.revision}${position !== -1 ? ` · comparison ${position === 0 ? 'left' : 'right'}` : ''}`);
+  });
+  $('#compareSelectedVersions').disabled = submoduleCompareSelection.length !== 2;
+  $('#submoduleVersionSelection').textContent = submoduleCompareSelection.length
+    ? `${submoduleCompareSelection.map(id => id.slice(0, 8)).join(' → ')} · ${submoduleCompareSelection.length}/2 selected · Ctrl/Cmd-click to toggle`
+    : 'Ctrl/Cmd-click two commits to compare · right-click for actions';
+}
+
+function compareSelectedSubmoduleVersions() {
+  if (refs.submoduleMenu.hidden || !submoduleMenuData || submoduleCompareSelection.length !== 2 || state.repository?.path !== submoduleMenuRepositoryPath) return;
+  const entry = submoduleMenuEntry, versionsData = submoduleMenuData;
+  const [leftRef, rightRef] = submoduleCompareSelection;
+  closeSubmoduleMenu();
+  return openSubmoduleCompareFromEntry(entry, { leftRef, rightRef, versionsData });
+}
+
+function showSubmoduleVersionCompareMenu(event, revision) {
+  if (!submoduleCompareSelection.includes(revision)) {
+    submoduleCompareSelection = [revision]; syncSubmoduleCompareSelection();
+  }
+  const data = submoduleMenuData, repositoryPath = state.repository?.path;
+  const selected = submoduleCompareSelection.join('|');
+  showFloatingMenu(event, [{
+    id: 'compare-selected-versions', label: 'Compare selected commits', kind: 'compare',
+    detail: submoduleCompareSelection.length === 2 ? submoduleCompareSelection.map(id => id.slice(0, 8)).join(' → ') : 'Ctrl/Cmd-click a second commit first. No checkout.',
+    disabled: submoduleCompareSelection.length !== 2,
+    run: () => {
+      if (state.repository?.path === repositoryPath && submoduleMenuData === data && submoduleCompareSelection.join('|') === selected) compareSelectedSubmoduleVersions();
+    },
+  }, { id: 'clear-version-selection', label: 'Clear selection', run: () => {
+    if (submoduleMenuData === data) { submoduleCompareSelection = []; syncSubmoduleCompareSelection(); }
+  } }]);
+  document.querySelector('.floating-action-menu')?.setAttribute('data-version-context', '');
+}
+
+function placeSubmoduleMenu(rect) {
+  const fitted = fitFloatingPanel(rect, { width: innerWidth, height: innerHeight });
+  for (const key of ['width', 'height', 'left', 'top']) refs.submoduleMenu.style[key] = `${fitted[key]}px`;
+  return fitted;
 }
 
 async function switchSubmoduleVersion(revision, kind, name, button = null) {
@@ -9126,6 +9196,33 @@ refs.subCompareSwap.addEventListener('click', () => {
   });
 });
 $('#closeSubmoduleMenu').addEventListener('click', closeSubmoduleMenu);
+$('#compareSelectedVersions').addEventListener('click', compareSelectedSubmoduleVersions);
+for (const [id, widthOnly] of [['submoduleWidthResize', true], ['submoduleCornerResize', false]]) {
+  bindPanelResize($(`#${id}`), {
+    read: () => refs.submoduleMenu.getBoundingClientRect(),
+    resize: (rect, dx, dy) => {
+      const fitted = placeSubmoduleMenu({ left: rect.left, top: rect.top, width: rect.width + dx, height: rect.height + (widthOnly ? 0 : dy) });
+      submoduleMenuSize = { width: fitted.width, height: fitted.height };
+    },
+    reset: () => { submoduleMenuSize = { width: 1060, height: 760 }; placeSubmoduleMenu({ ...submoduleMenuSize, left: 16, top: 16 }); },
+  });
+}
+function resizeWorkingTree(height) {
+  const fitted = fitWorkingTreeHeight(height, innerHeight);
+  refs.changesDrawer.style.height = `${fitted}px`;
+  $('#workingTreeResize').setAttribute('aria-valuenow', String(Math.round(fitted)));
+  $('#workingTreeResize').setAttribute('aria-valuemin', String(Math.min(220, innerHeight - 100)));
+  $('#workingTreeResize').setAttribute('aria-valuemax', String(Math.max(1, innerHeight - 100)));
+}
+bindPanelResize($('#workingTreeResize'), {
+  read: () => refs.changesDrawer.getBoundingClientRect(),
+  resize: (rect, _dx, dy) => resizeWorkingTree(rect.height - dy),
+  reset: () => resizeWorkingTree(280),
+});
+window.addEventListener('resize', () => {
+  if (!refs.submoduleMenu.hidden) placeSubmoduleMenu(refs.submoduleMenu.getBoundingClientRect());
+  if (refs.changesDrawer.classList.contains('open')) resizeWorkingTree(refs.changesDrawer.getBoundingClientRect().height);
+});
 $('#refreshSubmoduleMenu').addEventListener('click', event => refreshSubmoduleMenu(event.currentTarget));
 $('#fetchSubmoduleVersions').addEventListener('click', event => { if (submoduleMenuEntry) fetchSubmodule(submoduleMenuEntry, event.currentTarget); });
 // Uses submoduleMenuEntry (the entry the popup was actually opened for), not
@@ -9156,7 +9253,7 @@ document.addEventListener('click', event => {
   // just Cancel) would hide the versions menu underneath before the push
   // dialog itself even closes.
   const childActionOpen = refs.newBranchDialog.open || $('#newTagDialog').open || $('#submodulePublishDialog').open;
-  if (!childActionOpen && !refs.submoduleMenu.hidden && !refs.submoduleMenu.contains(event.target) && !event.target.closest('[data-entry]') && !event.target.closest('[data-detail-action="versions"]')) closeSubmoduleMenu();
+  if (!childActionOpen && !refs.submoduleMenu.hidden && !refs.submoduleMenu.contains(event.target) && !event.target.closest('[data-version-context]') && !event.target.closest('[data-entry]') && !event.target.closest('[data-detail-action="versions"]')) closeSubmoduleMenu();
 });
 refs.commitScope.addEventListener('click', openScopeCommit);
 refs.showPathHistory.addEventListener('click', showSelectedHistory);

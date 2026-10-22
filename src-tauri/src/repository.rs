@@ -896,6 +896,8 @@ pub struct SubmoduleVersion {
     kind: String,
     current: bool,
     subject: String,
+    // Already available in the loaded commit object; hover never starts another Git read.
+    message: String,
     author: String,
     date: String,
     // Only populated for kind == "tag": the local branch (if any) whose tip
@@ -6621,6 +6623,7 @@ fn submodule_versions_inner(repository_path: String, relative_path: String) -> R
             } else { (None, None, None) };
             versions.push(SubmoduleVersion {
                 name: name.clone(), revision: oid.to_string(), kind: kind.into(), current: kind == "branch" && name == current_branch,
+                message: String::from_utf8_lossy(commit.message_bytes()).into_owned(),
                 subject: commit.summary().unwrap_or("").into(), author: commit.author().name().unwrap_or("Unknown").into(), date: short_date(commit.time().seconds()),
                 attached_branch: None, upstream, ahead, behind, contains_current, commits_after_current, containing_branches: Vec::new(),
             });
@@ -6635,6 +6638,7 @@ fn submodule_versions_inner(repository_path: String, relative_path: String) -> R
             versions.push(SubmoduleVersion {
                 name: name.to_string(), revision: commit.id().to_string(), kind: "tag".into(),
                 current: commit.id().to_string() == current_revision,
+                message: String::from_utf8_lossy(commit.message_bytes()).into_owned(),
                 subject: commit.summary().unwrap_or("").into(), author: commit.author().name().unwrap_or("Unknown").into(),
                 date: short_date(commit.time().seconds()), attached_branch: branch_tip_names.get(&commit.id().to_string()).cloned(),
                 upstream: None, ahead: None, behind: None, contains_current: false, commits_after_current: None, containing_branches: Vec::new(),
@@ -6649,7 +6653,7 @@ fn submodule_versions_inner(repository_path: String, relative_path: String) -> R
     for oid in walk.flatten().take(HISTORY_LIMIT) {
         if let Ok(commit) = repo.find_commit(oid) {
             let containing_branches = branches_containing_commit(&repo, &branch_tips_simple, oid);
-            versions.push(SubmoduleVersion { name: oid.to_string()[..8].into(), revision: oid.to_string(), kind: "commit".into(), current: oid.to_string() == current_revision, subject: commit.summary().unwrap_or("").into(), author: commit.author().name().unwrap_or("Unknown").into(), date: short_date(commit.time().seconds()), attached_branch: None, upstream: None, ahead: None, behind: None, contains_current: false, commits_after_current: None, containing_branches });
+            versions.push(SubmoduleVersion { name: oid.to_string()[..8].into(), revision: oid.to_string(), kind: "commit".into(), current: oid.to_string() == current_revision, subject: commit.summary().unwrap_or("").into(), message: String::from_utf8_lossy(commit.message_bytes()).into_owned(), author: commit.author().name().unwrap_or("Unknown").into(), date: short_date(commit.time().seconds()), attached_branch: None, upstream: None, ahead: None, behind: None, contains_current: false, commits_after_current: None, containing_branches });
         }
     }
     perf_log(&format!("submodule_versions: TOTAL path={relative_path} local_branches={} remote_branches={} tags={} history_commits={} history_context={} history_start={} checkout={} ({} refs/commits, {} containing branches; local refs only)",
@@ -6690,6 +6694,7 @@ fn push_submodule_revision_result(
         revision: revision.clone(),
         kind: kind.into(),
         current: revision == current_revision,
+        message: String::from_utf8_lossy(commit.message_bytes()).into_owned(),
         subject: commit.summary().unwrap_or("").into(),
         author: commit.author().name().unwrap_or("Unknown").into(),
         date: short_date(commit.time().seconds()),
@@ -8590,7 +8595,10 @@ fn tree_directory_entries(repository: &str, commit: &str, relative_path: &str) -
         let path = if relative_path.is_empty() { name.clone() } else { format!("{relative_path}/{name}") };
         let kind = if entry.filemode() == 0o160000 { "submodule" } else if entry.kind() == Some(ObjectType::Tree) { "folder" } else { "file" };
         let size = if entry.kind() == Some(ObjectType::Blob) { repo.find_blob(entry.id()).map(|blob| blob.size() as u64).unwrap_or(0) } else { 0 };
-        let commander_entry = CommanderEntry { name: name.clone(), relative_path: path, kind: kind.into(), size, revision: None };
+        // Gitlinks store their target SHA in this tree, even when the submodule
+        // is absent on disk or its registration has since been removed.
+        let revision = (entry.filemode() == 0o160000).then(|| entry.id().to_string());
+        let commander_entry = CommanderEntry { name: name.clone(), relative_path: path, kind: kind.into(), size, revision };
         entries.insert(name, GitTreeEntry { entry: commander_entry, oid: entry.id(), filemode: entry.filemode() });
     }
     Ok(entries)
@@ -8704,6 +8712,9 @@ fn compare_git_tree_file_list(repository_path: &str, relative_path: &str, left_r
     let left_tree = repo.find_commit(left_oid).and_then(|commit| commit.tree()).map_err(|error| error.message().to_string())?;
     let right_tree = repo.find_commit(right_oid).and_then(|commit| commit.tree()).map_err(|error| error.message().to_string())?;
     let mut options = git2::DiffOptions::new();
+    // Comparing two committed snapshots must not hide gitlink changes due to
+    // working-tree ignore settings. No submodule repository is opened here.
+    options.ignore_submodules(false).include_typechange(true);
     if !relative_path.is_empty() { options.pathspec(&relative_path); }
     let diff = repo.diff_tree_to_tree(Some(&left_tree), Some(&right_tree), Some(&mut options)).map_err(|error| error.message().to_string())?;
     let mut rows = Vec::new();
@@ -10086,6 +10097,86 @@ mod tests {
         assert_eq!(run_git_capture(root, &["symbolic-ref", "HEAD"]), branch);
         assert_eq!(fs::read_to_string(root.join("outside.txt")).unwrap(), "unrelated local work");
         assert_eq!(fs::read_to_string(root.join("src/edited.txt")).unwrap(), "unstaged\n");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn branch_comparison_gitlinks_show_both_pointers_without_submodule_objects_or_checkout() {
+        let path = unique_status_epoch_test_path("branch-gitlinks");
+        let root = Path::new(&path);
+        create_libgit2_repository(root, "README.md");
+        run_git(root, &["config", "user.name", "Test User"]);
+        run_git(root, &["config", "user.email", "test@example.com"]);
+        let old = "1111111111111111111111111111111111111111";
+        let new = "2222222222222222222222222222222222222222";
+        for name in ["changed", "removed", "typed"] {
+            run_git(root, &["update-index", "--add", "--cacheinfo", &format!("160000,{old},vendor/{name}")]);
+        }
+        run_git(root, &["commit", "-m", "Old pointers"]);
+        let left = resolve_commit(&path, "HEAD").unwrap();
+        run_git(root, &["branch", "before", &left]);
+        for name in ["changed", "added"] {
+            run_git(root, &["update-index", "--add", "--cacheinfo", &format!("160000,{new},vendor/{name}")]);
+        }
+        for name in ["removed", "typed"] {
+            run_git(root, &["update-index", "--force-remove", &format!("vendor/{name}")]);
+        }
+        fs::create_dir_all(root.join("vendor")).unwrap();
+        fs::write(root.join("vendor/typed"), "now an ordinary file\n").unwrap();
+        run_git(root, &["add", "vendor/typed"]);
+        run_git(root, &["commit", "-m", "New pointers and type change"]);
+        let right = resolve_commit(&path, "HEAD").unwrap();
+        run_git(root, &["branch", "after", &right]);
+        run_git(root, &["config", "diff.ignoreSubmodules", "all"]);
+        run_git(root, &["config", "submodule.vendor/changed.ignore", "all"]);
+        fs::write(root.join("README.md"), "staged").unwrap();
+        run_git(root, &["add", "README.md"]);
+        fs::write(root.join("README.md"), "unstaged").unwrap();
+        fs::write(root.join("untouched.txt"), "untracked").unwrap();
+        let index = fs::read(root.join(".git/index")).unwrap();
+        let branch = run_git_capture(root, &["symbolic-ref", "HEAD"]);
+        assert!(!root.join(".gitmodules").exists());
+        assert!(internal_repository(&path).unwrap().find_commit(Oid::from_str(new).unwrap()).is_err());
+        for (a, b) in [("before", "after"), (left.as_str(), right.as_str())] {
+            for flat in [false, true] {
+                let comparison = if flat { compare_git_tree_file_list(&path, "", a, b) }
+                    else { compare_git_tree_directory(&path, "vendor", a, b) }.unwrap();
+                assert_eq!(comparison.rows.len(), 4);
+                let changed = comparison.rows.iter().find(|r| r.relative_path == "vendor/changed").unwrap();
+                assert_eq!(changed.status, "modified");
+                assert_eq!(changed.local.as_ref().unwrap().revision.as_deref(), Some(old));
+                assert_eq!(changed.remote.as_ref().unwrap().revision.as_deref(), Some(new));
+                let removed = comparison.rows.iter().find(|r| r.relative_path == "vendor/removed").unwrap();
+                assert_eq!(removed.status, "local-only");
+                assert_eq!(removed.local.as_ref().unwrap().revision.as_deref(), Some(old));
+                assert!(removed.remote.is_none());
+                let added = comparison.rows.iter().find(|r| r.relative_path == "vendor/added").unwrap();
+                assert_eq!(added.status, "remote-only");
+                assert_eq!(added.remote.as_ref().unwrap().revision.as_deref(), Some(new));
+                assert!(added.local.is_none());
+                let typed = comparison.rows.iter().find(|r| r.relative_path == "vendor/typed").unwrap();
+                assert_eq!(typed.status, "type-changed");
+                assert_eq!(typed.local.as_ref().unwrap().kind, "submodule");
+                assert_eq!(typed.remote.as_ref().unwrap().kind, "file");
+                let reversed = if flat { compare_git_tree_file_list(&path, "vendor", b, a) }
+                    else { compare_git_tree_directory(&path, "vendor", b, a) }.unwrap();
+                let changed = reversed.rows.iter().find(|r| r.relative_path == "vendor/changed").unwrap();
+                assert_eq!(changed.local.as_ref().unwrap().revision.as_deref(), Some(new));
+                assert_eq!(changed.remote.as_ref().unwrap().revision.as_deref(), Some(old));
+            }
+        }
+        let top = compare_git_tree_directory(&path, "", &left, &right).unwrap();
+        assert_eq!(top.rows.iter().find(|r| r.name == "vendor").unwrap().status, "modified");
+        let diff = compare_git_tree_file(&path, "vendor/changed", &left, &right).unwrap();
+        assert_eq!(diff.local_content, format!("Subproject commit {old}\n"));
+        assert_eq!(diff.remote_content, format!("Subproject commit {new}\n"));
+        assert!(compare_git_tree_file_list(&path, "", &right, &right).unwrap().rows.is_empty());
+        assert_eq!(fs::read(root.join(".git/index")).unwrap(), index);
+        assert_eq!(resolve_commit(&path, "HEAD").unwrap(), right);
+        assert_eq!(run_git_capture(root, &["symbolic-ref", "HEAD"]), branch);
+        assert_eq!(fs::read_to_string(root.join("README.md")).unwrap(), "unstaged");
+        assert_eq!(fs::read_to_string(root.join("untouched.txt")).unwrap(), "untracked");
+        assert!(!root.join("vendor/changed").exists());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -16017,7 +16108,7 @@ mod tests {
             run_git(path, &["config", "user.email", "test@example.com"]);
             run_git(path, &["config", "user.name", "Test User"]);
             run_git(path, &["add", "."]);
-            run_git(path, &["commit", "-m", "Initial"]);
+            run_git(path, &["commit", "-m", "Initial\n\nFull commit body for hover, not just the summary."]);
         }
         run_git(&repository, &["-c", "protocol.file.allow=always", "submodule", "add", dependency.to_str().unwrap(), "vendor/dep"]);
         run_git(&repository, &["commit", "-am", "Add dep submodule"]);
@@ -16032,6 +16123,10 @@ mod tests {
         let tip_commit = Repository::open(&sub_path).unwrap().head().unwrap().target().unwrap().to_string();
 
         let versions = submodule_versions_inner(repo_path.clone(), "vendor/dep".into()).unwrap();
+        for item in &versions.versions {
+            assert_eq!(item.subject, "Initial");
+            assert!(item.message.contains("\n\nFull commit body for hover"), "every ref/history row should expose the full loaded message");
+        }
         let light = versions.versions.iter().find(|v| v.kind == "tag" && v.name == "v1.0-light").expect("lightweight tag should be listed");
         let annotated = versions.versions.iter().find(|v| v.kind == "tag" && v.name == "v1.0-annotated").expect("annotated tag should be listed");
         assert_eq!(light.revision, tip_commit, "a lightweight tag should resolve to the commit it points at");
