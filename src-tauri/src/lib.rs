@@ -118,6 +118,7 @@ pub fn run() {
             repository::remotes::fetch_all_remotes,
             repository::remotes::sync_repository,
             repository::publish_status,
+            repository::refresh_publish_metadata,
             repository::combine_local_commits,
             repository::publish_branch,
             repository::submodule_publish_risks,

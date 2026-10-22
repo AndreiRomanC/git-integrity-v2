@@ -4,7 +4,7 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 const { polarionCommitMessage, polarionSearchExplanation } = require('../frontend/polarion.js');
 const source = fs.readFileSync(require('node:path').join(__dirname, '../src-tauri/src/repository/polarion-search.js'), 'utf8');
-async function portal({ status = 200, origin = 'https://polarion.vitesco.io', contentType = 'application/json', type = 'basic', data = { data: [] }, error = null, token = 'SECRET', kind = 'tasks', fallbackUrl = null, readFallback = false, documentGlobalUrl = null, documentModulesUrl = null, documentModuleQueries = null, statuses = null, pages = null, query = '', page = 1, portalWindow = {}, resourceId = '', project = 'P', probes = [], url = null, responseHeaders = {}, body = null, clock = null } = {}) {
+async function portal({ status = 200, origin = 'https://polarion.vitesco.io', contentType = 'application/json', type = 'basic', data = { data: [] }, error = null, token = 'SECRET', kind = 'tasks', fallbackUrl = null, readFallback = false, documentGlobalUrl = null, documentModulesUrl = null, documentModuleQueries = null, statuses = null, pages = null, query = '', page = 1, portalWindow = {}, resourceId = '', project = 'P', probes = [], url = null, responseHeaders = {}, body = null, clock = null, taskGroups = null, taskCursor = [0, 1, 0] } = {}) {
   let request = null, reply = null;
   const requests = [];
   const location = { origin, set href(value) { reply = JSON.parse(new URL(value).searchParams.get('data')); } };
@@ -17,7 +17,7 @@ async function portal({ status = 200, origin = 'https://polarion.vitesco.io', co
     return { status: code, type, ok: code >= 200 && code < 300, body, headers: { get: key => key === 'content-type' ? contentType : responseHeaders[key] || '' }, json: async () => pages ? pages[requests.length - 1] : data };
   } };
   if (clock) sandbox.Date = class extends Date { static now() { return clock(); } };
-  await vm.runInNewContext(source.replace('__DDT_ARGUMENTS__', JSON.stringify({ url: url || (kind === 'projects' ? 'https://polarion.vitesco.io/polarion/rest/v1/projects?fields[projects]=id,name,trackerPrefix&page[size]=100' : kind === 'documents' ? 'https://polarion.vitesco.io/polarion/rest/v1/projects/P/documents?page[size]=100' : 'https://polarion.vitesco.io/polarion/rest/v1/projects/P/workitems'), fallbackUrl, readFallback, documentGlobalUrl, documentModulesUrl, documentModuleQueries, project, resourceId, kind, query, page, probes, request: '1' })), sandbox);
+  await vm.runInNewContext(source.replace('__DDT_ARGUMENTS__', JSON.stringify({ url: url || (kind === 'projects' ? 'https://polarion.vitesco.io/polarion/rest/v1/projects?fields[projects]=id,name,trackerPrefix&page[size]=100' : kind === 'documents' ? 'https://polarion.vitesco.io/polarion/rest/v1/projects/P/documents?page[size]=100' : 'https://polarion.vitesco.io/polarion/rest/v1/projects/P/workitems'), fallbackUrl, readFallback, documentGlobalUrl, documentModulesUrl, documentModuleQueries, project, resourceId, kind, query, page, probes, taskGroups, taskCursor, request: '1' })), sandbox);
   return { request, reply, requests };
 }
 test('fragment rejection falls back once to legacy prefix search, not on authentication or empty results', async () => {
@@ -58,6 +58,51 @@ test('task search returns actual workflow status without per-task requests or gu
   const { reply, requests } = await portal({ data });
   assert.deepEqual(reply.items.map(item => item.status), ['new', 'in_progress', '']);
   assert.equal(requests.length, 1);
+});
+
+const taskStates = ['inwork', 'planned', 'realized', 'closed', 'canceled'];
+const taskGroups = [...taskStates, 'other'].map(state => {
+  const url = 'https://polarion.vitesco.io/polarion/rest/v1/projects/P/workitems?query=' + encodeURIComponent(`type:task AND ${state === 'other' ? 'NOT ' : ''}status:(${state === 'other' ? taskStates.join(' OR ') : state})`) + '&page[size]=25&sort=id';
+  return { url, fallbackUrl: url, statuses: state === 'other' ? taskStates : [state], exclude: state === 'other' };
+});
+const taskPage = (status, count, first = 1, more = false) => ({ data: Array.from({ length: count }, (_, i) => ({ id: `P/P-${status}-${first + i}`, type: 'workitems', attributes: { type: 'task', title: `Task ${i}`, status } })), links: more ? { next: '/next' } : {} });
+
+test('All tasks paginate globally in requested state order without downloading the full history', async () => {
+  const first = await portal({ taskGroups, pages: [taskPage('inwork', 25, 1, true), taskPage('inwork', 5, 26)] });
+  assert.equal(first.reply.items.length, 25); assert.equal(first.requests.length, 2);
+  assert.equal(first.reply.task_next_cursor, '0:2:0'); assert.equal(first.reply.more, true);
+  const rest = [taskPage('inwork', 5, 26), ...taskStates.slice(1).map(state => taskPage(state, 1)), taskPage('custom_status', 1)];
+  const second = await portal({ taskGroups, taskCursor: first.reply.task_next_cursor.split(':').map(Number), pages: rest });
+  assert.deepEqual(second.reply.items.map(item => item.status), [...Array(5).fill('inwork'), ...taskStates.slice(1), 'custom_status']);
+  assert.equal(second.reply.more, false); assert.equal(second.requests.length, 6);
+  assert.equal(new URL(second.requests[0].url).searchParams.get('page[number]'), '2');
+  assert.equal(new Set([...first.reply.items, ...second.reply.items].map(i => i.id)).size, 35);
+});
+
+test('task pagination preserves a partially consumed group and has no empty trailing page', async () => {
+  const first = await portal({ taskGroups, pages: [taskPage('inwork', 24), taskPage('planned', 4)] });
+  assert.equal(first.reply.task_next_cursor, '1:1:1');
+  assert.equal(first.reply.items.at(-1).status, 'planned');
+  const next = await portal({ taskGroups, taskCursor: [1, 1, 1], pages: [taskPage('planned', 4), ...Array(4).fill({ data: [] })] });
+  assert.equal(next.reply.items.length, 3); assert.equal(next.reply.more, false);
+  assert.equal(next.reply.items[0].id, 'P-planned-2');
+  const exact = await portal({ taskGroups, pages: [taskPage('inwork', 25), ...Array(5).fill({ data: [] })] });
+  assert.equal(exact.reply.items.length, 25); assert.equal(exact.reply.more, false);
+  const single = await portal({ taskGroups: [taskGroups[2]], pages: [taskPage('realized', 3)] });
+  assert.equal(single.requests.length, 1); assert.equal(single.reply.items.length, 3);
+});
+
+test('ordered task search fails explicitly on partial errors, wrong groups and inconsistent pages', async () => {
+  const partial = await portal({ taskGroups, statuses: [200, 403], pages: [taskPage('inwork', 1), {}] });
+  assert.equal(partial.reply.code, 'forbidden'); assert.equal(partial.reply.items, undefined);
+  const wrong = await portal({ taskGroups, data: taskPage('closed', 1) });
+  assert.equal(wrong.reply.code, 'invalid_response');
+  const stale = await portal({ taskGroups, taskCursor: [0, 1, 5], data: taskPage('inwork', 2) });
+  assert.equal(stale.reply.code, 'invalid_response');
+  const emptyLoop = await portal({ taskGroups, data: { data: [], links: { next: '/next' } } });
+  assert.equal(emptyLoop.reply.code, 'invalid_response'); assert.equal(emptyLoop.requests.length, 1);
+  const differentProject = taskPage('inwork', 1); differentProject.data[0].id = 'OTHER/X-1';
+  assert.equal((await portal({ taskGroups, data: differentProject })).reply.code, 'invalid_response');
 });
 test('portal classifies authentication, permissions, API, redirects and non-JSON without raw bodies', async () => {
   for (const [options, code] of [[{ status: 401 }, 'auth_required'], [{ status: 403 }, 'forbidden'], [{ status: 404 }, 'api_unavailable'], [{ type: 'opaqueredirect' }, 'auth_required'], [{ contentType: 'text/html' }, 'not_json'], [{ error: new Error('secret raw response') }, 'network_error'], [{ error: { name: 'AbortError' } }, 'timeout']]) {

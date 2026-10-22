@@ -384,6 +384,47 @@
       return reply({ code: 'ok', http: 200, catalog_cached, catalog_pages, received: items.length, matched: matches.length,
         items: matches.slice(start, start + 25).map(({ id, title, item_type }) => ({ id, title, item_type })), more: matches.length > start + 25 });
     }
+    if (args.kind === 'tasks' && args.taskGroups) {
+      const groups = args.taskGroups;
+      if (!Array.isArray(groups) || !groups.length || groups.length > 6 || !Array.isArray(args.taskCursor)) throw { code: 'invalid_response' };
+      let [group, serverPage, offset] = args.taskCursor, reads = 0, received = 0;
+      const items = [], seen = new Set();
+      // At most one display page plus lookahead, never a repository-wide
+      // catalog. The offset lets a display page span status groups without
+      // dropping the unused tail of a server page.
+      while (group < groups.length) {
+        // Even servers returning fewer rows than requested stay bounded:
+        // 25 displayed rows, up to six empty groups and one lookahead.
+        if (++reads > 32 || !Number.isInteger(group) || !Number.isInteger(serverPage) || !Number.isInteger(offset)
+          || group < 0 || serverPage < 1 || serverPage > 1000 || offset < 0 || offset > 24) throw { code: 'catalog_limit' };
+        const urls = groups[group];
+        const atPage = value => { const url = new URL(value); url.searchParams.set('page[number]', String(serverPage)); return url.href; };
+        let data;
+        try { data = await request(atPage(urls.url)); }
+        catch (error) {
+          if (error.http !== 400 || !urls.fallbackUrl || urls.fallbackUrl === urls.url) throw error;
+          prefix_fallback = true; data = await request(atPage(urls.fallbackUrl), 'prefix_fallback');
+        }
+        if (!Array.isArray(data.data) || data.data.length > 25 || offset > data.data.length
+          || (!data.data.length && data.links?.next)) throw { code: 'invalid_response' };
+        received += data.data.length;
+        for (; offset < data.data.length; offset++) {
+          const item = data.data[offset];
+          if (item.type !== 'workitems' || !validId(item.id, 2) || !item.id.startsWith(args.project + '/')
+            || hasErrors(item) || enumValue(item.attributes?.type) !== 'task' || seen.has(item.id)) throw { code: 'invalid_response' };
+          const matches = urls.statuses?.some(status => status.toLowerCase() === enumValue(item.attributes?.status).toLowerCase());
+          if (urls.exclude ? matches : !matches) throw { code: 'invalid_response' };
+          // Look ahead for a real next result, not just a possibly empty group.
+          if (items.length === 25) return reply({ code: 'ok', http: 200, items, received, more: true, task_next_cursor: [group, serverPage, offset].join(':') });
+          seen.add(item.id);
+          items.push({ id: item.id.split('/').pop(), title: text(item.attributes?.title || item.id), item_type: 'task', status: enumValue(item.attributes?.status) });
+        }
+        offset = 0;
+        if (data.links?.next) serverPage++;
+        else { group++; serverPage = 1; }
+      }
+      return reply({ code: 'ok', http: 200, items, received, more: false, task_next_cursor: '' });
+    }
     let data;
     try { data = await request(args.url); }
     catch (error) {

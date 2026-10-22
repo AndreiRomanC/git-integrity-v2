@@ -147,10 +147,12 @@ test('complete details preserve existing checkout and action behavior', () => {
   assert.equal(h.buttons().find(b => b.dataset.detailAction === 'subcommit').disabled, false);
   assert.match(h.details.html, /Loading…/);
 });
-test('backend only adds phase timings, without splitting the command or adding scans', () => {
+test('backend shares the unpublished walk, preserving phase timings and all state checks', () => {
   const start = repository.indexOf('fn entry_details_inner('), end = repository.indexOf('// The "last commit touching this path" lookup', start);
   const body = repository.slice(start, end);
-  for (const phase of ['filesystem', 'metadata', 'submodule_urls', 'state_and_remote_relation', 'push_summary', 'unpushed_commits', 'head_commit', 'head_tags', 'total']) assert.ok(body.includes(`log_phase("${phase}"`));
+  for (const phase of ['filesystem', 'metadata', 'submodule_urls', 'state_and_remote_relation', 'publish_summary_and_commits', 'head_commit', 'head_tags', 'total']) assert.ok(body.includes(`log_phase("${phase}"`));
+  assert.equal((body.match(/submodule_publish_details_in\(&sub_repo\)/g) || []).length, 1);
+  assert.doesNotMatch(body, /submodule_push_status_in|submodule_unpushed_commits_in/);
   assert.equal((body.match(/cached_git_metadata\(/g) || []).length, 1);
   assert.equal((body.match(/inspect_submodule_state_in\(/g) || []).length, 1);
   assert.doesNotMatch(body, /refresh_status|git\([^\n]*fetch/);

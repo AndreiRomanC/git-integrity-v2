@@ -6,6 +6,20 @@ const c = (id, parents = [], refs = []) => ({ id, parents, refs });
 const ref = (name, kind = 'local_branch') => ({ name, kind });
 const ids = story => story.commits.map(commit => commit.id);
 const { branchStoryStart } = require('../frontend/graph-model.js');
+const { lastFirstParentMerge } = require('../frontend/graph-model.js');
+
+test('Last merge follows first parents, ignoring imported merges and commit timestamps', () => {
+  const commits = [c('tip', ['linear']), c('linear', ['merge']), c('merge', ['olderMerge', 'imported']),
+    c('imported', ['a', 'b']), c('olderMerge', ['root', 'c']), c('root')];
+  commits[3].timestamp = 999999;
+  assert.equal(lastFirstParentMerge(commits, 'tip').id, 'merge');
+  assert.equal(lastFirstParentMerge(commits, 'merge').id, 'merge');
+  assert.equal(lastFirstParentMerge([c('tip', ['missing']), c('other', ['a','b'])], 'tip').id, null);
+  assert.match(lastFirstParentMerge([c('tip', ['missing'])], 'tip').reason, /load older/);
+  assert.equal(lastFirstParentMerge([c('linear', ['root']), c('root')], 'linear').id, null);
+  assert.equal(lastFirstParentMerge([], null).id, null);
+  assert.equal(lastFirstParentMerge([c('a', ['b']), c('b', ['a'])], 'a').id, null);
+});
 
 test('Branch Start uses creation evidence and remains B after main merges, not current base D', () => {
   const commits = originalForkFixture();
@@ -353,11 +367,11 @@ function rendererHarness() {
     refsBadges:refs=>JSON.stringify(refs), graphCommitCompareAnchorMatches:()=>false,activeRepositoryContext:()=>({}),
     graphHeadBannerHtml:()=>'', loadingOlderCommits:false, GRAPH_LEGEND_HTML:'<details class="graph-legend"></details>',
     $:()=>null, requestAnimationFrame:()=>{}, wireGraphRowInteractions:()=>{interactions++;},
-    loadOlderGraphCommits:()=>{}, jumpToGraphHead:()=>{}, jumpToGraphBranchStart:()=>{},
+    loadOlderGraphCommits:()=>{}, jumpToGraphHead:()=>{}, graphCommitRow:()=>null, status:()=>{},
     lastGraphRenderContext:null, lastGraphModel:null,lastGraphLanesWidth:0,lastGraphOnlySearchMatches:false,
   };
   vm.createContext(context);
-  const names = ['activeGraphPrimaryBranch','setActiveGraphPrimaryBranch','activeGraphRefFilter','setActiveGraphRefFilter','activeBranchStoryView','traceGraphStart','resolvePrimarySelection','mergeCommitPresentation','buildCommitRowHtml','graphTruncationStubHtml','renderGraph','appendOlderGraphRows'];
+  const names = ['activeGraphPrimaryBranch','setActiveGraphPrimaryBranch','activeGraphRefFilter','setActiveGraphRefFilter','activeBranchStoryView','traceGraphStart','resolvePrimarySelection','graphNavigationTargets','jumpToGraphNavigation','jumpToGraphBranchStart','jumpToGraphLastMerge','mergeCommitPresentation','buildCommitRowHtml','graphTruncationStubHtml','renderGraph','appendOlderGraphRows'];
   vm.runInContext('const branchStoryViews = new WeakMap();\n'+names.map(appFunction).join('\n'),context);
   return {context,state,refs,graph,annotationCalls:()=>backendAnnotations,interactions:()=>interactions};
 }
@@ -450,8 +464,8 @@ test('Branch Story UI: verified Branch Start marker and jump select the original
   h.context.activeBranchStoryView().mode = 'story';
   h.context.ensureStoryCreation = () => 'B';
   let jump, selected, scrolled = false;
-  h.refs.laneLegend.querySelector = selector => selector === '[data-jump-story-start]'
-    ? { addEventListener: (_name, handler) => { jump = handler; } } : null;
+  h.refs.laneLegend.querySelectorAll = selector => selector === '[data-jump-branch-start]'
+    ? [{ addEventListener: (_name, handler) => { jump = handler; } }] : [];
   h.context.graphCommitRow = id => { assert.equal(id, 'B'); return { scrollIntoView: () => { scrolled = true; } }; };
   h.context.selectCommit = id => { selected = id; };
   h.context.renderGraph();
@@ -487,6 +501,9 @@ test('Branch Story creation lookup is async, cached and ignores completion after
   assert.equal(retained, 'C');
   assert.equal(context.ensureStoryCreation(graph, view, 'branch', 'other', 'G1'), 'C');
   assert.equal(pending.length, 2);
+  graph.commits = [{id:'older'}]; view.mode = 'full';
+  assert.equal(context.ensureStoryCreation(graph, view, 'branch', 'other', 'G1'), 'C');
+  assert.equal(pending.length, 2, 'pagination or view switch must not reread the same reflog');
   assert.equal(context.ensureStoryCreation(graph, view, 'remote', 'origin/other', 'G1'), null);
   assert.equal(view.creation, null);
   context.ensureStoryCreation(graph, view, 'branch', 'next', 'H1');
@@ -495,7 +512,7 @@ test('Branch Story creation lookup is async, cached and ignores completion after
   assert.equal(rendered, 1, 'Do not redraw a graph after leaving its page');
 });
 
-test('start diagnostics distinguish original creation B from shared base D without adding lookups or changing navigation', async () => {
+test('both graph views navigate to original B, not advanced shared base D or merge M', () => {
   const h = rendererHarness(), lines = [], selected = [];
   h.state.view = 'graph'; h.graph.commits = originalForkFixture(); h.graph.headOid = 'F1';
   h.context.jsPerfLog = text => { if (text.startsWith('graph_start: ')) lines.push(JSON.parse(text.slice('graph_start: '.length))); };
@@ -504,29 +521,29 @@ test('start diagnostics distinguish original creation B from shared base D witho
   h.context.renderGraph(); h.context.renderGraph();
   const existingAnnotationCalls = h.annotationCalls();
   assert.equal(lines.filter(line => line.event === 'candidate').length, 1, 'identical redraws must not flood logs');
-  assert.equal(lines[0].source, 'current_head_merge_base'); assert.equal(lines[0].target, 'D');
+  assert.equal(lines[0].source, 'creation_and_first_parent'); assert.equal(lines[0].target, 'B');
+  h.context.graphCommitRow = () => ({scrollIntoView(){}});
+  h.context.selectCommit = id => selected.push(id);
+  h.context.jumpToGraphBranchStart(); h.context.jumpToGraphLastMerge();
+  assert.deepEqual(selected, ['B', 'M']);
   h.context.activeBranchStoryView().mode = 'story';
   let jump;
-  h.refs.laneLegend.querySelector = selector => selector === '[data-jump-story-start]' ? {addEventListener: (_name, fn) => {jump = fn;}} : null;
+  h.refs.laneLegend.querySelectorAll = selector => selector === '[data-jump-branch-start]' ? [{addEventListener: (_name, fn) => {jump = fn;}}] : [];
   h.context.graphCommitRow = () => ({scrollIntoView(){}});
   h.context.selectCommit = id => selected.push(id);
   h.context.renderGraph();
   const story = lines.filter(line => line.event === 'candidate').at(-1);
   assert.equal(story.target, 'B'); assert.equal(story.source, 'creation_and_first_parent');
   assert.equal(story.story_shared_base, 'D'); assert.equal(story.head, 'F1');
-  jump(); assert.deepEqual(selected, ['B']);
+  jump(); assert.deepEqual(selected, ['B', 'M', 'B']);
   assert.equal(lines.at(-1).event, 'jump_selected'); assert.equal(lines.at(-1).target, 'B');
   assert.equal(h.annotationCalls(), existingAnnotationCalls, 'logging must not add Git or status queries');
   assert.ok(lines.every(line => !JSON.stringify(line).includes('/fixture')));
 
-  vm.runInContext('async ' + appFunction('jumpToGraphBranchStart'), h.context);
-  h.context.status = () => {};
-  await h.context.jumpToGraphBranchStart();
-  assert.deepEqual(selected, ['B', 'D'], 'diagnostics must preserve both existing destinations');
-  assert.equal(lines.at(-1).mode, 'full'); assert.equal(lines.at(-1).target, 'D');
-  h.context.ensureHeadMainMergeBase = () => null;
-  await h.context.jumpToGraphBranchStart();
-  assert.equal(lines.at(-1).event, 'jump_unavailable'); assert.equal(lines.at(-1).reason, 'no_shared_base');
+  h.context.ensureStoryCreation = () => null;
+  h.context.jumpToGraphBranchStart();
+  assert.deepEqual(selected, ['B', 'M', 'B'], 'missing evidence must not fall back to shared base');
+  assert.equal(lines.at(-1).target, null);
 });
 
 test('start diagnostics expose a Primary selection different from HEAD and unavailable story evidence', () => {
@@ -538,8 +555,71 @@ test('start diagnostics expose a Primary selection different from HEAD and unava
   h.context.renderGraph();
   assert.equal(lines.at(-1).selected_kind, 'remote'); assert.equal(lines.at(-1).selected_tip, 'D');
   assert.equal(lines.at(-1).selected_is_checkout, false); assert.equal(lines.at(-1).head, 'F1');
+  assert.equal(lines.at(-1).target, null, 'Full Graph also refuses unproven remote branch starts');
   h.context.activeBranchStoryView().mode = 'story'; h.context.renderGraph();
   assert.equal(lines.at(-1).target, null); assert.match(lines.at(-1).reason, /creation record is missing/);
+});
+
+test('navigation is selection-scoped, reveals filtered targets and never invents a start', () => {
+  const h = rendererHarness(), selected = [];
+  h.graph.commits = originalForkFixture(); h.graph.headOid = 'F1';
+  h.context.ensureStoryCreation = () => 'B';
+  h.context.graphCommitRow = () => ({scrollIntoView(){}});
+  h.context.selectCommit = id => selected.push(id);
+  h.state.graphOnlySearchMatches = true;
+  h.context.jumpToGraphBranchStart();
+  assert.equal(h.state.graphOnlySearchMatches, false);
+  assert.deepEqual(selected, ['B']);
+  h.state.graphPrimaryBranch = 'remote:origin/main';
+  h.context.ensureStoryCreation = () => null;
+  h.context.jumpToGraphBranchStart(); h.context.jumpToGraphLastMerge();
+  assert.deepEqual(selected, ['B'], 'neither action may silently use checkout history');
+  h.graph.headDetached = true; h.state.graphPrimaryBranch = 'detached';
+  h.context.jumpToGraphBranchStart(); h.context.jumpToGraphLastMerge();
+  assert.deepEqual(selected, ['B', 'M']);
+});
+
+test('navigation toolbar has one HEAD action and three matching buttons in both views', () => {
+  const h = rendererHarness();
+  h.graph.commits = originalForkFixture(); h.graph.headOid = 'F1';
+  h.context.ensureStoryCreation = () => 'B';
+  h.context.graphHeadBannerHtml = vm.runInContext('(' + appFunction('graphHeadBannerHtml') + ')', h.context);
+  for (const mode of ['full', 'story']) {
+    h.context.activeBranchStoryView().mode = mode;
+    h.context.renderGraph();
+    const html = h.refs.laneLegend.innerHTML;
+    assert.equal((html.match(/data-jump-head/g) || []).length, 1);
+    assert.equal((html.match(/class="graph-nav-button"/g) || []).length, 3);
+    assert.match(html, /data-jump-last-merge/);
+    assert.doesNotMatch(html, /data-jump-story-start/);
+    assert.equal(h.context.graphNavigationTargets().start.id, 'B');
+  }
+});
+
+test('navigation retains missing-history reasons and enables Start when older evidence is loaded', () => {
+  const h = rendererHarness();
+  h.graph.commits = originalForkFixture().slice(0, 6); h.graph.headOid = 'F1';
+  h.context.ensureStoryCreation = () => 'B';
+  h.context.renderGraph();
+  assert.equal(h.context.graphNavigationTargets().start.id, null);
+  assert.match(h.refs.laneLegend.innerHTML, /data-jump-branch-start disabled/);
+  const before = h.graph.commits.length;
+  h.graph.commits = originalForkFixture();
+  h.context.appendOlderGraphRows(before);
+  assert.equal(h.context.graphNavigationTargets().start.id, 'B');
+  assert.doesNotMatch(h.refs.laneLegend.innerHTML, /data-jump-branch-start disabled/);
+  assert.match(h.refs.graph.innerHTML, />Branch Start</);
+});
+
+test('graph annotation commands use the worker and do not add Git operations or status scans', () => {
+  const rust = fs.readFileSync(path.join(__dirname, '../src-tauri/src/repository/branches.rs'), 'utf8');
+  for (const name of ['graph_branch_divergence', 'graph_head_main_merge_base']) {
+    const start = rust.indexOf(`pub async fn ${name}(`), end = rust.indexOf(`fn ${name}_inner(`, start);
+    assert.ok(start >= 0 && end > start);
+    const wrapper = rust.slice(start, end);
+    assert.match(wrapper, /off_main_thread\(move \|\|/);
+    assert.doesNotMatch(wrapper, /repo_write_lock|invalidate|refresh_status|git\(/);
+  }
 });
 
 test('shared-base diagnostics report rejected late results, cache hits and classified errors without extra requests', async () => {

@@ -461,7 +461,7 @@ test('Publish dialog defaults to Fast publish and still asks for confirmation be
   assert.doesNotMatch(html, /id="publishSafeMode" checked/);
   assert.match(app, /if \(refs\.publishFastMode\) refs\.publishFastMode\.checked = true;/);
   assert.match(repository, /skip_submodule_safety\.unwrap_or\(false\)/, 'omitting the backend flag must still default to Safe');
-  assert.match(app, /const skipSubmoduleSafety = !!refs\.publishFastMode\?\.checked;/);
+  assert.match(app, /skipSubmoduleSafety: !!refs\.publishFastMode\?\.checked/);
   assert.match(app, /if \(commitMode !== 'combine_only' && skipSubmoduleSafety && !overrideUnpushedSubmodules\) \{/);
   assert.match(app, /await customConfirm\(\s*\n\s*'Fast publish skips the submodule safety check and its fetches/);
   assert.match(html, /id="publishSafetyExplanation"/);
@@ -471,7 +471,7 @@ test('Publish dialog defaults to Fast publish and still asks for confirmation be
   assert.match(html, /The safety check does not push submodules, update their checked-out files, merge, stage or commit/);
   assert.match(app, /Same normal push, without the submodule safety check or its fetches\./);
   assert.match(app, /Fast publish is not a force push\./);
-  assert.match(app, /invoke\('publish_branch', \{ repositoryPath: state\.repository\.path, branch: state\.publish\.branch, remote: state\.publish\.remote, username: \$\('#publishUsername'\)\.value\.trim\(\), accessToken: \$\('#publishToken'\)\.value, uptoCommit: combined \? '' : state\.publishUpto \|\| '', overrideUnpushedSubmodules, skipSubmoduleSafety \}\)/);
+  assert.match(app, /invoke\('publish_branch', \{ repositoryPath, branch: publish\.branch, remote: publish\.remote, username: request\.username, accessToken: request\.accessToken, uptoCommit: combined \? '' : request\.uptoCommit, overrideUnpushedSubmodules, skipSubmoduleSafety \}\)/);
 });
 
 test('opening Publish resets Fast as the UI default without starting a push', async () => {
@@ -479,7 +479,7 @@ test('opening Publish resets Fast as the UI default without starting a push', as
   let opened = 0, refreshed = 0;
   const refs = { publishFastMode: { checked: false }, publishBranch: {}, publishRemote: {},
     publishDialog: { showModal() { opened++; } } };
-  const context = { refs, state: { repository: { path: '/fixture' }, remotes: [{ name: 'origin' }], branches: [{ name: 'main', current: true }] },
+  const context = { refs, publishInFlight: false, state: { repository: { path: '/fixture' }, remotes: [{ name: 'origin' }], branches: [{ name: 'main', current: true }] },
     blockDetachedHeadWork: () => false, invoke() { assert.fail('must not push or run preflight when selecting the default'); },
     esc: String, document: { querySelector: () => ({}) }, $: () => ({}),
     updatePublishModeUi() { assert.equal(refs.publishFastMode.checked, true); },
@@ -509,7 +509,7 @@ test('publish explanations follow Safe/Fast selection and disappear for Combine 
   const node = id => { if (!nodes.has(id)) nodes.set(id, { hidden: false, classes: new Map(), classList: { toggle(name, enabled) { node(id).classes.set(name, enabled); } } }); return nodes.get(id); };
   let mode = 'all';
   const refs = { publishFastMode: { checked: true }, publishCommits: { querySelectorAll: () => [] } };
-  const context = { refs, state: { publish: { ahead: 2, outgoing_count: 2, commits: [{}, {}] } }, $: node,
+  const context = { refs, publishInFlight: false, state: { publish: { ahead: 2, outgoing_count: 2, commits: [{}, {}] } }, $: node,
     document: { querySelector: () => ({ value: mode }) }, invoke() { assert.fail('changing explanatory text must not call the backend'); } };
   const fn = app.match(/function updatePublishModeUi\(\) \{[\s\S]*?\n\}/)[0];
   vm.runInNewContext(fn, context);
@@ -550,15 +550,16 @@ test('Publish preview clears stale selection and disables Push while loading or 
   assert.match(refresh, /try \{/);
   assert.match(refresh, /catch \(error\) \{/);
   assert.match(refresh, /Publish unavailable — retry or change selection/);
-  assert.match(refresh, /risksPromise\.then\(risks => \{/);
+  assert.match(refresh, /refreshPublishRisks\(\);/);
+  assert.doesNotMatch(refresh, /invoke\('submodule_publish_risks'/, 'the optional preview must be gated on Safe mode');
   assert.doesNotMatch(refresh, /await Promise\.all\(/, 'slow submodule warnings must not block the basic Publish preview');
 });
 
 test('a capped Publish preview shows the full count and cannot offer a misleading partial cutoff', () => {
   assert.match(app, /Showing \$\{commits\.length\} of \$\{outgoingCount\} pending commits/);
-  assert.match(app, /box\.disabled = mode !== 'all' \|\| incompleteList/);
+  assert.match(app, /box\.disabled = publishInFlight \|\| mode !== 'all' \|\| incompleteList/);
   assert.match(app, /const willPushCount = limited \? outgoingCount : uptoIndex \+ 1/);
-  assert.match(app, /invoke\('combine_local_commits',[^\n]*accessToken: \$\('#publishToken'\)\.value/);
+  assert.match(app, /invoke\('combine_local_commits',[^\n]*accessToken: request\.accessToken/);
 });
 
 test('folder restore is an explicit right-panel action with preview and scoped backend commands', () => {
@@ -639,19 +640,19 @@ test('graph exposes branch and commit context actions without relying on lane id
   assert.match(app, /function graphHeadBannerHtml\(g, currentBranch, headVisible\)/);
   assert.match(app, /data-jump-head/);
   assert.match(app, /function jumpToGraphHead\(\)/);
-  assert.match(app, /class="graph-current-jump"/);
+  assert.match(app, /class="graph-nav-button"/);
   assert.match(app, /function jumpToGraphBranchStart\(\)/);
   assert.match(app, /data-jump-branch-start/);
-  assert.match(app, /aria-label="Go to start"/);
-  assert.match(app, /<span>Go to start<\/span>/);
-  assert.match(app, /Shared base is still being calculated/);
-  assert.match(app, /Loading older history to find shared base/);
+  assert.match(app, /aria-label="History navigation"/);
+  assert.match(app, /Go to last merge/);
+  assert.match(app, /Go to start/);
+  assert.match(app, /function graphNavigationTargets/);
   assert.match(app, /not necessarily the original branch start/);
   assert.doesNotMatch(app, />Branch start<\/b>|>Command start<\/b>/);
-  assert.match(css, /\.graph-branch-start-jump/);
+  assert.match(css, /\.graph-nav-button/);
   assert.match(app, /YOU ARE HERE · HEAD/);
   assert.match(css, /\.head-location-pill/);
-  assert.match(css, /\.graph-current-jump/);
+  assert.match(css, /\.graph-navigation/);
   assert.match(app, /Real merge-base between HEAD and \$\{esc\(commonAncestorBaseRef\)\}/);
   assert.match(app, /MERGE MAIN/);
   assert.match(app, /const palette = \[[\s\S]*?'#b4f1cf'[\s\S]*?\]/);

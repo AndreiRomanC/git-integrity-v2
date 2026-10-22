@@ -1,4 +1,9 @@
 // Optional Polarion workspace. No Git mutations or background portal requests.
+function polarionTaskState(status) {
+  const key = String(status || '').toLowerCase().replace(/[\s_-]+/g, '').replace(/^cancelled$/, 'canceled');
+  const labels = { inwork: 'In Work', planned: 'Planned', realized: 'Realized', closed: 'Closed', canceled: 'Canceled' };
+  return { key: labels[key] ? key : 'other', label: labels[key] || status || 'Status unavailable' };
+}
 function polarionCommitMessage(task) {
   if (!/^[A-Za-z0-9][A-Za-z0-9_]*-\d+$/.test(task?.id || '')) throw new Error('This task ID does not match the supported P:PROJECT-123 reference format. No message was added.');
   return 'P:' + task.id + ' - ' + String(task.title || '').replace(/[\r\n\t]+/g, ' ').trim();
@@ -454,7 +459,7 @@ function createPolarionTaskPicker({ invoke, addMessage, log = () => {}, onDocume
         : (items.length - local) + (cached ? ' cached server results' : ' server results') + ' · ' + local + ' local matches. Local snapshots are not server search results.';
     }
     if (!items.length) el('Results').append(make('p', mode === 'documents' ? 'No server matches returned. Your selected local document, if any, remains available above. Try another fragment or open its exact link.' :
-      kind === 'tasks' && el('TaskStatus').value === 'new' ? 'No tasks with status “new” match this search. Choose All statuses to include other workflow states.' :
+      kind === 'tasks' && el('TaskStatus').value ? `No ${polarionTaskState(el('TaskStatus').value).label} tasks match this search. Choose All to include other workflow states.` :
       'No matching ' + (kind === 'projects' ? 'projects' : 'tasks') + '. Try another fragment.', 'polarion-empty'));
     for (const item of items) {
       const row = button('', () => {
@@ -470,8 +475,10 @@ function createPolarionTaskPicker({ invoke, addMessage, log = () => {}, onDocume
       row.disabled = false; row.className = 'polarion-result'; row.setAttribute('aria-pressed', 'false');
       row.append(make('strong', item.id), make('span', item.title + (item.item_type ? ' · ' + item.item_type : '')));
       if (kind === 'tasks') {
-        const badge = make('small', item.status || 'Status unavailable', 'polarion-task-status');
-        badge.dataset.state = item.status === 'new' ? 'new' : 'other';
+        const status = polarionTaskState(item.status);
+        const badge = make('small', status.label, 'polarion-task-status');
+        badge.dataset.state = status.key;
+        badge.title = item.status || 'Status not returned by Polarion';
         row.append(badge);
       }
       if (mode === 'documents') {
@@ -486,7 +493,7 @@ function createPolarionTaskPicker({ invoke, addMessage, log = () => {}, onDocume
       const searchProject = ['documents', 'containers'].includes(kind) ? documentProject() : project;
       if (kind !== 'projects' && !searchProject) return;
       const params = previous || { kind, project: searchProject?.id || '', query: el(kind === 'projects' ? 'ProjectQuery' : kind === 'tasks' ? 'TaskQuery' : 'DocumentQuery').value.trim(), user: '' };
-      if (kind === 'tasks' && !previous) params.taskStatus = el('TaskStatus').value;
+      if (kind === 'tasks' && !previous) { params.taskStatus = el('TaskStatus').value; params.taskCursors = { 1: '0:1:0' }; }
       if (kind === 'tasks' && !previous && el('Assigned').checked) {
         if (!otherUser && !identity?.id && !el('User').value.trim()) await detectUser(ticket);
         if (!current(ticket)) return;
@@ -504,7 +511,9 @@ function createPolarionTaskPicker({ invoke, addMessage, log = () => {}, onDocume
       }
       say(kind === 'documents' ? 'Searching Polarion for documents…' : 'Searching Polarion…');
       if (mode === 'documents') { documentSearchPending = true; el('ResultSummary').hidden = false; el('ResultSummary').textContent = 'Searching Polarion… Local snapshots remain available above.'; }
-      const response = await invoke('polarion_search', { ...params, page: requestedPage });
+      const { taskCursors, ...requestParams } = params;
+      if (kind === 'tasks' && !taskCursors?.[requestedPage]) throw new Error('This task page is no longer available. Search again to refresh the list.');
+      const response = await invoke('polarion_search', { ...requestParams, page: requestedPage, ...(kind === 'tasks' ? { taskCursor: taskCursors[requestedPage] } : {}) });
       if (!current(ticket)) return;
       if (kind === 'documents' && ['api_unavailable', 'forbidden'].includes(response.code)) {
         documentSearchPending = false; el('ResultSummary').textContent = 'Server search unavailable. Local matches, if shown, are saved snapshots only.';
@@ -514,6 +523,13 @@ function createPolarionTaskPicker({ invoke, addMessage, log = () => {}, onDocume
         return;
       }
       const result = checked(response);
+      if (kind === 'tasks') {
+        if (result.more && !result.task_next_cursor) throw new Error('Task pagination was incomplete. Search again to refresh the list.');
+        // Revisiting a page may observe changed server state. Discard later
+        // bookmarks and derive the next one from this response, not old pages.
+        for (const key of Object.keys(taskCursors)) if (Number(key) > requestedPage) delete taskCursors[key];
+        if (result.more) taskCursors[requestedPage + 1] = result.task_next_cursor;
+      }
       documentSearchPending = false;
       connection('connected', 'Connected · Polarion read access verified');
       if (kind === 'tasks' && params.user && !otherUser && !identity) {
@@ -525,7 +541,7 @@ function createPolarionTaskPicker({ invoke, addMessage, log = () => {}, onDocume
       lastSearch = params; page = requestedPage; more = result.more; render(rows, kind, { cached: Boolean(result.catalog_cached) });
       if (kind === 'tasks') {
         el('ResultSummary').hidden = false;
-        el('ResultSummary').textContent = (params.taskStatus === 'new' ? 'New tasks only · server status: new' : 'All task statuses') + ' · status read with these search results. Search again to refresh.';
+        el('ResultSummary').textContent = (params.taskStatus ? polarionTaskState(params.taskStatus).label + ' tasks' : 'All · In Work → Planned → Realized → Closed → Canceled · other statuses last') + ' · Search again to refresh.';
       }
       const moduleSearch = kind === 'documents' && result.catalog_source === 'work_item_modules';
       const tokenSearch = moduleSearch && result.document_query_variant && !['module_id_contains', 'module_contains'].includes(result.document_query_variant);
@@ -683,12 +699,14 @@ function createPolarionTaskPicker({ invoke, addMessage, log = () => {}, onDocume
   el('ProjectSearchButton').addEventListener('click', () => search('projects'));
   el('AllProjects').addEventListener('click', () => { el('ProjectQuery').value = ''; search('projects'); });
   el('TaskSearchButton').addEventListener('click', () => search('tasks'));
-  el('TaskStatus').value = 'new';
+  el('TaskStatus').value = '';
+  el('TaskStatus').dataset.state = 'all';
   el('TaskStatus').addEventListener('change', () => {
     if (busy) return;
+    el('TaskStatus').dataset.state = el('TaskStatus').value || 'all';
     // Repeat the SAME query/assignee at page 1; no result from the previous
     // filter may stay selected or be added to the commit list while loading.
-    if (lastSearch?.kind === 'tasks') search('tasks', 1, { ...lastSearch, taskStatus: el('TaskStatus').value });
+    if (lastSearch?.kind === 'tasks') search('tasks', 1, { ...lastSearch, taskStatus: el('TaskStatus').value, taskCursors: { 1: '0:1:0' } });
     else { clearResults(); clearDetail(); }
   });
   el('DocumentSearchButton').addEventListener('click', () => search(el('DocumentSource').value || 'documents'));

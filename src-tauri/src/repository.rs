@@ -5310,7 +5310,18 @@ fn outgoing_commit_ids(repo: &Repository, branch: &str, remote: &str) -> Result<
 }
 
 #[tauri::command]
-pub fn publish_status(repository_path: String, branch: String, remote: String) -> Result<PublishStatus, String> {
+pub async fn publish_status(repository_path: String, branch: String, remote: String) -> Result<PublishStatus, String> {
+    let queued = Instant::now();
+    off_main_thread(move || {
+        perf_log("publish_status: worker queue", queued.elapsed());
+        let started = Instant::now();
+        let result = publish_status_inner(repository_path, branch, remote);
+        perf_log("publish_status: local history", started.elapsed());
+        result
+    }).await
+}
+
+fn publish_status_inner(repository_path: String, branch: String, remote: String) -> Result<PublishStatus, String> {
     validate_path(&repository_path)?;
     let branch = branch.trim(); let remote = remote.trim();
     if branch.is_empty() || remote.is_empty() { return Err("Choose a local branch and a remote".into()); }
@@ -5328,6 +5339,43 @@ pub fn publish_status(repository_path: String, branch: String, remote: String) -
         None => (commits.len(), 0, false),
     };
     Ok(PublishStatus { branch: branch.into(), remote: remote.into(), remote_branch, local_tip: local_oid.to_string(), commits, outgoing_count: outgoing.len(), ahead, behind, remote_branch_exists })
+}
+
+#[derive(Serialize)]
+pub struct PublishRefresh {
+    head_oid: String,
+    current_branch: String,
+    upstream: Option<String>,
+    remote_tip: String,
+    unpushed_paths: Vec<String>,
+}
+
+// Refresh only facts changed by a normal push. No working-tree/index scan,
+// submodule open, fetch, or graph reload. The frontend keeps its known local
+// changes and falls back to the full reload if HEAD/branch changed meanwhile.
+#[tauri::command]
+pub async fn refresh_publish_metadata(repository_path: String, branch: String, remote: String) -> Result<PublishRefresh, String> {
+    off_main_thread(move || refresh_publish_metadata_inner(repository_path, branch, remote)).await
+}
+
+fn refresh_publish_metadata_inner(repository_path: String, branch: String, remote: String) -> Result<PublishRefresh, String> {
+    let started = Instant::now();
+    validate_path(&repository_path)?;
+    let repo = internal_repository(&repository_path)?;
+    let head = repo.head().map_err(|error| error.message().to_string())?;
+    let head_oid = head.peel_to_commit().map_err(|error| error.message().to_string())?.id().to_string();
+    let current_branch = if repo.head_detached().unwrap_or(true) { String::new() } else { head.shorthand().unwrap_or("").to_string() };
+    let upstream = repo.find_branch(&branch, BranchType::Local)
+        .and_then(|branch| branch.upstream()).ok()
+        .and_then(|upstream| upstream.get().shorthand().map(str::to_string));
+    let remote_tip = repo.refname_to_id(&format!("refs/remotes/{remote}/{branch}"))
+        .map_err(|error| error.message().to_string())?.to_string();
+    // Reuse the existing committed-history-only calculation; never turn
+    // retained commits from a partial push into falsely "published" rows.
+    let unpushed_paths = unpushed_paths(&repository_path).into_iter().collect();
+    let result = PublishRefresh { head_oid, current_branch, upstream, remote_tip, unpushed_paths };
+    perf_log("refresh_publish_metadata: TOTAL (local refs + unpublished paths only)", started.elapsed());
+    Ok(result)
 }
 
 // One outgoing parent commit's gitlink that cannot be confirmed safe to
@@ -6340,11 +6388,8 @@ fn entry_details_inner(repository_path: String, relative_path: String) -> Result
                 let snapshot = inspect_submodule_state_in(&sub_repo);
                 log_phase("state_and_remote_relation", step);
                 let step = Instant::now();
-                let push_status = submodule_push_status_in(&sub_repo);
-                log_phase("push_summary", step);
-                let step = Instant::now();
-                let unpushed_commits = submodule_unpushed_commits_in(&sub_repo);
-                log_phase("unpushed_commits", step);
+                let (push_status, unpushed_commits) = submodule_publish_details_in(&sub_repo);
+                log_phase("publish_summary_and_commits", step);
                 let step = Instant::now();
                 let commit = sub_repo.head().ok().and_then(|head| head.peel_to_commit().ok()).map(|commit| {
                     let author_name = commit.author().name().unwrap_or("Unknown").to_string();
@@ -6414,58 +6459,36 @@ fn entry_last_commit_inner(repository_path: String, relative_path: String) -> Re
 // they're looking at has actually reached the submodule's own remote yet.
 #[cfg(test)]
 fn submodule_push_status(sub_path: &str) -> Option<String> {
-    submodule_push_status_in(&internal_submodule_repository(Path::new(sub_path)).ok()?)
+    submodule_publish_details_in(&internal_submodule_repository(Path::new(sub_path)).ok()?).0
 }
 
-// Same check, taking an already-open Repository — lets a caller that needs
-// several pieces of a submodule's state at once (entry_details opens the
-// submodule's repo for `submodule_commit` right next to this) share the one
-// `internal_repository`/`Repository::discover` instead of repeating it.
-fn submodule_push_status_in(repo: &Repository) -> Option<String> {
-    let head = repo.head().ok()?;
-    let local_target = head.target()?;
-    if repo.head_detached().unwrap_or(true) { return Some("Detached — not on a branch, so it cannot be pushed as-is. Use \"Change version\" to switch to a branch first.".into()); }
-    let branch = head.shorthand()?.to_string();
-    drop(head);
-    // The branch's real upstream (see upstream_ref's own doc comment) — not a
-    // hardcoded assumption that it's origin/<same name>. No configured
-    // upstream at all reads as "can't tell", same as it always has.
-    let (remote_target, upstream_label) = upstream_ref(repo, &branch)?;
-    if remote_target == local_target { return None; }
-    let mut walk = repo.revwalk().ok()?; walk.push(local_target).ok()?; let _ = walk.hide(remote_target);
-    let ahead = walk.take(50).count();
-    Some(if ahead > 0 { format!("{ahead} commit{} not yet pushed to {upstream_label} — needs push", if ahead == 1 { "" } else { "s" }) } else { format!("Diverged from {upstream_label}") })
-}
-
-// The actual commits behind `submodule_push_status`'s summary line — showing
-// "3 commits not pushed" as a sentence and making the user guess which three
-// isn't good enough; list them the same way the main project's "Unpublished
-// commits" dialog already does.
-// Path-based wrapper around `submodule_unpushed_commits_in` — production code
-// now always already has the submodule's `Repository` open for something else
-// by the time it needs this (entry_details shares it with submodule_push_status
-// and the HEAD commit lookup) and calls the `_in` version directly instead of
-// re-opening the repo here; kept for tests, which exercise it standalone.
 #[cfg(test)]
 fn submodule_unpushed_commits(sub_path: &str) -> Vec<PublishCommit> {
-    match internal_submodule_repository(Path::new(sub_path)) { Ok(repo) => submodule_unpushed_commits_in(&repo), Err(_) => Vec::new() }
+    match internal_submodule_repository(Path::new(sub_path)) { Ok(repo) => submodule_publish_details_in(&repo).1, Err(_) => Vec::new() }
 }
 
-fn submodule_unpushed_commits_in(repo: &Repository) -> Vec<PublishCommit> {
-    (|| -> Option<Vec<PublishCommit>> {
+// One local, bounded walk supplies both the existing summary and commit list.
+// Keep upstream selection, detached handling, ordering and the 50-item limit
+// unchanged. No status check or publish safety check is removed.
+fn submodule_publish_details_in(repo: &Repository) -> (Option<String>, Vec<PublishCommit>) {
+    (|| -> Option<(Option<String>, Vec<PublishCommit>)> {
         let head = repo.head().ok()?;
         let local_target = head.target()?;
-        if repo.head_detached().unwrap_or(true) { return Some(Vec::new()); }
+        if repo.head_detached().unwrap_or(true) {
+            return Some((Some("Detached — not on a branch, so it cannot be pushed as-is. Use \"Change version\" to switch to a branch first.".into()), Vec::new()));
+        }
         let branch = head.shorthand()?.to_string();
         drop(head);
-        let (remote_target, _) = upstream_ref(repo, &branch)?;
-        if remote_target == local_target { return Some(Vec::new()); }
+        let (remote_target, upstream_label) = upstream_ref(repo, &branch)?;
+        if remote_target == local_target { return Some((None, Vec::new())); }
         let mut walk = repo.revwalk().ok()?; walk.push(local_target).ok()?; let _ = walk.hide(remote_target);
-        let mut commits: Vec<PublishCommit> = walk.take(50).flatten().filter_map(|oid| repo.find_commit(oid).ok().map(|commit| PublishCommit {
+        let mut ahead = 0;
+        let mut commits: Vec<PublishCommit> = walk.take(50).inspect(|_| ahead += 1).flatten().filter_map(|oid| repo.find_commit(oid).ok().map(|commit| PublishCommit {
             id: oid.to_string(), subject: commit.summary().unwrap_or("No message").into(), author: commit.author().name().unwrap_or("Unknown").into(), date: short_date(commit.time().seconds()),
         })).collect();
         commits.reverse();
-        Some(commits)
+        let summary = if ahead > 0 { format!("{ahead} commit{} not yet pushed to {upstream_label} — needs push", if ahead == 1 { "" } else { "s" }) } else { format!("Diverged from {upstream_label}") };
+        Some((Some(summary), commits))
     })().unwrap_or_default()
 }
 
@@ -8398,30 +8421,67 @@ fn path_restore_with_clean(repository_path: String, relative_path: String, sourc
 // large/long-lived repository, one of the biggest remaining sources of the
 // "selecting anything is slow, and it gets worse the deeper you navigate" feeling
 // — every single click paid for a full history walk regardless of depth.
-fn last_commit_touching_path(repository_path: &str, relative: &Path) -> Option<(String, String, String, String)> {
+type LastPathCommit = (String, String, String, String);
+type LastPathCommitKey = (String, Oid, String, u64);
+// Positive, complete reads only. HEAD pins the immutable history snapshot;
+// the existing repository epoch also retires reads after explicit Refresh or
+// fetch. No Working Tree state is cached here. Bounded across all repositories.
+const LAST_PATH_COMMIT_CACHE_LIMIT: usize = 256;
+static LAST_PATH_COMMIT_CACHE: OnceLock<Mutex<VecDeque<(LastPathCommitKey, LastPathCommit)>>> = OnceLock::new();
+fn last_path_commit_cache() -> &'static Mutex<VecDeque<(LastPathCommitKey, LastPathCommit)>> {
+    LAST_PATH_COMMIT_CACHE.get_or_init(|| Mutex::new(VecDeque::new()))
+}
+
+fn last_commit_touching_path(repository_path: &str, relative: &Path) -> Option<LastPathCommit> {
     let started = Instant::now();
     let mut examined = 0; let mut diff_queries = 0;
+    let mut cache_hit = false;
     let result = (|| {
         let repo = internal_repository(repository_path).ok()?;
-        let mut walk = repo.revwalk().ok()?; walk.push_head().ok()?; let _ = walk.set_sorting(Sort::TOPOLOGICAL | Sort::TIME);
-        for oid in walk.flatten().take(2000) {
+        let epoch = status_cache_epoch(repository_path);
+        let head = repo.head().ok()?.peel_to_commit().ok()?.id();
+        let key = (repo_lock_key(repository_path), head, normalized(relative), epoch);
+        // Fetching missing shallow ancestors can change the answer without
+        // moving HEAD. Avoid caching this incomplete form of history.
+        let mut cacheable = !repo.is_shallow();
+        if cacheable {
+            if let Some((_, value)) = last_path_commit_cache().lock().unwrap().iter().find(|(cached, _)| cached == &key) {
+                cache_hit = true;
+                return Some(value.clone());
+            }
+        }
+        let mut walk = repo.revwalk().ok()?; walk.push(head).ok()?; let _ = walk.set_sorting(Sort::TOPOLOGICAL | Sort::TIME);
+        for item in walk {
+            if examined >= 2000 { break; }
+            let Ok(oid) = item else { cacheable = false; continue };
             examined += 1;
-            let Ok(commit) = repo.find_commit(oid) else { continue };
+            let Ok(commit) = repo.find_commit(oid) else { cacheable = false; continue };
             let matches = if relative.as_os_str().is_empty() { true } else {
                 let parent_tree = commit.parent(0).ok().and_then(|parent| parent.tree().ok());
+                if commit.parent_count() > 0 && parent_tree.is_none() { cacheable = false; }
                 let mut options = git2::DiffOptions::new(); options.pathspec(relative);
-                commit.tree().ok().and_then(|tree| {
+                let diff = commit.tree().ok().and_then(|tree| {
                     diff_queries += 1;
                     repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), Some(&mut options)).ok()
-                }).map(|diff| diff.deltas().next().is_some()).unwrap_or(false)
+                });
+                if diff.is_none() { cacheable = false; }
+                diff.map(|diff| diff.deltas().next().is_some()).unwrap_or(false)
             };
             if matches {
-                return Some((oid.to_string(), commit.summary().unwrap_or("No message").to_string(), commit.author().name().unwrap_or("Unknown").to_string(), short_date(commit.time().seconds())));
+                let value = (oid.to_string(), commit.summary().unwrap_or("No message").to_string(), commit.author().name().unwrap_or("Unknown").to_string(), short_date(commit.time().seconds()));
+                if cacheable && status_cache_epoch(repository_path) == epoch {
+                    let mut cache = last_path_commit_cache().lock().unwrap();
+                    if !cache.iter().any(|(cached, _)| cached == &key) {
+                        if cache.len() >= LAST_PATH_COMMIT_CACHE_LIMIT { cache.pop_front(); }
+                        cache.push_back((key, value.clone()));
+                    }
+                }
+                return Some(value);
             }
         }
         None
     })();
-    perf_log(&format!("last_commit_touching_path: repo={} entry={} examined={examined} diff_queries={diff_queries} found={} at_walk_limit={}",
+    perf_log(&format!("last_commit_touching_path: repo={} entry={} cache_hit={cache_hit} examined={examined} diff_queries={diff_queries} found={} at_walk_limit={}",
         anonymized_repository_id(repository_path), anonymized_repository_id(&relative.to_string_lossy()), result.is_some(), examined == 2000), started.elapsed());
     result
 }
@@ -12712,7 +12772,7 @@ mod tests {
         run_git(&base, &["update-ref", "refs/remotes/origin/main", "main"]);
         let repo_path = base.to_string_lossy().into_owned();
 
-        let divergence = graph_branch_divergence(repo_path, "main".into()).unwrap();
+        let divergence = tauri::async_runtime::block_on(graph_branch_divergence(repo_path, "main".into())).unwrap();
         let by_name = |name: &str| divergence.iter().find(|d| d.name == name).unwrap_or_else(|| panic!("branch {name} should be reported"));
 
         let main = by_name("main");
@@ -12965,6 +13025,115 @@ mod tests {
         assert!(!submodule_state_cache().lock().unwrap().contains_key(&sub_key));
         assert_eq!(run_git_capture(&base, &["rev-parse", "HEAD"]), original_head);
         assert_eq!(fs::read_to_string(base.join("keep-untracked.txt")).unwrap(), "keep this local file\n");
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn path_commit_cache_reuses_pinned_history_and_preserves_local_state() {
+        let path = unique_status_epoch_test_path("path-commit-cache");
+        let base = Path::new(&path);
+        create_libgit2_repository(base, "a.txt");
+        let repo = Repository::open(base).unwrap();
+        let original = repo.head().unwrap().peel_to_commit().unwrap();
+        let tree = original.tree().unwrap();
+        let signature = git2::Signature::now("Test", "test@example.com").unwrap();
+        // A rarely touched file behind 120 commits is deliberately expensive
+        // on a cache miss, but needs no additional walk on a repeat selection.
+        for i in 0..120 {
+            let parent = repo.head().unwrap().peel_to_commit().unwrap();
+            repo.commit(Some("HEAD"), &signature, &signature, &format!("Other history {i}"), &tree, &[&parent]).unwrap();
+        }
+        fs::write(base.join("a.txt"), "staged").unwrap();
+        let mut index = repo.index().unwrap(); index.add_path(Path::new("a.txt")).unwrap(); index.write().unwrap();
+        fs::write(base.join("a.txt"), "unstaged").unwrap();
+        fs::write(base.join("untracked.txt"), "keep").unwrap();
+        let index_before = fs::read(base.join(".git/index")).unwrap();
+        let head = repo.head().unwrap().target().unwrap();
+        let key = (repo_lock_key(&path), head, "a.txt".to_string(), status_cache_epoch(&path));
+        let started = Instant::now();
+        let first = last_commit_touching_path(&path, Path::new("a.txt")).unwrap();
+        let miss = started.elapsed();
+        assert_eq!(first.0, original.id().to_string());
+        assert!(last_path_commit_cache().lock().unwrap().iter().any(|(entry, value)| entry == &key && value == &first));
+        let started = Instant::now();
+        for _ in 0..20 { assert_eq!(last_commit_touching_path(&path, Path::new("a.txt")), Some(first.clone())); }
+        eprintln!("path history fixture: 121 commits; miss={miss:?}, average repeated selection={:?}", started.elapsed() / 20);
+        assert_eq!(fs::read(base.join(".git/index")).unwrap(), index_before);
+        assert_eq!(fs::read_to_string(base.join("a.txt")).unwrap(), "unstaged");
+        assert_eq!(fs::read_to_string(base.join("untracked.txt")).unwrap(), "keep");
+        assert_eq!(repo.head().unwrap().target(), Some(head));
+        assert!(!full_status_cache().lock().unwrap().contains_key(&repo_lock_key(&path)), "history reads must not scan status");
+
+        // External commits do not have to notify the cache: the actual HEAD
+        // is read on each request, and a changed OID selects another key.
+        let changed_tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let parent = repo.find_commit(head).unwrap();
+        let next = repo.commit(Some("HEAD"), &signature, &signature, "New a.txt", &changed_tree, &[&parent]).unwrap();
+        assert_eq!(last_commit_touching_path(&path, Path::new("a.txt")).unwrap().0, next.to_string());
+        repo.set_head_detached(head).unwrap();
+        assert_eq!(last_commit_touching_path(&path, Path::new("a.txt")), Some(first.clone()));
+        invalidate_git_metadata(&path);
+        assert_ne!(status_cache_epoch(&path), key.3);
+        assert_eq!(last_commit_touching_path(&path, Path::new("a.txt")), Some(first));
+        assert!(last_commit_touching_path(&path, Path::new("never-tracked")).is_none());
+        assert!(!last_path_commit_cache().lock().unwrap().iter().any(|(entry, _)| entry.0 == key.0 && entry.2 == "never-tracked"));
+
+        // An incomplete shallow history must bypass even an existing entry.
+        fs::write(base.join(".git/shallow"), format!("{head}\n")).unwrap();
+        let shallow = last_commit_touching_path(&path, Path::new("a.txt")).unwrap();
+        assert_eq!(shallow.0, head.to_string());
+        assert!(!last_path_commit_cache().lock().unwrap().iter().any(|(entry, value)| entry.0 == key.0 && value == &shallow));
+        assert!(last_path_commit_cache().lock().unwrap().len() <= LAST_PATH_COMMIT_CACHE_LIMIT);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn path_commit_cache_keeps_parent_submodule_and_paths_separate() {
+        let base = submodule_property_fixture();
+        let path = base.to_string_lossy().into_owned();
+        let parent = entry_last_commit_inner(path.clone(), "README.md".into()).unwrap().unwrap();
+        let child = entry_last_commit_inner(path.clone(), "vendor/dep/module.txt".into()).unwrap().unwrap();
+        let pointer = entry_last_commit_inner(path.clone(), "vendor/dep".into()).unwrap().unwrap();
+        assert_ne!(parent.id, child.id);
+        assert_eq!(pointer.subject, "Register submodule");
+        assert_eq!(entry_last_commit_inner(base.join("vendor/dep").to_string_lossy().into_owned(), "module.txt".into()).unwrap().unwrap().id, child.id);
+        assert_eq!(entry_last_commit_inner(path, "vendor/dep".into()).unwrap().unwrap().id, pointer.id);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn submodule_publish_details_preserve_upstream_order_limit_and_detached_states() {
+        let path = unique_status_epoch_test_path("publish-details");
+        let base = Path::new(&path);
+        create_libgit2_repository(base, "module.txt");
+        let repo = Repository::open(base).unwrap();
+        let start = repo.head().unwrap().peel_to_commit().unwrap();
+        let branch = repo.head().unwrap().shorthand().unwrap().to_string();
+        assert_eq!(submodule_publish_details_in(&repo).0, None, "no upstream stays unknown");
+        repo.remote("mirror", "https://example.invalid/dep.git").unwrap();
+        repo.reference("refs/remotes/mirror/release", start.id(), true, "fixture").unwrap();
+        repo.find_branch(&branch, BranchType::Local).unwrap().set_upstream(Some("mirror/release")).unwrap();
+        assert!(submodule_publish_details_in(&repo).1.is_empty());
+        let tree = start.tree().unwrap();
+        let signature = git2::Signature::now("Test", "test@example.com").unwrap();
+        for i in 0..55 {
+            let parent = repo.head().unwrap().peel_to_commit().unwrap();
+            repo.commit(Some("HEAD"), &signature, &signature, &format!("Local {i}"), &tree, &[&parent]).unwrap();
+        }
+        let head = repo.head().unwrap().target().unwrap();
+        let index_before = fs::read(base.join(".git/index")).unwrap();
+        let (summary, commits) = submodule_publish_details_in(&repo);
+        assert_eq!(summary.as_deref(), Some("50 commits not yet pushed to mirror/release — needs push"));
+        assert_eq!(commits.len(), 50);
+        assert_eq!(commits.first().unwrap().subject, "Local 5");
+        assert_eq!(commits.last().unwrap().id, head.to_string());
+        assert_eq!(fs::read(base.join(".git/index")).unwrap(), index_before);
+        repo.reference("refs/remotes/mirror/release", head, true, "published fixture").unwrap();
+        assert_eq!(submodule_publish_details_in(&repo).0, None);
+        assert!(submodule_publish_details_in(&repo).1.is_empty());
+        repo.set_head_detached(head).unwrap();
+        let (summary, commits) = submodule_publish_details_in(&repo);
+        assert!(summary.unwrap().starts_with("Detached")); assert!(commits.is_empty());
         fs::remove_dir_all(base).unwrap();
     }
 
@@ -17018,7 +17187,7 @@ mod tests {
         let path = repository.to_string_lossy().into_owned();
 
         // main IS published — nothing unexpected there.
-        let main_status = publish_status(path.clone(), "main".into(), "origin".into()).unwrap();
+        let main_status = publish_status_inner(path.clone(), "main".into(), "origin".into()).unwrap();
         assert_eq!(main_status.commits.len(), 0);
         assert_eq!((main_status.ahead, main_status.behind, main_status.remote_branch_exists), (0, 0, true));
 
@@ -17026,14 +17195,14 @@ mod tests {
         // its own yet, shares 100% of its history with origin/main — it should
         // have nothing new to publish, not its whole 2-commit ancestry.
         create_branch(path.clone(), "feature-x".into()).unwrap();
-        let unpublished = publish_status(path.clone(), "feature-x".into(), "origin".into()).unwrap();
+        let unpublished = publish_status_inner(path.clone(), "feature-x".into(), "origin".into()).unwrap();
         assert_eq!(unpublished.commits.len(), 0, "a new branch with no commits of its own should have nothing new to publish, even though origin/feature-x doesn't exist yet");
         assert_eq!((unpublished.ahead, unpublished.behind, unpublished.remote_branch_exists), (0, 0, false));
 
         // Now make one genuinely new commit on it — only *that* should show up.
         fs::write(repository.join("a.txt"), "three").unwrap();
         run_git(&repository, &["commit", "-am", "Commit 3 on feature-x"]);
-        let unpublished = publish_status(path.clone(), "feature-x".into(), "origin".into()).unwrap();
+        let unpublished = publish_status_inner(path.clone(), "feature-x".into(), "origin".into()).unwrap();
         assert_eq!(unpublished.commits.len(), 1);
         assert_eq!(unpublished.commits[0].subject, "Commit 3 on feature-x");
         assert_eq!((unpublished.ahead, unpublished.behind, unpublished.remote_branch_exists), (1, 0, false));
@@ -17047,7 +17216,7 @@ mod tests {
         run_git(&other, &["commit", "-am", "Remote commit on main"]);
         run_git(&other, &["-c", "protocol.file.allow=always", "push", "origin", "HEAD:main"]);
         run_git(&repository, &["fetch", "origin"]);
-        let behind_status = publish_status(path.clone(), "main".into(), "origin".into()).unwrap();
+        let behind_status = publish_status_inner(path.clone(), "main".into(), "origin".into()).unwrap();
         assert_eq!(behind_status.commits.len(), 0, "being behind is not the same as having local commits to publish");
         assert_eq!((behind_status.ahead, behind_status.behind, behind_status.remote_branch_exists), (0, 1, true));
 
@@ -17863,17 +18032,64 @@ mod tests {
         assert_eq!(remote_head, commit1, "the server should be at exactly the chosen commit, not the branch tip");
 
         // The two newer commits must still show as unpublished locally.
-        let status = publish_status(path.clone(), "main".into(), "origin".into()).unwrap();
+        let status = publish_status_inner(path.clone(), "main".into(), "origin".into()).unwrap();
         assert_eq!(status.commits.len(), 2, "commits 2 and 3 should still be pending, since only commit 1 was published");
         assert_eq!(status.commits[0].subject, "Commit 2");
         assert_eq!(status.commits[1].subject, "Commit 3");
 
         // Publishing the rest afterward (a normal full push) must succeed cleanly.
         publish_branch_inner(path.clone(), "main".into(), "origin".into(), String::new(), String::new(), String::new(), false).unwrap();
-        assert_eq!(publish_status(path, "main".into(), "origin".into()).unwrap().commits.len(), 0);
+        assert_eq!(publish_status_inner(path, "main".into(), "origin".into()).unwrap().commits.len(), 0);
 
         fs::remove_dir_all(repository).unwrap();
         fs::remove_dir_all(remote).unwrap();
+    }
+
+    #[test]
+    fn publish_refresh_preserves_dirty_files_index_and_partial_history_without_scanning_status() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-publish-refresh-{suffix}"));
+        let repository = base.join("local");
+        let remote = base.join("origin.git");
+        fs::create_dir_all(&repository).unwrap(); fs::create_dir_all(&remote).unwrap();
+        run_git(&remote, &["init", "--bare"]);
+        run_git(&repository, &["init", "-b", "feature"]);
+        run_git(&repository, &["config", "user.name", "Test User"]);
+        run_git(&repository, &["config", "user.email", "test@example.com"]);
+        fs::write(repository.join("first.txt"), "base").unwrap();
+        run_git(&repository, &["add", "."]); run_git(&repository, &["commit", "-m", "First"]);
+        let first = run_git_capture(&repository, &["rev-parse", "HEAD"]);
+        fs::write(repository.join("later.txt"), "later").unwrap();
+        run_git(&repository, &["add", "."]); run_git(&repository, &["commit", "-m", "Later"]);
+        let head = run_git_capture(&repository, &["rev-parse", "HEAD"]);
+        run_git(&repository, &["remote", "add", "origin", remote.to_str().unwrap()]);
+        let path = repository.to_string_lossy().into_owned();
+        // New remote branch, partial push; ordinary dirty state is not involved
+        // in either the push or its metadata-only UI refresh.
+        fs::write(repository.join("first.txt"), "staged").unwrap();
+        run_git(&repository, &["add", "first.txt"]);
+        fs::write(repository.join("first.txt"), "unstaged").unwrap();
+        fs::write(repository.join("untracked.txt"), "keep me").unwrap();
+        let index = fs::read(repository.join(".git/index")).unwrap();
+        publish_branch_inner_with_options(path.clone(), "feature".into(), "origin".into(), String::new(), String::new(), first.clone(), false, true).unwrap();
+        let key = repo_lock_key(&path);
+        assert!(!full_status_cache().lock().unwrap().contains_key(&key));
+        let refreshed = tauri::async_runtime::block_on(refresh_publish_metadata(path.clone(), "feature".into(), "origin".into())).unwrap();
+        assert_eq!(refreshed.head_oid, head); assert_eq!(refreshed.remote_tip, first);
+        assert_eq!(refreshed.current_branch, "feature"); assert_eq!(refreshed.upstream.as_deref(), Some("origin/feature"));
+        assert_eq!(refreshed.unpushed_paths, vec!["later.txt"]);
+        let pending = tauri::async_runtime::block_on(publish_status(path.clone(), "feature".into(), "origin".into())).unwrap();
+        assert_eq!(pending.ahead, 1); assert_eq!(pending.commits.len(), 1);
+        assert!(!full_status_cache().lock().unwrap().contains_key(&key), "metadata refresh must not populate a working-tree scan cache");
+        assert_eq!(fs::read(repository.join(".git/index")).unwrap(), index);
+        assert_eq!(fs::read_to_string(repository.join("first.txt")).unwrap(), "unstaged");
+        assert_eq!(fs::read_to_string(repository.join("untracked.txt")).unwrap(), "keep me");
+        publish_branch_inner_with_options(path.clone(), "feature".into(), "origin".into(), String::new(), String::new(), String::new(), false, true).unwrap();
+        let refreshed = refresh_publish_metadata_inner(path.clone(), "feature".into(), "origin".into()).unwrap();
+        assert_eq!(refreshed.remote_tip, head); assert!(refreshed.unpushed_paths.is_empty());
+        assert!(publish_status_inner(path, "feature".into(), "origin".into()).unwrap().commits.is_empty());
+        assert_eq!(fs::read(repository.join(".git/index")).unwrap(), index);
+        fs::remove_dir_all(base).unwrap();
     }
 
     #[test]
@@ -17894,7 +18110,7 @@ mod tests {
         for index in 0..101 {
             run_git(&repository, &["commit", "--allow-empty", "-m", &format!("Local {index}")]);
         }
-        let status = publish_status(repository.to_string_lossy().into_owned(), "main".into(), "origin".into()).unwrap();
+        let status = publish_status_inner(repository.to_string_lossy().into_owned(), "main".into(), "origin".into()).unwrap();
         assert_eq!(status.outgoing_count, 101);
         assert_eq!(status.commits.len(), 100, "only the visual preview should be capped");
         assert_eq!(status.ahead, 101);
@@ -18434,7 +18650,7 @@ mod tests {
         run_git(&sub_path, &["config", "user.name", "Test User"]);
 
         // Before pushing the submodule, the parent has nothing new to push.
-        let before = publish_status(repo_path.clone(), "main".into(), "origin".into()).unwrap();
+        let before = publish_status_inner(repo_path.clone(), "main".into(), "origin".into()).unwrap();
         assert_eq!(before.commits.len(), 0, "parent should have nothing to push before the submodule is touched");
 
         fs::write(sub_path.join("module.txt"), "v2").unwrap();
@@ -18446,20 +18662,20 @@ mod tests {
 
         // Staged, not committed — publish_status walks real commits, and there
         // still isn't one in the parent yet, so it must show nothing new.
-        let staged_only = publish_status(repo_path.clone(), "main".into(), "origin".into()).unwrap();
+        let staged_only = publish_status_inner(repo_path.clone(), "main".into(), "origin".into()).unwrap();
         assert_eq!(staged_only.commits.len(), 0, "the parent must show nothing new to push until the user actually commits the staged gitlink themselves: {:?}", staged_only.commits.iter().map(|c| &c.subject).collect::<Vec<_>>());
 
         // The user's own explicit parent commit — only now does the bump become
         // a real, ready-to-push commit.
         commit_selected_internal(&repo_path, &["vendor/dep".to_string()], "Bump vendor/dep").expect("committing the staged gitlink should succeed");
-        let after = publish_status(repo_path.clone(), "main".into(), "origin".into()).unwrap();
+        let after = publish_status_inner(repo_path.clone(), "main".into(), "origin".into()).unwrap();
         assert_eq!(after.commits.len(), 1, "parent should show exactly one new commit ready to push (the submodule bump), now that it was actually committed: {:?}", after.commits.iter().map(|c| &c.subject).collect::<Vec<_>>());
         assert!(after.commits[0].subject.contains("vendor/dep"), "the ready-to-push commit should be the submodule bump: {:?}", after.commits[0].subject);
 
         // And publishing it must actually succeed — the submodule commit it
         // references is already safely on the submodule's own remote.
         publish_branch_inner(repo_path.clone(), "main".into(), "origin".into(), String::new(), String::new(), String::new(), false).expect("publishing should succeed once the submodule was pushed first");
-        let after_publish = publish_status(repo_path, "main".into(), "origin".into()).unwrap();
+        let after_publish = publish_status_inner(repo_path, "main".into(), "origin".into()).unwrap();
         assert_eq!(after_publish.commits.len(), 0, "nothing should be left to publish after a successful push");
 
         fs::remove_dir_all(base).unwrap();

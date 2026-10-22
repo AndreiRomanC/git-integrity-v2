@@ -96,6 +96,7 @@ pr_status
 preview_folder_restore
 publish_branch
 publish_status
+refresh_publish_metadata
 pull_submodule
 push_submodule
 push_submodule_preview

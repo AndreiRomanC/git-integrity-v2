@@ -130,42 +130,58 @@ async function selectedTask(h) {
   h.el('Results').children[0].handlers.click();
 }
 
-test('task search defaults to New, labels statuses and keeps server filtering through paging', async () => {
+test('task search defaults to All, labels statuses and keeps ordered cursors through paging', async () => {
   const h = harness(); await inProject(h);
-  assert.equal(h.el('TaskStatus').value, 'new');
+  assert.equal(h.el('TaskStatus').value, '');
   assert.equal(h.calls.filter(c => c.name === 'polarion_search').length, 0);
   h.el('TaskQuery').value = 'errm';
-  h.search(async () => ({ code: 'ok', items: [{ id: 'P-1', title: 'Task', status: 'new' }], more: true }));
+  h.search(async () => ({ code: 'ok', items: [{ id: 'P-1', title: 'Task', status: 'in_work' }], more: true, task_next_cursor: '1:2:3' }));
   await h.el('TaskSearchButton').handlers.click();
   let call = h.calls.filter(c => c.name === 'polarion_search').at(-1);
-  assert.equal(call.args.taskStatus, 'new');
-  assert.equal(h.el('Results').children[0].children.at(-1).textContent, 'new');
-  assert.match(h.el('ResultSummary').textContent, /New tasks only/);
+  assert.equal(call.args.taskStatus, ''); assert.equal(call.args.taskCursor, '0:1:0');
+  assert.equal(h.el('Results').children[0].children.at(-1).textContent, 'In Work');
+  assert.match(h.el('ResultSummary').textContent, /All · In Work → Planned → Realized → Closed → Canceled/);
   h.el('Next').handlers.click(); await tick();
   call = h.calls.filter(c => c.name === 'polarion_search').at(-1);
-  assert.equal(call.args.page, 2); assert.equal(call.args.taskStatus, 'new');
+  assert.equal(call.args.page, 2); assert.equal(call.args.taskStatus, ''); assert.equal(call.args.taskCursor, '1:2:3');
 
   let resolve;
   h.search(() => new Promise(r => { resolve = r; }));
-  h.el('TaskStatus').value = ''; h.el('TaskStatus').handlers.change(); await tick();
+  h.el('TaskStatus').value = 'closed'; h.el('TaskStatus').handlers.change(); await tick();
   call = h.calls.filter(c => c.name === 'polarion_search').at(-1);
-  assert.equal(call.args.page, 1); assert.equal(call.args.taskStatus, ''); assert.equal(call.args.query, 'errm');
+  assert.equal(call.args.page, 1); assert.equal(call.args.taskStatus, 'closed'); assert.equal(call.args.query, 'errm'); assert.equal(call.args.taskCursor, '0:1:0');
   assert.equal(h.el('Results').children.length, 0, 'old results cleared while loading');
   assert.equal(h.el('Add').disabled, true); assert.equal(h.el('TaskStatus').disabled, true);
-  resolve({ code: 'ok', items: [{ id: 'P-2', title: 'Closed task', status: 'custom_done' }, { id: 'P-3', title: 'No status' }] }); await tick();
-  assert.equal(h.el('Results').children[0].children.at(-1).textContent, 'custom_done');
+  resolve({ code: 'ok', items: [{ id: 'P-2', title: 'Closed task', status: 'closed' }, { id: 'P-3', title: 'No status' }] }); await tick();
+  assert.equal(h.el('Results').children[0].children.at(-1).textContent, 'Closed');
   assert.equal(h.el('Results').children[1].children.at(-1).textContent, 'Status unavailable');
-  assert.match(h.el('ResultSummary').textContent, /All task statuses/);
+  assert.match(h.el('ResultSummary').textContent, /Closed tasks/);
 });
 
-test('empty New search explains scope and closing drops late task results', async () => {
+test('empty filtered search explains scope and closing drops late task results', async () => {
   const h = harness(); await inProject(h);
+  h.el('TaskStatus').value = 'planned';
   await h.el('TaskSearchButton').handlers.click();
-  assert.match(h.el('Results').children[0].textContent, /Choose All statuses/);
+  assert.match(h.el('Results').children[0].textContent, /No Planned tasks.*Choose All/);
   let resolve; h.search(() => new Promise(r => { resolve = r; }));
   const pending = h.el('TaskSearchButton').handlers.click(); await tick(); h.dialog.close();
-  resolve({ code: 'ok', items: [{ id: 'P-1', title: 'Stale', status: 'new' }] }); await pending;
+  resolve({ code: 'ok', items: [{ id: 'P-1', title: 'Stale', status: 'planned' }] }); await pending;
   assert.equal(h.el('Results').children.length, 0);
+});
+
+test('All task rows show readable state names and distinct badges, including unknown states', async () => {
+  const h = harness(); await inProject(h);
+  const states = ['inWork', 'planned', 'realized', 'closed', 'cancelled', 'custom_status'];
+  h.search(async () => ({ code: 'ok', items: states.map((status, i) => ({ id: `P-${i}`, title: 'Task', status })) }));
+  await h.el('TaskSearchButton').handlers.click();
+  const badges = h.el('Results').children.map(row => row.children.at(-1));
+  assert.deepEqual(badges.map(b => b.textContent), ['In Work', 'Planned', 'Realized', 'Closed', 'Canceled', 'custom_status']);
+  assert.deepEqual(badges.map(b => b.dataset.state), ['inwork', 'planned', 'realized', 'closed', 'canceled', 'other']);
+  const html = fs.readFileSync(path.join(__dirname, '../frontend/index.html'), 'utf8');
+  assert.match(html, /id="polarionTaskStatus"><option value="">All<\/option><option value="inwork">In Work/);
+  const css = fs.readFileSync(path.join(__dirname, '../frontend/polarion.css'), 'utf8');
+  assert.match(css, /#polarionTaskStatus \{[^}]*background: #e8eff5; color: #142536/);
+  assert.match(css, /#polarionTaskStatus option \{ color: #142536; background: #e8eff5/);
 });
 const cardButton = (h, card, label) => h.el(card).children[1].children.find(b => b.textContent === label);
 

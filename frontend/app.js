@@ -791,6 +791,7 @@ function handleError(error) {
   return fullMsg;
 }
 function clearDetails(message) {
+  refs.details.displayedEntry = null;
   refs.details.closest?.('.main-layout')?.classList.add('details-empty-state');
   refs.details.innerHTML = `<div class="details-empty"><div class="details-node"></div><strong>${esc(message)}</strong><span>Select an item in this view to see only relevant details and actions.</span></div>`;
 }
@@ -3795,6 +3796,7 @@ function contextActionSectionHtml(label, actionsHtml, extraClass = '') {
 }
 
 function renderEntryDetails(entry) {
+  refs.details.displayedEntry = entry;
   refs.details.closest?.('.main-layout')?.classList.remove('details-empty-state');
   const pending = entry.details_loading === true;
   const waiting = entry.details_error ? 'Unavailable' : 'Checking…';
@@ -6209,24 +6211,24 @@ function traceGraphStart(event, g, facts) {
     head: g.headOid || null, detached: !!g.headDetached, loaded: g.commits?.length || 0,
     truncated: !!g.commitsTruncated, ...facts })}`, 0);
 }
-// One small reflog lookup per selected branch/tip and loaded graph generation.
+// One small reflog lookup per selected branch/tip and repository context.
 // No history walk, status scan, ref mutation or fallback to current merge-base.
 function ensureStoryCreation(g, view, kind, branch, tip) {
   if (!invoke || kind !== 'branch' || !tip) { view.creation = null; return null; }
   const key = `${g.path}::${branch}::${tip}`;
-  if (view.creation?.key === key && view.creation.commits === g.commits) return view.creation.id;
-  const entry = { key, commits: g.commits, id: null, pending: true };
+  if (view.creation?.key === key) return view.creation.id;
+  const entry = { key, id: null, pending: true };
   view.creation = entry;
   invoke('branch_story_creation', { repositoryPath: g.path, branch, tip }).then(id => {
     entry.id = id;
-    traceGraphStart('creation_result', g, { mode: 'story', source: 'local_reflog', tip, creation: id || null,
+    traceGraphStart('creation_result', g, { mode: view.mode, source: 'local_reflog', tip, creation: id || null,
       current_selection: view.creation === entry });
   }).catch(error => {
     entry.error = String(error);
-    traceGraphStart('creation_error', g, { mode: 'story', source: 'local_reflog', tip, category: diagnosticErrorCategory(error), current_selection: view.creation === entry });
+    traceGraphStart('creation_error', g, { mode: view.mode, source: 'local_reflog', tip, category: diagnosticErrorCategory(error), current_selection: view.creation === entry });
   }).finally(() => {
     entry.pending = false;
-    if (state.view === 'graph' && activeBranchStoryView() === view && view.creation === entry && view.mode === 'story') {
+    if (state.view === 'graph' && activeBranchStoryView() === view && view.creation === entry) {
       const selected = state.selectedCommit?.id;
       renderGraph();
       // Metadata completion must not clear the user's existing inspection.
@@ -6267,6 +6269,21 @@ function resolvePrimarySelection(g, selection = activeGraphPrimaryBranch()) {
   if (selection?.startsWith('remote:') && remoteBranchNames.includes(selection.slice(7))) return { kind: 'remote', name: selection.slice(7) };
   if (g.headDetached) return { kind: 'detached', name: null };
   return { kind: 'branch', name: g.currentBranch };
+}
+
+// Both views share navigation; start verification needs only first-parent
+// paths, not a second graph projection. Nothing here scans the Working Tree.
+function graphNavigationTargets(g = activeGraphData(), view = activeBranchStoryView()) {
+  const selection = resolvePrimarySelection(g, view?.mode === 'story' ? view.selection : activeGraphPrimaryBranch());
+  const commits = g.commits || [];
+  const tip = selection.kind === 'detached' ? g.headOid : commits.find(commit => (commit.refs || []).some(ref =>
+    ref.name === selection.name && ref.kind === (selection.kind === 'remote' ? 'remote_branch' : 'local_branch')))?.id;
+  const creation = view ? ensureStoryCreation(g, view, selection.kind, selection.name, tip) : null;
+  const start = view ? branchStoryStart(commits, { tipId: tip }, creation)
+    : { id: null, reason: 'Open the full repository history to identify the branch start.' };
+  if (view?.creation?.pending) start.reason = 'Checking the selected branch’s local creation record…';
+  if (view?.creation?.error) start.reason = 'Could not read the local creation record. Refresh history to retry.';
+  return { selection, tip, start, merge: lastFirstParentMerge(commits, tip) };
 }
 
 // The 500-commit window load_repository/open_repository_fast return is never
@@ -6479,7 +6496,7 @@ function buildCommitRowHtml(commit, index, ctx) {
   const structuralBadges = [
     headLocationPill,
     ctx.story?.tipId === commit.id ? '<b class="head-location-pill" data-tooltip="Tip of the branch or revision selected for Branch Story, not necessarily the checked-out HEAD">Story tip</b>' : '',
-    ctx.story?.start?.id === commit.id ? `<b class="branch-point-pill" data-tooltip="${esc(ctx.story.start.reason)}">Branch Start</b>` : '',
+    ctx.branchStart?.id === commit.id ? `<b class="branch-point-pill" data-tooltip="${esc(ctx.branchStart.reason)}">Branch Start</b>` : '',
     ctx.story?.baseId === commit.id ? `<b class="branch-point-pill" data-tooltip="Unique common ancestor with ${esc(ctx.story.baseRef)} proven by loaded commit parents. This is not necessarily the original branch creation point.">Shared base</b>` : '',
     ctx.story?.incoming.has(commit.id) ? `<b class="branch-point-pill" data-tooltip="Real incoming merge parent${ctx.story.incoming.get(commit.id).refs.length ? ' with current branch references shown below' : ' without a current branch reference; its historical name is unknown'}.${ctx.story.incoming.get(commit.id).onBaseHistory ? ` Also reachable from current ${esc(ctx.story.incoming.get(commit.id).onBaseHistory)}; this is ancestry, not an original branch name.` : ''}">${ctx.story.incoming.get(commit.id).refs.length ? 'Incoming path' : 'Historical Path'}</b>` : '',
     isCommonAncestorWithMain ? `<b class="branch-point-pill common-main-pill" data-tooltip="Real merge-base between HEAD and ${esc(commonAncestorBaseRef)} — current shared ancestor, not necessarily the original branch start">Shared base</b>` : '',
@@ -6505,9 +6522,7 @@ function graphTruncationStubHtml(truncated) {
 function graphHeadBannerHtml(g, currentBranch, headVisible) {
   const label = g.headDetached ? `Detached at ${(g.headOid || '').slice(0, 8)}` : currentBranch;
   if (!label) return '';
-  const visibility = headVisible
-    ? '<button type="button" class="head-jump" data-jump-head>Jump to HEAD</button>'
-    : '<em>not in loaded rows</em>';
+  const visibility = headVisible ? '' : '<em>not in loaded rows</em>';
   return `<span class="head-banner ${headVisible ? 'head-visible' : 'head-missing'}" data-tooltip="HEAD is the commit currently checked out">HEAD <i>→</i> <b>${esc(label)}</b>${visibility}</span>`;
 }
 
@@ -6526,55 +6541,21 @@ function graphCommitRow(commitId) {
   return Array.from(refs.graph?.querySelectorAll('.commit-row[data-id]') || []).find(row => row.dataset.id === commitId) || null;
 }
 
-async function jumpToGraphBranchStart() {
-  const initialGraph = activeGraphData();
-  const branchStart = ensureHeadMainMergeBase(initialGraph);
-  traceGraphStart('jump_requested', initialGraph, { mode: 'full', source: 'current_head_merge_base',
-    target: branchStart?.oid || null, base_ref: branchStart?.base_ref || null });
-  if (!branchStart?.oid) {
-    const key = `${initialGraph.path}::${initialGraph.headOid}`;
-    traceGraphStart('jump_unavailable', initialGraph, { mode: 'full', reason: headMainMergeBaseFetchKey === key ? 'lookup_pending' : 'no_shared_base' });
-    status(headMainMergeBaseFetchKey === key
-      ? 'Shared base is still being calculated. Try again in a moment.'
-      : 'Shared base is not available for this checkout.', 'error');
-    return;
-  }
+function jumpToGraphBranchStart() { jumpToGraphNavigation('start'); }
+function jumpToGraphLastMerge() { jumpToGraphNavigation('merge'); }
 
-  // "Only matches" deliberately removes non-matching rows. Restore the
-  // topology before navigating so a valid branch-start row cannot remain
-  // hidden merely because it does not match the current search text.
-  if (state.graphOnlySearchMatches) {
-    state.graphOnlySearchMatches = false;
-    renderGraph();
-  }
-
-  const targetContext = state.submoduleGraph;
-  const targetPath = initialGraph.path;
-  let pagesLoaded = 0;
-  let row = graphCommitRow(branchStart.oid);
-  while (!row && activeGraphData().commitsTruncated) {
-    const before = activeGraphData().commits.length;
-    status(`Loading older history to find shared base ${branchStart.oid.slice(0, 8)}…`, 'busy');
-    await loadOlderGraphCommits();
-    pagesLoaded++;
-    if (state.view !== 'graph' || state.submoduleGraph !== targetContext || activeGraphData().path !== targetPath) {
-      traceGraphStart('jump_discarded', initialGraph, { mode: 'full', target: branchStart.oid, reason: 'context_changed', pages: pagesLoaded });
-      return;
-    }
-    if (activeGraphData().commits.length <= before) break;
-    row = graphCommitRow(branchStart.oid);
-  }
-
-  if (!row) {
-    traceGraphStart('jump_unavailable', activeGraphData(), { mode: 'full', target: branchStart.oid, reason: 'target_not_loaded', pages: pagesLoaded });
-    status(`Shared base ${branchStart.oid.slice(0, 8)} is not present in the available graph history.`, 'error');
-    return;
-  }
-  row.scrollIntoView({ block: 'center', behavior: 'smooth' });
-  selectCommit(branchStart.oid);
-  traceGraphStart('jump_selected', activeGraphData(), { mode: 'full', source: 'current_head_merge_base', target: branchStart.oid, base_ref: branchStart.base_ref, pages: pagesLoaded });
-  if (row.animate) row.animate([{ boxShadow: '0 0 0 0 rgba(245, 181, 75, .8)' }, { boxShadow: '0 0 0 12px rgba(245, 181, 75, 0)' }], { duration: 900, easing: 'ease-out' });
-  status(`Shared base: ${branchStart.oid.slice(0, 8)} against ${branchStart.base_ref}. This may advance after merges; it is not necessarily the original branch start.`);
+function jumpToGraphNavigation(kind) {
+  const g = activeGraphData(), view = activeBranchStoryView();
+  const navigation = graphNavigationTargets(g, view), target = navigation[kind];
+  const facts = { mode: view?.mode || 'full', source: kind === 'start' ? 'creation_and_first_parent' : 'first_parent_merge',
+    target: target.id, selected_tip: navigation.tip || null, reason: target.reason };
+  traceGraphStart('jump_requested', g, facts);
+  if (!target.id) { status(target.reason, 'error'); return; }
+  if (state.graphOnlySearchMatches) { state.graphOnlySearchMatches = false; renderGraph(); }
+  const row = graphCommitRow(target.id);
+  if (row) { row.scrollIntoView({ block: 'center', behavior: 'smooth' }); selectCommit(target.id); }
+  else status('This commit is not in the visible history. Load older history or refresh the graph.', 'error');
+  traceGraphStart(row ? 'jump_selected' : 'jump_unavailable', g, facts);
 }
 
 function activeGraphMergeTarget() {
@@ -7107,6 +7088,7 @@ function renderGraph() {
   // actually is, by name.
   const hasRefNamed = (commit, name) => (commit.refs || []).some(r => (r.kind === 'local_branch' || r.kind === 'remote_branch') && r.name === name);
   const primaryTip = primaryKind === 'detached' ? commits.find(c => c.id === g.headOid) : primaryName ? commits.find(c => hasRefNamed(c, primaryName)) : null;
+  const navigation = graphNavigationTargets(g, storyView);
   const story = storyMode ? buildBranchStory(allGraphCommits, primaryTip?.id) : null;
   if (story && (storyView.diagnosticCommits !== g.commits || storyView.diagnosticTip !== story.tipId)) {
     storyView.diagnosticCommits = g.commits; storyView.diagnosticTip = story.tipId;
@@ -7117,7 +7099,7 @@ function renderGraph() {
     // overlapping/redundant parent can be distinguished from missing data.
     merges.slice(0, 12).forEach(([id, parents]) => jsPerfLog(`branch_story_merge: commit=${id} incoming=${parents.map(parent => `${parent.id}:${parent.loaded ? 'loaded' : 'unloaded'}`).join(',')}`, 0));
   }
-  if (story) story.start = branchStoryStart(allGraphCommits, story, ensureStoryCreation(g, storyView, primaryKind, primaryName, primaryTip?.id));
+  if (story) story.start = navigation.start;
   if (story) commits = story.commits;
   const model = buildGraphModel(commits, primaryTip?.id);
   if (onlySearchMatches) model.forEach(node => { node.lane = 0; node.before = []; node.after = []; node.parents = []; });
@@ -7154,14 +7136,13 @@ function renderGraph() {
   const filterOptions = [['all', 'All'], ['branches', 'Branches'], ['releases', 'Releases']];
   const headMainBase = storyMode ? null : ensureHeadMainMergeBase(g);
   const startDiagnostic = {
-    mode: storyMode ? 'story' : 'full', source: storyMode ? 'creation_and_first_parent' : 'current_head_merge_base',
+    mode: storyMode ? 'story' : 'full', source: 'creation_and_first_parent',
     selected_kind: primaryKind, selected_tip: primaryTip?.id || null,
     selected_is_checkout: primaryKind === 'detached' ? !!g.headDetached : primaryKind === 'branch' && primaryName === g.currentBranch,
-    target: (storyMode ? story.start.id : headMainBase?.oid) || null,
-    base_ref: (storyMode ? story.start.baseRef || story.baseRef : headMainBase?.base_ref) || null,
-    story_shared_base: story?.baseId || null, creation: storyMode ? storyView.creation?.id || null : null,
-    lookup_pending: storyMode ? !!storyView.creation?.pending : headMainMergeBaseFetchKey === `${g.path}::${g.headOid}`,
-    reason: storyMode ? story.start.reason : 'Current HEAD merge-base; independent of Primary picker; may advance after merges.',
+    target: navigation.start.id, base_ref: navigation.start.baseRef || null,
+    story_shared_base: story?.baseId || null, creation: storyView?.creation?.id || null,
+    last_merge: navigation.merge.id, lookup_pending: !!storyView?.creation?.pending,
+    reason: navigation.start.reason,
   };
   // Log decisions only when their inputs/results change, not every redraw.
   const startDiagnosticKey = JSON.stringify([g.headOid, allGraphCommits.length, !!g.commitsTruncated, startDiagnostic]);
@@ -7169,15 +7150,6 @@ function renderGraph() {
     storyView.startDiagnostic = startDiagnosticKey;
     traceGraphStart('candidate', g, startDiagnostic);
   }
-  const branchStartVisible = !!(headMainBase?.oid && commits.some(commit => commit.id === headMainBase.oid));
-  const branchStartLookupPending = headMainMergeBaseFetchKey === `${g.path}::${g.headOid}`;
-  const branchStartTitle = headMainBase?.oid
-    ? branchStartVisible
-      ? `Go to shared base ${headMainBase.oid.slice(0, 8)} against ${headMainBase.base_ref} — not necessarily the original branch start`
-      : `Load older history and go to shared base against ${headMainBase.base_ref}`
-    : branchStartLookupPending
-      ? 'Shared base is being calculated'
-      : 'Shared base is not available for this checkout';
   refs.graphView.style.setProperty('--lanes-width', `${lanesWidth}px`);
   // Message C, point 3's own literal example format ("Repository: X" /
   // "Branch: Y" or "Detached at Z" / "Parent: repo") — explicit, labeled
@@ -7201,8 +7173,11 @@ function renderGraph() {
     <div class="graph-toolbar-row graph-toolbar-controls">
       <div class="graph-toolbar-actions">
         <div class="ref-filter-group" role="group" aria-label="Filter by ref kind">${filterOptions.map(([value, label]) => `<button type="button" class="ref-filter-btn ${refFilter === value ? 'active' : ''}" data-ref-filter="${value}">${label}</button>`).join('')}</div>
-        <button type="button" class="graph-current-jump" data-jump-head ${headVisible ? '' : 'disabled'} title="${headVisible ? 'Jump to current HEAD in this graph' : 'Current HEAD is not loaded in this graph'}">⌖</button>
-        ${storyMode ? `<button type="button" class="graph-branch-start-jump" data-jump-story-start ${story.start.id ? '' : 'disabled'} title="${esc(story.start.reason)}">⑂ Go to start</button>` : `<button type="button" class="graph-branch-start-jump ${branchStartLookupPending ? 'is-loading' : ''}" data-jump-branch-start title="${esc(branchStartTitle)}" aria-label="Go to start"><b>⑂</b><span>Go to start</span></button>`}
+        <div class="graph-navigation" role="group" aria-label="History navigation">
+          <button type="button" class="graph-nav-button" data-jump-head ${headVisible ? '' : 'disabled'} title="${headVisible ? 'Select the currently checked-out commit' : 'Current HEAD is not visible in this history'}"><span aria-hidden="true">⌖</span> Go to HEAD</button>
+          <button type="button" class="graph-nav-button" data-jump-last-merge ${navigation.merge.id ? '' : 'disabled'} title="${esc(navigation.merge.reason)}"><span aria-hidden="true">⑂</span> Go to last merge</button>
+          <button type="button" class="graph-nav-button" data-jump-branch-start ${navigation.start.id ? '' : 'disabled'} title="${esc(navigation.start.reason)}"><span aria-hidden="true">↤</span> Go to start</button>
+        </div>
       </div>
       ${pickerOptions.length > 1 || storyMode ? `<label class="primary-branch-picker"><span>${storyMode ? 'Story branch' : 'Primary'}</span><select id="graphPrimaryBranch">${pickerOptions.map(opt => `<option value="${esc(opt.value)}" ${opt.value === selectedPickerValue ? 'selected' : ''}>${esc(opt.label)}</option>`).join('')}</select></label>` : ''}
       <span class="lane-header"><span>GRAPH</span><span>COMMIT</span></span>
@@ -7215,13 +7190,7 @@ function renderGraph() {
   }));
   refs.laneLegend.querySelectorAll('[data-jump-head]').forEach(button => button.addEventListener('click', jumpToGraphHead));
   refs.laneLegend.querySelectorAll('[data-jump-branch-start]').forEach(button => button.addEventListener('click', jumpToGraphBranchStart));
-  refs.laneLegend.querySelector('[data-jump-story-start]')?.addEventListener('click', () => {
-    const row = graphCommitRow(story.start.id);
-    traceGraphStart('jump_requested', g, { mode: 'story', source: 'creation_and_first_parent', target: story.start.id,
-      tip: story.tipId, creation: storyView.creation?.id || null, base_ref: story.start.baseRef || null, reason: story.start.reason, visible: !!row });
-    if (row) { row.scrollIntoView({ block: 'center', behavior: 'smooth' }); selectCommit(story.start.id); }
-    traceGraphStart(row ? 'jump_selected' : 'jump_unavailable', g, { mode: 'story', target: story.start.id, reason: row ? 'visible_row_selected' : 'target_not_loaded' });
-  });
+  refs.laneLegend.querySelectorAll('[data-jump-last-merge]').forEach(button => button.addEventListener('click', jumpToGraphLastMerge));
   refs.laneLegend.querySelectorAll('[data-ref-filter]').forEach(button => button.addEventListener('click', () => { if (storyMode) storyView.refFilter = button.dataset.refFilter; else setActiveGraphRefFilter(button.dataset.refFilter); renderGraph(); }));
   refs.laneLegend.querySelectorAll('[data-graph-only-matches]').forEach(button => button.addEventListener('click', () => { state.graphOnlySearchMatches = !state.graphOnlySearchMatches; renderGraph(); }));
 
@@ -7284,7 +7253,7 @@ function renderGraph() {
   // recompute the exact same inputs for just the newly-arrived rows,
   // without a second, drifting copy of the actual row markup — both paths
   // call buildCommitRowHtml for the real template.
-  lastGraphRenderContext = { model, lanesWidth, stashesByBase, aheadAnnotations, branchPointRows, commonAncestorRows, headMainBase, commitById: new Map(commits.map(commit => [commit.id, commit])), query, matchesQuery, currentBranch, refFilter, repositoryName: g.name, onlySearchMatches, story };
+  lastGraphRenderContext = { model, lanesWidth, stashesByBase, aheadAnnotations, branchPointRows, commonAncestorRows, headMainBase, commitById: new Map(commits.map(commit => [commit.id, commit])), query, matchesQuery, currentBranch, refFilter, repositoryName: g.name, onlySearchMatches, story, branchStart: navigation.start, navigationMerge: navigation.merge };
   const rowsStarted = performance.now();
   const rows = commits.map((commit, index) => buildCommitRowHtml(commit, index, lastGraphRenderContext)).join('') || '<div class="empty-change">No commits in this history</div>';
 
@@ -7352,6 +7321,11 @@ function appendOlderGraphRows(previousCommitCount) {
   const refFilter = activeGraphRefFilter();
   if (commits.length <= previousCommitCount || !lastGraphRenderContext || query || refFilter !== 'all') { renderGraph(); return; }
 
+  const navigation = graphNavigationTargets(g);
+  // Newly loaded evidence can enable Start/Last merge or add a marker to an
+  // existing row. Rebuild only when these navigation facts actually change.
+  if (JSON.stringify([navigation.start, navigation.merge]) !== JSON.stringify([lastGraphRenderContext.branchStart, lastGraphRenderContext.navigationMerge])) { renderGraph(); return; }
+
   const modelStarted = performance.now();
   const currentBranch = g.currentBranch;
   const hasRefNamed = (commit, name) => (commit.refs || []).some(r => (r.kind === 'local_branch' || r.kind === 'remote_branch') && r.name === name);
@@ -7398,7 +7372,7 @@ function appendOlderGraphRows(previousCommitCount) {
   // (set once per full renderGraph) must be kept in sync here too, or the
   // "GRAPH | COMMIT" labels stop lining up with the wider rows below them.
   refs.graphView.style.setProperty('--lanes-width', `${lanesWidth}px`);
-  const ctx = { model, lanesWidth, stashesByBase: lastGraphRenderContext.stashesByBase, aheadAnnotations, branchPointRows, commonAncestorRows, headMainBase, commitById: new Map(commits.map(commit => [commit.id, commit])), query: '', matchesQuery: () => false, currentBranch, refFilter, repositoryName: g.name };
+  const ctx = { model, lanesWidth, stashesByBase: lastGraphRenderContext.stashesByBase, aheadAnnotations, branchPointRows, commonAncestorRows, headMainBase, commitById: new Map(commits.map(commit => [commit.id, commit])), query: '', matchesQuery: () => false, currentBranch, refFilter, repositoryName: g.name, branchStart: navigation.start, navigationMerge: navigation.merge };
   jsPerfLog(`appendOlderGraphRows model build (${commits.length} commits)`, performance.now() - modelStarted);
 
   const domStarted = performance.now();
@@ -7626,6 +7600,7 @@ function renderChanges() {
 }
 
 async function openPublish() {
+  if (publishInFlight) return status('A publish operation is already running.', 'busy');
   if (!state.repository) return;
   if (blockDetachedHeadWork('publish')) return;
   // "Unpublished commits" only ever means the MAIN project — it has no
@@ -7655,12 +7630,36 @@ async function openPublish() {
 // out" can only mean "stop pushing at the commit before it": clicking a
 // commit sets it as the cutoff (included, along with everything older);
 // everything newer than it is left unpublished for now.
-// Submodule-publish-safety report, point 2: fetched once per refreshPublish
-// and re-prepended on every renderPublishCommits call (including the ones
-// triggered later by clicking a cutoff checkbox) — the outgoing commits stay
-// fully visible either way; this only ever adds a warning above them,
-// exactly what "mark them with a warning instead of hiding them" asks for.
+// Optional warnings above the outgoing list. Only Safe requests them; Fast
+// retains its explicit warning/confirmation without doing the history scan.
 let publishSubmoduleRisksHtml = '';
+let publishInFlight = false;
+let publishRiskGeneration = 0;
+
+// Optional, local-only preview. Fast never starts it; the authoritative Safe
+// preflight remains in publish_branch, regardless of preview success/failure.
+async function refreshPublishRisks() {
+  const ticket = ++publishRiskGeneration;
+  publishSubmoduleRisksHtml = '';
+  if (state.publish) renderPublishCommits();
+  if (!invoke || !state.publish || !refs.publishDialog.open || refs.publishFastMode.checked || publishInFlight ||
+      document.querySelector('[name="publishCommitMode"]:checked')?.value === 'combine_only') return;
+  const publish = state.publish, repositoryPath = state.repository.path, generation = repoOpenGeneration;
+  const uptoCommit = state.publishUpto || '';
+  if (uptoCommit === '__none__') return;
+  try {
+    const risks = await invoke('submodule_publish_risks', { repositoryPath, branch: publish.branch, remote: publish.remote, uptoCommit });
+    if (ticket !== publishRiskGeneration || publishInFlight || refs.publishFastMode.checked || !refs.publishDialog.open ||
+        repoOpenGeneration !== generation || state.repository?.path !== repositoryPath || state.publish !== publish) return;
+    publishSubmoduleRisksHtml = submodulePublishRisksHtml(risks);
+    renderPublishCommits(); updatePublishModeUi();
+  } catch (error) {
+    if (ticket === publishRiskGeneration && state.publish === publish && refs.publishDialog.open && !refs.publishFastMode.checked && !publishInFlight) {
+      publishSubmoduleRisksHtml = '<div class="publish-remote-ahead-warning">Submodule preview unavailable. Safe publish will still run the complete safety check before pushing.</div>';
+      renderPublishCommits();
+    }
+  }
+}
 function submodulePublishRisksHtml(risks) {
   if (!risks.length) return '';
   const reasonText = risk => risk.risk === 'unpushed'
@@ -7723,6 +7722,7 @@ function renderPublishCommits() {
     // which means "no cutoff set yet, default to a full push".
     state.publishUpto = box.checked ? commits[index].id : (index > 0 ? commits[index - 1].id : '__none__');
     renderPublishCommits(); updatePublishSummary();
+    refreshPublishRisks();
   }));
 }
 
@@ -7756,16 +7756,19 @@ function updatePublishModeUi() {
   $('#publishCombinedMessageLabel').hidden = mode === 'all';
   $('#publishCombineNotice').textContent = mode === 'all' ? '' : `Combine affects committed history only: ${state.publish?.ahead || state.publish?.commits?.length || 0} local-only commits become one. Existing staged, unstaged and untracked parent-repository changes remain untouched and are not included. A recovery reference is created before the branch moves. Changes inside a submodule must be handled first.`;
   const incompleteList = Number(state.publish?.outgoing_count) > (state.publish?.commits?.length || 0);
-  refs.publishCommits.querySelectorAll('.publish-check').forEach(box => { box.disabled = mode !== 'all' || incompleteList; });
+  refs.publishCommits.querySelectorAll('.publish-check').forEach(box => { box.disabled = publishInFlight || mode !== 'all' || incompleteList; });
+  if (publishInFlight) $('#confirmPublish').disabled = true;
 }
 
 const refreshPublishGuard = createRequestGuard();
 async function refreshPublish() {
+  if (publishInFlight) return;
   const branch = refs.publishBranch.value, remote = refs.publishRemote.value;
   const stillCurrent = refreshPublishGuard();
   state.publish = null;
   state.publishUpto = null;
   publishSubmoduleRisksHtml = '';
+  ++publishRiskGeneration;
   $('#confirmPublish').disabled = true;
   $('#publishCommitMode').hidden = true;
   document.querySelector('[name="publishCommitMode"][value="all"]').checked = true;
@@ -7774,13 +7777,8 @@ async function refreshPublish() {
   refs.publishDestination.textContent = `${branch} → ${remote}/${branch}`; refs.publishCommits.innerHTML = '<div class="loading-row"><i class="spinner"></i>Checking server state…</div>';
   refs.publishSummary.textContent = 'Checking…';
   let publish;
-  let risksPromise = Promise.resolve([]);
   try {
     if (invoke) {
-      // The safety preview can take much longer than reading the local
-      // commit list. Do not hold the Push dialog hostage to it: Safe publish
-      // repeats the authoritative check in the backend before the push.
-      risksPromise = invoke('submodule_publish_risks', { repositoryPath: state.repository.path, branch, remote, uptoCommit: '' }).catch(() => []);
       publish = await invoke('publish_status', { repositoryPath: state.repository.path, branch, remote });
     } else {
       publish = { branch, remote, commits: previewData.commits.slice(0, 2) };
@@ -7809,12 +7807,66 @@ async function refreshPublish() {
     ? `${outgoingCount} local commit${outgoingCount === 1 ? '' : 's'} to publish · ${comparison}`
     : Number(state.publish.ahead) > 0 ? `Branch update needed · ${comparison}` : `Everything is on the server · ${comparison}`;
   updatePublishSummary();
-  risksPromise.then(risks => {
-    if (!stillCurrent() || !refs.publishDialog.open || state.publish !== publish || refs.publishBranch.value !== branch || refs.publishRemote.value !== remote) return;
-    publishSubmoduleRisksHtml = submodulePublishRisksHtml(risks);
-    renderPublishCommits();
-    updatePublishModeUi();
-  });
+  refreshPublishRisks();
+}
+
+async function refreshAfterPublish(request, combined) {
+  if (!request.isCurrent()) return;
+  if (combined) {
+    if (!await loadRepository(request.repositoryPath, { keepPath: true })) throw new Error('Repository reload failed');
+    return;
+  }
+  updatePublishIndicatorGuard(); // retire any sidebar result captured before this push
+  const data = await invoke('refresh_publish_metadata', { repositoryPath: request.repositoryPath, branch: request.publish.branch, remote: request.publish.remote });
+  if (!request.isCurrent()) return;
+  // An external checkout or another history-changing action is not a normal
+  // push-only refresh. Do not patch its old visible commits or file badges.
+  if (data.head_oid !== request.headOid || data.current_branch !== request.currentBranch || state.repository.head_oid !== request.headOid) {
+    if (!await loadRepository(request.repositoryPath, { keepPath: true })) throw new Error('Repository changed; reload failed');
+    return;
+  }
+  // Closing Publish and navigating while the push runs may leave an older
+  // folder/details read in flight. Let the existing full-load generations
+  // retire it instead of repainting old entries under the new folder name.
+  if (state.view === 'explorer' && (refs.fileList?.querySelector('.loading-row') ||
+      (refs.details.displayedEntry?.details_loading && state.selectedEntry))) {
+    if (!await loadRepository(request.repositoryPath, { keepPath: true })) throw new Error('Concurrent navigation reload failed');
+    return;
+  }
+  const remoteBranch = `${request.publish.remote}/${request.publish.branch}`;
+  state.branches = state.branches.map(branch => !branch.remote && branch.name === request.publish.branch ? { ...branch, upstream: data.upstream } : branch);
+  if (!state.branches.some(branch => branch.remote && branch.name === remoteBranch)) state.branches.push({ name: remoteBranch, remote: true, current: false, upstream: null });
+  const updateRefs = commit => {
+    const refs = (commit.refs || []).filter(ref => !(ref.kind === 'remote_branch' && ref.name === remoteBranch));
+    if (commit.id === data.remote_tip) refs.push({ name: remoteBranch, kind: 'remote_branch' });
+    return { ...commit, refs };
+  };
+  state.commits = state.commits.map(updateRefs);
+  state.allCommits = state.allCommits.map(updateRefs);
+  // Keep local/staged changes, graph pagination, selection and compare state.
+  // Entries INSIDE a submodule belong to another repository: don't relabel them.
+  const unpushed = new Set(data.unpushed_paths);
+  const unpushedFolders = new Set();
+  for (const path of unpushed) { const parts = path.split('/'); parts.pop(); while (parts.length) { unpushedFolders.add(parts.join('/')); parts.pop(); } }
+  const patchEntry = entry => {
+    const boundary = submoduleBoundaryFor(entry.relative_path);
+    if (boundary && boundary !== entry.relative_path) return entry;
+    const pending = unpushed.has(entry.relative_path) || (entry.kind === 'folder' && unpushedFolders.has(entry.relative_path));
+    const submodule_state = entry.submodule_state === 'project_commit_push_needed' && !pending ? 'synced' : entry.submodule_state;
+    return { ...entry, unpushed: pending, submodule_state };
+  };
+  directoryCache.clear(); // other folders must not retain old publication badges
+  state.entries = state.entries.map(patchEntry);
+  if (state.selectedEntry) Object.assign(state.selectedEntry, patchEntry(state.selectedEntry));
+  const displayed = refs.details.displayedEntry;
+  if (state.view === 'explorer' && displayed && displayed.relative_path === state.selectedEntry?.relative_path) {
+    const historyHtml = $('#entryLastCommitSection')?.innerHTML;
+    renderEntryDetails(patchEntry(displayed));
+    if (historyHtml !== undefined && $('#entryLastCommitSection')) $('#entryLastCommitSection').innerHTML = historyHtml;
+  }
+  render();
+  updatePublishIndicator();
+  jsPerfLog('publish_refresh: targeted refs + badges applied; working-tree state retained', 0);
 }
 
 // Submodule-publish-safety report, point 3: Safe publish runs a backend
@@ -7827,15 +7879,43 @@ async function refreshPublish() {
 // to check) is override-eligible, marked with a fixed prefix this function
 // looks for and strips before showing anything.
 const UNPUSHED_SUBMODULE_OVERRIDABLE_PREFIX = 'UNPUSHED_SUBMODULE_OVERRIDABLE::';
-async function confirmPublish(event, overrideUnpushedSubmodules = false, alreadyCombined = null) {
-  event.preventDefault(); if (!state.publish) return;
-  const commitMode = document.querySelector('[name="publishCommitMode"]:checked')?.value || 'all';
+async function confirmPublish(event) {
+  event.preventDefault(); if (!state.publish || publishInFlight) return;
+  const publish = state.publish, repositoryPath = state.repository.path, generation = repoOpenGeneration;
+  const request = {
+    publish, repositoryPath, headOid: state.repository.head_oid, currentBranch: state.repository.current_branch,
+    uptoCommit: state.publishUpto || '',
+    commitMode: document.querySelector('[name="publishCommitMode"]:checked')?.value || 'all',
+    skipSubmoduleSafety: !!refs.publishFastMode?.checked,
+    message: $('#publishCombinedMessage').value.trim(), username: $('#publishUsername').value.trim(), accessToken: $('#publishToken').value,
+    isCurrent: () => repoOpenGeneration === generation && state.repository?.path === repositoryPath,
+  };
+  publishInFlight = true;
+  ++publishRiskGeneration;
+  const controls = [$('#confirmPublish'), refs.publishBranch, refs.publishRemote, refs.publishFastMode, refs.publishSafeMode,
+    $('#publishCombinedMessage'), $('#publishUsername'), $('#publishToken'),
+    ...document.querySelectorAll('[name="publishCommitMode"], .publish-check')];
+  const previousDisabled = controls.map(control => control.disabled);
+  controls.forEach(control => { control.disabled = true; });
+  try { await executePublish(request); }
+  finally {
+    request.accessToken = '';
+    publishInFlight = false;
+    controls.forEach((control, i) => { control.disabled = previousDisabled[i]; });
+    if (request.isCurrent() && refs.publishDialog.open) {
+      if (request.refreshPreview) await refreshPublish();
+      else updatePublishSummary();
+    }
+  }
+}
+
+async function executePublish(request, overrideUnpushedSubmodules = false, alreadyCombined = null) {
+  const { publish, repositoryPath, commitMode, skipSubmoduleSafety } = request;
   const combining = commitMode !== 'all';
   if (combining && !alreadyCombined && !overrideUnpushedSubmodules) {
-    const proceed = await customConfirm(`Combine ${state.publish.ahead} local-only commits on ${state.publish.branch} into one new commit?\n\nOnly committed history is combined. The new commit preserves the exact committed files from the current HEAD. Existing staged, unstaged and untracked parent-repository changes remain untouched and are not included. Their commit IDs change, and a recovery reference to the original tip will be kept. ${commitMode === 'combine_only' ? 'Nothing will be pushed.' : 'The new commit will then be pushed.'}`, { title: commitMode === 'combine_only' ? 'Combine local commits' : 'Combine and push', danger: true, okLabel: commitMode === 'combine_only' ? 'Combine only' : 'Combine & push' });
+    const proceed = await customConfirm(`Combine ${publish.ahead} local-only commits on ${publish.branch} into one new commit?\n\nOnly committed history is combined. The new commit preserves the exact committed files from the current HEAD. Existing staged, unstaged and untracked parent-repository changes remain untouched and are not included. Their commit IDs change, and a recovery reference to the original tip will be kept. ${commitMode === 'combine_only' ? 'Nothing will be pushed.' : 'The new commit will then be pushed.'}`, { title: commitMode === 'combine_only' ? 'Combine local commits' : 'Combine and push', danger: true, okLabel: commitMode === 'combine_only' ? 'Combine only' : 'Combine & push' });
     if (!proceed) return;
   }
-  const skipSubmoduleSafety = !!refs.publishFastMode?.checked;
   if (commitMode !== 'combine_only' && skipSubmoduleSafety && !overrideUnpushedSubmodules) {
     const proceed = await customConfirm(
       'Fast publish skips the submodule safety check and its fetches, including checks of intermediate versions in the outgoing history. If a project commit references an unpublished submodule commit, another clone may fail to check it out.\n\nUse this only when the referenced submodule commits are already published, or no outgoing commit changes a submodule pointer. This is a normal push, not a force push; authentication, non-fast-forward checks and server rules still apply.',
@@ -7843,37 +7923,53 @@ async function confirmPublish(event, overrideUnpushedSubmodules = false, already
     );
     if (!proceed) return;
   }
-  const operation = $('#publishOperationStatus'); operation.textContent = `${skipSubmoduleSafety ? 'Fast publishing' : 'Publishing'} ${state.publish.branch}…`; operation.className = 'submodule-operation-status busy';
+  // Confirmation is not permission to publish a different selection if the
+  // user changed repository while the confirmation window was open.
+  if (!request.isCurrent() || state.publish !== publish || !refs.publishDialog.open) return;
+  const operation = $('#publishOperationStatus'); operation.textContent = `${skipSubmoduleSafety ? 'Fast publishing' : 'Publishing'} ${publish.branch}…`; operation.className = 'submodule-operation-status busy';
   let combined = alreadyCombined;
   try {
-    $('#confirmPublish').disabled = true; status(`${skipSubmoduleSafety ? 'Fast publishing' : 'Publishing'} ${state.publish.branch}…`, 'busy');
+    status(`${skipSubmoduleSafety ? 'Fast publishing' : 'Publishing'} ${publish.branch}…`, 'busy');
     if (combining && !combined) {
-      combined = await invoke('combine_local_commits', { repositoryPath: state.repository.path, branch: state.publish.branch, remote: state.publish.remote, expectedTip: state.publish.local_tip, message: $('#publishCombinedMessage').value.trim(), username: $('#publishUsername').value.trim(), accessToken: $('#publishToken').value });
+      combined = await invoke('combine_local_commits', { repositoryPath, branch: publish.branch, remote: publish.remote, expectedTip: publish.local_tip, message: request.message, username: request.username, accessToken: request.accessToken });
       if (commitMode === 'combine_only') {
-        $('#publishToken').value = ''; refs.publishDialog.close(); await loadRepository(state.repository.path, { keepPath: true });
         const message = `Combined ${combined.count} local commits into ${combined.revision.slice(0, 8)}. Nothing was pushed. Original commits: ${combined.backup_ref}`;
-        status(message); showOperationToast(message, 'success'); return;
+        await finishPublishUi(request, combined, message); return;
       }
     }
-    await invoke('publish_branch', { repositoryPath: state.repository.path, branch: state.publish.branch, remote: state.publish.remote, username: $('#publishUsername').value.trim(), accessToken: $('#publishToken').value, uptoCommit: combined ? '' : state.publishUpto || '', overrideUnpushedSubmodules, skipSubmoduleSafety });
-    $('#publishToken').value = ''; refs.publishDialog.close(); await loadRepository(state.repository.path, { keepPath: true });
-    const msg = combined ? `Combined ${combined.count} commits and published ${combined.revision.slice(0, 8)}. Original commits: ${combined.backup_ref}` : state.publishUpto ? `Published part of ${state.publish.branch} to ${state.publish.remote} (up to your chosen commit)${skipSubmoduleSafety ? ' — fast publish' : ''}.` : `Published ${state.publish.branch} to ${state.publish.remote}${skipSubmoduleSafety ? ' (fast publish)' : ''}`;
-    status(msg); showOperationToast(msg);
+    await invoke('publish_branch', { repositoryPath, branch: publish.branch, remote: publish.remote, username: request.username, accessToken: request.accessToken, uptoCommit: combined ? '' : request.uptoCommit, overrideUnpushedSubmodules, skipSubmoduleSafety });
+    const msg = combined ? `Combined ${combined.count} commits and published ${combined.revision.slice(0, 8)}. Original commits: ${combined.backup_ref}` : request.uptoCommit ? `Published part of ${publish.branch} to ${publish.remote} (up to your chosen commit)${skipSubmoduleSafety ? ' — fast publish' : ''}.` : `Published ${publish.branch} to ${publish.remote}${skipSubmoduleSafety ? ' (fast publish)' : ''}`;
+    await finishPublishUi(request, combined, msg);
   } catch (error) {
     const rawMessage = String(error);
+    request.refreshPreview = true;
     const message = combined ? `Commits were combined locally at ${combined.revision.slice(0, 8)}, but push did not finish. Original history is saved at ${combined.backup_ref}. ${rawMessage}` : rawMessage;
+    if (!request.isCurrent()) { showOperationToast(`${publish.branch}: ${message}`, 'error'); return; }
     if (rawMessage.startsWith(UNPUSHED_SUBMODULE_OVERRIDABLE_PREFIX)) {
       const detail = rawMessage.slice(UNPUSHED_SUBMODULE_OVERRIDABLE_PREFIX.length);
-      $('#confirmPublish').disabled = false;
       const proceed = await customConfirm(`${detail}\n\nPublish anyway?`, { title: 'Local-only submodule commit', danger: true, okLabel: 'Publish anyway' });
-      if (proceed) return confirmPublish(event, true, combined);
+      if (proceed) return executePublish(request, true, combined);
       const cancelled = combined ? `Push cancelled. ${combined.count} commits remain combined locally at ${combined.revision.slice(0, 8)}; original history: ${combined.backup_ref}` : 'Publish cancelled';
       operation.textContent = cancelled; operation.className = 'submodule-operation-status'; status(cancelled);
-      if (combined) await refreshPublish().catch(() => {});
       return;
     }
-    operation.textContent = message; operation.className = 'submodule-operation-status error'; status(message, 'error'); $('#confirmPublish').disabled = false;
-    if (combined) await refreshPublish().catch(() => {});
+    operation.textContent = message; operation.className = 'submodule-operation-status error'; status(message, 'error');
+  }
+}
+
+async function finishPublishUi(request, combined, message) {
+  $('#publishToken').value = '';
+  if (request.isCurrent()) { refs.publishDialog.close(); status(message); }
+  showOperationToast(message, 'success');
+  // A UI refresh failure must never report a completed server push as failed
+  // (nor invite retrying it). Keep this separate from the Git operation.
+  try { await refreshAfterPublish(request, combined); }
+  catch (error) {
+    jsPerfLog(`publish_refresh: failed after successful operation: ${String(error)}`, 0);
+    if (state.repository?.path === request.repositoryPath) {
+      const warning = `${message} Display refresh failed; use Refresh to update the project view.`;
+      status(warning, 'error'); showOperationToast(warning, 'error');
+    }
   }
 }
 
@@ -8765,10 +8861,13 @@ async function syncCurrent(action, button = null) {
   finally { finishButton(); }
 }
 $('#pullCurrent').addEventListener('click', event => syncCurrent('pull', event.currentTarget)); $('#pushCurrent').addEventListener('click', () => openPublish().catch(error => status(String(error), 'error')));
-refs.publishBranch.addEventListener('change', refreshPublish); refs.publishRemote.addEventListener('change', refreshPublish); refs.publishSafeMode.addEventListener('change', updatePublishModeUi); refs.publishFastMode.addEventListener('change', updatePublishModeUi); $('#confirmPublish').addEventListener('click', confirmPublish);
+refs.publishBranch.addEventListener('change', refreshPublish); refs.publishRemote.addEventListener('change', refreshPublish);
+for (const input of [refs.publishSafeMode, refs.publishFastMode]) input.addEventListener('change', () => { updatePublishModeUi(); refreshPublishRisks(); });
+$('#confirmPublish').addEventListener('click', confirmPublish);
 document.querySelectorAll('[name="publishCommitMode"]').forEach(input => input.addEventListener('change', () => {
   if (input.checked && input.value !== 'all') { state.publishUpto = null; renderPublishCommits(); }
   updatePublishSummary();
+  refreshPublishRisks();
 }));
 $('#publishCombinedMessage').addEventListener('input', updatePublishSummary);
 [['#compareRestoreRemote','remote'],['#compareRestoreHead','head'],['#compareStage','stage'],['#compareUnstage','unstage']].forEach(([selector, action]) => $(selector)?.addEventListener('click', event => { event.preventDefault(); updateRecoveryHelp(action); applyFileRecovery(action).catch(error => handleError(error)); }));

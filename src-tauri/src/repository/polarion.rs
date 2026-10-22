@@ -90,6 +90,7 @@ pub struct SearchResult {
     #[serde(default)] http: u16,
     #[serde(default)] session_token: bool,
     #[serde(default)] more: bool,
+    #[serde(default)] task_next_cursor: String,
     #[serde(default)] received: usize,
     #[serde(default)] prefix_fallback: bool,
     #[serde(default)] metadata_fallback: bool,
@@ -175,20 +176,59 @@ fn escaped_query_literal(value: &str) -> String {
     escaped
 }
 
-// Apply on the server BEFORE pagination, not to just the first 25 results.
-// Workflow states are project-specific: only the literal ID `new` is claimed
-// as New. All statuses remains available for custom workflows and older tasks.
+// Apply before pagination. Only spelling variants of the requested states
+// are aliases; unrelated/custom states are never guessed to mean In Work.
+const TASK_STATES: &[(&str, &[&str])] = &[
+    ("inwork", &["inwork", "in_work", "inWork", "in-work", "In Work", "in work"]),
+    ("planned", &["planned", "Planned"]),
+    ("realized", &["realized", "Realized"]),
+    ("closed", &["closed", "Closed"]),
+    ("canceled", &["canceled", "Canceled", "cancelled", "Cancelled"]),
+];
+
 fn task_search_url(project: &str, query: &str, user: &str, page: usize, status: &str) -> Result<String, String> {
-    if !["", "new"].contains(&status) { return Err("Unsupported task status filter".into()); }
+    let ids = if status == "new" { vec!["new"] } // Compatibility with older callers, not a visible option.
+        else if status.is_empty() { Vec::new() }
+        else { TASK_STATES.iter().find(|(key, _)| *key == status).ok_or("Unsupported task status filter")?.1.to_vec() };
+    task_group_url(project, query, user, page, &ids, false)
+}
+
+fn task_group_url(project: &str, query: &str, user: &str, page: usize, ids: &[&str], exclude: bool) -> Result<String, String> {
     let mut url = reqwest::Url::parse(&search_url("tasks", project, query, user, page)?).unwrap();
-    if status == "new" {
+    if !ids.is_empty() {
+        let states = ids.iter().map(|id| format!("\"{id}\"")).collect::<Vec<_>>().join(" OR ");
         let pairs: Vec<(String, String)> = url.query_pairs().map(|(key, value)| {
-            let value = if key == "query" { format!("{value} AND status:new") } else { value.into_owned() };
+            let value = if key == "query" { format!("{value} AND {}status:({states})", if exclude { "NOT " } else { "" }) } else { value.into_owned() };
             (key.into_owned(), value)
         }).collect();
         url.query_pairs_mut().clear().extend_pairs(pairs);
     }
     Ok(url.to_string())
+}
+
+fn task_cursor(value: &str) -> Option<(usize, usize, usize)> {
+    let parts = value.split(':').map(str::parse::<usize>).collect::<Result<Vec<_>, _>>().ok()?;
+    if parts.len() != 3 || parts[0] > 5 || !(1..=1000).contains(&parts[1]) || parts[2] > 24 { return None; }
+    Some((parts[0], parts[1], parts[2]))
+}
+
+fn task_search_args(project: &str, query: &str, user: &str, page: usize, status: &str, cursor: &str) -> Result<serde_json::Value, String> {
+    // Preserve bounded server pages instead of downloading a whole task catalog
+    // to impose a custom status order. Unknown states form the final All group.
+    let url = task_search_url(project, query, user, page, status)?;
+    let mut groups = Vec::new();
+    let all_ids: Vec<_> = TASK_STATES.iter().flat_map(|(_, ids)| ids.iter().copied()).collect();
+    let selections = if status.is_empty() { TASK_STATES.iter().map(|(key, _)| *key).chain(std::iter::once("other")).collect::<Vec<_>>() } else { vec![status] };
+    for key in selections {
+        let group_url = if key == "other" { task_group_url(project, query, user, 1, &all_ids, true)? } else { task_search_url(project, query, user, 1, key)? };
+        let ids = if key == "other" { all_ids.clone() } else if key == "new" { vec!["new"] }
+            else { TASK_STATES.iter().find(|(name, _)| *name == key).unwrap().1.to_vec() };
+        groups.push(serde_json::json!({ "url":group_url, "fallbackUrl":prefix_fallback_url(&group_url)?, "statuses":ids, "exclude":key == "other" }));
+    }
+    let (group, server_page, offset) = task_cursor(cursor).ok_or("Invalid task search cursor; search again")?;
+    if group >= groups.len() { return Err("Invalid task status group; search again".into()); }
+    Ok(serde_json::json!({"url":url, "kind":"tasks", "project":project, "query":query, "page":page, "assigned":!user.is_empty(),
+        "taskGroups":groups, "taskCursor":[group,server_page,offset]}))
 }
 
 fn workitem_query_url(project: &str, expression: &str, page_size: usize) -> String {
@@ -608,6 +648,7 @@ pub async fn polarion_connect(app: tauri::AppHandle) -> Result<(), String> {
 fn validate_result(raw: &str) -> Result<SearchResult, String> {
     let result: SearchResult = serde_json::from_str(raw).map_err(|_| "Invalid Polarion search response")?;
     if !["ok", "auth_required", "forbidden", "api_unavailable", "query_rejected", "http_error", "not_json", "network_error", "timeout", "wrong_origin", "invalid_response", "catalog_limit", "response_limit"].contains(&result.code.as_str())
+        || (!result.task_next_cursor.is_empty() && task_cursor(&result.task_next_cursor).is_none())
         || result.items.len() > 25 || result.items.iter().any(|item| (!identifier(&item.id) && resource_segments(&item.id, 3).is_err() && resource_segments(&item.id, 2).is_err()) || item.title.len() > 2000 || item.item_type.len() > 240 || item.status.len() > 240)
         || result.elements.len() > 25 || result.elements.iter().any(|s| !valid_snapshot(s))
         || result.snapshot.as_ref().is_some_and(|s| !valid_snapshot(s)) || result.user_id.len() > 120 || result.user_name.len() > 500 || result.page_key.len() > 30_000
@@ -854,7 +895,7 @@ mod tests {
             let params = pairs(&checked);
             assert!(params["query"].starts_with("type:task AND "));
             assert!(params["query"].contains("assignee.id:\"user.name\""));
-            assert!(params["query"].ends_with(" AND status:new"));
+            assert!(params["query"].ends_with(" AND status:(\"new\")"));
             assert_eq!(params["fields[workitems]"], "id,title,type,status");
             assert_eq!(params["page[number]"], "3");
         }
@@ -862,6 +903,36 @@ mod tests {
         assert!(task_search_url("P", "", "", 1, "new OR *").is_err());
         let result = validate_result(r#"{"code":"ok","items":[{"id":"P-1","title":"Task","item_type":"task","status":"custom_state"}]}"#).unwrap();
         assert_eq!(result.items[0].status, "custom_state");
+    }
+
+    #[test]
+    fn task_all_groups_follow_workflow_order_preserve_scope_and_keep_unknown_states() {
+        let args = task_search_args("P", "errm", "my.user", 2, "", "1:3:7").unwrap();
+        assert_eq!(args["taskCursor"], serde_json::json!([1,3,7]));
+        let groups = args["taskGroups"].as_array().unwrap();
+        assert_eq!(groups.len(), 6);
+        for (i, expected) in ["inwork", "planned", "realized", "closed", "canceled"].iter().enumerate() {
+            let group = &groups[i];
+            assert_eq!(group["statuses"][0], *expected);
+            for key in ["url", "fallbackUrl"] {
+                let url = reqwest::Url::parse(group[key].as_str().unwrap()).unwrap();
+                assert_eq!(url.path(), "/polarion/rest/v1/projects/P/workitems");
+                let params = pairs(url.as_str());
+                assert_eq!(params["page[size]"], "25"); assert_eq!(params["sort"], "id");
+                assert!(params["query"].contains("type:task"));
+                assert!(params["query"].contains("assignee.id:\"my.user\""));
+                assert!(params["query"].contains(&format!("status:(\"{expected}\"")));
+            }
+            let single = task_search_args("P", "", "", 1, expected, "0:1:0").unwrap();
+            assert_eq!(single["taskGroups"].as_array().unwrap().len(), 1);
+        }
+        assert_eq!(groups[5]["exclude"], true);
+        assert!(pairs(groups[5]["url"].as_str().unwrap())["query"].contains("AND NOT status:"));
+        for cursor in ["", "-1:1:0", "6:1:0", "0:1001:0", "0:1:25", "1:1:0:0"] {
+            assert!(task_search_args("P", "", "", 1, "", cursor).is_err());
+        }
+        assert!(task_search_args("P", "", "", 1, "closed", "1:1:0").is_err());
+        assert!(validate_result(r#"{"code":"ok","task_next_cursor":"99:1:0"}"#).is_err());
     }
     #[test]
     fn invalid_queries_do_not_reach_browser() {
@@ -1078,12 +1149,16 @@ mod tests {
 }
 
 #[tauri::command]
-pub async fn polarion_search(app: tauri::AppHandle, kind: String, project: String, query: String, user: String, page: usize, task_status: Option<String>) -> Result<SearchResult, String> {
+pub async fn polarion_search(app: tauri::AppHandle, kind: String, project: String, query: String, user: String, page: usize, task_status: Option<String>, task_cursor: Option<String>) -> Result<SearchResult, String> {
     if kind == "documents" { return portal_request(app, document_search_args(&project, &query, page)?).await; }
     let status = task_status.as_deref().unwrap_or("");
-    let url = if kind == "tasks" { task_search_url(&project, &query, &user, page, status)? } else { search_url(&kind, &project, &query, &user, page)? };
+    if kind == "tasks" {
+        let args = task_search_args(&project, &query, &user, page, status, task_cursor.as_deref().unwrap_or("0:1:0"))?;
+        perf_log(&format!("polarion: task_search status_filter={} page={page} ordered_groups=true status_field_requested=true", if status.is_empty() { "all" } else { status }), Duration::ZERO);
+        return portal_request(app, args).await;
+    }
+    let url = search_url(&kind, &project, &query, &user, page)?;
     let fallback = prefix_fallback_url(&url)?;
-    if kind == "tasks" { perf_log(&format!("polarion: task_search status_filter={} page={page} status_field_requested=true", if status.is_empty() { "all" } else { status }), Duration::ZERO); }
     portal_request(app, serde_json::json!({"url":url,"fallbackUrl":fallback,"kind":kind,"project":project,"query":query,"page":page,"assigned":!user.is_empty()})).await
 }
 

@@ -713,11 +713,11 @@ button.pr-reviewer:hover { border-color: #59758e; background: #1b2b38; color: #e
 .lane-legend { position: sticky; z-index: 3; top: 0; min-height: 40px; display: flex; flex-direction: column; align-items: stretch; gap: 6px; padding: 7px 22px; background: #111820; border-bottom: 1px solid var(--border); }
 .graph-toolbar-row { min-width: 0; align-items: center; gap: 8px 12px; }
 .graph-toolbar-context { min-height: 27px; display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(250px, auto); }
-.graph-toolbar-controls { min-height: 29px; display: grid; grid-template-columns: auto minmax(300px, 420px) minmax(100px, 1fr); }
+.graph-toolbar-controls { min-height: 29px; display: grid; grid-template-columns: minmax(0, 1fr) minmax(220px, 340px) 84px; }
 .graph-toolbar-meta, .graph-toolbar-head, .graph-toolbar-actions { min-width: 0; display: flex; align-items: center; gap: 8px 12px; }
 .graph-toolbar-meta { overflow: hidden; }
 .graph-toolbar-head { justify-content: flex-end; }
-.graph-toolbar-actions { white-space: nowrap; }
+.graph-toolbar-actions { white-space: nowrap; flex-wrap: wrap; }
 .graph-view-switch { margin-left: 0; }
 .time-direction { flex: none; display: grid; grid-template-columns: auto auto auto; align-items: center; gap: 7px; padding-right: 15px; border-right: 1px solid #34414c; color: #c0d0dd; font-size: 9px; }.time-direction i { color: var(--blue); font-style: normal; }
 .head-banner { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border: 1px solid #3d5368; border-radius: 999px; background: #182432; color: #cfe3f5; font-size: 11px; font-weight: 600; }
@@ -726,8 +726,6 @@ button.pr-reviewer:hover { border-color: #59758e; background: #1b2b38; color: #e
 .head-banner i { color: #6f8daa; font-style: normal; }
 .head-banner b { color: #7fc1ff; }
 .head-banner em { color: #ffcf8a; font-style: normal; font-weight: 700; }
-.head-jump { height: 20px; padding: 0 8px; border: 1px solid #4d83ad; border-radius: 999px; background: #12324b; color: #ccecff; font-size: 10px; font-weight: 800; }
-.head-jump:hover { border-color: #7ed3ff; background: #184566; color: #fff; }
 /* Always visible, whether the parent repository or a submodule's own
    history is on screen (point 4 of the rework) — the persistent global
    topbar's own path/name is the *parent's*, even inside a submodule's map,
@@ -755,14 +753,11 @@ button.pr-reviewer:hover { border-color: #59758e; background: #1b2b38; color: #e
 .ref-filter-btn { height: 22px; padding: 0 9px; border: 0; border-radius: 4px; background: transparent; color: #7f92a4; font-size: 10px; font-weight: 600; }
 .ref-filter-btn:hover { color: #cfe0ee; }
 .ref-filter-btn.active { background: #23364a; color: #bfe0ff; }
-.graph-current-jump { width: 25px; height: 25px; border: 1px solid #3d5c78; border-radius: 7px; background: #142435; color: #9ed0ff; font-size: 13px; font-weight: 900; line-height: 1; }
-.graph-current-jump:hover:not(:disabled) { border-color: #72b6ec; background: #1d3a55; color: #fff; }
-.graph-current-jump:disabled { opacity: .42; cursor: not-allowed; color: #62778a; }
-.graph-branch-start-jump { height: 25px; display: inline-flex; align-items: center; gap: 4px; padding: 0 8px; border: 1px solid #66532e; border-radius: 7px; background: #241f16; color: #c6a769; font-size: 10px; font-weight: 800; line-height: 1; white-space: nowrap; }
-.graph-branch-start-jump:hover { border-color: #b88a3d; background: #302719; color: #f1c978; }
-.graph-branch-start-jump b { font-size: 11px; line-height: 1; }
-.graph-branch-start-jump span { font-size: 8.5px; letter-spacing: .025em; }
-.graph-branch-start-jump.is-loading { opacity: .68; }
+.graph-navigation { display: inline-flex; align-items: center; flex-wrap: wrap; gap: 5px; }
+.graph-nav-button { height: 27px; display: inline-flex; align-items: center; gap: 5px; padding: 0 8px; border: 1px solid #48525d; border-radius: 6px; background: transparent; color: #e4e9ef; font-size: 10px; font-weight: 600; line-height: 1; white-space: nowrap; }
+.graph-nav-button:hover:not(:disabled) { background: #ffffff0c; border-color: #a6b0bc; color: #fff; }
+.graph-nav-button:focus-visible { outline: 2px solid #9ed0ff; outline-offset: 2px; }
+.graph-nav-button:disabled { opacity: .45; cursor: not-allowed; }
 .lane-header { min-width: 0; display: grid; grid-template-columns: var(--lanes-width, 90px) 1fr; gap: 8px; color: #5a6c7d; font-size: 9px; font-weight: 700; letter-spacing: .8px; }
 .back-context { margin: 12px 20px 0; height: 32px; padding: 0 12px; border: 1px solid #3c5368; border-radius: 6px; background: #172737; color: #bcd8ef; }
 .graph { position: relative; padding: 14px 20px 30px; }
@@ -1475,7 +1470,7 @@ dialog form { padding: 28px; text-align: center; }dialog h2 { margin: 0 0 10px; 
 .recent-repo-btn:hover { opacity: 1; border-color: #4f8fc0; background: #1a3040; color: #d7e7f4; }
 
 @media (max-width: 1180px) { .main-layout, .main-layout.details-empty-state:not(.details-collapsed) { grid-template-columns: 220px 1fr; }.details-panel-wrap { display: none; }.changes-drawer { left: 220px; }.commit-card { grid-template-columns: minmax(180px, 1fr) auto 82px auto minmax(90px, 140px); } }
-@media (max-width: 1450px) { .graph-toolbar-context { grid-template-columns: minmax(0, 1fr) auto minmax(220px, auto); }.graph-toolbar-controls { grid-template-columns: auto minmax(250px, 340px) minmax(84px, 1fr); }.graph-toolbar-meta, .graph-toolbar-head, .graph-toolbar-actions { gap: 6px 8px; } }
+@media (max-width: 1450px) { .graph-toolbar-context { grid-template-columns: minmax(0, 1fr) auto minmax(220px, auto); }.graph-toolbar-controls { grid-template-columns: minmax(0, 1fr) minmax(200px, 280px) 84px; }.graph-toolbar-meta, .graph-toolbar-head, .graph-toolbar-actions { gap: 6px 8px; } }
 @media (max-width: 1280px) { .local-drive-merge-key { display: none; }.local-drive-difference-tools select { width: 128px; } }
 @media (max-width: 1050px) { .local-drive-compare-toolbar { flex-wrap: wrap; }.local-drive-difference-tools { order: 3; width: 100%; justify-content: center; }.local-drive-compare-shell { height: min(850px, 94vh); } }
 @media (max-width: 1050px) { .local-folder-modebar { flex-wrap: wrap; }.local-folder-modebar .local-folder-ignore { margin-left: 0; } }

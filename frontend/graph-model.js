@@ -275,6 +275,21 @@ function buildBranchStory(commits, tipId) {
 // Confirm a first-parent fork with independent branch-creation metadata.
 // Neither a modern merge-base nor a structural fork alone proves creation.
 // A tracking branch created locally at an existing feature tip is NOT its fork.
+// First-parent topology, not timestamps or unrelated merges on incoming paths.
+function lastFirstParentMerge(commits, tipId) {
+  const byId = new Map(commits.map(commit => [commit.id, commit]));
+  const visited = new Set();
+  let id = tipId;
+  while (id && !visited.has(id)) {
+    visited.add(id);
+    const commit = byId.get(id);
+    if (!commit) return { id: null, reason: 'Last merge is not established: load older history for the selected branch.' };
+    if ((commit.parents || []).length > 1) return { id, reason: 'Most recent merge on the selected branch’s first-parent path.' };
+    id = commit.parents?.[0];
+  }
+  return { id: null, reason: tipId ? 'No merge found on the selected branch’s loaded first-parent path.' : 'The selected branch tip is not loaded.' };
+}
+
 function branchStoryStart(commits, story, creationId) {
   if (!creationId) return { id: null, reason: 'Branch Start unavailable: original local creation record is missing (or this is a remote ref).' };
   const byId = new Map(commits.map(commit => [commit.id, commit]));
@@ -321,5 +336,5 @@ function branchStoryIncomingPath(from, to, incomingX, laneWidth, graphWidth) {
 // functions above stay ordinary globals there, exactly as if this code was
 // still inline in app.js. No bundler, no import/export syntax, either way.
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { reachableFrom, buildGraphModel, selectRefBadges, selectBranchRows, buildBranchStory, branchStoryStart, branchStoryIncomingPath };
+  module.exports = { reachableFrom, buildGraphModel, selectRefBadges, selectBranchRows, buildBranchStory, branchStoryStart, branchStoryIncomingPath, lastFirstParentMerge };
 }

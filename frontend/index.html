@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Git DrillDown</title>
   <link rel="icon" type="image/png" href="assets/git-drilldown-mark.png">
-  <link rel="stylesheet" href="styles.css?v=20261021-restore-clean-task-status">
-  <link rel="stylesheet" href="polarion.css?v=20261021-restore-clean-task-status">
+  <link rel="stylesheet" href="styles.css?v=20261022-history-navigation">
+  <link rel="stylesheet" href="polarion.css?v=20261022-history-navigation">
 </head>
 <body>
   <div class="app-shell">
@@ -850,8 +850,8 @@
           <label for="polarionTaskQuery">Find task in the selected project</label>
           <div class="polarion-search-row"><input id="polarionTaskQuery" placeholder="Task ID or title…" autocomplete="off"><button type="button" id="polarionTaskSearchButton">Find tasks</button></div>
           <label for="polarionTaskStatus">Task status</label>
-          <select id="polarionTaskStatus"><option value="new">New tasks only</option><option value="">All statuses</option></select>
-          <small>“New” uses Polarion status ID <b>new</b>. Choose All statuses for in-progress, completed or custom workflow states.</small>
+          <select id="polarionTaskStatus"><option value="">All</option><option value="inwork">In Work</option><option value="planned">Planned</option><option value="realized">Realized</option><option value="closed">Closed</option><option value="canceled">Canceled</option></select>
+          <small>Order: In Work → Planned → Realized → Closed → Canceled. Other statuses, if any, remain visible at the end of All.</small>
           <div class="polarion-assignee"><label><input id="polarionAssigned" type="checkbox"> Assigned to me</label><span id="polarionIdentity"></span><button type="button" id="polarionDetectUser">Detect signed-in user</button><button type="button" id="polarionOtherUser">Other user…</button><input id="polarionUser" aria-label="Polarion assignee user ID" placeholder="Polarion user ID" hidden autocomplete="off"><button type="button" id="polarionUseMe" hidden>Use me</button></div>
           <small>Your user ID is remembered on this computer. Filtering another user does not replace it.</small>
           <div id="polarionTaskWorkspace"></div>
@@ -899,18 +899,18 @@
       <footer><span>Read-only on Polarion · local snapshots outside Git</span><button value="cancel">Close</button><button type="button" id="polarionAdd" class="confirm" disabled>Add to Commit List</button></footer>
     </form>
   </dialog>
-  <script src="polarion.js?v=20261021-restore-clean-task-status"></script>
-  <script src="console-context.js?v=20261021-restore-clean-task-status"></script>
-  <script src="graph-model.js?v=20261021-restore-clean-task-status"></script>
-  <script src="submodule-state.js?v=20261021-restore-clean-task-status"></script>
-  <script src="submodule-versions.js?v=20261021-restore-clean-task-status"></script>
-  <script src="local-diff.js?v=20261021-restore-clean-task-status"></script>
-  <script src="local-drive.js?v=20261021-restore-clean-task-status"></script>
-  <script src="pr-status.js?v=20261021-restore-clean-task-status"></script>
-  <script src="refresh-coordinator.js?v=20261021-restore-clean-task-status"></script>
-  <script src="comparison-authors.js?v=20261021-restore-clean-task-status"></script>
-  <script src="git-activity.js?v=20261021-restore-clean-task-status"></script>
-  <script src="comparison-navigation.js?v=20261021-restore-clean-task-status"></script>
-  <script src="app.js?v=20261021-restore-clean-task-status"></script>
+  <script src="polarion.js?v=20261022-history-navigation"></script>
+  <script src="console-context.js?v=20261022-history-navigation"></script>
+  <script src="graph-model.js?v=20261022-history-navigation"></script>
+  <script src="submodule-state.js?v=20261022-history-navigation"></script>
+  <script src="submodule-versions.js?v=20261022-history-navigation"></script>
+  <script src="local-diff.js?v=20261022-history-navigation"></script>
+  <script src="local-drive.js?v=20261022-history-navigation"></script>
+  <script src="pr-status.js?v=20261022-history-navigation"></script>
+  <script src="refresh-coordinator.js?v=20261022-history-navigation"></script>
+  <script src="comparison-authors.js?v=20261022-history-navigation"></script>
+  <script src="git-activity.js?v=20261022-history-navigation"></script>
+  <script src="comparison-navigation.js?v=20261022-history-navigation"></script>
+  <script src="app.js?v=20261022-history-navigation"></script>
 </body>
 </html>

@@ -38,7 +38,17 @@
 .commit-area:has(> .polarion-commit-references:not([hidden])) textarea { flex: 0 0 96px; min-height: 96px; box-sizing: border-box; }
 .polarion-task-dialog .polarion-results { max-height: 280px; margin-top: 14px; }
 .polarion-task-dialog .polarion-task-status { display: inline-block; justify-self: start; width: fit-content; padding: 2px 7px; border: 1px solid var(--border); border-radius: 10px; color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
-.polarion-task-dialog .polarion-task-status[data-state=new] { color: #9bd9bd; border-color: #477d65; background: #18362a; }
+.polarion-task-dialog .polarion-task-status[data-state=inwork] { color: #b9dfff; border-color: #578cba; background: #173752; }
+.polarion-task-dialog .polarion-task-status[data-state=planned] { color: #ffe0a3; border-color: #a17b36; background: #3b2d13; }
+.polarion-task-dialog .polarion-task-status[data-state=realized] { color: #b3edd0; border-color: #477d65; background: #18362a; }
+.polarion-task-dialog .polarion-task-status[data-state=closed] { color: #d2dce5; border-color: #708395; background: #29323b; }
+.polarion-task-dialog .polarion-task-status[data-state=canceled] { color: #ffc8cb; border-color: #a46b70; background: #47272e; }
+/* Native dropdowns vary by host. Explicit foreground AND background keep
+   both the closed control and its option popup readable on Windows. */
+.polarion-task-dialog #polarionTaskStatus { color-scheme: light; background: #e8eff5; color: #142536; border: 1px solid #8eabc2; font-weight: 600; }
+.polarion-task-dialog #polarionTaskStatus option { color: #142536; background: #e8eff5; }
+.polarion-task-dialog #polarionTaskStatus option:checked { color: #fff; background: #235c8d; }
+.polarion-task-dialog #polarionTaskStatus:disabled { opacity: .65; }
 .polarion-open-document { padding: 14px; border: 1px solid var(--border); border-radius: 8px; margin-bottom: 14px; background: var(--surface); }
 .polarion-open-document > summary { cursor: pointer; color: var(--muted); font-size: 12px; line-height: 1.5; }
 .polarion-open-document[open] > summary { margin-bottom: 12px; color: var(--text); }

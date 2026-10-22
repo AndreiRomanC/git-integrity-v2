@@ -61,7 +61,7 @@ mod tests {
         repo.reference("refs/remotes/origin/main", d, true, "local fixture").unwrap();
         repo.set_head("refs/heads/feature").unwrap();
         assert_eq!(creation_oid(&repo, "feature", tip), Some(b.to_string()));
-        let shared = super::super::branches::graph_head_main_merge_base(path.to_string_lossy().into_owned()).unwrap().unwrap();
+        let shared = tauri::async_runtime::block_on(super::super::branches::graph_head_main_merge_base(path.to_string_lossy().into_owned())).unwrap().unwrap();
         assert_eq!(shared.oid, d.to_string()); assert_eq!(shared.base_ref, "origin/main");
         assert_eq!(repo.head().unwrap().target(), Some(tip), "diagnostics must not move HEAD");
         drop(tree); drop(repo);

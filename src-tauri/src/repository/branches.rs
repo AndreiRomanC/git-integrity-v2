@@ -42,7 +42,18 @@ const RESTORE_SUBMODULE_UPDATE_TIMEOUT_LABEL: &str = SUBMODULE_UPDATE_TIMEOUT_LA
 
 // Computes OID-based divergence independently of the graph renderer.
 #[tauri::command]
-pub fn graph_branch_divergence(repository_path: String, primary_branch: String) -> Result<Vec<BranchDivergence>, String> {
+pub async fn graph_branch_divergence(repository_path: String, primary_branch: String) -> Result<Vec<BranchDivergence>, String> {
+    let queued = Instant::now();
+    off_main_thread(move || {
+        perf_log("graph_branch_divergence: worker_queue", queued.elapsed());
+        let started = Instant::now();
+        let result = graph_branch_divergence_inner(repository_path, primary_branch);
+        perf_log("graph_branch_divergence: local_history", started.elapsed());
+        result
+    }).await
+}
+
+fn graph_branch_divergence_inner(repository_path: String, primary_branch: String) -> Result<Vec<BranchDivergence>, String> {
     validate_path(&repository_path)?;
     let repo = internal_repository(&repository_path)?;
     let Some(primary_tip) = repo.find_branch(&primary_branch, BranchType::Local).ok().and_then(|b| b.get().target()) else {
@@ -63,12 +74,20 @@ pub fn graph_branch_divergence(repository_path: String, primary_branch: String) 
     Ok(result)
 }
 
-// The graph's explicit "Branch start" marker is the real merge-base between
+// The graph's "Shared base" annotation is the real merge-base between
 // the currently checked-out commit (branch or detached HEAD) and the primary
 // remote main ref. This intentionally does not depend on visual lane order or
 // on the graph's "Primary" picker.
 #[tauri::command]
-pub fn graph_head_main_merge_base(repository_path: String) -> Result<Option<GraphBranchStart>, String> {
+pub async fn graph_head_main_merge_base(repository_path: String) -> Result<Option<GraphBranchStart>, String> {
+    let queued = Instant::now();
+    off_main_thread(move || {
+        perf_log("graph_head_main_merge_base: worker_queue", queued.elapsed());
+        graph_head_main_merge_base_inner(repository_path)
+    }).await
+}
+
+fn graph_head_main_merge_base_inner(repository_path: String) -> Result<Option<GraphBranchStart>, String> {
     let started = Instant::now();
     validate_path(&repository_path)?;
     let repo = internal_repository(&repository_path)?;
