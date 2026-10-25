@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Git DrillDown</title>
   <link rel="icon" type="image/png" href="assets/git-drilldown-mark.png">
-<link rel="stylesheet" href="styles.css?v=20261025-author-scope">
-  <link rel="stylesheet" href="polarion.css?v=20261025-author-scope">
+<link rel="stylesheet" href="styles.css?v=20261025-tree-authors">
+  <link rel="stylesheet" href="polarion.css?v=20261025-tree-authors">
 </head>
 <body>
   <div id="startupIntro" class="startup-intro" hidden>
@@ -17,7 +17,7 @@
       <div id="startupIntroFailure" class="startup-intro-failure" hidden><p>Reload the window to retry.</p><button type="button" id="startupIntroRetry">Reload interface</button></div>
     </div>
   </div>
-  <script src="startup-intro.js?v=20261025-author-scope"></script>
+  <script src="startup-intro.js?v=20261025-tree-authors"></script>
   <div class="app-shell">
     <header class="topbar">
       <div class="brand" aria-label="Git DrillDown">
@@ -184,11 +184,11 @@
             </div>
             <div class="commander-toolbar compare-scope-toolbar">
               <nav id="commanderBreadcrumbs" class="commander-breadcrumbs" aria-label="Compared folder"></nav>
+              <div id="gitCompareFlatControls" class="compare-flat-controls compare-inline-controls">
+                <label title="Filter changed items, including those inside folders"><span>TYPE</span><select id="gitCompareFlatFilter"><option value="all">Any change type</option><option value="modified">Modified</option><option value="local-only">Only left</option><option value="remote-only">Only right</option><option value="type-changed">Type changed</option></select></label>
+              </div>
               <div class="compare-layout-choice" role="group" aria-label="Git comparison layout"><button type="button" id="gitCompareTree" class="active" aria-pressed="true" title="Browse folders side by side; double-click a folder to drill down">Drill-down</button><button type="button" id="gitCompareFlatToggle" aria-pressed="false" title="Show all changed files in a flat list, with optional author filtering">List</button></div>
               <button type="button" id="gitCompareDownload" class="snapshot-download" title="Download both complete folder snapshots, not only filtered rows" aria-label="Download both folder snapshots" disabled><svg class="ui-icon" viewBox="0 0 20 20" aria-hidden="true" focusable="false"><path d="M10 2v10m-4-4 4 4 4-4M3 13v4h14v-4"/></svg></button>
-            </div>
-            <div id="gitCompareFlatControls" class="compare-flat-controls" hidden>
-              <label><span>FILTER</span><select id="gitCompareFlatFilter"><option value="all">All differences</option><option value="modified">Modified</option><option value="local-only">Only left</option><option value="remote-only">Only right</option><option value="type-changed">Type changed</option></select></label>
             </div>
             <div class="commander-head commander-grid"><span id="gitCompareLeftLabel">LOCAL WORKSPACE</span><span>STATE</span><span id="gitCompareRightLabel">REMOTE BRANCH</span></div>
             <div id="commanderRows" class="commander-rows"></div>
@@ -206,12 +206,12 @@
             </div>
             <div class="submodule-compare-exact" id="subCompareExact">Choose a submodule and two revisions.</div>
             <div class="submodule-compare-commits" id="subCompareCommits" hidden></div>
-            <div id="subCompareFlatControls" class="compare-flat-controls">
-              <div class="compare-layout-choice" role="group" aria-label="Submodule comparison layout"><button type="button" id="subCompareTree" class="active" aria-pressed="true" title="Browse folders side by side; double-click a folder to drill down">Drill-down</button><button type="button" id="subCompareFlatToggle" aria-pressed="false" title="Show all changed files in a flat list, with optional author filtering">List</button></div>
-              <label><span>FILTER</span><select id="subCompareFlatFilter"><option value="all">All differences</option><option value="modified">Modified</option><option value="local-only">Only left</option><option value="remote-only">Only right</option><option value="type-changed">Type changed</option></select></label>
-            </div>
-            <div class="commander-toolbar">
+            <div class="commander-toolbar compare-scope-toolbar">
               <nav id="subCompareBreadcrumbs" class="commander-breadcrumbs"></nav>
+            <div id="subCompareFlatControls" class="compare-flat-controls compare-inline-controls">
+              <div class="compare-layout-choice" role="group" aria-label="Submodule comparison layout"><button type="button" id="subCompareTree" class="active" aria-pressed="true" title="Browse folders side by side; double-click a folder to drill down">Drill-down</button><button type="button" id="subCompareFlatToggle" aria-pressed="false" title="Show all changed files in a flat list, with optional author filtering">List</button></div>
+              <label title="Filter changed items, including those inside folders"><span>TYPE</span><select id="subCompareFlatFilter"><option value="all">Any change type</option><option value="modified">Modified</option><option value="local-only">Only left</option><option value="remote-only">Only right</option><option value="type-changed">Type changed</option></select></label>
+            </div>
             </div>
             <div class="commander-head commander-grid"><span>LEFT REVISION</span><span>STATE</span><span>RIGHT REVISION</span></div>
             <div id="subCompareRows" class="commander-rows"></div>
@@ -956,21 +956,21 @@
       <footer><span>Read-only on Polarion · local snapshots outside Git</span><button value="cancel">Close</button><button type="button" id="polarionAdd" class="confirm" disabled>Add to Commit List</button></footer>
     </form>
   </dialog>
-  <script src="polarion.js?v=20261025-author-scope"></script>
-  <script src="console-context.js?v=20261025-author-scope"></script>
-  <script src="graph-model.js?v=20261025-author-scope"></script>
-  <script src="submodule-state.js?v=20261025-author-scope"></script>
-  <script src="submodule-versions.js?v=20261025-author-scope"></script>
-  <script src="local-diff.js?v=20261025-author-scope"></script>
-  <script src="local-drive.js?v=20261025-author-scope"></script>
-  <script src="pr-status.js?v=20261025-author-scope"></script>
-  <script src="refresh-coordinator.js?v=20261025-author-scope"></script>
-  <script src="comparison-authors.js?v=20261025-author-scope"></script>
-  <script src="git-activity.js?v=20261025-author-scope"></script>
-  <script src="comparison-navigation.js?v=20261025-author-scope"></script>
-  <script src="panel-resize.js?v=20261025-author-scope"></script>
-  <script src="submodule-compare-details.js?v=20261025-author-scope"></script>
-  <script src="navigation-refresh.js?v=20261025-author-scope"></script>
-  <script src="app.js?v=20261025-author-scope"></script>
+  <script src="polarion.js?v=20261025-tree-authors"></script>
+  <script src="console-context.js?v=20261025-tree-authors"></script>
+  <script src="graph-model.js?v=20261025-tree-authors"></script>
+  <script src="submodule-state.js?v=20261025-tree-authors"></script>
+  <script src="submodule-versions.js?v=20261025-tree-authors"></script>
+  <script src="local-diff.js?v=20261025-tree-authors"></script>
+  <script src="local-drive.js?v=20261025-tree-authors"></script>
+  <script src="pr-status.js?v=20261025-tree-authors"></script>
+  <script src="refresh-coordinator.js?v=20261025-tree-authors"></script>
+  <script src="comparison-authors.js?v=20261025-tree-authors"></script>
+  <script src="git-activity.js?v=20261025-tree-authors"></script>
+  <script src="comparison-navigation.js?v=20261025-tree-authors"></script>
+  <script src="panel-resize.js?v=20261025-tree-authors"></script>
+  <script src="submodule-compare-details.js?v=20261025-tree-authors"></script>
+  <script src="navigation-refresh.js?v=20261025-tree-authors"></script>
+  <script src="app.js?v=20261025-tree-authors"></script>
 </body>
 </html>

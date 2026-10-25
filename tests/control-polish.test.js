@@ -130,10 +130,11 @@ test('comparison revision controls share a row and layout buttons share the fold
   for (const id of ['branchCompareKindSelect', 'remoteRef', 'branchCompareLeftRef', 'branchCompareRightRef', 'branchCompareSwap', 'branchCompareRefresh']) {
     assert.match(revisions, new RegExp(`id="${id}"`));
   }
-  const scope = html.slice(html.indexOf('<div class="commander-toolbar compare-scope-toolbar"'), html.indexOf('<div id="gitCompareFlatControls"'));
+  const scope = html.slice(html.indexOf('<div class="commander-toolbar compare-scope-toolbar"'), html.indexOf('<div class="commander-head commander-grid"'));
   for (const id of ['commanderBreadcrumbs', 'gitCompareTree', 'gitCompareFlatToggle', 'gitCompareDownload']) assert.match(scope, new RegExp(`id="${id}"`));
-  const filters = html.slice(html.indexOf('<div id="gitCompareFlatControls"'), html.indexOf('<div id="commanderRows"'));
+  const filters = html.slice(html.indexOf('<div id="gitCompareFlatControls"'), html.indexOf('<div class="compare-layout-choice"', html.indexOf('<div id="gitCompareFlatControls"')));
   assert.doesNotMatch(filters, /id="gitCompareTree"|id="gitCompareFlatToggle"/);
+  assert.match(scope,/compare-inline-controls/,'filters share the existing scope toolbar, not another header row');
   assert.match(css, /\.git-revision-toolbar \{[^}]*flex-wrap: wrap/);
   assert.match(css, /\.git-revision-toolbar select \{[^}]*min-width: 0;[^}]*max-width: none/);
 });

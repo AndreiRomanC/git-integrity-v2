@@ -1847,9 +1847,9 @@ function renderBranchCompareSelectors() {
   refs.branchCompareRightRef.innerHTML = html(state.branchCompareRightRef);
 }
 
-function commanderSide(entry, side) {
+function commanderSide(entry, side, matchingInside = 0) {
   if (!entry) return `<span class="commander-side empty ${side}">— not present —</span>`;
-  const meta = entry.kind === 'submodule' && entry.revision ? `submodule · ${entry.revision.slice(0, 8)}` : `${entry.kind}${entry.kind === 'file' ? ` · ${formatSize(entry.size)}` : ''}`;
+  const meta = matchingInside && ['folder','submodule'].includes(entry.kind) ? `${matchingInside} matching items inside` : entry.kind === 'submodule' && entry.revision ? `submodule · ${entry.revision.slice(0, 8)}` : `${entry.kind}${entry.kind === 'file' ? ` · ${formatSize(entry.size)}` : ''}`;
   return `<span class="commander-side ${side}">${iconFor(entry)}<span class="commander-file-copy"><strong>${esc(entry.name)}</strong><small title="${esc(entry.revision || '')}">${esc(meta)}</small></span></span>`;
 }
 function flatCompareSide(entry, side, fallbackPath = '') {
@@ -1872,44 +1872,119 @@ function flatCompareRowHtml(row, datasetName) {
 }
 
 const comparisonAuthorCache = createComparisonAuthorCache((command, args) => invoke(command, args));
+function bindComparisonConversion(node, row, submodule = false) {
+  const kinds = [row?.local?.kind, row?.remote?.kind].filter(Boolean);
+  if (!kinds.includes('folder') || !kinds.some(kind => kind !== 'folder')) return false;
+  node.title = 'Folder conversion · double-click or Enter to inspect changed items in List';
+  // One endpoint has no tree at this path. Use the existing leaf comparison
+  // instead of asking the directory endpoint to descend into a file/gitlink.
+  SubmoduleCompareDetails.bindRow(node, () => {
+    state[submodule ? 'subCompareFlatMode' : 'compareFlatMode'] = true;
+    return submodule ? openSubmoduleCompareDirectory(row.relative_path) : openCommanderDirectory(row.relative_path);
+  });
+  return true;
+}
+function renderComparisonScopedFilter(container, context, snapshot, options) {
+  if (!context || !snapshot) return {model:renderComparisonAuthorFilter(container, null, {visible:true}), scopeRows:options.flat ? options.sourceRows : null};
+  const scope = snapshot.authorScope ||= {rows:options.flat ? options.sourceRows : null, error:'', pending:null};
+  if (scope.rows === null) {
+    const model = comparisonAuthorCache.get(scopedComparisonAuthorContext(context, []));
+    const filtered = comparisonAuthorMode(model) !== 'all';
+    const needsScope = filtered || options.filter !== 'all' || Boolean(options.query);
+    const load = retry => loadComparisonLeafScope(scope, async () => {
+      const repositoryPath = snapshot.repository_path || snapshot.repositoryPath || context.repositoryPath;
+      const result = options.workspace
+        ? await invoke('compare_workspace_revision', {repositoryPath, relativePath:options.path, revision:context.rightRevision, flat:true})
+        : await invoke('compare_git_revisions_file_list', {repositoryPath, relativePath:options.path, leftRef:context.leftRevision, rightRef:context.rightRevision});
+      if (options.workspace && result.local_revision !== context.leftRevision) throw new Error('HEAD changed during analysis. Refresh the comparison.');
+      return result;
+    }, retry).then(() => { if (state.view === 'commander') renderCommander(); });
+    container.classList.add('has-author-filter');
+    let element = container.querySelector('.comparison-author-filter');
+    if (!element) { element = document.createElement('div'); element.className = 'comparison-author-filter'; container.append(element); }
+    element.hidden = false;
+    element.innerHTML = `<button type="button" data-load-scope ${scope.pending ? 'disabled' : ''}>${scope.pending ? 'Loading compared items…' : scope.error ? 'Retry contributor filters' : 'Contributor filters…'}</button>${scope.error ? `<small role="alert">${esc(scope.error)}</small>` : ''}${filtered ? '<button type="button" data-clear-scope-filter>Show all differences</button>' : ''}`;
+    element.querySelector('[data-load-scope]')?.addEventListener('click', () => { scope.historyRequested = true; load(true); renderCommander(); });
+    element.querySelector('[data-clear-scope-filter]')?.addEventListener('click', () => { comparisonAuthorCache.setMode(model,'all'); renderCommander(); });
+    if (needsScope && !scope.pending && !scope.error) { load(false); }
+    return {model:filtered ? {...model,error:scope.error,introductionError:scope.error} : null, scopeRows:null,
+      scopeMessage:needsScope ? scope.error ? 'Compared items could not be loaded. Retry contributor filters or refresh the comparison.' : 'Loading compared items…' : ''};
+  }
+  const scopeContext = options.workspace ? {...context, comparisonPaths:scope.rows.flatMap(comparisonRowPaths)} : context;
+  const candidates = comparisonViewRows([], scope.rows, null, options).candidates;
+  // Opening contributor filters from Drill-down is the same explicit action
+  // as opening them from List; don't ask the user to press a second button.
+  const model = renderComparisonAuthorFilter(container, scopeContext, {workspace:options.workspace, rows:candidates, scopeRows:scope.rows, loadHistory:scope.historyRequested});
+  return {model, scopeRows:scope.rows};
+}
 function comparisonEvidenceRowHtml(row, model) {
-  if (!model?.selected) return '';
-  return `<details class="comparison-file-evidence" data-author-evidence="${esc(row.relative_path)}"><summary>Why included?</summary><div data-evidence-body></div></details>`;
+  if (row.local?.kind === 'folder' || row.remote?.kind === 'folder') return '';
+  if (!model?.authors && !model?.introductions) return '';
+  const count = comparisonAuthorContributors(row, model).length;
+  if (!count && comparisonAuthorMode(model) === 'all') return '';
+  return `<details class="comparison-file-evidence" data-author-evidence="${esc(row.relative_path)}"><summary>${['touched','introduced'].includes(comparisonAuthorMode(model)) ? 'Why included?' : `Contributors · ${count}`}</summary><div data-evidence-body></div></details>`;
 }
 function comparisonEvidenceCommitHtml(touch) {
   return `<code title="${esc(touch.commit)}">${esc(touch.commit.slice(0, 8))}</code> · <time title="Commit date (UTC, same as history)">${esc(touch.date || 'Date unavailable')}</time>`;
 }
 function comparisonAuthorRowsHtml(rows, candidates, model, dataset) {
   const render = row => flatCompareRowHtml(row, dataset) + comparisonEvidenceRowHtml(row, model);
-  if (!model?.directOnly || !model.selected || !model.strictResult?.result) return rows.map(render).join('');
+  if (!comparisonAuthorStrict(model) || !model.strictResult?.result) return rows.map(render).join('');
   const groups = comparisonAuthorPartition(candidates, model);
   let html = groups.content.map(render).join('');
   for (const [root, items] of groups.structural) {
     const touch = comparisonAuthorEvidence(items[0], model)[0];
     html += `<details class="comparison-structure-group"><summary>Reconfiguration · <code>${esc(root)}</code> · ${items.length} items</summary><p>Folder/submodule conversion recorded by this author. File contents may come from other authors.</p>${touch ? `<p>${comparisonEvidenceCommitHtml(touch)}</p>` : ''}<p>Open an item to inspect its complete comparison.</p>${items.map(row => flatCompareRowHtml(row, dataset)).join('')}</details>`;
   }
-  if (groups.excluded) {
-    html += `<details class="comparison-excluded-group"><summary>${groups.excluded} excluded · ${groups.inconclusive.length} inconclusive · ${groups.noContribution.length} without a surviving contribution</summary>`;
-    for (const {row, reason} of groups.inconclusive) html += flatCompareRowHtml(row, dataset) + `<p><strong>Attribution could not be established.</strong> ${esc(reason)}</p>`;
-    for (const {row, reason} of groups.noContribution) html += flatCompareRowHtml(row, dataset) + `<p>${esc(reason)}</p>`;
-    html += '</details>';
+  return html + comparisonExcludedRowsHtml(candidates,model,dataset);
+}
+function comparisonExcludedRowsHtml(candidates, model, dataset) {
+  if (!comparisonAuthorStrict(model) || !model.strictResult?.result) return '';
+  const groups = comparisonAuthorPartition(candidates,model);
+  if (!groups.excluded) return '';
+  return `<details class="comparison-excluded-group"><summary>${groups.excluded} excluded · ${groups.inconclusive.length} inconclusive · ${groups.noContribution.length} without a surviving contribution</summary>`
+    + groups.inconclusive.map(({row,reason}) => flatCompareRowHtml(row,dataset) + `<p><strong>Attribution could not be established.</strong> ${esc(reason)}</p>`).join('')
+    + groups.noContribution.map(({row,reason}) => flatCompareRowHtml(row,dataset) + `<p>${esc(reason)}</p>`).join('') + '</details>';
+}
+function comparisonEvidenceBodyHtml(row, model, touches) {
+  const contributors = comparisonAuthorContributors(row, model);
+  const label = author => esc(author.name || author.email || author.key) + (author.email ? ` &lt;${esc(author.email)}&gt;` : '');
+  const pointer = row.local?.kind === 'submodule' || row.remote?.kind === 'submodule';
+  const mode = comparisonAuthorMode(model);
+  if (mode === 'introduced') {
+    const selected = model.introductions?.find(author => author.key === model.selected);
+    const reasons = {
+      commit:'Changed in this author’s non-merge commit.',
+      merge:'Brought in by this author’s merge (result versus first parent).',
+      'submodule-update':'This author updated the submodule pointer.',
+      'merge-submodule':'This author’s merge changed the submodule pointer.',
+      'parent-submodule-update':'This author updated the parent’s submodule pointer; this item differs across that update.',
+      'parent-merge-submodule':'This author’s parent merge changed the submodule pointer; this item differs across that update.',
+    };
+    return `<p>Introduced by ${selected ? label(selected) : 'selected author'}. This can include work by others; individual edits need not survive.</p><p>${pointer ? 'Pointer contributors' : 'File contributors in this comparison'}: ${contributors.map(label).join(', ') || 'No non-merge touches identified'}.</p>`
+      + touches.map((touch,index) => `<div class="comparison-introduction"><p>${esc(reasons[touch.kind] || 'Recorded in this author’s commit.')}</p><div class="comparison-touch"><span>${comparisonEvidenceCommitHtml(touch)}</span>${touch.parent && touch.kind !== 'submodule-update' && touch.kind !== 'merge-submodule' && !touch.parent_repository ? `<button type="button" data-evidence-diff="${index}">View change</button>` : ''}</div>${touch.before_revision || touch.after_revision ? `<p>Submodule: <code>${esc(touch.witness_path)}</code> · <code>${esc(touch.before_revision || 'absent')}</code> → <code>${esc(touch.after_revision || 'absent')}</code></p>` : ''}${touch.parent_repository ? `<p>Parent repository: ${esc(touch.parent_repository)}</p>` : ''}</div>`).join('')
+      + `<p>Full comparison shown.${pointer ? ' Internal file authors require a direct submodule comparison.' : ''}</p>`;
   }
-  return html;
+  const reason = comparisonAuthorStrict(model) ? 'A contribution from this author remains in the comparison.'
+    : mode === 'shared' ? 'At least two recorded authors touched this item in the comparison history.'
+    : mode === 'touched' ? 'This author touched this item in a non-merge commit within the comparison history.'
+    : 'This item differs between the selected versions.';
+  return `<p>${reason}</p><p>${pointer ? 'Contributors to this submodule pointer' : 'Contributors in this comparison'}: ${contributors.map(label).join(', ') || 'Unavailable'}.</p><p>${pointer ? 'Internal file authors are not analyzed here. Open the submodule comparison to inspect its contents.' : 'Full file comparison shown. History touches do not prove that each author’s edits survived.'}</p>`
+    + (touches.length ? touches.map((touch, index) => `<div class="comparison-touch"><span>${touch.authorKey ? `${label({name:touch.authorName,email:touch.authorEmail,key:touch.authorKey})} · ` : ''}${comparisonEvidenceCommitHtml(touch)}</span><button type="button" data-evidence-diff="${index}" title="Compare this commit with its parent; the main comparison stays unchanged" ${touch.parent ? '' : 'disabled'}>View change</button></div>`).join('')
+      : '<p>Commit evidence is unavailable in this cached result.</p>');
 }
 function bindComparisonEvidence(container, rows, model) {
-  if (!model?.selected) return;
+  if (!model?.authors && !model?.introductions) return;
   const byPath = new Map(rows.map(row => [row.relative_path, row]));
   container.querySelectorAll('[data-author-evidence]').forEach(details => {
     details.addEventListener('toggle', () => {
       if (!details.open) return;
       const row = byPath.get(details.dataset.authorEvidence);
       if (!row) return;
-      const touches = comparisonAuthorEvidence(row, model);
+      const touches = ['touched','introduced'].includes(comparisonAuthorMode(model)) ? comparisonAuthorEvidence(row, model) : comparisonContributorEvidence(row, model);
       const body = details.querySelector('[data-evidence-body]');
-      body.innerHTML = touches.length
-        ? `<p>${model.directOnly ? 'A contribution from this author remains in the comparison.' : 'This author touched this item in a non-merge commit.'}</p>` + touches.map((touch, index) => `<div class="comparison-touch"><span>${comparisonEvidenceCommitHtml(touch)}</span><button type="button" data-evidence-diff="${index}" title="Compare this commit with its parent; the main comparison stays unchanged" ${touch.parent ? '' : 'disabled'}>View change</button></div>`).join('')
-        : '<p>Commit evidence is unavailable in this cached result.</p>';
-      touches.forEach(touch => jsPerfLog(`comparison_author_evidence: commit=${touch.commit} date=${touch.date || 'unknown'} parent=${touch.parent || 'root'} direct=${touch.direct} change=${touch.change}`, 0));
+      body.innerHTML = comparisonEvidenceBodyHtml(row, model, touches);
+      touches.forEach(touch => jsPerfLog(`comparison_author_evidence: commit=${touch.commit} date=${touch.date || 'unknown'} parent=${touch.parent || 'root'} direct=${touch.direct ?? 'n/a'} change=${touch.change || touch.kind}`, 0));
       body.querySelectorAll('[data-evidence-diff]').forEach(button => button.addEventListener('click', event => {
         event.preventDefault(); event.stopPropagation();
         const touch = touches[Number(button.dataset.evidenceDiff)];
@@ -1924,33 +1999,31 @@ function renderComparisonAuthorFilter(container, context, options = {}) {
   if (!element) { element = document.createElement('div'); element.className = 'comparison-author-filter'; container.append(element); }
   element.hidden = !(context || options.visible);
   if (!context) {
-    element.innerHTML = options.visible ? '<button type="button" disabled>Files touched by author…</button><small>Available after loading a comparison with committed history.</small>' : '';
+    element.innerHTML = options.visible ? '<button type="button" disabled>Contributor filters…</button><small>Available after loading a comparison with committed history.</small>' : '';
     return null;
   }
   const model = comparisonAuthorCache.get(scopedComparisonAuthorContext(context, options.scopeRows || options.rows || []));
+  if (options.loadHistory && !model.authors && !model.pending && !model.error) comparisonAuthorCache.load(model).then(() => { if (state.view === 'commander') renderCommander(); });
+  const mode = comparisonAuthorMode(model), strictActive = comparisonAuthorStrict(model), filtered = mode !== 'all';
+  const helpOpen = element.querySelector('.comparison-author-help')?.open || false;
+  const introductionOptions = `<optgroup label="Introduced by author"><option value="@introduced">${model.introductions ? 'Choose introducer…' : 'Load introduction history…'}</option>${(model.introductions || []).map(author => `<option value="introduced:${esc(author.key)}">${esc(author.name)}${author.email ? ` &lt;${esc(author.email)}&gt;` : ''}</option>`).join('')}${mode === 'introduced' && model.selected && !model.introductions?.some(author => author.key === model.selected) ? `<option value="introduced:${esc(model.selected)}">${esc(model.selected.replace(/^(email|name):/, ''))}${model.introductions ? ' — no matching items here' : ''}</option>` : ''}</optgroup>`;
   element.innerHTML = model.authors
-    ? `<label class="comparison-author-select">Author <select data-author-select><option value="">All authors — clear filter</option>${model.authors.map(author => `<option value="${esc(author.key)}" ${model.selected === author.key ? 'selected' : ''}>${esc(author.name)}${author.email ? ` &lt;${esc(author.email)}&gt;` : ' (no email)'}</option>`).join('')}</select></label><details class="comparison-author-help"><summary>About this filter</summary><div><p>Authors and items are limited to the compared folder. Normal: matching items touched in this author's non-merge commits between the two revisions.</p><p>Strict: a surviving content or pointer change must be identified. Folder/submodule conversions are grouped separately; their file contents are not claimed as personal edits.</p><p>Counts use the same items in the current view, including its search and state filters. Expand excluded items for individual reasons. All item diffs remain complete.</p><p>Merged changes keep their original authors. Uncertain merge resolutions, edited renames or unsupported content remain inconclusive. Git cannot distinguish manual edits from squash/copy imports. Identity uses the recorded email, without mailmap or co-author matching. Submodule contents are analyzed only when comparing that submodule directly.</p></div></details>`
-    : `<button type="button" data-load-authors ${model.pending ? 'disabled' : ''}>${model.pending ? 'Loading authors…' : 'Files touched by author…'}</button>${model.error ? `<small role="alert">${esc(model.error)} ${model.selected ? 'No files shown while attribution is unavailable.' : 'Complete comparison remains visible.'} Retry to load authors.</small>` : ''}`;
-  if (model.authors && (model.authors.length || model.selected)) {
-    element.insertAdjacentHTML('beforeend', `<label class="comparison-author-direct"><input type="checkbox" data-author-direct ${model.directOnly ? 'checked' : ''} ${!model.selected ? 'disabled' : ''}> Only actual author contributions</label>`);
-    const checkbox = element.querySelector('[data-author-direct]');
-    checkbox.checked = model.directOnly;
-    checkbox.addEventListener('change', event => {
+    ? `<label class="comparison-author-select">Show <select data-author-select aria-label="Contributor filter"><option value="">All differences</option><option value="@shared">Shared files · 2+ authors</option><optgroup label="Files touched by author">${model.authors.map(author => `<option value="${esc(author.key)}">${esc(author.name)}${author.email ? ` &lt;${esc(author.email)}&gt;` : ' (no email)'}</option>`).join('')}${mode === 'touched' && !model.authors.some(author => author.key === model.selected) ? `<option value="${esc(model.selected)}">${esc(model.selected.replace(/^(email|name):/, ''))} — no matching items here</option>` : ''}</optgroup>${introductionOptions}</select></label><details class="comparison-author-help" ${helpOpen ? 'open' : ''}><summary>Details${strictActive ? ' · surviving required' : ''}</summary><div><p>Introduced by author: changes recorded in their commits, including merge results compared with the first parent. This is integration, not personal line ownership. A parent submodule update is included only when this exact pair was opened from the parent comparison. Changing the revisions removes that parent context.</p><p>Files touched by author: matching items touched in that author's non-merge commits, including intermediate commits. Shared files: at least two recorded authors touched the item. Neither means every individual edit survived.</p><p>Authors, counts and evidence are scoped to these compared items and revisions. On divergent histories, commits unique to either side are included. Merge integration alone is not a file touch.</p><label class="comparison-author-direct"><input type="checkbox" data-author-direct ${strictActive ? 'checked' : ''} ${mode !== 'touched' || !model.selected ? 'disabled' : ''}> Require surviving contribution</label><p>Advanced · selected author only. A surviving content or pointer change must be identified. Folder/submodule conversions remain grouped separately, not claimed as personal file edits.</p><p>Identity uses recorded email (name when absent), without mailmap or co-author matching. Different identities may belong to the same person. Git cannot distinguish manual edits from squash/copy imports. Internal submodule authors are analyzed only in a direct submodule comparison.</p></div></details>`
+    : `<button type="button" data-load-authors ${model.pending ? 'disabled' : ''}>${model.pending ? 'Loading contributor history…' : 'Contributor filters…'}</button>${model.error ? `<small role="alert">${esc(model.error)} ${filtered ? 'No filtered results were applied.' : 'Complete comparison remains visible.'} Retry to load history.</small>` : ''}`;
+  if (model.authors) {
+    const select = element.querySelector('[data-author-select]');
+    select.value = mode === 'introduced' ? model.selected ? `introduced:${model.selected}` : '@introduced' : mode === 'shared' ? '@shared' : mode === 'touched' ? model.selected : '';
+    const selectedAuthor = (mode === 'introduced' ? model.introductions : model.authors)?.find(author => author.key === model.selected);
+    select.title = mode === 'introduced' ? `Introduced by ${selectedAuthor?.name || 'selected author'} · may include work by others` : mode === 'touched' ? `Files touched by ${selectedAuthor?.name || 'selected author'}${strictActive ? ' · surviving contribution required' : ''}` : mode === 'shared' ? 'Files touched by at least two recorded authors' : 'All differences';
+    element.querySelector('[data-author-direct]').addEventListener('change', event => {
       comparisonAuthorCache.setDirectOnly(model, event.target.checked);
-      jsPerfLog(`comparison_author_filter: mode=${model.directOnly ? 'strict' : 'all-history'} matched_paths=${model.paths?.size ?? 0}`, 0);
+      jsPerfLog(`comparison_author_filter: mode=${comparisonAuthorStrict(model) ? 'strict' : comparisonAuthorMode(model)} selected=${!!model.selected} matched_paths=${model.paths?.size ?? 0}`, 0);
       renderCommander();
     });
-    const select = element.querySelector('[data-author-select]');
-    if (model.selected && !model.authors.some(author => author.key === model.selected)) {
-      select.insertAdjacentHTML('beforeend', `<option value="${esc(model.selected)}">${esc(model.selected.replace(/^(email|name):/, ''))} — no matching items here</option>`);
-    }
-    select.value = model.selected;
-    if (model.directOnly && model.selected) {
-      if (!model.strictResult) {
-        comparisonAuthorCache.loadStrict(model).then(() => { if (state.view === 'commander') renderCommander(); });
-      }
+    if (strictActive) {
+      if (!model.strictResult) comparisonAuthorCache.loadStrict(model).then(() => { if (state.view === 'commander') renderCommander(); });
       const strict = model.strictResult;
-      if (strict?.pending) element.insertAdjacentHTML('beforeend', '<small role="status">Analyzing actual contributions… No previous results are shown.</small>');
+      if (strict?.pending) element.insertAdjacentHTML('beforeend', '<small role="status">Checking surviving contributions… No previous results are shown.</small>');
       else if (strict?.error) {
         element.insertAdjacentHTML('beforeend', `<small role="alert">${esc(strict.error)} No files shown. <button type="button" data-retry-strict>Retry</button></small>`);
         element.querySelector('[data-retry-strict]').addEventListener('click', () => {
@@ -1960,20 +2033,36 @@ function renderComparisonAuthorFilter(container, context, options = {}) {
       } else if (strict?.result) {
         const counts = comparisonAuthorPartition(options.rows || [], model);
         const structural = counts.shown - counts.content.length;
-        element.insertAdjacentHTML('beforeend', `<small class="comparison-author-summary" role="status" title="Items in this view; the same population as the normal author filter">${counts.shown} of ${counts.total} items shown · ${counts.excluded} excluded${structural ? ` · ${structural} grouped as reconfiguration` : ''}</small>`);
+        element.insertAdjacentHTML('beforeend', `<small class="comparison-author-summary" role="status" title="${counts.shown} of ${counts.total} items shown · ${counts.excluded} excluded · surviving contribution required${structural ? ` · ${structural} grouped as reconfiguration` : ''}">${counts.shown}/${counts.total} items · ${counts.excluded} excluded</small>`);
         const diagnostic = `comparison_author_partition: total=${counts.total} shown=${counts.shown} content=${counts.content.length} structural=${structural} inconclusive=${counts.inconclusive.length} no_contribution=${counts.noContribution.length}`;
         if (model.lastPartitionDiagnostic !== diagnostic) { model.lastPartitionDiagnostic = diagnostic; jsPerfLog(diagnostic, 0); }
       }
-    } else if (model.selected) {
+    } else if (mode === 'introduced') {
+      if (!model.introductions && !model.introductionError && !model.introductionPending) comparisonAuthorCache.loadIntroductions(model).then(() => { if (state.view === 'commander') renderCommander(); });
+      if (model.introductionError) {
+        element.insertAdjacentHTML('beforeend', `<small role="alert">${esc(model.introductionError)} <button type="button" data-retry-introductions>Retry</button></small>`);
+        element.querySelector('[data-retry-introductions]').addEventListener('click', () => {
+          const request = comparisonAuthorCache.loadIntroductions(model,true); renderCommander();
+          request.then(() => { if (state.view === 'commander') renderCommander(); });
+        });
+      } else if (!model.introductions) element.insertAdjacentHTML('beforeend', '<small role="status">Reading introduction history… No partial results shown.</small>');
+      else {
+        const count = (options.rows || []).filter(row => comparisonAuthorMatches(row,model)).length;
+        element.insertAdjacentHTML('beforeend', `<small class="comparison-author-summary" role="status" title="${model.selected ? `${count} items shown · introduced by this author · may include work by others` : 'Choose an author under Introduced by author.'}${model.context.parentComparison ? ' · parent pointer history included' : ''}">${model.selected ? `${count} items · integration` : 'Choose an introducer'}</small>`);
+      }
+    } else if (filtered) {
       const count = (options.rows || []).filter(row => comparisonAuthorMatches(row, model)).length;
-      element.insertAdjacentHTML('beforeend', `<small class="comparison-author-summary" role="status">${count} items shown · touched by this author · complete item diffs</small>`);
+      element.insertAdjacentHTML('beforeend', `<small class="comparison-author-summary" role="status" title="${count} items shown · ${mode === 'shared' ? 'touched by 2+ recorded authors' : 'touched by this author'} · complete item diffs">${count} items · ${mode === 'shared' ? 'shared' : 'touched'}</small>`);
     }
   }
-  if (options.workspace) element.querySelector('.comparison-author-help > div')?.insertAdjacentHTML('beforeend', '<p>Uncommitted changes have no Git author. Strict mode requires two committed revisions.</p>');
-  if (model.authors?.length === 0) element.insertAdjacentHTML('beforeend', `<small>No author touches found for these compared items in the selected history. ${model.selected ? 'No matching items.' : 'All differences remain visible.'}</small>`);
+  if (options.workspace) element.querySelector('.comparison-author-help > div')?.insertAdjacentHTML('beforeend', '<p>Uncommitted changes have no Git author. These are recorded history touches, not attribution of local edits. Surviving-contribution analysis requires two committed revisions.</p>');
+  if (model.authors?.length === 0 && mode !== 'introduced') element.insertAdjacentHTML('beforeend', `<small>No author touches found for these compared items in the selected history. ${filtered ? 'No matching items.' : 'All differences remain visible.'}</small>`);
   element.querySelector('[data-author-select]')?.addEventListener('change', event => {
-    comparisonAuthorCache.select(model, event.target.value);
-    jsPerfLog(`comparison_author_filter: mode=${model.directOnly ? 'strict' : 'all-history'} selected=${!!model.selected} matched_paths=${model.paths?.size ?? 0}`, 0);
+    if (event.target.value === '@shared') comparisonAuthorCache.setMode(model, 'shared');
+    else if (event.target.value === '@introduced') comparisonAuthorCache.setMode(model, 'introduced');
+    else if (event.target.value.startsWith('introduced:')) comparisonAuthorCache.select(model, event.target.value.slice('introduced:'.length), 'introduced');
+    else comparisonAuthorCache.select(model, event.target.value);
+    jsPerfLog(`comparison_author_filter: mode=${comparisonAuthorStrict(model) ? 'strict' : comparisonAuthorMode(model)} selected=${!!model.selected} matched_paths=${model.paths?.size ?? 0}`, 0);
     renderCommander();
   });
   element.querySelector('[data-load-authors]')?.addEventListener('click', async () => {
@@ -1983,12 +2072,12 @@ function renderComparisonAuthorFilter(container, context, options = {}) {
     // Render the CURRENT context, never install old rows/selections on completion.
     if (state.view === 'commander') renderCommander();
   });
-  if (model.selected && !model.authors && !model.pending && !model.error) {
+  if (filtered && !model.authors && !model.pending && !model.error) {
     comparisonAuthorCache.load(model).then(() => { if (state.view === 'commander') renderCommander(); });
   }
-  if (model.selected && !model.authors) {
-    if (!model.error) element.insertAdjacentHTML('beforeend', '<small role="status">Loading author information for this comparison…</small>');
-    element.insertAdjacentHTML('beforeend', '<button type="button" data-clear-author>Clear author filter</button>');
+  if (filtered && !model.authors) {
+    if (!model.error) element.insertAdjacentHTML('beforeend', '<small role="status">Loading contributor history for this comparison…</small>');
+    element.insertAdjacentHTML('beforeend', '<button type="button" data-clear-author>Show all differences</button>');
     element.querySelector('[data-clear-author]').addEventListener('click', () => { comparisonAuthorCache.select(model, ''); renderCommander(); });
   }
   return model;
@@ -2040,7 +2129,7 @@ function renderCommander() {
   const branchCompareMode = !spec.workspace;
   refs.gitWorkspaceCompareControls.hidden = historyMode || branchCompareMode;
   refs.gitBranchCompareControls.hidden = historyMode || !branchCompareMode;
-  if (refs.gitCompareFlatControls) refs.gitCompareFlatControls.hidden = !state.compareFlatMode;
+  if (refs.gitCompareFlatControls) refs.gitCompareFlatControls.hidden = false;
   if (refs.gitCompareFlatToggle) {
     refs.gitCompareFlatToggle.classList.toggle('active', state.compareFlatMode);
     refs.gitCompareFlatToggle.setAttribute('aria-pressed', String(state.compareFlatMode));
@@ -2048,7 +2137,7 @@ function renderCommander() {
     $('#gitCompareTree').setAttribute('aria-pressed', String(!state.compareFlatMode));
   }
   if (refs.gitCompareFlatFilter) {
-    refs.gitCompareFlatFilter.closest('label').hidden = !state.compareFlatMode;
+    refs.gitCompareFlatFilter.closest('label').hidden = false;
     refs.gitCompareFlatFilter.value = state.compareFlatFilter;
   }
   refs.gitCompareLeftLabel.textContent = branchCompareMode ? 'LEFT SNAPSHOT' : 'WORKING TREE · FILES ON DISK';
@@ -2071,33 +2160,36 @@ function renderCommander() {
     ? (state.branchCompareLeftRevision && state.branchCompareRightRevision
       ? { repositoryPath: spec.repositoryPath, leftRevision: state.branchCompareLeftRevision, rightRevision: state.branchCompareRightRevision } : null)
     : state.workspaceCompareAuthorContext;
+  const parentComparison = branchCompareMode && state.comparisonContext?.integration && comparisonParentContext(state.comparisonContext.integration, state.branchCompareLeftRevision, state.branchCompareRightRevision);
+  if (authorContext && parentComparison) authorContext.parentComparison = parentComparison;
   const flatMode = state.compareFlatMode;
   const query = refs.search.value.trim().toLowerCase();
-  const candidates = state.commanderRows.filter(row => compareRowVisible(row, query, flatMode ? state.compareFlatFilter : 'all'));
-  const authorModel = renderComparisonAuthorFilter(refs.gitCompareFlatControls,
-    state.compareFlatMode ? authorContext : null,
-    { visible: state.compareFlatMode, workspace: !branchCompareMode, rows:candidates, scopeRows:state.commanderRows });
+  const viewOptions = {flat:flatMode, query, filter:state.compareFlatFilter, path:state.commanderPath, workspace:!branchCompareMode, sourceRows:state.commanderRows};
+  const {model:authorModel, scopeRows, scopeMessage} = renderComparisonScopedFilter(refs.gitCompareFlatControls, authorContext, resolved, viewOptions);
+  const view = comparisonViewRows(state.commanderRows, scopeRows, authorModel, viewOptions);
+  const {candidates, matching, descendants} = view, rows = scopeMessage ? [] : view.rows;
   const remoteBranches = (comparisonBranches() || []).filter(branch => branch.remote);
   refs.remoteRef.innerHTML = remoteBranches.map(branch => `<option value="${esc(branch.name)}" ${branch.name === state.remoteRef ? 'selected' : ''}>${esc(branch.name)}</option>`).join('') || '<option value="">No remote refs</option>';
-  const rows = candidates.filter(row => comparisonAuthorMatches(row, authorModel));
-  if (flatMode) logComparisonAuthorDisplay(authorModel, state.commanderRows.length, rows.length, query || state.compareFlatFilter !== 'all');
+  logComparisonAuthorDisplay(authorModel, scopeRows?.length || 0, matching.length, query || state.compareFlatFilter !== 'all');
   const upRow = state.commanderPath && !flatMode ? `<button class="commander-row commander-grid up-row" data-commander-up="1">
     <span class="commander-side local">${iconFor({kind:'folder'})}<span class="commander-file-copy"><strong>..</strong><small>Parent folder</small></span></span><span class="compare-state"><i></i></span><span class="commander-side remote">${iconFor({kind:'folder'})}<span class="commander-file-copy"><strong>..</strong><small>Parent folder</small></span></span>
   </button>` : '';
   const rowsHtml = flatMode
     ? comparisonAuthorRowsHtml(rows, candidates, authorModel, 'data-commander-entry')
     : rows.map(row => `<button class="commander-row commander-grid ${row.relative_path === state.commanderFocus ? 'focused' : ''}" data-commander-entry="${esc(row.relative_path)}">
-    ${commanderSide(row.local, 'local')}<span class="compare-state ${esc(row.status)}"><i></i>${esc(compareStatusText(row.status, branchCompareMode ? 'branch' : state.compareMode))}</span>${commanderSide(row.remote, 'remote')}</button>`).join('');
-  refs.commanderRows.innerHTML = upRow + rowsHtml || `<div class="loading-row">${flatMode ? comparisonAuthorEmptyMessage(authorModel) : 'No items to compare'}</div>`;
-  if (flatMode) bindComparisonEvidence(refs.commanderRows, rows, authorModel);
+    ${commanderSide(row.local, 'local', descendants.get(row.relative_path))}<span class="compare-state ${esc(row.status)}"><i></i>${esc(compareStatusText(row.status, branchCompareMode ? 'branch' : state.compareMode))}</span>${commanderSide(row.remote, 'remote', descendants.get(row.relative_path))}</button>${comparisonEvidenceRowHtml(row,authorModel)}`).join('');
+  refs.commanderRows.innerHTML = upRow + (rowsHtml || `<div class="loading-row">${scopeMessage || (comparisonAuthorMode(authorModel) !== 'all' || flatMode ? comparisonAuthorEmptyMessage(authorModel) : 'No items to compare')}</div>`)
+    + (!flatMode ? comparisonExcludedRowsHtml(candidates,authorModel,'data-commander-entry') : '');
+  bindComparisonEvidence(refs.commanderRows, rows, authorModel);
   refs.commanderRows.querySelector('[data-commander-up]')?.addEventListener('click', () => { const parent = state.commanderPath.split('/').slice(0, -1).join('/'); openCommanderDirectory(parent); });
   refs.commanderRows.querySelectorAll('[data-commander-entry]').forEach(rowNode => {
-    const row = state.commanderRows.find(item => item.relative_path === rowNode.dataset.commanderEntry);
+    const row = state.commanderRows.find(item => item.relative_path === rowNode.dataset.commanderEntry) || scopeRows?.find(item => item.relative_path === rowNode.dataset.commanderEntry);
+    if (bindComparisonConversion(rowNode,row)) return;
     if (row?.local?.kind === 'submodule' || row?.remote?.kind === 'submodule') {
       SubmoduleCompareDetails.bindRow(rowNode, () => openSubmoduleComparisonDetails(row));
       return;
     }
-    rowNode.addEventListener('dblclick', () => { const entry = row?.local || row?.remote; if (entry?.kind === 'folder') openCommanderDirectory(row.relative_path); });
+    rowNode.addEventListener('dblclick', () => { if (row?.local?.kind === 'folder' || row?.remote?.kind === 'folder') openCommanderDirectory(row.relative_path); });
     rowNode.addEventListener('click', () => { const localIsFile = !row?.local || row.local.kind === 'file'; const remoteIsFile = !row?.remote || row.remote.kind === 'file'; const eitherIsFile = row?.local?.kind === 'file' || row?.remote?.kind === 'file'; if (eitherIsFile && localIsFile && remoteIsFile) branchCompareMode ? openGitRevisionFileCompare(row) : state.compareMode === 'git' && !state.comparisonContext?.submodulePath ? openFileCompare(row) : openWorkspaceRevisionFileCompare(row); });
   });
   const focused = refs.commanderRows.querySelector('.commander-row.focused, .flat-compare-row.focused'); if (focused) requestAnimationFrame(() => focused.scrollIntoView({ block: 'center' }));
@@ -2122,6 +2214,13 @@ function openSubmoduleComparisonDetails(row, nested = false) {
     onCompare: async (details, isActive) => {
       const owner = state.repository?.path, context = state.comparisonContext, session = state.comparisonSession;
       const target = { owner, repositoryPath: details.compare_repository_path, originPath: '', submodulePath: '', name: details.relative_path.split('/').pop() };
+      // Only immutable parent snapshots establish integration provenance. A
+      // workspace pointer has no recorded author, and must not be inherited.
+      if (/^[0-9a-f]{40}$/i.test(details.left.source) && /^[0-9a-f]{40}$/i.test(details.right.source)) {
+        target.integration = { repositoryPath:details.repository_path, relativePath:details.relative_path,
+          leftRevision:details.left.source, rightRevision:details.right.source,
+          childLeft:details.left.revision, childRight:details.right.revision };
+      }
       await ensureComparisonContext(target);
       if (!isActive() || state.repository?.path !== owner || state.comparisonContext !== context || state.comparisonSession !== session) return;
       await openRepositoryRevisionCompare(details.left.revision, details.right.revision, '', '', target);
@@ -2232,7 +2331,7 @@ function renderSubmoduleCompare() {
     $('#subCompareTree').setAttribute('aria-pressed', String(!state.subCompareFlatMode));
   }
   if (refs.subCompareFlatFilter) {
-    refs.subCompareFlatFilter.closest('label').hidden = !state.subCompareFlatMode;
+    refs.subCompareFlatFilter.closest('label').hidden = false;
     refs.subCompareFlatFilter.value = state.subCompareFlatFilter;
   }
   if (compare?.loading) {
@@ -2241,24 +2340,27 @@ function renderSubmoduleCompare() {
   }
   const rowsSource = compare?.rows || [];
   const query = refs.search.value.trim().toLowerCase();
-  const candidates = rowsSource.filter(row => compareRowVisible(row, query, state.subCompareFlatMode ? state.subCompareFlatFilter : 'all'));
-  const authorModel = renderComparisonAuthorFilter(refs.subCompareFlatControls,
-    state.subCompareFlatMode && compare?.leftRevision && compare?.rightRevision
-      ? { repositoryPath: state.repository.path, ...(compare.externalOwner ? { owner: compare.externalOwner, repositoryName: compare.externalRepositoryName } : { submodulePath: compare.submodulePath }), leftRevision: compare.leftRevision, rightRevision: compare.rightRevision } : null, {rows:candidates, scopeRows:rowsSource});
-  const rows = candidates.filter(row => comparisonAuthorMatches(row, authorModel));
-  if (state.subCompareFlatMode) logComparisonAuthorDisplay(authorModel, rowsSource.length, rows.length, query || state.subCompareFlatFilter !== 'all');
+  const viewOptions = {flat:state.subCompareFlatMode, query, filter:state.subCompareFlatFilter, path:state.commanderPath, sourceRows:rowsSource};
+  const {model:authorModel, scopeRows, scopeMessage} = renderComparisonScopedFilter(refs.subCompareFlatControls,
+    compare?.leftRevision && compare?.rightRevision
+      ? { repositoryPath: state.repository.path, ...(compare.externalOwner ? { owner: compare.externalOwner, repositoryName: compare.externalRepositoryName } : { submodulePath: compare.submodulePath }), leftRevision: compare.leftRevision, rightRevision: compare.rightRevision } : null, compare, viewOptions);
+  const view = comparisonViewRows(rowsSource, scopeRows, authorModel, viewOptions);
+  const {candidates, matching, descendants} = view, rows = scopeMessage ? [] : view.rows;
+  logComparisonAuthorDisplay(authorModel, scopeRows?.length || 0, matching.length, query || state.subCompareFlatFilter !== 'all');
   const upRow = state.commanderPath && !state.subCompareFlatMode ? `<button class="commander-row commander-grid up-row" data-commander-up="1">
     <span class="commander-side local">${iconFor({kind:'folder'})}<span class="commander-file-copy"><strong>..</strong><small>Parent folder</small></span></span><span class="compare-state"><i></i></span><span class="commander-side remote">${iconFor({kind:'folder'})}<span class="commander-file-copy"><strong>..</strong><small>Parent folder</small></span></span>
   </button>` : '';
   const rowsHtml = state.subCompareFlatMode
     ? comparisonAuthorRowsHtml(rows, candidates, authorModel, 'data-sub-compare-entry')
     : rows.map(row => `<button class="commander-row commander-grid ${row.relative_path === state.commanderFocus ? 'focused' : ''}" data-sub-compare-entry="${esc(row.relative_path)}">
-    ${commanderSide(row.local, 'local')}<span class="compare-state ${esc(row.status)}"><i></i>${esc(compareStatusText(row.status, 'submodule'))}</span>${commanderSide(row.remote, 'remote')}</button>`).join('');
-  refs.subCompareRows.innerHTML = upRow + rowsHtml || `<div class="loading-row">${state.subCompareFlatMode ? comparisonAuthorEmptyMessage(authorModel) : 'No differences in this folder'}</div>`;
-  if (state.subCompareFlatMode) bindComparisonEvidence(refs.subCompareRows, rows, authorModel);
+    ${commanderSide(row.local, 'local', descendants.get(row.relative_path))}<span class="compare-state ${esc(row.status)}"><i></i>${esc(compareStatusText(row.status, 'submodule'))}</span>${commanderSide(row.remote, 'remote', descendants.get(row.relative_path))}</button>${comparisonEvidenceRowHtml(row,authorModel)}`).join('');
+  refs.subCompareRows.innerHTML = upRow + (rowsHtml || `<div class="loading-row">${scopeMessage || (comparisonAuthorMode(authorModel) !== 'all' || state.subCompareFlatMode ? comparisonAuthorEmptyMessage(authorModel) : 'No differences in this folder')}</div>`)
+    + (!state.subCompareFlatMode ? comparisonExcludedRowsHtml(candidates,authorModel,'data-sub-compare-entry') : '');
+  bindComparisonEvidence(refs.subCompareRows, rows, authorModel);
   refs.subCompareRows.querySelector('[data-commander-up]')?.addEventListener('click', () => { const parent = state.commanderPath.split('/').slice(0, -1).join('/'); openSubmoduleCompareDirectory(parent); });
   refs.subCompareRows.querySelectorAll('[data-sub-compare-entry]').forEach(rowNode => {
-    const row = rowsSource.find(item => item.relative_path === rowNode.dataset.subCompareEntry);
+    const row = rowsSource.find(item => item.relative_path === rowNode.dataset.subCompareEntry) || scopeRows?.find(item => item.relative_path === rowNode.dataset.subCompareEntry);
+    if (bindComparisonConversion(rowNode,row,true)) return;
     if (row?.local?.kind === 'submodule' || row?.remote?.kind === 'submodule') {
       SubmoduleCompareDetails.bindRow(rowNode, () => openSubmoduleComparisonDetails(row, true));
       return;
@@ -2281,6 +2383,7 @@ const openCommanderDirectoryGuard = createRequestGuard();
 async function openCommanderDirectory(path) {
   if (state.compareMode === 'history') folderHistoryComparison.activate(state.comparisonContext, path);
   else if (state.gitCompareMode === 'refs') ensureBranchCompareRefs();
+  const previous = state.commanderComparisonResult;
   const spec = commanderComparisonSpec();
   const branchCompareMode = !spec.workspace;
   const mode = state.compareMode, context = state.comparisonContext, session = state.comparisonSession;
@@ -2319,6 +2422,10 @@ async function openCommanderDirectory(path) {
       ? await invoke(flatMode ? 'compare_git_revisions_file_list' : 'compare_git_revisions_directory', { repositoryPath: spec.repositoryPath, relativePath: path, leftRef: spec.leftRef, rightRef: spec.rightRef })
       : await invoke('compare_workspace_revision', { repositoryPath: spec.repositoryPath, relativePath: path, revision: spec.rightRef, flat: flatMode });
     if (!stillCurrent()) return;
+    if (!flatMode && branchCompareMode && previous?.relative_path === result.relative_path
+      && previous.repository_path === result.repository_path && previous.left_revision === result.left_revision && previous.right_revision === result.right_revision) {
+      result.authorScope = previous.authorScope;
+    }
     state.commanderComparisonLoading = null;
     state.commanderRows = result.rows;
     state.commanderComparisonResult = result;
@@ -2326,7 +2433,7 @@ async function openCommanderDirectory(path) {
     if (branchCompareMode) {
       state.branchCompareLeftRevision = result.left_revision || result.leftRevision || '';
       state.branchCompareRightRevision = result.right_revision || result.rightRevision || '';
-    } else state.workspaceCompareAuthorContext = state.compareFlatMode ? workspaceComparisonAuthorContext(result) : null;
+    } else state.workspaceCompareAuthorContext = workspaceComparisonAuthorContext(result);
     render(); status(`Compared ${spec.leftRef} with ${spec.rightRef}`);
   } catch (error) { if (stillCurrent()) { state.commanderComparisonLoading = null; state.commanderComparisonError = String(error); status(String(error), 'error'); render(); } }
   finally { if (state.commanderComparisonLoading === loading) state.commanderComparisonLoading = null; }
@@ -2335,6 +2442,7 @@ async function openCommanderDirectory(path) {
 const openSubmoduleCompareDirectoryGuard = createRequestGuard();
 async function openSubmoduleCompareDirectory(path = state.commanderPath || '') {
   const compare = state.submoduleCompare;
+  const previous = compare ? {path:compare.relativePath, left:compare.leftRevision, right:compare.rightRevision, scope:compare.authorScope} : null;
   const external = Boolean(compare?.externalOwner && compare?.externalRepositoryName);
   if (!compare?.submodulePath && !external) { refs.subCompareRows.innerHTML = '<div class="loading-row">Select a submodule first.</div>'; return; }
   if (!compare.leftRef || !compare.rightRef) { refs.subCompareRows.innerHTML = '<div class="loading-row">Choose both revisions first.</div>'; return; }
@@ -2342,6 +2450,7 @@ async function openSubmoduleCompareDirectory(path = state.commanderPath || '') {
   const loading = {};
   compare.loading = loading;
   compare.rows = [];
+  compare.authorScope = null;
   refs.subCompareRows.innerHTML = '<div class="loading-row"><i class="spinner"></i>Comparing submodule revisions…</div>';
   const sameRequest = openSubmoduleCompareDirectoryGuard();
   const flatMode = state.subCompareFlatMode;
@@ -2378,12 +2487,14 @@ async function openSubmoduleCompareDirectory(path = state.commanderPath || '') {
     compare.loading = null;
     Object.assign(compare, {
       repositoryPath: result.repository_path,
+      relativePath: result.relative_path || path,
       rows: result.rows || [],
       leftRevision: result.left_revision || result.leftRevision || '',
       rightRevision: result.right_revision || result.rightRevision || '',
       leftOnlyCommits: result.left_only_commits || result.leftOnlyCommits || [],
       rightOnlyCommits: result.right_only_commits || result.rightOnlyCommits || [],
     });
+    if (!flatMode && previous?.path === path && previous.left === compare.leftRevision && previous.right === compare.rightRevision) compare.authorScope = previous.scope;
     state.commanderPath = result.relative_path || path;
     render();
     status(`Compared ${compare.name}: ${revisionDisplay(compare.leftRevision)} → ${revisionDisplay(compare.rightRevision)}`);

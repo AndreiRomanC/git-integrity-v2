@@ -114,7 +114,7 @@ test('compact comparison header preserves layout toggles, history controls, meta
       assert.equal(h.nodes.get('#compareGitInfo').hidden, false);
       assert.equal(h.nodes.get('#gitRevisionToolbar').hidden, mode === 'history');
       assert.equal(h.nodes.get('#folderHistoryControls').hidden, mode !== 'history');
-      assert.equal(h.context.refs.gitCompareFlatControls.hidden, !flat);
+      assert.equal(h.context.refs.gitCompareFlatControls.hidden, false, 'same compact filters in both layouts');
       assert.equal(h.context.refs.gitCompareFlatToggle.hidden, false, 'layout switch is not in the hidden filter row');
       assert.match(h.context.refs.commanderRows.innerHTML, /Loading comparison/);
       assert.doesNotMatch(h.context.refs.commanderRows.innerHTML, /old/);

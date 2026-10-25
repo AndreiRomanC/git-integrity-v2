@@ -1585,19 +1585,24 @@ dialog form { padding: 28px; text-align: center; }dialog h2 { margin: 0 0 10px; 
 @media (max-width: 1180px) { .commander-mode .main-layout { grid-template-columns: 220px minmax(0, 1fr); } }
 .help-dialog { width: min(760px, 90vw); max-width: 760px; }.help-dialog form { padding: 0; text-align: left; }.help-dialog header { display: flex; align-items: center; padding: 14px 18px; border-bottom: 1px solid var(--border); }.help-dialog header h2 { margin: 0 0 3px; }.help-dialog header p { margin: 0; color: #8497a7; font-size: 11px; }.help-dialog header button { width: 32px; height: 32px; margin: 0 0 0 auto; border: 0; background: transparent; color: #9aaab8; font-size: 22px; }.help-body { max-height: 65vh; overflow: auto; padding: 6px 18px 16px; }.help-body details { border-bottom: 1px solid var(--border-soft); padding: 11px 0; }.help-body details:last-child { border-bottom: 0; }.help-body summary { cursor: pointer; color: #d4e1eb; font-size: 12px; font-weight: 700; list-style: none; }.help-body summary::-webkit-details-marker { display: none; }.help-body summary::before { content: '▸'; display: inline-block; width: 14px; color: #7f92a3; }.help-body details[open] summary::before { content: '▾'; }.help-body p { margin: 8px 0 0 14px; color: #9db0c0; font-size: 11px; line-height: 1.6; }.help-body ul { margin: 8px 0 0 14px; padding-left: 16px; color: #9db0c0; font-size: 11px; line-height: 1.7; }.help-body li { margin-bottom: 2px; }.help-tag { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 9px; font-weight: 700; letter-spacing: .3px; }.help-tag.amber { background: #3a2c12; color: #e8b458; }.help-tag.blue { background: #12253a; color: #6db4ff; }.help-warn { color: #ff8a8a; }.help-dialog footer { display: flex; align-items: center; padding: 13px 18px; border-top: 1px solid var(--border); }.help-dialog footer button { width: auto; min-width: 90px; margin: 0 0 0 auto; }
 /* Optional snapshot metadata; does not affect the Commander grid columns. */
-.comparison-author-filter { flex: 1 1 360px; min-width: 0; display: flex; align-items: center; flex-wrap: wrap; gap: 6px 14px; }
+.comparison-author-filter { flex: 1 1 240px; min-width: 0; display: flex; align-items: center; flex-wrap: wrap; gap: 6px 10px; }
 .comparison-author-filter[hidden] { display: none; }
 .comparison-author-filter label { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 .compare-flat-controls .comparison-author-filter label { font-size: 11px; font-weight: 500; letter-spacing: 0; }
 .compare-flat-controls .comparison-author-filter select { font-size: 11px; font-weight: 500; }
-.comparison-author-filter select { max-width: min(420px, 42vw); min-width: 0; }
+.comparison-author-filter select { width: 230px; max-width: min(300px, 35vw); min-width: 0; text-overflow: ellipsis; }
 .comparison-author-select { order: 0; min-width: 0; }
-.comparison-author-filter .comparison-author-direct { order: 1; }
 .comparison-author-help { order: 2; position: relative; margin-left: auto; }
 .comparison-author-help > summary { cursor: pointer; white-space: nowrap; }
 .comparison-author-help > div { position: absolute; z-index: 40; top: calc(100% + 8px); right: 0; width: min(460px, 75vw); padding: 10px 14px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); box-shadow: 0 8px 24px #0008; max-height: 45vh; overflow: auto; }
-.comparison-author-summary, .comparison-author-filter > small { flex-basis: 100%; order: 3; }
-.comparison-author-filter .comparison-author-direct { font-size: 12px; gap: 6px; }
+.comparison-author-summary { order: 1; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.comparison-author-filter > small:not(.comparison-author-summary) { order: 3; max-width: 65ch; }
+.compare-inline-controls { flex: 1 1 auto; min-width: 0; min-height: 28px; padding: 0; border: 0; background: transparent; justify-content: flex-start; }
+.compare-scope-toolbar { flex-wrap: wrap; gap: 6px 12px; }
+.compare-scope-toolbar .commander-breadcrumbs { flex: 0 1 auto; min-width: 80px; max-width: 35%; }
+.compare-inline-controls > label { flex-shrink: 0; }
+.compare-inline-controls .compare-layout-choice { order: 4; }
+.comparison-author-filter .comparison-author-direct { font-size: 12px; gap: 6px; padding-top: 10px; margin-top: 10px; border-top: 1px solid var(--border-soft); color: var(--text); }
 .comparison-author-direct input { width: auto; margin: 0; flex: 0 0 auto; }
 .comparison-author-filter small, .comparison-author-filter details { font-size: 12px; color: var(--muted); }
 .comparison-author-filter p { max-width: 85ch; margin: 6px 0; }

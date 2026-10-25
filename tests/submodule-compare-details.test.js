@@ -91,6 +91,10 @@ test('integration pins displayed parent commits and opens contents in the exact 
   await c.options.onCompare(details('child'), () => true);
   assert.equal(c.compared[0], 'child-old'); assert.equal(c.compared[1], 'child-new');
   assert.equal(c.compared[4].repositoryPath, '/parent/modules/dep'); assert.equal(state.repository.path, '/parent');
+  assert.equal(c.compared[4].integration,undefined,'workspace/non-immutable sources do not claim parent authorship');
+  const pinned=details('child'); pinned.left.source='a'.repeat(40); pinned.right.source='b'.repeat(40);
+  await c.options.onCompare(pinned,()=>true);
+  assert.deepEqual(clone(c.compared[4].integration),{repositoryPath:'/parent',relativePath:'modules/dep',leftRevision:'a'.repeat(40),rightRevision:'b'.repeat(40),childLeft:'child-old',childRight:'child-new'});
   c.commanderComparisonSpec = () => ({ repositoryPath: '/parent', workspace: true });
   c.openSubmoduleComparisonDetails({ relative_path: 'modules/dep', local: { revision: 'child-local' } });
   assert.equal(calls.at(-1).leftRef, null); assert.equal(calls.at(-1).rightRef, 'parent-remote');

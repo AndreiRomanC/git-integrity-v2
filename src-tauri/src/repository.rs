@@ -8710,7 +8710,10 @@ fn compare_git_tree_file_list(repository_path: &str, relative_path: &str, left_r
     let relative_path = normalized(&relative);
     let left_revision = resolve_commit(repository_path, left_ref)?;
     let right_revision = resolve_commit(repository_path, right_ref)?;
-    let repo = internal_repository(repository_path)?;
+    // Leaf scope also powers Drill-down filtering in an already-resolved
+    // child/bare snapshot. Never discover the superproject if child metadata
+    // disappeared; hold this exact repository for the whole tree diff.
+    let repo = Repository::open(repository_path).map_err(|e| format!("Cannot open the exact comparison repository: {}", e.message()))?;
     let left_oid = git2::Oid::from_str(&left_revision).map_err(|error| error.message().to_string())?;
     let right_oid = git2::Oid::from_str(&right_revision).map_err(|error| error.message().to_string())?;
     let left_tree = repo.find_commit(left_oid).and_then(|commit| commit.tree()).map_err(|error| error.message().to_string())?;
@@ -10051,6 +10054,23 @@ mod tests {
     fn unique_status_epoch_test_path(label: &str) -> String {
         let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         std::env::temp_dir().join(format!("git-integrity-status-epoch-{label}-{suffix}")).to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn leaf_scope_requires_exact_repository_and_accepts_local_bare_snapshots() {
+        let path = unique_status_epoch_test_path("leaf-scope-owner");
+        let root = Path::new(&path);
+        create_libgit2_repository(root, "file.txt");
+        let revision = resolve_commit(&path, "HEAD").unwrap();
+        let missing_child = root.join("missing-child");
+        fs::create_dir(&missing_child).unwrap();
+        let call = |path: String| tauri::async_runtime::block_on(compare_git_revisions_file_list(path, "".into(), revision.clone(), revision.clone()));
+        assert!(call(missing_child.to_string_lossy().into_owned()).err().unwrap().contains("exact comparison repository"));
+        assert!(call(path.clone()).unwrap().rows.is_empty());
+        let bare = root.join("snapshot.git");
+        git2::build::RepoBuilder::new().bare(true).clone(&path, &bare).unwrap();
+        assert!(call(bare.to_string_lossy().into_owned()).unwrap().rows.is_empty());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

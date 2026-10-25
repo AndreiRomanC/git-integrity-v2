@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
-const { createComparisonAuthorCache, comparisonAuthorMatches, comparisonAuthorPartition, comparisonAuthorEmptyMessage, comparisonAuthorDiagnostic, comparisonAuthorEvidence, workspaceComparisonAuthorContext, scopedComparisonAuthorContext } = require('../frontend/comparison-authors.js');
+const { createComparisonAuthorCache, comparisonAuthorMatches, comparisonAuthorPartition, comparisonAuthorEmptyMessage, comparisonAuthorDiagnostic, comparisonAuthorEvidence, workspaceComparisonAuthorContext, scopedComparisonAuthorContext, comparisonAuthorMode, comparisonAuthorStrict } = require('../frontend/comparison-authors.js');
 const context = { repositoryPath: '/repo', leftRevision: 'a', rightRevision: 'b' };
 const authors = [{ key: 'email:a@test', name: 'Name', email: 'a@test', paths: ['old', 'new', 'modified'] }];
 
@@ -83,7 +83,7 @@ test('filter renderer scopes to loaded rows, not search results, and does not st
   const contexts = [];
   const element = {innerHTML:'',querySelector:()=>null};
   const container = {classList:{toggle(){}},querySelector:()=>element};
-  const h = {scopedComparisonAuthorContext,comparisonAuthorCache:{get:context=>{contexts.push(context);return {authors:null};}}};
+  const h = {comparisonAuthorMode,comparisonAuthorStrict,scopedComparisonAuthorContext,comparisonAuthorCache:{get:context=>{contexts.push(context);return {authors:null};}}};
   vm.createContext(h);
   vm.runInContext(app.slice(app.indexOf('function renderComparisonAuthorFilter('),app.indexOf('function logComparisonAuthorDisplay(')),h);
   const scopeRows = [{relative_path:'folder/a'},{relative_path:'folder/b'}];
@@ -91,8 +91,9 @@ test('filter renderer scopes to loaded rows, not search results, and does not st
   h.renderComparisonAuthorFilter(container,context,{scopeRows,rows:scopeRows.slice(0,1)});
   h.renderComparisonAuthorFilter(container,context,{scopeRows,rows:[]});
   assert.deepEqual(contexts,[0,1,2].map(()=>({...context,scopePaths:['folder/a','folder/b']})));
-  assert.match(app,/scopeRows:state\.commanderRows/);
-  assert.match(app,/scopeRows:rowsSource/);
+  assert.match(app,/sourceRows:state\.commanderRows/);
+  assert.match(app,/sourceRows:rowsSource/);
+  assert.match(app,/scopeRows:scope\.rows/,'both layouts use the complete leaf scope, not immediate folders');
 });
 
 test('151 candidates = 123 shown + 28 excluded, never 54 from unrelated paths', async () => {
@@ -132,7 +133,7 @@ test('compact rendering groups structure separately and escapes specific exclusi
   const app = fs.readFileSync(path.join(__dirname,'../frontend/app.js'),'utf8');
   const rows = ['own','converted','unknown','none'].map(relative_path => ({relative_path}));
   const model = {selected:'author',directOnly:true,authors:[{key:'author',paths:rows.map(r=>r.relative_path)}],strictResult:{result:{paths:['own','converted'],structural_paths:{converted:'module'},ambiguous_paths:{unknown:'Repeated <XML> values'},no_contribution_paths:['none'],evidence:{}}}};
-  const context = {comparisonAuthorPartition,comparisonAuthorEvidence,esc:value=>String(value).replaceAll('<','&lt;'),
+  const context = {comparisonAuthorStrict,comparisonAuthorPartition,comparisonAuthorEvidence,esc:value=>String(value).replaceAll('<','&lt;'),
     flatCompareRowHtml:row=>`<button>${row.relative_path}</button>`,comparisonEvidenceRowHtml:row=>`<span>why:${row.relative_path}</span>`};
   vm.createContext(context);
   vm.runInContext(app.slice(app.indexOf('function comparisonAuthorRowsHtml('),app.indexOf('function bindComparisonEvidence(')),context);
@@ -160,7 +161,7 @@ test('Why included shows the witness commit date and handles older cached eviden
   assert.match(html,/UTC/);
   assert.match(context.comparisonEvidenceCommitHtml({commit:'old'}),/Date unavailable/);
   assert.match(context.comparisonEvidenceCommitHtml({...touch,date:'<invalid>'}),/&lt;invalid>/);
-  assert.match(app.slice(app.indexOf('function bindComparisonEvidence('),app.indexOf('function renderComparisonAuthorFilter(')),/comparisonEvidenceCommitHtml\(touch\)/);
+  assert.match(app.slice(app.indexOf('function comparisonEvidenceBodyHtml('),app.indexOf('function bindComparisonEvidence(')),/comparisonEvidenceCommitHtml\(touch\)/);
 });
 
 test('display diagnostics distinguish failure from empty results without logging identity', () => {

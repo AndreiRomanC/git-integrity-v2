@@ -2,6 +2,7 @@
 use super::*;
 use std::collections::BTreeMap;
 pub mod strict;
+pub mod introduced;
 
 #[derive(Debug, Serialize)]
 pub struct ComparisonAuthor {
@@ -171,18 +172,18 @@ pub async fn comparison_authors(repository_path: String, submodule_path: Option<
 #[cfg(test)]
 mod tests {
     use super::*;
-    struct Fixture { repo: Repository, path: PathBuf }
+    pub(super) struct Fixture { pub(super) repo: Repository, pub(super) path: PathBuf }
     impl Fixture {
-        fn new() -> Self {
+        pub(super) fn new() -> Self {
             static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let sequence = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let path = std::env::temp_dir().join(format!("ddt-author-test-{}-{}-{sequence}", std::process::id(), std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
             Self { repo: Repository::init(&path).unwrap(), path }
         }
-        fn commit(&self, email: &str, files: &[(&str, &str)], parents: &[Oid]) -> Oid {
+        pub(super) fn commit(&self, email: &str, files: &[(&str, &str)], parents: &[Oid]) -> Oid {
             self.entries(email, &files.iter().map(|&(path, content)| (path, content, 0o100644)).collect::<Vec<_>>(), parents)
         }
-        fn entries(&self, email: &str, files: &[(&str, &str, i32)], parents: &[Oid]) -> Oid {
+        pub(super) fn entries(&self, email: &str, files: &[(&str, &str, i32)], parents: &[Oid]) -> Oid {
             fn tree(repo: &Repository, files: &[(&str, &str, i32)]) -> Oid {
                 let mut builder = repo.treebuilder(None).unwrap();
                 let mut folders: BTreeMap<&str, Vec<(&str, &str, i32)>> = BTreeMap::new();
@@ -210,6 +211,75 @@ mod tests {
     fn compared_paths(f: &Fixture, folder: &str, left: Oid, right: Oid) -> Vec<String> {
         compare_git_tree_file_list(&f.path.to_string_lossy(), folder, &left.to_string(), &right.to_string()).unwrap().rows.into_iter()
             .flat_map(|row| [row.local.map(|e| e.relative_path), row.remote.map(|e| e.relative_path)].into_iter().flatten()).collect()
+    }
+
+    fn contributors<'a>(authors: &'a [ComparisonAuthor], path: &str) -> Vec<&'a str> {
+        authors.iter().filter(|a| a.paths.iter().any(|p| p == path)).map(|a| a.email.as_str()).collect()
+    }
+
+    #[test]
+    fn shared_history_keeps_overwritten_intermediate_touches_but_not_fully_reverted_files() {
+        let f = Fixture::new();
+        let base = f.commit("base@test", &[("folder/shared", "base"), ("folder/reverted", "base"), ("folder/solo", "base"), ("elsewhere/file", "base")], &[]);
+        let intermediate = f.commit("alice@test", &[("folder/shared", "alice"), ("folder/reverted", "temporary"), ("folder/solo", "alice"), ("elsewhere/file", "base")], &[base]);
+        let repeated = f.commit("alice@test", &[("folder/shared", "alice again"), ("folder/reverted", "temporary"), ("folder/solo", "alice again"), ("elsewhere/file", "base")], &[intermediate]);
+        let overwritten = f.commit("bob@test", &[("folder/shared", "bob replaces everything"), ("folder/reverted", "base"), ("folder/solo", "alice again"), ("elsewhere/file", "base")], &[repeated]);
+        let tip = f.commit("endpoint@test", &[("folder/shared", "bob replaces everything"), ("folder/reverted", "base"), ("folder/solo", "alice again"), ("elsewhere/file", "endpoint")], &[overwritten]);
+        let scope = compared_paths(&f, "folder", base, tip);
+        let result = collect_for_paths(&f.repo, base, tip, Some(scope.clone())).unwrap();
+        assert_eq!(contributors(&result, "folder/shared"), ["alice@test", "bob@test"]);
+        assert_eq!(contributors(&result, "folder/solo"), ["alice@test"], "two commits from one identity do not make a shared file");
+        assert!(contributors(&result, "folder/reverted").is_empty(), "identical endpoints exclude even a file touched by two authors");
+        assert!(contributors(&result, "elsewhere/file").is_empty());
+        assert_eq!(result.len(), 2, "the endpoint author's unrelated changes do not establish authorship");
+        assert!(result.iter().all(|a| a.name == "Same display name"), "identities use emails, not display names");
+        assert_eq!(result[0].commits, 2);
+        let evidence = &result[0].evidence["folder/shared"][0];
+        assert_eq!(evidence.commit, repeated.to_string());
+        assert_eq!(evidence.parent.as_deref(), Some(intermediate.to_string().as_str()));
+        assert!(!evidence.date.is_empty());
+        assert_eq!(serde_json::to_value(&result).unwrap(), serde_json::to_value(collect_for_paths(&f.repo, tip, base, Some(scope)).unwrap()).unwrap());
+        let full_diff = compare_git_tree_file(&f.path.to_string_lossy(), "folder/shared", &base.to_string(), &tip.to_string()).unwrap();
+        assert_eq!(full_diff.local_content, "base");
+        assert_eq!(full_diff.remote_content, "bob replaces everything", "history metadata never substitutes an intermediate diff");
+    }
+
+    #[test]
+    fn shared_history_counts_both_divergent_sides_and_original_authors_not_merge_resolutions() {
+        let f = Fixture::new();
+        let base = f.commit("base@test", &[("folder/shared", "base")], &[]);
+        let left = f.commit("alice@test", &[("folder/shared", "left")], &[base]);
+        let right = f.commit("bob@test", &[("folder/shared", "right")], &[base]);
+        let merged = f.commit("integrator@test", &[("folder/shared", "resolved"), ("folder/resolution_only", "new")], &[left, right]);
+        for (start, end) in [(left, right), (right, left), (base, merged), (merged, base)] {
+            let result = collect_for_paths(&f.repo, start, end, Some(compared_paths(&f, "folder", start, end))).unwrap();
+            assert_eq!(contributors(&result, "folder/shared"), ["alice@test", "bob@test"]);
+            assert!(contributors(&result, "folder/resolution_only").is_empty(), "merge-only resolution is not a proven personal edit");
+            assert_eq!(result.len(), 2);
+            assert!(result.iter().all(|a| a.merge_commits == 0));
+            assert!(result.iter().flat_map(|a| a.evidence.values().flatten()).all(|e| e.commit != merged.to_string()));
+        }
+        let after_left = collect_for_paths(&f.repo, left, merged, Some(compared_paths(&f, "folder", left, merged))).unwrap();
+        assert_eq!(contributors(&after_left, "folder/shared"), ["bob@test"], "Alice's common history is outside this interval");
+    }
+
+    #[test]
+    fn shared_gitlink_history_counts_pointer_authors_without_claiming_internal_file_authorship() {
+        let f = Fixture::new();
+        let first = "1111111111111111111111111111111111111111";
+        let second = "2222222222222222222222222222222222222222";
+        let third = "3333333333333333333333333333333333333333";
+        let base = f.entries("base@test", &[("modules/unit", first, 0o160000)], &[]);
+        let alice = f.entries("alice@test", &[("modules/unit", second, 0o160000)], &[base]);
+        let bob = f.entries("bob@test", &[("modules/unit", third, 0o160000)], &[alice]);
+        let result = collect_for_paths(&f.repo, base, bob, Some(compared_paths(&f, "modules", base, bob))).unwrap();
+        assert_eq!(contributors(&result, "modules/unit"), ["alice@test", "bob@test"]);
+        assert!(result.iter().all(|a| a.paths == ["modules/unit"]));
+        assert!(contributors(&result, "modules/unit/file.c").is_empty());
+        assert!(!f.path.join("modules").exists(), "no recursive checkout or fetch for metadata");
+        assert!(f.repo.find_commit(Oid::from_str(third).unwrap()).is_err(), "child objects deliberately absent");
+        let result = collect_for_paths(&f.repo, alice, bob, Some(compared_paths(&f, "modules", alice, bob))).unwrap();
+        assert_eq!(contributors(&result, "modules/unit"), ["bob@test"]);
     }
 
     #[test]
