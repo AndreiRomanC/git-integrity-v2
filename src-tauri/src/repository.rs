@@ -11041,6 +11041,37 @@ mod tests {
     }
 
     #[test]
+    fn folder_picker_history_includes_merged_changes_but_not_unmerged_branches() {
+        let (root, path, old, head) = individual_restore_fixture("picker-ancestry");
+        let branch = run_git_capture(&root, &["branch", "--show-current"]);
+        run_git(&root, &["checkout", "-b", "not-merged"]);
+        fs::write(root.join("folder/file.txt"), "unmerged\n").unwrap();
+        run_git(&root, &["commit", "-am", "Unmerged folder edit"]);
+        let excluded = run_git_capture(&root, &["rev-parse", "HEAD"]);
+        run_git(&root, &["checkout", &branch]);
+        run_git(&root, &["checkout", "-b", "incoming"]);
+        fs::write(root.join("folder/file.txt"), "incoming\n").unwrap();
+        run_git(&root, &["commit", "-am", "Incoming folder edit"]);
+        let incoming = run_git_capture(&root, &["rev-parse", "HEAD"]);
+        run_git(&root, &["checkout", &branch]);
+        fs::write(root.join("outside.txt"), "unrelated\n").unwrap();
+        run_git(&root, &["commit", "-am", "Unrelated path edit"]);
+        let outside = run_git_capture(&root, &["rev-parse", "HEAD"]);
+        run_git(&root, &["merge", "--no-ff", "incoming", "-m", "Merge incoming"]);
+        let merged = run_git_capture(&root, &["rev-parse", "HEAD"]);
+        let refs_before = run_git_capture(&root, &["show-ref"]);
+        let page = path_history_page_inner(path, "folder".into(), None, 0).unwrap();
+        let ids: Vec<&str> = page.commits.iter().map(|c| c.id.as_str()).collect();
+        for included in [&old, &head, &incoming, &merged] { assert!(ids.contains(&included.as_str())); }
+        assert!(!ids.contains(&excluded.as_str()));
+        assert!(!ids.contains(&outside.as_str()));
+        assert_eq!(page.head_id, merged);
+        assert_eq!(run_git_capture(&root, &["show-ref"]), refs_before);
+        assert!(run_git_capture(&root, &["status", "--porcelain"]).is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn restore_preview_reports_staging_relative_to_head_even_when_source_matches() {
         let (root, path, old, _) = individual_restore_fixture("staged-source");
         path_restore_inner(path.clone(), "folder/file.txt".into(), old.clone(), vec![], true).unwrap();

@@ -1,6 +1,63 @@
 //! Read-only, bounded return from a full submodule workspace to its parent.
 //! Reuses the existing 5-minute navigation cache, never extends its age.
 use super::*;
+
+#[derive(Serialize)]
+pub struct NavigationStatus {
+    fresh: bool,
+    head_oid: String,
+    branch: String,
+}
+
+// Cheap freshness/identity probe only. Never walks files, history, submodules
+// or remote refs. The frontend can keep its last snapshot visible while the
+// existing refresh_status command does the actual background scan.
+fn navigation_status_inner(repository_path: &str) -> Result<NavigationStatus, String> {
+    validate_path(repository_path)?;
+    let repo = internal_submodule_repository(Path::new(repository_path))?;
+    let key = repo_lock_key(repository_path);
+    let age = full_status_cache().lock().unwrap().get(&key).map(|(at, _)| at.elapsed());
+    let head = repo.head().ok();
+    let head_oid = head.as_ref().and_then(|head| head.target()).map(|id| id.to_string()).unwrap_or_default();
+    let branch = if repo.head_detached().unwrap_or(false) { String::new() }
+        else { head.as_ref().and_then(|head| head.shorthand()).unwrap_or("").to_string() };
+    let fresh = age.is_some_and(|age| age < GIT_METADATA_TTL);
+    if !fresh {
+        perf_log(&perf_logging::cache_lookup_label("navigation", &key, None, age, GIT_METADATA_TTL, "background_refresh"), Duration::ZERO);
+    }
+    Ok(NavigationStatus { fresh, head_oid, branch })
+}
+
+#[tauri::command]
+pub async fn navigation_status(repository_path: String) -> Result<NavigationStatus, String> {
+    off_main_thread(move || navigation_status_inner(&repository_path)).await
+}
+
+fn refresh_navigation_status_inner(repository_path: String, head_oid: String, branch: String, force_fresh: bool) -> Result<Vec<Change>, String> {
+    let same_head = |status: &NavigationStatus| status.head_oid == head_oid && status.branch == branch;
+    if !same_head(&navigation_status_inner(&repository_path)?) {
+        return Err("Repository HEAD/branch changed. Refresh repository before continuing.".into());
+    }
+    if force_fresh { invalidate_git_metadata(&repository_path); }
+    let epoch = status_cache_epoch(&repository_path);
+    let changes = refresh_status_inner(repository_path.clone())?;
+    if !same_head(&navigation_status_inner(&repository_path)?) {
+        return Err("Repository HEAD/branch changed during verification. Refresh repository before continuing.".into());
+    }
+    // A newer full snapshot also supersedes still-young per-folder snapshots.
+    // Keep its index/HEAD-derived caches and the freshly populated root entry.
+    let key = repo_lock_key(&repository_path);
+    let epochs = status_cache_epochs().lock().unwrap();
+    if *epochs.get(&key).unwrap_or(&0) != epoch { return Err(STATUS_SNAPSHOT_SUPERSEDED.into()); }
+    let prefix = format!("{key}\u{0}");
+    metadata_cache().lock().unwrap().retain(|scope, _| !scope.starts_with(&prefix) || scope == &prefix);
+    Ok(changes)
+}
+
+#[tauri::command]
+pub async fn refresh_navigation_status(repository_path: String, head_oid: String, branch: String, force_fresh: Option<bool>) -> Result<Vec<Change>, String> {
+    off_main_thread(move || refresh_navigation_status_inner(repository_path, head_oid, branch, force_fresh.unwrap_or(false))).await
+}
 use std::hash::{Hash, Hasher};
 
 fn fingerprint(repo: &Repository) -> Result<String, String> {
@@ -98,7 +155,8 @@ mod tests {
     struct Fixture { root: PathBuf, parent: PathBuf }
     impl Fixture {
         fn new() -> Self {
-            let root = std::env::temp_dir().join(format!("ddt-return-navigation-{}", std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+            static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
+            let root = std::env::temp_dir().join(format!("ddt-return-navigation-{}-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos(), NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)));
             let dependency = root.join("dependency"); let parent = root.join("parent");
             fs::create_dir_all(&dependency).unwrap(); fs::create_dir_all(&parent).unwrap();
             git(&dependency, &["init", "-b", "main"]); fs::write(dependency.join("module.txt"), "initial\n").unwrap();
@@ -113,6 +171,59 @@ mod tests {
         fn seed(&self) { refresh_status_inner(self.path()).unwrap(); }
     }
     impl Drop for Fixture { fn drop(&mut self) { let _ = fs::remove_dir_all(&self.root); } }
+    #[test]
+    fn navigation_probe_detects_expiry_without_refreshing_or_touching_git() {
+        let f = Fixture::new();
+        let index_before = fs::read(f.parent.join(".git/index")).unwrap();
+        let fresh = navigation_status_inner(&f.path()).unwrap();
+        assert!(fresh.fresh); assert_eq!(fresh.branch, "main"); assert!(!fresh.head_oid.is_empty());
+        let key = repo_lock_key(&f.path());
+        let old = Instant::now() - GIT_METADATA_TTL - Duration::from_secs(1);
+        full_status_cache().lock().unwrap().get_mut(&key).unwrap().0 = old;
+        fs::write(f.parent.join("external.txt"), "outside edit").unwrap();
+        assert!(!navigation_status_inner(&f.path()).unwrap().fresh);
+        assert_eq!(full_status_cache().lock().unwrap().get(&key).unwrap().0, old, "probe must not scan or renew the cache");
+        assert_eq!(fs::read(f.parent.join(".git/index")).unwrap(), index_before);
+    }
+    #[test]
+    fn navigation_refresh_detects_external_changes_and_discards_younger_scoped_snapshots() {
+        let f = Fixture::new();
+        let head = navigation_status_inner(&f.path()).unwrap();
+        let old_scope = cached_git_metadata(&f.path(), "parent.txt");
+        assert!(old_scope.statuses.is_empty());
+        let index_before = fs::read(f.parent.join(".git/index")).unwrap();
+        fs::write(f.parent.join("parent.txt"), "external modification\n").unwrap();
+        let key = repo_lock_key(&f.path());
+        full_status_cache().lock().unwrap().get_mut(&key).unwrap().0 = Instant::now() - GIT_METADATA_TTL - Duration::from_secs(1);
+        let changes = refresh_navigation_status_inner(f.path(), head.head_oid.clone(), head.branch, false).unwrap();
+        assert!(changes.iter().any(|change| change.path == "parent.txt"));
+        assert!(!cached_git_metadata(&f.path(), "parent.txt").statuses.is_empty());
+        assert_eq!(navigation_status_inner(&f.path()).unwrap().head_oid, head.head_oid);
+        assert_eq!(fs::read(f.parent.join(".git/index")).unwrap(), index_before);
+        assert_eq!(fs::read_to_string(f.parent.join("parent.txt")).unwrap(), "external modification\n");
+    }
+    #[test]
+    fn navigation_refresh_refuses_external_checkout_and_missing_child_never_falls_back_to_parent() {
+        let f = Fixture::new();
+        let before = navigation_status_inner(&f.path()).unwrap();
+        git(&f.parent, &["checkout", "-b", "external"]);
+        let error = refresh_navigation_status_inner(f.path(), before.head_oid, before.branch, false).err().unwrap();
+        assert!(error.contains("HEAD/branch changed"));
+        let not_a_repository = f.parent.join("ordinary-folder"); fs::create_dir(&not_a_repository).unwrap();
+        assert!(navigation_status_inner(not_a_repository.to_str().unwrap()).is_err());
+    }
+    #[test]
+    fn navigation_refresh_inside_one_submodule_does_not_scan_or_rewrite_parent_cache() {
+        let f = Fixture::new();
+        let child = f.parent.join("vendor/dep").to_string_lossy().into_owned();
+        let head = navigation_status_inner(&child).unwrap();
+        let parent_key = repo_lock_key(&f.path());
+        let before = full_status_cache().lock().unwrap().get(&parent_key).unwrap().0;
+        fs::write(Path::new(&child).join("module.txt"), "child external change").unwrap();
+        let changes = refresh_navigation_status_inner(child, head.head_oid, head.branch, true).unwrap();
+        assert!(changes.iter().any(|change| change.path == "module.txt"));
+        assert_eq!(full_status_cache().lock().unwrap().get(&parent_key).unwrap().0, before);
+    }
     #[test]
     fn returning_patches_only_the_child_gitlink_preserving_parent_local_state_and_cache_age() {
         let f = Fixture::new();

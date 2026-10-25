@@ -96,6 +96,46 @@ test('Folder Compare is initialized at the exact scope before rendering, never r
   assert.deepEqual(h.calls.at(-1), ['activate', '/parent/modules/dep']);
 });
 
+test('compact comparison header preserves layout toggles, history controls, metadata and loading errors', () => {
+  const h = harness();
+  h.context.localDriveWorkspace.deactivate = () => {};
+  h.context.refs = new Proxy(h.context.refs, { get(object, key) { return object[key] ||= element(); } });
+  h.context.renderCommanderBreadcrumbs = () => {};
+  h.context.renderBranchCompareSelectors = () => {};
+  vm.runInContext(source('renderComparisonLocation') + '\n' + source('renderCommander'), h.context);
+  for (const mode of ['git', 'history']) {
+    for (const flat of [false, true]) {
+      h.state.compareMode = mode;
+      h.state.compareFlatMode = flat;
+      h.state.comparisonContext.ready = true;
+      h.state.commanderComparisonLoading = {};
+      h.state.commanderRows = ['old'];
+      h.context.renderCommander();
+      assert.equal(h.nodes.get('#compareGitInfo').hidden, false);
+      assert.equal(h.nodes.get('#gitRevisionToolbar').hidden, mode === 'history');
+      assert.equal(h.nodes.get('#folderHistoryControls').hidden, mode !== 'history');
+      assert.equal(h.context.refs.gitCompareFlatControls.hidden, !flat);
+      assert.equal(h.context.refs.gitCompareFlatToggle.hidden, false, 'layout switch is not in the hidden filter row');
+      assert.match(h.context.refs.commanderRows.innerHTML, /Loading comparison/);
+      assert.doesNotMatch(h.context.refs.commanderRows.innerHTML, /old/);
+      assert.match(h.nodes.get('#compareSnapshotSummary').textContent, /Resolving/);
+      h.state.commanderComparisonLoading = null;
+      h.state.commanderComparisonError = 'Unknown revision';
+      h.state.commanderComparisonResult = { left_revision: 'left-exact', right_revision: 'right-exact' };
+      h.context.renderCommander();
+      assert.match(h.context.refs.commanderRows.innerHTML, /Unknown revision/, 'errors are not hidden in Details');
+      assert.match(h.nodes.get('#compareSnapshotSummary').textContent, /right-exact/);
+    }
+  }
+  for (const mode of ['local-drive', 'submodule']) {
+    h.state.compareMode = mode;
+    h.context.renderComparisonLocation();
+    assert.equal(h.nodes.get('#compareGitInfo').hidden, true, 'other tabs never display stale branch snapshot metadata');
+    assert.match(h.nodes.get('#compareOrigin').textContent, /\/parent\/modules\/dep/);
+  }
+  assert.equal(h.calls.length, 0, 'rearranging controls does not request Git or server work');
+});
+
 test('history compares either local files or two exact refs with the same existing renderer', async () => {
   const h = harness(); await h.context.switchComparisonMode('history'); h.calls.length = 0;
   h.selection({ left: 'old-sha', right: 'new-sha' });
@@ -149,10 +189,10 @@ test('late snapshot and metadata responses cannot replace newer selections or an
 });
 
 function historyHarness() {
-  const nodes = new Map(), pending = [], changes = [];
+  const nodes = new Map(), pending = [], changes = [], menus = [];
   const root = { querySelector: id => { if (!nodes.has(id)) nodes.set(id, element()); return nodes.get(id); } };
-  const history = ComparisonNavigation.createHistory({ root, invoke: (name, args) => new Promise((resolve, reject) => pending.push({ name, args, resolve, reject })), onChange: () => changes.push(history.selection()) });
-  return { history, pending, changes, get: id => root.querySelector(`[data-history-${id}]`) };
+  const history = ComparisonNavigation.createHistory({ root, invoke: (name, args) => new Promise((resolve, reject) => pending.push({ name, args, resolve, reject })), onChange: () => changes.push(history.selection()), onContextMenu: (event, items) => menus.push(items) });
+  return { history, pending, changes, menus, picker: root.querySelector('.folder-history-picker'), get: id => root.querySelector(`[data-history-${id}]`) };
 }
 const page = (id, more = false, head = 'pinned') => ({ commits: [{ id, subject: 'Complete long message', author: 'A', date: '2026-10-21' }], head_id: head, next_offset: 500, has_more: more });
 const tick = () => new Promise(resolve => setImmediate(resolve));
@@ -193,4 +233,173 @@ test('working tree is explicit and stays on the left; two committed refs can be 
   h.get('left').value = 'a'; h.get('left').handlers.change();
   h.get('swap').handlers.click(); assert.deepEqual(h.history.selection(), { left: 'HEAD', right: 'a' });
   h.get('worktree').handlers.click(); assert.deepEqual(h.history.selection(), { left: 'Working tree', right: 'a' });
+});
+
+const selectHistoryEvent = (id, modifiers = {}) => ({ ...modifiers,
+  target: { closest: selector => selector === '[data-history-select]' ? { dataset: { historySelect: id } }
+    : selector === '[data-history-row]' ? { dataset: { historyRow: id } } : null },
+});
+const historyPageWith = (...ids) => ({ ...page(ids[0]), commits: ids.map(id => ({ ...page(id).commits[0] })) });
+
+test('Ctrl/Cmd history selection is local until Compare selected and uses the selected order', async () => {
+  for (const modifier of ['ctrlKey', 'metaKey']) {
+    const h = historyHarness();
+    h.history.activate({ repositoryPath: '/repo' }, 'folder');
+    h.pending[0].resolve(historyPageWith('A', 'B', 'C')); await tick();
+    const click = (id, extend = true) => h.get('rows').handlers.click(selectHistoryEvent(id, { [modifier]: extend }));
+    click('A'); assert.equal(h.get('compare-selected').disabled, true);
+    click('B'); assert.equal(h.get('compare-selected').disabled, false);
+    assert.match(h.get('rows').innerHTML, /LEFT/); assert.match(h.get('rows').innerHTML, /RIGHT/);
+    click('C'); // The most recent two, matching the version-picker convention.
+    assert.match(h.get('selected-note').textContent, /B → C/);
+    assert.equal(h.changes.length, 0); assert.equal(h.pending.length, 1);
+    h.picker.open = true;
+    h.get('compare-selected').handlers.click();
+    assert.equal(h.picker.open, false, 'make room for the comparison without losing the selected pair');
+    assert.deepEqual(h.changes, [{ left: 'B', right: 'C' }]);
+    click('C'); assert.equal(h.get('compare-selected').disabled, true);
+    h.get('compare-selected').handlers.click(); assert.equal(h.changes.length, 1);
+    click('A', false); assert.match(h.get('selected-note').textContent, /A · 1\/2/);
+    h.get('clear-selected').handlers.click(); assert.equal(h.get('clear-selected').hidden, true);
+    assert.deepEqual(h.history.selection(), { left: 'B', right: 'C' }, 'clearing selection does not alter the displayed comparison');
+    assert.equal(h.pending.length, 1, 'no refresh, fetch or write on selection');
+  }
+});
+
+test('history context menu compares the pair and ignores actions from an older folder or selection', async () => {
+  const h = historyHarness(), context = { repositoryPath: '/repo' };
+  h.history.activate(context, 'folder'); h.pending[0].resolve(historyPageWith('A', 'B')); await tick();
+  h.get('rows').handlers.click(selectHistoryEvent('A'));
+  h.get('rows').handlers.click(selectHistoryEvent('B', { metaKey: true }));
+  h.get('rows').handlers.contextmenu(selectHistoryEvent('A'));
+  assert.equal(h.menus[0][0].disabled, false);
+  h.menus[0][0].run(); assert.deepEqual(h.changes, [{ left: 'A', right: 'B' }]);
+  h.get('rows').handlers.click(selectHistoryEvent('B'));
+  h.menus[0][0].run(); assert.equal(h.changes.length, 1, 'old pair menu cannot compare a different selection');
+  h.get('rows').handlers.contextmenu(selectHistoryEvent('B'));
+  assert.equal(h.menus[1][0].disabled, true);
+  h.get('rows').handlers.click(selectHistoryEvent('A', { ctrlKey: true }));
+  h.get('rows').handlers.contextmenu(selectHistoryEvent('A'));
+  h.history.activate(context, 'other-folder');
+  h.menus[2][0].run(); assert.equal(h.changes.length, 1, 'old folder menu is inert');
+  h.pending[1].resolve(historyPageWith('C', 'D')); await tick();
+  assert.equal(h.get('compare-selected').disabled, true);
+  assert.deepEqual(h.pending.map(p => p.name), ['restore_path_history', 'restore_path_history']);
+});
+
+test('history supports keyboard pairs; pagination preserves selection and refresh prunes missing commits', async () => {
+  const h = historyHarness(); h.history.activate({ repositoryPath: '/repo' }, 'folder');
+  h.pending[0].resolve({ ...historyPageWith('A', 'B'), has_more: true }); await tick();
+  let prevented = 0;
+  for (const [id, key, modifier] of [['A', 'Enter', 'ctrlKey'], ['B', ' ', 'metaKey']]) {
+    h.get('rows').handlers.keydown(selectHistoryEvent(id, { key, [modifier]: true, preventDefault: () => prevented++ }));
+  }
+  assert.equal(prevented, 2); assert.equal(h.get('compare-selected').disabled, false);
+  const more = h.history.load(true); h.pending[1].resolve(historyPageWith('C')); await more;
+  assert.match(h.get('selected-note').textContent, /A → B/);
+  h.get('search').value = 'does not match'; h.get('search').handlers.input();
+  assert.equal(h.get('compare-selected').disabled, false, 'search does not discard selected commits');
+  const refresh = h.history.load(); h.pending[2].resolve(historyPageWith('B', 'C')); await refresh;
+  assert.match(h.get('selected-note').textContent, /B · 1\/2/);
+  assert.equal(h.get('compare-selected').disabled, true);
+  h.get('rows').handlers.click(selectHistoryEvent('not-loaded', { ctrlKey: true }));
+  assert.match(h.get('selected-note').textContent, /B · 1\/2/);
+});
+
+test('right-click a folder opens its history picker directly, without a menu or details query', async () => {
+  const list = element(), opened = [], menus = [], submodules = [];
+  const folder = { kind: 'folder', relative_path: 'folder' }, submodule = { kind: 'submodule', relative_path: 'dep' };
+  const context = { refs: { fileList: list }, state: { repository: { path: '/repo' }, entries: [folder, submodule] },
+    showFloatingMenu: (event, items) => menus.push(items), handleError: assert.fail,
+    openFolderComparisonHistory: async entry => opened.push(entry), selectEntry: id => submodules.push(id),
+    openSubmoduleMenu: entry => submodules.push(entry),
+  };
+  vm.runInNewContext('let fileListDelegationAttached = false;\n' + source('attachFileListDelegation'), context);
+  context.attachFileListDelegation();
+  const event = path => ({ target: { closest: () => ({ dataset: { entry: path } }) }, preventDefault() {}, stopPropagation() {} });
+  list.handlers.contextmenu(event('folder'));
+  assert.equal(menus.length, 0); assert.equal(submodules.length, 0);
+  await tick(); assert.deepEqual(opened, [folder]);
+  list.handlers.contextmenu(event('dep'));
+  assert.deepEqual(submodules, ['dep', submodule]); assert.equal(menus.length, 0);
+});
+
+function pickerHarness(insideSubmodule = false) {
+  const nodes = new Map(), pending = [], comparisons = [];
+  const $ = id => { if (!nodes.has(id)) nodes.set(id, element()); return nodes.get(id); };
+  const dialog = $('#folderHistoryDialog');
+  dialog.open = false;
+  dialog.showModal = () => { dialog.open = true; };
+  dialog.close = () => { dialog.open = false; };
+  dialog.querySelector = id => /data-history-(left|right|options|compare\]|worktree|swap)/.test(id) ? null : $(id);
+  const state = { view: 'explorer', repository: { path: '/repo', name: 'repo', current_branch: 'feature', head_oid: 'head' }, branches: [],
+    compareMode: 'submodule', commanderPath: 'previous', comparisonContext: { previous: true } };
+  const originalContext = state.comparisonContext;
+  const context = { state, $, ComparisonNavigation, status() {},
+    submoduleBoundaryFor: () => insideSubmodule ? 'modules/dep' : null,
+    innerPathForSubmodule: (sub, path) => path.slice(sub.length + 1),
+    openRepositoryRevisionCompare: async (...args) => { comparisons.push(args); state.view = 'commander'; },
+  };
+  vm.createContext(context);
+  vm.runInContext(['openFolderComparisonHistory', 'compareSelectedFolderHistory', 'closeFolderComparisonHistory'].map(source).join('\n'), context);
+  context.folderHistoryPicker = ComparisonNavigation.createHistory({ root: dialog,
+    invoke: (name, args) => new Promise((resolve, reject) => pending.push({ name, args, resolve, reject })),
+    onCompare: selection => context.compareSelectedFolderHistory(selection),
+  });
+  return { context, state, dialog, pending, comparisons, originalContext, get: id => $(`[data-history-${id}]`),
+    open: path => context.openFolderComparisonHistory({ kind: 'folder', relative_path: path }),
+    click: (id, key = 'ctrlKey') => $('[data-history-rows]').handlers.click(selectHistoryEvent(id, { [key]: true })),
+  };
+}
+
+test('folder picker stays in Explorer until a complete pair is explicitly compared, including submodule scope', async () => {
+  for (const inside of [false, true]) {
+    const h = pickerHarness(inside);
+    await h.open(inside ? 'modules/dep/src' : 'src');
+    assert.equal(h.dialog.open, true); assert.equal(h.state.view, 'explorer');
+    assert.equal(h.state.comparisonContext, h.originalContext); assert.equal(h.state.commanderPath, 'previous');
+    assert.equal(h.pending.length, 1);
+    assert.deepEqual(h.pending[0].args, { repositoryPath: inside ? '/repo/modules/dep' : '/repo', relativePath: 'src', headId: null, offset: 0 });
+    h.pending[0].resolve(historyPageWith('A', 'B')); await tick();
+    assert.doesNotMatch(h.get('rows').innerHTML, /Set left|Set right|data-history-pick=/);
+    assert.equal(h.get('compare-selected').disabled, true);
+    h.click('A'); h.get('compare-selected').handlers.click();
+    assert.equal(h.comparisons.length, 0);
+    h.click('B', 'metaKey');
+    assert.equal(h.state.view, 'explorer'); assert.equal(h.comparisons.length, 0);
+    h.get('compare-selected').handlers.click(); await tick();
+    assert.equal(h.comparisons.length, 1); assert.equal(h.dialog.open, false);
+    assert.equal(h.state.view, 'commander'); assert.equal(h.state.folderHistoryPicker, null);
+    assert.deepEqual(h.comparisons[0].slice(0, 4), ['A', 'B', 'src', '']);
+    assert.equal(h.comparisons[0][4].repositoryPath, inside ? '/repo/modules/dep' : '/repo');
+    assert.deepEqual(h.pending.map(p => p.name), ['restore_path_history']);
+  }
+});
+
+test('closing or replacing the folder picker ignores late history and never opens Compare', async () => {
+  const h = pickerHarness(); await h.open('one');
+  h.context.closeFolderComparisonHistory();
+  h.pending[0].resolve(historyPageWith('old-closed')); await tick();
+  assert.equal(h.dialog.open, false); assert.equal(h.state.view, 'explorer');
+  assert.doesNotMatch(h.get('rows').innerHTML, /old-closed/);
+  await h.open('two'); await h.open('three');
+  h.pending[1].reject('old-folder-failure'); await tick();
+  assert.doesNotMatch(h.get('note').textContent, /old-folder-failure/);
+  h.pending[2].resolve(historyPageWith('new')); await tick();
+  assert.match(h.get('rows').innerHTML, /new/); assert.equal(h.comparisons.length, 0);
+});
+
+test('folder picker rejects repository/branch changes and supports explicit paginated history', async () => {
+  for (const field of ['path', 'current_branch', 'head_oid']) {
+    const h = pickerHarness(); await h.open('src');
+    h.pending[0].resolve({ ...historyPageWith('A'), has_more: true }); await tick();
+    h.click('A');
+    h.get('more').handlers.click();
+    assert.equal(h.pending[1].args.headId, 'pinned'); assert.equal(h.pending[1].args.offset, 500);
+    h.pending[1].resolve(historyPageWith('B')); await tick(); h.click('B');
+    h.state.repository[field] = 'changed';
+    h.get('compare-selected').handlers.click(); await tick();
+    assert.equal(h.comparisons.length, 0); assert.equal(h.dialog.open, false);
+    assert.equal(h.state.view, 'explorer');
+  }
 });

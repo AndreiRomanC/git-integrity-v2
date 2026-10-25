@@ -30,7 +30,7 @@ test('directory logging distinguishes cache reuse, frontend bypass and actual Gi
   const entries = [{ name: 'existing' }], calls = [], logs = [];
   const { context: c } = clock({
     state: { repository: { path: '/private-repo' }, view: 'explorer', statusReady: true },
-    directoryCache: new Map([['secret-folder', entries]]), refs: { fileList: {} }, explorerRequestSeq: 1,
+    directoryCache: new Map([['secret-folder', entries]]), refs: { fileList: {} }, explorerRequestSeq: 1, repoOpenGeneration: 1,
     performance, jsPerfLog: line => logs.push(line), render() {}, renderExplorerAfterStatusRefresh() {},
     invoke: async (name, args) => { calls.push({ name, args }); return entries; },
   });
@@ -50,7 +50,7 @@ test('instrumented directory loading still rejects late responses', async () => 
   let resolve;
   const { context: c } = clock({
     state: { repository: { path: '/repo' }, statusReady: true }, directoryCache: new Map(),
-    refs: { fileList: {} }, explorerRequestSeq: 1, performance, jsPerfLog() {},
+    refs: { fileList: {} }, explorerRequestSeq: 1, repoOpenGeneration: 1, performance, jsPerfLog() {},
     invoke: () => new Promise(done => { resolve = done; }), render: () => assert.fail('stale render'),
   });
   vm.runInContext(source('fetchAndRenderDirectory'), c);

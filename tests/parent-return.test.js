@@ -94,6 +94,12 @@ test('repository switching is blocked during a Git write and the guard is releas
     } } } },
   };
   vm.createContext(context); vm.runInContext(source.slice(0, source.indexOf('const $ =')) + '\nglobalThis.call = invoke; globalThis.writes = () => inFlightRepositoryWrites;', context);
+  state.navigationStatusPending = true;
+  await assert.rejects(context.call('stage_files', {}), /status is being verified/);
+  await assert.rejects(context.call('restore_folder', {}), /status is being verified/);
+  const read = context.call('list_directory_fast', {}); calls.at(-1).resolve([]); await read;
+  assert.equal(context.writes(), 0); calls.length = 0;
+  state.navigationStatusPending = false;
   const write = context.call('commit_staged', {}); assert.equal(context.writes(), 1);
   await assert.rejects(context.call('open_repository_fast', {}), /write is still running/);
   calls[0].resolve(); await write; assert.equal(context.writes(), 0);

@@ -42,6 +42,8 @@ pub fn run() {
             repository::tag_details,
             repository::refresh_status,
             repository::navigation::capture_repository_return,
+            repository::navigation::navigation_status,
+            repository::navigation::refresh_navigation_status,
             repository::navigation::resume_repository_return,
             repository::stage_files,
             repository::stage_all,

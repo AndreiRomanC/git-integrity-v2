@@ -5,10 +5,19 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Git DrillDown</title>
   <link rel="icon" type="image/png" href="assets/git-drilldown-mark.png">
-  <link rel="stylesheet" href="styles.css?v=20261022-submodule-details">
-  <link rel="stylesheet" href="polarion.css?v=20261022-submodule-details">
+<link rel="stylesheet" href="styles.css?v=20261024-navigation-refresh">
+  <link rel="stylesheet" href="polarion.css?v=20261024-navigation-refresh">
 </head>
 <body>
+  <div id="startupIntro" class="startup-intro" hidden>
+    <div class="startup-intro-content">
+      <div class="startup-intro-brand"><img src="assets/git-drilldown-mark.png" width="56" height="56" alt=""><div><strong>Git DrillDown</strong><span>GIT WORKSPACE</span></div></div>
+      <div id="startupIntroProgress" class="startup-intro-progress" role="progressbar" aria-label="Starting Git DrillDown" aria-valuetext="Loading interface"><span></span></div>
+      <p id="startupIntroPhase" role="status" aria-live="polite">Loading interface…</p>
+      <div id="startupIntroFailure" class="startup-intro-failure" hidden><p>Reload the window to retry.</p><button type="button" id="startupIntroRetry">Reload interface</button></div>
+    </div>
+  </div>
+  <script src="startup-intro.js?v=20261024-navigation-refresh"></script>
   <div class="app-shell">
     <header class="topbar">
       <div class="brand" aria-label="Git DrillDown">
@@ -114,22 +123,46 @@
 
         <div id="explorerView" class="explorer-view" hidden>
           <nav id="breadcrumbs" class="breadcrumbs" aria-label="Repository path"></nav>
+          <div id="navigationRefreshNotice" class="navigation-refresh-notice" role="status" aria-live="polite" hidden><span></span><button type="button" hidden>Retry</button></div>
           <div class="file-header file-grid"><span>NAME</span><span>GIT</span><span>SIZE</span><span>MODIFIED</span></div>
           <div id="fileList" class="file-list"></div>
         </div>
 
         <div id="commanderView" class="commander-view" hidden>
-          <div class="compare-mode-tabs" role="tablist" aria-label="Compare and Sync mode">
-            <button id="compareModeDrive" class="active" type="button" role="tab">Folder Compare</button>
-            <button id="compareModeGit" type="button" role="tab">Branch Compare</button>
-            <button id="compareModeSubmodule" type="button" role="tab">Submodule Compare</button>
-            <button id="compareModeHistory" type="button" role="tab">Folder History</button>
+          <div class="compare-mode-bar">
+            <div class="compare-mode-tabs" role="tablist" aria-label="Compare and Sync mode">
+              <button id="compareModeDrive" class="active" type="button" role="tab">Folder Compare</button>
+              <button id="compareModeGit" type="button" role="tab" title="Compare branches, tags or any two commits">Git Compare</button>
+              <button id="compareModeSubmodule" type="button" role="tab">Submodule Compare</button>
+              <button id="compareModeHistory" type="button" role="tab">Folder History</button>
+            </div>
+            <details id="compareContextDetails" class="compare-context-details">
+              <summary title="Starting folder, exact snapshot IDs and comparison behavior">Details</summary>
+              <div class="compare-context-body">
+                <div id="compareOrigin" class="compare-origin" aria-live="polite"></div>
+                <div id="compareGitInfo" hidden>
+                  <div id="compareSnapshotSummary" class="compare-snapshot-summary" aria-live="polite"></div>
+                  <p>Remote refs are local snapshots from the last Fetch. Comparing does not contact the server or change your checkout. HEAD is the committed version; Working tree includes local edits.</p>
+                </div>
+              </div>
+            </details>
           </div>
-          <div id="compareOrigin" class="compare-origin" aria-live="polite"></div>
           <div id="gitComparePanel" class="compare-panel" hidden>
-            <div id="branchCompareKind" class="compare-kind-controls">
-              <label>Compare <select id="branchCompareKindSelect"><option value="refs">Two branches / revisions</option><option value="workspace">Working tree ↔ cached remote</option></select></label>
-              <small>Remote refs are local snapshots from the last Fetch. Comparing does not contact the server.</small>
+            <div id="gitRevisionToolbar" class="git-revision-toolbar">
+              <div id="branchCompareKind" class="compare-kind-controls">
+                <label><span>COMPARE</span><select id="branchCompareKindSelect"><option value="refs">Two branches / revisions</option><option value="workspace">Working tree ↔ remote</option></select></label>
+              </div>
+              <div id="gitWorkspaceCompareControls" class="git-compare-controls">
+                <span class="compare-workspace-label">Working tree <small>Files on disk</small></span>
+                <span class="compare-versus" aria-hidden="true">↔</span>
+                <label><span>CACHED REMOTE SNAPSHOT</span><select id="remoteRef"></select></label>
+              </div>
+              <div id="gitBranchCompareControls" class="git-compare-controls branch-ref-compare" hidden>
+                <label><span>LEFT REVISION</span><select id="branchCompareLeftRef"></select></label>
+                <button type="button" id="branchCompareSwap" title="Swap start and compare refs" aria-label="Swap left and right revisions">⇄</button>
+                <label><span>RIGHT REVISION</span><select id="branchCompareRightRef"></select></label>
+                <button type="button" id="branchCompareRefresh" title="Re-run comparison for these refs">Compare</button>
+              </div>
             </div>
             <div id="folderHistoryControls" class="folder-history-controls" hidden>
               <div class="folder-history-selectors">
@@ -144,26 +177,17 @@
               <details class="folder-history-picker">
                 <summary>Choose from commits touching this folder</summary>
                 <div class="folder-history-search"><input data-history-search placeholder="Filter loaded history by message, author or SHA" aria-label="Filter folder history"><button type="button" data-history-refresh>Refresh history</button></div>
+                <div class="folder-history-selection"><small data-history-selected-note role="status">Ctrl/Cmd-click two commits, then Compare selected or right-click.</small><button type="button" data-history-clear-selected hidden>Clear</button><button type="button" data-history-compare-selected disabled>Compare selected</button></div>
                 <div data-history-rows class="folder-history-rows"></div>
                 <div class="folder-history-footer"><small data-history-note aria-live="polite"></small><button type="button" data-history-more hidden>Load older</button></div>
               </details>
             </div>
-            <div class="commander-toolbar">
-              <nav id="commanderBreadcrumbs" class="commander-breadcrumbs"></nav>
-              <button type="button" id="gitCompareDownload" class="snapshot-download" title="Download both complete folder snapshots, not only filtered rows" aria-label="Download both folder snapshots" disabled>⇩</button>
-              <div id="gitWorkspaceCompareControls" class="git-compare-controls">
-                <label><span>REMOTE SNAPSHOT</span><select id="remoteRef"></select></label>
-              </div>
-              <div id="gitBranchCompareControls" class="git-compare-controls branch-ref-compare" hidden>
-                <label><span>LEFT REVISION</span><select id="branchCompareLeftRef"></select></label>
-                <button type="button" id="branchCompareSwap" title="Swap start and compare refs">⇄</button>
-                <label><span>RIGHT REVISION</span><select id="branchCompareRightRef"></select></label>
-                <button type="button" id="branchCompareRefresh" title="Re-run comparison for these refs">Compare</button>
-              </div>
-            </div>
-            <div id="compareSnapshotSummary" class="compare-snapshot-summary" aria-live="polite"></div>
-            <div id="gitCompareFlatControls" class="compare-flat-controls" hidden>
+            <div class="commander-toolbar compare-scope-toolbar">
+              <nav id="commanderBreadcrumbs" class="commander-breadcrumbs" aria-label="Compared folder"></nav>
               <div class="compare-layout-choice" role="group" aria-label="Git comparison layout"><button type="button" id="gitCompareTree" class="active" aria-pressed="true" title="Browse folders side by side; double-click a folder to drill down">Drill-down</button><button type="button" id="gitCompareFlatToggle" aria-pressed="false" title="Show all changed files in a flat list, with optional author filtering">List</button></div>
+              <button type="button" id="gitCompareDownload" class="snapshot-download" title="Download both complete folder snapshots, not only filtered rows" aria-label="Download both folder snapshots" disabled><svg class="ui-icon" viewBox="0 0 20 20" aria-hidden="true" focusable="false"><path d="M10 2v10m-4-4 4 4 4-4M3 13v4h14v-4"/></svg></button>
+            </div>
+            <div id="gitCompareFlatControls" class="compare-flat-controls" hidden>
               <label><span>FILTER</span><select id="gitCompareFlatFilter"><option value="all">All differences</option><option value="modified">Modified</option><option value="local-only">Only left</option><option value="remote-only">Only right</option><option value="type-changed">Type changed</option></select></label>
             </div>
             <div class="commander-head commander-grid"><span id="gitCompareLeftLabel">LOCAL WORKSPACE</span><span>STATE</span><span id="gitCompareRightLabel">REMOTE BRANCH</span></div>
@@ -177,7 +201,7 @@
               <button type="button" id="subCompareSwap" title="Swap left and right revisions">⇄</button>
               <label><span>RIGHT REVISION</span><div class="revision-input-row"><input id="subCompareRightRef" placeholder="branch, tag or SHA…" autocomplete="off" spellcheck="false"><button type="button" id="subComparePickRight" title="Pick or search right revision">⌕</button></div></label>
               <button type="button" id="subCompareRefresh" title="Re-run comparison for these revisions">Compare</button>
-              <button type="button" id="subCompareDownload" class="submodule-export-button" aria-label="Export compared revisions" title="Compare two submodule revisions first" disabled>⇩</button>
+              <button type="button" id="subCompareDownload" class="submodule-export-button" aria-label="Export compared revisions" title="Compare two submodule revisions first" disabled><svg class="ui-icon" viewBox="0 0 20 20" aria-hidden="true" focusable="false"><path d="M10 2v10m-4-4 4 4 4-4M3 13v4h14v-4"/></svg></button>
               <datalist id="subCompareSubmoduleOptions"></datalist>
             </div>
             <div class="submodule-compare-exact" id="subCompareExact">Choose a submodule and two revisions.</div>
@@ -233,7 +257,7 @@
         <button id="toggleDetailsPanel" class="details-toggle" title="Collapse panel" data-tooltip="Collapse details panel">›</button>
         <aside id="detailsPanel" class="details-panel">
           <div class="details-empty">
-            <div class="details-node"></div>
+            <svg class="ui-icon details-empty-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M14 3H5v18h14V8l-5-5Zm0 0v5h5M8 12h8M8 16h5"/></svg>
             <strong>Select an item</strong>
             <span>Select a file or folder to inspect its Git details.</span>
           </div>
@@ -417,18 +441,24 @@
       </div>
       <div id="recoveryHelp" class="recovery-help">Choose an action to see exactly what it changes. This only affects this one file — no repository-wide reset is performed here.</div>
       <strong id="compareActionStatus" role="status" class="compare-status-line">Ready — choose one action for this file.</strong>
-      <div class="compare-diff-nav" aria-label="Difference navigation">
+      <div class="compare-diff-nav comparison-tools" aria-label="Difference navigation">
         <span id="compareDiffStatus">No differences loaded yet.</span>
-        <label class="compare-find" title="Find text in either loaded version">
-          <span class="sr-only">Find in comparison</span>
-          <input id="compareSearch" type="search" placeholder="Find in file…" autocomplete="off" spellcheck="false">
-          <output id="compareSearchStatus" aria-live="polite"></output>
-        </label>
-        <button type="button" id="previousCompareSearch" class="compare-find-step" title="Previous text match (Shift+Enter)" aria-label="Previous text match" disabled>↑</button>
-        <button type="button" id="nextCompareSearch" class="compare-find-step" title="Next text match (Enter)" aria-label="Next text match" disabled>↓</button>
-        <button type="button" id="compareDownload" class="snapshot-download" title="Download both loaded text versions into left and right folders" aria-label="Download both file versions" disabled>⇩</button>
-        <button type="button" id="previousCompareDifference" disabled>↑ Previous block</button>
-        <button type="button" id="nextCompareDifference" disabled>↓ Next block</button>
+        <div class="compare-tool-group" role="group" aria-label="Find text">
+          <label class="compare-find" title="Find text in either loaded version">
+            <span class="sr-only">Find in comparison</span>
+            <input id="compareSearch" type="search" placeholder="Find in file…" autocomplete="off" spellcheck="false">
+            <output id="compareSearchStatus" aria-live="polite"></output>
+          </label>
+          <button type="button" id="previousCompareSearch" class="compare-find-step" title="Previous text match (Shift+Enter)" aria-label="Previous text match" disabled><svg class="ui-icon" viewBox="0 0 20 20" aria-hidden="true" focusable="false"><path d="m5 12 5-5 5 5"/></svg></button>
+          <button type="button" id="nextCompareSearch" class="compare-find-step" title="Next text match (Enter)" aria-label="Next text match" disabled><svg class="ui-icon" viewBox="0 0 20 20" aria-hidden="true" focusable="false"><path d="m5 8 5 5 5-5"/></svg></button>
+        </div>
+        <div class="compare-tool-group" role="group" aria-label="Changed blocks">
+          <button type="button" id="previousCompareDifference" title="Go to the previous changed block" disabled><svg class="ui-icon" viewBox="0 0 20 20" aria-hidden="true" focusable="false"><path d="M10 16V4m-5 5 5-5 5 5"/></svg>Previous block</button>
+          <button type="button" id="nextCompareDifference" title="Go to the next changed block" disabled><svg class="ui-icon" viewBox="0 0 20 20" aria-hidden="true" focusable="false"><path d="M10 4v12m-5-5 5 5 5-5"/></svg>Next block</button>
+        </div>
+        <div class="compare-tool-group" role="group" aria-label="Export comparison">
+          <button type="button" id="compareDownload" class="snapshot-download" title="Download both loaded text versions into left and right folders" aria-label="Download both file versions" disabled><svg class="ui-icon" viewBox="0 0 20 20" aria-hidden="true" focusable="false"><path d="M10 2v10m-4-4 4 4 4-4M3 13v4h14v-4"/></svg></button>
+        </div>
       </div>
       <div class="compare-head"><span>LOCAL</span><span>REMOTE</span></div>
       <div class="compare-content"><pre id="localCompare"></pre><pre id="remoteCompare"></pre></div>
@@ -473,17 +503,23 @@
           <button type="button" id="showLocalDriveDiff" class="active" role="tab">Aligned differences</button>
           <button type="button" id="editLocalDriveDiff" role="tab">Aligned editor</button>
         </div>
-        <div class="local-drive-difference-tools">
-          <label class="local-drive-compare-find" title="Find text in either side">
-            <span class="sr-only">Find in comparison</span>
-            <input id="localDriveCompareSearch" type="search" placeholder="Find in files…" autocomplete="off" spellcheck="false">
-            <output id="localDriveCompareSearchStatus" aria-live="polite"></output>
-          </label>
-          <button type="button" id="previousLocalDriveSearch" title="Previous text match (Shift+Enter)" aria-label="Previous text match" disabled>↑</button>
-          <button type="button" id="nextLocalDriveSearch" title="Next text match (Enter)" aria-label="Next text match" disabled>↓</button>
-          <button type="button" id="downloadLocalDriveComparison" class="snapshot-download" title="Download both displayed texts, including unsaved prepared edits, without saving to the originals" aria-label="Download both displayed file versions" disabled>⇩</button>
-          <button type="button" id="previousLocalDriveDifference" title="Go to the previous changed block">↑ Previous block</button>
-          <button type="button" id="nextLocalDriveDifference" title="Go to the next changed block">↓ Next block</button>
+        <div class="local-drive-difference-tools comparison-tools">
+          <div class="compare-tool-group" role="group" aria-label="Find text">
+            <label class="local-drive-compare-find" title="Find text in either side">
+              <span class="sr-only">Find in comparison</span>
+              <input id="localDriveCompareSearch" type="search" placeholder="Find in files…" autocomplete="off" spellcheck="false">
+              <output id="localDriveCompareSearchStatus" aria-live="polite"></output>
+            </label>
+            <button type="button" id="previousLocalDriveSearch" class="compare-find-step" title="Previous text match (Shift+Enter)" aria-label="Previous text match" disabled><svg class="ui-icon" viewBox="0 0 20 20" aria-hidden="true" focusable="false"><path d="m5 12 5-5 5 5"/></svg></button>
+            <button type="button" id="nextLocalDriveSearch" class="compare-find-step" title="Next text match (Enter)" aria-label="Next text match" disabled><svg class="ui-icon" viewBox="0 0 20 20" aria-hidden="true" focusable="false"><path d="m5 8 5 5 5-5"/></svg></button>
+          </div>
+          <div class="compare-tool-group" role="group" aria-label="Changed blocks">
+            <button type="button" id="previousLocalDriveDifference" title="Go to the previous changed block"><svg class="ui-icon" viewBox="0 0 20 20" aria-hidden="true" focusable="false"><path d="M10 16V4m-5 5 5-5 5 5"/></svg>Previous block</button>
+            <button type="button" id="nextLocalDriveDifference" title="Go to the next changed block"><svg class="ui-icon" viewBox="0 0 20 20" aria-hidden="true" focusable="false"><path d="M10 4v12m-5-5 5 5 5-5"/></svg>Next block</button>
+          </div>
+          <div class="compare-tool-group" role="group" aria-label="Export comparison">
+            <button type="button" id="downloadLocalDriveComparison" class="snapshot-download" title="Download both displayed texts, including unsaved prepared edits, without saving to the originals" aria-label="Download both displayed file versions" disabled><svg class="ui-icon" viewBox="0 0 20 20" aria-hidden="true" focusable="false"><path d="M10 2v10m-4-4 4 4 4-4M3 13v4h14v-4"/></svg></button>
+          </div>
           <label title="Changes ignored by this rule remain visible but are not treated as merge blocks">Rules
             <select id="localDriveComparisonRules" aria-label="Text comparison rules">
               <option value="exact">Exact text</option>
@@ -528,7 +564,7 @@
         <button type="button" id="closeLocalFolderMerge" aria-label="Close">×</button>
       </header>
       <div class="local-folder-modebar">
-        <button type="button" id="downloadLocalFolderComparison" class="snapshot-download" title="Download both complete folders as they are on disk now; Git metadata excluded, display filters do not limit export" aria-label="Download both folders" disabled>⇩</button>
+        <button type="button" id="downloadLocalFolderComparison" class="snapshot-download" title="Download both complete folders as they are on disk now; Git metadata excluded, display filters do not limit export" aria-label="Download both folders" disabled><svg class="ui-icon" viewBox="0 0 20 20" aria-hidden="true" focusable="false"><path d="M10 2v10m-4-4 4 4 4-4M3 13v4h14v-4"/></svg></button>
         <div class="local-folder-modes" role="tablist" aria-label="Folder operation mode">
           <button type="button" id="localFolderCompareMode" class="active" role="tab">Compare only</button>
           <button type="button" id="localFolderGuidedMode" role="tab">Guided merge</button>
@@ -567,9 +603,20 @@
       </footer>
     </div>
   </dialog>
+  <dialog id="folderHistoryDialog" class="folder-history-dialog" aria-labelledby="folderHistoryDialogTitle" aria-describedby="folderHistoryDialogScope">
+    <header><div><h2 id="folderHistoryDialogTitle">Folder history</h2><p id="folderHistoryDialogPath"></p></div><button type="button" data-history-close aria-label="Close folder history">×</button></header>
+    <div class="folder-history-controls">
+      <p id="folderHistoryDialogScope"></p>
+      <div class="folder-history-search"><input data-history-search placeholder="Filter by message, author or SHA" aria-label="Filter folder history" autofocus><button type="button" data-history-refresh>Refresh</button></div>
+      <div data-history-rows class="folder-history-rows"></div>
+      <div class="folder-history-footer"><small data-history-note aria-live="polite"></small><button type="button" data-history-more hidden>Load older</button></div>
+    </div>
+    <footer class="folder-history-selection"><small data-history-selected-note role="status">Ctrl/Cmd-click two commits, then Compare selected.</small><button type="button" data-history-clear-selected hidden>Clear</button><button type="button" data-history-close>Cancel</button><button type="button" data-history-compare-selected disabled>Compare selected</button></footer>
+  </dialog>
+
   <dialog id="folderRestoreDialog" class="folder-restore-dialog">
     <form method="dialog">
-      <header><div><h2 data-restore-title>Restore folder</h2><p id="folderRestoreSubtitle">Make only this folder match a selected revision.</p></div><button value="cancel">×</button></header>
+      <header><div><h2 data-restore-title>Restore folder</h2><p id="folderRestoreSubtitle">Make only this folder match a selected revision.</p></div><button value="cancel" aria-label="Close restore">×</button></header>
       <div class="folder-restore-body">
         <div class="folder-restore-target"><span data-restore-kind>FOLDER</span><strong id="folderRestorePath">—</strong></div>
         <div class="folder-restore-options">
@@ -578,7 +625,7 @@
         </div>
         <div id="folderRestoreCommitPicker" class="folder-restore-commit-picker" hidden>
           <div class="folder-restore-commit-head"><strong data-restore-history-title>COMMITS TOUCHING THIS FOLDER</strong><button type="button" id="refreshFolderRestoreCommits">Refresh</button></div>
-          <div class="folder-restore-compare-bar"><span data-restore-compare-status role="status">Compare: set a start below, then compare another commit.</span><button type="button" data-restore-compare-clear hidden>Clear start</button><small>Opens Compare &amp; Sync at this path. Read-only; nothing is restored.</small></div>
+          <div class="folder-restore-compare-bar"><span data-restore-compare-status role="status">Compare: set a start below, or Ctrl/Cmd-click two commits.</span><button type="button" data-restore-compare-selected disabled>Compare selected</button><button type="button" data-restore-compare-clear hidden>Clear selection</button><small>Opens Compare &amp; Sync at this path. Read-only; nothing is restored.</small></div>
           <p data-restore-history-help hidden>History follows this exact file path, not earlier names. A commit must contain this path to restore it.</p>
           <div id="folderRestoreCommitList" class="folder-restore-commit-list"></div>
           <div class="folder-restore-history-footer"><span id="folderRestoreHistoryStatus" role="status"></span><button type="button" id="loadOlderFolderRestoreCommits" hidden>Load older</button></div>
@@ -589,7 +636,7 @@
         <label class="folder-restore-clean"><input type="checkbox" id="folderRestoreUnstage"><span><b>Leave restored changes unstaged</b><small>Restore the selected content, then reset only this selection’s staging to HEAD. Other staged paths stay untouched. Not available during an unfinished merge/rebase.</small></span></label>
         <p id="folderRestoreStatus" class="submodule-operation-status" role="status"></p>
       </div>
-      <footer><span>This does not move HEAD, switch branch, commit or push.</span><button value="cancel">Cancel</button><button type="button" id="previewFolderRestore">Preview</button><button type="button" id="confirmFolderRestore" class="danger-action-soft" disabled>Restore folder</button></footer>
+      <footer><span>This does not move HEAD, switch branch, commit or push.</span><button value="cancel" class="restore-cancel">Cancel</button><button type="button" id="previewFolderRestore" class="restore-preview">Preview</button><button type="button" id="confirmFolderRestore" class="danger-action-soft" disabled>Restore folder</button></footer>
     </form>
   </dialog>
   <dialog id="publishDialog" class="publish-dialog">
@@ -909,20 +956,21 @@
       <footer><span>Read-only on Polarion · local snapshots outside Git</span><button value="cancel">Close</button><button type="button" id="polarionAdd" class="confirm" disabled>Add to Commit List</button></footer>
     </form>
   </dialog>
-  <script src="polarion.js?v=20261022-submodule-details"></script>
-  <script src="console-context.js?v=20261022-submodule-details"></script>
-  <script src="graph-model.js?v=20261022-submodule-details"></script>
-  <script src="submodule-state.js?v=20261022-submodule-details"></script>
-  <script src="submodule-versions.js?v=20261022-submodule-details"></script>
-  <script src="local-diff.js?v=20261022-submodule-details"></script>
-  <script src="local-drive.js?v=20261022-submodule-details"></script>
-  <script src="pr-status.js?v=20261022-submodule-details"></script>
-  <script src="refresh-coordinator.js?v=20261022-submodule-details"></script>
-  <script src="comparison-authors.js?v=20261022-submodule-details"></script>
-  <script src="git-activity.js?v=20261022-submodule-details"></script>
-  <script src="comparison-navigation.js?v=20261022-submodule-details"></script>
-  <script src="panel-resize.js?v=20261022-submodule-details"></script>
-  <script src="submodule-compare-details.js?v=20261022-submodule-details"></script>
-  <script src="app.js?v=20261022-submodule-details"></script>
+  <script src="polarion.js?v=20261024-navigation-refresh"></script>
+  <script src="console-context.js?v=20261024-navigation-refresh"></script>
+  <script src="graph-model.js?v=20261024-navigation-refresh"></script>
+  <script src="submodule-state.js?v=20261024-navigation-refresh"></script>
+  <script src="submodule-versions.js?v=20261024-navigation-refresh"></script>
+  <script src="local-diff.js?v=20261024-navigation-refresh"></script>
+  <script src="local-drive.js?v=20261024-navigation-refresh"></script>
+  <script src="pr-status.js?v=20261024-navigation-refresh"></script>
+  <script src="refresh-coordinator.js?v=20261024-navigation-refresh"></script>
+  <script src="comparison-authors.js?v=20261024-navigation-refresh"></script>
+  <script src="git-activity.js?v=20261024-navigation-refresh"></script>
+  <script src="comparison-navigation.js?v=20261024-navigation-refresh"></script>
+  <script src="panel-resize.js?v=20261024-navigation-refresh"></script>
+  <script src="submodule-compare-details.js?v=20261024-navigation-refresh"></script>
+  <script src="navigation-refresh.js?v=20261024-navigation-refresh"></script>
+  <script src="app.js?v=20261024-navigation-refresh"></script>
 </body>
 </html>

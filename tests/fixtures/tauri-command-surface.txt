@@ -6,6 +6,8 @@ branch_creation_context
 branch_story_creation
 build_info
 capture_repository_return
+navigation_status
+refresh_navigation_status
 change_submodule_url
 checkout_commit
 combine_local_commits

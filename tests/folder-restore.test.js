@@ -21,7 +21,7 @@ function harness() {
     };
   } });
   const state = { repository: { path: 'repo' }, changes: [], entries: [], currentPath: '' };
-  const context = { state, refs, esc: String, commitSubjectHtml: String, status() {},
+  const context = { state, refs, ComparisonNavigation: require('../frontend/comparison-navigation.js'), esc: String, commitSubjectHtml: String, status() {},
     submoduleBoundaryFor: () => null, directoryCache: new Map(), performance, jsPerfLog() {},
     refreshStatusAndFolder: async () => {}, showOperationToast() {},
     beginButtonOperation: () => () => {}, handleError(error) { throw error; },
@@ -73,6 +73,47 @@ test('restore history comparison selects two exact commits without changing rest
   assert.equal(h.refs.folderRestoreDialog.open, false);
   assert.equal(h.state.folderRestore, null);
   assert.equal(h.calls.length, 0, 'no restore, stage, checkout or additional history request');
+});
+
+test('Ctrl/Cmd restore history selection leaves restore source and preview unchanged', async () => {
+  for (const modifier of ['ctrlKey', 'metaKey']) {
+    const h = harness(), model = h.state.folderRestore;
+    model.commits = [{ id: 'A' }, { id: 'B' }, { id: 'C' }];
+    model.selectedCommit = 'C'; model.preview = preview('C');
+    const originalPreview = model.preview, originalRequest = model.previewRequest;
+    const click = id => h.refs.folderRestoreCommitList.listeners.click({ [modifier]: true,
+      target: { closest: selector => selector === '[data-folder-restore-commit]' ? { dataset: { folderRestoreCommit: id } } : null } });
+    click('A'); click('B');
+    assert.equal(model.compareStart.id, 'A'); assert.equal(model.compareEnd.id, 'B');
+    assert.equal(model.selectedCommit, 'C'); assert.equal(model.preview, originalPreview);
+    assert.equal(model.previewRequest, originalRequest); assert.equal(h.calls.length, 0);
+    assert.equal(h.refs.folderRestoreCommitPicker.querySelector('[data-restore-compare-selected]').disabled, false);
+    click('B'); assert.equal(model.compareEnd, undefined);
+    assert.equal(h.refs.folderRestoreCommitPicker.querySelector('[data-restore-compare-selected]').disabled, true);
+    click('B');
+    let compared;
+    h.context.openRepositoryRevisionCompare = async (...args) => { compared = args; };
+    h.refs.folderRestoreCommitPicker.querySelector('[data-restore-compare-selected]').listeners.click();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(compared, ['A', 'B', 'folder', '']);
+    assert.equal(h.calls.length, 0); assert.equal(h.state.folderRestore, null);
+  }
+});
+
+test('restore keyboard comparison selection is guarded and clears independently', () => {
+  const h = harness(), model = h.state.folderRestore;
+  model.commits = [{ id: 'A' }, { id: 'B' }]; model.selectedCommit = 'B';
+  let prevented = 0;
+  for (const [id, key, modifier] of [['A', 'Enter', 'ctrlKey'], ['B', ' ', 'metaKey']]) {
+    h.refs.folderRestoreCommitList.listeners.keydown({ key, [modifier]: true, preventDefault: () => prevented++, target: { closest: () => ({ dataset: { folderRestoreCommit: id } }) } });
+  }
+  assert.equal(prevented, 2); assert.equal(model.compareEnd.id, 'B'); assert.equal(model.selectedCommit, 'B');
+  h.context.toggleFolderRestoreCompareCommit('unknown'); assert.equal(model.compareStart.id, 'A');
+  h.state.repository.path = 'other'; h.context.toggleFolderRestoreCompareCommit('A');
+  assert.equal(model.compareStart.id, 'A');
+  h.refs.folderRestoreCommitPicker.querySelector('[data-restore-compare-clear]').listeners.click();
+  assert.equal(model.compareStart, null); assert.equal(model.compareEnd, null); assert.equal(model.selectedCommit, 'B');
+  assert.equal(h.calls.length, 0);
 });
 
 test('file restore comparison opens the existing comparison at its folder and focuses the file', async () => {

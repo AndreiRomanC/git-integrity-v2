@@ -1,3 +1,5 @@
+window.GitDrillDownStartup?.preparing();
+
 // Every command that mutates the repository (index, HEAD, branches, stashes,
 // submodules, remotes, files on disk...) is refused centrally, right here,
 // while state.statusReady is false — right after opening a repository,
@@ -63,6 +65,9 @@ const invoke = rawInvoke && ((command, args) => {
   }
   if (REPO_SWITCH_COMMANDS.has(command) && inFlightRepositoryWrites) {
     return Promise.reject('A Git write is still running. Wait for it to finish before switching repositories.');
+  }
+  if (MUTATING_COMMANDS.has(command) && state.navigationStatusPending) {
+    return Promise.reject('Git status is being verified or its refresh failed. You can keep browsing; wait for verification or use Retry before changing the repository.');
   }
   if (MUTATING_COMMANDS.has(command) && !state.statusReady) {
     const message = 'Still loading status — please wait a moment.';
@@ -796,7 +801,7 @@ function handleError(error) {
 function clearDetails(message) {
   refs.details.displayedEntry = null;
   refs.details.closest?.('.main-layout')?.classList.add('details-empty-state');
-  refs.details.innerHTML = `<div class="details-empty"><div class="details-node"></div><strong>${esc(message)}</strong><span>Select an item in this view to see only relevant details and actions.</span></div>`;
+  refs.details.innerHTML = `<div class="details-empty"><svg class="ui-icon details-empty-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M14 3H5v18h14V8l-5-5Zm0 0v5h5M8 12h8M8 16h5"/></svg><strong>${esc(message)}</strong><span>Select an item in this view to see only relevant details and actions.</span></div>`;
 }
 
 // window.confirm() / window.prompt() are unreliable inside Tauri's WKWebView (macOS) —
@@ -1016,7 +1021,7 @@ function renderSubmoduleRefResults() {
         <span class="submodule-ref-title"><strong>${esc(ref.name || revisionDisplay(ref.revision))}</strong><small>${esc(subject)}</small></span>
         <span class="submodule-ref-meta"><code>${esc(revisionDisplay(ref.revision))}</code>${ref.date ? `<small>${esc(ref.date)}</small>` : ''}</span>
       </button>
-      <button type="button" class="submodule-ref-action" data-submodule-ref-download="${index}" title="Download this exact revision to a local folder"><span>⇩</span><b>Export</b></button>
+      <button type="button" class="submodule-ref-action" data-submodule-ref-download="${index}" title="Download this exact revision to a local folder"><svg class="ui-icon" viewBox="0 0 20 20" aria-hidden="true" focusable="false"><path d="M10 2v10m-4-4 4 4 4-4M3 13v4h14v-4"/></svg><b>Export</b></button>
       <button type="button" class="submodule-ref-action" data-submodule-ref-compare="${index}" title="Compare this revision with the repository default branch, or with another selected revision"><span>⇄</span><b>Compare</b></button>
     </div>`;
   }).join('') || '<div class="version-loading">No refs found. Type a branch, tag or SHA and press Find.</div>';
@@ -1468,7 +1473,7 @@ async function completeRepositoryOpenStatus(path, generation) {
     // full-scan cache, and load_directory's own status lookup opportunistically
     // reuses a fresh full scan instead of running its own scoped one when
     // one's already sitting there (see worktree_status's own doc comment).
-    await openDirectory(state.currentPath, { force: true });
+    if (state.view === 'explorer') await openDirectory(state.currentPath, { force: true, keepVisible: true, preserveSelection: true, explorerOnly: true });
     render();
     status(`${state.commits.length} commits loaded`);
   } catch (error) { handleError(error); }
@@ -1658,9 +1663,17 @@ function renderCommitScope() {
   refs.commitScope.title = scopeChangeCount ? '' : 'Nothing to commit here — no uncommitted local changes in this scope';
 }
 
+function viewSearchCopy(view, compareMode) {
+  if (view === 'explorer') return { placeholder: 'Filter this folder', description: 'Filter files and folders in the current folder' };
+  if (view === 'commander') return { placeholder: 'Filter files…', description: compareMode === 'local-drive' ? 'Filter both local folders' : 'Filter the current comparison by file or folder name' };
+  return { placeholder: 'Find commit…', description: 'Find commit or author · Enter: next match · Shift+Enter: previous match' };
+}
+
 function render() {
+  syncNavigationRefreshNotice();
   const loaded = Boolean(state.repository);
   document.body.classList.toggle('commander-mode', ['commander','remotes'].includes(state.view));
+  document.body.classList.toggle('comparison-view', state.view === 'commander');
   if (loaded && !state.remoteRef) state.remoteRef = state.branches.find(branch => branch.remote)?.name || '';
   refs.emptyState.hidden = loaded; refs.explorerView.hidden = !loaded || state.view !== 'explorer'; refs.commanderView.hidden = !loaded || state.view !== 'commander'; refs.graphView.hidden = !loaded || state.view !== 'graph'; refs.remotesView.hidden = !loaded || state.view !== 'remotes';
   refs.repoName.textContent = loaded ? state.repository.name : 'Open a repository';
@@ -1673,8 +1686,11 @@ function render() {
   // of Message C's point 1 is that a user must never be unsure which of
   // these three they're looking at.
   refs.viewTitle.textContent = state.view === 'explorer' ? 'Project Explorer' : state.view === 'commander' ? 'Compare & Sync' : state.view === 'remotes' ? 'Remotes' : state.submoduleGraph ? `Submodule History · ${state.submoduleGraph.relativePath}` : state.historyKind === 'submodule-refs' ? `Submodule Reference Changes · ${state.historyScope}` : state.historyScope ? `History · ${state.historyScope}` : 'Repository History';
-  refs.graphSubtitle.textContent = !loaded ? 'Navigate folders and inspect every item in your repository.' : state.view === 'explorer' ? `${state.entries.length} items in ${state.currentPath || state.repository.name}` : state.view === 'commander' ? (state.compareMode === 'local-drive' ? 'Two independent local folders. Copy safely without overwriting; delete through Trash/Recycle Bin.' : state.compareMode === 'history' ? 'Compare this folder’s local files or historical snapshots. No checkout or restore.' : state.compareMode === 'submodule' ? 'Compare two exact revisions of the same submodule without checking anything out.' : state.gitCompareMode === 'refs' ? 'Compare two repository branches or refs without checking anything out.' : 'Compare the workspace with a cached remote snapshot—no second checkout.') : state.view === 'remotes' ? 'Configured server locations and explicit fetch controls.' : state.historyKind === 'submodule-refs' ? `Parent-repository commits that changed this submodule's recorded version — not ${state.historyScope}'s own history` : state.historyScope ? `Commits touching ${state.historyScope}` : state.submoduleGraph ? 'Commits, branches and release tags for this submodule' : 'Commits, branches and release tags';
-  refs.search.placeholder = state.view === 'explorer' ? 'Filter this folder' : state.view === 'commander' ? (state.compareMode === 'local-drive' ? 'Filter both local folders' : state.compareMode === 'submodule' ? 'Filter changed folders/files' : 'Filter comparison') : 'Find commit or author · Enter: next';
+  refs.graphSubtitle.textContent = !loaded ? 'Navigate folders and inspect every item in your repository.' : state.view === 'explorer' ? `${state.entries.length} items in ${state.currentPath || state.repository.name}` : state.view === 'commander' ? (state.compareMode === 'local-drive' ? 'Two independent local folders. Copy safely without overwriting; delete through Trash/Recycle Bin.' : state.compareMode === 'history' ? 'Compare this folder’s local files or historical snapshots. No checkout or restore.' : state.compareMode === 'submodule' ? 'Compare two exact revisions of the same submodule without checking anything out.' : state.gitCompareMode === 'refs' ? 'Compare branches, tags or commits without checking anything out.' : 'Compare the workspace with a cached remote snapshot—no second checkout.') : state.view === 'remotes' ? 'Configured server locations and explicit fetch controls.' : state.historyKind === 'submodule-refs' ? `Parent-repository commits that changed this submodule's recorded version — not ${state.historyScope}'s own history` : state.historyScope ? `Commits touching ${state.historyScope}` : state.submoduleGraph ? 'Commits, branches and release tags for this submodule' : 'Commits, branches and release tags';
+  const searchCopy = viewSearchCopy(state.view, state.compareMode);
+  refs.search.placeholder = searchCopy.placeholder;
+  refs.search.title = searchCopy.description;
+  refs.search.setAttribute('aria-label', searchCopy.description);
   refs.search.closest('label').hidden = state.view === 'remotes';
   const localDriveMode = state.view === 'commander' && state.compareMode === 'local-drive';
   if (!localDriveMode) localDriveWorkspace?.deactivate();
@@ -1697,7 +1713,7 @@ function render() {
   $('#navExplorer').classList.toggle('active', state.view === 'explorer'); $('#navGraph').classList.toggle('active', state.view === 'graph');
   $('#navCommander').classList.toggle('active', state.view === 'commander');
   $('#navRemotes').classList.toggle('active', state.view === 'remotes');
-  refs.locationRepository.textContent = state.submoduleGraph?.name || state.repository?.name || '—'; refs.locationBranch.textContent = describeBranch(state.submoduleGraph ? state.submoduleGraph.repository : state.repository); refs.locationPath.textContent = state.view === 'commander' ? (state.compareMode === 'local-drive' ? 'Folder Compare' : state.compareMode === 'history' ? `Folder history /${state.commanderPath}` : state.compareMode === 'submodule' ? `Submodule compare /${state.commanderPath}` : state.gitCompareMode === 'refs' ? `Branch compare /${state.commanderPath}` : `/${state.commanderPath}`) : state.view === 'explorer' ? `/${state.currentPath}` : state.view === 'graph' ? 'commit history' : 'remote configuration';
+  refs.locationRepository.textContent = state.submoduleGraph?.name || state.repository?.name || '—'; refs.locationBranch.textContent = describeBranch(state.submoduleGraph ? state.submoduleGraph.repository : state.repository); refs.locationPath.textContent = state.view === 'commander' ? (state.compareMode === 'local-drive' ? 'Folder Compare' : state.compareMode === 'history' ? `Folder history /${state.commanderPath}` : state.compareMode === 'submodule' ? `Submodule compare /${state.commanderPath}` : state.gitCompareMode === 'refs' ? `Git compare /${state.commanderPath}` : `/${state.commanderPath}`) : state.view === 'explorer' ? `/${state.currentPath}` : state.view === 'graph' ? 'commit history' : 'remote configuration';
   const activeOrigin = loaded && state.repositoryOrigin?.repositoryPath === state.repository?.path ? state.repositoryOrigin : null;
   refs.parentRepositoryButton.hidden = !activeOrigin;
   if (activeOrigin) {
@@ -1764,6 +1780,7 @@ function commanderComparisonSpec() {
 }
 function renderComparisonLocation() {
   const context = state.comparisonContext;
+  $('#compareGitInfo').hidden = !['git', 'history'].includes(state.compareMode);
   const node = $('#compareOrigin');
   if (!node) return;
   if (state.compareMode === 'submodule' && state.submoduleCompare?.externalFullName) {
@@ -1981,6 +1998,7 @@ function renderCommander() {
   $('#compareModeHistory').setAttribute('aria-selected', String(historyMode));
   $('#folderHistoryControls').hidden = !historyMode || !state.comparisonContext?.ready;
   $('#branchCompareKind').hidden = historyMode;
+  $('#gitRevisionToolbar').hidden = historyMode;
   $('#branchCompareKindSelect').value = state.gitCompareMode;
   refs.compareModeDrive.classList.toggle('active', localDrive);
   refs.compareModeDrive.setAttribute('aria-selected', String(localDrive));
@@ -2003,7 +2021,7 @@ function renderCommander() {
   const branchCompareMode = !spec.workspace;
   refs.gitWorkspaceCompareControls.hidden = historyMode || branchCompareMode;
   refs.gitBranchCompareControls.hidden = historyMode || !branchCompareMode;
-  if (refs.gitCompareFlatControls) refs.gitCompareFlatControls.hidden = false;
+  if (refs.gitCompareFlatControls) refs.gitCompareFlatControls.hidden = !state.compareFlatMode;
   if (refs.gitCompareFlatToggle) {
     refs.gitCompareFlatToggle.classList.toggle('active', state.compareFlatMode);
     refs.gitCompareFlatToggle.setAttribute('aria-pressed', String(state.compareFlatMode));
@@ -2918,6 +2936,7 @@ function untrackedItemLabel(entry) {
 }
 
 function entryKindHint(entry) {
+  if (entry.status_known === false) return entry.kind === 'submodule' ? 'Independent Git repository · status not checked' : entry.kind;
   if (entry.kind === 'submodule') return submoduleHeadHint(entry);
   if (entry.kind === 'deleted-submodule') return 'Deleted Git submodule';
   if (entry.kind === 'deleted-folder') return 'Deleted tracked folder';
@@ -3052,6 +3071,7 @@ let lastExplorerClick = { path: null, time: 0 };
 const EXPLORER_DOUBLE_CLICK_MS = 800;
 function renderExplorer() {
   if (!state.repository) return;
+  syncNavigationRefreshNotice();
   renderBreadcrumbs();
   const query = refs.search.value.trim().toLowerCase();
   const samePlace = explorerRenderState.path === state.currentPath && explorerRenderState.query === query;
@@ -3111,9 +3131,13 @@ function renderExplorer() {
 // those can change here. Keep the Explorer's one relevant header count and
 // listing live, without touching unrelated views.
 function renderExplorerAfterStatusRefresh() {
+  if (refs.graphSubtitle) refs.graphSubtitle.textContent = `${state.entries.length} items in ${state.currentPath || state.repository.name}`;
+  if (refs.locationPath) refs.locationPath.textContent = `/${state.currentPath}${state.repositoryOrigin?.parentName ? ` · submodule of ${state.repositoryOrigin.parentName}` : ''}`;
+  if (refs.goUp) refs.goUp.disabled = !state.currentPath;
   const folderChangeCount = state.changes.filter(change => !state.currentPath || change.path === state.currentPath || change.path.startsWith(`${state.currentPath}/`)).length;
   $('#showFolderChanges').textContent = `Folder changes · ${folderChangeCount}`;
   renderExplorer();
+  renderCommitScope();
 }
 
 let fileListDelegationAttached = false;
@@ -3160,6 +3184,11 @@ function attachFileListDelegation() {
     const row = event.target.closest('[data-entry]');
     if (!row) return;
     const entry = state.entries.find(item => item.relative_path === row.dataset.entry);
+    if (entry?.kind === 'folder') {
+      event.preventDefault(); event.stopPropagation();
+      openFolderComparisonHistory(entry).catch(handleError);
+      return;
+    }
     if (entry?.kind !== 'submodule') return;
     event.preventDefault(); selectEntry(entry.relative_path); openSubmoduleMenu(entry, event.clientX, event.clientY);
   });
@@ -3283,31 +3312,114 @@ function currentSubmoduleCompareContext() {
   return { entry: submoduleEntryForPath(submodulePath), innerPath: innerPathForSubmodule(submodulePath, openPath) };
 }
 
-// The actual load_directory round-trip + render. Keep this as one coherent
-// backend read even inside a submodule: a previous fast-paint/background-scan
-// experiment caused flicker and unreliable-feeling navigation on Windows.
+const navigationRefresh = window.GitDrillDownNavigationRefresh.create({
+  invoke: (command, args) => invoke(command, args),
+  current: target => state.repository?.path === target.owner && repoOpenGeneration === target.generation &&
+    state.repository.head_oid === target.rootHead && state.repository.current_branch === target.rootBranch,
+  changed: syncNavigationRefreshNotice,
+  refreshed: (target, changes) => {
+    // Only expire listings belonging to the scanned repository. Keep the
+    // currently displayed frame until its replacement is ready.
+    for (const path of directoryCache.keys()) {
+      if (!target.submodulePath || path === target.submodulePath || path.startsWith(`${target.submodulePath}/`)) directoryCache.delete(path);
+    }
+    if (!target.submodulePath) {
+      state.changes = changes;
+      updateChangeBadge();
+      if (refs.changesDrawer.classList.contains('open')) renderChanges();
+    }
+  },
+  log: (phase, target, elapsedMs) => jsPerfLog(`navigation_refresh: phase=${phase} repository=${anonymizeForLog(target.repositoryPath)} nonblocking=true`, elapsedMs),
+});
+
+function syncNavigationRefreshNotice() {
+  const jobs = navigationRefresh.states();
+  state.navigationStatusPending = jobs.length > 0;
+  const notice = $('#navigationRefreshNotice');
+  if (!notice) return;
+  const error = jobs.find(job => job.phase === 'error');
+  const updating = jobs.some(job => job.phase === 'refreshing');
+  notice.hidden = !error && !updating;
+  notice.classList.toggle('refresh-failed', !!error);
+  notice.querySelector('span').textContent = error
+    ? `Git status not verified (${anonymizeForLog(error.target.repositoryPath)}). Previous data remain visible. ${error.error}`
+    : 'Updating Git status… You can keep browsing. Displayed status may be out of date.';
+  notice.querySelector('button').hidden = !error;
+}
+
+function ensureNavigationStatus(path, { entry = false } = {}) {
+  if (!invoke || !state.statusReady) return Promise.resolve({ refreshed: false });
+  const owner = state.repository.path;
+  let submodulePath = submoduleBoundaryFor(path) || '';
+  if (entry && normalizeRepositoryRelativePath(path) === submodulePath) submodulePath = '';
+  return navigationRefresh.ensure({
+    owner, generation: repoOpenGeneration, submodulePath,
+    rootHead: state.repository.head_oid, rootBranch: state.repository.current_branch,
+    repositoryPath: submodulePath ? `${owner.replace(/[\\/]+$/, '')}/${submodulePath}` : owner,
+    expectedHead: !submodulePath && state.repository.head_oid
+      ? { head_oid: state.repository.head_oid, branch: state.repository.current_branch || '' } : null,
+  });
+}
+
+$('#navigationRefreshNotice button').addEventListener('click', () => {
+  navigationRefresh.retry();
+  openDirectory(state.currentPath, { preserveSelection: true });
+});
+
+async function loadNavigableDirectory(path, requestId, options) {
+  const repositoryPath = state.repository.path, generation = repoOpenGeneration;
+  const current = () => requestId === explorerRequestSeq && state.repository?.path === repositoryPath &&
+    generation === repoOpenGeneration && state.view === 'explorer';
+  const existing = directoryCache.get(path);
+  if (existing) {
+    state.entries = existing;
+    renderExplorerAfterStatusRefresh();
+  }
+  // Attach both success/failure handlers immediately: a slow filesystem list
+  // must not turn a quick failed verification into an unhandled rejection.
+  const verification = ensureNavigationStatus(path).then(result => ({ result }), error => ({ error }));
+  if (!existing && !(options.preserveSelection && state.entries.length)) await paintDirectoryFast(path, requestId);
+  const { result, error } = await verification;
+  if (!current()) return;
+  if (error) return; // Keep the navigable snapshot and the explicit Retry notice.
+  if (result?.obsolete) return;
+  if (!result?.refreshed && !options.force && directoryCache.has(path)) return;
+  await fetchAndRenderDirectory(path, requestId, { ...options, force: true, keepVisible: true, explorerOnly: true });
+}
+
+// Preserve the old frame while a read runs. Repaint only the current folder,
+// with its current selection/scroll, never the whole repository shell.
 async function fetchAndRenderDirectory(path, requestId, options) {
+  const repositoryPath = state.repository?.path, generation = repoOpenGeneration;
   jsPerfLog(`navigation_ui: action=folder request=${requestId} source=${!options.force && directoryCache.has(path) ? 'directory_cache' : 'backend'} force=${!!options.force} invalidate_git=${!!options.invalidateGit} status_ready=${!!state.statusReady} ${navigationTraceFields()}`, 0);
   if (!options.force && directoryCache.has(path)) {
     state.entries = directoryCache.get(path);
     if (options.explorerOnly && state.view === 'explorer') renderExplorerAfterStatusRefresh(); else render();
     return;
   }
-  refs.fileList.innerHTML = '<div class="loading-row"><i class="spinner"></i>Loading folder…</div>';
+  if (!options.keepVisible) refs.fileList.innerHTML = '<div class="loading-row"><i class="spinner"></i>Loading folder…</div>';
   if (!invoke) { state.entries = previewData.entries; directoryCache.set(path, state.entries); render(); return; }
   try {
     const invokeStarted = performance.now();
     const entries = await invoke('load_directory', { repositoryPath: state.repository.path, relativePath: path, force: !!options.invalidateGit });
     jsPerfLog(`openDirectory invoke(load_directory) (${path || '/'})`, performance.now() - invokeStarted);
     if (requestId !== explorerRequestSeq) return;
+    if (state.repository?.path !== repositoryPath || generation !== repoOpenGeneration || (options.keepVisible && state.view !== 'explorer')) return;
     directoryCache.set(path, entries);
     const renderStarted = performance.now();
+    const selection = options.keepVisible ? state.selectedEntry?.relative_path : null;
+    const scroll = refs.fileList.parentElement?.scrollTop;
     state.entries = entries;
+    if (selection) state.selectedEntry = entries.find(entry => entry.relative_path === selection) || null;
     if (options.explorerOnly && state.view === 'explorer') renderExplorerAfterStatusRefresh(); else render();
+    if (options.keepVisible && refs.fileList.parentElement) refs.fileList.parentElement.scrollTop = scroll;
+    if (selection && state.selectedEntry) selectEntry(selection, { navigationVerified: true });
+    else if (selection) clearDetails('The selected item is no longer in this folder.');
     jsPerfLog(`openDirectory ${options.explorerOnly ? 'explorer-only render' : 'render()'} (${path || '/'}, ${entries.length} entries)`, performance.now() - renderStarted);
   } catch (error) {
-    if (requestId !== explorerRequestSeq) return;
-    status(String(error), 'error'); refs.fileList.innerHTML = `<div class="empty-change">${esc(String(error))}</div>`;
+    if (requestId !== explorerRequestSeq || state.repository?.path !== repositoryPath || generation !== repoOpenGeneration) return;
+    status(String(error), 'error');
+    if (!options.keepVisible) refs.fileList.innerHTML = `<div class="empty-change">${esc(String(error))}</div>`;
   }
 }
 
@@ -3328,9 +3440,16 @@ async function fetchAndRenderDirectory(path, requestId, options) {
 async function openDirectory(path, options = {}) {
   if (!state.repository) return;
   const changedContext = state.currentPath !== path;
-  state.currentPath = path; state.selectedEntry = null;
-  if (changedContext) resetFooterForContextChange();
+  state.currentPath = path;
+  if (changedContext || !options.preserveSelection) state.selectedEntry = null;
+  if (changedContext) { resetFooterForContextChange(); clearDetails('Select a file or folder'); }
   const requestId = ++explorerRequestSeq;
+
+  if (state.statusReady && !options.force && !options.invalidateGit) {
+    const boundary = submoduleBoundaryFor(path);
+    state.activeSubmodule = boundary ? { path: boundary, statusReady: true } : null;
+    return loadNavigableDirectory(path, requestId, options);
+  }
 
   // During fast repository open, the expensive full status scan is already
   // running in the background. Do not let quick navigation into `work/` (or
@@ -3343,6 +3462,7 @@ async function openDirectory(path, options = {}) {
   if (!state.statusReady && !options.force && !options.invalidateGit) {
     const boundary = submoduleBoundaryFor(path);
     state.activeSubmodule = boundary ? { path: boundary, statusReady: false } : null;
+    if (directoryCache.has(path)) { state.entries = directoryCache.get(path); renderExplorerAfterStatusRefresh(); return; }
     return paintDirectoryFast(path, requestId);
   }
 
@@ -3359,14 +3479,19 @@ async function openDirectory(path, options = {}) {
 // serve this incomplete data back as if it were a real, status-complete
 // listing.
 async function paintDirectoryFast(path, requestId) {
-  refs.fileList.innerHTML = '<div class="loading-row"><i class="spinner"></i>Loading folder…</div>';
+  const repositoryPath = state.repository?.path, generation = repoOpenGeneration;
+  // Do not leave the previous folder's rows active under a new breadcrumb.
+  state.entries = [];
+  if (!state.statusReady) render(); else renderExplorerAfterStatusRefresh();
   if (!invoke) { state.entries = previewData.entries; render(); return; }
   try {
     const entries = await invoke('list_directory_fast', { repositoryPath: state.repository.path, relativePath: path });
-    if (requestId !== explorerRequestSeq) return;
-    state.entries = entries; render();
+    if (requestId !== explorerRequestSeq || state.repository?.path !== repositoryPath || generation !== repoOpenGeneration || state.view !== 'explorer') return;
+    state.entries = entries.map(entry => (state.submodule_paths || []).includes(entry.relative_path)
+      ? { ...entry, kind: 'submodule', submodule_checked: false, submodule_initialized: undefined } : entry);
+    if (!state.statusReady) render(); else renderExplorerAfterStatusRefresh();
   } catch (error) {
-    if (requestId !== explorerRequestSeq) return;
+    if (requestId !== explorerRequestSeq || state.repository?.path !== repositoryPath || generation !== repoOpenGeneration || state.view !== 'explorer') return;
     status(String(error), 'error'); refs.fileList.innerHTML = `<div class="empty-change">${esc(String(error))}</div>`;
   }
 }
@@ -3647,6 +3772,9 @@ let entryDetailsTraceSequence = 0;
 const selectEntryGuard = createRequestGuard();
 
 async function selectEntry(path, options = {}) {
+  const previousDetails = refs.details?.displayedRepositoryPath === state.repository?.path &&
+    refs.details?.displayedEntry?.relative_path === path ? refs.details.displayedEntry : null;
+  if (refs.details) refs.details.displayedRepositoryPath = state.repository?.path;
   state.selectedEntry = state.entries.find(entry => entry.relative_path === path);
   const selected = state.selectedEntry;
   const selectionTrace = ++entryDetailsTraceSequence, selectionStarted = performance.now();
@@ -3673,7 +3801,10 @@ async function selectEntry(path, options = {}) {
   if (['deleted', 'deleted-folder', 'deleted-submodule'].includes(state.selectedEntry?.kind)) {
     const deletedEntry = { ...state.selectedEntry, item_count: null, last_commit_id: undefined };
     renderEntryDetails(deletedEntry);
-    if (invoke) invoke('entry_last_commit', { repositoryPath, relativePath: path })
+    if (invoke) (options.navigationVerified ? Promise.resolve() : ensureNavigationStatus(path, { entry: true })).then(() => {
+      if (!stillCurrent()) return null;
+      return invoke('entry_last_commit', { repositoryPath, relativePath: path });
+    })
       .then(last => {
         if (!stillCurrent()) return;
         const section = $('#entryLastCommitSection'); if (!section) return;
@@ -3686,11 +3817,20 @@ async function selectEntry(path, options = {}) {
   if (!invoke) return renderEntryDetails({ ...state.selectedEntry, item_count: state.selectedEntry.kind === 'folder' ? 12 : null, submodule_url: state.selectedEntry.kind === 'submodule' ? 'git@example.com:platform/diagnostics-core.git' : null, submodule_branch: state.selectedEntry.kind === 'submodule' ? 'main' : null, last_commit_id: 'a39f21d', last_commit_subject: 'P:423421431 test', last_commit_author: 'Andrei Pop', last_commit_date: '2026-08-14' });
   // Stage 1 is the listing we already have: no extra IPC, scan or cache.
   // Missing fields are explicitly pending, never inferred as clean/detached.
-  renderEntryDetails({ ...selected, details_loading: true, last_commit_id: undefined });
+  renderEntryDetails(previousDetails && !previousDetails.details_loading ? previousDetails : { ...selected, details_loading: true, last_commit_id: undefined });
   traceSelection('basic_dom_ready');
   const fetchDetails = async () => {
     if (!stillCurrent()) return;
     try {
+      if (!options.navigationVerified) {
+        const verification = await ensureNavigationStatus(path, { entry: true });
+        if (!stillCurrent() || verification?.obsolete) return;
+        if (verification?.refreshed) {
+          await fetchAndRenderDirectory(state.currentPath, explorerRequestSeq, { force: true, keepVisible: true, explorerOnly: true });
+          return; // The repaint continues the still-selected entry with fresh data.
+        }
+      }
+      if (state.statusReady === false) return; // Initial open already owns the scan.
       traceSelection('request_started');
       const result = await invoke('entry_details', { repositoryPath, relativePath: path });
       if (!stillCurrent()) { traceSelection('details_discarded'); return; }
@@ -3719,7 +3859,7 @@ async function selectEntry(path, options = {}) {
         });
     } catch (error) {
       if (!stillCurrent()) { traceSelection('error_discarded'); return; }
-      renderEntryDetails({ ...selected, details_loading: true, details_error: true, last_commit_error: true });
+      renderEntryDetails(previousDetails && !previousDetails.details_loading ? previousDetails : { ...selected, details_loading: true, details_error: true, last_commit_error: true });
       handleError(error);
       traceSelection('details_failed');
     }
@@ -3895,6 +4035,18 @@ function contextActionSectionHtml(label, actionsHtml, extraClass = '') {
   return `<div class="context-action-section ${esc(extraClass)}">${label ? `<div class="context-action-section-title">${esc(label)}</div>` : ''}<div class="context-actions">${actions}</div></div>`;
 }
 
+// Presentation only: reuse the selected entry's verified details, with no
+// additional history lookup. The complete commit metadata remains below.
+function submoduleVersionSummaryHtml(entry) {
+  if (entry.kind !== 'submodule') return '';
+  const pending = entry.details_loading;
+  const revision = pending ? (entry.details_error ? 'Unavailable' : 'Checking…')
+    : entry.submodule_commit_id ? `<a href="#" class="commit-server-link" data-commit-id="${esc(entry.submodule_commit_id)}" data-submodule-path="${esc(entry.relative_path)}" title="${esc(entry.submodule_commit_id)} · Open on the submodule's server">${esc(entry.submodule_commit_id.slice(0, 8))} ↗</a>`
+    : entry.submodule_initialized === false ? 'Not initialized' : 'No commit';
+  const subject = !pending && entry.submodule_commit_subject || '';
+  return `<section class="submodule-version-summary" aria-label="Checked-out submodule version"><div class="submodule-version-summary-head"><span>Checked-out commit</span><strong>${revision}</strong></div>${subject ? `<div class="submodule-version-summary-message" title="${esc(subject)}">${commitSubjectHtml(subject)}</div>` : ''}<div class="submodule-version-summary-state">${esc(entryGitSummary(entry))}</div></section>`;
+}
+
 function renderEntryDetails(entry) {
   refs.details.displayedEntry = entry;
   refs.details.closest?.('.main-layout')?.classList.remove('details-empty-state');
@@ -3927,7 +4079,7 @@ function renderEntryDetails(entry) {
     ? '<button data-detail-action="subinit" data-tooltip="Clone/check out this submodule at the commit recorded by the parent project. Equivalent to git submodule update --init for this path.">Initialize submodule</button>'
     : '';
   const editAction = deletedEntry || entry.kind !== 'file' ? '' : '<button data-detail-action="edit">Edit local file</button>';
-  const navigationActions = `${entry.kind === 'submodule' ? '' : '<button data-detail-action="server">Open on server ↗</button>'}${entry.kind === 'submodule' ? '' : '<button data-detail-action="history">View history</button>'}${['folder','submodule'].includes(entry.kind) ? '<button data-detail-action="utrud" data-tooltip="Launches UTRUD with this folder path. UTRUD decides whether the selected folder is valid. Windows only.">▶ Run UTRUD</button>' : ''}`;
+  const navigationActions = `${entry.kind === 'submodule' ? '' : '<button data-detail-action="server">Open on server ↗</button>'}${entry.kind === 'submodule' ? '' : '<button data-detail-action="history">View history</button>'}${entry.kind === 'folder' ? '<button data-detail-action="folderhistory" data-tooltip="Commits touching this folder; select two snapshots for a read-only comparison">History &amp; compare…</button>' : ''}${['folder','submodule'].includes(entry.kind) ? '<button data-detail-action="utrud" data-tooltip="Launches UTRUD with this folder path. UTRUD decides whether the selected folder is valid. Windows only.">▶ Run UTRUD</button>' : ''}`;
   const folderActions = entry.kind === 'folder'
     ? '<button data-detail-action="restorefolder" class="danger-action-soft" data-tooltip="Restore only this folder from HEAD or a selected commit. Does not move HEAD or switch branch.">↶ Restore folder…</button><button data-detail-action="stashwork" data-tooltip="Stash uncommitted changes in the current repository. This is repository-scoped, not only this folder. If there is nothing local to save, Git Drill Down will refuse and explain why.">Stash repository changes</button>'
     : '';
@@ -3947,9 +4099,10 @@ function renderEntryDetails(entry) {
   const detailActions = entry.kind === 'submodule'
     ? `${contextActionSectionHtml('Open / inspect', submoduleOpenActions, 'open-section')}${contextActionSectionHtml('History / version', submoduleHistoryActions)}${contextActionSectionHtml('Local work', submoduleWorkActions)}${contextActionSectionHtml('Remote sync', submoduleSyncActions)}${contextActionSectionHtml('Recovery / danger', submoduleDangerActions, 'danger-section')}`
     : `${contextActionSectionHtml('', `${editAction}${navigationActions}${folderActions}${fileRestoreAction}${commitAction}${deletedRestoreAction}${fileGitActions}${deleteAction}`)}`;
-  refs.details.innerHTML = `<div class="entry-details"><div class="entry-preview ${esc(entry.kind)}">${entry.kind === 'submodule' ? '◇' : entry.kind === 'folder' ? '▰' : '▤'}</div>
-    <h2>${esc(entry.name)}</h2><div class="entry-path">${esc(entry.relative_path)}</div>${entry.kind === 'submodule' ? `<div class="submodule-badges"><span class="submodule-badge">◇ Git submodule</span>${submoduleCheckoutBadgeHtml(entry)}</div>` : ''}
+  refs.details.innerHTML = `<div class="entry-details ${entry.kind === 'submodule' ? 'submodule-details' : ''}"><div class="entry-heading"><div class="entry-preview ${esc(entry.kind)}">${entry.kind === 'submodule' ? '◇' : entry.kind === 'folder' ? '▰' : '▤'}</div>
+    <h2>${esc(entry.name)}</h2><div class="entry-path">${esc(entry.relative_path)}</div></div>${entry.kind === 'submodule' ? `<div class="submodule-badges"><span class="submodule-badge">◇ Git submodule</span>${submoduleCheckoutBadgeHtml(entry)}</div>` : ''}
     ${pending ? `<div class="entry-details-loading ${entry.details_error ? 'failed' : ''}" role="status">${entry.details_error ? 'Details could not be verified. Select this item again to retry.' : '<i class="spinner"></i> Checking current Git details…'}<small>${entry.details_error ? 'Actions remain unavailable.' : 'Basic information is from the folder listing. Actions become available after verification.'}</small></div>` : ''}
+    ${submoduleVersionSummaryHtml(entry)}
     ${changeBanner}
     ${detailActions}
     <div class="detail-section"><h3>GENERAL</h3><div class="detail-grid"><span>Type</span><strong>${kindLabel}</strong><span>Git</span><strong>${esc(entryGitSummary(entry))}</strong>
@@ -4011,9 +4164,10 @@ function renderFolderRestoreCommits() {
   if (!model) return;
   const start = model.compareStart;
   const comparisonStatus = refs.folderRestoreCommitPicker.querySelector('[data-restore-compare-status]');
-  comparisonStatus.textContent = start ? `Compare start: ${start.id.slice(0, 8)}` : 'Compare: set a start below, then compare another commit.';
+  comparisonStatus.textContent = model.compareEnd && start ? `${start.id.slice(0, 8)} → ${model.compareEnd.id.slice(0, 8)} · 2 selected for comparison` : start ? `Compare start: ${start.id.slice(0, 8)} · Ctrl/Cmd-click a second commit` : 'Compare: set a start below, or Ctrl/Cmd-click two commits.';
   comparisonStatus.title = start ? `${start.id} · ${start.subject || 'No message'}` : 'Read-only comparison. No restore is performed.';
   refs.folderRestoreCommitPicker.querySelector('[data-restore-compare-clear]').hidden = !start;
+  refs.folderRestoreCommitPicker.querySelector('[data-restore-compare-selected]').disabled = !start || !model.compareEnd;
   refs.refreshFolderRestoreCommits.disabled = model.loadingCommits;
   refs.loadOlderFolderRestoreCommits.hidden = !model.historyHasMore;
   refs.loadOlderFolderRestoreCommits.disabled = model.loadingCommits;
@@ -4032,7 +4186,8 @@ function renderFolderRestoreCommits() {
   refs.folderRestoreCommitList.innerHTML = model.commits.map(commit => {
     const selected = commit.id === model.selectedCommit;
     const isStart = start?.id === commit.id;
-    return `<div class="folder-restore-commit-row ${isStart ? 'compare-start' : ''}"><button type="button" class="folder-restore-commit ${selected ? 'selected' : ''}" data-folder-restore-commit="${esc(commit.id)}" aria-pressed="${selected}" title="Select this snapshot for restore"><span class="folder-restore-commit-marker" aria-hidden="true">${selected ? '●' : '○'}</span><span class="folder-restore-commit-content"><strong>${esc(commit.subject || 'No message')}</strong><span class="folder-restore-commit-meta"><code title="${esc(commit.id)}">${esc(commit.id.slice(0, 8))}</code><span>${esc(commit.author || 'Unknown')}</span><time>${esc(commit.date || '—')}</time></span></span></button><div class="folder-restore-compare-actions" aria-label="Read-only comparison"><button type="button" class="snapshot-download" data-restore-download="${esc(commit.id)}" title="Download this ${model.isFile ? 'file' : 'folder'} snapshot; no restore" aria-label="Download snapshot"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 2v10m-4-4 4 4 4-4M3 13v4h14v-4"/></svg></button><button type="button" data-restore-compare-start="${esc(commit.id)}" aria-pressed="${isStart}" title="Set ${esc(commit.id.slice(0, 8))} as comparison start; does not change the restore selection">${isStart ? '✓ Start' : 'Set start'}</button>${start && !isStart ? `<button type="button" data-restore-compare-with="${esc(commit.id)}" title="Open Compare & Sync: ${esc(start.id.slice(0, 8))} → ${esc(commit.id.slice(0, 8))}. Nothing will be restored.">Compare</button>` : ''}</div></div>`;
+    const isEnd = model.compareEnd?.id === commit.id;
+    return `<div class="folder-restore-commit-row ${isStart || isEnd ? 'compare-start' : ''}"><button type="button" class="folder-restore-commit ${selected ? 'selected' : ''}" data-folder-restore-commit="${esc(commit.id)}" aria-pressed="${selected}" title="Click to select this snapshot for restore · Ctrl/Cmd-click to select for comparison only"><span class="folder-restore-commit-marker" aria-hidden="true">${selected ? '●' : '○'}</span><span class="folder-restore-commit-content"><strong>${esc(commit.subject || 'No message')}</strong><span class="folder-restore-commit-meta">${isStart || isEnd ? `<b class="history-compare-side">${isStart ? 'LEFT' : 'RIGHT'}</b>` : ''}<code title="${esc(commit.id)}">${esc(commit.id.slice(0, 8))}</code><span>${esc(commit.author || 'Unknown')}</span><time>${esc(commit.date || '—')}</time></span></span></button><div class="folder-restore-compare-actions" aria-label="Read-only comparison"><button type="button" class="snapshot-download" data-restore-download="${esc(commit.id)}" title="Download this ${model.isFile ? 'file' : 'folder'} snapshot; no restore" aria-label="Download snapshot"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 2v10m-4-4 4 4 4-4M3 13v4h14v-4"/></svg></button><button type="button" data-restore-compare-start="${esc(commit.id)}" aria-pressed="${isStart}" title="Set ${esc(commit.id.slice(0, 8))} as comparison start; does not change the restore selection">${isStart ? '✓ Start' : 'Set start'}</button>${start && !isStart ? `<button type="button" data-restore-compare-with="${esc(commit.id)}" title="Open Compare & Sync: ${esc(start.id.slice(0, 8))} → ${esc(commit.id.slice(0, 8))}. Nothing will be restored.">Compare</button>` : ''}</div></div>`;
   }).join('');
 }
 
@@ -4042,7 +4197,17 @@ function setFolderRestoreCompareStart(commitId) {
   const commit = model.commits.find(item => item.id === commitId);
   if (!commit) return;
   model.compareStart = { id: commit.id, subject: commit.subject };
+  model.compareEnd = null;
   renderFolderRestoreCommits();
+}
+
+function toggleFolderRestoreCompareCommit(commitId) {
+  const model = state.folderRestore;
+  if (!model || model.repositoryPath !== state.repository?.path || !model.commits.some(c => c.id === commitId)) return;
+  const pair = ComparisonNavigation.selectCommitPair([model.compareStart?.id, model.compareEnd?.id].filter(Boolean), commitId, true);
+  [model.compareStart, model.compareEnd] = pair.map(id => model.commits.find(c => c.id === id) || (model.compareStart?.id === id ? model.compareStart : model.compareEnd));
+  renderFolderRestoreCommits();
+  refs.folderRestoreCommitList.querySelector(`[data-folder-restore-commit="${commitId}"]`)?.focus?.();
 }
 
 async function compareFolderRestoreWithStart(commitId) {
@@ -4124,7 +4289,7 @@ function openFolderRestoreDialog(entry) {
   const isFile = ['file', 'deleted'].includes(entry.kind) && entry.tracked && !submoduleBoundaryFor(entry.relative_path);
   if (entry.kind !== 'folder' && !isFile) return;
   invalidateFolderRestorePreview();
-  state.folderRestore = { repositoryPath: state.repository.path, entry, isFile, commits: [], selectedCommit: '', compareStart: null, loadingCommits: false, preview: null };
+  state.folderRestore = { repositoryPath: state.repository.path, entry, isFile, commits: [], selectedCommit: '', compareStart: null, compareEnd: null, loadingCommits: false, preview: null };
   const kind = isFile ? 'file' : 'folder';
   refs.folderRestoreDialog.querySelector('[data-restore-title]').textContent = `Restore ${kind}`;
   refs.folderRestoreDialog.querySelector('[data-restore-kind]').textContent = kind.toUpperCase();
@@ -4337,6 +4502,7 @@ async function handleDetailAction(action, entry, button) {
   // this branch stays only as a defensive fallback in case something else
   // still dispatches 'history' for a submodule.
   if (action === 'history') return entry.kind === 'submodule' ? openSubmoduleGraph(entry) : showSelectedHistory();
+  if (action === 'folderhistory') return openFolderComparisonHistory(entry);
   if (action === 'commit') return openScopeCommit();
   if (action === 'restorefolder') return openFolderRestoreDialog(entry);
   if (action === 'versions') return await openSubmoduleMenu(entry, innerWidth - 480, 110);
@@ -6588,7 +6754,7 @@ function buildCommitRowHtml(commit, index, ctx) {
   const incomingHistory = ctx.story?.mergeParents.get(commit.id)?.map(parent => {
     const names = parent.refs.map(ref => ref.name).join(', ');
     const label = names ? `Current refs: ${names}` : 'Historical Path';
-    return `<span class="story-merge-source"><span title="${esc(names || 'No current branch ref is loaded at this incoming commit; its original branch name is not established')}">Incoming · ${esc(label)}</span><button type="button" data-story-parent="${esc(parent.id)}" title="${esc(parent.id)}">${esc(parent.id.slice(0, 8))} · ${parent.loaded ? 'Show commit' : 'Load history'}</button>${parent.loaded ? '' : '<small>Not loaded yet</small>'}</span>`;
+    return `<span class="story-merge-source"><span title="${esc(names || 'No current branch ref is loaded at this incoming commit; its original branch name is not established')}">Incoming · ${esc(label)}</span><button type="button" data-story-parent="${esc(parent.id)}" title="${esc(parent.id)}"><code>${esc(parent.id.slice(0, 8))}</code><span>${parent.loaded ? 'Show commit' : 'Load history'}</span><svg class="ui-icon" viewBox="0 0 20 20" aria-hidden="true" focusable="false"><path d="M4 10h12m-5-5 5 5-5 5"/></svg></button>${parent.loaded ? '' : '<small>Not loaded yet</small>'}</span>`;
   }).join('') || '';
   const headLocationPill = node.isHead
     ? `<b class="head-location-pill" data-tooltip="This is the commit currently checked out in ${esc(ctx.repositoryName || 'this repository')}">YOU ARE HERE · HEAD</b>`
@@ -8807,8 +8973,48 @@ function syncLocalDriveToCommanderPath() {
 }
 const folderHistoryComparison = ComparisonNavigation.createHistory({
   root: $('#folderHistoryControls'), invoke,
+  onContextMenu: showFloatingMenu,
   onChange: () => { if (state.view === 'commander' && state.compareMode === 'history') openCommanderDirectory(state.commanderPath); },
 });
+const folderHistoryPicker = ComparisonNavigation.createHistory({
+  root: $('#folderHistoryDialog'), invoke,
+  onCompare: selection => compareSelectedFolderHistory(selection).catch(handleError),
+});
+function closeFolderComparisonHistory() {
+  state.folderHistoryPicker = null;
+  folderHistoryPicker.deactivate();
+  $('#folderHistoryDialog').close();
+}
+async function compareSelectedFolderHistory({ context, path, left, right }) {
+  const picker = state.folderHistoryPicker;
+  if (!picker || !$('#folderHistoryDialog').open || picker.context !== context || !left || !right || left === right) return;
+  if (state.repository?.path !== context.owner || state.repository.current_branch !== picker.branch || state.repository.head_oid !== picker.headOid) {
+    status('Repository or branch changed. Reopen the folder history before comparing.', 'error');
+    closeFolderComparisonHistory(); return;
+  }
+  closeFolderComparisonHistory();
+  // Keep the existing comparison workflow and its exact folder/submodule scope.
+  // No comparison request has been made while browsing this dialog.
+  await openRepositoryRevisionCompare(left, right, path, '', context);
+}
+$('#folderHistoryDialog').querySelectorAll('[data-history-close]').forEach(button => button.addEventListener('click', closeFolderComparisonHistory));
+$('#folderHistoryDialog').addEventListener('cancel', closeFolderComparisonHistory);
+$('#folderHistoryDialog').addEventListener('close', () => {
+  if (!$('#folderHistoryDialog').open) { state.folderHistoryPicker = null; folderHistoryPicker.deactivate(); }
+});
+async function openFolderComparisonHistory(entry) {
+  if (!state.repository || entry?.kind !== 'folder') return;
+  const submodulePath = submoduleBoundaryFor(entry.relative_path) || '';
+  const path = submodulePath ? innerPathForSubmodule(submodulePath, entry.relative_path) : entry.relative_path;
+  const context = ComparisonNavigation.origin(state.repository, path, submodulePath);
+  if (!submodulePath) context.branches = state.branches || [];
+  state.folderHistoryPicker = { context, branch: state.repository.current_branch, headOid: state.repository.head_oid };
+  $('#folderHistoryDialogPath').textContent = `${context.name} / ${path || '(root)'}`;
+  $('#folderHistoryDialogScope').textContent = `Commits touching this folder in ${submodulePath ? 'the submodule’s current checkout' : state.repository.current_branch || 'the current detached checkout'}, including merged history. Select two snapshots before opening Compare & Sync.`;
+  folderHistoryPicker.activate(context, path);
+  if (!$('#folderHistoryDialog').open) $('#folderHistoryDialog').showModal();
+}
+
 async function switchComparisonMode(mode) {
   if (!state.repository || (mode === state.compareMode && !state.commanderComparisonError)) return;
   if (state.compareMode === 'submodule' && state.submoduleCompare?.externalOwner) {
@@ -9318,13 +9524,23 @@ refs.folderRestoreCommitList.addEventListener('click', event => {
   if (compare) { compareFolderRestoreWithStart(compare.dataset.restoreCompareWith).catch(error => handleError(error)); return; }
   const button = event.target.closest('[data-folder-restore-commit]');
   if (!button || !state.folderRestore) return;
+  if (event.ctrlKey || event.metaKey) { toggleFolderRestoreCompareCommit(button.dataset.folderRestoreCommit); return; }
   state.folderRestore.selectedCommit = button.dataset.folderRestoreCommit;
   invalidateFolderRestorePreview();
   renderFolderRestoreCommits();
   renderFolderRestorePreview(null);
 });
 refs.folderRestoreCommitPicker.querySelector('[data-restore-compare-clear]').addEventListener('click', () => {
-  if (state.folderRestore) { state.folderRestore.compareStart = null; renderFolderRestoreCommits(); }
+  if (state.folderRestore) { state.folderRestore.compareStart = null; state.folderRestore.compareEnd = null; renderFolderRestoreCommits(); }
+});
+refs.folderRestoreCommitPicker.querySelector('[data-restore-compare-selected]').addEventListener('click', () => {
+  const end = state.folderRestore?.compareEnd?.id;
+  if (end) compareFolderRestoreWithStart(end).catch(handleError);
+});
+refs.folderRestoreCommitList.addEventListener('keydown', event => {
+  const button = event.target.closest('[data-folder-restore-commit]');
+  if (!button || !(event.ctrlKey || event.metaKey) || !['Enter', ' '].includes(event.key)) return;
+  event.preventDefault(); toggleFolderRestoreCompareCommit(button.dataset.folderRestoreCommit);
 });
 refs.previewFolderRestore.addEventListener('click', () => previewFolderRestore().catch(error => handleError(error)));
 refs.confirmFolderRestore.addEventListener('click', () => confirmFolderRestore().catch(error => handleError(error)));
@@ -10484,4 +10700,7 @@ if (!invoke) {
 }
 renderRecentRepos();
 render();
+// Mark the shell ready now. Its non-blocking visual exit never delays build
+// info, repository opening, status scans, network requests or user actions.
+window.GitDrillDownStartup?.ready();
 if (invoke) invoke('build_info').then(sha => { $('#buildInfo').textContent = `build ${sha}`; }).catch(() => {});

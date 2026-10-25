@@ -31,7 +31,7 @@ function harness() {
   const start = app.indexOf('let pendingEntryDetailsTimeout = null;');
   vm.runInContext(app.slice(start, app.indexOf('\nfunction selectedScope()', start)), sandbox);
   return { sandbox, state, calls, renders, errors, histories, logs, timers, section,
-    select: name => sandbox.selectEntry(`modules/${name}`),
+    select: name => sandbox.selectEntry(`modules/${name}`, { navigationVerified: true }),
     details: (index, name) => calls[index].pending.resolve({ ...state.entries.find(e => e.name === name), status_known: true, last_commit_id: null, submodule_current_branch: 'feature' }) };
 }
 test('selection updates only Explorer and the selected commit scope, without rebuilding the shell', async () => {
@@ -98,7 +98,7 @@ test('errors for obsolete selections stay silent; current errors remain explicit
   assert.deepEqual(h.errors, ['current error']); assert.equal(h.calls.length, 2);
 });
 test('deferred selection shows basics immediately but does not query an abandoned folder', async () => {
-  const h = harness(); await h.sandbox.selectEntry('modules/a', { deferMs: 250 });
+  const h = harness(); await h.sandbox.selectEntry('modules/a', { deferMs: 250, navigationVerified: true });
   assert.equal(h.renders[0].details_loading, true); assert.equal(h.calls.length, 0);
   h.state.currentPath = 'modules/a'; const run = [...h.timers.values()][0]; run();
   assert.equal(h.calls.length, 0);
@@ -124,7 +124,7 @@ function renderHarness() {
     submoduleBoundaryFor: () => null, renderPersonalNoteSection: () => '', commitSubjectHtml: value => value,
     specDetailRows: () => '', tagListHtml: () => '', untrackedItemLabel: () => 'Untracked', handleDetailAction() { throw new Error('An unverified action must not execute'); } };
   vm.createContext(sandbox);
-  for (const name of ['entryGitSummary', 'contextActionSectionHtml', 'submoduleRepositoryRowsHtml', 'submoduleCheckoutBadgeHtml', 'renderEntryLastCommitInner', 'renderEntryDetails']) vm.runInContext(functionSource(name), sandbox);
+  for (const name of ['entryGitSummary', 'contextActionSectionHtml', 'submoduleRepositoryRowsHtml', 'submoduleCheckoutBadgeHtml', 'submoduleVersionSummaryHtml', 'renderEntryLastCommitInner', 'renderEntryDetails']) vm.runInContext(functionSource(name), sandbox);
   return { sandbox, details, buttons: () => buttons };
 }
 test('pending and failed submodule panels never claim detached, uninitialized, missing remote, or missing commit', () => {
@@ -146,6 +146,38 @@ test('complete details preserve existing checkout and action behavior', () => {
   assert.match(h.details.html, /On branch · feature/); assert.doesNotMatch(h.details.html, /Checking current Git details/);
   assert.equal(h.buttons().find(b => b.dataset.detailAction === 'subcommit').disabled, false);
   assert.match(h.details.html, /Loading…/);
+});
+test('submodule summary precedes every action, without hiding or reordering any action', () => {
+  const expected = ['subopenfull', 'subserver', 'subcompare', 'utrud', 'subgraph', 'subrefchanges', 'versions', 'subnewbranch',
+    'subcommit', 'substash', 'substashes', 'subfetch', 'subpull', 'subpush', 'submerge', 'subreset', 'subforcepush', 'location', 'delete'];
+  for (const branch of ['feature', '']) {
+    const h = renderHarness();
+    h.sandbox.renderEntryDetails({ name: 'module', relative_path: 'modules/module', kind: 'submodule', tracked: true,
+      submodule_initialized: true, submodule_current_branch: branch, submodule_state: 'clean', submodule_commit_id: '123456789abc',
+      submodule_commit_subject: 'Current version', submodule_commit_author: 'Author', submodule_commit_date: '2026-10-23', submodule_commit_tags: ['v1'] });
+    assert.deepEqual(h.buttons().map(b => b.dataset.detailAction), expected);
+    const summary = h.details.html.match(/<section class="submodule-version-summary"[\s\S]*?<\/section>/)[0];
+    assert.ok(h.details.html.indexOf(summary) < h.details.html.indexOf('class="context-action-section'));
+    assert.match(summary, /data-submodule-path="modules\/module"/);
+    assert.match(summary, /12345678/);
+    assert.match(summary, /Current version/);
+    assert.doesNotMatch(h.details.html, /<details|\shidden(?:\s|>)/, 'all action groups stay visible');
+    assert.match(h.details.html, /SUBMODULE COMMIT \(actual change\)/, 'full metadata remains available');
+    assert.match(h.details.html, /<strong>Author<\/strong>/);
+    assert.match(h.details.html, /2026-10-23/);
+    assert.equal(h.buttons().find(b => b.dataset.detailAction === 'subpush').disabled, !branch);
+  }
+});
+test('version summary never publishes stale commit details while verification is pending or failed', () => {
+  const h = renderHarness();
+  for (const failed of [false, true]) {
+    const summary = h.sandbox.submoduleVersionSummaryHtml({ kind: 'submodule', details_loading: true, details_error: failed,
+      submodule_commit_id: 'stale1234', submodule_commit_subject: 'Stale message' });
+    assert.match(summary, failed ? /Unavailable/ : /Checking…/);
+    assert.doesNotMatch(summary, /stale1234|Stale message|data-commit-id/);
+  }
+  assert.equal(h.sandbox.submoduleVersionSummaryHtml({ kind: 'folder' }), '');
+  assert.match(h.sandbox.submoduleVersionSummaryHtml({ kind: 'submodule', submodule_initialized: false }), /Not initialized/);
 });
 test('backend shares the unpublished walk, preserving phase timings and all state checks', () => {
   const start = repository.indexOf('fn entry_details_inner('), end = repository.indexOf('// The "last commit touching this path" lookup', start);

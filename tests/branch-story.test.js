@@ -158,7 +158,7 @@ test('Branch Story UI: missing merge source is explicit; loaded sources can be s
   h.context.renderGraph();
   const full = h.refs.graph.innerHTML;
   h.context.activeBranchStoryView().mode = 'story'; h.context.renderGraph();
-  assert.match(h.refs.graph.innerHTML, /data-story-parent="side"[^>]*>side · Load history/);
+  assert.match(h.refs.graph.innerHTML, /data-story-parent="side"[^>]*><code>side<\/code><span>Load history<\/span>/);
   assert.match(h.refs.graph.innerHTML, /Not loaded yet/);
   assert.match(h.refs.graph.innerHTML, /Historical Path/);
   h.context.activeBranchStoryView().mode = 'full'; h.context.renderGraph();
@@ -166,7 +166,7 @@ test('Branch Story UI: missing merge source is explicit; loaded sources can be s
   h.graph.commits = [...h.graph.commits, c('side', [], [ref('origin/topic','remote_branch')])];
   h.context.activeBranchStoryView().mode = 'story'; h.context.renderGraph();
   assert.match(h.refs.graph.innerHTML, /Current refs: origin\/topic/);
-  assert.match(h.refs.graph.innerHTML, /side · Show commit/);
+  assert.match(h.refs.graph.innerHTML, /data-story-parent="side"[^>]*><code>side<\/code><span>Show commit<\/span>/);
   assert.doesNotMatch(h.refs.graph.innerHTML, /Not loaded yet/);
 });
 
