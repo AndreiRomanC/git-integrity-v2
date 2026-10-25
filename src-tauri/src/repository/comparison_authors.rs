@@ -40,9 +40,10 @@ fn collect_for_paths(repo: &Repository, left: Oid, right: Oid, comparison_paths:
         return Err("Author filtering needs complete local history; this repository is shallow. No partial author results were applied.".into());
     }
     let started = Instant::now();
+    let scoped = comparison_paths.is_some();
     let relevant: HashSet<String> = if let Some(paths) = comparison_paths {
-        // Workspace comparisons already have their exact displayed paths. Do
-        // not scan the worktree again or intersect only HEAD's net tree diff:
+        // The caller supplies the exact loaded file/gitlink paths, including
+        // folder scope. For workspaces do not intersect only HEAD's net diff:
         // a committed change may have been undone before a local edit.
         paths.into_iter().collect()
     } else {
@@ -53,6 +54,10 @@ fn collect_for_paths(repo: &Repository, left: Oid, right: Oid, comparison_paths:
             [d.old_file().path().map(normalized), d.new_file().path().map(normalized)].into_iter().flatten()
         }).collect()
     };
+    if scoped && relevant.is_empty() {
+        perf_log("comparison_authors: scoped_paths=0; authors=0; history walk skipped", started.elapsed());
+        return Ok(Vec::new());
+    }
     let mut authors: BTreeMap<String, (ComparisonAuthor, HashSet<String>, HashSet<String>)> = BTreeMap::new();
     let mut count = 0;
     let mut direct_count = 0;
@@ -83,14 +88,17 @@ fn collect_for_paths(repo: &Repository, left: Oid, right: Oid, comparison_paths:
             let (author, paths, direct_paths) = authors.entry(key.clone()).or_insert_with(|| (ComparisonAuthor {
                 key, name, email, commits: 0, merge_commits: 0, paths: Vec::new(), direct_paths: Vec::new(), evidence: BTreeMap::new(),
             }, HashSet::new(), HashSet::new()));
-            author.commits += 1;
-            author.merge_commits += usize::from(commit.parent_count() > 1);
-            // Keep merge-only authors selectable (zero matching files), but
+            if !scoped {
+                author.commits += 1;
+                author.merge_commits += usize::from(commit.parent_count() > 1);
+            }
+            // Unscoped legacy callers can retain merge-only identities. Scoped
+            // comparisons return only authors with actual matching path touches;
             // never treat integrating other people's commits as their own edit.
             // Resolution-only edits are deliberately excluded: stored parent
             // trees cannot prove which edits were made manually by this author.
             if commit.parent_count() > 1 { continue; }
-            direct_count += usize::from(direct);
+            let mut touched_scope = false;
             let tree = commit.tree().map_err(|e| e.to_string())?;
             for parent_index in 0..commit.parent_count().max(1) {
                 let parent_tree = if commit.parent_count() == 0 { None }
@@ -101,6 +109,7 @@ fn collect_for_paths(repo: &Repository, left: Oid, right: Oid, comparison_paths:
                     for path in [delta.old_file().path(), delta.new_file().path()].into_iter().flatten() {
                         let path = normalized(path);
                         if relevant.contains(&path) {
+                            touched_scope = true;
                             // At most one direct and one imported witness per
                             // path. Reuse this diff: no extra history/worktree
                             // scan, and no unbounded list of all file touches.
@@ -121,16 +130,18 @@ fn collect_for_paths(repo: &Repository, left: Oid, right: Oid, comparison_paths:
                     }
                 }
             }
+            if scoped && touched_scope { author.commits += 1; }
+            direct_count += usize::from(direct && (!scoped || touched_scope));
         }
     }
-    let result = authors.into_values().map(|(mut author, paths, direct_paths)| {
+    let result: Vec<_> = authors.into_values().filter(|(_, paths, _)| !scoped || !paths.is_empty()).map(|(mut author, paths, direct_paths)| {
         author.paths = paths.into_iter().collect();
         author.paths.sort();
         author.direct_paths = direct_paths.into_iter().collect();
         author.direct_paths.sort();
         author
     }).collect();
-    perf_log(&format!("comparison_authors: {count} commits; direct_non_merge={direct_count} (object trees only; non-merge touches; first-parent metadata)"), started.elapsed());
+    perf_log(&format!("comparison_authors: {count} commits; direct_non_merge={direct_count}; scoped={scoped}; compared_paths={}; authors={} (object trees only; non-merge touches; first-parent metadata)", relevant.len(), result.len()), started.elapsed());
     Ok(result)
 }
 
@@ -169,9 +180,23 @@ mod tests {
             Self { repo: Repository::init(&path).unwrap(), path }
         }
         fn commit(&self, email: &str, files: &[(&str, &str)], parents: &[Oid]) -> Oid {
-            let mut builder = self.repo.treebuilder(None).unwrap();
-            for (name, content) in files { builder.insert(*name, self.repo.blob(content.as_bytes()).unwrap(), 0o100644).unwrap(); }
-            let tree = self.repo.find_tree(builder.write().unwrap()).unwrap();
+            self.entries(email, &files.iter().map(|&(path, content)| (path, content, 0o100644)).collect::<Vec<_>>(), parents)
+        }
+        fn entries(&self, email: &str, files: &[(&str, &str, i32)], parents: &[Oid]) -> Oid {
+            fn tree(repo: &Repository, files: &[(&str, &str, i32)]) -> Oid {
+                let mut builder = repo.treebuilder(None).unwrap();
+                let mut folders: BTreeMap<&str, Vec<(&str, &str, i32)>> = BTreeMap::new();
+                for &(path, content, mode) in files {
+                    if let Some((folder, rest)) = path.split_once('/') { folders.entry(folder).or_default().push((rest, content, mode)); }
+                    else {
+                        let id = if mode == 0o160000 { Oid::from_str(content).unwrap() } else { repo.blob(content.as_bytes()).unwrap() };
+                        builder.insert(path, id, mode).unwrap();
+                    }
+                }
+                for (folder, children) in folders { builder.insert(folder, tree(repo, &children), 0o40000).unwrap(); }
+                builder.write().unwrap()
+            }
+            let tree = self.repo.find_tree(tree(&self.repo, files)).unwrap();
             let signature = git2::Signature::now("Same display name", email).unwrap();
             let parents: Vec<_> = parents.iter().map(|id| self.repo.find_commit(*id).unwrap()).collect();
             self.repo.commit(None, &signature, &signature, "Checkpoint", &tree, &parents.iter().collect::<Vec<_>>()).unwrap()
@@ -180,6 +205,81 @@ mod tests {
     impl Drop for Fixture { fn drop(&mut self) { let _ = fs::remove_dir_all(&self.path); } }
     fn paths<'a>(authors: &'a [ComparisonAuthor], email: &str) -> Vec<&'a str> {
         authors.iter().find(|a| a.email == email).unwrap().paths.iter().map(String::as_str).collect()
+    }
+
+    fn compared_paths(f: &Fixture, folder: &str, left: Oid, right: Oid) -> Vec<String> {
+        compare_git_tree_file_list(&f.path.to_string_lossy(), folder, &left.to_string(), &right.to_string()).unwrap().rows.into_iter()
+            .flat_map(|row| [row.local.map(|e| e.relative_path), row.remote.map(|e| e.relative_path)].into_iter().flatten()).collect()
+    }
+
+    #[test]
+    fn folder_authors_only_count_matching_touches_from_mixed_commits() {
+        let f = Fixture::new();
+        let base = f.commit("base@test", &[("folder/file", "old"), ("folder/gone", "delete"), ("folder/stable", "same"), ("folder-other/file", "other"), ("elsewhere/file", "other")], &[]);
+        let mixed = f.commit("alice@test", &[("folder/file", "alice"), ("folder/deep/new", "added"), ("folder/stable", "same"), ("folder-other/file", "other"), ("elsewhere/file", "alice")], &[base]);
+        let outside = f.commit("alice@test", &[("folder/file", "alice"), ("folder/deep/new", "added"), ("folder/stable", "same"), ("folder-other/file", "other"), ("elsewhere/file", "alice again")], &[mixed]);
+        let sibling = f.commit("bob@test", &[("folder/file", "alice"), ("folder/deep/new", "added"), ("folder/stable", "same"), ("folder-other/file", "bob"), ("elsewhere/file", "alice again")], &[outside]);
+        let temporary = f.commit("carol@test", &[("folder/file", "alice"), ("folder/deep/new", "added"), ("folder/stable", "temporary"), ("folder-other/file", "bob"), ("elsewhere/file", "alice again")], &[sibling]);
+        let tip = f.commit("dave@test", &[("folder/file", "alice"), ("folder/deep/new", "added"), ("folder/stable", "same"), ("folder-other/file", "bob"), ("elsewhere/file", "alice again")], &[temporary]);
+        let scope = compared_paths(&f, "folder", base, tip);
+        let result = collect_for_paths(&f.repo, base, tip, Some(scope.clone())).unwrap();
+        assert_eq!(result.len(), 1, "no sibling-folder authors or touches absent from the endpoint diff");
+        assert_eq!(result[0].email, "alice@test");
+        assert_eq!(result[0].commits, 1, "the mixed commit counts once; Alice's outside-only commit does not count");
+        assert_eq!(result[0].paths, ["folder/deep/new", "folder/file", "folder/gone"]);
+        assert_eq!(result[0].direct_paths, result[0].paths);
+        assert!(result[0].evidence.values().flatten().all(|e| e.commit == mixed.to_string()));
+        assert_eq!(result[0].evidence.len(), 3);
+        assert_eq!(serde_json::to_value(&result).unwrap(), serde_json::to_value(collect_for_paths(&f.repo, tip, base, Some(scope)).unwrap()).unwrap());
+        let other = collect_for_paths(&f.repo, base, tip, Some(compared_paths(&f, "folder-other", base, tip))).unwrap();
+        assert_eq!(other.len(), 1); assert_eq!(other[0].email, "bob@test");
+        assert_eq!(other[0].paths, ["folder-other/file"]);
+    }
+
+    #[test]
+    fn folder_authors_keep_incoming_authors_but_not_integrator_or_other_feature_paths() {
+        let f = Fixture::new();
+        let base = f.commit("base@test", &[], &[]);
+        let left = f.commit("alice@test", &[("other/a", "left")], &[base]);
+        let right = f.commit("bob@test", &[("folder/b", "incoming"), ("other/b", "right")], &[base]);
+        let merged = f.commit("merger@test", &[("folder/b", "incoming"), ("other/a", "left"), ("other/b", "right")], &[left, right]);
+        for (start, end) in [(base, merged), (left, right), (right, left), (left, merged)] {
+            let result = collect_for_paths(&f.repo, start, end, Some(compared_paths(&f, "folder", start, end))).unwrap();
+            assert_eq!(result.len(), 1);
+            assert_eq!(result[0].email, "bob@test"); assert_eq!(result[0].commits, 1);
+            assert_eq!(result[0].paths, ["folder/b"]); assert_eq!(result[0].merge_commits, 0);
+            assert_eq!(result[0].evidence["folder/b"][0].commit, right.to_string());
+        }
+    }
+
+    #[test]
+    fn folder_authors_include_atomic_gitlinks_without_opening_submodules() {
+        let f = Fixture::new();
+        f.repo.config().unwrap().set_str("diff.ignoreSubmodules", "all").unwrap();
+        let old = "1111111111111111111111111111111111111111";
+        let new = "2222222222222222222222222222222222222222";
+        let base = f.entries("base@test", &[("folder/module", old, 0o160000)], &[]);
+        let changed = f.entries("alice@test", &[("folder/module", new, 0o160000)], &[base]);
+        let tip = f.entries("bob@test", &[("folder/module", new, 0o160000), ("other/file", "bob", 0o100644)], &[changed]);
+        let result = collect_for_paths(&f.repo, base, tip, Some(compared_paths(&f, "folder", base, tip))).unwrap();
+        assert_eq!(result.len(), 1); assert_eq!(result[0].email, "alice@test");
+        assert_eq!(result[0].paths, ["folder/module"]); assert_eq!(result[0].commits, 1);
+        assert_eq!(result[0].evidence["folder/module"][0].commit, changed.to_string());
+        assert!(!f.path.join("folder").exists());
+        assert!(f.repo.find_commit(Oid::from_str(new).unwrap()).is_err());
+    }
+
+    #[test]
+    fn empty_folder_comparison_never_falls_back_to_repository_authors() {
+        let f = Fixture::new();
+        let base = f.commit("base@test", &[("folder/file", "same")], &[]);
+        let tip = f.commit("alice@test", &[("folder/file", "same"), ("other/file", "new")], &[base]);
+        for folder in ["folder", "missing"] {
+            let scope = compared_paths(&f, folder, base, tip);
+            assert!(scope.is_empty());
+            assert!(collect_for_paths(&f.repo, base, tip, Some(scope)).unwrap().is_empty());
+        }
+        assert_eq!(collect(&f.repo, base, tip).unwrap().len(), 1, "unscoped history is unchanged");
     }
 
     #[test]
@@ -378,6 +478,7 @@ mod tests {
         let mut index = f.repo.index().unwrap(); index.add_path(Path::new("f")).unwrap(); index.write().unwrap();
         let before = fs::read(f.repo.path().join("index")).unwrap();
         collect(&f.repo, base, tip).unwrap();
+        collect_for_paths(&f.repo, base, tip, Some(vec!["f".into()])).unwrap();
         assert_eq!(fs::read(f.repo.path().join("index")).unwrap(), before);
         assert_eq!(fs::read_to_string(f.path.join("f")).unwrap(), "local changes");
         assert_eq!(fs::read_to_string(f.path.join("untracked")).unwrap(), "untouched");

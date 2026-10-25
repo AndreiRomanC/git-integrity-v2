@@ -7,7 +7,8 @@ function createComparisonAuthorCache(invoke, capacity = 4) {
   function apply(model) {
     const author = model.authors?.find(author => author.key === model.selected);
     model.strictResult = model.strict.get(model.selected) || null;
-    model.paths = model.selected ? new Set(model.directOnly ? model.strictResult?.result?.paths || [] : author?.paths || []) : null;
+    const base = new Set(author?.paths || []);
+    model.paths = model.selected ? (model.directOnly ? new Set((model.strictResult?.result?.paths || []).filter(path => base.has(path))) : base) : null;
   }
   return {
     get(context) {
@@ -25,7 +26,12 @@ function createComparisonAuthorCache(invoke, capacity = 4) {
       if (model.pending) return model.pending;
       if (model.authors) return model.authors;
       model.error = '';
-      model.pending = Promise.resolve().then(() => invoke('comparison_authors', model.context))
+      // Reuse the metadata endpoint's exact-path support for committed folder
+      // comparisons too. Keep this separate from the workspace marker: strict
+      // attribution still receives two committed revisions, not a worktree.
+      const { scopePaths, ...context } = model.context;
+      const request = scopePaths ? {...context, comparisonPaths:scopePaths} : context;
+      model.pending = Promise.resolve().then(() => invoke('comparison_authors', request))
         .then(authors => { model.authors = authors; apply(model); return authors; })
         .catch(error => { model.error = String(error); return null; })
         .finally(() => { model.pending = null; });
@@ -41,14 +47,16 @@ function createComparisonAuthorCache(invoke, capacity = 4) {
       this.select(model, model.selected);
     },
     async loadStrict(model, retry = false) {
-      if (!model.directOnly || !model.selected) return null;
+      if (!model.directOnly || !model.selected || !model.authors) return null;
       const key = model.selected;
       let entry = model.strict.get(key);
       if (!entry) { entry = {result:null,error:'',pending:null}; model.strict.set(key,entry); }
       if (entry.pending) return entry.pending;
       if (entry.result || (entry.error && !retry)) return entry.result;
       entry.error = '';
-      entry.pending = Promise.resolve().then(() => invoke('comparison_author_contributions', {...model.context, authorKey:key}))
+      const candidatePaths = [...(model.authors.find(author => author.key === key)?.paths || [])];
+      const { scopePaths, ...context } = model.context;
+      entry.pending = Promise.resolve().then(() => invoke('comparison_author_contributions', {...context, authorKey:key, candidatePaths}))
         .then(result => { entry.result = result; return result; })
         .catch(error => { entry.error = String(error); return null; })
         .finally(() => { entry.pending = null; apply(model); });
@@ -58,8 +66,46 @@ function createComparisonAuthorCache(invoke, capacity = 4) {
   };
 }
 function comparisonAuthorMatches(row, model) {
-  return !model?.paths || [row.relative_path, row.local?.relative_path, row.remote?.relative_path]
+  return !model?.paths || comparisonRowPaths(row)
     .some(path => path && model.paths.has(path));
+}
+function comparisonRowPaths(row) {
+  return [...new Set([row.relative_path, row.local?.relative_path, row.remote?.relative_path].filter(Boolean))];
+}
+// Scope to the actual loaded comparison, before text/state/author filtering.
+// No prefix guesses, repository scans, or additional requests while typing.
+// Stable ordering lets the same folder reuse its own metadata, while another
+// folder at the same SHAs gets a separate cache entry (including strict results).
+function scopedComparisonAuthorContext(context, rows) {
+  return context ? {...context, scopePaths:[...new Set(rows.flatMap(comparisonRowPaths))].sort()} : null;
+}
+// Counts are rows in the SAME normal-author population, after the view's path,
+// search and state filters. Aliases/renames count once, never once per path.
+function comparisonAuthorPartition(rows, model) {
+  const author = model?.authors?.find(author => author.key === model.selected);
+  const base = new Set(author?.paths || []);
+  const result = model?.strictResult?.result;
+  const own = new Set(result?.paths || []);
+  const none = new Set(result?.no_contribution_paths || []);
+  const partition = {total:0, shown:0, excluded:0, content:[], structural:new Map(), inconclusive:[], noContribution:[]};
+  for (const row of rows) {
+    const paths = comparisonRowPaths(row).filter(path => base.has(path));
+    if (!paths.length) continue;
+    partition.total++;
+    const included = paths.some(path => own.has(path));
+    const root = paths.map(path => result?.structural_paths?.[path]).find(Boolean);
+    if (included && !root) { partition.content.push(row); partition.shown++; }
+    else if (included && root) {
+      if (!partition.structural.has(root)) partition.structural.set(root, []);
+      partition.structural.get(root).push(row); partition.shown++;
+    } else {
+      partition.excluded++;
+      const reason = paths.map(path => result?.ambiguous_paths?.[path]).find(Boolean);
+      if (reason || !paths.some(path => none.has(path))) partition.inconclusive.push({row, reason:reason || 'This item has no analysis result. Retry with the updated application.'});
+      else partition.noContribution.push({row, reason:'No surviving contribution from this author was found.'});
+    }
+  }
+  return partition;
 }
 function comparisonAuthorEmptyMessage(model) {
   if (model?.selected && model.directOnly) {
@@ -99,4 +145,4 @@ function workspaceComparisonAuthorContext(result) {
       [row.relative_path, row.local?.relative_path, row.remote?.relative_path].filter(Boolean)))].sort(),
   };
 }
-if (typeof module !== 'undefined' && module.exports) module.exports = { createComparisonAuthorCache, comparisonAuthorMatches, comparisonAuthorEmptyMessage, comparisonAuthorDiagnostic, comparisonAuthorEvidence, workspaceComparisonAuthorContext };
+if (typeof module !== 'undefined' && module.exports) module.exports = { createComparisonAuthorCache, comparisonAuthorMatches, comparisonAuthorPartition, comparisonRowPaths, scopedComparisonAuthorContext, comparisonAuthorEmptyMessage, comparisonAuthorDiagnostic, comparisonAuthorEvidence, workspaceComparisonAuthorContext };

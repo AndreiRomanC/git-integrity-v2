@@ -3,11 +3,14 @@
 //! Unlike a path-touch filter, a witness must explain a surviving endpoint fact.
 use super::*;
 use std::sync::Arc;
+mod contextual;
 
 #[derive(Debug, Serialize, Default)]
 pub struct Contributions {
     paths: Vec<String>,
     ambiguous_paths: BTreeMap<String, String>,
+    no_contribution_paths: Vec<String>,
+    structural_paths: BTreeMap<String, String>, // compared path -> conversion root
     evidence: BTreeMap<String, Vec<ComparisonTouch>>,
 }
 
@@ -25,11 +28,11 @@ enum Probe {
 }
 
 #[derive(Clone, Debug)]
-enum Proof { Other, Own(Oid, Option<Oid>, String), Unknown }
+enum Proof { Other, Own(Oid, Option<Oid>, String), Structure(Oid, Option<Oid>, String), Unknown(&'static str) }
 
 #[derive(Clone)]
 struct CommitInfo { tree: Oid, parents: Vec<Oid>, author: String, time: i64 }
-struct Text { counts: HashMap<Vec<u8>, usize>, supported: bool }
+struct Text { counts: HashMap<Vec<u8>, usize>, reason: Option<&'static str> }
 
 struct Analysis<'a> {
     repo: &'a Repository,
@@ -107,12 +110,12 @@ impl<'a> Analysis<'a> {
         self.probes = 0; self.probes_done = 0;
     }
 
-    fn finish_file(&mut self, outcome: usize, witness: Option<Oid>) {
+    fn finish_file(&mut self, outcome: usize, witness: Option<Oid>, reason: &str) {
         self.outcomes[outcome] += 1;
         // Bound diagnostics: never log file contents, line text or credentials.
         if self.detail_logs < 20 || (self.file_started.elapsed() > Duration::from_millis(250) && self.detail_logs < 30) {
             self.detail_logs += 1;
-            perf_log(&format!("comparison_author_contributions: request={} file={:?} outcome={} probes_done={}/{} visits={} bytes={} witness={}", self.request_id, self.current_path, ["proven", "inconclusive", "no_surviving_witness"][outcome], self.probes_done, self.probes, self.visits - self.file_visits, self.bytes, witness.map(|id| id.to_string()).unwrap_or_else(|| "none".into())), self.file_started.elapsed());
+            perf_log(&format!("comparison_author_contributions: request={} file={:?} outcome={} reason={reason:?} probes_done={}/{} visits={} bytes={} witness={}", self.request_id, self.current_path, ["included", "inconclusive", "no_surviving_witness"][outcome], self.probes_done, self.probes, self.visits - self.file_visits, self.bytes, witness.map(|id| id.to_string()).unwrap_or_else(|| "none".into())), self.file_started.elapsed());
         }
     }
 
@@ -160,22 +163,23 @@ impl<'a> Analysis<'a> {
     }
 
     fn text(&mut self, entry: Option<Entry>) -> Result<Arc<Text>, String> {
-        let Some(entry) = entry else { return Ok(Arc::new(Text { counts: HashMap::new(), supported: true })); };
+        let Some(entry) = entry else { return Ok(Arc::new(Text { counts: HashMap::new(), reason: None })); };
         if entry.mode == 0o160000 || entry.mode == 0o40000 {
-            return Ok(Arc::new(Text { counts: HashMap::new(), supported: false }));
+            return Ok(Arc::new(Text { counts: HashMap::new(), reason: Some("This entry is a folder or a submodule, not file content.") }));
         }
         if let Some(text) = self.texts.get(&entry.id) { return Ok(text.clone()); }
         let blob = self.repo.find_blob(entry.id).map_err(|e| e.to_string())?;
-        let supported = blob.size() <= 2 * 1024 * 1024 && !blob.is_binary();
+        let reason = if blob.size() > 2 * 1024 * 1024 { Some("Large text requires a unique contextual change witness.") }
+            else if blob.is_binary() || blob.content().contains(&0) { Some("Binary or NUL-encoded content cannot be attributed as text.") } else { None };
         let mut counts = HashMap::new();
-        if supported {
+        if reason.is_none() {
             self.bytes += blob.size();
             self.budget()?;
             for line in blob.content().split_inclusive(|byte| *byte == b'\n') {
                 *counts.entry(line.to_vec()).or_insert(0) += 1;
             }
         }
-        let text = Arc::new(Text { counts, supported });
+        let text = Arc::new(Text { counts, reason });
         self.texts.insert(entry.id, text.clone());
         Ok(text)
     }
@@ -189,7 +193,7 @@ impl<'a> Analysis<'a> {
             Probe::Line(line, present) => {
                 let text = self.text(entry)?;
                 let count = text.counts.get(line).copied().unwrap_or(0);
-                if !text.supported || count > 1 { None } else { Some((count == 1) == *present) }
+                if text.reason.is_some() || count > 1 { None } else { Some((count == 1) == *present) }
             }
         })
     }
@@ -233,19 +237,23 @@ impl<'a> Analysis<'a> {
     fn trace(&mut self, id: Oid, path: &str, probe: &Probe, depth: usize) -> Result<Proof, String> {
         let id = self.unchanged_origin(id, path)?;
         if !self.exclusive.contains(&id) { return Ok(Proof::Other); }
-        if depth > 256 { return Ok(Proof::Unknown); }
+        if depth > 256 { return Ok(Proof::Unknown("More than 256 changing history steps are needed.")); }
         let key = (id, path.to_string(), probe.clone());
         if let Some(proof) = self.proofs.get(&key) { return Ok(proof.clone()); }
         self.bytes += path.len() + if let Probe::Line(line, _) = probe { line.len() } else { 64 };
         self.budget()?;
-        if self.matches(id, path, probe)? != Some(true) { return Ok(Proof::Unknown); }
+        if self.matches(id, path, probe)? != Some(true) { return Ok(Proof::Unknown("The line is repeated or its historical text cannot be analyzed.")); }
         let info = self.commit(id)?;
         let mut inherited = Vec::new();
         for parent in &info.parents {
-            let Some(parent_path) = self.parent_path(id, *parent, path, probe)? else { inherited.push(Proof::Unknown); continue; };
+            let Some(parent_path) = self.parent_path(id, *parent, path, probe)? else { inherited.push(Proof::Unknown("An edited rename has no unambiguous historical identity.")); continue; };
             match self.matches(*parent, &parent_path, probe)? {
                 Some(true) => inherited.push(self.trace(*parent, &parent_path, probe, depth + 1)?),
-                None => inherited.push(Proof::Unknown),
+                None => {
+                    let entry = self.entry(*parent, &parent_path)?;
+                    let reason = self.text(entry)?.reason.unwrap_or("A repeated historical line has more than one possible origin.");
+                    inherited.push(Proof::Unknown(reason));
+                },
                 Some(false) => {},
             }
         }
@@ -253,26 +261,45 @@ impl<'a> Analysis<'a> {
             // Equal content in multiple parents has multiple possible origins.
             // Do not pick the author's parent simply because it is convenient.
             if inherited.iter().all(|p| matches!(p, Proof::Own(..))) { inherited.remove(0) }
+            else if inherited.iter().all(|p| matches!(p, Proof::Structure(..))) { inherited.remove(0) }
             else if inherited.iter().all(|p| matches!(p, Proof::Other)) { Proof::Other }
-            else { Proof::Unknown }
+            else { inherited.into_iter().find(|p| matches!(p, Proof::Unknown(_))).unwrap_or(Proof::Unknown("Matching merge parents have different possible authors.")) }
         } else if info.parents.len() > 1 {
             // Novel merge content/deletion may be a resolution or a different
             // historical merge driver. Never attribute it from authorship alone.
-            Proof::Unknown
+            Proof::Unknown("The change first appears in a merge resolution; its author cannot be established.")
         } else if info.parents.is_empty() && matches!(probe, Probe::Line(_, false) | Probe::Atomic(None) | Probe::Exists(false) | Probe::Mode(None)) {
             Proof::Other
         } else if info.author == self.author {
-            if let (Probe::Line(line, false), Some(parent)) = (probe, info.parents.first()) {
+            if let Some(root) = info.parents.first().map(|parent| self.conversion_root(id, *parent, path)).transpose()?.flatten() {
+                Proof::Structure(id, info.parents.first().copied(), root)
+            } else if let (Probe::Line(line, false), Some(parent)) = (probe, info.parents.first()) {
                 // A->B->C must not credit B's author merely because A is still
                 // absent. Replacement provenance is proved by surviving added
                 // lines; absence alone proves only a standalone deletion hunk.
                 if self.standalone_deletion(id, *parent, path, line)? {
                     Proof::Own(id, Some(*parent), path.into())
-                } else { Proof::Unknown }
+                } else { Proof::Other } // replaced line, not a surviving standalone deletion
             } else { Proof::Own(id, info.parents.first().copied(), path.into()) }
         } else { Proof::Other };
         self.proofs.insert(key, proof.clone());
         Ok(proof)
+    }
+
+    // A gitlink/tree conversion belongs to the superproject. It does not make
+    // the author of that commit the author of all imported/removed file text.
+    fn conversion_root(&mut self, child: Oid, parent: Oid, path: &str) -> Result<Option<String>, String> {
+        let mut prefix = String::new();
+        for component in path.split('/') {
+            if !prefix.is_empty() { prefix.push('/'); }
+            prefix.push_str(component);
+            let a = self.entry(parent, &prefix)?.map(|e| e.mode);
+            let b = self.entry(child, &prefix)?.map(|e| e.mode);
+            if matches!((a, b), (Some(0o160000), Some(0o40000)) | (Some(0o40000), Some(0o160000))) {
+                return Ok(Some(prefix));
+            }
+        }
+        Ok(None)
     }
 
     fn standalone_deletion(&mut self, id: Oid, parent: Oid, path: &str, line: &[u8]) -> Result<bool, String> {
@@ -300,8 +327,14 @@ impl<'a> Analysis<'a> {
     }
 }
 
+#[cfg(test)]
 fn collect_strict(repo: &Repository, left: Oid, right: Oid, author: &str) -> Result<Contributions, String> {
+    collect_strict_candidates(repo, left, right, author, None)
+}
+
+fn collect_strict_candidates(repo: &Repository, left: Oid, right: Oid, author: &str, candidates: Option<&HashSet<String>>) -> Result<Contributions, String> {
     if repo.is_shallow() { return Err("Strict attribution requires complete local history. No results were applied.".into()); }
+    if candidates.is_some_and(HashSet::is_empty) { return Ok(Contributions::default()); }
     let started = Instant::now();
     static NEXT_REQUEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let request_id = NEXT_REQUEST.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -335,31 +368,52 @@ fn collect_strict(repo: &Repository, left: Oid, right: Oid, author: &str) -> Res
         let new = delta.new_file().path().map(normalized);
         let old_path = old.as_deref().or(new.as_deref()).unwrap_or("");
         let new_path = new.as_deref().or(old.as_deref()).unwrap_or("");
+        if candidates.is_some_and(|paths| !paths.contains(old_path) && !paths.contains(new_path)) { continue; }
         analysis.begin_file(new_path);
         if delta.status() == git2::Delta::Renamed && (removed.get(&delta.old_file().id()) != Some(&1) || added.get(&delta.new_file().id()) != Some(&1)) {
             for path in [old, new].into_iter().flatten() {
+                if candidates.is_some_and(|paths| !paths.contains(&path)) { continue; }
                 result.ambiguous_paths.insert(path, "Multiple identical files make rename pairing ambiguous. No historical file identity was guessed.".into());
             }
-            analysis.finish_file(1, None);
+            analysis.finish_file(1, None, "Ambiguous rename pairing");
             continue;
         }
         let a = analysis.entry(left, old_path)?;
         let b = analysis.entry(right, new_path)?;
         let mut probes = Vec::new();
-        let mut ambiguous = false;
+        let mut reason = None;
+        let mut structure = None;
+        // A conversion's descendant files may be binary or unchanged imports.
+        // Trace the structural state separately, without opening a submodule.
+        if let Some(root) = analysis.conversion_root(right, left, new_path)? {
+            for tip in [left, right] {
+                let mode = analysis.entry(tip, &root)?.map(|e| e.mode);
+                match analysis.trace(tip, &root, &Probe::Mode(mode), 0)? {
+                    proof @ Proof::Structure(..) => structure = Some(proof),
+                    Proof::Unknown(actual) => reason = Some(actual),
+                    _ => {},
+                }
+            }
+        }
         if a.into_iter().chain(b).any(|e| e.mode == 0o160000) {
-            probes.push((left, old_path.to_string(), Probe::Atomic(a)));
-            probes.push((right, new_path.to_string(), Probe::Atomic(b)));
+            if a.into_iter().chain(b).any(|e| e.mode == 0o40000) {
+                // A folder tree ID changes with every descendant edit. That is
+                // not a new submodule-pointer contribution at the root. Its
+                // structural state was traced above; children are independent.
+            } else {
+                probes.push((left, old_path.to_string(), Probe::Atomic(a)));
+                probes.push((right, new_path.to_string(), Probe::Atomic(b)));
+            }
         } else {
             let at = analysis.text(a)?;
             let bt = analysis.text(b)?;
-            if at.supported && bt.supported {
+            if at.reason.is_none() && bt.reason.is_none() {
                 let lines: std::collections::BTreeSet<_> = at.counts.keys().chain(bt.counts.keys()).cloned().collect();
                 for line in lines {
                     let ac = at.counts.get(&line).copied().unwrap_or(0);
                     let bc = bt.counts.get(&line).copied().unwrap_or(0);
                     if ac == bc { continue; }
-                    if ac > 1 || bc > 1 || line.len() > 8192 { ambiguous = true; continue; }
+                    if ac > 1 || bc > 1 || line.len() > 8192 { reason = Some("Repeated or long changed lines require a contextual witness."); continue; }
                     probes.push((left, old_path.to_string(), Probe::Line(line.clone(), ac == 1)));
                     probes.push((right, new_path.to_string(), Probe::Line(line, bc == 1)));
                 }
@@ -368,8 +422,9 @@ fn collect_strict(repo: &Repository, left: Oid, right: Oid, author: &str) -> Res
                     probes.push((right, new_path.to_string(), Probe::Exists(b.is_some())));
                 }
             } else {
-                // Binary/oversized blobs have no safe partial-edit attribution.
-                ambiguous = true;
+                // Do not allocate per-line maps for large blobs. The bounded
+                // contextual fallback below validates text/encoding separately.
+                reason = at.reason.or(bt.reason);
             }
             if a.is_some() && b.is_some() && a.map(|e| e.mode) != b.map(|e| e.mode) {
                 probes.push((left, old_path.to_string(), Probe::Mode(a.map(|e| e.mode))));
@@ -384,7 +439,9 @@ fn collect_strict(repo: &Repository, left: Oid, right: Oid, author: &str) -> Res
         }
         // Pure reordering/duplicate-line edits cannot be established by unique
         // line provenance. Report uncertainty instead of guessing line identity.
-        if probes.is_empty() { ambiguous = true; }
+        if probes.is_empty() && reason.is_none() && !a.into_iter().chain(b).any(|e| e.mode == 0o160000 || e.mode == 0o40000) {
+            reason = Some("Line order changed without a unique line addition or deletion.");
+        }
         // A large endpoint diff can still contain one small, provable personal
         // contribution. Never discard every candidate because the file has
         // many imported lines. Trace until a witness is found; the existing
@@ -395,29 +452,50 @@ fn collect_strict(repo: &Repository, left: Oid, right: Oid, author: &str) -> Res
             analysis.probes_done += 1;
             match analysis.trace(tip, &path, &probe, 0)? {
                 Proof::Own(commit, parent, path) => { witness = Some((commit, parent, path)); break; },
-                Proof::Unknown => ambiguous = true,
+                proof @ Proof::Structure(..) => structure = Some(proof),
+                Proof::Unknown(actual) => reason = Some(actual),
                 Proof::Other => {},
             }
         }
-        analysis.finish_file(if witness.is_some() { 0 } else if ambiguous { 1 } else { 2 }, witness.as_ref().map(|(commit, _, _)| *commit));
+        if witness.is_none() && reason.is_some() && !a.into_iter().chain(b).any(|e| e.mode == 0o160000 || e.mode == 0o40000) {
+            match analysis.contextual(left, right, old_path, new_path)? {
+                Proof::Own(commit, parent, path) => witness = Some((commit, parent, path)),
+                proof @ Proof::Structure(..) => structure = Some(proof),
+                Proof::Unknown(actual) => reason = Some(actual),
+                Proof::Other => reason = None,
+            }
+        }
+        let structural_root = if witness.is_none() {
+            if let Some(Proof::Structure(commit, parent, root)) = structure {
+                if analysis.entry(left, &root)?.map(|e| e.mode) == analysis.entry(right, &root)?.map(|e| e.mode) {
+                    reason = Some("Content passed through a folder/submodule conversion, but that structural change no longer differs between these revisions."); None
+                } else { witness = Some((commit, parent, root.clone())); Some(root) }
+            } else { None }
+        } else { None };
+        let category = if structural_root.is_some() { "Folder/submodule conversion" } else if witness.is_some() { "Surviving contribution" } else { reason.unwrap_or("No surviving contribution") };
+        analysis.budget()?; // including time spent in the final libgit2 patch
+        analysis.finish_file(if witness.is_some() { 0 } else if reason.is_some() { 1 } else { 2 }, witness.as_ref().map(|(commit, _, _)| *commit), category);
         let paths: HashSet<_> = [old, new].into_iter().flatten().collect();
         for path in paths {
+            if candidates.is_some_and(|paths| !paths.contains(&path)) { continue; }
             if let Some((commit, parent, witness_path)) = &witness {
                 result.paths.push(path.clone());
+                if let Some(root) = &structural_root { result.structural_paths.insert(path.clone(), root.clone()); }
                 // The witness's historic path may differ after an exact rename.
-                result.evidence.insert(path, vec![ComparisonTouch { commit: commit.to_string(), date: short_date(analysis.commit(*commit)?.time), parent: parent.map(|p| p.to_string()), change: "Surviving contribution".into(), direct: true, witness_path: Some(witness_path.clone()) }]);
-            } else if ambiguous {
-                result.ambiguous_paths.insert(path, "Attribution is inconclusive (merge resolution, duplicate/moved lines, rename ambiguity, binary/large file, or history depth). Not included as a proven contribution.".into());
-            }
+                result.evidence.insert(path, vec![ComparisonTouch { commit: commit.to_string(), date: short_date(analysis.commit(*commit)?.time), parent: parent.map(|p| p.to_string()), change: if structural_root.is_some() { "Folder/submodule conversion" } else { "Surviving contribution" }.into(), direct: true, witness_path: Some(witness_path.clone()) }]);
+            } else if let Some(reason) = reason {
+                result.ambiguous_paths.insert(path, reason.into());
+            } else { result.no_contribution_paths.push(path); }
         }
     }
     result.paths.sort(); result.paths.dedup();
+    result.no_contribution_paths.sort(); result.no_contribution_paths.dedup();
     perf_log(&format!("comparison_author_contributions: request={request_id} complete left={left} right={right} commits={} paths={} ambiguous={} files_done={}/{} proven={} inconclusive={} no_witness={} visits={} peak_file_bytes={} detail_logs={}", analysis.exclusive.len(), result.paths.len(), result.ambiguous_paths.len(), analysis.outcomes.iter().sum::<usize>(), analysis.file_total, analysis.outcomes[0], analysis.outcomes[1], analysis.outcomes[2], analysis.visits, analysis.peak_bytes, analysis.detail_logs), started.elapsed());
     Ok(result)
 }
 
 #[tauri::command]
-pub async fn comparison_author_contributions(repository_path: String, submodule_path: Option<String>, owner: Option<String>, repository_name: Option<String>, left_revision: String, right_revision: String, author_key: String, comparison_paths: Option<Vec<String>>) -> Result<Contributions, String> {
+pub async fn comparison_author_contributions(repository_path: String, submodule_path: Option<String>, owner: Option<String>, repository_name: Option<String>, left_revision: String, right_revision: String, author_key: String, comparison_paths: Option<Vec<String>>, candidate_paths: Option<Vec<String>>) -> Result<Contributions, String> {
     off_main_thread(move || {
         if comparison_paths.is_some() {
             return Err("Strict attribution is available for two committed revisions. Local uncommitted differences have no Git author; compare HEAD with the other revision or disable the strict filter.".into());
@@ -430,7 +508,8 @@ pub async fn comparison_author_contributions(repository_path: String, submodule_
             _ => return Err("Invalid comparison repository context".into()),
         };
         let repo = internal_repository(&path.to_string_lossy())?;
-        collect_strict(&repo, Oid::from_str(&left_revision).map_err(|e| e.to_string())?, Oid::from_str(&right_revision).map_err(|e| e.to_string())?, &author_key)
+        let candidates = candidate_paths.map(|paths| paths.into_iter().collect::<HashSet<_>>());
+        collect_strict_candidates(&repo, Oid::from_str(&left_revision).map_err(|e| e.to_string())?, Oid::from_str(&right_revision).map_err(|e| e.to_string())?, &author_key, candidates.as_ref())
     }).await
 }
 
@@ -449,12 +528,20 @@ mod tests {
             self.entries(author, &files.iter().map(|(p,c)| (*p,*c,0o100644)).collect::<Vec<_>>(), parents)
         }
         fn entries(&self, author: &str, files: &[(&str, &str, i32)], parents: &[Oid]) -> Oid {
-            let mut builder = self.repo.treebuilder(None).unwrap();
-            for (name, content, mode) in files {
-                let id = if *mode == 0o160000 { Oid::from_str(content).unwrap() } else { self.repo.blob(content.as_bytes()).unwrap() };
-                builder.insert(*name, id, *mode).unwrap();
+            fn tree(repo: &Repository, files: &[(&str, &str, i32)]) -> Oid {
+                let mut builder = repo.treebuilder(None).unwrap();
+                let mut directories: BTreeMap<&str, Vec<(&str, &str, i32)>> = BTreeMap::new();
+                for &(name, content, mode) in files {
+                    if let Some((dir, rest)) = name.split_once('/') { directories.entry(dir).or_default().push((rest, content, mode)); }
+                    else {
+                        let id = if mode == 0o160000 { Oid::from_str(content).unwrap() } else { repo.blob(content.as_bytes()).unwrap() };
+                        builder.insert(name, id, mode).unwrap();
+                    }
+                }
+                for (dir, children) in directories { builder.insert(dir, tree(repo, &children), 0o40000).unwrap(); }
+                builder.write().unwrap()
             }
-            let tree = self.repo.find_tree(builder.write().unwrap()).unwrap();
+            let tree = self.repo.find_tree(tree(&self.repo, files)).unwrap();
             let sig = git2::Signature::now(author, &format!("{author}@test")).unwrap();
             let parents: Vec<_> = parents.iter().map(|id| self.repo.find_commit(*id).unwrap()).collect();
             self.repo.commit(None, &sig, &sig, "fixture", &tree, &parents.iter().collect::<Vec<_>>()).unwrap()
@@ -681,8 +768,10 @@ mod tests {
         let f = Fixture::new();
         let base = f.commit("base", &[("duplicate","x\nx\n"),("order","a\nb\n"),("binary","a\0b")], &[]);
         let a = f.commit("alice", &[("duplicate","x\n"),("order","b\na\n"),("binary","a\0c")], &[base]);
-        let result = f.check(base,a,"alice",&[]);
-        assert_eq!(result.ambiguous_paths.len(),3);
+        // The unique contextual move is identifiable; indistinguishable copies
+        // and binary content remain explicitly inconclusive.
+        let result = f.check(base,a,"alice",&["order"]);
+        assert_eq!(result.ambiguous_paths.len(),2);
     }
 
     #[test]
@@ -712,5 +801,123 @@ mod tests {
         let tip = f.commit("alice", &[("c","same\n"),("d","same\n")], &[base]);
         let result = f.check(base,tip,"alice",&[]);
         assert_eq!(result.ambiguous_paths.len(),4);
+    }
+
+    #[test]
+    fn repeated_xml_values_and_context_only_reordering_have_real_witnesses() {
+        let f = Fixture::new();
+        let xml = "<A>\n<V>1</V>\n</A>\n<B>\n<V>2</V>\n</B>\n<C>\n<V>1</V>\n</C>\n<D>\n<V>2</V>\n</D>\n";
+        let base = f.commit("base", &[("Master_target.tdxml", xml)], &[]);
+        let repeated = xml.replacen("<V>1</V>", "<V>2</V>", 1);
+        let direct = f.commit("alice", &[("Master_target.tdxml", &repeated)], &[base]);
+        let result = f.check(base, direct, "alice", &["Master_target.tdxml"]);
+        assert_eq!(result.evidence["Master_target.tdxml"][0].commit, direct.to_string());
+        let swapped = xml.replace("<A>\n<V>1</V>", "<A>\n<V>2</V>").replace("<B>\n<V>2</V>", "<B>\n<V>1</V>");
+        let side = f.commit("alice", &[("Master_target.tdxml", &swapped)], &[base]);
+        f.check(base, side, "alice", &["Master_target.tdxml"]);
+        let merge = f.commit("integrator", &[("Master_target.tdxml", &repeated)], &[base, direct]);
+        f.check(base, merge, "alice", &["Master_target.tdxml"]);
+        f.check(base, merge, "integrator", &[]);
+        let overwritten = f.commit("bob", &[("Master_target.tdxml", &xml.replace("<A>\n<V>1</V>", "<A>\n<V>3</V>"))], &[merge]);
+        f.check(base, overwritten, "alice", &[]);
+        let reverted = f.commit("bob", &[("Master_target.tdxml", xml), ("other", "bob\n")], &[merge]);
+        f.check(base, reverted, "alice", &[]);
+    }
+
+    #[test]
+    fn large_cdfx_uses_bounded_context_instead_of_rejecting_two_megabytes() {
+        let f = Fixture::new();
+        let padding = "<VALUE>0</VALUE>\n".repeat(1_800_000);
+        let before = format!("{padding}<CALIBRATION name=\"target\">\n<V>1</V>\n</CALIBRATION>\n");
+        let after = before.replace("<V>1</V>", "<V>2</V>");
+        assert!(before.len() > 27 * 1024 * 1024);
+        let base = f.commit("base", &[("VWAQ4_B1.CDFX", &before)], &[]);
+        let direct = f.commit("alice", &[("VWAQ4_B1.CDFX", &after)], &[base]);
+        let start = Instant::now();
+        let result = f.check(base, direct, "alice", &["VWAQ4_B1.CDFX"]);
+        assert_eq!(result.evidence["VWAQ4_B1.CDFX"][0].commit, direct.to_string());
+        eprintln!("large CDFX fixture: {} bytes/version, both directions {:?}", before.len(), start.elapsed());
+    }
+
+    #[test]
+    fn conversion_groups_binary_and_text_without_claiming_imported_content() {
+        let f = Fixture::new();
+        let base = f.entries("base", &[("modules/a", "1111111111111111111111111111111111111111", 0o160000)], &[]);
+        let unpacked = f.commit("alice", &[("modules/a/code.c", "imported\n"), ("modules/a/model.slx", "binary\0payload")], &[base]);
+        let result = f.check(base, unpacked, "alice", &["modules/a", "modules/a/code.c", "modules/a/model.slx"]);
+        assert_eq!(result.structural_paths.len(), 3);
+        assert!(result.structural_paths.values().all(|root| root == "modules/a"));
+        assert!(result.ambiguous_paths.is_empty());
+        let edited = f.commit("alice", &[("modules/a/code.c", "imported\npersonal edit\n"), ("modules/a/model.slx", "binary\0payload")], &[unpacked]);
+        let result = f.check(base, edited, "alice", &["modules/a", "modules/a/code.c", "modules/a/model.slx"]);
+        assert!(!result.structural_paths.contains_key("modules/a/code.c"));
+        let packed = f.entries("alice", &[("modules/a", "2222222222222222222222222222222222222222", 0o160000)], &[unpacked]);
+        let result = f.check(unpacked, packed, "alice", &["modules/a", "modules/a/code.c", "modules/a/model.slx"]);
+        assert_eq!(result.structural_paths.len(), 3);
+        let merged = f.entries("integrator", &[("modules/a", "2222222222222222222222222222222222222222", 0o160000)], &[unpacked, packed]);
+        f.check(unpacked, merged, "integrator", &[]);
+    }
+
+    #[test]
+    fn strict_population_only_contains_normal_author_candidates() {
+        let f = Fixture::new();
+        let base = f.commit("base", &[("shared", "base\n")], &[]);
+        let a = f.commit("alice", &[("shared", "alice\n"), ("own", "mine\n")], &[base]);
+        let b = f.commit("bob", &[("shared", "bob\n"), ("own", "mine\n"), ("binary", "not\0mine")], &[a]);
+        let candidates = HashSet::from(["shared".into(), "own".into()]);
+        let result = collect_strict_candidates(&f.repo, base, b, "email:alice@test", Some(&candidates)).unwrap();
+        assert_eq!(result.paths, ["own"]);
+        assert_eq!(result.no_contribution_paths, ["shared"]);
+        assert!(result.ambiguous_paths.is_empty());
+        assert_eq!(result.paths.len() + result.no_contribution_paths.len() + result.ambiguous_paths.len(), candidates.len());
+        let empty = collect_strict_candidates(&f.repo, base, b, "email:alice@test", Some(&HashSet::new())).unwrap();
+        assert!(empty.paths.is_empty() && empty.ambiguous_paths.is_empty());
+    }
+
+    #[test]
+    fn reasons_distinguish_binary_context_limits_and_merge_resolution() {
+        let f = Fixture::new();
+        let base = f.commit("base", &[("utf16", "\0a\0b"), ("repeated", "x\nx\nx\n")], &[]);
+        let tip = f.commit("alice", &[("utf16", "\0c\0b"), ("repeated", "x\nx\n")], &[base]);
+        let result = f.check(base, tip, "alice", &[]);
+        assert!(result.ambiguous_paths["utf16"].contains("NUL-encoded"));
+        assert!(!result.ambiguous_paths["repeated"].contains("binary"));
+        assert_ne!(result.ambiguous_paths["utf16"], result.ambiguous_paths["repeated"]);
+    }
+
+    #[test]
+    fn contextual_neighbour_edit_is_not_ownership_of_another_changed_line() {
+        let f = Fixture::new();
+        let base_text = "<A>\n<V>0</V>\n</A>\n<B>\n<V>0</V>\n</B>\n<C>\n<V>1</V>\n</C>\n<D>\n<V>1</V>\n</D>\n";
+        let base = f.commit("base", &[("xml", base_text)], &[]);
+        let bob_text = base_text.replacen("<V>0</V>", "<V>1</V>", 1);
+        let bob = f.commit("bob", &[("xml", &bob_text)], &[base]);
+        let left = f.commit("alice", &[("xml", &bob_text.replace("<A>", "<A name=\"shared\">"))], &[bob]);
+        // Same neighbour independently present on the other feature branch;
+        // only Bob's value differs between endpoints, not Alice's neighbour.
+        let right = f.commit("other", &[("xml", &base_text.replace("<A>", "<A name=\"shared\">"))], &[base]);
+        f.check(left, right, "alice", &[]);
+    }
+
+    #[test]
+    fn contextual_edits_after_conversion_are_not_hidden_inside_structure() {
+        let f = Fixture::new();
+        let base = f.entries("base", &[("module", "1111111111111111111111111111111111111111", 0o160000)], &[]);
+        let xml = "<A>\n1\n</A>\n<B>\n1\n</B>\n<C>\n2\n</C>\n<D>\n2\n</D>\n";
+        let imported = f.commit("alice", &[("module/data.xml", xml)], &[base]);
+        let changed = f.commit("alice", &[("module/data.xml", &xml.replacen("1", "2", 1))], &[imported]);
+        let result = f.check(base, changed, "alice", &["module", "module/data.xml"]);
+        assert_eq!(result.structural_paths.len(), 1);
+        assert_eq!(result.evidence["module/data.xml"][0].commit, changed.to_string());
+    }
+
+    #[test]
+    fn oversized_context_has_a_specific_limit_reason_not_a_negative_claim() {
+        let f = Fixture::new();
+        let base = f.commit("base", &[("one-line.xml", &"a".repeat(70_000))], &[]);
+        let tip = f.commit("alice", &[("one-line.xml", &"b".repeat(70_000))], &[base]);
+        let result = f.check(base, tip, "alice", &[]);
+        assert!(result.ambiguous_paths["one-line.xml"].contains("64 KiB"));
+        assert!(result.no_contribution_paths.is_empty());
     }
 }

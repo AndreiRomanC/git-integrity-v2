@@ -1879,6 +1879,23 @@ function comparisonEvidenceRowHtml(row, model) {
 function comparisonEvidenceCommitHtml(touch) {
   return `<code title="${esc(touch.commit)}">${esc(touch.commit.slice(0, 8))}</code> · <time title="Commit date (UTC, same as history)">${esc(touch.date || 'Date unavailable')}</time>`;
 }
+function comparisonAuthorRowsHtml(rows, candidates, model, dataset) {
+  const render = row => flatCompareRowHtml(row, dataset) + comparisonEvidenceRowHtml(row, model);
+  if (!model?.directOnly || !model.selected || !model.strictResult?.result) return rows.map(render).join('');
+  const groups = comparisonAuthorPartition(candidates, model);
+  let html = groups.content.map(render).join('');
+  for (const [root, items] of groups.structural) {
+    const touch = comparisonAuthorEvidence(items[0], model)[0];
+    html += `<details class="comparison-structure-group"><summary>Reconfiguration · <code>${esc(root)}</code> · ${items.length} items</summary><p>Folder/submodule conversion recorded by this author. File contents may come from other authors.</p>${touch ? `<p>${comparisonEvidenceCommitHtml(touch)}</p>` : ''}<p>Open an item to inspect its complete comparison.</p>${items.map(row => flatCompareRowHtml(row, dataset)).join('')}</details>`;
+  }
+  if (groups.excluded) {
+    html += `<details class="comparison-excluded-group"><summary>${groups.excluded} excluded · ${groups.inconclusive.length} inconclusive · ${groups.noContribution.length} without a surviving contribution</summary>`;
+    for (const {row, reason} of groups.inconclusive) html += flatCompareRowHtml(row, dataset) + `<p><strong>Attribution could not be established.</strong> ${esc(reason)}</p>`;
+    for (const {row, reason} of groups.noContribution) html += flatCompareRowHtml(row, dataset) + `<p>${esc(reason)}</p>`;
+    html += '</details>';
+  }
+  return html;
+}
 function bindComparisonEvidence(container, rows, model) {
   if (!model?.selected) return;
   const byPath = new Map(rows.map(row => [row.relative_path, row]));
@@ -1888,11 +1905,10 @@ function bindComparisonEvidence(container, rows, model) {
       const row = byPath.get(details.dataset.authorEvidence);
       if (!row) return;
       const touches = comparisonAuthorEvidence(row, model);
-      const author = model.authors.find(item => item.key === model.selected) || {name:model.selected,email:''};
       const body = details.querySelector('[data-evidence-body]');
-      body.innerHTML = `<p>${esc(author.name)}${author.email ? ` &lt;${esc(author.email)}&gt;` : ''}</p>` + (touches.length
-        ? '<p>Example commits proving inclusion, not a complete file history. Each change is measured against its own parent; the list diff still compares the two selected revisions.</p>' + touches.map((touch, index) => `<div class="comparison-touch"><span><strong>${model.directOnly ? 'Contribution to the compared difference' : touch.direct ? 'Direct history · non-merge commit' : 'Imported history · non-merge commit'}</strong><br>${comparisonEvidenceCommitHtml(touch)} · ${esc(touch.change)} · parent <code title="${esc(touch.parent || '')}">${esc(touch.parent?.slice(0, 8) || 'none (initial commit)')}</code></span><button type="button" data-evidence-diff="${index}" ${touch.parent ? '' : 'disabled'}>View this change</button></div>`).join('') + '<p>Recorded Git authorship is not proof of manual editing. Squash/copy imports can look like direct commits.</p>'
-        : '<p>Evidence is unavailable in this cached result. Reopen the comparison in the updated application; no claim of manual authorship can be made.</p>');
+      body.innerHTML = touches.length
+        ? `<p>${model.directOnly ? 'A contribution from this author remains in the comparison.' : 'This author touched this item in a non-merge commit.'}</p>` + touches.map((touch, index) => `<div class="comparison-touch"><span>${comparisonEvidenceCommitHtml(touch)}</span><button type="button" data-evidence-diff="${index}" title="Compare this commit with its parent; the main comparison stays unchanged" ${touch.parent ? '' : 'disabled'}>View change</button></div>`).join('')
+        : '<p>Commit evidence is unavailable in this cached result.</p>';
       touches.forEach(touch => jsPerfLog(`comparison_author_evidence: commit=${touch.commit} date=${touch.date || 'unknown'} parent=${touch.parent || 'root'} direct=${touch.direct} change=${touch.change}`, 0));
       body.querySelectorAll('[data-evidence-diff]').forEach(button => button.addEventListener('click', event => {
         event.preventDefault(); event.stopPropagation();
@@ -1911,14 +1927,12 @@ function renderComparisonAuthorFilter(container, context, options = {}) {
     element.innerHTML = options.visible ? '<button type="button" disabled>Files touched by author…</button><small>Available after loading a comparison with committed history.</small>' : '';
     return null;
   }
-  const model = comparisonAuthorCache.get(context);
+  const model = comparisonAuthorCache.get(scopedComparisonAuthorContext(context, options.scopeRows || options.rows || []));
   element.innerHTML = model.authors
-    ? `<label>Files touched by author <select data-author-select><option value="">All authors — clear filter</option>${model.authors.map(author => `<option value="${esc(author.key)}" ${model.selected === author.key ? 'selected' : ''}>${esc(author.name)}${author.email ? ` &lt;${esc(author.email)}&gt;` : ' (no email)'} · ${author.paths.length} files</option>`).join('')}</select></label><small>Shows files touched in non-merge commits by the selected author. The full diff may also include changes made by others.</small><details><summary>History scope and limitations</summary><p>Commits reachable from either revision but not both. Merge commits do not establish authorship: imported changes remain attributed to the authors of the original commits within this range. Edits made only during merge resolution are excluded. This is a conservative history filter, not proof of personal line ownership. Renames use the existing added/deleted paths; earlier touches are not followed across later renames. Author emails are used as recorded, without mailmap, co-author or cherry-pick attribution. Submodule contents are analyzed only when comparing that submodule directly.</p></details>`
+    ? `<label class="comparison-author-select">Author <select data-author-select><option value="">All authors — clear filter</option>${model.authors.map(author => `<option value="${esc(author.key)}" ${model.selected === author.key ? 'selected' : ''}>${esc(author.name)}${author.email ? ` &lt;${esc(author.email)}&gt;` : ' (no email)'}</option>`).join('')}</select></label><details class="comparison-author-help"><summary>About this filter</summary><div><p>Authors and items are limited to the compared folder. Normal: matching items touched in this author's non-merge commits between the two revisions.</p><p>Strict: a surviving content or pointer change must be identified. Folder/submodule conversions are grouped separately; their file contents are not claimed as personal edits.</p><p>Counts use the same items in the current view, including its search and state filters. Expand excluded items for individual reasons. All item diffs remain complete.</p><p>Merged changes keep their original authors. Uncertain merge resolutions, edited renames or unsupported content remain inconclusive. Git cannot distinguish manual edits from squash/copy imports. Identity uses the recorded email, without mailmap or co-author matching. Submodule contents are analyzed only when comparing that submodule directly.</p></div></details>`
     : `<button type="button" data-load-authors ${model.pending ? 'disabled' : ''}>${model.pending ? 'Loading authors…' : 'Files touched by author…'}</button>${model.error ? `<small role="alert">${esc(model.error)} ${model.selected ? 'No files shown while attribution is unavailable.' : 'Complete comparison remains visible.'} Retry to load authors.</small>` : ''}`;
   if (model.authors && (model.authors.length || model.selected)) {
-    if (model.directOnly && model.selected) element.querySelector('small').textContent = 'Shows files with an identifiable surviving contribution by the selected author between these two revisions. The full diff may also include changes made by others.';
     element.insertAdjacentHTML('beforeend', `<label class="comparison-author-direct"><input type="checkbox" data-author-direct ${model.directOnly ? 'checked' : ''} ${!model.selected ? 'disabled' : ''}> Only actual author contributions</label>`);
-    element.querySelector('details')?.insertAdjacentHTML('beforeend', '<p>Strict mode traces surviving unique-line additions/deletions and atomic submodule pointer changes through both sides of the history, including merged branches. Imported changes are not assigned to the merge author. Reverted/overwritten contributions are excluded. Ambiguous resolutions, duplicate/moved lines, binary/large files and edited renames may be inconclusive and are not claimed as proven. Git authorship cannot distinguish manual edits from squash/copy imports.</p>');
     const checkbox = element.querySelector('[data-author-direct]');
     checkbox.checked = model.directOnly;
     checkbox.addEventListener('change', event => {
@@ -1928,7 +1942,7 @@ function renderComparisonAuthorFilter(container, context, options = {}) {
     });
     const select = element.querySelector('[data-author-select]');
     if (model.selected && !model.authors.some(author => author.key === model.selected)) {
-      select.insertAdjacentHTML('beforeend', `<option value="${esc(model.selected)}">${esc(model.selected.replace(/^(email|name):/, ''))} — no commits in this range</option>`);
+      select.insertAdjacentHTML('beforeend', `<option value="${esc(model.selected)}">${esc(model.selected.replace(/^(email|name):/, ''))} — no matching items here</option>`);
     }
     select.value = model.selected;
     if (model.directOnly && model.selected) {
@@ -1944,14 +1958,19 @@ function renderComparisonAuthorFilter(container, context, options = {}) {
           request.then(() => { if (state.view === 'commander') renderCommander(); });
         });
       } else if (strict?.result) {
-        const ambiguous = Object.entries(strict.result.ambiguous_paths || {});
-        element.insertAdjacentHTML('beforeend', `<small>${strict.result.paths.length} paths with an identifiable contribution. The full file diff is preserved.</small>`);
-        if (ambiguous.length) element.insertAdjacentHTML('beforeend', `<details><summary>${ambiguous.length} paths inconclusive — excluded, not claimed as yours</summary>${ambiguous.slice(0,20).map(([path,reason]) => `<p><code>${esc(path)}</code>: ${esc(reason)}</p>`).join('')}${ambiguous.length>20?'<p>Showing the first 20 inconclusive paths.</p>':''}</details>`);
+        const counts = comparisonAuthorPartition(options.rows || [], model);
+        const structural = counts.shown - counts.content.length;
+        element.insertAdjacentHTML('beforeend', `<small class="comparison-author-summary" role="status" title="Items in this view; the same population as the normal author filter">${counts.shown} of ${counts.total} items shown · ${counts.excluded} excluded${structural ? ` · ${structural} grouped as reconfiguration` : ''}</small>`);
+        const diagnostic = `comparison_author_partition: total=${counts.total} shown=${counts.shown} content=${counts.content.length} structural=${structural} inconclusive=${counts.inconclusive.length} no_contribution=${counts.noContribution.length}`;
+        if (model.lastPartitionDiagnostic !== diagnostic) { model.lastPartitionDiagnostic = diagnostic; jsPerfLog(diagnostic, 0); }
       }
+    } else if (model.selected) {
+      const count = (options.rows || []).filter(row => comparisonAuthorMatches(row, model)).length;
+      element.insertAdjacentHTML('beforeend', `<small class="comparison-author-summary" role="status">${count} items shown · touched by this author · complete item diffs</small>`);
     }
   }
-  if (options.workspace) element.insertAdjacentHTML('beforeend', '<small>Authors come from commits between local HEAD and the compared remote revision. Uncommitted changes have no Git author; matching files still show the complete local–remote diff.</small>');
-  if (model.authors?.length === 0) element.insertAdjacentHTML('beforeend', `<small>No authors in the history between these revisions. ${model.selected ? 'No matching files.' : 'All differences remain visible.'}</small>`);
+  if (options.workspace) element.querySelector('.comparison-author-help > div')?.insertAdjacentHTML('beforeend', '<p>Uncommitted changes have no Git author. Strict mode requires two committed revisions.</p>');
+  if (model.authors?.length === 0) element.insertAdjacentHTML('beforeend', `<small>No author touches found for these compared items in the selected history. ${model.selected ? 'No matching items.' : 'All differences remain visible.'}</small>`);
   element.querySelector('[data-author-select]')?.addEventListener('change', event => {
     comparisonAuthorCache.select(model, event.target.value);
     jsPerfLog(`comparison_author_filter: mode=${model.directOnly ? 'strict' : 'all-history'} selected=${!!model.selected} matched_paths=${model.paths?.size ?? 0}`, 0);
@@ -2052,19 +2071,21 @@ function renderCommander() {
     ? (state.branchCompareLeftRevision && state.branchCompareRightRevision
       ? { repositoryPath: spec.repositoryPath, leftRevision: state.branchCompareLeftRevision, rightRevision: state.branchCompareRightRevision } : null)
     : state.workspaceCompareAuthorContext;
+  const flatMode = state.compareFlatMode;
+  const query = refs.search.value.trim().toLowerCase();
+  const candidates = state.commanderRows.filter(row => compareRowVisible(row, query, flatMode ? state.compareFlatFilter : 'all'));
   const authorModel = renderComparisonAuthorFilter(refs.gitCompareFlatControls,
     state.compareFlatMode ? authorContext : null,
-    { visible: state.compareFlatMode, workspace: !branchCompareMode });
+    { visible: state.compareFlatMode, workspace: !branchCompareMode, rows:candidates, scopeRows:state.commanderRows });
   const remoteBranches = (comparisonBranches() || []).filter(branch => branch.remote);
   refs.remoteRef.innerHTML = remoteBranches.map(branch => `<option value="${esc(branch.name)}" ${branch.name === state.remoteRef ? 'selected' : ''}>${esc(branch.name)}</option>`).join('') || '<option value="">No remote refs</option>';
-  const flatMode = state.compareFlatMode;
-  const query = refs.search.value.trim().toLowerCase(); const rows = state.commanderRows.filter(row => compareRowVisible(row, query, flatMode ? state.compareFlatFilter : 'all') && comparisonAuthorMatches(row, authorModel));
+  const rows = candidates.filter(row => comparisonAuthorMatches(row, authorModel));
   if (flatMode) logComparisonAuthorDisplay(authorModel, state.commanderRows.length, rows.length, query || state.compareFlatFilter !== 'all');
   const upRow = state.commanderPath && !flatMode ? `<button class="commander-row commander-grid up-row" data-commander-up="1">
     <span class="commander-side local">${iconFor({kind:'folder'})}<span class="commander-file-copy"><strong>..</strong><small>Parent folder</small></span></span><span class="compare-state"><i></i></span><span class="commander-side remote">${iconFor({kind:'folder'})}<span class="commander-file-copy"><strong>..</strong><small>Parent folder</small></span></span>
   </button>` : '';
   const rowsHtml = flatMode
-    ? rows.map(row => flatCompareRowHtml(row, 'data-commander-entry') + comparisonEvidenceRowHtml(row, authorModel)).join('')
+    ? comparisonAuthorRowsHtml(rows, candidates, authorModel, 'data-commander-entry')
     : rows.map(row => `<button class="commander-row commander-grid ${row.relative_path === state.commanderFocus ? 'focused' : ''}" data-commander-entry="${esc(row.relative_path)}">
     ${commanderSide(row.local, 'local')}<span class="compare-state ${esc(row.status)}"><i></i>${esc(compareStatusText(row.status, branchCompareMode ? 'branch' : state.compareMode))}</span>${commanderSide(row.remote, 'remote')}</button>`).join('');
   refs.commanderRows.innerHTML = upRow + rowsHtml || `<div class="loading-row">${flatMode ? comparisonAuthorEmptyMessage(authorModel) : 'No items to compare'}</div>`;
@@ -2219,16 +2240,18 @@ function renderSubmoduleCompare() {
     return;
   }
   const rowsSource = compare?.rows || [];
+  const query = refs.search.value.trim().toLowerCase();
+  const candidates = rowsSource.filter(row => compareRowVisible(row, query, state.subCompareFlatMode ? state.subCompareFlatFilter : 'all'));
   const authorModel = renderComparisonAuthorFilter(refs.subCompareFlatControls,
     state.subCompareFlatMode && compare?.leftRevision && compare?.rightRevision
-      ? { repositoryPath: state.repository.path, ...(compare.externalOwner ? { owner: compare.externalOwner, repositoryName: compare.externalRepositoryName } : { submodulePath: compare.submodulePath }), leftRevision: compare.leftRevision, rightRevision: compare.rightRevision } : null);
-  const query = refs.search.value.trim().toLowerCase(); const rows = rowsSource.filter(row => compareRowVisible(row, query, state.subCompareFlatMode ? state.subCompareFlatFilter : 'all') && comparisonAuthorMatches(row, authorModel));
+      ? { repositoryPath: state.repository.path, ...(compare.externalOwner ? { owner: compare.externalOwner, repositoryName: compare.externalRepositoryName } : { submodulePath: compare.submodulePath }), leftRevision: compare.leftRevision, rightRevision: compare.rightRevision } : null, {rows:candidates, scopeRows:rowsSource});
+  const rows = candidates.filter(row => comparisonAuthorMatches(row, authorModel));
   if (state.subCompareFlatMode) logComparisonAuthorDisplay(authorModel, rowsSource.length, rows.length, query || state.subCompareFlatFilter !== 'all');
   const upRow = state.commanderPath && !state.subCompareFlatMode ? `<button class="commander-row commander-grid up-row" data-commander-up="1">
     <span class="commander-side local">${iconFor({kind:'folder'})}<span class="commander-file-copy"><strong>..</strong><small>Parent folder</small></span></span><span class="compare-state"><i></i></span><span class="commander-side remote">${iconFor({kind:'folder'})}<span class="commander-file-copy"><strong>..</strong><small>Parent folder</small></span></span>
   </button>` : '';
   const rowsHtml = state.subCompareFlatMode
-    ? rows.map(row => flatCompareRowHtml(row, 'data-sub-compare-entry') + comparisonEvidenceRowHtml(row, authorModel)).join('')
+    ? comparisonAuthorRowsHtml(rows, candidates, authorModel, 'data-sub-compare-entry')
     : rows.map(row => `<button class="commander-row commander-grid ${row.relative_path === state.commanderFocus ? 'focused' : ''}" data-sub-compare-entry="${esc(row.relative_path)}">
     ${commanderSide(row.local, 'local')}<span class="compare-state ${esc(row.status)}"><i></i>${esc(compareStatusText(row.status, 'submodule'))}</span>${commanderSide(row.remote, 'remote')}</button>`).join('');
   refs.subCompareRows.innerHTML = upRow + rowsHtml || `<div class="loading-row">${state.subCompareFlatMode ? comparisonAuthorEmptyMessage(authorModel) : 'No differences in this folder'}</div>`;
