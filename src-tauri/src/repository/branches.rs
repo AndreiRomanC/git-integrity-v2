@@ -1,6 +1,7 @@
 use super::*;
 
 pub mod merge;
+pub mod merge_preview;
 
 #[derive(Serialize)]
 pub struct BranchCreationContext {

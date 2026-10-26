@@ -110,6 +110,17 @@ fn unregistered_merge_gitlinks(
 ) -> Result<Vec<String>, String> {
     if links.is_empty() { return Ok(vec![]); }
     let index = repo.index().map_err(|error| error.message().to_string())?;
+    unregistered_gitlinks_in_index(&index, repository_path, links)
+}
+
+// Also used by the preview's IN-MEMORY index. Never substitute the real index
+// when checking the simulated result's .gitmodules registration.
+pub(super) fn unregistered_gitlinks_in_index(
+    index: &git2::Index,
+    repository_path: &str,
+    links: &HashMap<String, git2::Oid>,
+) -> Result<Vec<String>, String> {
+    if links.is_empty() { return Ok(vec![]); }
     if (1..=3).any(|stage| index.get_path(Path::new(".gitmodules"), stage).is_some()) {
         return Err("Resolve the .gitmodules conflict before reviewing or updating submodules.".into());
     }

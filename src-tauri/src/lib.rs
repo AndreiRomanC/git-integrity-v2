@@ -151,6 +151,8 @@ pub fn run() {
             repository::force_push_submodule,
             repository::file_blame,
             repository::branches::merge::merge_branch,
+            repository::branches::merge_preview::preview_merge,
+            repository::branches::merge_preview::merge_preview_contents,
             repository::branches::merge::merge_in_progress,
             repository::branches::merge::list_conflicts,
             repository::branches::merge::submodule_merge_review,

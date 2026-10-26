@@ -17,6 +17,8 @@ pub struct Introduction {
     date: String,
     parent: Option<String>,
     kind: String,
+    #[serde(flatten)]
+    context: EvidenceContext,
     witness_path: String,
     before_revision: Option<String>,
     after_revision: Option<String>,
@@ -52,28 +54,29 @@ fn record(authors: &mut Authors, commit: &git2::Commit, path: &str, witness: Int
     let key = if email.is_empty() { format!("name:{name}") } else { format!("email:{email}") };
     let author = authors.entry(key.clone()).or_insert_with(|| Introducer { key, name, email, paths: vec![], evidence: BTreeMap::new() });
     let evidence = author.evidence.entry(path.to_owned()).or_default();
-    // One witness of each reason per item; history membership is not a list
+    // One witness of each reason and side per item; history membership is not a list
     // of every intermediate commit, nor proof that a specific edit survived.
-    if !evidence.iter().any(|e| e.kind == witness.kind && e.parent_repository == witness.parent_repository) {
+    if !evidence.iter().any(|e| e.kind == witness.kind && e.parent_repository == witness.parent_repository && e.context.side == witness.context.side) {
         budget.evidence += 1; budget.check()?;
         evidence.push(witness);
     }
     Ok(())
 }
 
-fn witness(commit: &git2::Commit, path: &str, kind: &str, before: Option<Oid>, after: Option<Oid>, parent_repository: Option<&str>) -> Result<Introduction, String> {
+fn witness(commit: &git2::Commit, path: &str, kind: &str, before: Option<Oid>, after: Option<Oid>, parent_repository: Option<&str>, context: &EvidenceContext) -> Result<Introduction, String> {
     Ok(Introduction {
         commit: commit.id().to_string(), date: short_date(commit.time().seconds()),
         parent: if commit.parent_count() == 0 { None } else { Some(commit.parent_id(0).map_err(|e| e.to_string())?.to_string()) },
-        kind: kind.into(), witness_path: path.into(), before_revision: before.map(|id| id.to_string()),
+        kind: kind.into(), context: context.clone(), witness_path: path.into(), before_revision: before.map(|id| id.to_string()),
         after_revision: after.map(|id| id.to_string()), parent_repository: parent_repository.map(str::to_owned),
     })
 }
 
 fn walk(repo: &Repository, left: Oid, right: Oid, budget: &mut Budget,
-    mut visit: impl FnMut(&git2::Commit, &git2::Diff, &mut Budget) -> Result<(), String>) -> Result<(), String> {
+    mut visit: impl FnMut(&git2::Commit, &git2::Diff, &HashSet<String>, &EvidenceContext, &mut Budget) -> Result<(), String>) -> Result<(), String> {
     if repo.is_shallow() { return Err("Introduction history is incomplete: this repository is shallow. No partial results were applied.".into()); }
-    for (tip, hide) in [(left, right), (right, left)] {
+    for (tip, hide, side) in [(left, right, "left"), (right, left, "right")] {
+        let context = EvidenceContext::new(repo, side);
         let mut walk = repo.revwalk().map_err(|e| e.to_string())?;
         walk.set_sorting(git2::Sort::TOPOLOGICAL).map_err(|e| e.to_string())?;
         walk.push(tip).map_err(|e| e.to_string())?; walk.hide(hide).map_err(|e| e.to_string())?;
@@ -86,7 +89,8 @@ fn walk(repo: &Repository, left: Oid, right: Oid, budget: &mut Budget,
             // claimed as a personal edit by the merge author.
             let parent = if commit.parent_count() == 0 { None } else { Some(commit.parent(0).and_then(|p| p.tree()).map_err(|e| e.to_string())?) };
             let diff = repo.diff_tree_to_tree(parent.as_ref(), Some(&tree), None).map_err(|e| e.to_string())?;
-            visit(&commit, &diff, budget)?;
+            let conversions = conversion_roots(&diff, parent.as_ref(), &tree)?;
+            visit(&commit, &diff, &conversions, &context, budget)?;
         }
     }
     budget.check()
@@ -128,7 +132,7 @@ fn collect_introductions(repo: &Repository, left: Oid, right: Oid, paths: Option
     };
     let mut authors = Authors::new();
     if relevant.is_empty() { return Ok(vec![]); }
-    walk(repo, left, right, &mut budget, |commit, diff, budget| {
+    walk(repo, left, right, &mut budget, |commit, diff, conversions, context, budget| {
         for delta in diff.deltas() {
             budget.check()?;
             let before = gitlink(delta.old_file()); let after = gitlink(delta.new_file());
@@ -136,7 +140,13 @@ fn collect_introductions(repo: &Repository, left: Oid, right: Oid, paths: Option
                 (true, true) => "merge-submodule", (false, true) => "submodule-update", (true, false) => "merge", (false, false) => "commit",
             };
             for path in [delta.old_file().path(), delta.new_file().path()].into_iter().flatten().map(normalized) {
-                if relevant.contains(&path) { record(&mut authors, commit, &path, witness(commit, &path, kind, before, after, None)?, budget)?; }
+                if relevant.contains(&path) {
+                    let conversion = conversion_for_path(&path, conversions);
+                    let kind = if conversion.is_some() {
+                        if commit.parent_count() > 1 { "merge-folder-submodule-conversion" } else { "folder-submodule-conversion" }
+                    } else { kind };
+                    record(&mut authors, commit, &path, witness(commit, conversion.unwrap_or(&path), kind, before, after, None, context)?, budget)?;
+                }
             }
         }
         Ok(())
@@ -147,7 +157,7 @@ fn collect_introductions(repo: &Repository, left: Oid, right: Oid, paths: Option
         // Cache only this request's bounded set of pointer pairs; no repository
         // cache or polling. Repeated merges do not repeatedly diff child trees.
         let mut pairs: BTreeMap<(Option<Oid>, Option<Oid>), Vec<String>> = BTreeMap::new();
-        walk(&parent_repo, Oid::from_str(&parent.left_revision).map_err(|e| e.to_string())?, Oid::from_str(&parent.right_revision).map_err(|e| e.to_string())?, &mut budget, |commit, diff, budget| {
+        walk(&parent_repo, Oid::from_str(&parent.left_revision).map_err(|e| e.to_string())?, Oid::from_str(&parent.right_revision).map_err(|e| e.to_string())?, &mut budget, |commit, diff, _, context, budget| {
             for delta in diff.deltas() {
                 budget.check()?;
                 if ![delta.old_file().path(), delta.new_file().path()].into_iter().flatten().any(|p| normalized(p) == parent_path) { continue; }
@@ -181,7 +191,7 @@ fn collect_introductions(repo: &Repository, left: Oid, right: Oid, paths: Option
                 }
                 for path in &pairs[&pair] {
                     let kind = if commit.parent_count() > 1 { "parent-merge-submodule" } else { "parent-submodule-update" };
-                    record(&mut authors, commit, path, witness(commit, &parent_path, kind, before, after, Some(&parent.repository_path))?, budget)?;
+                    record(&mut authors, commit, path, witness(commit, &parent_path, kind, before, after, Some(&parent.repository_path), context)?, budget)?;
                 }
             }
             Ok(())
@@ -390,6 +400,57 @@ mod tests {
         // Parent-level atomic changes remain inspectable; only the unsupported
         // cross-repository expansion fails instead of inventing file ownership.
         assert!(!collect_introductions(&parent.repo,p0,p2,None,None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn conversion_introductions_are_structural_and_keep_later_file_edits_distinct() {
+        let f = Fixture::new();
+        let base = f.entries("base@test", &[("unit", "1111111111111111111111111111111111111111", 0o160000)], &[]);
+        let unpacked = f.commit("converter@test", &[("unit/code", "copied"), ("unit/model", "binary\0import")], &[base]);
+        let tip = f.commit("converter@test", &[("unit/code", "personal edit"), ("unit/model", "binary\0import")], &[unpacked]);
+        for (left, right, side) in [(base, tip, "right"), (tip, base, "left")] {
+            let result = collect_introductions(&f.repo, left, right, Some(vec!["unit/code".into(), "unit/model".into()]), None).unwrap();
+            let author = &result[0]; assert_eq!(author.paths, ["unit/code", "unit/model"]);
+            assert_eq!(author.evidence["unit/model"][0].kind, "folder-submodule-conversion");
+            let events = &author.evidence["unit/code"];
+            assert_eq!(events.len(), 2);
+            assert!(events.iter().any(|e| e.commit == tip.to_string() && e.kind == "commit"));
+            assert!(events.iter().any(|e| e.commit == unpacked.to_string() && e.kind == "folder-submodule-conversion" && e.witness_path == "unit"));
+            assert!(events.iter().all(|e| e.context.side == side));
+        }
+        let merged = f.commit("integrator@test", &[("unit/code", "personal edit"), ("unit/model", "binary\0import")], &[base, tip]);
+        let result = collect_introductions(&f.repo, base, merged, None, None).unwrap();
+        let integrator = result.iter().find(|a| a.email == "integrator@test").unwrap();
+        assert_eq!(integrator.evidence["unit/code"][0].kind, "merge-folder-submodule-conversion");
+        let touched = collect(&f.repo, base, merged).unwrap();
+        assert!(touched.iter().find(|a| a.email == "integrator@test").unwrap().paths.is_empty());
+    }
+
+    #[test]
+    fn introduction_events_keep_both_sides_and_parent_repository_context() {
+        let f = Fixture::new();
+        let base = f.commit("base@test", &[("f", "base")], &[]);
+        let a = f.commit("alice@test", &[("f", "a")], &[base]);
+        let b = f.commit("alice@test", &[("f", "b")], &[base]);
+        let result = collect_introductions(&f.repo, a, b, None, None).unwrap();
+        assert_eq!(result[0].evidence["f"].len(), 2);
+        for event in &result[0].evidence["f"] {
+            assert_eq!(event.context.side, if event.commit == a.to_string() { "left" } else { "right" });
+        }
+        let parent=Fixture::new(); let sub=child(&parent);
+        let old=sub.commit("writer@test", &[("f", "old")], &[]);
+        let new=sub.commit("writer@test", &[("f", "new")], &[old]);
+        let p0=pointer(&parent,"base@test",old,&[]);
+        let p1=pointer(&parent,"updater@test",new,&[p0]);
+        for (left,right,pa,pb,side) in [(old,new,p0,p1,"right"),(new,old,p1,p0,"left")] {
+            let result=collect_introductions(&sub.repo,left,right,None,Some(&context(&parent,pa,pb))).unwrap();
+            let updater=result.iter().find(|a| a.email=="updater@test").unwrap();
+            let event=&updater.evidence["f"][0];
+            assert_eq!(event.kind,"parent-submodule-update"); assert_eq!(event.context.side,side);
+            assert_eq!(event.context.repository_path,normalized(parent.repo.workdir().unwrap()));
+            assert_ne!(event.context.repository_path,normalized(sub.repo.workdir().unwrap()));
+            assert_eq!(event.before_revision,Some(old.to_string())); assert_eq!(event.after_revision,Some(new.to_string()));
+        }
     }
 
     #[test]

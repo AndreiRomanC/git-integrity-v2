@@ -601,7 +601,7 @@ test('graph exposes branch and commit context actions without relying on lane id
   assert.match(app, /openMergeBranchDialog\(activeGraphMergeTarget\(\), branchName\)/);
   assert.match(app, /showGraphCommitContextMenu\(event, row\.dataset\.id\)/);
   assert.doesNotMatch(app, /function showGraphBranchContextMenu\(/);
-  assert.match(app, /\.\.\.mergeRefs\.map\(\(ref, index\) => graphMergeMenuItem\(ref\.name, `merge-\$\{index\}`\)\)/);
+  assert.match(app, /\.\.\.mergeRefs\.flatMap\(\(ref, index\) => \[graphMergeMenuItem\(ref\.name, `merge-\$\{index\}`\), graphMergePreviewMenuItem\(ref\.name, `preview-merge-\$\{index\}`, commitId\)\]/);
   assert.match(app, /Create new branch here…/);
   assert.match(app, /Checkout exact commit/);
   assert.match(app, /Clean checkout exact commit…/);

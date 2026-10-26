@@ -68,7 +68,7 @@ test('switching folders at identical SHAs isolates pending author and strict res
   pending.get('comparison_authors:a/file')([{...authors[0],paths:['a/file']}]); await loadA;
   const strictA = cache.loadStrict(a); await Promise.resolve();
   assert.equal(b.authors,null);
-  assert.equal(b.selected,authors[0].key); assert.equal(b.directOnly,true);
+  assert.equal(b.selected,authors[0].key); assert.equal(b.directOnly,false,'surviving analysis is not inherited by another folder');
   assert.equal(comparisonAuthorMatches({relative_path:'b/file'},b),false);
   pending.get('comparison_authors:b/file')([{key:'other',paths:['b/file']}]); await loadB;
   pending.get('comparison_author_contributions:a/file')({paths:['a/file']}); await strictA;
@@ -205,6 +205,8 @@ test('per-file evidence uses selected identity and active mode without including
   await cache.loadStrict(model);
   assert.deepEqual(comparisonAuthorEvidence(row,model),[{...direct,path:'modified'}]);
   cache.select(model,'other');
+  assert.deepEqual(comparisonAuthorEvidence(row,model),[{...imported,path:'modified'}]);
+  cache.setDirectOnly(model,true);
   assert.deepEqual(comparisonAuthorEvidence(row,model),[]);
   cache.select(model,'');
   assert.deepEqual(comparisonAuthorEvidence(row,model),[]);
@@ -267,6 +269,9 @@ test('strict checkbox loads attribution only on demand and caches each author in
   assert.equal(model.selected, authors[0].key);
   assert.deepEqual(rows.filter(row => comparisonAuthorMatches(row, model)), [rows[2]]);
   cache.select(model, 'side');
+  assert.equal(model.directOnly,false);
+  assert.deepEqual(rows.filter(row => comparisonAuthorMatches(row, model)),[rows[1]]);
+  cache.setDirectOnly(model,true);
   await cache.loadStrict(model);
   assert.equal(rows.filter(row => comparisonAuthorMatches(row, model)).length, 0);
   cache.select(model, '');
@@ -359,15 +364,18 @@ test('late author results never enter another repository/revision/submodule cont
   assert.equal(next.paths, null); assert.equal(old.authors, authors);
 });
 
-test('author and strict preference survive revision changes without falling back to all files', async () => {
+test('author survives revision changes, but surviving attribution requires a new explicit choice', async () => {
   const cache = createComparisonAuthorCache(async command => command==='comparison_author_contributions'?{paths:['modified'],evidence:{},ambiguous_paths:{}}:[{...authors[0], direct_paths:['modified']}]);
   const old = cache.get(context); await cache.load(old);
   cache.select(old, authors[0].key); cache.setDirectOnly(old, true);
   const next = cache.get({...context, rightRevision:'next'});
   assert.equal(next.selected, authors[0].key);
-  assert.equal(next.directOnly, true);
+  assert.equal(next.directOnly, false);
   assert.equal(comparisonAuthorMatches({relative_path:'modified'},next), false);
   await cache.load(next);
+  assert.equal(await cache.loadStrict(next),null);
+  assert.equal(comparisonAuthorMatches({relative_path:'new'},next),true);
+  cache.setDirectOnly(next,true);
   await cache.loadStrict(next);
   assert.equal(comparisonAuthorMatches({relative_path:'modified'},next), true);
   assert.equal(comparisonAuthorMatches({relative_path:'new'},next), false);
@@ -382,12 +390,12 @@ test('rapid author changes cannot install a previous author strict result; toggl
   const model = cache.get(context); await cache.load(model);
   cache.select(model,authors[0].key); cache.setDirectOnly(model,true);
   const a = cache.loadStrict(model); await Promise.resolve();
-  cache.select(model,'b'); const b = cache.loadStrict(model); await Promise.resolve();
+  cache.select(model,'b'); cache.setDirectOnly(model,true); const b = cache.loadStrict(model); await Promise.resolve();
   pending.get(authors[0].key)({paths:['modified'],evidence:{},ambiguous_paths:{}}); await a;
   assert.equal(model.paths.size,0);
   pending.get('b')({paths:['other'],evidence:{},ambiguous_paths:{}}); await b;
   assert.deepEqual([...model.paths],['other']);
-  cache.select(model,authors[0].key); await cache.loadStrict(model);
+  cache.select(model,authors[0].key); cache.setDirectOnly(model,true); await cache.loadStrict(model);
   assert.deepEqual([...model.paths],['modified']);
   cache.setDirectOnly(model,false);
   assert.deepEqual([...model.paths],authors[0].paths);

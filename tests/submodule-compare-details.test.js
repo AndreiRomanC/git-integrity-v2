@@ -104,6 +104,14 @@ test('integration pins displayed parent commits and opens contents in the exact 
   c.openSubmoduleComparisonDetails({ relative_path: 'nested', local: { revision: 'grandchild' } }, true);
   assert.equal(calls.at(-1).repositoryPath, '/parent/modules/dep');
   assert.equal(calls.at(-1).leftRef, 'child-old'); assert.equal(c.current(), true);
+  const evidence={touch:{parent:'parent-before',commit:'parent-event',kind:'parent-submodule-update',repository_path:'/parent'}};
+  c.openSubmoduleComparisonDetails({relative_path:'modules/dep'},true,evidence);
+  assert.equal(calls.at(-1).repositoryPath,'/parent');
+  assert.equal(calls.at(-1).leftRef,'parent-before'); assert.equal(calls.at(-1).rightRef,'parent-event');
+  assert.equal(calls.at(-1).workspaceRevision,null);
+  assert.equal(c.current(),true,'witness refs differ from child endpoints without invalidating the request');
+  state.submoduleCompare.leftRevision='another'; assert.equal(c.current(),false);
+  state.submoduleCompare.leftRevision='child-old'; assert.equal(c.current(),true);
   state.submoduleCompare.loading = {}; assert.equal(c.current(), false);
 });
 test('closing or replacing a details request during context loading cancels navigation', async () => {

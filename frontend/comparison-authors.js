@@ -3,9 +3,12 @@
 function createComparisonAuthorCache(invoke, capacity = 4) {
   const entries = new Map();
   const preferences = new Map();
+  let activeKey = null;
   const scope = context => JSON.stringify([context.repositoryPath, context.submodulePath || '', context.owner || '', context.repositoryName || '']);
   function remember(model) {
-    preferences.set(scope(model.context), { mode:model.mode, selected:model.selected, directOnly:model.directOnly });
+    // Surviving attribution is an explicit choice for this exact comparison,
+    // not a hidden preference inherited by another folder/revision/author.
+    preferences.set(scope(model.context), { mode:model.mode, selected:model.selected });
     apply(model);
   }
   function apply(model) {
@@ -24,7 +27,11 @@ function createComparisonAuthorCache(invoke, capacity = 4) {
         if (entries.size > capacity) entries.delete(entries.keys().next().value);
       }
       const model = entries.get(key);
-      Object.assign(model, preferences.get(scope(context)) || {});
+      if (activeKey !== key) model.directOnly = false;
+      activeKey = key;
+      const preference = preferences.get(scope(context));
+      if (preference && (preference.mode !== model.mode || preference.selected !== model.selected)) model.directOnly = false;
+      Object.assign(model, preference || {});
       apply(model);
       return model;
     },
@@ -38,12 +45,13 @@ function createComparisonAuthorCache(invoke, capacity = 4) {
       const { scopePaths, parentComparison, ...context } = model.context;
       const request = scopePaths ? {...context, comparisonPaths:scopePaths} : context;
       model.pending = Promise.resolve().then(() => invoke('comparison_authors', request))
-        .then(authors => { model.authors = authors; model.contributorsByPath = comparisonContributorIndex(authors); apply(model); return authors; })
+        .then(authors => { model.authors = authors; model.contributorsByPath = comparisonContributorIndex(authors); model.structuralByPath = comparisonStructuralIndex(authors); apply(model); return authors; })
         .catch(error => { model.error = String(error); return null; })
         .finally(() => { model.pending = null; });
       return model.pending;
     },
     select(model, key, mode = 'touched') {
+      model.directOnly = false;
       model.selected = key || '';
       model.mode = model.selected ? mode : 'all';
       remember(model);
@@ -51,6 +59,7 @@ function createComparisonAuthorCache(invoke, capacity = 4) {
     setMode(model, mode) {
       if (!['all','touched','shared','introduced'].includes(mode)) throw new Error('Unknown contributor filter');
       model.mode = mode;
+      model.directOnly = false;
       remember(model);
     },
     setDirectOnly(model, enabled) {
@@ -162,6 +171,32 @@ function comparisonContributorEvidence(row, model) {
     comparisonAuthorEvidence(row, {...model, mode:'touched', selected:author.key, directOnly:false})
       .map(touch => ({...touch, authorKey:author.key, authorName:author.name, authorEmail:author.email})));
 }
+function comparisonStructuralIndex(authors) {
+  const index = new Map();
+  for (const author of authors) for (const [path, touches] of Object.entries(author.evidence || {})) {
+    const structural = touches.filter(touch => touch.kind === 'folder-submodule-conversion' && touch.witness_path !== path)
+      .map(touch => ({...touch, path:touch.witness_path, authorKey:author.key, authorName:author.name, authorEmail:author.email}));
+    if (structural.length) index.set(path, [...(index.get(path) || []), ...structural]);
+  }
+  return index;
+}
+function comparisonStructuralEvidence(row, model) {
+  const index = model?.structuralByPath || comparisonStructuralIndex(model?.authors || []);
+  const seen = new Set();
+  return comparisonRowPaths(row).flatMap(path => index.get(path) || []).filter(touch => {
+    const key = JSON.stringify([touch.repository_path, touch.commit, touch.path]);
+    if (seen.has(key)) return false;
+    seen.add(key); return true;
+  });
+}
+function comparisonEvidenceDiagnostic(row, model, touch) {
+  // Explicitly expanded evidence only. No file contents, identities or remote
+  // URLs; JSON escapes line breaks in paths so each diagnostic stays one line.
+  return 'comparison_author_evidence: ' + JSON.stringify({mode:comparisonAuthorMode(model), surviving:comparisonAuthorStrict(model),
+    left:model.context.leftRevision, right:model.context.rightRevision, item:row.relative_path, witness_path:touch.path || touch.witness_path || row.relative_path,
+    repository_id:touch.repository_id || 'unavailable', side:touch.side || 'unavailable', kind:touch.kind || 'unavailable',
+    commit:touch.commit, parent:touch.parent || null, date:touch.date || null, change:touch.change || null});
+}
 // Scope to the actual loaded comparison, before text/state/author filtering.
 // No prefix guesses, repository scans, or additional requests while typing.
 // Stable ordering lets the same folder reuse its own metadata, while another
@@ -231,7 +266,9 @@ function comparisonAuthorEvidence(row, model) {
   if (!author) return [];
   const seen = new Set();
   return [row.relative_path, row.local?.relative_path, row.remote?.relative_path].filter(Boolean)
-    .flatMap(path => ((comparisonAuthorStrict(model) ? model.strictResult?.result?.evidence : author.evidence)?.[path] || []).map(touch => ({...touch, path:touch.witness_path || path})))
+    .flatMap(path => ((comparisonAuthorStrict(model) ? model.strictResult?.result?.evidence : author.evidence)?.[path] || [])
+      .filter(touch => comparisonAuthorMode(model) === 'introduced' || comparisonAuthorStrict(model) || touch.kind !== 'folder-submodule-conversion' || touch.witness_path === path)
+      .map(touch => ({...touch, path:touch.witness_path || path})))
     .filter(touch => {
       const key = `${touch.parent_repository || ''}:${touch.path}:${touch.commit}:${touch.kind || ''}`;
       if (seen.has(key)) return false;
@@ -257,4 +294,4 @@ function workspaceComparisonAuthorContext(result) {
       [row.relative_path, row.local?.relative_path, row.remote?.relative_path].filter(Boolean)))].sort(),
   };
 }
-if (typeof module !== 'undefined' && module.exports) module.exports = { createComparisonAuthorCache, loadComparisonLeafScope, comparisonViewRows, comparisonAuthorMatches, comparisonAuthorPartition, comparisonRowPaths, scopedComparisonAuthorContext, comparisonAuthorMode, comparisonAuthorStrict, comparisonAuthorContributors, comparisonContributorEvidence, comparisonAuthorEmptyMessage, comparisonAuthorDiagnostic, comparisonAuthorEvidence, comparisonParentContext, workspaceComparisonAuthorContext };
+if (typeof module !== 'undefined' && module.exports) module.exports = { createComparisonAuthorCache, loadComparisonLeafScope, comparisonViewRows, comparisonAuthorMatches, comparisonAuthorPartition, comparisonRowPaths, scopedComparisonAuthorContext, comparisonAuthorMode, comparisonAuthorStrict, comparisonAuthorContributors, comparisonContributorEvidence, comparisonStructuralEvidence, comparisonEvidenceDiagnostic, comparisonAuthorEmptyMessage, comparisonAuthorDiagnostic, comparisonAuthorEvidence, comparisonParentContext, workspaceComparisonAuthorContext };

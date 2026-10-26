@@ -79,7 +79,7 @@ test('row aliases union contributors and deduplicate each identity once', () => 
   assert.equal(comparisonAuthorMatches(renamed,model),true,'two aliases of a single comparison item count together');
 });
 
-test('All and Shared ignore a retained strict preference; switching back restores it explicitly', async () => {
+test('changing mode clears surviving attribution; selecting Touched never silently restores it', async () => {
   const calls = [];
   const cache = createComparisonAuthorCache(async command => {
     calls.push(command); return command === 'comparison_authors' ? authors : {paths:['src/solo'], evidence:{}, ambiguous_paths:{}};
@@ -94,8 +94,12 @@ test('All and Shared ignore a retained strict preference; switching back restore
   cache.select(model,'');
   assert.deepEqual(matching(model),rows.map(r=>r.relative_path));
   assert.equal(comparisonAuthorStrict(model),false);
-  assert.equal(model.directOnly,true,'the preference is not silently discarded');
+  assert.equal(model.directOnly,false,'surviving analysis resets on filter changes');
   cache.select(model,authors[0].key);
+  assert.equal(comparisonAuthorStrict(model),false);
+  assert.deepEqual(matching(model),['src/shared','src/solo']);
+  assert.equal(await cache.loadStrict(model),null);
+  cache.setDirectOnly(model,true); await cache.loadStrict(model);
   assert.equal(comparisonAuthorStrict(model),true);
   assert.deepEqual(matching(model),['src/solo']);
   assert.deepEqual(calls,['comparison_authors','comparison_author_contributions']);
@@ -189,7 +193,7 @@ test('existing selector includes introduction history; strict is inside Details 
   assert.match(ui.element.innerHTML,/1 of 2 items shown · 1 excluded · surviving contribution required/);
   assert.equal(ui.h.renders,2);
   const shared=ui.element.querySelector('[data-author-select]'); shared.value='@shared'; shared.fire('change'); ui.render();
-  assert.equal(model.mode,'shared'); assert.equal(model.directOnly,true);
+  assert.equal(model.mode,'shared'); assert.equal(model.directOnly,false);
   assert.match(ui.element.innerHTML,/1 items shown · touched by 2\+ recorded authors/);
   assert.doesNotMatch(ui.element.innerHTML,/Details · surviving required|data-author-direct checked/);
 });
@@ -398,7 +402,22 @@ test('parent pointer evidence never opens its commit IDs in a child file diff', 
   assert.match(html,/parent merge changed the submodule pointer/);
   assert.match(html,/modules\/&lt;unit&gt;/); assert.match(html,/child-a.*child-b/);
   assert.match(html,/Parent repository: \/parent/);
-  assert.doesNotMatch(html,/data-evidence-diff|<unit>/);
+  assert.doesNotMatch(html,/<unit>/);
+  assert.match(html,/data-evidence-diff="0"/);
+  const button={dataset:{evidenceDiff:'0'},addEventListener(_,fn){this.click=fn;}};
+  const body={innerHTML:'',querySelectorAll:()=>[button]};
+  const details={open:true,dataset:{authorEvidence:'src/shared'},addEventListener(_,fn){this.toggle=fn;},querySelector:()=>body};
+  const opened=[];
+  ui.h.openGitRevisionFileCompare=()=>assert.fail('parent commits must not be read in the child repository');
+  ui.h.openSubmoduleComparisonDetails=(r,nested,args)=>opened.push({r,nested,args});
+  ui.h.state.compareMode='submodule';
+  ui.h.bindComparisonEvidence({querySelectorAll:()=>[details]},rows,model); details.toggle();
+  button.click({preventDefault(){},stopPropagation(){}});
+  assert.equal(opened[0].r.relative_path,'modules/<unit>');
+  assert.equal(opened[0].args.touch.parent_repository,'/parent');
+  assert.equal(opened[0].args.touch.parent,'parent-before');
+  assert.equal(opened[0].args.touch.commit,'parent-merge');
+  assert.equal(opened[0].nested,true);
 });
 
 test('changing child refs drops parent provenance, reversing swaps both pairs', () => {
@@ -434,4 +453,75 @@ test('a pending strict result cannot narrow the newly chosen introduction filter
   finishStrict({paths:['src/solo']}); await strict;
   assert.deepEqual(matching(model),['src/shared']);
   assert.equal(comparisonAuthorStrict(model),false);
+});
+
+test('conversion imports stay in All with structural evidence, but do not qualify Touched or Shared', async () => {
+  const conversion={...witness('conversion'),kind:'folder-submodule-conversion',witness_path:'src',side:'right',repository_path:'/repo',repository_id:'repo-id'};
+  const edit={...witness('edit'),kind:'file-change',side:'right',repository_path:'/repo',repository_id:'repo-id'};
+  const data=[{...authors[0],paths:['src/solo'],evidence:{'src/shared':[conversion],'src/solo':[conversion,edit],'src/unattributed':[conversion]}},
+    {...authors[1],paths:['src/shared']}, {key:'converter',name:'Only structure',paths:[],evidence:{'src/other':[conversion]}}];
+  const calls=[];
+  const cache=createComparisonAuthorCache(async (...args)=>{calls.push(args);return data;});
+  const ui=renderer(cache), model=ui.render(); await cache.load(model); ui.render();
+  assert.deepEqual(matching(model),rows.map(r=>r.relative_path));
+  assert.deepEqual(comparisonAuthorContributors(rows[0],model).map(a=>a.name),['Bob']);
+  assert.equal(comparisonAuthorContributors(rows[3],model).length,0);
+  assert.match(ui.h.comparisonEvidenceRowHtml(rows[3],model),/History · reconfiguration/);
+  assert.doesNotMatch(ui.element.innerHTML,/<option value="converter">/);
+  const structure=helpers.comparisonStructuralEvidence(rows[3],model);
+  const html=ui.h.comparisonEvidenceBodyHtml(rows[3],model,structure);
+  assert.match(html,/This item differs between the selected versions/);
+  assert.match(html,/Reconfiguration only · individual file edits not established/);
+  assert.match(html,/Right history.*Repository: \/repo/);
+  assert.doesNotMatch(html,/Introduced by|A contribution from this author remains/);
+  cache.select(model,authors[0].key);
+  assert.deepEqual(matching(model),['src/solo']);
+  assert.deepEqual(helpers.comparisonAuthorEvidence(rows[1],model).map(e=>e.commit),['edit']);
+  cache.setMode(model,'shared'); assert.deepEqual(matching(model),[]);
+  cache.setMode(model,'all'); assert.equal(matching(model).length,4);
+  assert.equal(calls.length,1,'classification and disclosure reuse the loaded response');
+});
+
+test('Touched, Introduced, Shared and All explanations follow the current selection, never a late result', async () => {
+  let complete;
+  const cache=createComparisonAuthorCache(command=>command==='comparison_authors' ? Promise.resolve(authors)
+    : new Promise(resolve=>{complete=resolve;}));
+  const ui=renderer(cache), model=ui.render(); await cache.load(model);
+  cache.select(model,introduced[0].key,'introduced'); const pending=cache.loadIntroductions(model); await Promise.resolve();
+  cache.setMode(model,'all'); complete(introduced); await pending;
+  let html=ui.h.comparisonEvidenceBodyHtml(rows[0],model,comparisonContributorEvidence(rows[0],model));
+  assert.match(html,/This item differs between the selected versions/); assert.doesNotMatch(html,/Introduced by/);
+  cache.select(model,introduced[0].key,'introduced');
+  html=ui.h.comparisonEvidenceBodyHtml(rows[0],model,helpers.comparisonAuthorEvidence(rows[0],model));
+  assert.match(html,/Introduced by Integrator/);
+  cache.select(model,authors[0].key);
+  html=ui.h.comparisonEvidenceBodyHtml(rows[0],model,helpers.comparisonAuthorEvidence(rows[0],model));
+  assert.match(html,/This author touched this item/); assert.doesNotMatch(html,/Introduced by/);
+  cache.setMode(model,'shared');
+  html=ui.h.comparisonEvidenceBodyHtml(rows[0],model,comparisonContributorEvidence(rows[0],model));
+  assert.match(html,/At least two recorded authors/); assert.doesNotMatch(html,/Introduced by/);
+});
+
+test('diagnostics carry exact mode, witness and anonymous repository context without contents or identities', () => {
+  const model={context,mode:'touched',selected:'email:alice@test',directOnly:true};
+  const touch={...witness('commit'),path:'module/old\nname',kind:'file-change',side:'left',repository_id:'anonymous-id',repository_path:'/private-repo',authorName:'Alice',authorEmail:'alice@test'};
+  const message=helpers.comparisonEvidenceDiagnostic(row('module/new'),model,touch);
+  const data=JSON.parse(message.slice(message.indexOf(': ')+2));
+  assert.equal(data.mode,'touched'); assert.equal(data.surviving,true);
+  assert.equal(data.side,'left'); assert.equal(data.kind,'file-change'); assert.equal(data.repository_id,'anonymous-id');
+  assert.equal(data.item,'module/new'); assert.equal(data.witness_path,'module/old\nname');
+  assert.equal(data.commit,'commit'); assert.equal(data.parent,'base');
+  assert.doesNotMatch(message,/Alice|alice@test|\/private-repo|\n/);
+});
+
+test('surviving attribution persists through rerenders only, not another author, scope or return navigation', async () => {
+  const cache=createComparisonAuthorCache(async()=>authors);
+  const a=cache.get(context); await cache.load(a); cache.select(a,authors[0].key); cache.setDirectOnly(a,true);
+  assert.equal(comparisonAuthorStrict(cache.get(context)),true,'ordinary rerender preserves explicit choice');
+  const b=cache.get({...context,rightRevision:'another'}); await cache.load(b);
+  assert.equal(comparisonAuthorStrict(b),false);
+  assert.equal(comparisonAuthorStrict(cache.get(context)),false,'returning to cached results cannot resurrect strict filtering');
+  cache.setDirectOnly(a,true); cache.select(a,authors[1].key);
+  assert.equal(comparisonAuthorStrict(a),false);
+  assert.deepEqual(matching(a),['src/shared','src/other']);
 });

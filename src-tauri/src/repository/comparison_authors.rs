@@ -23,8 +23,62 @@ pub struct ComparisonTouch {
     parent: Option<String>,
     change: String,
     direct: bool,
+    kind: &'static str,
+    #[serde(flatten)]
+    context: EvidenceContext,
     #[serde(skip_serializing_if = "Option::is_none")]
     witness_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct EvidenceContext {
+    side: &'static str,
+    repository_path: String,
+    repository_id: String,
+}
+
+impl EvidenceContext {
+    fn new(repo: &Repository, side: &'static str) -> Self {
+        Self { side, repository_path: normalized(repo.workdir().unwrap_or(repo.path())),
+            repository_id: anonymized_repository_id(&repo.path().to_string_lossy()) }
+    }
+}
+
+fn is_folder_submodule_conversion(before: Option<i32>, after: Option<i32>) -> bool {
+    matches!((before, after), (Some(0o160000), Some(0o40000)) | (Some(0o40000), Some(0o160000)))
+}
+
+// Reuse the already computed diff. Only changed gitlink roots need an entry
+// lookup; never enumerate a submodule or scan each descendant's history again.
+fn conversion_roots(diff: &git2::Diff, before: Option<&git2::Tree>, after: &git2::Tree) -> Result<HashSet<String>, String> {
+    let mode = |tree: Option<&git2::Tree>, path: &Path| match tree.map(|t| t.get_path(path)) {
+        Some(Ok(entry)) => Ok(Some(entry.filemode())),
+        None => Ok(None),
+        Some(Err(e)) if e.code() == git2::ErrorCode::NotFound => Ok(None),
+        Some(Err(e)) => Err(e.to_string()),
+    };
+    let mut roots = HashSet::new();
+    for delta in diff.deltas() {
+        if delta.old_file().mode() == git2::FileMode::Commit && delta.new_file().mode() == git2::FileMode::Commit { continue; }
+        for file in [delta.old_file(), delta.new_file()] {
+            if file.mode() != git2::FileMode::Commit { continue; }
+            if let Some(path) = file.path() {
+                if is_folder_submodule_conversion(mode(before, path)?, mode(Some(after), path)?) {
+                    roots.insert(normalized(path));
+                }
+            }
+        }
+    }
+    Ok(roots)
+}
+
+fn conversion_for_path<'a>(path: &'a str, roots: &HashSet<String>) -> Option<&'a str> {
+    if roots.is_empty() { return None; }
+    let mut prefix = path;
+    loop {
+        if roots.contains(prefix) { return Some(prefix); }
+        prefix = prefix.rsplit_once('/')?.0;
+    }
 }
 
 // Symmetric difference: commits reachable from either endpoint but not both.
@@ -62,7 +116,9 @@ fn collect_for_paths(repo: &Repository, left: Oid, right: Oid, comparison_paths:
     let mut authors: BTreeMap<String, (ComparisonAuthor, HashSet<String>, HashSet<String>)> = BTreeMap::new();
     let mut count = 0;
     let mut direct_count = 0;
-    for (tip, hide) in [(left, right), (right, left)] {
+    let mut structural_items = 0;
+    for (tip, hide, side) in [(left, right, "left"), (right, left, "right")] {
+        let context = EvidenceContext::new(repo, side);
         let mut walk = repo.revwalk().map_err(|e| e.to_string())?;
         // Children before parents lets us follow each endpoint's first-parent
         // chain during the existing walk, with no second walk or tree diff.
@@ -105,28 +161,40 @@ fn collect_for_paths(repo: &Repository, left: Oid, right: Oid, comparison_paths:
                 let parent_tree = if commit.parent_count() == 0 { None }
                     else { Some(commit.parent(parent_index).and_then(|p| p.tree()).map_err(|e| e.to_string())?) };
                 let diff = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), None).map_err(|e| e.to_string())?;
+                let conversions = conversion_roots(&diff, parent_tree.as_ref(), &tree)?;
                 for delta in diff.deltas() {
                     // Renames retain existing comparison semantics (delete/add).
                     for path in [delta.old_file().path(), delta.new_file().path()].into_iter().flatten() {
                         let path = normalized(path);
                         if relevant.contains(&path) {
-                            touched_scope = true;
-                            // At most one direct and one imported witness per
-                            // path. Reuse this diff: no extra history/worktree
-                            // scan, and no unbounded list of all file touches.
+                            let conversion = conversion_for_path(&path, &conversions);
+                            let structural_child = conversion.is_some_and(|root| root != path);
+                            let kind = if conversion.is_some() { "folder-submodule-conversion" }
+                                else if delta.old_file().mode() == git2::FileMode::Commit || delta.new_file().mode() == git2::FileMode::Commit { "submodule-update" }
+                                else { "file-change" };
+                            touched_scope |= !structural_child;
+                            // Bounded evidence by kind, side and first-parent
+                            // membership. A conversion never suppresses a real
+                            // later file edit, or an event on the other side.
                             let evidence = author.evidence.entry(path.clone()).or_default();
-                            if !evidence.iter().any(|touch| touch.direct == direct) {
+                            if !evidence.iter().any(|touch| touch.direct == direct && touch.kind == kind && touch.context.side == side) {
                                 evidence.push(ComparisonTouch {
                                     commit: commit.id().to_string(),
                                     date: short_date(commit.time().seconds()),
                                     parent: if commit.parent_count() == 0 { None } else { Some(commit.parent_id(0).map_err(|e| e.to_string())?.to_string()) },
                                     change: format!("{:?}", delta.status()),
                                     direct,
-                                    witness_path: None,
+                                    kind, context: context.clone(),
+                                    witness_path: conversion.map(str::to_owned),
                                 });
+                                structural_items += usize::from(structural_child);
                             }
-                            if direct { direct_paths.insert(path.clone()); }
-                            paths.insert(path);
+                            // Keep structural evidence for All differences,
+                            // not in the file-touch/shared contributor set.
+                            if !structural_child {
+                                if direct { direct_paths.insert(path.clone()); }
+                                paths.insert(path);
+                            }
                         }
                     }
                 }
@@ -135,14 +203,14 @@ fn collect_for_paths(repo: &Repository, left: Oid, right: Oid, comparison_paths:
             direct_count += usize::from(direct && (!scoped || touched_scope));
         }
     }
-    let result: Vec<_> = authors.into_values().filter(|(_, paths, _)| !scoped || !paths.is_empty()).map(|(mut author, paths, direct_paths)| {
+    let result: Vec<_> = authors.into_values().filter(|(author, _, _)| !scoped || !author.evidence.is_empty()).map(|(mut author, paths, direct_paths)| {
         author.paths = paths.into_iter().collect();
         author.paths.sort();
         author.direct_paths = direct_paths.into_iter().collect();
         author.direct_paths.sort();
         author
     }).collect();
-    perf_log(&format!("comparison_authors: {count} commits; direct_non_merge={direct_count}; scoped={scoped}; compared_paths={}; authors={} (object trees only; non-merge touches; first-parent metadata)", relevant.len(), result.len()), started.elapsed());
+    perf_log(&format!("comparison_authors: {count} commits; direct_non_merge={direct_count}; scoped={scoped}; compared_paths={}; authors={}; structural_items={structural_items} (object trees only; non-merge touches; conversion imports separate)", relevant.len(), result.len()), started.elapsed());
     Ok(result)
 }
 
@@ -217,6 +285,15 @@ mod tests {
         authors.iter().filter(|a| a.paths.iter().any(|p| p == path)).map(|a| a.email.as_str()).collect()
     }
 
+    fn assert_reversed(forward: &[ComparisonAuthor], mut reversed: Vec<ComparisonAuthor>) {
+        for author in &mut reversed {
+            for event in author.evidence.values_mut().flatten() {
+                event.context.side = match event.context.side { "left" => "right", "right" => "left", other => panic!("Unknown side: {other}") };
+            }
+        }
+        assert_eq!(serde_json::to_value(forward).unwrap(), serde_json::to_value(reversed).unwrap());
+    }
+
     #[test]
     fn shared_history_keeps_overwritten_intermediate_touches_but_not_fully_reverted_files() {
         let f = Fixture::new();
@@ -238,7 +315,7 @@ mod tests {
         assert_eq!(evidence.commit, repeated.to_string());
         assert_eq!(evidence.parent.as_deref(), Some(intermediate.to_string().as_str()));
         assert!(!evidence.date.is_empty());
-        assert_eq!(serde_json::to_value(&result).unwrap(), serde_json::to_value(collect_for_paths(&f.repo, tip, base, Some(scope)).unwrap()).unwrap());
+        assert_reversed(&result, collect_for_paths(&f.repo, tip, base, Some(scope)).unwrap());
         let full_diff = compare_git_tree_file(&f.path.to_string_lossy(), "folder/shared", &base.to_string(), &tip.to_string()).unwrap();
         assert_eq!(full_diff.local_content, "base");
         assert_eq!(full_diff.remote_content, "bob replaces everything", "history metadata never substitutes an intermediate diff");
@@ -300,7 +377,7 @@ mod tests {
         assert_eq!(result[0].direct_paths, result[0].paths);
         assert!(result[0].evidence.values().flatten().all(|e| e.commit == mixed.to_string()));
         assert_eq!(result[0].evidence.len(), 3);
-        assert_eq!(serde_json::to_value(&result).unwrap(), serde_json::to_value(collect_for_paths(&f.repo, tip, base, Some(scope)).unwrap()).unwrap());
+        assert_reversed(&result, collect_for_paths(&f.repo, tip, base, Some(scope)).unwrap());
         let other = collect_for_paths(&f.repo, base, tip, Some(compared_paths(&f, "folder-other", base, tip))).unwrap();
         assert_eq!(other.len(), 1); assert_eq!(other[0].email, "bob@test");
         assert_eq!(other[0].paths, ["folder-other/file"]);
@@ -416,7 +493,7 @@ mod tests {
         let alice = result.iter().find(|a| a.email == "alice@test").unwrap();
         assert_eq!(alice.paths, ["imported", "later", "shared"]);
         assert_eq!(alice.direct_paths, ["later", "shared"]);
-        assert_eq!(serde_json::to_value(&result).unwrap(), serde_json::to_value(collect(&f.repo, tip, base).unwrap()).unwrap());
+        assert_reversed(&result, collect(&f.repo, tip, base).unwrap());
         let workspace = collect_for_paths(&f.repo, base, tip, Some(vec!["imported".into(), "later".into(), "untracked".into()])).unwrap();
         assert_eq!(workspace.iter().find(|a| a.email == "alice@test").unwrap().direct_paths, ["later"]);
     }
@@ -509,7 +586,7 @@ mod tests {
         let forward = collect(&f.repo, left, right).unwrap();
         assert_eq!(paths(&forward, "left@test"), ["old", "renamed"]);
         assert_eq!(paths(&forward, "right@test"), ["old"]);
-        assert_eq!(serde_json::to_value(&forward).unwrap(), serde_json::to_value(collect(&f.repo, right, left).unwrap()).unwrap());
+        assert_reversed(&forward, collect(&f.repo, right, left).unwrap());
         assert_eq!(compare_git_tree_file_list(&f.path.to_string_lossy(), "", &base.to_string(), &left.to_string()).unwrap().rows.len(), 2);
     }
 
@@ -534,6 +611,88 @@ mod tests {
         assert_eq!(fs::read(f.repo.path().join("index")).unwrap(), before);
         assert_eq!(fs::read_to_string(f.path.join("f")).unwrap(), "local edit after revert");
         assert_eq!(fs::read_to_string(f.path.join("untracked")).unwrap(), "no author");
+    }
+
+    #[test]
+    fn conversions_keep_structural_evidence_without_crediting_imported_or_removed_files() {
+        let f = Fixture::new();
+        let gitlink = "1111111111111111111111111111111111111111";
+        let packed = f.entries("base@test", &[("module", gitlink, 0o160000)], &[]);
+        let unpacked = f.commit("converter@test", &[("module/code", "imported"), ("module/model", "binary\0payload")], &[packed]);
+        let repacked = f.entries("packer@test", &[("module", gitlink, 0o160000)], &[unpacked]);
+        for (base, tip, email) in [(packed, unpacked, "converter@test"), (unpacked, repacked, "packer@test")] {
+            for (left, right, side) in [(base, tip, "right"), (tip, base, "left")] {
+                let result = collect_for_paths(&f.repo, left, right, Some(vec!["module".into(), "module/code".into(), "module/model".into()])).unwrap();
+                assert_eq!(paths(&result, email), ["module"]);
+                assert!(contributors(&result, "module/code").is_empty());
+                let author = result.iter().find(|a| a.email == email).unwrap();
+                for path in ["module", "module/code", "module/model"] {
+                    let event = &author.evidence[path][0];
+                    assert_eq!(event.kind, "folder-submodule-conversion");
+                    assert_eq!(event.witness_path.as_deref(), Some("module"));
+                    assert_eq!(event.context.side, side);
+                    assert_eq!(event.commit, tip.to_string());
+                }
+                let scoped = collect_for_paths(&f.repo, left, right, Some(vec!["module/code".into()])).unwrap();
+                assert_eq!(scoped.len(), 1, "structural evidence is retained even in a descendant-only scope");
+                assert!(scoped[0].paths.is_empty());
+            }
+        }
+        assert!(f.repo.find_commit(Oid::from_str(gitlink).unwrap()).is_err(), "no child objects needed");
+        assert!(!f.path.join("module").exists());
+    }
+
+    #[test]
+    fn conversion_does_not_mask_independent_later_file_edits_or_create_shared_authors() {
+        let f = Fixture::new();
+        let base = f.entries("base@test", &[("unit", "1111111111111111111111111111111111111111", 0o160000)], &[]);
+        let imported = f.commit("alice@test", &[("unit/own", "copied"), ("unit/other", "copied")], &[base]);
+        let edited = f.commit("alice@test", &[("unit/own", "real edit"), ("unit/other", "copied")], &[imported]);
+        let tip = f.commit("bob@test", &[("unit/own", "real edit"), ("unit/other", "bob edit")], &[edited]);
+        for (left, right) in [(base, tip), (tip, base)] {
+            let result = collect_for_paths(&f.repo, left, right, Some(vec!["unit/own".into(), "unit/other".into()])).unwrap();
+            assert_eq!(paths(&result, "alice@test"), ["unit/own"]);
+            assert_eq!(contributors(&result, "unit/other"), ["bob@test"]);
+            let evidence = &result.iter().find(|a| a.email == "alice@test").unwrap().evidence["unit/own"];
+            assert_eq!(evidence.len(), 2);
+            assert!(evidence.iter().any(|e| e.kind == "file-change" && e.commit == edited.to_string()));
+            assert!(evidence.iter().any(|e| e.kind == "folder-submodule-conversion" && e.commit == imported.to_string()));
+        }
+    }
+
+    #[test]
+    fn event_sides_and_repositories_are_preserved_even_for_the_same_author_on_both_sides() {
+        let f = Fixture::new();
+        let base = f.commit("base@test", &[("file", "base")], &[]);
+        let left = f.commit("alice@test", &[("file", "left")], &[base]);
+        let right = f.commit("alice@test", &[("file", "right")], &[base]);
+        for (a, b) in [(left, right), (right, left)] {
+            let result = collect(&f.repo, a, b).unwrap();
+            let evidence = &result[0].evidence["file"];
+            assert_eq!(evidence.len(), 2);
+            for (commit, side) in [(a, "left"), (b, "right")] {
+                let event = evidence.iter().find(|e| e.commit == commit.to_string()).unwrap();
+                assert_eq!(event.context.side, side);
+                assert_eq!(event.kind, "file-change");
+                assert_eq!(event.context.repository_path, normalized(f.repo.workdir().unwrap()));
+                let json = serde_json::to_value(event).unwrap();
+                assert_eq!(json["side"], side); assert!(json["repository_id"].is_string());
+                assert!(json.get("context").is_none(), "flat IPC evidence contract");
+            }
+        }
+    }
+
+    #[test]
+    fn many_conversion_children_reuse_one_root_without_submodule_objects() {
+        let f = Fixture::new();
+        let base = f.entries("base@test", &[("unit", "1111111111111111111111111111111111111111", 0o160000)], &[]);
+        let names: Vec<_> = (0..1500).map(|i| format!("unit/deep/file-{i}")).collect();
+        let files: Vec<_> = names.iter().map(|name| (name.as_str(), "imported content")).collect();
+        let tip = f.commit("converter@test", &files, &[base]);
+        let result = collect_for_paths(&f.repo, base, tip, Some(names)).unwrap();
+        assert_eq!(result.len(), 1); assert!(result[0].paths.is_empty());
+        assert_eq!(result[0].evidence.len(), 1500);
+        assert!(result[0].evidence.values().all(|events| events.len() == 1 && events[0].witness_path.as_deref() == Some("unit")));
     }
 
     #[test]

@@ -85,6 +85,7 @@ load_older_commits
 load_repository
 merge_branch
 merge_in_progress
+merge_preview_contents
 move_local_item
 open_commit_on_server
 open_external_url
@@ -98,6 +99,7 @@ pop_stash
 post_pull_request_comment
 pr_status
 preview_folder_restore
+preview_merge
 publish_branch
 publish_status
 refresh_publish_metadata

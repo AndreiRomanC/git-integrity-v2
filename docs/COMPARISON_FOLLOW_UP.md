@@ -6,7 +6,15 @@ Recorded on 2026-10-25 at the user's request. Keep these comparison limitations 
 
 The three agreed steps are implemented: consistent author and Shared filters with scoped counts and explanations; a separate Introduced by author analysis; and consistent List and Drill-down filtering with a compact header and matching ancestor containers. Opening an item preserves the full endpoint comparison.
 
-The last local test run passed 723 frontend tests and 472 Rust tests, with 5 Rust tests ignored. The frontend layout was inspected at widths from 800 to 1440 pixels. The changes still require a packaged build and validation on the company Windows workstation and real repository.
+The initial 2026-10-25 checkpoint passed 723 frontend tests and 472 Rust tests, with 5 Rust tests ignored. The frontend layout was inspected at widths from 800 to 1440 pixels. The changes still require a packaged build and validation on the company Windows workstation and real repository.
+
+### Attribution clarification — 2026-10-26
+
+Folder/gitlink conversions now keep structural evidence without counting their imported/removed descendants as individual file touches or Shared contributors. The root remains an atomic structural change; separate file edits still qualify. All differences retains structural explanations and Introduced by retains the conversion items. Detecting edits made inside the conversion commit itself remains inconclusive, not a claim that none occurred.
+
+Surviving-contribution analysis now requires an explicit choice for the active author/comparison. Changing filter, author, folder or endpoints resets it; rerendering the same view does not. Evidence carries event kind, comparison side and the actual repository, including parent-pointer events. View change uses submodule details for pointer/conversion events rather than the child file viewer. Expanded-evidence logs identify the active mode, exact endpoints and witness, paths, side and anonymous repository ID; they exclude file contents and author identities.
+
+Validation: 739 frontend tests and 493 Rust tests passed, 5 Rust tests ignored. The full Rust suite required loopback permission for four existing publish tests. New fixtures cover both conversion directions, later edits, distinct authors, reversed/divergent evidence and a 1,500-file conversion. Browser checks used the real frontend with synthetic data at 1440 and 1000 pixels; the filter toolbar remained 41 px tall across All/Introduced/Touched at 1440 px. No application release build or real company-repository validation was performed.
 
 ## Remaining limitations
 

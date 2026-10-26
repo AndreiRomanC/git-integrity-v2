@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Git DrillDown</title>
   <link rel="icon" type="image/png" href="assets/git-drilldown-mark.png">
-<link rel="stylesheet" href="styles.css?v=20261025-tree-authors">
-  <link rel="stylesheet" href="polarion.css?v=20261025-tree-authors">
+  <link rel="stylesheet" href="styles.css?v=20261026-attribution-evidence">
+  <link rel="stylesheet" href="polarion.css?v=20261026-attribution-evidence">
 </head>
 <body>
   <div id="startupIntro" class="startup-intro" hidden>
@@ -17,7 +17,7 @@
       <div id="startupIntroFailure" class="startup-intro-failure" hidden><p>Reload the window to retry.</p><button type="button" id="startupIntroRetry">Reload interface</button></div>
     </div>
   </div>
-  <script src="startup-intro.js?v=20261025-tree-authors"></script>
+  <script src="startup-intro.js?v=20261026-attribution-evidence"></script>
   <div class="app-shell">
     <header class="topbar">
       <div class="brand" aria-label="Git DrillDown">
@@ -741,8 +741,14 @@
       <label><span>SOURCE BRANCH</span><select id="mergeBranchSource"></select></label>
       <div class="local-change-banner"><i></i><div><strong>This stays entirely local</strong><span>Only creates a commit on your machine. Nothing is pushed or sent to the server — push and go through your normal PR process afterward.</span></div></div>
       <p id="mergeBranchStatus" class="submodule-operation-status" role="status"></p>
-      <div class="commit-dialog-actions"><button value="cancel">Cancel</button><button type="button" id="confirmMergeBranch" class="confirm">Merge</button></div>
+      <div class="commit-dialog-actions"><button value="cancel">Cancel</button><button type="button" id="previewMergeBranch">Preview merge…</button><button type="button" id="confirmMergeBranch" class="confirm">Merge</button></div>
     </form>
+  </dialog>
+  <dialog id="mergePreviewDialog" class="merge-preview-dialog" aria-labelledby="mergePreviewTitle">
+    <header><div><h2 id="mergePreviewTitle">Merge preview</h2><p data-preview-direction></p></div><span data-preview-snapshots></span><button type="button" data-preview-close aria-label="Close merge preview">×</button></header>
+    <div class="merge-preview-toolbar"><span data-preview-summary role="status" aria-live="polite"></span><div><input data-preview-search type="search" aria-label="Find paths in merge preview" placeholder="Find a path…"><select data-preview-filter aria-label="Filter merge report"><option value="all">All items</option><option value="changes">Result changes</option><option value="conflicts">Conflicts</option><option value="submodules">Submodules</option><option value="review">Needs review</option></select><button type="button" data-preview-refresh title="Recalculate using the latest local branch references. No fetch.">Recalculate</button></div></div>
+    <div class="merge-preview-scroll"><div data-preview-warnings></div><div data-preview-list></div></div>
+    <footer><div><span data-preview-shown></span><small>Committed snapshots only · local edits excluded · no checkout, staging, commit or fetch.<br>Submodule folders stay unchanged. Ref changes or manual conflict choices require a new review.</small></div><button type="button" data-preview-close>Close</button></footer>
   </dialog>
   <dialog id="conflictsDialog" class="publish-dialog">
     <form method="dialog"><header><div><h2 id="conflictsTitle">Merge conflicts</h2><p id="conflictsSubtitle">Resolve each file, then complete the merge.</p></div><button value="cancel">×</button></header>
@@ -956,21 +962,22 @@
       <footer><span>Read-only on Polarion · local snapshots outside Git</span><button value="cancel">Close</button><button type="button" id="polarionAdd" class="confirm" disabled>Add to Commit List</button></footer>
     </form>
   </dialog>
-  <script src="polarion.js?v=20261025-tree-authors"></script>
-  <script src="console-context.js?v=20261025-tree-authors"></script>
-  <script src="graph-model.js?v=20261025-tree-authors"></script>
-  <script src="submodule-state.js?v=20261025-tree-authors"></script>
-  <script src="submodule-versions.js?v=20261025-tree-authors"></script>
-  <script src="local-diff.js?v=20261025-tree-authors"></script>
-  <script src="local-drive.js?v=20261025-tree-authors"></script>
-  <script src="pr-status.js?v=20261025-tree-authors"></script>
-  <script src="refresh-coordinator.js?v=20261025-tree-authors"></script>
-  <script src="comparison-authors.js?v=20261025-tree-authors"></script>
-  <script src="git-activity.js?v=20261025-tree-authors"></script>
-  <script src="comparison-navigation.js?v=20261025-tree-authors"></script>
-  <script src="panel-resize.js?v=20261025-tree-authors"></script>
-  <script src="submodule-compare-details.js?v=20261025-tree-authors"></script>
-  <script src="navigation-refresh.js?v=20261025-tree-authors"></script>
-  <script src="app.js?v=20261025-tree-authors"></script>
+  <script src="polarion.js?v=20261026-attribution-evidence"></script>
+  <script src="console-context.js?v=20261026-attribution-evidence"></script>
+  <script src="graph-model.js?v=20261026-attribution-evidence"></script>
+  <script src="submodule-state.js?v=20261026-attribution-evidence"></script>
+  <script src="submodule-versions.js?v=20261026-attribution-evidence"></script>
+  <script src="local-diff.js?v=20261026-attribution-evidence"></script>
+  <script src="local-drive.js?v=20261026-attribution-evidence"></script>
+  <script src="pr-status.js?v=20261026-attribution-evidence"></script>
+  <script src="refresh-coordinator.js?v=20261026-attribution-evidence"></script>
+  <script src="comparison-authors.js?v=20261026-attribution-evidence"></script>
+  <script src="git-activity.js?v=20261026-attribution-evidence"></script>
+  <script src="comparison-navigation.js?v=20261026-attribution-evidence"></script>
+  <script src="panel-resize.js?v=20261026-attribution-evidence"></script>
+  <script src="submodule-compare-details.js?v=20261026-attribution-evidence"></script>
+  <script src="merge-preview.js?v=20261026-attribution-evidence"></script>
+  <script src="navigation-refresh.js?v=20261026-attribution-evidence"></script>
+  <script src="app.js?v=20261026-attribution-evidence"></script>
 </body>
 </html>

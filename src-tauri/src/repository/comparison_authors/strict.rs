@@ -37,7 +37,7 @@ struct Text { counts: HashMap<Vec<u8>, usize>, reason: Option<&'static str> }
 struct Analysis<'a> {
     repo: &'a Repository,
     author: &'a str,
-    exclusive: HashSet<Oid>,
+    exclusive: HashMap<Oid, &'static str>, // event's comparison side, from the existing walk
     commits: HashMap<Oid, CommitInfo>,
     entries: HashMap<(Oid, String), Option<Entry>>,
     texts: HashMap<Oid, Arc<Text>>,
@@ -121,7 +121,7 @@ impl<'a> Analysis<'a> {
 
     fn unchanged_origin(&mut self, mut id: Oid, path: &str) -> Result<Oid, String> {
         let mut skipped = Vec::new();
-        while self.exclusive.contains(&id) {
+        while self.exclusive.contains_key(&id) {
             let key = (id, path.to_string());
             if let Some(origin) = self.unchanged_origins.get(&key) { id = *origin; break; }
             self.budget()?;
@@ -134,7 +134,7 @@ impl<'a> Analysis<'a> {
         }
         // Cache the stopping point as well: every line in this file otherwise
         // repeats the same parent/entry equality check at the changed commit.
-        if self.exclusive.contains(&id) { self.unchanged_origins.entry((id, path.to_string())).or_insert(id); }
+        if self.exclusive.contains_key(&id) { self.unchanged_origins.entry((id, path.to_string())).or_insert(id); }
         for key in skipped { self.unchanged_origins.insert(key, id); }
         Ok(id)
     }
@@ -236,7 +236,7 @@ impl<'a> Analysis<'a> {
 
     fn trace(&mut self, id: Oid, path: &str, probe: &Probe, depth: usize) -> Result<Proof, String> {
         let id = self.unchanged_origin(id, path)?;
-        if !self.exclusive.contains(&id) { return Ok(Proof::Other); }
+        if !self.exclusive.contains_key(&id) { return Ok(Proof::Other); }
         if depth > 256 { return Ok(Proof::Unknown("More than 256 changing history steps are needed.")); }
         let key = (id, path.to_string(), probe.clone());
         if let Some(proof) = self.proofs.get(&key) { return Ok(proof.clone()); }
@@ -295,7 +295,7 @@ impl<'a> Analysis<'a> {
             prefix.push_str(component);
             let a = self.entry(parent, &prefix)?.map(|e| e.mode);
             let b = self.entry(child, &prefix)?.map(|e| e.mode);
-            if matches!((a, b), (Some(0o160000), Some(0o40000)) | (Some(0o40000), Some(0o160000))) {
+            if is_folder_submodule_conversion(a, b) {
                 return Ok(Some(prefix));
             }
         }
@@ -339,13 +339,13 @@ fn collect_strict_candidates(repo: &Repository, left: Oid, right: Oid, author: &
     static NEXT_REQUEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let request_id = NEXT_REQUEST.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     perf_log(&format!("comparison_author_contributions: request={request_id} start repo={} left={left} right={right} time_limit_ms=30000 per_file_bytes_limit=67108864 visit_limit=none", anonymized_repository_id(&repo.path().to_string_lossy())), Duration::ZERO);
-    let mut exclusive = HashSet::new();
-    for (tip, hide) in [(left, right), (right, left)] {
+    let mut exclusive = HashMap::new();
+    for (tip, hide, side) in [(left, right, "left"), (right, left, "right")] {
         let mut walk = repo.revwalk().map_err(|e| e.to_string())?;
         walk.push(tip).map_err(|e| e.to_string())?;
         walk.hide(hide).map_err(|e| e.to_string())?;
         for id in walk {
-            exclusive.insert(id.map_err(|e| e.to_string())?);
+            exclusive.insert(id.map_err(|e| e.to_string())?, side);
             if exclusive.len() > 100_000 || started.elapsed() > Duration::from_secs(30) {
                 perf_log(&format!("comparison_author_contributions: request={request_id} history_budget_exceeded commits={}", exclusive.len()), started.elapsed());
                 return Err("History exceeds the strict attribution budget. Choose closer revisions.".into());
@@ -482,7 +482,11 @@ fn collect_strict_candidates(repo: &Repository, left: Oid, right: Oid, author: &
                 result.paths.push(path.clone());
                 if let Some(root) = &structural_root { result.structural_paths.insert(path.clone(), root.clone()); }
                 // The witness's historic path may differ after an exact rename.
-                result.evidence.insert(path, vec![ComparisonTouch { commit: commit.to_string(), date: short_date(analysis.commit(*commit)?.time), parent: parent.map(|p| p.to_string()), change: if structural_root.is_some() { "Folder/submodule conversion" } else { "Surviving contribution" }.into(), direct: true, witness_path: Some(witness_path.clone()) }]);
+                let pointer = analysis.entry(*commit, witness_path)?.is_some_and(|e| e.mode == 0o160000)
+                    || match parent { Some(parent) => analysis.entry(*parent, witness_path)?.is_some_and(|e| e.mode == 0o160000), None => false };
+                let kind = if structural_root.is_some() { "folder-submodule-conversion" } else if pointer { "submodule-update" } else { "file-change" };
+                let side = analysis.exclusive.get(commit).copied().ok_or("Attribution witness is outside the compared history.")?;
+                result.evidence.insert(path, vec![ComparisonTouch { commit: commit.to_string(), date: short_date(analysis.commit(*commit)?.time), parent: parent.map(|p| p.to_string()), change: if structural_root.is_some() { "Folder/submodule conversion" } else { "Surviving contribution" }.into(), direct: true, kind, context: EvidenceContext::new(repo, side), witness_path: Some(witness_path.clone()) }]);
             } else if let Some(reason) = reason {
                 result.ambiguous_paths.insert(path, reason.into());
             } else { result.no_contribution_paths.push(path); }
@@ -856,6 +860,27 @@ mod tests {
         assert_eq!(result.structural_paths.len(), 3);
         let merged = f.entries("integrator", &[("modules/a", "2222222222222222222222222222222222222222", 0o160000)], &[unpacked, packed]);
         f.check(unpacked, merged, "integrator", &[]);
+    }
+
+    #[test]
+    fn strict_candidates_use_actual_touches_not_conversion_imports_and_keep_witness_side() {
+        let f = Fixture::new();
+        let base = f.entries("base", &[("unit", "1111111111111111111111111111111111111111", 0o160000)], &[]);
+        let imported = f.commit("alice", &[("unit/own", "copied\n"), ("unit/other", "copied\n")], &[base]);
+        let edited = f.commit("alice", &[("unit/own", "copied\nmy change\n"), ("unit/other", "copied\n")], &[imported]);
+        for (left, right, side) in [(base, edited, "right"), (edited, base, "left")] {
+            let authors = collect_for_paths(&f.repo, left, right, Some(vec!["unit/own".into(), "unit/other".into()])).unwrap();
+            let author = authors.iter().find(|a| a.key == "email:alice@test").unwrap();
+            let candidates = author.paths.iter().cloned().collect();
+            let result = collect_strict_candidates(&f.repo, left, right, &author.key, Some(&candidates)).unwrap();
+            assert_eq!(result.paths, ["unit/own"]);
+            assert!(result.structural_paths.is_empty());
+            assert!(!result.no_contribution_paths.contains(&"unit/other".into()), "import is not a negative ownership claim");
+            let event = &result.evidence["unit/own"][0];
+            assert_eq!(event.kind, "file-change"); assert_eq!(event.context.side, side);
+            assert_eq!(event.commit, edited.to_string());
+            assert_eq!(event.context.repository_path, normalized(f.repo.workdir().unwrap()));
+        }
     }
 
     #[test]

@@ -87,7 +87,7 @@ impl Analysis<'_> {
         memo: &mut HashMap<(Oid, String), Proof>) -> Result<Proof, String> {
         self.budget()?;
         let id = self.unchanged_origin(id, path)?;
-        if !self.exclusive.contains(&id) { return Ok(Proof::Other); }
+        if !self.exclusive.contains_key(&id) { return Ok(Proof::Other); }
         if depth > 128 { return Ok(Proof::Unknown("More than 128 contextual history steps are needed.")); }
         let key = (id, path.to_string());
         if let Some(proof) = memo.get(&key) { return Ok(proof.clone()); }

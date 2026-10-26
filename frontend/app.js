@@ -1921,11 +1921,25 @@ function comparisonEvidenceRowHtml(row, model) {
   if (row.local?.kind === 'folder' || row.remote?.kind === 'folder') return '';
   if (!model?.authors && !model?.introductions) return '';
   const count = comparisonAuthorContributors(row, model).length;
-  if (!count && comparisonAuthorMode(model) === 'all') return '';
-  return `<details class="comparison-file-evidence" data-author-evidence="${esc(row.relative_path)}"><summary>${['touched','introduced'].includes(comparisonAuthorMode(model)) ? 'Why included?' : `Contributors · ${count}`}</summary><div data-evidence-body></div></details>`;
+  const structure = comparisonAuthorMode(model) === 'all' && comparisonStructuralEvidence(row, model).length > 0;
+  if (!count && comparisonAuthorMode(model) === 'all' && !structure) return '';
+  return `<details class="comparison-file-evidence" data-author-evidence="${esc(row.relative_path)}"><summary>${['touched','introduced'].includes(comparisonAuthorMode(model)) ? 'Why included?' : count ? `Contributors · ${count}` : 'History · reconfiguration'}</summary><div data-evidence-body></div></details>`;
 }
 function comparisonEvidenceCommitHtml(touch) {
   return `<code title="${esc(touch.commit)}">${esc(touch.commit.slice(0, 8))}</code> · <time title="Commit date (UTC, same as history)">${esc(touch.date || 'Date unavailable')}</time>`;
+}
+function comparisonEvidenceContextHtml(touch, model) {
+  const context = model.context || {};
+  const kinds = {'file-change':'Recorded file change', commit:'Recorded file change', merge:'Merge integration',
+    'submodule-update':'Submodule revision update', 'merge-submodule':'Submodule revision in merge',
+    'parent-submodule-update':'Parent submodule revision update', 'parent-merge-submodule':'Parent submodule revision in merge',
+    'folder-submodule-conversion':'Folder/submodule conversion', 'merge-folder-submodule-conversion':'Folder/submodule conversion in merge'};
+  const side = touch.side === 'left' ? 'Left history' : touch.side === 'right' ? 'Right history' : 'Side unavailable';
+  const repository = touch.repository_path || touch.parent_repository
+    || (context.submodulePath ? `${context.repositoryPath}/${context.submodulePath}` : context.repositoryPath) || '';
+  const name = context.owner && !touch.repository_path && !touch.parent_repository
+    ? `${context.owner}/${context.repositoryName}` : repository.replace(/\\/g,'/').replace(/\/$/,'').split('/').pop();
+  return `<small class="comparison-evidence-context"><span>${esc(kinds[touch.kind] || touch.change || 'Recorded change')}</span> · <span title="The commit is reachable only from this comparison side; this does not prove its edits survive.">${side}</span> · <span title="Repository: ${esc(repository)}">${esc(name || 'Repository unavailable')}</span></small>`;
 }
 function comparisonAuthorRowsHtml(rows, candidates, model, dataset) {
   const render = row => flatCompareRowHtml(row, dataset) + comparisonEvidenceRowHtml(row, model);
@@ -1960,17 +1974,19 @@ function comparisonEvidenceBodyHtml(row, model, touches) {
       'merge-submodule':'This author’s merge changed the submodule pointer.',
       'parent-submodule-update':'This author updated the parent’s submodule pointer; this item differs across that update.',
       'parent-merge-submodule':'This author’s parent merge changed the submodule pointer; this item differs across that update.',
+      'folder-submodule-conversion':'Folder/submodule conversion recorded in this commit. Individual file edits are not established by the conversion.',
+      'merge-folder-submodule-conversion':'This merge brought in a folder/submodule conversion, not proof of individual file edits.',
     };
     return `<p>Introduced by ${selected ? label(selected) : 'selected author'}. This can include work by others; individual edits need not survive.</p><p>${pointer ? 'Pointer contributors' : 'File contributors in this comparison'}: ${contributors.map(label).join(', ') || 'No non-merge touches identified'}.</p>`
-      + touches.map((touch,index) => `<div class="comparison-introduction"><p>${esc(reasons[touch.kind] || 'Recorded in this author’s commit.')}</p><div class="comparison-touch"><span>${comparisonEvidenceCommitHtml(touch)}</span>${touch.parent && touch.kind !== 'submodule-update' && touch.kind !== 'merge-submodule' && !touch.parent_repository ? `<button type="button" data-evidence-diff="${index}">View change</button>` : ''}</div>${touch.before_revision || touch.after_revision ? `<p>Submodule: <code>${esc(touch.witness_path)}</code> · <code>${esc(touch.before_revision || 'absent')}</code> → <code>${esc(touch.after_revision || 'absent')}</code></p>` : ''}${touch.parent_repository ? `<p>Parent repository: ${esc(touch.parent_repository)}</p>` : ''}</div>`).join('')
+      + touches.map((touch,index) => `<div class="comparison-introduction"><p>${esc(reasons[touch.kind] || 'Recorded in this author’s commit.')}</p><div class="comparison-touch"><span>${comparisonEvidenceCommitHtml(touch)}${comparisonEvidenceContextHtml(touch, model)}</span>${touch.parent ? `<button type="button" data-evidence-diff="${index}">View change</button>` : ''}</div>${touch.before_revision || touch.after_revision ? `<p>Submodule: <code>${esc(touch.witness_path)}</code> · <code>${esc(touch.before_revision || 'absent')}</code> → <code>${esc(touch.after_revision || 'absent')}</code></p>` : ''}${touch.parent_repository ? `<p>Parent repository: ${esc(touch.parent_repository)}</p>` : ''}</div>`).join('')
       + `<p>Full comparison shown.${pointer ? ' Internal file authors require a direct submodule comparison.' : ''}</p>`;
   }
   const reason = comparisonAuthorStrict(model) ? 'A contribution from this author remains in the comparison.'
     : mode === 'shared' ? 'At least two recorded authors touched this item in the comparison history.'
     : mode === 'touched' ? 'This author touched this item in a non-merge commit within the comparison history.'
     : 'This item differs between the selected versions.';
-  return `<p>${reason}</p><p>${pointer ? 'Contributors to this submodule pointer' : 'Contributors in this comparison'}: ${contributors.map(label).join(', ') || 'Unavailable'}.</p><p>${pointer ? 'Internal file authors are not analyzed here. Open the submodule comparison to inspect its contents.' : 'Full file comparison shown. History touches do not prove that each author’s edits survived.'}</p>`
-    + (touches.length ? touches.map((touch, index) => `<div class="comparison-touch"><span>${touch.authorKey ? `${label({name:touch.authorName,email:touch.authorEmail,key:touch.authorKey})} · ` : ''}${comparisonEvidenceCommitHtml(touch)}</span><button type="button" data-evidence-diff="${index}" title="Compare this commit with its parent; the main comparison stays unchanged" ${touch.parent ? '' : 'disabled'}>View change</button></div>`).join('')
+  return `<p>${reason}</p><p>${pointer ? 'Contributors to this submodule pointer' : 'Contributors in this comparison'}: ${contributors.map(label).join(', ') || 'No separate non-merge touches identified'}.</p><p>${pointer ? 'Internal file authors are not analyzed here. Open the submodule comparison to inspect its contents.' : 'Full file comparison shown. History touches do not prove that each author’s edits survived.'}</p>`
+    + (touches.length ? touches.map((touch, index) => `<div class="comparison-touch"><span>${touch.kind === 'folder-submodule-conversion' ? 'Reconfiguration only · individual file edits not established. ' : ''}${touch.authorKey ? `${label({name:touch.authorName,email:touch.authorEmail,key:touch.authorKey})} · ` : ''}${comparisonEvidenceCommitHtml(touch)}${comparisonEvidenceContextHtml(touch, model)}</span><button type="button" data-evidence-diff="${index}" title="Compare this commit with its parent; the main comparison stays unchanged" ${touch.parent ? '' : 'disabled'}>View change</button></div>`).join('')
       : '<p>Commit evidence is unavailable in this cached result.</p>');
 }
 function bindComparisonEvidence(container, rows, model) {
@@ -1981,14 +1997,19 @@ function bindComparisonEvidence(container, rows, model) {
       if (!details.open) return;
       const row = byPath.get(details.dataset.authorEvidence);
       if (!row) return;
-      const touches = ['touched','introduced'].includes(comparisonAuthorMode(model)) ? comparisonAuthorEvidence(row, model) : comparisonContributorEvidence(row, model);
+      const touches = ['touched','introduced'].includes(comparisonAuthorMode(model)) ? comparisonAuthorEvidence(row, model)
+        : [...comparisonContributorEvidence(row, model), ...(comparisonAuthorMode(model) === 'all' ? comparisonStructuralEvidence(row, model) : [])];
       const body = details.querySelector('[data-evidence-body]');
       body.innerHTML = comparisonEvidenceBodyHtml(row, model, touches);
-      touches.forEach(touch => jsPerfLog(`comparison_author_evidence: commit=${touch.commit} date=${touch.date || 'unknown'} parent=${touch.parent || 'root'} direct=${touch.direct ?? 'n/a'} change=${touch.change || touch.kind}`, 0));
+      touches.forEach(touch => jsPerfLog(comparisonEvidenceDiagnostic(row, model, touch), 0));
       body.querySelectorAll('[data-evidence-diff]').forEach(button => button.addEventListener('click', event => {
         event.preventDefault(); event.stopPropagation();
         const touch = touches[Number(button.dataset.evidenceDiff)];
-        if (touch?.parent) openGitRevisionFileCompare(row, { context: model.context, touch });
+        if (!touch?.parent) return;
+        const evidence = {context:model.context, touch};
+        if (touch.kind?.includes('submodule') || row.local?.kind === 'submodule' || row.remote?.kind === 'submodule') {
+          openSubmoduleComparisonDetails({...row, relative_path:touch.path || row.relative_path}, state.compareMode === 'submodule', evidence);
+        } else openGitRevisionFileCompare(row, evidence);
       }));
     });
   });
@@ -2005,10 +2026,11 @@ function renderComparisonAuthorFilter(container, context, options = {}) {
   const model = comparisonAuthorCache.get(scopedComparisonAuthorContext(context, options.scopeRows || options.rows || []));
   if (options.loadHistory && !model.authors && !model.pending && !model.error) comparisonAuthorCache.load(model).then(() => { if (state.view === 'commander') renderCommander(); });
   const mode = comparisonAuthorMode(model), strictActive = comparisonAuthorStrict(model), filtered = mode !== 'all';
+  const touchedAuthors = (model.authors || []).filter(author => author.paths?.length);
   const helpOpen = element.querySelector('.comparison-author-help')?.open || false;
   const introductionOptions = `<optgroup label="Introduced by author"><option value="@introduced">${model.introductions ? 'Choose introducer…' : 'Load introduction history…'}</option>${(model.introductions || []).map(author => `<option value="introduced:${esc(author.key)}">${esc(author.name)}${author.email ? ` &lt;${esc(author.email)}&gt;` : ''}</option>`).join('')}${mode === 'introduced' && model.selected && !model.introductions?.some(author => author.key === model.selected) ? `<option value="introduced:${esc(model.selected)}">${esc(model.selected.replace(/^(email|name):/, ''))}${model.introductions ? ' — no matching items here' : ''}</option>` : ''}</optgroup>`;
   element.innerHTML = model.authors
-    ? `<label class="comparison-author-select">Show <select data-author-select aria-label="Contributor filter"><option value="">All differences</option><option value="@shared">Shared files · 2+ authors</option><optgroup label="Files touched by author">${model.authors.map(author => `<option value="${esc(author.key)}">${esc(author.name)}${author.email ? ` &lt;${esc(author.email)}&gt;` : ' (no email)'}</option>`).join('')}${mode === 'touched' && !model.authors.some(author => author.key === model.selected) ? `<option value="${esc(model.selected)}">${esc(model.selected.replace(/^(email|name):/, ''))} — no matching items here</option>` : ''}</optgroup>${introductionOptions}</select></label><details class="comparison-author-help" ${helpOpen ? 'open' : ''}><summary>Details${strictActive ? ' · surviving required' : ''}</summary><div><p>Introduced by author: changes recorded in their commits, including merge results compared with the first parent. This is integration, not personal line ownership. A parent submodule update is included only when this exact pair was opened from the parent comparison. Changing the revisions removes that parent context.</p><p>Files touched by author: matching items touched in that author's non-merge commits, including intermediate commits. Shared files: at least two recorded authors touched the item. Neither means every individual edit survived.</p><p>Authors, counts and evidence are scoped to these compared items and revisions. On divergent histories, commits unique to either side are included. Merge integration alone is not a file touch.</p><label class="comparison-author-direct"><input type="checkbox" data-author-direct ${strictActive ? 'checked' : ''} ${mode !== 'touched' || !model.selected ? 'disabled' : ''}> Require surviving contribution</label><p>Advanced · selected author only. A surviving content or pointer change must be identified. Folder/submodule conversions remain grouped separately, not claimed as personal file edits.</p><p>Identity uses recorded email (name when absent), without mailmap or co-author matching. Different identities may belong to the same person. Git cannot distinguish manual edits from squash/copy imports. Internal submodule authors are analyzed only in a direct submodule comparison.</p></div></details>`
+    ? `<label class="comparison-author-select">Show <select data-author-select aria-label="Contributor filter"><option value="">All differences</option><option value="@shared">Shared files · 2+ authors</option><optgroup label="Files touched by author">${touchedAuthors.map(author => `<option value="${esc(author.key)}">${esc(author.name)}${author.email ? ` &lt;${esc(author.email)}&gt;` : ' (no email)'}</option>`).join('')}${mode === 'touched' && !touchedAuthors.some(author => author.key === model.selected) ? `<option value="${esc(model.selected)}">${esc(model.selected.replace(/^(email|name):/, ''))} — no matching items here</option>` : ''}</optgroup>${introductionOptions}</select></label><details class="comparison-author-help" ${helpOpen ? 'open' : ''}><summary>Details${strictActive ? ' · surviving required' : ''}</summary><div><p>Introduced by author: changes recorded in their commits, including merge results compared with the first parent. This is integration, not personal line ownership. A parent submodule update is included only when this exact pair was opened from the parent comparison. Changing the revisions removes that parent context.</p><p>Files touched by author: matching items touched in that author's non-merge commits, including intermediate commits. Shared files: at least two recorded authors touched the item. Neither means every individual edit survived.</p><p>Authors, counts and evidence are scoped to these compared items and revisions. On divergent histories, commits unique to either side are included. Merge integration and files imported or removed by a folder/submodule conversion are not individual file touches. Their structural evidence stays under All differences and Introduced by.</p><label class="comparison-author-direct"><input type="checkbox" data-author-direct ${strictActive ? 'checked' : ''} ${mode !== 'touched' || !model.selected ? 'disabled' : ''}> Require surviving contribution</label><p>Advanced · this comparison only; resets when you choose another filter or author. A surviving content or pointer change must be identified. Folder/submodule conversions remain grouped separately, not claimed as personal file edits.</p><p>Identity uses recorded email (name when absent), without mailmap or co-author matching. Different identities may belong to the same person. Git cannot distinguish manual edits from squash/copy imports. Internal submodule authors are analyzed only in a direct submodule comparison.</p></div></details>`
     : `<button type="button" data-load-authors ${model.pending ? 'disabled' : ''}>${model.pending ? 'Loading contributor history…' : 'Contributor filters…'}</button>${model.error ? `<small role="alert">${esc(model.error)} ${filtered ? 'No filtered results were applied.' : 'Complete comparison remains visible.'} Retry to load history.</small>` : ''}`;
   if (model.authors) {
     const select = element.querySelector('[data-author-select]');
@@ -2056,7 +2078,7 @@ function renderComparisonAuthorFilter(container, context, options = {}) {
     }
   }
   if (options.workspace) element.querySelector('.comparison-author-help > div')?.insertAdjacentHTML('beforeend', '<p>Uncommitted changes have no Git author. These are recorded history touches, not attribution of local edits. Surviving-contribution analysis requires two committed revisions.</p>');
-  if (model.authors?.length === 0 && mode !== 'introduced') element.insertAdjacentHTML('beforeend', `<small>No author touches found for these compared items in the selected history. ${filtered ? 'No matching items.' : 'All differences remain visible.'}</small>`);
+  if (model.authors && touchedAuthors.length === 0 && mode !== 'introduced') element.insertAdjacentHTML('beforeend', `<small>No author touches found for these compared items in the selected history. ${filtered ? 'No matching items.' : 'All differences remain visible.'}</small>`);
   element.querySelector('[data-author-select]')?.addEventListener('change', event => {
     if (event.target.value === '@shared') comparisonAuthorCache.setMode(model, 'shared');
     else if (event.target.value === '@introduced') comparisonAuthorCache.setMode(model, 'introduced');
@@ -2196,17 +2218,19 @@ function renderCommander() {
 }
 
 let submoduleDetailsPanel = null;
-function openSubmoduleComparisonDetails(row, nested = false) {
+function openSubmoduleComparisonDetails(row, nested = false, evidence = null) {
   const snapshot = nested ? state.submoduleCompare : state.commanderComparisonResult;
   if (!snapshot || snapshot.loading || (!nested && state.commanderComparisonLoading)) return;
   const context = state.comparisonContext, session = state.comparisonSession;
   const spec = nested ? null : commanderComparisonSpec();
-  const repositoryPath = nested ? snapshot.repositoryPath : spec.repositoryPath;
-  const leftRef = nested ? snapshot.leftRevision : spec.workspace ? null : snapshot.left_revision;
-  const rightRef = nested ? snapshot.rightRevision : spec.workspace ? snapshot.remote_revision : snapshot.right_revision;
+  const repositoryPath = evidence?.touch.repository_path || evidence?.touch.parent_repository || (nested ? snapshot.repositoryPath : spec.repositoryPath);
+  const snapshotLeft = nested ? snapshot.leftRevision : spec.workspace ? null : snapshot.left_revision;
+  const snapshotRight = nested ? snapshot.rightRevision : spec.workspace ? snapshot.remote_revision : snapshot.right_revision;
+  const leftRef = evidence?.touch.parent || snapshotLeft;
+  const rightRef = evidence?.touch.commit || snapshotRight;
   if (!repositoryPath || !rightRef || (!nested && !spec.workspace && !leftRef)) return;
   const isCurrent = () => state.view === 'commander' && state.comparisonContext === context && state.comparisonSession === session
-    && (nested ? state.compareMode === 'submodule' && state.submoduleCompare === snapshot && !snapshot.loading && snapshot.leftRevision === leftRef && snapshot.rightRevision === rightRef
+    && (nested ? state.compareMode === 'submodule' && state.submoduleCompare === snapshot && !snapshot.loading && snapshot.leftRevision === snapshotLeft && snapshot.rightRevision === snapshotRight
       : state.commanderComparisonResult === snapshot && !state.commanderComparisonLoading);
   if (!submoduleDetailsPanel) submoduleDetailsPanel = SubmoduleCompareDetails.create({
     dialog: $('#submoduleDetailsDialog'), body: $('#submoduleDetailsBody'), compareButton: $('#submoduleDetailsCompare'),
@@ -2227,7 +2251,7 @@ function openSubmoduleComparisonDetails(row, nested = false) {
     },
   });
   return submoduleDetailsPanel.open({ repositoryPath, relativePath: row.relative_path, leftRef, rightRef,
-    workspaceRevision: !nested && spec.workspace ? row.local?.revision || null : null }, isCurrent);
+    workspaceRevision: !evidence && !nested && spec.workspace ? row.local?.revision || null : null }, isCurrent);
 }
 
 function revisionDisplay(value = '') { return value ? value.slice(0, 8) : '—'; }
@@ -4816,6 +4840,52 @@ async function pullSubmodule(entry) {
 function mergeTargetForMain() { return { targetPath: '', label: state.repository.current_branch || 'current branch', isSubmodule: false }; }
 function mergeTargetForSubmodule(entry) { return { targetPath: entry.relative_path, label: entry.name, isSubmodule: true }; }
 
+let mergePreviewPanel = null;
+function openMergePreview(target, sourceRef, expectedIncoming = null) {
+  if (!state.repository || !sourceRef) return;
+  const context = { owner:state.repository.path, generation:repoOpenGeneration,
+    graphPath:state.view==='graph' ? activeGraphData().path : null };
+  if (!mergePreviewPanel) mergePreviewPanel = MergePreview.create({
+    dialog:$('#mergePreviewDialog'),
+    invoke:(command,args)=>invoke ? invoke(command,args) : Promise.reject('Merge preview is available in the desktop application.'),
+    current:c=>!!c && state.repository?.path===c.owner && repoOpenGeneration===c.generation &&
+      (!c.graphPath || state.view==='graph' && activeGraphData().path===c.graphPath),
+    onFile:openMergePreviewFile,
+  });
+  return mergePreviewPanel.open({repositoryPath:context.owner,targetPath:target.targetPath,sourceRef,expectedIncoming},context);
+}
+
+async function openMergePreviewFile(report, item, pair, isCurrent) {
+  const pairs = {result:[item.current,item.result,'CURRENT','PROPOSED RESULT'],
+    sides:[item.current,item.incoming,'CURRENT','INCOMING · UNRESOLVED'],
+    ours:[item.base,item.current,'COMMON BASE','CURRENT'], theirs:[item.base,item.incoming,'COMMON BASE','INCOMING']};
+  const selected=pairs[pair]; if(!selected || !isCurrent())return;
+  const row={name:item.path,relative_path:item.path};
+  state.comparingRow=row;
+  const guard=openFileCompareGuard();
+  const valid=()=>guard() && isCurrent() && state.comparingRow===row && refs.compareDialog.open;
+  refs.compareTitle.textContent=item.path;
+  refs.compareSubtitle.textContent=`Merge preview · ${report.source_ref} → ${report.current_branch} · committed snapshots`;
+  refs.localCompare.textContent=refs.remoteCompare.textContent='Loading…';
+  resetCompareDiffNavigation();
+  setCompareReadOnly(true,'Preview only. No files, staging or branches were changed. Conflicts have no final result yet.');
+  setCompareHeadLabels(selected[2],selected[3]);
+  refs.compareDialog.showModal();
+  try {
+    const contents=await invoke('merge_preview_contents',{repositoryPath:report.repository_path,versions:selected.slice(0,2)});
+    if(!valid())return;
+    if(contents.some(c=>c.content===null)) {
+      resetCompareDiffNavigation('Text comparison unavailable for this item.');
+      refs.localCompare.textContent=contents[0].note || 'Text comparison unavailable because the other side cannot be displayed.';
+      refs.remoteCompare.textContent=contents[1].note || 'Text comparison unavailable because the other side cannot be displayed.';
+      return;
+    }
+    renderComparisonContents(contents[0].content,contents[1].content);
+  }catch(error){if(valid()){resetCompareDiffNavigation('Could not load preview contents.');refs.localCompare.textContent=String(error);refs.remoteCompare.textContent='';}}
+}
+
+$('#previewMergeBranch').addEventListener('click',()=>openMergePreview(state.mergeTarget || mergeTargetForMain(),refs.mergeBranchSource.value));
+
 function updateMergeDirectionPreview() {
   const source = refs.mergeBranchSource.value;
   const target = refs.mergeBranchCurrent.value || state.mergeTarget?.label || 'current branch';
@@ -6109,6 +6179,7 @@ function showBranchMenu(branchName, event) {
     { separator: true },
     { header: 'Merge' },
     graphMergeMenuItem(branchName),
+    graphMergePreviewMenuItem(branchName),
   ];
   if (mutableLocal) {
     items.push(
@@ -7033,6 +7104,17 @@ function graphMergeMenuItem(branchName, id = 'merge') {
   };
 }
 
+function graphMergePreviewMenuItem(branchName, id = 'preview-merge', expectedIncoming = null) {
+  const target=activeGraphMergeTarget();
+  const context={owner:state.repository?.path,generation:repoOpenGeneration,path:activeGraphData().path};
+  return {id,label:`Preview merge with ${branchName}…`,kind:'compare',
+    detail:`${branchName} → ${target.label}. Inspect files, conflicts and submodule choices; nothing is applied.`,
+    run:()=>{
+      if(state.repository?.path!==context.owner || repoOpenGeneration!==context.generation || activeGraphData().path!==context.path)return;
+      return openMergePreview(target,branchName,expectedIncoming);
+    }};
+}
+
 function graphCheckoutBranchMenuItem(branchName, kind = 'local_branch', id = 'checkout-branch') {
   const g = activeGraphData();
   const isRemote = kind === 'remote_branch';
@@ -7380,7 +7462,7 @@ function showGraphCommitContextMenu(event, commitId) {
     menuItems.push(
       { separator: true },
       { header: 'Merge into current branch' },
-      ...mergeRefs.map((ref, index) => graphMergeMenuItem(ref.name, `merge-${index}`)),
+      ...mergeRefs.flatMap((ref, index) => [graphMergeMenuItem(ref.name, `merge-${index}`), graphMergePreviewMenuItem(ref.name, `preview-merge-${index}`, commitId)]),
     );
   }
   menuItems.push(
