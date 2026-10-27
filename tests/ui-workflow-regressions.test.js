@@ -10,7 +10,7 @@ const css = fs.readFileSync(path.join(root, 'frontend/styles.css'), 'utf8');
 const repository = fs.readFileSync(path.join(root, 'src-tauri/src/repository.rs'), 'utf8');
 
 test('Clean checkout confirms embedded-repository removal without an extra force mode', () => {
-  const action = app.slice(app.indexOf('async function restoreExactCheckpointFromGraphCommit'), app.indexOf('function showGraphCommitContextMenu'));
+  const action = app.match(/async function restoreExactCheckpointFromGraphCommit\([^]*?\n}/)[0];
   assert.match(action, /discards staged and unstaged local edits/);
   assert.match(action, /including nested Git repositories and their local-only commits/);
   assert.match(action, /including ignored files inside them/);

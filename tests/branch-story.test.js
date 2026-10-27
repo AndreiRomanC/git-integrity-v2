@@ -660,7 +660,7 @@ test('Branch Story UI: the original fork supports inspection, compare with HEAD,
     openCommanderDirectory: async scope => calls.push(['compare', scope, h.state.branchCompareLeftRef, h.state.branchCompareRightRef]),
   });
   const names = ['graphCommitCompareAnchorMatches', 'selectedGraphCommitIds', 'refreshGraphCommitSelection', 'handleGraphCommitRowClick', 'setGraphCommitCompareStart',
-    'openRepositoryRevisionCompare', 'openGraphRevisionCompare', 'showGraphCommitContextMenu', 'wireGraphRowInteractions'];
+    'openRepositoryRevisionCompare', 'openGraphRevisionCompare', 'cleanUpstreamMenuItems', 'showGraphCommitContextMenu', 'wireGraphRowInteractions'];
   vm.runInContext(names.map(name => `${['openRepositoryRevisionCompare', 'openGraphRevisionCompare'].includes(name) ? 'async ' : ''}${appFunction(name)}`).join('\n'), h.context);
   h.graph.commits = originalForkFixture(); h.graph.headOid = 'F1';
   h.context.activeBranchStoryView().mode = 'story';

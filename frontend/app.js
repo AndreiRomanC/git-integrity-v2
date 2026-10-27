@@ -14,7 +14,7 @@ const MUTATING_COMMANDS = new Set([
   'stage_files', 'unstage_files', 'stage_all', 'commit_files', 'commit_staged', 'commit_path',
   'remove_git_path', 'delete_local_path', 'switch_branch', 'checkout_remote_tracking_branch', 'create_branch', 'create_branch_at_commit', 'checkout_commit', 'rename_branch', 'delete_branch',
   'stash_changes', 'stash_file', 'pop_stash', 'drop_stash', 'restore_stash_paths', 'abort_stash_conflict',
-  'restore_file', 'restore_remote_file', 'restore_folder', 'restore_exact_checkpoint', 'restore_exact_checkpoint_branch', 'add_submodule', 'init_submodule', 'switch_submodule_version', 'reset_submodule', 'reset_submodule_branch_to_upstream', 'change_submodule_url',
+  'restore_file', 'restore_remote_file', 'restore_folder', 'restore_exact_checkpoint', 'restore_exact_checkpoint_branch', 'clean_branch_from_upstream', 'add_submodule', 'init_submodule', 'switch_submodule_version', 'reset_submodule', 'reset_submodule_branch_to_upstream', 'change_submodule_url',
   'commit_submodule', 'push_submodule', 'pull_submodule', 'force_push_submodule', 'fetch_submodule',
   'create_submodule_branch', 'merge_branch', 'open_merge_tool', 'resolve_conflict', 'complete_merge', 'abort_merge',
   'sync_repository', 'publish_branch', 'combine_local_commits', 'fetch_remote', 'fetch_all_remotes', 'fetch_project', 'write_text_file', 'run_git_command', 'run_terminal_command',
@@ -43,6 +43,7 @@ const DIAGNOSTIC_COMMANDS = new Set(['commit_staged', 'commit_files', 'commit_pa
 for (const command of ['compare_git_revisions_directory', 'compare_git_revisions_file_list', 'compare_submodule_revisions_directory', 'compare_submodule_revisions_file_list', 'compare_github_module_revisions_directory', 'compare_github_module_revisions_file_list', 'compare_workspace_revision', 'submodule_comparison_details']) DIAGNOSTIC_COMMANDS.add(command);
 for (const command of ['push_submodule_preview', 'open_status_check_url']) DIAGNOSTIC_COMMANDS.add(command);
 for (const command of ['refresh_navigation_status', 'submodule_folder_status']) DIAGNOSTIC_COMMANDS.add(command);
+DIAGNOSTIC_COMMANDS.add('inspect_submodule_checkout');
 let diagnosticRequestSequence = 0;
 let inFlightRepositoryWrites = 0;
 let inFlightBackendRequests = 0;
@@ -738,6 +739,7 @@ async function downloadSnapshots(name, sources, button) {
 }
 
 function fileComparisonDownloadSources(comparison, name) {
+  if (Array.isArray(comparison.download_sources) && comparison.download_sources.length === 2) return comparison.download_sources;
   return [
     comparison.local_exists === false ? { kind: 'missing' } : { kind: 'text', name, content: comparison.local_content || '' },
     comparison.remote_exists === false ? { kind: 'missing' } : { kind: 'text', name, content: comparison.remote_content || '' },
@@ -2705,7 +2707,7 @@ async function openSubmoduleRevisionFileCompare(row) {
       });
     if (!stillCurrent() || state.comparingRow !== row) return;
     renderComparisonContents(comparison.local_content || (leftMissing ? '(file does not exist on left revision)' : ''), comparison.remote_content || (rightMissing ? '(file does not exist on right revision)' : ''), comparison);
-  } catch (error) { if (stillCurrent() && state.comparingRow === row) { refs.localCompare.textContent = String(error); refs.remoteCompare.textContent = ''; } }
+  } catch (error) { if (stillCurrent() && state.comparingRow === row) { resetCompareDiffNavigation('Comparison could not be loaded.'); refs.localCompare.textContent = String(error); refs.remoteCompare.textContent = ''; } }
 }
 
 async function openGitRevisionFileCompare(row, evidence = null) {
@@ -2740,7 +2742,7 @@ async function openGitRevisionFileCompare(row, evidence = null) {
     });
     if (!stillCurrent() || state.comparingRow !== row || state.comparisonContext !== contextAtStart || state.comparisonSession !== session) return;
     renderComparisonContents(comparison.local_content || (leftMissing ? '(file does not exist on start ref)' : ''), comparison.remote_content || (rightMissing ? '(file does not exist on compare ref)' : ''), comparison);
-  } catch (error) { if (stillCurrent() && state.comparingRow === row) { refs.localCompare.textContent = String(error); refs.remoteCompare.textContent = ''; } }
+  } catch (error) { if (stillCurrent() && state.comparingRow === row) { resetCompareDiffNavigation('Comparison could not be loaded.'); refs.localCompare.textContent = String(error); refs.remoteCompare.textContent = ''; } }
 }
 
 function previewCommanderRows() {
@@ -2767,7 +2769,7 @@ async function openWorkspaceRevisionFileCompare(row) {
     const result = await invoke('compare_workspace_revision_file', { repositoryPath: spec.repositoryPath, relativePath: row.relative_path, revision });
     if (!stillCurrent()) return;
     renderComparisonContents(result.local_content, result.remote_content, result);
-  } catch (error) { if (stillCurrent()) { refs.localCompare.textContent = String(error); refs.remoteCompare.textContent = ''; } }
+  } catch (error) { if (stillCurrent()) { resetCompareDiffNavigation('Comparison could not be loaded.'); refs.localCompare.textContent = String(error); refs.remoteCompare.textContent = ''; } }
 }
 
 async function openFileCompare(row) {
@@ -2788,7 +2790,7 @@ async function openFileCompare(row) {
     const comparison = await invoke('compare_file_contents', { repositoryPath: state.repository.path, relativePath: row.relative_path, remoteRef: state.remoteRef });
     if (!stillCurrent() || state.comparingRow !== row) return; // a newer file's compare (same guard) or the dialog moved on
     renderComparisonContents(comparison.local_content || (localMissing ? '(file does not exist locally)' : ''), comparison.remote_content, comparison);
-  } catch (error) { if (stillCurrent() && state.comparingRow === row) { refs.localCompare.textContent = String(error); refs.remoteCompare.textContent = ''; } }
+  } catch (error) { if (stillCurrent() && state.comparingRow === row) { resetCompareDiffNavigation('Comparison could not be loaded.'); refs.localCompare.textContent = String(error); refs.remoteCompare.textContent = ''; } }
 }
 
 async function openIndexWorktreeCompare(change) {
@@ -2815,6 +2817,7 @@ async function openIndexWorktreeCompare(change) {
     renderComparisonContents(comparison.local_content || '', comparison.remote_content || '', comparison);
   } catch (error) {
     if (stillCurrent() && state.comparingRow === row) {
+      resetCompareDiffNavigation('Comparison could not be loaded.');
       refs.localCompare.textContent = String(error);
       refs.remoteCompare.textContent = '';
     }
@@ -2883,7 +2886,9 @@ function resetCompareDiffNavigation(message = 'Loading differences…') {
   state.compareRendered = null;
   state.compareSearchRows = [];
   state.compareSearchActive = -1;
-  if (refs.compareSearch) refs.compareSearch.value = '';
+  if (refs.compareSearch) { refs.compareSearch.value = ''; refs.compareSearch.disabled = false; }
+  refs.localCompare?.classList?.remove('compare-preview-note');
+  refs.remoteCompare?.classList?.remove('compare-preview-note');
   if (refs.compareSearchStatus) refs.compareSearchStatus.textContent = '';
   refs.compareDiffStatus.textContent = message;
   refs.previousCompareDifference.disabled = refs.nextCompareDifference.disabled = true;
@@ -2993,12 +2998,31 @@ function renderComparisonRows() {
   updateCompareSearchNavigation();
 }
 
+function showComparisonPreviewUnavailable(note, snapshot) {
+  resetCompareDiffNavigation('Text preview unavailable · download both versions');
+  if (snapshot) captureFileComparisonDownload(snapshot);
+  if (refs.compareSearch) refs.compareSearch.disabled = true;
+  refs.localCompare.classList?.add('compare-preview-note');
+  refs.remoteCompare.classList?.add('compare-preview-note');
+  const describe = (exists, size) => exists === false ? 'Absent on this side.'
+    : Number.isFinite(size) ? `${(size / 1024 / 1024).toFixed(2)} MiB · complete file available for download.` : 'Complete version available for download.';
+  refs.localCompare.textContent = `${describe(snapshot?.local_exists, snapshot?.local_size)}\n\n${note}\n\nUse Download both versions in the comparison toolbar. No content is truncated or treated as identical.`;
+  refs.remoteCompare.textContent = `${describe(snapshot?.remote_exists, snapshot?.remote_size)}\n\n${note}`;
+}
+
 function renderComparisonContents(localText, remoteText, snapshot = null) {
+  if (snapshot?.preview_note) { showComparisonPreviewUnavailable(snapshot.preview_note, snapshot); return; }
   if (snapshot) captureFileComparisonDownload(snapshot);
   const diffEngine = window.LocalDriveDiff || globalThis.LocalDriveDiff;
   const diff = diffEngine?.buildLineDiff
     ? diffEngine.buildLineDiff(localText, remoteText, undefined, 'exact')
     : fallbackComparisonDiff(localText, remoteText);
+  // Bound the DOM too: the byte limit alone does not protect against many
+  // short lines. Keep the complete download pair, never a truncated diff.
+  if (snapshot && diff.rows.length > 12000) {
+    showComparisonPreviewUnavailable('More than 12,000 aligned lines. Download both complete versions to compare externally.', snapshot);
+    return;
+  }
   state.compareRendered = { localText, remoteText, diff };
   state.compareDiffRows = diff.rows.map((row, index) => row.same ? null : index).filter(index => index !== null);
   state.compareDiffBlocks = comparisonBlocks(diff.rows);
@@ -3494,6 +3518,7 @@ function currentSubmoduleCompareContext() {
   return { entry: submoduleEntryForPath(submodulePath), innerPath: innerPathForSubmodule(submodulePath, openPath) };
 }
 
+let navigationFeedbackTimer = null;
 const navigationRefresh = window.GitDrillDownNavigationRefresh.create({
   invoke: (command, args) => invoke(command, args),
   current: target => state.repository?.path === target.owner && repoOpenGeneration === target.generation &&
@@ -3515,18 +3540,37 @@ const navigationRefresh = window.GitDrillDownNavigationRefresh.create({
 });
 
 function syncNavigationRefreshNotice() {
+  if (navigationFeedbackTimer !== null) { clearTimeout(navigationFeedbackTimer); navigationFeedbackTimer = null; }
   const jobs = navigationRefresh.states();
   state.navigationStatusPending = jobs.length > 0;
   const notice = $('#navigationRefreshNotice');
   if (!notice) return;
   const error = jobs.find(job => job.phase === 'error');
-  const updating = jobs.some(job => job.phase === 'refreshing');
-  notice.hidden = !error && !updating;
+  const updating = jobs.filter(job => job.phase === 'refreshing');
+  const elapsed = updating.length ? Math.max(0, Math.floor((Date.now() - Math.min(...updating.map(job => job.refreshStartedAt))) / 1000)) : 0;
+  notice.hidden = !error && !updating.length;
   notice.classList.toggle('refresh-failed', !!error);
   notice.querySelector('span').textContent = error
     ? `Git status not verified (${anonymizeForLog(error.target.repositoryPath)}). Previous data remain visible. ${error.error}`
-    : 'Updating Git status… You can keep browsing. Displayed status may be out of date.';
+    : `Checking local Git status · ${elapsed} s. You can keep browsing; displayed status is not yet verified.`;
   notice.querySelector('button').hidden = !error;
+  const entry = refs.details?.displayedEntry;
+  const pending = state.view === 'explorer' && refs.details?.displayedRepositoryPath === state.repository?.path &&
+    entry?.relative_path === state.selectedEntry?.relative_path && entry?.details_loading && !entry.details_error;
+  const label = refs.details?.querySelector('[data-entry-progress]');
+  if (pending && label) label.textContent = entryDetailsProgressText(entry);
+  // UI-only clock while a read is pending. No polling, Git commands, cache
+  // renewal or extra renders; stop as soon as no current operation needs it.
+  if ((!error && updating.length) || pending) navigationFeedbackTimer = setTimeout(syncNavigationRefreshNotice, 1000);
+}
+
+function entryDetailsProgressText(entry, now = Date.now()) {
+  if (entry.details_error) return 'Details could not be verified. Select this item again to retry.';
+  const elapsed = Math.max(0, Math.floor((now - (entry.details_wait_started ?? now)) / 1000));
+  const phase = entry.details_phase === 'waiting_status' ? 'Waiting for repository status verification'
+    : entry.details_phase === 'reading_inspection' ? 'Reading local submodule information; Git status is still being verified'
+    : 'Checking current Git details';
+  return `${phase} · ${elapsed} s`;
 }
 
 function ensureNavigationStatus(path, { entry = false } = {}) {
@@ -3954,8 +3998,6 @@ let entryDetailsTraceSequence = 0;
 const selectEntryGuard = createRequestGuard();
 
 async function selectEntry(path, options = {}) {
-  const previousDetails = refs.details?.displayedRepositoryPath === state.repository?.path &&
-    refs.details?.displayedEntry?.relative_path === path ? refs.details.displayedEntry : null;
   if (refs.details) refs.details.displayedRepositoryPath = state.repository?.path;
   state.selectedEntry = state.entries.find(entry => entry.relative_path === path);
   const selected = state.selectedEntry;
@@ -3999,13 +4041,47 @@ async function selectEntry(path, options = {}) {
   if (!invoke) return renderEntryDetails({ ...state.selectedEntry, item_count: state.selectedEntry.kind === 'folder' ? 12 : null, submodule_url: state.selectedEntry.kind === 'submodule' ? 'git@example.com:platform/diagnostics-core.git' : null, submodule_branch: state.selectedEntry.kind === 'submodule' ? 'main' : null, last_commit_id: 'a39f21d', last_commit_subject: 'P:423421431 test', last_commit_author: 'Andrei Pop', last_commit_date: '2026-08-14' });
   // Stage 1 is the listing we already have: no extra IPC, scan or cache.
   // Missing fields are explicitly pending, never inferred as clean/detached.
-  renderEntryDetails(previousDetails && !previousDetails.details_loading ? previousDetails : { ...selected, details_loading: true, last_commit_id: undefined });
+  let pendingDetails = { ...selected, details_loading: true, last_commit_id: undefined,
+    details_phase: !options.navigationVerified || state.statusReady === false ? 'waiting_status' : 'reading_details', details_wait_started: Date.now() };
+  renderEntryDetails(pendingDetails);
   traceSelection('basic_dom_ready');
   const fetchDetails = async () => {
     if (!stillCurrent()) return;
+    let inspectionTimer = null, waitingForStatus = false;
+    const inspectWhileWaiting = () => {
+      if (!waitingForStatus || !stillCurrent() || selected.kind !== 'submodule') return;
+      pendingDetails = { ...pendingDetails, details_phase: 'reading_inspection' };
+      renderEntryDetails(pendingDetails);
+      traceSelection('inspection_started');
+      invoke('inspect_submodule_checkout', { repositoryPath, relativePath: path }).then(inspection => {
+        if (!waitingForStatus || !stillCurrent()) { traceSelection('inspection_discarded'); return; }
+        pendingDetails = { ...pendingDetails, ...inspection, details_inspection: true, details_phase: 'waiting_status' };
+        renderEntryDetails(pendingDetails);
+        traceSelection('inspection_dom_ready');
+      }).catch(() => {
+        if (!waitingForStatus || !stillCurrent()) return;
+        // A deleted/unavailable child is not a clean or uninitialized child.
+        // The normal verified path will provide the definitive result later.
+        pendingDetails = { ...pendingDetails, details_phase: 'waiting_status' };
+        renderEntryDetails(pendingDetails);
+        traceSelection('inspection_unavailable');
+      });
+    };
     try {
+      if (state.statusReady === false) {
+        // Initial open already owns the full scan; do not launch another one.
+        waitingForStatus = true;
+        inspectWhileWaiting();
+        return;
+      }
       if (!options.navigationVerified) {
+        waitingForStatus = true;
+        // Warm navigation keeps its existing call count. Only a verification
+        // still pending after 150 ms warrants this small read-only fallback.
+        inspectionTimer = setTimeout(inspectWhileWaiting, 150);
         const verification = await ensureNavigationStatus(path, { entry: true });
+        waitingForStatus = false;
+        clearTimeout(inspectionTimer); inspectionTimer = null;
         if (!stillCurrent() || verification?.obsolete) return;
         if (verification?.refreshed) {
           await fetchAndRenderDirectory(state.currentPath, explorerRequestSeq, { force: true, keepVisible: true, explorerOnly: true });
@@ -4013,6 +4089,10 @@ async function selectEntry(path, options = {}) {
         }
       }
       if (state.statusReady === false) return; // Initial open already owns the scan.
+      if (pendingDetails.details_phase !== 'reading_details') {
+        pendingDetails = { ...pendingDetails, details_phase: 'reading_details', details_wait_started: Date.now() };
+        renderEntryDetails(pendingDetails);
+      }
       traceSelection('request_started');
       const result = await invoke('entry_details', { repositoryPath, relativePath: path });
       if (!stillCurrent()) { traceSelection('details_discarded'); return; }
@@ -4040,10 +4120,13 @@ async function selectEntry(path, options = {}) {
           traceSelection('history_failed');
         });
     } catch (error) {
+      waitingForStatus = false;
       if (!stillCurrent()) { traceSelection('error_discarded'); return; }
-      renderEntryDetails(previousDetails && !previousDetails.details_loading ? previousDetails : { ...selected, details_loading: true, details_error: true, last_commit_error: true });
+      renderEntryDetails({ ...pendingDetails, details_error: true, last_commit_error: true });
       handleError(error);
       traceSelection('details_failed');
+    } finally {
+      if (inspectionTimer !== null) clearTimeout(inspectionTimer);
     }
   };
   // Selecting a folder/submodule this way happens on the *first* click of
@@ -4178,7 +4261,8 @@ function submoduleRepositoryLinkHtml(entry) {
   return `<a href="${esc(href)}" class="submodule-repository-link" data-submodule-path="${esc(entry.relative_path)}" title="${esc(href)}">${esc(remote)} ↗</a>`;
 }
 function submoduleRepositoryRowsHtml(entry) {
-  if (entry.details_loading) return `<span>Remote</span><strong>${entry.details_error ? 'Unavailable' : 'Checking…'}</strong>`;
+  if (entry.details_loading && !entry.details_inspection) return `<span>Remote</span><strong>${entry.details_error ? 'Unavailable' : 'Checking…'}</strong>`;
+  if (entry.details_loading && !entry.submodule_url && !entry.submodule_web_url) return '<span>Remote</span><strong>Unavailable locally</strong>';
   const remote = entry.submodule_web_url ? submoduleRepositoryLinkHtml(entry) : esc(entry.submodule_url || 'Not configured');
   return `<span>Remote</span><strong>${remote}</strong>`;
 }
@@ -4203,8 +4287,8 @@ function renderEntryLastCommitInner(entry) {
 
 function submoduleCheckoutBadgeHtml(entry) {
   if (entry.kind !== 'submodule') return '';
-  if (entry.details_loading) return `<span class="submodule-checkout-pill pending">${entry.details_error ? 'Checkout unavailable' : 'Checking checkout…'}</span>`;
-  if (entry.submodule_initialized === false) return '<span class="submodule-checkout-pill not-initialized">Not initialized</span>';
+  if (entry.details_loading && !(entry.details_inspection && entry.inspection_checkout_available)) return `<span class="submodule-checkout-pill pending">${entry.details_error || entry.details_inspection ? 'Checkout unavailable' : 'Checking checkout…'}</span>`;
+  if (!entry.details_loading && entry.submodule_initialized === false) return '<span class="submodule-checkout-pill not-initialized">Not initialized</span>';
   const branch = entry.submodule_current_branch || '';
   return branch
     ? `<span class="submodule-checkout-pill attached" title="${esc(`This submodule is currently checked out on branch ${branch}`)}">On branch · ${esc(branch)}</span>`
@@ -4217,12 +4301,12 @@ function contextActionSectionHtml(label, actionsHtml, extraClass = '') {
   return `<div class="context-action-section ${esc(extraClass)}">${label ? `<div class="context-action-section-title">${esc(label)}</div>` : ''}<div class="context-actions">${actions}</div></div>`;
 }
 
-// Presentation only: reuse the selected entry's verified details, with no
-// additional history lookup. The complete commit metadata remains below.
+// Presentation only: verified details or an explicitly unverified local
+// checkout inspection. Neither presentation performs a history lookup.
 function submoduleVersionSummaryHtml(entry) {
   if (entry.kind !== 'submodule') return '';
-  const pending = entry.details_loading;
-  const revision = pending ? (entry.details_error ? 'Unavailable' : 'Checking…')
+  const pending = entry.details_loading && !(entry.details_inspection && entry.inspection_checkout_available);
+  const revision = pending ? (entry.details_error ? 'Unavailable' : entry.details_inspection ? 'Unavailable locally' : 'Checking…')
     : entry.submodule_commit_id ? `<a href="#" class="commit-server-link" data-commit-id="${esc(entry.submodule_commit_id)}" data-submodule-path="${esc(entry.relative_path)}" title="${esc(entry.submodule_commit_id)} · Open on the submodule's server">${esc(entry.submodule_commit_id.slice(0, 8))} ↗</a>`
     : entry.submodule_initialized === false ? 'Not initialized' : 'No commit';
   const subject = !pending && entry.submodule_commit_subject || '';
@@ -4233,6 +4317,8 @@ function renderEntryDetails(entry) {
   refs.details.displayedEntry = entry;
   refs.details.closest?.('.main-layout')?.classList.remove('details-empty-state');
   const pending = entry.details_loading === true;
+  const checkoutPending = pending && !(entry.details_inspection && entry.inspection_checkout_available);
+  const configPending = pending && !entry.details_inspection;
   const waiting = entry.details_error ? 'Unavailable' : 'Checking…';
   const deletedEntry = ['deleted', 'deleted-folder', 'deleted-submodule'].includes(entry.kind);
   const kindLabel = entry.kind === 'submodule' ? 'Git submodule' : entry.kind === 'deleted-submodule' ? 'Deleted Git submodule' : entry.kind === 'deleted-folder' ? 'Deleted tracked folder' : entry.kind === 'deleted' ? 'Deleted tracked file' : entry.kind.charAt(0).toUpperCase() + entry.kind.slice(1);
@@ -4283,16 +4369,16 @@ function renderEntryDetails(entry) {
     : `${contextActionSectionHtml('', `${editAction}${navigationActions}${folderActions}${fileRestoreAction}${commitAction}${deletedRestoreAction}${fileGitActions}${deleteAction}`)}`;
   refs.details.innerHTML = `<div class="entry-details ${entry.kind === 'submodule' ? 'submodule-details' : ''}"><div class="entry-heading"><div class="entry-preview ${esc(entry.kind)}">${entry.kind === 'submodule' ? '◇' : entry.kind === 'folder' ? '▰' : '▤'}</div>
     <h2>${esc(entry.name)}</h2><div class="entry-path">${esc(entry.relative_path)}</div></div>${entry.kind === 'submodule' ? `<div class="submodule-badges"><span class="submodule-badge">◇ Git submodule</span>${submoduleCheckoutBadgeHtml(entry)}</div>` : ''}
-    ${pending ? `<div class="entry-details-loading ${entry.details_error ? 'failed' : ''}" role="status">${entry.details_error ? 'Details could not be verified. Select this item again to retry.' : '<i class="spinner"></i> Checking current Git details…'}<small>${entry.details_error ? 'Actions remain unavailable.' : 'Basic information is from the folder listing. Actions become available after verification.'}</small></div>` : ''}
+    ${pending ? `<div class="entry-details-loading ${entry.details_error ? 'failed' : ''}" role="status">${entry.details_error ? '' : '<i class="spinner"></i> '}<span data-entry-progress>${esc(entryDetailsProgressText(entry))}</span><small>${entry.details_error ? 'Actions remain unavailable.' : entry.details_inspection ? 'Read-only local information. Changes and Git actions remain unverified.' : 'You can keep browsing. Git actions remain unavailable until verification completes.'}</small></div>` : ''}
     ${submoduleVersionSummaryHtml(entry)}
     ${changeBanner}
     ${detailActions}
     <div class="detail-section"><h3>GENERAL</h3><div class="detail-grid"><span>Type</span><strong>${kindLabel}</strong><span>Git</span><strong>${esc(entryGitSummary(entry))}</strong>
     ${pending && ['folder', 'submodule'].includes(entry.kind) ? `<span>Items</span><strong>${waiting}</strong>` : entry.item_count != null ? `<span>Items</span><strong>${entry.item_count}</strong>` : `<span>Size</span><strong>${formatSize(entry.size)}</strong>`}<span>Modified</span><strong>${formatModified(entry.modified)}</strong></div></div>
     ${renderPersonalNoteSection(entry)}
-    ${entry.kind === 'submodule' ? `<div class="detail-section"><h3>SUBMODULE</h3><div class="detail-grid">${submoduleRepositoryRowsHtml(entry)}<span>Current checkout</span><strong>${pending ? waiting : submoduleBranchName ? `On branch ${esc(submoduleBranchName)}` : entry.submodule_initialized === false ? 'Not initialized' : 'Detached HEAD'}</strong><span>Default branch</span><strong>${esc(pending ? waiting : entry.submodule_branch || 'Default')}</strong><span>Status</span><strong>${esc(submoduleState.short)}</strong></div>
+    ${entry.kind === 'submodule' ? `<div class="detail-section"><h3>SUBMODULE</h3><div class="detail-grid">${submoduleRepositoryRowsHtml(entry)}<span>Current checkout</span><strong>${checkoutPending ? entry.details_inspection ? 'Unavailable locally' : waiting : submoduleBranchName ? `On branch ${esc(submoduleBranchName)}` : !pending && entry.submodule_initialized === false ? 'Not initialized' : 'Detached HEAD'}</strong><span>Default branch</span><strong>${esc(configPending ? waiting : entry.submodule_branch || 'Default')}</strong><span>Status</span><strong>${esc(submoduleState.short)}</strong></div>
     ${entry.submodule_unpushed_commits?.length ? `<div class="submodule-push-banner"><i></i><span>${entry.submodule_unpushed_commits.length} commit${entry.submodule_unpushed_commits.length === 1 ? '' : 's'} not yet pushed to its own remote:</span></div><div class="submodule-unpushed-list">${entry.submodule_unpushed_commits.map(commit => `<div class="submodule-unpushed-commit"><strong>${commitSubjectHtml(commit.subject)}</strong><small>${esc(commit.id.slice(0, 8))} · ${esc(commit.author)} · ${esc(commit.date)}</small></div>`).join('')}</div>` : entry.submodule_push_status ? `<div class="submodule-push-banner"><i></i><span>${esc(entry.submodule_push_status)}</span></div>` : ''}</div>` : ''}
-    ${entry.kind === 'submodule' ? `<div class="detail-section"><h3>SUBMODULE COMMIT (actual change)</h3><div class="detail-grid"><span>Commit</span><strong>${pending ? waiting : entry.submodule_commit_id ? `<a href="#" class="commit-server-link" data-commit-id="${esc(entry.submodule_commit_id)}" data-submodule-path="${esc(entry.relative_path)}" title="Open this commit on the submodule's own server">${esc(entry.submodule_commit_id.slice(0, 8))} ↗</a>` : 'No commit'}</strong>${entry.submodule_commit_tags?.length ? `<span>Tags</span><strong class="spec-list">${tagListHtml(entry.submodule_commit_tags)}</strong>` : ''}<span>Message</span><strong>${commitSubjectHtml(entry.submodule_commit_subject || '—')}</strong>${specDetailRows(entry.submodule_commit_subject, ...(entry.submodule_commit_tags || []))}<span>Author</span><strong>${esc(entry.submodule_commit_author || '—')}</strong><span>Date</span><strong>${esc(entry.submodule_commit_date || '—')}</strong></div></div>` : ''}
+    ${entry.kind === 'submodule' ? `<div class="detail-section"><h3>SUBMODULE COMMIT (actual change)</h3><div class="detail-grid"><span>Commit</span><strong>${checkoutPending ? entry.details_inspection ? 'Unavailable locally' : waiting : entry.submodule_commit_id ? `<a href="#" class="commit-server-link" data-commit-id="${esc(entry.submodule_commit_id)}" data-submodule-path="${esc(entry.relative_path)}" title="Open this commit on the submodule's own server">${esc(entry.submodule_commit_id.slice(0, 8))} ↗</a>` : 'No commit'}</strong>${entry.submodule_commit_tags?.length ? `<span>Tags</span><strong class="spec-list">${tagListHtml(entry.submodule_commit_tags)}</strong>` : ''}<span>Message</span><strong>${commitSubjectHtml(entry.submodule_commit_subject || '—')}</strong>${specDetailRows(entry.submodule_commit_subject, ...(entry.submodule_commit_tags || []))}<span>Author</span><strong>${esc(entry.submodule_commit_author || '—')}</strong><span>Date</span><strong>${esc(entry.submodule_commit_date || '—')}</strong></div></div>` : ''}
     <div class="detail-section" id="entryLastCommitSection">${renderEntryLastCommitInner(entry)}</div></div>`;
   refs.details.querySelectorAll('[data-detail-action]').forEach(button => {
     if (pending) {
@@ -4302,6 +4388,7 @@ function renderEntryDetails(entry) {
     button.addEventListener('click', () => { if (button.disabled) return; Promise.resolve(handleDetailAction(button.dataset.detailAction, entry, button)).catch(error => handleError(error)); });
   });
   refs.details.querySelectorAll('[data-note-action]').forEach(button => button.addEventListener('click', () => { Promise.resolve(button.dataset.noteAction === 'delete' ? deleteEntryPersonalNote(entry) : editEntryPersonalNote(entry)).catch(error => handleError(error)); }));
+  syncNavigationRefreshNotice();
 }
 
 function folderRestoreSourceRevision() {
@@ -7442,6 +7529,45 @@ async function restoreExactCheckpointFromGraphCommit(commitId, branch = '') {
   } catch (error) { handleError(error); }
 }
 
+function cleanUpstreamMenuItems(context, branchRefs) {
+  const local = (context.branches || []).find(branch => !branch.remote && branch.name === context.currentBranch);
+  if (context.headDetached || !local?.upstream || !context.headOid) return [];
+  if (!branchRefs.some(ref => (ref.kind === 'local_branch' && ref.name === local.name)
+    || (ref.kind === 'remote_branch' && ref.name === local.upstream))) return [];
+  const selection = { path: context.path, branch: local.name, upstream: local.upstream, head: context.headOid, generation: repoOpenGeneration };
+  return [{ id: 'clean-from-upstream', label: `Replace ${local.name} from ${local.upstream}…`,
+    detail: `Fetch + clean · stay on ${local.name} · discards local work`, danger: true,
+    run: () => cleanBranchFromUpstream(selection) }];
+}
+
+async function cleanBranchFromUpstream(selection) {
+  const stillSelected = () => {
+    const current = activeRepositoryContext();
+    return selection.generation === repoOpenGeneration && current.path === selection.path
+      && !current.headDetached && current.currentBranch === selection.branch && current.headOid === selection.head
+      && current.branches.some(branch => !branch.remote && branch.name === selection.branch && branch.upstream === selection.upstream);
+  };
+  if (!stillSelected()) return;
+  const ok = await customConfirm(
+    `Replace local branch ${selection.branch} with the latest ${selection.upstream}?\n\nFetch runs first. If it fails, no cleanup is performed. After a successful fetch:\n• ${selection.branch} moves to the fetched commit and stays checked out\n• local-only commits are removed from this branch\n• staged and unstaged edits are discarded\n• untracked, non-ignored leftovers are deleted, including whole nested Git repositories and their local history\n• submodules are forced to the versions recorded by the fetched commit\n\nOther ignored build artifacts are kept. The local branch name and upstream are preserved. No Push; nothing on the server is changed. This cannot be undone from the app.`,
+    { title: 'Replace branch from upstream · destructive', danger: true, okLabel: 'Fetch, replace & clean' }
+  );
+  if (!ok || !stillSelected() || !invoke) return;
+  try {
+    status(`Fetching ${selection.upstream}, then cleaning ${selection.branch}; submodule updates may take many minutes…`, 'busy');
+    const result = await invoke('clean_branch_from_upstream', { repositoryPath: selection.path, branch: selection.branch, upstream: selection.upstream, expectedHead: selection.head });
+    if (activeRepositoryContext().path === selection.path) await refreshAfterGraphCommitAction(selection.path);
+    const message = `${result.branch} replaced from ${result.upstream} at ${result.revision.slice(0, 8)}. Still on ${result.branch}; no Push performed.`;
+    status(message); showOperationToast(message, 'success');
+  } catch (error) {
+    // A failed recursive update can leave a partially restored/detached workspace.
+    if (activeRepositoryContext().path === selection.path) {
+      try { await refreshAfterGraphCommitAction(selection.path); } catch (_) { /* report the original operation error */ }
+    }
+    handleError(error);
+  }
+}
+
 function showGraphCommitContextMenu(event, commitId) {
   if (!selectedGraphCommitIds().includes(commitId)) selectCommit(commitId);
   const selectedIds = selectedGraphCommitIds();
@@ -7511,6 +7637,7 @@ function showGraphCommitContextMenu(event, commitId) {
     { header: 'Clean checkout · discards local files' },
     { id: 'restore-exact', label: 'Clean checkout exact commit…', detail: `${commitId.slice(0, 8)} · detached HEAD`, danger: true, run: () => restoreExactCheckpointFromGraphCommit(commitId) },
     ...localBranchesAtCommit.map((ref, index) => ({ id: `clean-branch-${index}`, label: `Clean checkout branch ${ref.name}…`, detail: 'Attach HEAD to this local branch after cleaning', danger: true, run: () => restoreExactCheckpointFromGraphCommit(commitId, ref.name) })),
+    ...cleanUpstreamMenuItems(context, branchRefs),
     { separator: true },
     { header: 'Compare · read only' },
     ...commitCompareItems,

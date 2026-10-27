@@ -73,3 +73,34 @@ test('fast-open status diagnostics still perform exactly one request and do not 
   assert.equal(c.state.statusReady, true);
   assert.deepEqual(logs, ['statusRefresh requested reason=fast_repository_open']);
 });
+
+test('elapsed feedback changes only text and stops its one timer after verification or failure', () => {
+  const text = {}, button = {}, label = {}, timers = new Map(); let sequence = 0;
+  const jobs = [{ phase: 'refreshing', refreshStartedAt: 1700000000000 }];
+  const notice = { classList: { toggle() {} }, querySelector: selector => selector === 'span' ? text : button };
+  const entry = { relative_path: 'module', details_loading: true, details_phase: 'waiting_status', details_wait_started: 1700000000000 };
+  const c = { state: { repository: { path: '/repo' }, view: 'explorer', selectedEntry: { relative_path: 'module' } },
+    refs: { details: { displayedEntry: entry, displayedRepositoryPath: '/repo', querySelector: () => label } },
+    navigationRefresh: { states: () => jobs }, $: () => notice, anonymizeForLog: () => 'repo',
+    setTimeout: fn => { const id = ++sequence; timers.set(id, fn); return id; }, clearTimeout: id => timers.delete(id),
+    invoke: () => assert.fail('the feedback clock must not query Git') };
+  const time = clock(c);
+  vm.runInContext('let navigationFeedbackTimer = null;\n' + source('entryDetailsProgressText') + '\n' + source('syncNavigationRefreshNotice'), c);
+  c.syncNavigationRefreshNotice(); assert.equal(timers.size, 1); assert.match(text.textContent, /0 s/);
+  time.advance(44000); c.syncNavigationRefreshNotice();
+  assert.equal(timers.size, 1); assert.match(text.textContent, /44 s/); assert.match(label.textContent, /Waiting for repository status verification · 44 s/);
+  assert.equal(c.state.navigationStatusPending, true);
+  jobs[0].phase = 'error'; jobs[0].error = 'scan failed'; jobs[0].target = { repositoryPath: '/repo' }; entry.details_error = true;
+  c.syncNavigationRefreshNotice(); assert.equal(timers.size, 0); assert.equal(button.hidden, false);
+  assert.equal(c.state.navigationStatusPending, true, 'failed verification must still block writes');
+  jobs.length = 0; entry.details_loading = false; c.syncNavigationRefreshNotice();
+  assert.equal(timers.size, 0); assert.equal(notice.hidden, true); assert.equal(c.state.navigationStatusPending, false);
+});
+
+test('details feedback distinguishes repository verification from reading the selected entry', () => {
+  const c = {}; vm.runInNewContext(source('entryDetailsProgressText'), c);
+  assert.match(c.entryDetailsProgressText({ details_phase: 'waiting_status', details_wait_started: 1000 }, 19000), /verification · 18 s/);
+  assert.match(c.entryDetailsProgressText({ details_phase: 'reading_inspection', details_wait_started: 1000 }, 19000), /Reading local submodule information/);
+  assert.match(c.entryDetailsProgressText({ details_phase: 'reading_details', details_wait_started: 19000 }, 19000), /Checking current Git details · 0 s/);
+  assert.doesNotMatch(c.entryDetailsProgressText({ details_phase: 'waiting_status', details_wait_started: 19000 }, 1000), /-18/);
+});

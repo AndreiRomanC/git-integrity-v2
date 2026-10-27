@@ -92,31 +92,21 @@ pub async fn compare_workspace_revision(repository_path: String, relative_path: 
     }).await
 }
 
-fn workspace_file(repository_path: &str, relative_path: &str, revision: &str) -> Result<FileComparison, String> {
+pub(super) fn workspace_file(repository_path: &str, relative_path: &str, revision: &str) -> Result<FileComparison, String> {
     validate_path(repository_path)?;
     let relative = safe_relative_path(relative_path)?;
     let repo = Repository::open(repository_path).map_err(|e| e.message().to_string())?;
     let commit = resolve_commit(repository_path, revision)?;
-    let remote = tree_file_content(repository_path, &commit, relative_path, true)?;
+    let remote = file_preview::tree(repository_path, &commit, relative_path)?;
     let absolute = Path::new(repository_path).join(&relative);
     let index_entry = repo.index().ok().and_then(|i| i.get_path(&relative, 0));
     let local = if let Some(entry) = index_entry.filter(|entry| entry.mode == 0o160000) {
         let oid = Repository::open(&absolute).ok().and_then(|sub| sub.head().ok().and_then(|h| h.target())).unwrap_or(entry.id);
-        Some(format!("Subproject commit {oid}\n").into_bytes())
+        file_preview::gitlink(oid, relative_path)
     } else {
-        match fs::read(&absolute) {
-            Ok(bytes) => Some(bytes),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => return Err(format!("Cannot read working-tree file: {e}")),
-        }
+        file_preview::worktree(repository_path, relative_path)?
     };
-    let (local_exists, remote_exists) = (local.is_some(), remote.is_some());
-    let (local, remote) = (local.unwrap_or_default(), remote.unwrap_or_default());
-    if local.len() > 1_000_000 || remote.len() > 1_000_000 || local.contains(&0) || remote.contains(&0) {
-        return Err("Binary files and files over 1 MB are not shown in the text compare view".into());
-    }
-    Ok(FileComparison { relative_path: normalized(&relative), remote_ref: commit,
-        local_content: String::from_utf8_lossy(&local).into_owned(), remote_content: String::from_utf8_lossy(&remote).into_owned(), local_exists, remote_exists })
+    Ok(file_preview::pair(normalized(&relative), commit, local, remote))
 }
 
 #[tauri::command]

@@ -232,6 +232,13 @@ pub(super) fn restore_exact_checkpoint_inner_with_branch(repository_path: String
     let _lock = lock_handle.lock().unwrap();
     log_repo_write_lock_acquired(&repository_path, "restore_exact_checkpoint", queue_started.elapsed());
 
+    restore_exact_checkpoint_locked(&repository_path, trimmed, branch)
+}
+
+// Caller holds repo_write_lock for the whole destructive workflow.
+fn restore_exact_checkpoint_locked(repository_path: &str, commit_id: &str, branch: Option<String>) -> Result<(), String> {
+    let trimmed = commit_id.trim();
+
     let repo = internal_repository(&repository_path)?;
     let object = repo.revparse_single(trimmed)
         .or_else(|_| Oid::from_str(trimmed).and_then(|oid| repo.find_object(oid, Some(ObjectType::Commit))))
@@ -347,6 +354,90 @@ pub(super) fn restore_exact_checkpoint_inner_with_branch(repository_path: String
     invalidate_git_metadata(&repository_path);
     invalidate_submodule_sync(&repository_path);
     Ok(())
+}
+
+#[derive(Serialize, Debug)]
+pub struct CleanUpstreamResult {
+    branch: String,
+    upstream: String,
+    revision: String,
+}
+
+fn clean_upstream_target(repo: &Repository, branch: &str, upstream: &str, expected_head: &str) -> Result<(String, String, String), String> {
+    let head = repo.head().map_err(|e| e.message().to_string())?;
+    if repo.head_detached().unwrap_or(true) || head.name() != Some(format!("refs/heads/{branch}").as_str())
+        || head.target().map(|oid| oid.to_string()).as_deref() != Some(expected_head) {
+        return Err("The active branch or its commit changed. Nothing was cleaned; reopen the action on the current local branch.".into());
+    }
+    if repo.state() != git2::RepositoryState::Clean {
+        return Err("Finish or abort the active merge/rebase before replacing this branch. Nothing was cleaned.".into());
+    }
+    let local = repo.find_branch(branch, BranchType::Local).map_err(|e| e.message().to_string())?;
+    let tracking = local.upstream().map_err(|_| "Configure a remote upstream for this branch first")?;
+    if tracking.get().shorthand() != Some(upstream) {
+        return Err("The configured upstream changed. Nothing was cleaned; reopen the action.".into());
+    }
+    let config = repo.config().map_err(|e| e.message().to_string())?;
+    let remote = config.get_string(&format!("branch.{branch}.remote")).map_err(|_| "Missing remote upstream")?;
+    let merge_ref = config.get_string(&format!("branch.{branch}.merge")).map_err(|_| "Missing upstream branch")?;
+    let tracking_ref = tracking.get().name().ok_or("Invalid remote-tracking ref")?.to_string();
+    if remote == "." || !merge_ref.starts_with("refs/heads/") || !tracking_ref.starts_with("refs/remotes/") {
+        return Err("Choose a branch with a real remote branch as its upstream. Nothing was cleaned.".into());
+    }
+    repo.find_remote(&remote).map_err(|_| "The configured remote is unavailable")?;
+    Ok((remote, merge_ref, tracking_ref))
+}
+
+#[tauri::command]
+pub async fn clean_branch_from_upstream(repository_path: String, branch: String, upstream: String, expected_head: String) -> Result<CleanUpstreamResult, String> {
+    off_main_thread(move || clean_branch_from_upstream_inner(repository_path, branch, upstream, expected_head)).await
+}
+
+fn clean_branch_from_upstream_inner(repository_path: String, branch: String, upstream: String, expected_head: String) -> Result<CleanUpstreamResult, String> {
+    validate_path(&repository_path)?;
+    let queue_started = Instant::now();
+    let lock_handle = repo_write_lock(&repository_path);
+    let _lock = lock_handle.lock().unwrap();
+    log_repo_write_lock_acquired(&repository_path, "clean_branch_from_upstream", queue_started.elapsed());
+    let result = (|| {
+        let repo = internal_repository(&repository_path)?;
+        let target = clean_upstream_target(&repo, &branch, &upstream, &expected_head)?;
+        let own = repo.workdir().and_then(|path| fs::canonicalize(path).ok());
+        let occupied = git(&repository_path, &["worktree", "list", "--porcelain"])?
+            .split("\n\n").any(|record| record.lines().any(|line| line == format!("branch refs/heads/{branch}"))
+                && record.lines().find_map(|line| line.strip_prefix("worktree ")).is_some_and(|path| fs::canonicalize(path).ok() != own));
+        if occupied { return Err("This branch is also checked out in another worktree. Nothing was cleaned.".into()); }
+        drop(repo);
+        // Fetch only the configured source branch. Missing/deleted branches
+        // fail here, before any cleaning; never use a stale tracking ref.
+        let refspec = format!("+{}:{}", target.1, target.2);
+        git(&repository_path, &["fetch", "--no-tags", "--no-recurse-submodules", "--", &target.0, &refspec])
+            .map_err(|e| format!("Fetch failed; no local files or branch commits were discarded. {e}"))?;
+        let repo = internal_repository(&repository_path)?;
+        if clean_upstream_target(&repo, &branch, &upstream, &expected_head)? != target {
+            return Err("Upstream configuration changed during fetch. Nothing was cleaned.".into());
+        }
+        let oid = repo.find_reference(&target.2).and_then(|r| r.peel_to_commit()).map_err(|e| e.message().to_string())?.id().to_string();
+        drop(repo);
+        // Keep the old local branch pointer until the existing recursive clean
+        // checkout succeeds. A failed submodule update must not silently report
+        // success or move that branch past an incomplete restore.
+        restore_exact_checkpoint_locked(&repository_path, &oid, None)
+            .map_err(|e| format!("Replacing {branch} from {upstream} did not complete. The local branch pointer was not reset; the workspace may already be detached at {oid}. {e}"))?;
+        let repo = internal_repository(&repository_path)?;
+        if !repo.head_detached().unwrap_or(false) || repo.head().ok().and_then(|h| h.target()).map(|id| id.to_string()).as_deref() != Some(&oid) {
+            return Err("Checkout changed during cleanup. The local branch was not reset; inspect the workspace.".into());
+        }
+        let branch_ref = format!("refs/heads/{branch}");
+        git(&repository_path, &["update-ref", "-m", "Git DrillDown: replace local branch from upstream", &branch_ref, &oid, &expected_head])
+            .map_err(|e| format!("Workspace cleaned at {oid} (detached), but {branch} could not be moved. {e}"))?;
+        repo.set_head(&branch_ref).map_err(|e| format!("{branch} now points to {oid}, but HEAD could not be attached: {}", e.message()))?;
+        Ok(CleanUpstreamResult { branch, upstream, revision: oid })
+    })();
+    // A failed fetch/restore may still have changed local refs or files.
+    invalidate_git_metadata(&repository_path);
+    invalidate_submodule_sync(&repository_path);
+    result
 }
 
 // Temporary, same-repository safety area for non-ignored untracked paths.
@@ -624,6 +715,147 @@ fn restore_checkpoint_summarize_lines(lines: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct UpstreamFixture { base: PathBuf, remote: PathBuf, local: PathBuf }
+    fn upstream_git(path: &Path, args: &[&str]) -> String {
+        let output = Command::new("git").arg("-C").arg(path).args(args).output().unwrap();
+        assert!(output.status.success(), "{args:?}: {}", String::from_utf8_lossy(&output.stderr));
+        String::from_utf8(output.stdout).unwrap().trim().into()
+    }
+    impl UpstreamFixture {
+        fn new() -> Self {
+            let suffix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            let base = std::env::temp_dir().join(format!("gdd-upstream-{}-{suffix}", std::process::id()));
+            let remote = base.join("remote"); let local = base.join("local");
+            fs::create_dir_all(&remote).unwrap();
+            upstream_git(&remote, &["init", "-b", "main"]);
+            upstream_git(&remote, &["config", "user.name", "Test"]);
+            upstream_git(&remote, &["config", "user.email", "test@example.invalid"]);
+            fs::write(remote.join("file.txt"), "base\n").unwrap();
+            fs::write(remote.join(".gitignore"), "*.ignored\n").unwrap();
+            upstream_git(&remote, &["add", "."]); upstream_git(&remote, &["commit", "-m", "base"]);
+            upstream_git(&base, &["clone", "-o", "company", remote.to_str().unwrap(), local.to_str().unwrap()]);
+            upstream_git(&local, &["branch", "-m", "my-main"]);
+            upstream_git(&local, &["config", "user.name", "Test"]);
+            upstream_git(&local, &["config", "user.email", "test@example.invalid"]);
+            Self { base, remote, local }
+        }
+        fn clean(&self, head: &str) -> Result<CleanUpstreamResult, String> {
+            clean_branch_from_upstream_inner(self.local.to_string_lossy().into(), "my-main".into(), "company/main".into(), head.into())
+        }
+    }
+    impl Drop for UpstreamFixture { fn drop(&mut self) { let _ = fs::remove_dir_all(&self.base); } }
+
+    #[test]
+    fn clean_upstream_fetches_then_replaces_differently_named_branch_without_remote_writes() {
+        let f = UpstreamFixture::new();
+        fs::write(f.remote.join("file.txt"), "new server version\n").unwrap();
+        upstream_git(&f.remote, &["commit", "-am", "remote advance"]);
+        let target = upstream_git(&f.remote, &["rev-parse", "HEAD"]);
+        fs::write(f.local.join("local-only.txt"), "local history").unwrap();
+        upstream_git(&f.local, &["add", "."]); upstream_git(&f.local, &["commit", "-m", "local-only"]);
+        let before = upstream_git(&f.local, &["rev-parse", "HEAD"]);
+        upstream_git(&f.local, &["branch", "untouched"]);
+        fs::write(f.local.join("file.txt"), "staged edit").unwrap(); upstream_git(&f.local, &["add", "file.txt"]);
+        fs::write(f.local.join("file.txt"), "unstaged edit").unwrap();
+        fs::write(f.local.join("loose.txt"), "untracked").unwrap();
+        fs::write(f.local.join("cache.ignored"), "keep build artifact").unwrap();
+        fs::create_dir(f.local.join("nested")).unwrap(); upstream_git(&f.local.join("nested"), &["init"]);
+        fs::write(f.local.join("nested/local.txt"), "remove whole nested repository").unwrap();
+        let result = f.clean(&before).unwrap();
+        assert_eq!(result.branch, "my-main"); assert_eq!(result.upstream, "company/main"); assert_eq!(result.revision, target);
+        assert_eq!(upstream_git(&f.local, &["branch", "--show-current"]), "my-main");
+        assert_eq!(upstream_git(&f.local, &["rev-parse", "HEAD"]), target);
+        assert_eq!(upstream_git(&f.local, &["rev-parse", "@{upstream}"]), target);
+        assert_eq!(upstream_git(&f.local, &["rev-parse", "untouched"]), before);
+        assert_eq!(upstream_git(&f.remote, &["rev-parse", "HEAD"]), target);
+        assert_eq!(upstream_git(&f.local, &["status", "--porcelain"]), "");
+        assert!(!f.local.join("local-only.txt").exists()); assert!(!f.local.join("loose.txt").exists()); assert!(!f.local.join("nested").exists());
+        assert!(f.local.join("cache.ignored").exists());
+        assert_eq!(fs::read_to_string(f.local.join("file.txt")).unwrap(), "new server version\n");
+    }
+
+    #[test]
+    fn clean_upstream_preflight_and_fetch_failures_do_not_discard_files() {
+        for failure in ["head", "upstream", "detached", "local-upstream", "missing-remote-branch", "remote-unavailable", "merge"] {
+            let f = UpstreamFixture::new();
+            let head = upstream_git(&f.local, &["rev-parse", "HEAD"]);
+            fs::write(f.local.join("file.txt"), "keep my staged change").unwrap();
+            upstream_git(&f.local, &["add", "file.txt"]);
+            fs::write(f.local.join("loose.txt"), "keep untracked").unwrap();
+            match failure {
+                "upstream" => { upstream_git(&f.local, &["config", "branch.my-main.merge", "refs/heads/other"]); }
+                "detached" => { upstream_git(&f.local, &["checkout", "--detach"]); }
+                "local-upstream" => { upstream_git(&f.local, &["config", "branch.my-main.remote", "."]); }
+                "missing-remote-branch" => { upstream_git(&f.remote, &["branch", "-m", "renamed"]); }
+                "remote-unavailable" => { upstream_git(&f.local, &["remote", "set-url", "company", f.base.join("does-not-exist").to_str().unwrap()]); }
+                "merge" => { fs::write(f.local.join(".git/MERGE_HEAD"), &head).unwrap(); }
+                _ => {}
+            }
+            let index = fs::read(f.local.join(".git/index")).unwrap();
+            assert!(f.clean(if failure == "head" { "0000000000000000000000000000000000000000" } else { &head }).is_err(), "{failure}");
+            assert_eq!(fs::read(f.local.join(".git/index")).unwrap(), index, "{failure}");
+            assert_eq!(fs::read_to_string(f.local.join("file.txt")).unwrap(), "keep my staged change", "{failure}");
+            assert!(f.local.join("loose.txt").exists(), "{failure}");
+            assert_eq!(upstream_git(&f.local, &["rev-parse", "my-main"]), head, "{failure}");
+        }
+    }
+
+    #[test]
+    fn clean_upstream_restores_recorded_submodule_revision_and_cleans_its_worktree() {
+        let f = UpstreamFixture::new();
+        let dep = f.base.join("dep"); fs::create_dir(&dep).unwrap();
+        upstream_git(&dep, &["init", "-b", "main"]);
+        upstream_git(&dep, &["config", "user.name", "Test"]); upstream_git(&dep, &["config", "user.email", "test@example.invalid"]);
+        fs::write(dep.join("module.txt"), "version 1").unwrap();
+        upstream_git(&dep, &["add", "."]); upstream_git(&dep, &["commit", "-m", "v1"]);
+        upstream_git(&f.remote, &["-c", "protocol.file.allow=always", "submodule", "add", dep.to_str().unwrap(), "module"]);
+        upstream_git(&f.remote, &["commit", "-am", "add module"]);
+        upstream_git(&f.local, &["fetch", "company"]); upstream_git(&f.local, &["merge", "--ff-only", "company/main"]);
+        upstream_git(&f.local, &["-c", "protocol.file.allow=always", "submodule", "update", "--init"]);
+        let before = upstream_git(&f.local, &["rev-parse", "HEAD"]);
+        fs::write(dep.join("module.txt"), "version 2").unwrap(); upstream_git(&dep, &["commit", "-am", "v2"]);
+        let v2 = upstream_git(&dep, &["rev-parse", "HEAD"]);
+        upstream_git(&f.remote.join("module"), &["fetch", "origin"]);
+        upstream_git(&f.remote.join("module"), &["checkout", "--detach", &v2]);
+        upstream_git(&f.remote, &["commit", "-am", "update module"]);
+        // Preload local objects; the actual clean/update must use the recorded
+        // commit, not a submodule branch tip or a parent index from before fetch.
+        upstream_git(&f.local.join("module"), &["fetch", "origin"]);
+        fs::write(f.local.join("module/module.txt"), "discard edited module").unwrap();
+        fs::write(f.local.join("module/loose.txt"), "discard loose file").unwrap();
+        f.clean(&before).unwrap();
+        assert_eq!(upstream_git(&f.local, &["branch", "--show-current"]), "my-main");
+        assert_eq!(upstream_git(&f.local.join("module"), &["rev-parse", "HEAD"]), v2);
+        assert_eq!(fs::read_to_string(f.local.join("module/module.txt")).unwrap(), "version 2");
+        assert!(!f.local.join("module/loose.txt").exists());
+        assert_eq!(upstream_git(&f.local, &["status", "--porcelain"]), "");
+    }
+
+    #[test]
+    fn clean_upstream_failed_submodule_update_does_not_move_local_branch_or_claim_success() {
+        let f = UpstreamFixture::new();
+        let before = upstream_git(&f.local, &["rev-parse", "HEAD"]);
+        fs::write(f.remote.join(".gitmodules"), format!("[submodule \"missing\"]\npath = missing\nurl = {}\n", f.base.join("no-such-remote").display())).unwrap();
+        upstream_git(&f.remote, &["add", ".gitmodules"]);
+        upstream_git(&f.remote, &["update-index", "--add", "--cacheinfo", &format!("160000,{before},missing")]);
+        upstream_git(&f.remote, &["commit", "-m", "unavailable submodule"]);
+        let error = f.clean(&before).unwrap_err();
+        assert!(error.contains("did not complete"), "{error}");
+        assert!(error.contains("local branch pointer was not reset"), "{error}");
+        assert_eq!(upstream_git(&f.local, &["rev-parse", "my-main"]), before);
+        assert_eq!(upstream_git(&f.local, &["branch", "--show-current"]), "");
+    }
+
+    #[test]
+    fn clean_upstream_rejects_branch_checked_out_in_another_worktree() {
+        let f = UpstreamFixture::new();
+        let before = upstream_git(&f.local, &["rev-parse", "HEAD"]);
+        upstream_git(&f.local, &["worktree", "add", "--force", f.base.join("other-worktree").to_str().unwrap(), "my-main"]);
+        fs::write(f.local.join("file.txt"), "keep").unwrap();
+        assert!(f.clean(&before).unwrap_err().contains("another worktree"));
+        assert_eq!(fs::read_to_string(f.local.join("file.txt")).unwrap(), "keep");
+    }
 
     #[test]
     fn exact_checkpoint_verification_flags_non_exact_submodule_states() {

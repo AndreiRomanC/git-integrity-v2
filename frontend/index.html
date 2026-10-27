@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Git DrillDown</title>
   <link rel="icon" type="image/png" href="assets/git-drilldown-mark.png">
-  <link rel="stylesheet" href="styles.css?v=20261027-status-diagnostics">
-  <link rel="stylesheet" href="polarion.css?v=20261027-status-diagnostics">
+  <link rel="stylesheet" href="styles.css?v=20261027-navigation-feedback">
+  <link rel="stylesheet" href="polarion.css?v=20261027-navigation-feedback">
 </head>
 <body>
   <div id="startupIntro" class="startup-intro" hidden>
@@ -17,7 +17,7 @@
       <div id="startupIntroFailure" class="startup-intro-failure" hidden><p>Reload the window to retry.</p><button type="button" id="startupIntroRetry">Reload interface</button></div>
     </div>
   </div>
-  <script src="startup-intro.js?v=20261027-status-diagnostics"></script>
+  <script src="startup-intro.js?v=20261027-navigation-feedback"></script>
   <div class="app-shell">
     <header class="topbar">
       <div class="brand" aria-label="Git DrillDown">
@@ -457,7 +457,7 @@
           <button type="button" id="nextCompareDifference" title="Go to the next changed block" disabled><svg class="ui-icon" viewBox="0 0 20 20" aria-hidden="true" focusable="false"><path d="M10 4v12m-5-5 5 5 5-5"/></svg>Next block</button>
         </div>
         <div class="compare-tool-group" role="group" aria-label="Export comparison">
-          <button type="button" id="compareDownload" class="snapshot-download" title="Download both loaded text versions into left and right folders" aria-label="Download both file versions" disabled><svg class="ui-icon" viewBox="0 0 20 20" aria-hidden="true" focusable="false"><path d="M10 2v10m-4-4 4 4 4-4M3 13v4h14v-4"/></svg></button>
+          <button type="button" id="compareDownload" class="snapshot-download" title="Download both complete file versions into left and right folders (also binary or oversized files)" aria-label="Download both file versions" disabled><svg class="ui-icon" viewBox="0 0 20 20" aria-hidden="true" focusable="false"><path d="M10 2v10m-4-4 4 4 4-4M3 13v4h14v-4"/></svg></button>
         </div>
       </div>
       <div class="compare-head"><span>LOCAL</span><span>REMOTE</span></div>
@@ -962,22 +962,22 @@
       <footer><span>Read-only on Polarion · local snapshots outside Git</span><button value="cancel">Close</button><button type="button" id="polarionAdd" class="confirm" disabled>Add to Commit List</button></footer>
     </form>
   </dialog>
-  <script src="polarion.js?v=20261027-status-diagnostics"></script>
-  <script src="console-context.js?v=20261027-status-diagnostics"></script>
-  <script src="graph-model.js?v=20261027-status-diagnostics"></script>
-  <script src="submodule-state.js?v=20261027-status-diagnostics"></script>
-  <script src="submodule-versions.js?v=20261027-status-diagnostics"></script>
-  <script src="local-diff.js?v=20261027-status-diagnostics"></script>
-  <script src="local-drive.js?v=20261027-status-diagnostics"></script>
-  <script src="pr-status.js?v=20261027-status-diagnostics"></script>
-  <script src="refresh-coordinator.js?v=20261027-status-diagnostics"></script>
-  <script src="comparison-authors.js?v=20261027-status-diagnostics"></script>
-  <script src="git-activity.js?v=20261027-status-diagnostics"></script>
-  <script src="comparison-navigation.js?v=20261027-status-diagnostics"></script>
-  <script src="panel-resize.js?v=20261027-status-diagnostics"></script>
-  <script src="submodule-compare-details.js?v=20261027-status-diagnostics"></script>
-  <script src="merge-preview.js?v=20261027-status-diagnostics"></script>
-  <script src="navigation-refresh.js?v=20261027-status-diagnostics"></script>
-  <script src="app.js?v=20261027-status-diagnostics"></script>
+  <script src="polarion.js?v=20261027-navigation-feedback"></script>
+  <script src="console-context.js?v=20261027-navigation-feedback"></script>
+  <script src="graph-model.js?v=20261027-navigation-feedback"></script>
+  <script src="submodule-state.js?v=20261027-navigation-feedback"></script>
+  <script src="submodule-versions.js?v=20261027-navigation-feedback"></script>
+  <script src="local-diff.js?v=20261027-navigation-feedback"></script>
+  <script src="local-drive.js?v=20261027-navigation-feedback"></script>
+  <script src="pr-status.js?v=20261027-navigation-feedback"></script>
+  <script src="refresh-coordinator.js?v=20261027-navigation-feedback"></script>
+  <script src="comparison-authors.js?v=20261027-navigation-feedback"></script>
+  <script src="git-activity.js?v=20261027-navigation-feedback"></script>
+  <script src="comparison-navigation.js?v=20261027-navigation-feedback"></script>
+  <script src="panel-resize.js?v=20261027-navigation-feedback"></script>
+  <script src="submodule-compare-details.js?v=20261027-navigation-feedback"></script>
+  <script src="merge-preview.js?v=20261027-navigation-feedback"></script>
+  <script src="navigation-refresh.js?v=20261027-navigation-feedback"></script>
+  <script src="app.js?v=20261027-navigation-feedback"></script>
 </body>
 </html>

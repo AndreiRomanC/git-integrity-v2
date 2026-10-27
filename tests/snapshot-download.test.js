@@ -82,3 +82,43 @@ test('current submodule revisions also expose download without requiring checkou
     assert.match(html,/data-download-version/); assert.match(html,/no checkout/);
   }
 });
+
+test('binary/large previews download immutable blob pairs, never empty placeholder text', () => {
+  const c = load(['fileComparisonDownloadSources']);
+  const sources=[{kind:'blob',repository_path:'/repo',oid:'abc',name:'Dcm.xdm'},{kind:'missing'}];
+  const pair=c.fileComparisonDownloadSources({preview_note:'too large',local_content:'',remote_content:'',download_sources:sources},'Dcm.xdm');
+  assert.deepEqual(pair,sources);
+});
+
+test('unavailable preview clears Loading and old diff navigation but enables complete download', () => {
+  const button={disabled:true};
+  const c=load(['resetCompareDiffNavigation','captureFileComparisonDownload','fileComparisonDownloadSources','showComparisonPreviewUnavailable','renderComparisonContents'], {
+    state:{compareDiffRows:[1],compareDiffBlocks:[{start:1,end:1}]}, $:()=>button,
+    refs:{localCompare:{},remoteCompare:{},compareDiffStatus:{},previousCompareDifference:{},nextCompareDifference:{},compareDialog:{querySelectorAll:()=>[]}},
+  });
+  c.renderComparisonContents('','',{relative_path:'Dcm.xdm',preview_note:'Left: File exceeds 10 MiB.',local_exists:true,remote_exists:false,local_size:11000000,download_sources:[{kind:'blob',oid:'abc'},{kind:'missing'}]});
+  assert.equal(button.disabled,false);
+  assert.match(c.refs.compareDiffStatus.textContent,/Text preview unavailable/);
+  assert.match(c.refs.remoteCompare.textContent,/Absent/);
+  assert.equal(c.state.compareDiffBlocks.length,0);
+  assert.equal(c.state.compareDownloadSnapshot.sources[0].oid,'abc');
+});
+
+test('large XML above old 1 MB limit retains exact text and uses bounded existing diff engine', () => {
+  const diffEngine=require('../frontend/local-diff.js');
+  let rendered=0;
+  const c=load(['comparisonBlocks','renderComparisonContents'],{state:{},window:{LocalDriveDiff:diffEngine},captureFileComparisonDownload(){},renderComparisonRows(){rendered++;}});
+  const left=Array.from({length:4000},(_,i)=>`<item id="${i}">${'a'.repeat(500)}</item>\n`).join('');
+  const right=left.replace('aaaa','bbbb');
+  c.renderComparisonContents(left,right,{relative_path:'Dcm.xdm'});
+  assert.equal(rendered,1); assert.equal(c.state.compareRendered.localText,left);
+  assert.equal(c.state.compareDiffBlocks.length,1);
+});
+
+test('too many aligned rows yield download-only instead of creating an excessive DOM', () => {
+  let unavailable=0,rendered=0;
+  const c=load(['renderComparisonContents'],{state:{},window:{LocalDriveDiff:{buildLineDiff:()=>({rows:Array(12001).fill({same:true})})}},
+    captureFileComparisonDownload(){},renderComparisonRows(){rendered++;},showComparisonPreviewUnavailable(note,snapshot){assert.match(note,/12,000/);assert.equal(snapshot.relative_path,'many.txt');unavailable++;}});
+  c.renderComparisonContents('a','b',{relative_path:'many.txt'});
+  assert.equal(unavailable,1);assert.equal(rendered,0);
+});

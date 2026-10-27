@@ -3,10 +3,11 @@ use super::*;
 use serde::Deserialize;
 use std::io::Write;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum SnapshotSource {
     Revision { repository_path: String, submodule_path: Option<String>, revision: String, relative_path: String },
+    Blob { repository_path: String, oid: String, name: String },
     Local { path: String },
     Text { name: String, content: String, encoding: Option<String> },
     Missing,
@@ -69,6 +70,14 @@ fn export_one(source: &SnapshotSource, destination: &Path) -> Result<(), String>
     fs::create_dir(destination).map_err(|e| e.to_string())?;
     match source {
         SnapshotSource::Missing => absent(destination),
+        SnapshotSource::Blob { repository_path, oid, name } => {
+            if !is_safe_export_entry_name(name) { return Err("Unsafe export filename".into()); }
+            validate_path(repository_path)?;
+            let repo = Repository::open(repository_path).map_err(|e| e.message().to_string())?;
+            let oid = Oid::from_str(oid).map_err(|e| e.message().to_string())?;
+            let blob = repo.find_blob(oid).map_err(|e| e.message().to_string())?;
+            write_new(&destination.join(name), blob.content())
+        }
         SnapshotSource::Text { name, content, encoding } => {
             if !is_safe_export_entry_name(name) { return Err("Unsafe export filename".into()); }
             let bytes = crate::local_drive::encode_local_text(content, encoding.as_deref().unwrap_or("utf-8"))?;
@@ -108,7 +117,7 @@ fn export_one(source: &SnapshotSource, destination: &Path) -> Result<(), String>
     }
 }
 
-fn export_snapshots_inner(name: String, sources: Vec<SnapshotSource>, destination_path: String) -> Result<String, String> {
+pub(super) fn export_snapshots_inner(name: String, sources: Vec<SnapshotSource>, destination_path: String) -> Result<String, String> {
     if sources.is_empty() || sources.len() > 2 { return Err("Select one snapshot or a comparison pair".into()); }
     let destination = destination_directory(&destination_path)?;
     for source in &sources {
@@ -124,6 +133,10 @@ fn export_snapshots_inner(name: String, sources: Vec<SnapshotSource>, destinatio
             SnapshotSource::Revision { repository_path, submodule_path, relative_path, .. } => {
                 let (path, _) = revision_source(repository_path, submodule_path, relative_path)?;
                 Some(fs::canonicalize(path).map_err(|e| e.to_string())?)
+            }
+            SnapshotSource::Blob { repository_path, .. } => {
+                validate_path(repository_path)?;
+                Some(fs::canonicalize(repository_path).map_err(|e| e.to_string())?)
             }
             _ => None,
         };

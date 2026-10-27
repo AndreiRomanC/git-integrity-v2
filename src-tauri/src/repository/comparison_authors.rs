@@ -451,7 +451,6 @@ mod tests {
         let comparison = compare_git_tree_file(&f.path.to_string_lossy(), "module", &base.to_string(), &tip.to_string()).unwrap();
         assert_eq!(comparison.local_content, "Subproject commit 1111111111111111111111111111111111111111\n");
         assert_eq!(comparison.remote_content, "Subproject commit 2222222222222222222222222222222222222222\n");
-        assert!(tree_file_content(&f.path.to_string_lossy(), &base.to_string(), "module", false).is_err());
     }
 
     #[test]

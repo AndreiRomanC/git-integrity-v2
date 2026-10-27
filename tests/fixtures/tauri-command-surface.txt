@@ -17,6 +17,7 @@ submodule_comparison_details
 comparison_author_contributions
 checkout_remote_tracking_branch
 choose_folder
+clean_branch_from_upstream
 clone_repository
 commit_files
 commit_path
@@ -73,6 +74,7 @@ graph_head_main_merge_base
 github_module_refs
 init_repository
 init_submodule
+inspect_submodule_checkout
 list_conflicts
 list_directory_fast
 list_local_directory

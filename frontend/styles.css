@@ -788,6 +788,7 @@ button.pr-reviewer:hover { border-color: #59758e; background: #1b2b38; color: #e
 .compare-find input { min-width: 0; height: 26px; flex: 1; padding: 0; border: 0; outline: 0; background: transparent; color: #d7e3ed; font-size: 11px; }
 .compare-find output { flex: none; color: #7fa8c6; font-size: 10px; font-weight: 500; }
 .compare-content { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); height: min(62vh, 600px); overflow: hidden; }.compare-content pre { min-width: 0; min-height: 0; height: 100%; margin: 0; overflow-x: scroll; overflow-y: auto; padding: 14px; background: #0b1116; color: #c5d1db; font: 11px/1.55 ui-monospace, SFMono-Regular, Consolas, monospace; white-space: pre; }.compare-content pre:last-child { border-left: 1px solid var(--border); background: #0e151b; }
+.compare-content pre.compare-preview-note { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.7; }
 .compare-content pre::-webkit-scrollbar, .local-drive-diff-rows::-webkit-scrollbar { width: 12px; height: 12px; }
 .compare-content pre::-webkit-scrollbar-thumb, .local-drive-diff-rows::-webkit-scrollbar-thumb { background: #506577; border: 3px solid #101820; border-radius: 8px; }
 .compare-content pre::-webkit-scrollbar-track, .local-drive-diff-rows::-webkit-scrollbar-track { background: #101820; }

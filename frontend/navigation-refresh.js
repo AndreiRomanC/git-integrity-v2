@@ -21,7 +21,7 @@
       // current() prevents them from publishing into a different repository.
       for (const [oldId, job] of jobs) if (!current(job.target)) jobs.delete(oldId);
       for (const [oldId, value] of verifiedHeads) if (!current(value.target)) verifiedHeads.delete(oldId);
-      const job = { target, phase: 'checking', error: '', promise: null };
+      const job = { target, phase: 'checking', error: '', promise: null, refreshStartedAt: null };
       const started = Date.now();
       jobs.set(id, job);
       job.promise = Promise.resolve().then(async () => {
@@ -32,7 +32,7 @@
         }
         const forceFresh = !target.expectedHead && !sameHead(before, verifiedHeads.get(id)?.head || {});
         if (before.fresh && !forceFresh) return { refreshed: false };
-        job.phase = 'refreshing'; changed(); log('started', target, Date.now() - started);
+        job.phase = 'refreshing'; job.refreshStartedAt = Date.now(); changed(); log('started', target, Date.now() - started);
         // Uses the same backend single-flight status scan and mutation epochs
         // as Working tree/Refresh; navigation clicks join, never queue reruns.
         const changes = await invoke('refresh_navigation_status', {

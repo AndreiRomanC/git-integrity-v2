@@ -10,6 +10,7 @@ pub mod polarion;
 pub mod command_console;
 pub mod remotes;
 pub mod snapshot_export;
+mod file_preview;
 pub mod navigation;
 pub mod comparison;
 pub mod submodule_compare;
@@ -1025,6 +1026,10 @@ pub struct FileComparison {
     remote_content: String,
     local_exists: bool,
     remote_exists: bool,
+    preview_note: Option<String>,
+    local_size: u64,
+    remote_size: u64,
+    download_sources: Vec<snapshot_export::SnapshotSource>,
 }
 
 #[derive(Serialize)]
@@ -6359,6 +6364,59 @@ fn load_directory_inner(repository_path: String, relative_path: String, force: O
 }
 
 #[tauri::command]
+pub async fn inspect_submodule_checkout(repository_path: String, relative_path: String) -> Result<SubmoduleCheckoutInspection, String> {
+    off_main_thread(move || inspect_submodule_checkout_inner(&repository_path, &relative_path)).await
+}
+
+// Informational only. Deliberately has no status/dirty/initialized fields:
+// this result must never authorize a mutation or populate a status cache.
+#[derive(Serialize)]
+pub struct SubmoduleCheckoutInspection {
+    submodule_url: Option<String>,
+    submodule_web_url: Option<String>,
+    submodule_branch: Option<String>,
+    inspection_checkout_available: bool,
+    submodule_current_branch: Option<String>,
+    submodule_commit_id: Option<String>,
+    submodule_commit_subject: Option<String>,
+    submodule_commit_author: Option<String>,
+    submodule_commit_date: Option<String>,
+}
+
+fn inspect_submodule_checkout_inner(repository_path: &str, relative_path: &str) -> Result<SubmoduleCheckoutInspection, String> {
+    let started = Instant::now();
+    validate_path(repository_path)?;
+    let relative = safe_relative_path(relative_path)?;
+    if relative.as_os_str().is_empty() { return Err("Select a submodule".into()); }
+    let parent = internal_repository(repository_path)?;
+    let relative_string = normalized(&relative);
+    // One index lookup, not cached metadata (which can trigger a status scan).
+    if !parent.index().map_err(|e| e.message().to_string())?.get_path(&relative, 0).is_some_and(|entry| entry.mode == 0o160000) {
+        return Err("The selected path is no longer a Git submodule".into());
+    }
+    let (url, branch) = submodule_url_and_branch_in(&parent, &relative_string);
+    // Never discover the parent repository when the child was removed or has
+    // a broken .git file. The URL is still useful when checkout is unavailable.
+    let child = internal_submodule_repository(&Path::new(repository_path).join(&relative)).ok();
+    let web_url = submodule_browser_base_in(&parent, child.as_ref(), url.as_deref()).ok();
+    let head = child.as_ref().and_then(|repo| repo.head().ok());
+    let commit = head.as_ref().and_then(|head| head.peel_to_commit().ok());
+    let checkout_available = commit.is_some() && child.as_ref().is_some_and(|repo| repo.head_detached().is_ok());
+    let current_branch = head.as_ref().filter(|head| head.is_branch()).and_then(|head| head.shorthand()).map(String::from);
+    let result = SubmoduleCheckoutInspection {
+        submodule_url: url, submodule_web_url: web_url, submodule_branch: branch,
+        inspection_checkout_available: checkout_available, submodule_current_branch: current_branch,
+        submodule_commit_id: commit.as_ref().map(|c| c.id().to_string()),
+        submodule_commit_subject: commit.as_ref().map(|c| c.summary().unwrap_or("No message").to_string()),
+        submodule_commit_author: commit.as_ref().map(|c| c.author().name().unwrap_or("Unknown").to_string()),
+        submodule_commit_date: commit.as_ref().map(|c| short_date(c.time().seconds())),
+    };
+    perf_log(&format!("submodule_checkout_inspection: repo={} entry={} checkout_available={} local=true status_scan=false",
+        anonymized_repository_id(repository_path), anonymized_repository_id(relative_path), checkout_available), started.elapsed());
+    Ok(result)
+}
+
+#[tauri::command]
 pub async fn entry_details(repository_path: String, relative_path: String) -> Result<EntryDetails, String> {
     let queued = Instant::now();
     off_main_thread(move || {
@@ -8850,36 +8908,14 @@ fn compare_workspace_file_list_exact(repository_path: &str, relative_path: &str,
     Ok(CommanderDirectory { repository_path: repository_path.into(), local_revision, remote_ref: remote_ref.into(), remote_revision: commit, relative_path, rows })
 }
 
-fn tree_file_content(repository_path: &str, revision: &str, relative_path: &str, allow_gitlink: bool) -> Result<Option<Vec<u8>>, String> {
-    let repo = internal_repository(repository_path)?;
-    let oid = git2::Oid::from_str(revision).map_err(|error| error.message().to_string())?;
-    let tree = repo.find_commit(oid).and_then(|commit| commit.tree())
-        .map_err(|e| comparison::snapshot_error(repository_path, relative_path, "selected", revision, "read-root-tree", e))?;
-    let Some(entry) = comparison::snapshot_path_entry(&repo, &tree, Path::new(relative_path))
-        .map_err(|e| comparison::snapshot_error(repository_path, relative_path, "selected", revision, "lookup-file", e))? else { return Ok(None); };
-    if allow_gitlink && entry.filemode() == 0o160000 {
-        return Ok(Some(format!("Subproject commit {}\n", entry.id()).into_bytes()));
-    }
-    if entry.kind() != Some(ObjectType::Blob) {
-        return Err(format!("{relative_path} is not a text file in {revision}"));
-    }
-    let blob = repo.find_blob(entry.id()).map_err(|e| comparison::snapshot_error(repository_path, relative_path, "selected", revision, "read-file", e))?;
-    Ok(Some(blob.content().to_vec()))
-}
-
 fn compare_git_tree_file(repository_path: &str, relative_path: &str, left_ref: &str, right_ref: &str) -> Result<FileComparison, String> {
     let relative = safe_relative_path(relative_path)?;
     let relative_path = normalized(&relative);
     let left_revision = resolve_commit(repository_path, left_ref)?;
     let right_revision = resolve_commit(repository_path, right_ref)?;
-    let left = tree_file_content(repository_path, &left_revision, &relative_path, true)?;
-    let right = tree_file_content(repository_path, &right_revision, &relative_path, true)?;
-    let (local_exists, remote_exists) = (left.is_some(), right.is_some());
-    let (left, right) = (left.unwrap_or_default(), right.unwrap_or_default());
-    if left.len() > 1_000_000 || right.len() > 1_000_000 || left.contains(&0) || right.contains(&0) {
-        return Err("Binary files and files over 1 MB are not shown in the text compare view".into());
-    }
-    Ok(FileComparison { relative_path, remote_ref: right_ref.into(), local_content: String::from_utf8_lossy(&left).into_owned(), remote_content: String::from_utf8_lossy(&right).into_owned(), local_exists, remote_exists })
+    let left = file_preview::tree(repository_path, &left_revision, &relative_path)?;
+    let right = file_preview::tree(repository_path, &right_revision, &relative_path)?;
+    Ok(file_preview::pair(relative_path, right_ref.into(), left, right))
 }
 
 fn changed_paths_against(repository: &str, commit: &str, relative_path: &str) -> HashSet<String> {
@@ -9008,26 +9044,19 @@ pub async fn compare_remote_file_list(repository_path: String, relative_path: St
 }
 
 #[tauri::command]
-pub fn compare_file_contents(repository_path: String, relative_path: String, remote_ref: String) -> Result<FileComparison, String> {
+pub async fn compare_file_contents(repository_path: String, relative_path: String, remote_ref: String) -> Result<FileComparison, String> {
+    off_main_thread(move || compare_file_contents_inner(repository_path, relative_path, remote_ref)).await
+}
+
+fn compare_file_contents_inner(repository_path: String, relative_path: String, remote_ref: String) -> Result<FileComparison, String> {
     validate_path(&repository_path)?;
     if let Some((sub_path, inner_relative)) = resolve_submodule_boundary(&repository_path, &relative_path) {
         let sub_remote_ref = default_remote_ref(&sub_path).ok_or("This submodule has no remote-tracking branch. Fetch the submodule first.")?;
-        return compare_file_contents(sub_path, inner_relative, sub_remote_ref);
+        return compare_file_contents_inner(sub_path, inner_relative, sub_remote_ref);
     }
-    let relative = safe_relative_path(&relative_path)?;
-    let absolute = Path::new(&repository_path).join(&relative);
-    // The file may exist only on the remote (not yet fetched locally), so a missing
-    // local file is a valid state here, not an error — it just renders as empty/absent.
-    let mut local_exists = true;
-    let local = match fs::read(&absolute) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => { local_exists = false; Vec::new() },
-        Err(error) => return Err(format!("Cannot read local file: {error}")),
-    };
-    if local.len() > 1_000_000 || local.contains(&0) { return Err("Binary files and files over 1 MB are not shown in the text compare view".into()); }
-    let commit = resolve_commit(&repository_path, &remote_ref)?; let repo = internal_repository(&repository_path)?; let oid = git2::Oid::from_str(&commit).map_err(|error| error.message().to_string())?; let tree = repo.find_commit(oid).and_then(|commit| commit.tree()).map_err(|error| error.message().to_string())?; let entry = tree.get_path(&relative).map_err(|_| "The file does not exist in the selected remote revision".to_string())?; let remote = repo.find_blob(entry.id()).map_err(|error| error.message().to_string())?.content().to_vec();
-    if remote.len() > 1_000_000 || remote.contains(&0) { return Err("Binary files and files over 1 MB are not shown in the text compare view".into()); }
-    Ok(FileComparison { relative_path, remote_ref, local_content: String::from_utf8_lossy(&local).into_owned(), remote_content: String::from_utf8_lossy(&remote).into_owned(), local_exists, remote_exists: true })
+    let mut result = comparison::workspace_file(&repository_path, &relative_path, &remote_ref)?;
+    result.remote_ref = remote_ref;
+    Ok(result)
 }
 
 fn compare_index_worktree_file_inner(repository_path: String, relative_path: String) -> Result<FileComparison, String> {
@@ -9038,60 +9067,15 @@ fn compare_index_worktree_file_inner(repository_path: String, relative_path: Str
     }
     let relative = safe_relative_path(&relative_path)?;
     let relative_path = normalized(&relative);
-    let absolute = Path::new(&repository_path).join(&relative);
-    let mut local_exists = true;
-    let worktree = match fs::read(&absolute) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => { local_exists = false; Vec::new() },
-        Err(error) => return Err(format!("Cannot read working-tree file: {error}")),
-    };
     let repo = internal_repository(&repository_path)?;
-    let index = repo.index().map_err(|error| error.message().to_string())?;
-    let indexed = match index.get_path(&relative, 0) {
-        Some(entry) => repo.find_blob(entry.id).map_err(|error| error.message().to_string())?.content().to_vec(),
-        None => Vec::new(),
-    };
-    if worktree.len() > 1_000_000 || indexed.len() > 1_000_000 || worktree.contains(&0) || indexed.contains(&0) {
-        return Err("Binary files and files over 1 MB are not shown in the text compare view".into());
-    }
-    Ok(FileComparison {
-        relative_path,
-        remote_ref: "index".into(),
-        local_exists,
-        remote_exists: index.get_path(&relative, 0).is_some(),
-        local_content: String::from_utf8_lossy(&worktree).into_owned(),
-        remote_content: String::from_utf8_lossy(&indexed).into_owned(),
-    })
+    let worktree = file_preview::worktree(&repository_path, &relative_path)?;
+    let indexed = file_preview::index(&repo, &repository_path, &relative_path)?;
+    Ok(file_preview::pair(relative_path, "index".into(), worktree, indexed))
 }
 
 #[tauri::command]
 pub async fn compare_index_worktree_file(repository_path: String, relative_path: String) -> Result<FileComparison, String> {
     off_main_thread(move || compare_index_worktree_file_inner(repository_path, relative_path)).await
-}
-
-fn head_file_content(repository_path: &str, relative_path: &str) -> Result<Option<Vec<u8>>, String> {
-    let revision = match resolve_commit(repository_path, "HEAD") {
-        Ok(revision) => revision,
-        Err(_) => return Ok(None),
-    };
-    tree_file_content(repository_path, &revision, relative_path, false)
-}
-
-fn index_file_content(repo: &Repository, relative: &Path) -> Result<Option<Vec<u8>>, String> {
-    let index = repo.index().map_err(|error| error.message().to_string())?;
-    match index.get_path(relative, 0) {
-        Some(entry) => repo.find_blob(entry.id).map(|blob| Some(blob.content().to_vec())).map_err(|error| error.message().to_string()),
-        None => Ok(None),
-    }
-}
-
-fn worktree_file_content(repository_path: &str, relative: &Path) -> Result<Option<Vec<u8>>, String> {
-    let absolute = Path::new(repository_path).join(relative);
-    match fs::read(&absolute) {
-        Ok(bytes) => Ok(Some(bytes)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(format!("Cannot read working-tree file: {error}")),
-    }
 }
 
 fn compare_working_area_file_inner(repository_path: String, relative_path: String, staged: bool) -> Result<FileComparison, String> {
@@ -9104,24 +9088,16 @@ fn compare_working_area_file_inner(repository_path: String, relative_path: Strin
     let relative_path = normalized(&relative);
     let repo = internal_repository(&repository_path)?;
     let (left, right, right_label) = if staged {
-        (head_file_content(&repository_path, &relative_path)?, index_file_content(&repo, &relative)?, "index")
+        let head = match repo.head() {
+            Ok(head) => file_preview::tree(&repository_path, &head.peel_to_commit().map_err(|e| e.message().to_string())?.id().to_string(), &relative_path)?,
+            Err(e) if e.code() == git2::ErrorCode::UnbornBranch => file_preview::missing(),
+            Err(e) => return Err(e.message().to_string()),
+        };
+        (head, file_preview::index(&repo, &repository_path, &relative_path)?, "index")
     } else {
-        (index_file_content(&repo, &relative)?, worktree_file_content(&repository_path, &relative)?, "working-tree")
+        (file_preview::index(&repo, &repository_path, &relative_path)?, file_preview::worktree(&repository_path, &relative_path)?, "working-tree")
     };
-    // Presence comes from the same reads as the contents: no extra lookup/scan.
-    let (local_exists, remote_exists) = (left.is_some(), right.is_some());
-    let (left, right) = (left.unwrap_or_default(), right.unwrap_or_default());
-    if left.len() > 1_000_000 || right.len() > 1_000_000 || left.contains(&0) || right.contains(&0) {
-        return Err("Binary files and files over 1 MB are not shown in the text compare view".into());
-    }
-    Ok(FileComparison {
-        relative_path,
-        remote_ref: right_label.into(),
-        local_exists,
-        remote_exists,
-        local_content: String::from_utf8_lossy(&left).into_owned(),
-        remote_content: String::from_utf8_lossy(&right).into_owned(),
-    })
+    Ok(file_preview::pair(relative_path, right_label.into(), left, right))
 }
 
 #[tauri::command]
@@ -10217,9 +10193,9 @@ mod tests {
                 }
             }
             let file = if mode == "40000" { "unit/nested/file.txt" } else { "unit/nested" };
-            assert!(tree_file_content(&path, &broken, file, true).is_err());
+            assert!(compare_git_tree_file(&path, file, &healthy, &broken).is_err());
             assert!(remote_directory_entries(&path, &broken, "unit/nested").is_err());
-            assert!(tree_file_content(&path, &broken, "truly-absent", true).unwrap().is_none());
+            assert!(!compare_git_tree_file(&path, "truly-absent", &healthy, &broken).unwrap().remote_exists);
         }
         for flat in [false, true] {
             assert!(compare_git_snapshots(&path, "", "bad-ref", &healthy, flat).err().unwrap().contains("resolve-commit"));
@@ -12210,7 +12186,7 @@ mod tests {
         let commander = compare_remote_directory(repository.to_string_lossy().into_owned(), "".into(), "HEAD~1".into()).unwrap();
         assert!(commander.rows.iter().any(|row| row.relative_path == "src" && row.status == "modified"));
         assert!(commander.rows.iter().any(|row| row.relative_path == "unrelated.txt" && row.status == "local-only"));
-        let comparison = compare_file_contents(repository.to_string_lossy().into_owned(), "src/main.c".into(), "HEAD~1".into()).unwrap();
+        let comparison = compare_file_contents_inner(repository.to_string_lossy().into_owned(), "src/main.c".into(), "HEAD~1".into()).unwrap();
         assert_ne!(comparison.local_content, comparison.remote_content);
         let editable = read_text_file(repository.to_string_lossy().into_owned(), "src/main.c".into()).unwrap();
         assert!(editable.content.contains("main"));
@@ -13608,6 +13584,58 @@ mod tests {
         let signature = git2::Signature::now("Test", "test@example.com").unwrap();
         parent.commit(Some("HEAD"), &signature, &signature, "Register submodule", &tree, &[&previous]).unwrap();
         base
+    }
+
+    #[test]
+    fn checkout_inspection_is_read_only_and_does_not_publish_verified_status() {
+        let base = submodule_property_fixture();
+        let path = base.to_string_lossy().into_owned();
+        fs::write(base.join("vendor/dep/module.txt"), "local edits must stay intact\n").unwrap();
+        fs::write(base.join("vendor/dep/new.txt"), "untracked\n").unwrap();
+        let before: Vec<_> = [".git/HEAD", ".git/index", ".git/config", ".gitmodules", "vendor/dep/.git/HEAD", "vendor/dep/.git/index", "vendor/dep/.git/config", "vendor/dep/module.txt", "vendor/dep/new.txt"]
+            .into_iter().map(|name| (name, fs::read(base.join(name)).unwrap())).collect();
+        let epoch = status_cache_epoch(&path);
+        let result = inspect_submodule_checkout_inner(&path, "vendor/dep").unwrap();
+        assert!(result.inspection_checkout_available);
+        assert_eq!(result.submodule_url.as_deref(), Some("../dep.git"));
+        assert_eq!(result.submodule_web_url.as_deref(), Some("https://github.vitesco.io/tools/effective"));
+        assert_eq!(result.submodule_branch.as_deref(), Some("release/1.0"));
+        assert!(result.submodule_commit_id.is_some());
+        assert!(result.submodule_current_branch.is_some());
+        assert_eq!(status_cache_epoch(&path), epoch);
+        assert!(!full_status_cache().lock().unwrap().contains_key(&repo_lock_key(&path)));
+        for (name, bytes) in before { assert_eq!(fs::read(base.join(name)).unwrap(), bytes, "inspection changed {name}"); }
+        let child = Repository::open(base.join("vendor/dep")).unwrap();
+        let oid = child.head().unwrap().target().unwrap();
+        child.set_head_detached(oid).unwrap();
+        let detached = inspect_submodule_checkout_inner(&path, "vendor/dep").unwrap();
+        assert!(detached.inspection_checkout_available); assert!(detached.submodule_current_branch.is_none());
+        assert_eq!(detached.submodule_commit_id, Some(oid.to_string()));
+        drop(child);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn checkout_inspection_handles_deleted_and_uninitialized_paths_without_parent_fallback() {
+        let base = submodule_property_fixture();
+        let path = base.to_string_lossy().into_owned();
+        fs::remove_dir_all(base.join("vendor/dep")).unwrap();
+        let missing = inspect_submodule_checkout_inner(&path, "vendor/dep").unwrap();
+        assert!(!missing.inspection_checkout_available); assert!(missing.submodule_commit_id.is_none());
+        assert_eq!(missing.submodule_url.as_deref(), Some("../dep.git"));
+        assert_eq!(missing.submodule_web_url.as_deref(), Some("https://github.vitesco.io/eng/dep"));
+        fs::create_dir_all(base.join("vendor/dep")).unwrap();
+        let empty = inspect_submodule_checkout_inner(&path, "vendor/dep").unwrap();
+        assert!(!empty.inspection_checkout_available); assert!(empty.submodule_current_branch.is_none());
+        assert!(empty.submodule_commit_id.is_none(), "must not show the parent commit");
+        assert!(inspect_submodule_checkout_inner(&path, "README.md").is_err());
+        assert!(inspect_submodule_checkout_inner(&path, "../other").is_err());
+        assert!(inspect_submodule_checkout_inner(&path, "").is_err());
+        let parent = Repository::open(&base).unwrap();
+        let mut index = parent.index().unwrap(); index.remove_path(Path::new("vendor/dep")).unwrap(); index.write().unwrap();
+        assert!(inspect_submodule_checkout_inner(&path, "vendor/dep").is_err(), "a stale selection must not revive an untracked path");
+        drop(index); drop(parent);
+        fs::remove_dir_all(base).unwrap();
     }
 
     #[test]
@@ -18775,7 +18803,7 @@ mod tests {
         let module_row = comparison.rows.iter().find(|row| row.name == "module.txt").expect("module.txt should be listed when browsing inside the submodule");
         assert_eq!(module_row.status, "same", "after commit+push inside the submodule, the file should compare as in sync with the submodule's own remote, got status: {}", module_row.status);
 
-        let file_comparison = compare_file_contents(repo_path, "vendor/dep/module.txt".into(), "origin/main".into()).unwrap();
+        let file_comparison = compare_file_contents_inner(repo_path, "vendor/dep/module.txt".into(), "origin/main".into()).unwrap();
         assert_eq!(file_comparison.local_content, file_comparison.remote_content, "local and remote content should match after push");
         assert_eq!(file_comparison.local_content, "v2");
 

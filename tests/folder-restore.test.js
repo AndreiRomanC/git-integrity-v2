@@ -278,7 +278,7 @@ test('file details offer only the source-selection restore, preserving the submo
   const details = { innerHTML: '', querySelectorAll: () => [] };
   const context = { refs: { details }, esc: String, submoduleBoundaryFor: () => null,
     entryGitSummary: () => '', formatSize: () => '', formatModified: () => '',
-    renderPersonalNoteSection: () => '', renderEntryLastCommitInner: () => '' };
+    syncNavigationRefreshNotice() {}, renderPersonalNoteSection: () => '', renderEntryLastCommitInner: () => '' };
   vm.createContext(context);
   vm.runInContext(app.slice(app.indexOf('function contextActionSectionHtml('), app.indexOf('function folderRestoreSourceRevision()')), context);
   for (const kind of ['file', 'deleted']) {

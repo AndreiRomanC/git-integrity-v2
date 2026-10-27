@@ -112,6 +112,70 @@ test('deleted items keep their existing history-only path and an empty selection
   assert.deepEqual(h.calls.map(c => c.command), ['entry_last_commit']);
   await h.select('missing'); assert.equal(h.renders.at(-1).empty, 'Select a file or folder');
 });
+test('slow verification shows local checkout information before status, without a second scan', async () => {
+  const h = harness(), verification = deferred();
+  h.state.statusReady = true;
+  h.sandbox.ensureNavigationStatus = () => verification.promise;
+  const pending = h.sandbox.selectEntry('modules/a');
+  assert.equal(h.calls.length, 0);
+  [...h.timers.values()][0]();
+  assert.deepEqual(h.calls.map(c => c.command), ['inspect_submodule_checkout']);
+  h.calls[0].pending.resolve({ inspection_checkout_available: true, submodule_current_branch: 'topic', submodule_commit_id: 'abc', submodule_url: '../a.git' });
+  await tick();
+  assert.equal(h.renders.at(-1).submodule_commit_id, 'abc');
+  assert.equal(h.renders.at(-1).details_inspection, true);
+  assert.equal(h.renders.at(-1).details_loading, true);
+  assert.equal(h.renders.at(-1).details_phase, 'waiting_status');
+  assert.equal(h.state.statusReady, true, 'inspection does not change verification state');
+  verification.resolve({ refreshed: false }); await tick();
+  assert.equal(h.calls[1].command, 'entry_details');
+  h.details(1, 'a'); await pending;
+  assert.equal(h.renders.at(-1).details_loading, undefined);
+  assert.deepEqual(h.calls.map(c => c.command), ['inspect_submodule_checkout', 'entry_details', 'entry_last_commit']);
+});
+test('warm verification cancels the inspection fallback and makes no extra IPC call', async () => {
+  const h = harness(); h.state.statusReady = true;
+  h.sandbox.ensureNavigationStatus = async () => ({ refreshed: false });
+  const pending = h.sandbox.selectEntry('modules/a'); await tick();
+  assert.equal(h.timers.size, 0);
+  assert.deepEqual(h.calls.map(c => c.command), ['entry_details']);
+  h.details(0, 'a'); await pending;
+});
+test('late inspection cannot overwrite verified details or an A → B → A selection', async () => {
+  for (const finishVerification of [true, false]) {
+    const h = harness(), verification = deferred(); h.state.statusReady = true;
+    h.sandbox.ensureNavigationStatus = () => verification.promise;
+    const pending = h.sandbox.selectEntry('modules/a'); [...h.timers.values()][0]();
+    if (!finishVerification) { await h.select('missing'); }
+    verification.resolve({ refreshed: false }); await tick();
+    if (finishVerification) { h.details(1, 'a'); await pending; }
+    else {
+      await pending; const newer = h.select('a'); h.details(1, 'a'); await newer;
+    }
+    const count = h.renders.length;
+    h.calls[0].pending.resolve({ inspection_checkout_available: true, submodule_commit_id: 'obsolete' }); await tick();
+    assert.equal(h.renders.length, count);
+    assert.ok(h.logs.some(line => line.includes('inspection_discarded')));
+  }
+});
+test('initial open inspection does not start another status scan or grant verified status', async () => {
+  const h = harness(); h.state.statusReady = false;
+  h.sandbox.ensureNavigationStatus = () => assert.fail('initial open already owns verification');
+  await h.sandbox.selectEntry('modules/a');
+  assert.deepEqual(h.calls.map(c => c.command), ['inspect_submodule_checkout']);
+  h.calls[0].pending.resolve({ inspection_checkout_available: true, submodule_commit_id: 'initial' }); await tick();
+  assert.equal(h.state.statusReady, false); assert.equal(h.renders.at(-1).details_loading, true);
+});
+test('a removed submodule and failed verification stay explicitly unverified', async () => {
+  const h = harness(), verification = deferred(); h.state.statusReady = true;
+  h.sandbox.ensureNavigationStatus = () => verification.promise;
+  const pending = h.sandbox.selectEntry('modules/a'); [...h.timers.values()][0]();
+  h.calls[0].pending.reject('path disappeared'); await tick();
+  assert.equal(h.renders.at(-1).details_loading, true); assert.equal(h.errors.length, 0);
+  verification.reject('repository changed'); await pending;
+  assert.equal(h.renders.at(-1).details_error, true);
+  assert.deepEqual(h.calls.map(c => c.command), ['inspect_submodule_checkout']);
+});
 function renderHarness() {
   let buttons = [];
   const details = { html: '', closest: () => ({ classList: { remove() {} } }),
@@ -122,9 +186,9 @@ function renderHarness() {
   const sandbox = { refs: { details }, SubmoduleStateModel: { presentation: () => ({ short: 'Tracked, clean', actionable: false }) },
     esc: value => String(value), entryGitSummary: () => 'Tracked, clean', formatSize: () => '0 B', formatModified: () => 'date',
     submoduleBoundaryFor: () => null, renderPersonalNoteSection: () => '', commitSubjectHtml: value => value,
-    specDetailRows: () => '', tagListHtml: () => '', untrackedItemLabel: () => 'Untracked', handleDetailAction() { throw new Error('An unverified action must not execute'); } };
+    syncNavigationRefreshNotice() {}, specDetailRows: () => '', tagListHtml: () => '', untrackedItemLabel: () => 'Untracked', handleDetailAction() { throw new Error('An unverified action must not execute'); } };
   vm.createContext(sandbox);
-  for (const name of ['entryGitSummary', 'contextActionSectionHtml', 'submoduleRepositoryRowsHtml', 'submoduleCheckoutBadgeHtml', 'submoduleVersionSummaryHtml', 'renderEntryLastCommitInner', 'renderEntryDetails']) vm.runInContext(functionSource(name), sandbox);
+  for (const name of ['entryDetailsProgressText', 'entryGitSummary', 'contextActionSectionHtml', 'submoduleRepositoryLinkHtml', 'submoduleRepositoryRowsHtml', 'submoduleCheckoutBadgeHtml', 'submoduleVersionSummaryHtml', 'renderEntryLastCommitInner', 'renderEntryDetails']) vm.runInContext(functionSource(name), sandbox);
   return { sandbox, details, buttons: () => buttons };
 }
 test('pending and failed submodule panels never claim detached, uninitialized, missing remote, or missing commit', () => {
@@ -146,6 +210,29 @@ test('complete details preserve existing checkout and action behavior', () => {
   assert.match(h.details.html, /On branch · feature/); assert.doesNotMatch(h.details.html, /Checking current Git details/);
   assert.equal(h.buttons().find(b => b.dataset.detailAction === 'subcommit').disabled, false);
   assert.match(h.details.html, /Loading…/);
+});
+test('read-only checkout inspection exposes URL and commit but leaves every Git action disabled', () => {
+  for (const available of [true, false]) {
+    const h = renderHarness();
+    h.sandbox.renderEntryDetails({ name: 'module', relative_path: 'modules/module', kind: 'submodule', tracked: true,
+      details_loading: true, details_inspection: true, inspection_checkout_available: available,
+      details_phase: 'waiting_status', submodule_current_branch: available ? 'topic' : null,
+      submodule_url: '../module.git', submodule_web_url: 'https://example.com/module',
+      submodule_commit_id: available ? 'abc12345' : null, submodule_commit_subject: available ? 'Local commit' : null });
+    assert.match(h.details.html, /Read-only local information/);
+    assert.match(h.details.html, /Waiting for repository status verification/);
+    assert.match(h.details.html, /https:\/\/example.com\/module/);
+    assert.match(h.details.html, available ? /abc12345/ : /Unavailable locally/);
+    assert.doesNotMatch(h.details.html, /Tracked, clean|<strong>Not initialized<\/strong>/);
+    for (const button of h.buttons()) { assert.equal(button.disabled, true); button.click(); }
+  }
+});
+
+test('lightweight backend inspection never calls status, history, tags, remote fetch or status caches', () => {
+  const body = repository.slice(repository.indexOf('fn inspect_submodule_checkout_inner('), repository.indexOf('pub async fn entry_details('));
+  assert.match(body, /internal_submodule_repository/);
+  assert.match(body, /entry.mode == 0o160000/);
+  assert.doesNotMatch(body, /cached_|statuses\(|refresh_status|inspect_submodule_state|tags_pointing|revwalk|git\(|\.submodules\(/);
 });
 test('submodule summary precedes every action, without hiding or reordering any action', () => {
   const expected = ['subopenfull', 'subserver', 'subcompare', 'utrud', 'subgraph', 'subrefchanges', 'versions', 'subnewbranch',
