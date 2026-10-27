@@ -58,3 +58,18 @@ test('instrumented directory loading still rejects late responses', async () => 
   c.explorerRequestSeq = 2; resolve(['stale']); await pending;
   assert.equal(c.directoryCache.size, 0);
 });
+
+test('fast-open status diagnostics still perform exactly one request and do not log repository paths', async () => {
+  const calls = [], logs = [], changes = [{ path: 'private-file', status: 'M' }];
+  const c = { state: { repository: { path: '/private/repo' }, view: 'history', commits: [] }, repoOpenGeneration: 4,
+    jsPerfLog: line => logs.push(line), invoke: async (command, args) => { calls.push({ command, args }); return changes; },
+    updateChangeBadge() {}, render() {}, status() {}, handleError: error => { throw error; } };
+  vm.createContext(c); vm.runInContext(source('completeRepositoryOpenStatus'), c);
+  await c.completeRepositoryOpenStatus('/private/repo', 4);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].command, 'refresh_status');
+  assert.equal(calls[0].args.repositoryPath, '/private/repo');
+  assert.equal(c.state.changes, changes);
+  assert.equal(c.state.statusReady, true);
+  assert.deepEqual(logs, ['statusRefresh requested reason=fast_repository_open']);
+});

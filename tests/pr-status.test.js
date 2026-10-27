@@ -3,7 +3,16 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const vm = require('node:vm');
-const { prCardHtml, prReviewerHtml, prCheckHtml, reviewerDisplayName } = require('../frontend/pr-status.js');
+const { prCardHtml, prReviewerHtml, prCheckHtml, reviewerDisplayName, checkLinkErrorMessage } = require('../frontend/pr-status.js');
+
+test('check link errors show the actual failure without the internal diagnostic prefix', () => {
+  for (const stage of ['validation', 'launch', 'wait', 'exit']) {
+    const message = 'Browser opening is unconfirmed.';
+    assert.equal(checkLinkErrorMessage(`[check-link:${stage}] ${message}`), message);
+    assert.equal(checkLinkErrorMessage(new Error(`[check-link:${stage}] ${message}`)), message);
+  }
+  assert.equal(checkLinkErrorMessage('Unexpected error'), 'Unexpected error');
+});
 
 const pr = {
   number: 282,

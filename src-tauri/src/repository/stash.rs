@@ -259,18 +259,46 @@ fn invalidate_stashed_paths_cache(repository_path: &str) {
 // file. Enumerate refs/stash once, diff each immutable stash commit only when
 // the stash OID list changes, and share the resulting path set across folder
 // navigation. This also notices stashes created or dropped outside the app.
-pub(super) fn all_stashed_paths(repository_path: &str, repo: &mut Repository) -> Result<Arc<HashSet<String>>, String> {
+pub(super) fn all_stashed_paths(repository_path: &str, repo: &mut Repository, request: &str) -> Result<Arc<HashSet<String>>, String> {
+    let started = Instant::now();
     let repository_key = repo_lock_key(repository_path);
+    let key_elapsed = started.elapsed();
+    let repo_id = perf_logging::opaque_id(&repository_key);
+    perf_log(&format!("stash_paths: {request} repo={repo_id} phase=enumerate_start"), Duration::ZERO);
     let mut stash_oids = Vec::new();
-    repo.stash_foreach(|_, _, oid| { stash_oids.push(*oid); true }).map_err(|error| error.message().to_string())?;
-    if let Some(cached) = stashed_paths_cache().lock().unwrap().get(&repository_key).filter(|entry| entry.stash_oids == stash_oids).cloned() {
+    let enumerate_started = Instant::now();
+    repo.stash_foreach(|_, _, oid| { stash_oids.push(*oid); true }).map_err(|error| {
+        perf_log(&format!("stash_paths: {request} repo={repo_id} phase=enumerate result=error code={:?}", error.code()), enumerate_started.elapsed());
+        error.message().to_string()
+    })?;
+    let enumerate_elapsed = enumerate_started.elapsed();
+    let count = stash_oids.len();
+    let lookup_started = Instant::now();
+    let cached = stashed_paths_cache().lock().unwrap().get(&repository_key).filter(|entry| entry.stash_oids == stash_oids).cloned();
+    if let Some(cached) = cached {
+        let lookup_elapsed = lookup_started.elapsed();
+        perf_log(&format!("stash_paths: {request} repo={repo_id} cache=hit stashes={count} paths={} key_ms={:.1} enumerate_ms={:.1} lookup_ms={:.1} diff_ms=0 result=ok",
+            cached.paths.len(), key_elapsed.as_secs_f64() * 1000.0, enumerate_elapsed.as_secs_f64() * 1000.0, lookup_elapsed.as_secs_f64() * 1000.0), started.elapsed());
         return Ok(cached.paths);
     }
+    let lookup_elapsed = lookup_started.elapsed();
 
+    let diff_started = Instant::now();
     let mut paths = HashSet::new();
-    for oid in &stash_oids { paths.extend(paths_in_stash(&repo, *oid)?); }
+    for oid in &stash_oids {
+        paths.extend(paths_in_stash(&repo, *oid).map_err(|error| {
+            perf_log(&format!("stash_paths: {request} repo={repo_id} cache=miss stashes={count} phase=contents result=error"), diff_started.elapsed());
+            error
+        })?);
+    }
+    let diff_elapsed = diff_started.elapsed();
     let paths = Arc::new(paths);
+    let publish_started = Instant::now();
     stashed_paths_cache().lock().unwrap().insert(repository_key, StashedPathsCacheEntry { stash_oids, paths: paths.clone() });
+    let publish_elapsed = publish_started.elapsed();
+    perf_log(&format!("stash_paths: {request} repo={repo_id} cache=miss stashes={count} paths={} key_ms={:.1} enumerate_ms={:.1} lookup_ms={:.1} diff_ms={:.1} publish_ms={:.1} result=ok",
+        paths.len(), key_elapsed.as_secs_f64() * 1000.0, enumerate_elapsed.as_secs_f64() * 1000.0, lookup_elapsed.as_secs_f64() * 1000.0,
+        diff_elapsed.as_secs_f64() * 1000.0, publish_elapsed.as_secs_f64() * 1000.0), started.elapsed());
     Ok(paths)
 }
 

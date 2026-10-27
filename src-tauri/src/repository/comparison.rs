@@ -3,6 +3,50 @@
 //! Workspace diffs still inspect local paths within the requested scope.
 use super::*;
 
+// A missing tree object also produces NotFound. Only a missing *entry in a
+// successfully read tree* means that a path is absent from the snapshot.
+// Walking components keeps unreadable history from becoming an empty side.
+pub(super) fn snapshot_path_entry(repo: &Repository, root: &git2::Tree, path: &Path) -> Result<Option<git2::TreeEntry<'static>>, git2::Error> {
+    let mut tree = root.clone();
+    let mut parts = path.iter().peekable();
+    while let Some(part) = parts.next() {
+        let name = part.to_str().ok_or_else(|| git2::Error::from_str("Snapshot path is not UTF-8"))?;
+        let Some(entry) = tree.get_name(name).map(|entry| entry.to_owned()) else { return Ok(None); };
+        if parts.peek().is_none() { return Ok(Some(entry)); }
+        // Files and gitlinks have no children in this repository's tree.
+        if entry.kind() != Some(ObjectType::Tree) { return Ok(None); }
+        tree = repo.find_tree(entry.id())?;
+    }
+    Ok(None)
+}
+
+pub(super) fn snapshot_error(repository: &str, path: &str, side: &str, revision: &str, stage: &str, error: git2::Error) -> String {
+    let commit = Oid::from_str(revision).map(|oid| oid.to_string()).unwrap_or_else(|_| "unresolved".into());
+    // No raw refs, paths, error text or file contents in the shared log.
+    perf_log(&format!("comparison_read: repo={} scope={} side={side} commit={commit} ref_id={} stage={stage} result=error code={:?} class={:?}",
+        anonymized_repository_id(repository), anonymized_repository_id(path), anonymized_repository_id(revision), error.code(), error.class()), Duration::ZERO);
+    let action = if stage == "open-repository" { "Cannot open the exact comparison repository".to_owned() }
+        else { format!("Cannot read {side} snapshot ({stage})") };
+    format!("{action}: {}. Comparison is incomplete; this is not an absent path.", error.message())
+}
+
+pub(super) fn snapshot_commit<'a>(repo: &'a Repository, repository: &str, path: &str, reference: &str, side: &str) -> Result<git2::Commit<'a>, String> {
+    repo.revparse_single(reference).or_else(|_| repo.revparse_single(&format!("refs/remotes/{reference}")))
+        .and_then(|object| object.peel_to_commit())
+        .map_err(|error| snapshot_error(repository, path, side, reference, "resolve-commit", error))
+}
+
+pub(super) fn snapshot_entry_info(repo: &Repository, entry: &git2::TreeEntry, path: &str) -> Result<GitTreeEntry, git2::Error> {
+    let kind = if entry.filemode() == 0o160000 { "submodule" } else if entry.kind() == Some(ObjectType::Tree) { "folder" } else { "file" };
+    // Never read a gitlink's commit from the parent object database.
+    let size = if kind == "file" { repo.find_blob(entry.id())?.size() as u64 } else { 0 };
+    Ok(GitTreeEntry {
+        entry: CommanderEntry { name: entry.name().unwrap_or("").into(), relative_path: path.into(), kind: kind.into(), size,
+            revision: (kind == "submodule").then(|| entry.id().to_string()) },
+        oid: entry.id(), filemode: entry.filemode(),
+    })
+}
+
 #[derive(Serialize)]
 pub struct ComparisonContext {
     pub(super) repository: RepositoryInfo,

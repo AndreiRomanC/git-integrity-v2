@@ -40,12 +40,25 @@ const RECOVER_ON_MUTATION_ERROR = new Set(['merge_branch', 'resolve_conflict', '
 // logging.
 const SLOW_INVOKE_LOG_THRESHOLD_MS = 250;
 const DIAGNOSTIC_COMMANDS = new Set(['commit_staged', 'commit_files', 'commit_path', 'stage_files', 'unstage_files', 'stage_all', 'refresh_status', 'compare_file_contents', 'entry_details', 'entry_last_commit', 'open_repository_fast', 'load_repository', 'load_directory', 'capture_repository_return', 'resume_repository_return']);
+for (const command of ['compare_git_revisions_directory', 'compare_git_revisions_file_list', 'compare_submodule_revisions_directory', 'compare_submodule_revisions_file_list', 'compare_github_module_revisions_directory', 'compare_github_module_revisions_file_list', 'compare_workspace_revision', 'submodule_comparison_details']) DIAGNOSTIC_COMMANDS.add(command);
+for (const command of ['push_submodule_preview', 'open_status_check_url']) DIAGNOSTIC_COMMANDS.add(command);
+for (const command of ['refresh_navigation_status', 'submodule_folder_status']) DIAGNOSTIC_COMMANDS.add(command);
 let diagnosticRequestSequence = 0;
 let inFlightRepositoryWrites = 0;
 let inFlightBackendRequests = 0;
 const ACTIVITY_OBSERVERS = new Set(['active_git_commands', 'recent_git_commands', 'stop_git_command', 'frontend_perf_log']);
+// Match only this backend precondition, never a network/push error mentioning
+// HEAD incidentally. The request still rejects and the Push button stays off.
+function detachedPushPreviewBlocked(command, error) {
+  return command === 'push_submodule_preview' && /^Push unavailable — detached HEAD at [0-9a-f]{8}\./.test(String(error?.message || error));
+}
 function diagnosticErrorCategory(error) {
   const text = String(error?.message || error).toLowerCase();
+  for (const category of ['validation', 'launch', 'wait', 'exit']) {
+    if (text.startsWith(`[check-link:${category}]`)) return `check-link-${category}`;
+  }
+  if (text.includes('comparison is incomplete')) return 'snapshot-read-failed';
+  if (text.includes('is not a folder in')) return 'snapshot-type-mismatch';
   if (/binary files|files over 1 mb/.test(text)) return 'binary-or-size-limit';
   if (text.includes('no remote-tracking branch')) return 'missing-submodule-remote';
   if (text.includes('file does not exist in the selected remote')) return 'file-absent-in-remote';
@@ -122,8 +135,9 @@ const invoke = rawInvoke && ((command, args) => {
   }, async error => {
     if (observeActivity) --inFlightBackendRequests;
     if (write) --inFlightRepositoryWrites;
-    jsPerfLog(`invoke(${command}) ERROR`, performance.now() - startedAt);
-    if (diagnosticId) jsPerfLog(`ipc_trace: request=${diagnosticId} command=${command} event=error category=${diagnosticErrorCategory(error)}`, performance.now() - startedAt);
+    const blocked = detachedPushPreviewBlocked(command, error);
+    jsPerfLog(`invoke(${command}) ${blocked ? 'BLOCKED' : 'ERROR'}`, performance.now() - startedAt);
+    if (diagnosticId) jsPerfLog(`ipc_trace: request=${diagnosticId} command=${command} event=${blocked ? 'blocked' : 'error'} category=${blocked ? 'detached-head' : diagnosticErrorCategory(error)}`, performance.now() - startedAt);
     if (recoveryContext) await refreshAfterMutationFailure(recoveryContext);
     throw error;
   });
@@ -1461,6 +1475,7 @@ async function openRepositoryFast(path, options = {}) {
 async function completeRepositoryOpenStatus(path, generation) {
   try {
     // The one and only full status scan in this whole flow.
+    jsPerfLog('statusRefresh requested reason=fast_repository_open', 0);
     const changes = await invoke('refresh_status', { repositoryPath: path });
     // A newer open, or the real loadRepository, already ran (or is running)
     // since this fast-open started — its own state is what should stay on
@@ -1875,13 +1890,13 @@ const comparisonAuthorCache = createComparisonAuthorCache((command, args) => inv
 function bindComparisonConversion(node, row, submodule = false) {
   const kinds = [row?.local?.kind, row?.remote?.kind].filter(Boolean);
   if (!kinds.includes('folder') || !kinds.some(kind => kind !== 'folder')) return false;
-  node.title = 'Folder conversion · double-click or Enter to inspect changed items in List';
   // One endpoint has no tree at this path. Use the existing leaf comparison
   // instead of asking the directory endpoint to descend into a file/gitlink.
   SubmoduleCompareDetails.bindRow(node, () => {
     state[submodule ? 'subCompareFlatMode' : 'compareFlatMode'] = true;
     return submodule ? openSubmoduleCompareDirectory(row.relative_path) : openCommanderDirectory(row.relative_path);
   });
+  node.title = 'Folder conversion · double-click or Enter to inspect changed items in List';
   return true;
 }
 function renderComparisonScopedFilter(container, context, snapshot, options) {
@@ -2028,9 +2043,9 @@ function renderComparisonAuthorFilter(container, context, options = {}) {
   const mode = comparisonAuthorMode(model), strictActive = comparisonAuthorStrict(model), filtered = mode !== 'all';
   const touchedAuthors = (model.authors || []).filter(author => author.paths?.length);
   const helpOpen = element.querySelector('.comparison-author-help')?.open || false;
-  const introductionOptions = `<optgroup label="Introduced by author"><option value="@introduced">${model.introductions ? 'Choose introducer…' : 'Load introduction history…'}</option>${(model.introductions || []).map(author => `<option value="introduced:${esc(author.key)}">${esc(author.name)}${author.email ? ` &lt;${esc(author.email)}&gt;` : ''}</option>`).join('')}${mode === 'introduced' && model.selected && !model.introductions?.some(author => author.key === model.selected) ? `<option value="introduced:${esc(model.selected)}">${esc(model.selected.replace(/^(email|name):/, ''))}${model.introductions ? ' — no matching items here' : ''}</option>` : ''}</optgroup>`;
+  const introductionOptions = `<optgroup label="Introduced by author"><option value="@introduced">${model.introductions ? 'Choose introducer…' : 'Load introduction history…'}</option>${(model.introductions || []).map(author => `<option value="introduced:${esc(author.key)}">Introduced by: ${esc(author.name)}${author.email ? ` &lt;${esc(author.email)}&gt;` : ''}</option>`).join('')}${mode === 'introduced' && model.selected && !model.introductions?.some(author => author.key === model.selected) ? `<option value="introduced:${esc(model.selected)}">Introduced by: ${esc(model.selected.replace(/^(email|name):/, ''))}${model.introductions ? ' — no matching items here' : ''}</option>` : ''}</optgroup>`;
   element.innerHTML = model.authors
-    ? `<label class="comparison-author-select">Show <select data-author-select aria-label="Contributor filter"><option value="">All differences</option><option value="@shared">Shared files · 2+ authors</option><optgroup label="Files touched by author">${touchedAuthors.map(author => `<option value="${esc(author.key)}">${esc(author.name)}${author.email ? ` &lt;${esc(author.email)}&gt;` : ' (no email)'}</option>`).join('')}${mode === 'touched' && !touchedAuthors.some(author => author.key === model.selected) ? `<option value="${esc(model.selected)}">${esc(model.selected.replace(/^(email|name):/, ''))} — no matching items here</option>` : ''}</optgroup>${introductionOptions}</select></label><details class="comparison-author-help" ${helpOpen ? 'open' : ''}><summary>Details${strictActive ? ' · surviving required' : ''}</summary><div><p>Introduced by author: changes recorded in their commits, including merge results compared with the first parent. This is integration, not personal line ownership. A parent submodule update is included only when this exact pair was opened from the parent comparison. Changing the revisions removes that parent context.</p><p>Files touched by author: matching items touched in that author's non-merge commits, including intermediate commits. Shared files: at least two recorded authors touched the item. Neither means every individual edit survived.</p><p>Authors, counts and evidence are scoped to these compared items and revisions. On divergent histories, commits unique to either side are included. Merge integration and files imported or removed by a folder/submodule conversion are not individual file touches. Their structural evidence stays under All differences and Introduced by.</p><label class="comparison-author-direct"><input type="checkbox" data-author-direct ${strictActive ? 'checked' : ''} ${mode !== 'touched' || !model.selected ? 'disabled' : ''}> Require surviving contribution</label><p>Advanced · this comparison only; resets when you choose another filter or author. A surviving content or pointer change must be identified. Folder/submodule conversions remain grouped separately, not claimed as personal file edits.</p><p>Identity uses recorded email (name when absent), without mailmap or co-author matching. Different identities may belong to the same person. Git cannot distinguish manual edits from squash/copy imports. Internal submodule authors are analyzed only in a direct submodule comparison.</p></div></details>`
+    ? `<label class="comparison-author-select">Show <select data-author-select aria-label="Contributor filter"><option value="">All differences</option><option value="@shared">Files touched by multiple authors</option><optgroup label="Files touched by author">${touchedAuthors.map(author => `<option value="${esc(author.key)}">Touched by: ${esc(author.name)}${author.email ? ` &lt;${esc(author.email)}&gt;` : ' (no email)'}</option>`).join('')}${mode === 'touched' && !touchedAuthors.some(author => author.key === model.selected) ? `<option value="${esc(model.selected)}">Touched by: ${esc(model.selected.replace(/^(email|name):/, ''))} — no matching items here</option>` : ''}</optgroup>${introductionOptions}</select></label><details class="comparison-author-help" ${helpOpen ? 'open' : ''}><summary>Details${strictActive ? ' · surviving required' : ''}</summary><div><p>Introduced by author: changes recorded in their commits, including merge results compared with the first parent. This is integration, not personal line ownership. A parent submodule update is included only when this exact pair was opened from the parent comparison. Changing the revisions removes that parent context.</p><p>Files touched by author: matching items touched in that author's non-merge commits, including intermediate commits. Shared files: at least two recorded authors touched the item. Neither means every individual edit survived.</p><p>Authors, counts and evidence are scoped to these compared items and revisions. On divergent histories, commits unique to either side are included. Merge integration and files imported or removed by a folder/submodule conversion are not individual file touches. Their structural evidence stays under All differences and Introduced by.</p><label class="comparison-author-direct"><input type="checkbox" data-author-direct ${strictActive ? 'checked' : ''} ${mode !== 'touched' || !model.selected ? 'disabled' : ''}> Require surviving contribution</label><p>Advanced · this comparison only; resets when you choose another filter or author. A surviving content or pointer change must be identified. Folder/submodule conversions remain grouped separately, not claimed as personal file edits.</p><p>Identity uses recorded email (name when absent), without mailmap or co-author matching. Different identities may belong to the same person. Git cannot distinguish manual edits from squash/copy imports. Internal submodule authors are analyzed only in a direct submodule comparison.</p></div></details>`
     : `<button type="button" data-load-authors ${model.pending ? 'disabled' : ''}>${model.pending ? 'Loading contributor history…' : 'Contributor filters…'}</button>${model.error ? `<small role="alert">${esc(model.error)} ${filtered ? 'No filtered results were applied.' : 'Complete comparison remains visible.'} Retry to load history.</small>` : ''}`;
   if (model.authors) {
     const select = element.querySelector('[data-author-select]');
@@ -2200,7 +2215,7 @@ function renderCommander() {
     ? comparisonAuthorRowsHtml(rows, candidates, authorModel, 'data-commander-entry')
     : rows.map(row => `<button class="commander-row commander-grid ${row.relative_path === state.commanderFocus ? 'focused' : ''}" data-commander-entry="${esc(row.relative_path)}">
     ${commanderSide(row.local, 'local', descendants.get(row.relative_path))}<span class="compare-state ${esc(row.status)}"><i></i>${esc(compareStatusText(row.status, branchCompareMode ? 'branch' : state.compareMode))}</span>${commanderSide(row.remote, 'remote', descendants.get(row.relative_path))}</button>${comparisonEvidenceRowHtml(row,authorModel)}`).join('');
-  refs.commanderRows.innerHTML = upRow + (rowsHtml || `<div class="loading-row">${scopeMessage || (comparisonAuthorMode(authorModel) !== 'all' || flatMode ? comparisonAuthorEmptyMessage(authorModel) : 'No items to compare')}</div>`)
+  refs.commanderRows.innerHTML = (resolved?.scope_note ? `<p class="comparison-scope-note" role="note">${esc(resolved.scope_note)}</p>` : '') + upRow + (rowsHtml || `<div class="loading-row">${scopeMessage || (comparisonAuthorMode(authorModel) !== 'all' || flatMode ? comparisonAuthorEmptyMessage(authorModel) : 'No items to compare')}</div>`)
     + (!flatMode ? comparisonExcludedRowsHtml(candidates,authorModel,'data-commander-entry') : '');
   bindComparisonEvidence(refs.commanderRows, rows, authorModel);
   refs.commanderRows.querySelector('[data-commander-up]')?.addEventListener('click', () => { const parent = state.commanderPath.split('/').slice(0, -1).join('/'); openCommanderDirectory(parent); });
@@ -2340,7 +2355,7 @@ function renderSubmoduleCompare() {
     ? `Comparing ${revisionDisplay(compare.leftRevision)} → ${revisionDisplay(compare.rightRevision)}. These are exact Git revisions; no checkout is performed.`
     : compare?.externalFullName ? 'External module from Browse. Choose left and right revisions, then Compare.' : compare ? 'Choose left and right revisions, then Compare.' : 'Select a submodule and choose Compare submodule.';
   if (refs.subCompareDownload) {
-    const ready = Boolean(!compare?.loading && (compare?.submodulePath || compare?.externalRepositoryName) && compare?.leftRevision && compare?.rightRevision);
+    const ready = Boolean(!compare?.loading && !compare?.error && (compare?.submodulePath || compare?.externalRepositoryName) && compare?.leftRevision && compare?.rightRevision);
     refs.subCompareDownload.disabled = !ready;
     refs.subCompareDownload.title = ready
       ? `Export ${revisionDisplay(compare.leftRevision)} and ${revisionDisplay(compare.rightRevision)} to folders on disk`
@@ -2362,6 +2377,10 @@ function renderSubmoduleCompare() {
     refs.subCompareRows.innerHTML = '<div class="loading-row"><i class="spinner"></i>Loading comparison…</div>';
     return;
   }
+  if (compare?.error) {
+    refs.subCompareRows.innerHTML = `<div class="loading-row" role="alert">${esc(compare.error)}</div>`;
+    return;
+  }
   const rowsSource = compare?.rows || [];
   const query = refs.search.value.trim().toLowerCase();
   const viewOptions = {flat:state.subCompareFlatMode, query, filter:state.subCompareFlatFilter, path:state.commanderPath, sourceRows:rowsSource};
@@ -2378,7 +2397,7 @@ function renderSubmoduleCompare() {
     ? comparisonAuthorRowsHtml(rows, candidates, authorModel, 'data-sub-compare-entry')
     : rows.map(row => `<button class="commander-row commander-grid ${row.relative_path === state.commanderFocus ? 'focused' : ''}" data-sub-compare-entry="${esc(row.relative_path)}">
     ${commanderSide(row.local, 'local', descendants.get(row.relative_path))}<span class="compare-state ${esc(row.status)}"><i></i>${esc(compareStatusText(row.status, 'submodule'))}</span>${commanderSide(row.remote, 'remote', descendants.get(row.relative_path))}</button>${comparisonEvidenceRowHtml(row,authorModel)}`).join('');
-  refs.subCompareRows.innerHTML = upRow + (rowsHtml || `<div class="loading-row">${scopeMessage || (comparisonAuthorMode(authorModel) !== 'all' || state.subCompareFlatMode ? comparisonAuthorEmptyMessage(authorModel) : 'No differences in this folder')}</div>`)
+  refs.subCompareRows.innerHTML = (compare?.scopeNote ? `<p class="comparison-scope-note" role="note">${esc(compare.scopeNote)}</p>` : '') + upRow + (rowsHtml || `<div class="loading-row">${scopeMessage || (comparisonAuthorMode(authorModel) !== 'all' || state.subCompareFlatMode ? comparisonAuthorEmptyMessage(authorModel) : 'No differences in this folder')}</div>`)
     + (!state.subCompareFlatMode ? comparisonExcludedRowsHtml(candidates,authorModel,'data-sub-compare-entry') : '');
   bindComparisonEvidence(refs.subCompareRows, rows, authorModel);
   refs.subCompareRows.querySelector('[data-commander-up]')?.addEventListener('click', () => { const parent = state.commanderPath.split('/').slice(0, -1).join('/'); openSubmoduleCompareDirectory(parent); });
@@ -2474,6 +2493,10 @@ async function openSubmoduleCompareDirectory(path = state.commanderPath || '') {
   const loading = {};
   compare.loading = loading;
   compare.rows = [];
+  compare.error = '';
+  compare.scopeNote = '';
+  compare.leftRevision = ''; compare.rightRevision = '';
+  compare.leftOnlyCommits = []; compare.rightOnlyCommits = [];
   compare.authorScope = null;
   refs.subCompareRows.innerHTML = '<div class="loading-row"><i class="spinner"></i>Comparing submodule revisions…</div>';
   const sameRequest = openSubmoduleCompareDirectoryGuard();
@@ -2513,6 +2536,7 @@ async function openSubmoduleCompareDirectory(path = state.commanderPath || '') {
       repositoryPath: result.repository_path,
       relativePath: result.relative_path || path,
       rows: result.rows || [],
+      scopeNote: result.scope_note || '',
       leftRevision: result.left_revision || result.leftRevision || '',
       rightRevision: result.right_revision || result.rightRevision || '',
       leftOnlyCommits: result.left_only_commits || result.leftOnlyCommits || [],
@@ -2523,7 +2547,7 @@ async function openSubmoduleCompareDirectory(path = state.commanderPath || '') {
     render();
     status(`Compared ${compare.name}: ${revisionDisplay(compare.leftRevision)} → ${revisionDisplay(compare.rightRevision)}`);
   } catch (error) {
-    if (stillCurrent()) { status(String(error), 'error'); refs.subCompareRows.innerHTML = `<div class="loading-row">${esc(String(error))}</div>`; }
+    if (stillCurrent()) { compare.loading = null; compare.error = String(error); status(String(error), 'error'); render(); }
   } finally { if (compare.loading === loading) compare.loading = null; }
 }
 
@@ -2840,8 +2864,8 @@ async function openWorkingTreeChangeCompare(change) {
 function setCompareActionStatus(message, kind = '') { const node = $('#compareActionStatus'); node.textContent = message; node.className = `compare-status-line ${kind}`.trim(); }
 function setCompareHeadLabels(left = 'LOCAL', right = 'REMOTE') {
   const labels = document.querySelectorAll('.compare-head span');
-  if (labels[0]) labels[0].textContent = left;
-  if (labels[1]) labels[1].textContent = right;
+  if (labels[0]) labels[0].textContent = labels[0].title = left;
+  if (labels[1]) labels[1].textContent = labels[1].title = right;
 }
 function setCompareReadOnly(readOnly, message = '') {
   document.querySelector('.compare-actionbar').hidden = !!readOnly;
@@ -4856,24 +4880,29 @@ function openMergePreview(target, sourceRef, expectedIncoming = null) {
 }
 
 async function openMergePreviewFile(report, item, pair, isCurrent) {
-  const pairs = {result:[item.current,item.result,'CURRENT','PROPOSED RESULT'],
-    sides:[item.current,item.incoming,'CURRENT','INCOMING · UNRESOLVED'],
-    ours:[item.base,item.current,'COMMON BASE','CURRENT'], theirs:[item.base,item.incoming,'COMMON BASE','INCOMING']};
-  const selected=pairs[pair]; if(!selected || !isCurrent())return;
+  const selected=MergePreview.comparison(item,report,pair); if(!selected || !isCurrent())return;
   const row={name:item.path,relative_path:item.path};
   state.comparingRow=row;
   const guard=openFileCompareGuard();
   const valid=()=>guard() && isCurrent() && state.comparingRow===row && refs.compareDialog.open;
   refs.compareTitle.textContent=item.path;
-  refs.compareSubtitle.textContent=`Merge preview · ${report.source_ref} → ${report.current_branch} · committed snapshots`;
+  refs.compareSubtitle.textContent=`Merge preview · ${selected.label} · ${selected.description}`;
   refs.localCompare.textContent=refs.remoteCompare.textContent='Loading…';
   resetCompareDiffNavigation();
-  setCompareReadOnly(true,'Preview only. No files, staging or branches were changed. Conflicts have no final result yet.');
-  setCompareHeadLabels(selected[2],selected[3]);
+  setCompareReadOnly(true,`Read-only · local edits excluded.${item.outcome==='conflict' ? ' Unresolved conflict: there is no final result yet.' : ''}`);
+  const versionLabel = (label,version) => label + (!version ? ' · Absent' :
+    (label==='Proposed merge result' ? ` · object ${version.oid.slice(0,10)}` : '') +
+    (version.mode===0o100755 ? ' · Executable' : version.mode===0o120000 ? ' · Symlink' : ''));
+  setCompareHeadLabels(versionLabel(selected.leftLabel,selected.left),versionLabel(selected.rightLabel,selected.right));
+  refs.compareDialog.querySelectorAll('.compare-head span').forEach((label,index)=>{
+    const version=index===0 ? selected.left : selected.right;
+    label.title=version ? `${label.textContent}\nFile object: ${version.oid}\nMode: ${version.mode.toString(8)}\nPath: ${version.path}` : label.textContent;
+  });
   refs.compareDialog.showModal();
   try {
-    const contents=await invoke('merge_preview_contents',{repositoryPath:report.repository_path,versions:selected.slice(0,2)});
+    const contents=await invoke('merge_preview_contents',{repositoryPath:report.repository_path,versions:[selected.left,selected.right]});
     if(!valid())return;
+    jsPerfLog(`merge_preview_diff: pair=${pair} current=${report.current_revision} incoming=${report.incoming_revision} left=${selected.left?.oid || 'absent'} right=${selected.right?.oid || 'absent'} left_mode=${selected.left?.mode || 0} right_mode=${selected.right?.mode || 0} identical=${selected.identical} text_equal=${contents[0].content!==null && contents[0].content===contents[1].content} readable=${contents.map(c=>c.content!==null).join(',')}`,0);
     if(contents.some(c=>c.content===null)) {
       resetCompareDiffNavigation('Text comparison unavailable for this item.');
       refs.localCompare.textContent=contents[0].note || 'Text comparison unavailable because the other side cannot be displayed.';
@@ -4881,6 +4910,16 @@ async function openMergePreviewFile(report, item, pair, isCurrent) {
       return;
     }
     renderComparisonContents(contents[0].content,contents[1].content);
+    // Text alone cannot express adding/deleting an empty file or a chmod/type
+    // change. Keep that distinction visible even when there are zero hunks.
+    if(contents[0].content===contents[1].content) {
+      const explanation = selected.identical ? 'The selected versions are identical.' :
+        !selected.left ? 'An empty file is added; there are no text lines to highlight.' :
+        !selected.right ? 'An empty file is removed; there are no text lines to highlight.' :
+        selected.left.mode!==selected.right.mode ? 'File mode/type changes; the text content is identical.' : 'The text content is identical.';
+      setCompareActionStatus(explanation,'busy');
+      refs.compareDiffStatus.textContent='No text differences · see version details';
+    }
   }catch(error){if(valid()){resetCompareDiffNavigation('Could not load preview contents.');refs.localCompare.textContent=String(error);refs.remoteCompare.textContent='';}}
 }
 
@@ -5663,8 +5702,10 @@ async function pushSubmodule(entry) {
     preview = await invoke('push_submodule_preview', { repositoryPath: state.repository.path, relativePath: entry.relative_path });
   }
   catch (error) {
-    $('#submodulePublishSummary').textContent = 'Push unavailable';
-    $('#submodulePublishCommits').innerHTML = `<div class="publish-empty">${esc(String(error))}</div>`;
+    const detached = detachedPushPreviewBlocked('push_submodule_preview', error);
+    $('#submodulePublishSummary').textContent = detached ? 'Detached HEAD · local branch required' : 'Push unavailable';
+    $('#submodulePublishCommits').innerHTML = `<div class="publish-empty">${esc(String(error?.message || error))}</div>`;
+    if (detached) $('#submodulePublishStatus').textContent = 'No fetch or push was attempted. Close this dialog, then use Change version or New branch.';
     return;
   }
   const pushState = submodulePushDialogState(preview);
@@ -10833,7 +10874,7 @@ function createPrStatusPanel(root, options) {
     const details = event.target.closest('[data-open-check-url]');
     if (!details) return;
     const url = details.dataset.openCheckUrl;
-    if (invoke) invoke('open_status_check_url', { url }).catch(error => status(String(error), 'error'));
+    if (invoke) invoke('open_status_check_url', { url }).catch(error => status(window.GitDrillDownPr.checkLinkErrorMessage(error), 'error'));
     else window.open(url, '_blank', 'noopener');
   });
   root.addEventListener('submit', async event => {

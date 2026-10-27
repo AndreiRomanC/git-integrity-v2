@@ -104,6 +104,84 @@ test('ordered task search fails explicitly on partial errors, wrong groups and i
   const differentProject = taskPage('inwork', 1); differentProject.data[0].id = 'OTHER/X-1';
   assert.equal((await portal({ taskGroups, data: differentProject })).reply.code, 'invalid_response');
 });
+test('task validation preserves HTTP 200 and logs the precise rejection without contents or extra requests', async () => {
+  const item = (overrides = {}) => ({ id: 'P/P-1', type: 'workitems', attributes: { type: 'task', status: 'inwork', title: 'PRIVATE_TITLE' }, ...overrides });
+  for (const [reason, data, cursor = [0, 1, 0]] of [
+    ['missing_task_type', { data: [item({ attributes: {} })] }], // Shape from log 36.
+    ['missing_task_status', { data: [item({ attributes: { type: 'task' } })] }],
+    ['unexpected_task_type', { data: [item({ attributes: { type: 'requirement' } })] }],
+    ['task_status_mismatch', taskPage('closed', 1)],
+    ['unexpected_resource', { data: [null] }],
+    ['wrong_project', { data: [item({ id: 'Other/PRIVATE-1' })] }],
+    ['invalid_item_id', { data: [item({ id: 'PRIVATE' })] }],
+    ['partial_errors', { data: [item({ meta: { errors: [{ detail: 'PRIVATE_ERROR' }] } })] }],
+    ['duplicate_item', { data: [item(), item()] }],
+    ['expected_list', { data: item() }],
+    ['page_size_exceeded', taskPage('inwork', 26)],
+    ['page_offset_changed', taskPage('inwork', 1), [0, 1, 5]],
+    ['empty_page_with_next', { data: [], links: { next: '/PRIVATE_NEXT' } }],
+    ['invalid_payload', null],
+  ]) {
+    const { reply, requests } = await portal({ taskGroups, data, taskCursor: cursor });
+    assert.equal(reply.code, 'invalid_response', reason);
+    assert.equal(reply.http, 200, reason);
+    assert.equal(reply.items, undefined, 'never apply partial or unverified results');
+    assert.equal(requests.length, 1);
+    assert.equal(reply.diagnostics.length, 1);
+    assert.equal(reply.diagnostics[0].http, 200);
+    assert.equal(reply.diagnostics[0].code, 'invalid_response', 'response_usable must be false');
+    assert.equal(reply.diagnostics[0].reason, reason);
+    assert.doesNotMatch(JSON.stringify(reply.diagnostics), /PRIVATE|SECRET/);
+    const explanation = polarionSearchExplanation(reply);
+    assert.match(explanation, /HTTP 200/);
+    assert.match(explanation, /snapshots were preserved/);
+    assert.doesNotMatch(explanation, /PRIVATE|SECRET/);
+  }
+});
+test('rejected task data after a fallback is attributed to that response, not the earlier HTTP 400', async () => {
+  const groups = [{ ...taskGroups[0], fallbackUrl: taskGroups[0].url + '&fallback=1' }];
+  const { reply, requests } = await portal({ taskGroups: groups, statuses: [400, 200], pages: [{ errors: [] }, { data: [{ id: 'P/P-1', type: 'workitems' }] }] });
+  assert.equal(requests.length, 2);
+  assert.equal(reply.http, 200); assert.equal(reply.code, 'invalid_response');
+  assert.deepEqual(reply.diagnostics.map(d => [d.http, d.code]), [[400, 'query_rejected'], [200, 'invalid_response']]);
+  assert.equal(reply.diagnostics[1].reason, 'missing_task_type');
+  assert.equal(reply.diagnostics[1].step, 'prefix_fallback');
+});
+test('local task cursor validation does not invent a server HTTP status', async () => {
+  const { reply, requests } = await portal({ taskGroups: [], taskCursor: [] });
+  assert.equal(reply.code, 'invalid_response'); assert.equal(reply.http, 0);
+  assert.equal(requests.length, 0); assert.deepEqual(reply.diagnostics, []);
+});
+test('malformed JSON keeps HTTP 200 and does not leak parser text', async () => {
+  const pages = new Proxy([], { get() { throw new SyntaxError('PRIVATE_RESPONSE_TOKEN'); } });
+  const { reply, requests } = await portal({ taskGroups, pages });
+  assert.equal(requests.length, 1);
+  assert.equal(reply.code, 'invalid_response'); assert.equal(reply.http, 200);
+  assert.equal(reply.diagnostics[0].reason, 'invalid_json');
+  assert.equal(reply.diagnostics[0].code, 'invalid_response');
+  assert.doesNotMatch(JSON.stringify(reply), /PRIVATE/);
+});
+test('resource/catalog validation also records unusable HTTP 200 without accepting malformed rows', async () => {
+  for (const options of [
+    { kind: 'projects', data: { data: {} } },
+    { kind: 'document', resourceId: 'P/S/D', data: { data: { type: 'documents', id: 'P/S/OTHER' } } },
+    { kind: 'user', data: { data: { type: 'users', id: 'bad/id' } } },
+    { data: { data: [taskPage('inwork', 1).data[0], null] } },
+    { kind: 'elements', resourceId: 'P/S/D', data: { data: [], included: [null] } },
+  ]) {
+    const { reply, requests } = await portal(options);
+    assert.equal(reply.code, 'invalid_response'); assert.equal(reply.http, 200);
+    assert.equal(reply.diagnostics.at(-1).code, 'invalid_response');
+    assert.ok(reply.diagnostics.at(-1).reason);
+    assert.equal(requests.length, 1);
+    assert.equal(reply.items, undefined); assert.equal(reply.elements, undefined); assert.equal(reply.snapshot, undefined);
+  }
+});
+test('task error explanations never interpolate arbitrary diagnostic reasons', () => {
+  const message = polarionSearchExplanation({ code: 'invalid_response', http: 200, diagnostics: [{ code: 'invalid_response', reason: 'PRIVATE_SERVER_TEXT' }] });
+  assert.doesNotMatch(message, /PRIVATE/);
+  assert.match(message, /unexpected format/);
+});
 test('portal classifies authentication, permissions, API, redirects and non-JSON without raw bodies', async () => {
   for (const [options, code] of [[{ status: 401 }, 'auth_required'], [{ status: 403 }, 'forbidden'], [{ status: 404 }, 'api_unavailable'], [{ type: 'opaqueredirect' }, 'auth_required'], [{ contentType: 'text/html' }, 'not_json'], [{ error: new Error('secret raw response') }, 'network_error'], [{ error: { name: 'AbortError' } }, 'timeout']]) {
     const { reply } = await portal(options); assert.equal(reply.code, code); assert.ok(!JSON.stringify(reply).includes('secret raw'));

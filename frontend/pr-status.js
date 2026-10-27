@@ -14,6 +14,11 @@ function escapePrHtml(value = '') {
   return String(value).replace(/[&<>"']/g, char => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[char]));
 }
 
+function checkLinkErrorMessage(error) {
+  // Stage codes belong in diagnostics, not in the visible status sentence.
+  return String(error?.message || error).replace(/^\[check-link:(validation|launch|wait|exit)\]\s*/, '');
+}
+
 function reviewerDisplayName(login) {
   return login === 'copilot-pull-request-reviewer' ? 'Copilot' : `@${login}`;
 }
@@ -74,7 +79,7 @@ function prCardHtml(pr = {}) {
   </div>`;
 }
 
-const api = { prCardHtml, prReviewerHtml, prCheckHtml, reviewerDisplayName };
+const api = { prCardHtml, prReviewerHtml, prCheckHtml, reviewerDisplayName, checkLinkErrorMessage };
 if (typeof window !== 'undefined') window.GitDrillDownPr = api;
 if (typeof module !== 'undefined' && module.exports) module.exports = api;
 })();

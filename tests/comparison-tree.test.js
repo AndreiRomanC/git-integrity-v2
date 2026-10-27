@@ -221,6 +221,20 @@ test('real renderers use projected rows, keep parent navigation on empty results
     excluded.handlers.click();assert.deepEqual(opened,['src/deep/shared'],'excluded leaf uses its full path, not its parent folder');
     model.strictResult.result.paths=[];model.paths=new Set();h[submodule?'renderSubmoduleCompare':'renderCommander']();
     assert.match(rendered.innerHTML,/Parent folder/);assert.match(rendered.innerHTML,/No changed files match/,'up-row does not hide the empty-state explanation');
+    const note='At this path: left = submodule; right = folder. Submodules are commit references.';
+    if(submodule)state.submoduleCompare.scopeNote=note;
+    else state.commanderComparisonResult={scope_note:note};
+    h[submodule?'renderSubmoduleCompare':'renderCommander']();
+    assert.match(rendered.innerHTML,/class="comparison-scope-note" role="note"/);
+    assert.ok(rendered.innerHTML.includes(note));
+    if(submodule) {
+      state.submoduleCompare.error='Cannot read right snapshot. Comparison is incomplete.';
+      h.renderSubmoduleCompare();h.renderSubmoduleCompare();
+      assert.match(rendered.innerHTML,/role="alert"/);
+      assert.match(rendered.innerHTML,/Comparison is incomplete/);
+      assert.doesNotMatch(rendered.innerHTML,/No differences|No changed files/);
+      assert.equal(refs.subCompareDownload.disabled,true);
+    }
   }
 });
 
@@ -256,7 +270,7 @@ test('the direct-submodule scope is reused only for the same loaded folder and e
 
 test('folder/gitlink and folder/file conversions stay navigable through the existing leaf comparison', () => {
   for(const submodule of [false,true]) for(const kind of ['submodule','file']) for(const reverse of [false,true]) {
-    const calls=[],state={},h={state,SubmoduleCompareDetails:{bindRow(node,open){node.open=open;}},
+    const calls=[],state={},h={state,SubmoduleCompareDetails:{bindRow(node,open){node.open=open;node.title='Submodule details';}},
       openCommanderDirectory:path=>calls.push(['git',path]),openSubmoduleCompareDirectory:path=>calls.push(['submodule',path])};
     vm.createContext(h);vm.runInContext(source('bindComparisonConversion'),h);
     const conversion={...row('converted','folder','type-changed'),remote:entry('converted',kind)};
@@ -268,4 +282,20 @@ test('folder/gitlink and folder/file conversions stay navigable through the exis
     assert.equal(h.bindComparisonConversion({},row('ordinary','folder'),submodule),false);
     assert.equal(h.bindComparisonConversion({},row('pointer','submodule'),submodule),false);
   }
+});
+
+test('failed submodule comparison cannot retain old snapshots for export or become an empty success on repaint', async () => {
+  const compare={submodulePath:'unit',relativePath:'src',leftRef:'a',rightRef:'b',leftRevision:'old-a',rightRevision:'old-b',rows:directories};
+  const state={repository:{path:'/repo'},view:'commander',compareMode:'submodule',subCompareFlatMode:false,submoduleCompare:compare};
+  let fail=true,calls=0;
+  const h={state,refs:{subCompareRows:{}},openSubmoduleCompareDirectoryGuard:()=>()=>true,render(){},status(){},revisionDisplay:String,
+    invoke:async()=>{calls++;if(fail)throw Error('Snapshot object unreadable');return {repository_path:'/repo/unit',relative_path:'src',left_revision:'a',right_revision:'b',rows:directories,scope_note:'folder to submodule'};}};
+  vm.createContext(h);vm.runInContext(source('openSubmoduleCompareDirectory'),h);
+  await h.openSubmoduleCompareDirectory('src');
+  assert.equal(compare.error,'Error: Snapshot object unreadable');
+  assert.equal(compare.loading,null);assert.equal(compare.leftRevision,'');assert.equal(compare.rightRevision,'');
+  assert.deepEqual(Array.from(compare.rows),[]);assert.equal(calls,1);
+  fail=false;await h.openSubmoduleCompareDirectory('src');
+  assert.equal(compare.error,'');assert.equal(compare.scopeNote,'folder to submodule');
+  assert.equal(compare.leftRevision,'a');assert.equal(compare.rightRevision,'b');assert.equal(calls,2);
 });

@@ -1382,6 +1382,7 @@ dialog form { padding: 28px; text-align: center; }dialog h2 { margin: 0 0 10px; 
 .submodule-detail-side h3 { margin: 0 0 12px; color: #a7ccef; font-size: 12px; }
 .submodule-detail-message { padding: 12px 0; border-block: 1px solid #304353; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; line-height: 1.6; user-select: text; }
 .submodule-detail-note { margin: 12px 0 0; color: #99adbd; font-size: 11px; line-height: 1.6; overflow-wrap: anywhere; }
+.comparison-scope-note { margin: 0; padding: 8px 12px; color: var(--muted); font-size: 12px; line-height: 1.4; border-bottom: 1px solid var(--border-soft); }
 .submodule-details-dialog footer { display: flex; flex: none; justify-content: flex-end; gap: 8px; padding: 14px 22px; border-top: 1px solid var(--border); }
 .submodule-details-dialog footer button { border: 1px solid #456077; border-radius: 5px; padding: 8px 14px; color: #d5e7f7; background: #203446; }
 .submodule-details-dialog footer button:last-child { background: #225d8b; }.submodule-details-dialog footer button:disabled { opacity: .45; cursor: not-allowed; }

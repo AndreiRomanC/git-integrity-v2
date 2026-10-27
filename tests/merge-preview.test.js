@@ -118,7 +118,7 @@ test('graph preview keeps submodule scope and rejects stale menu actions',()=>{
   assert.match(app,/graphMergeMenuItem\(ref.name, `merge-\$\{index\}`\), graphMergePreviewMenuItem/);
 });
 test('preview file comparison has no write actions, reads immutable objects and rejects stale loads',async()=>{
-  let resolve;const c={state:{},refs:{compareDialog:node(),compareTitle:node(),compareSubtitle:node(),localCompare:node(),remoteCompare:node()},
+  let resolve;const c={MergePreview:api,jsPerfLog(){},state:{},refs:{compareDialog:node(),compareTitle:node(),compareSubtitle:node(),localCompare:node(),remoteCompare:node()},
     openFileCompareGuard:()=>()=>true,resetCompareDiffNavigation:message=>{c.diffStatus=message;},setCompareHeadLabels(){},
     setCompareReadOnly:value=>{c.readOnly=value;},invoke:(command,args)=>{c.command=command;c.args=args;return new Promise(r=>{resolve=r;});},
     renderComparisonContents:(...contents)=>{c.rendered=contents;}};
@@ -130,4 +130,90 @@ test('preview file comparison has no write actions, reads immutable objects and 
   assert.deepEqual(Array.from(c.rendered),['old','new']);
   c.rendered=null;const binary=c.openMergePreviewFile(report(),item('f'),'result',()=>active);resolve([{content:null,note:'Binary file'},{content:'text',note:''}]);await binary;
   assert.match(c.diffStatus,/unavailable/);assert.equal(c.rendered,null);assert.equal(c.refs.localCompare.textContent,'Binary file');
+});
+
+test('current-only additions are kept, not mislabelled as unchanged since the base',()=>{
+  for(const kind of ['file','submodule']) {
+    const row=item('own','current','unchanged',kind);row.base=null;row.incoming=null;row.current=row.result;
+    assert.equal(api.changeLabel(row,report()),'Current-only addition');
+    assert.match(api.reason(row,report()),/Added only on the current branch.*absence on incoming is not a deletion/);
+    const html=api.rowHtml(row,0,report());
+    assert.match(html,/Current-only addition/);assert.doesNotMatch(html,/>unchanged</);
+    if(kind==='file') {
+      assert.match(html,/data-pair="result"[^>]* disabled>Current = result/);
+      assert.match(html,/data-pair="sides"/);assert.match(html,/data-pair="ours"/);
+      assert.doesNotMatch(html,/data-pair="theirs"/);
+    }
+  }
+});
+test('each compare action uses the stated versions, including an absent base',()=>{
+  const row=item('f','combined');row.current=version('c');row.result=version('d');
+  for(const [pair,left,right] of [['result','current','result'],['sides','current','incoming'],['ours','base','current'],['theirs','base','incoming']]) {
+    const selected=api.comparison(row,report(),pair);
+    assert.deepEqual(selected.left,row[left]);assert.deepEqual(selected.right,row[right]);assert.equal(selected.identical,false);
+  }
+  assert.match(api.comparison(row,report(),'result').leftLabel,/feature @ a{10}/);
+  assert.match(api.comparison(row,report(),'sides').rightLabel,/origin\/main @ b{10}/);
+  assert.match(api.comparison(row,report(),'sides').description,/not the proposed merge result/);
+  row.base=null;row.current=null;row.outcome='incoming';row.change='added';
+  assert.equal(api.comparison(row,report(),'theirs').left,null);
+  assert.match(api.rowHtml(row,0,report()),/data-pair="theirs"/);
+  row.outcome='conflict';row.result=null;
+  assert.equal(api.comparison(row,report(),'result'),null);
+  assert.doesNotMatch(api.rowHtml(row,0,report()),/data-pair="result"/);
+  assert.equal(api.comparison(row,{...report(),merge_bases:['a','b']},'ours'),null);
+});
+test('mode-only changes still allow result inspection; current-side removal is explicit',()=>{
+  const row=item('f');row.current=row.base;row.result={...row.current,mode:0o100755};
+  assert.equal(api.comparison(row,report(),'result').identical,false);
+  assert.match(api.rowHtml(row,0,report()),/Executable file object/);
+  row.current=null;row.result=null;row.incoming=row.base;row.outcome='current';row.change='unchanged';
+  assert.equal(api.changeLabel(row,report()),'Removed on current');
+  assert.match(api.reason(row,report()),/current branch’s removal is kept/);
+});
+test('folder/gitlink conversions distinguish directories from absence and do not open them as empty files',()=>{
+  const row=item('dep','current','unchanged','submodule');row.base=null;row.incoming=null;row.current=row.result;
+  row.directory_sides=['base','incoming'];
+  assert.equal(api.changeLabel(row,report()),'No change to current');
+  assert.match(api.reason(row,report()),/Folder\/submodule conversion.*keeps the current submodule pointer/);
+  assert.equal((api.rowHtml(row,0,report()).match(/>Folder</g)||[]).length,2);
+  assert.doesNotMatch(api.rowHtml(row,0,report()),/>Absent</);
+  assert.equal(api.comparison(row,report(),'sides'),null);
+  row.current=null;row.incoming=null;row.result=null;row.directory_sides=['current','incoming','result'];
+  assert.equal(api.changeLabel(row,report()),'No change to current');
+  row.change='removed';row.current=version('a');row.directory_sides=['result'];
+  assert.equal(api.changeLabel(row,report()),'Replaced by folder');
+  assert.equal(api.comparison(row,report(),'result'),null);
+});
+test('preview viewer uses the real line-diff renderer for all four pairs, not just a callback stub',async()=>{
+  const blobs={a:'base\nline\n',b:'incoming\nline\n',c:'current\nline\n',d:'current\nmerged\n'};
+  const row=item('f','combined');row.current=version('c');row.result=version('d');
+  const c={MergePreview:api,LocalDriveDiff:require('../frontend/local-diff.js'),state:{},
+    refs:{compareDialog:node(),compareTitle:node(),compareSubtitle:node(),localCompare:node(),remoteCompare:node(),compareDiffStatus:node()},
+    openFileCompareGuard:()=>()=>true,resetCompareDiffNavigation(){},setCompareHeadLabels:(...v)=>{c.labels=v;},
+    setCompareReadOnly(){},setCompareActionStatus:text=>{c.note=text;},jsPerfLog:label=>{c.log=label;},
+    renderComparisonRows(){},invoke:async(command,args)=>{
+      assert.equal(command,'merge_preview_contents');c.args=args;
+      return args.versions.map(v=>({content:v?blobs[v.oid[0]]:'',note:''}));
+    }};
+  c.window=c;vm.createContext(c);
+  vm.runInContext(['comparisonBlocks','renderComparisonContents','openMergePreviewFile'].map(source).join('\n'),c);
+  for(const [pair,left,right] of [['result','c','d'],['sides','c','b'],['ours','a','c'],['theirs','a','b']]) {
+    await c.openMergePreviewFile(report(),row,pair,()=>true);
+    assert.equal(c.state.compareRendered.localText,blobs[left]);assert.equal(c.state.compareRendered.remoteText,blobs[right]);
+    assert.ok(c.state.compareDiffBlocks.length>0,`${pair} must highlight actual differences`);
+    assert.match(c.log,new RegExp(`pair=${pair}.*text_equal=false`));
+  }
+  row.result={...row.current,mode:0o100755};
+  await c.openMergePreviewFile(report(),row,'result',()=>true);
+  assert.equal(c.state.compareDiffBlocks.length,0);assert.match(c.note,/mode\/type changes/);
+  assert.match(c.labels[1],/Executable/);
+  row.current=null;row.result=version('e');blobs.e='';
+  await c.openMergePreviewFile(report(),row,'result',()=>true);
+  assert.match(c.note,/empty file is added/);assert.match(c.labels[0],/Absent/);
+  row.current=row.result;row.result=null;
+  await c.openMergePreviewFile(report(),row,'result',()=>true);
+  assert.match(c.note,/empty file is removed/);
+  row.outcome='conflict';c.args=null;
+  await c.openMergePreviewFile(report(),row,'result',()=>true);assert.equal(c.args,null);
 });

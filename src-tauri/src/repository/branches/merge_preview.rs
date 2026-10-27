@@ -29,6 +29,9 @@ pub struct Item {
     current: Option<Version>,
     incoming: Option<Version>,
     result: Option<Version>,
+    // Directories have no index entry of their own. Do not invent a blob or
+    // mistake a folder/gitlink conversion for an absent path in the report.
+    directory_sides: Vec<String>,
     warnings: Vec<String>,
 }
 
@@ -78,6 +81,23 @@ fn change(current: Option<&Version>, result: Option<&Version>) -> String {
         (a, b) if a == b => "unchanged",
         _ => "modified",
     }.into()
+}
+fn base_version(tree: Option<&git2::Tree<'_>>, path: &str) -> Result<Option<Version>, String> {
+    let Some(tree) = tree else { return Ok(None); };
+    match tree.get_path(Path::new(path)) {
+        Ok(entry) if entry.kind() != Some(git2::ObjectType::Tree) => Ok(Some(version(path, entry.id(), entry.filemode() as u32))),
+        Ok(_) => Ok(None), // A directory is not a file/submodule pointer at this path.
+        Err(error) if error.code() == git2::ErrorCode::NotFound => Ok(None),
+        Err(error) => Err(format!("Cannot read the common base for this path: {}", error.message())),
+    }
+}
+fn outcome(current: Option<&Version>, incoming: Option<&Version>, result: Option<&Version>) -> &'static str {
+    if result == current && result == incoming { "both" }
+    else if result == incoming { "incoming" } else if result == current { "current" } else { "combined" }
+}
+fn contains_directory(entries: &BTreeMap<String, Version>, path: &str) -> bool {
+    let prefix = format!("{path}/");
+    entries.range(prefix.clone()..).next().is_some_and(|(key,_)| key.starts_with(&prefix))
 }
 
 #[tauri::command]
@@ -157,7 +177,7 @@ fn preview(root: String, target: String, source: String, expected_incoming: Opti
             else if current.is_none() || incoming.is_none() { "modify / delete" }
             else if base.is_none() { "add / add" } else { "content or file type" };
         items.push(Item { path: current.as_ref().or(incoming.as_ref()).or(base.as_ref()).ok_or("Empty conflict record")?.path.clone(),
-            kind, outcome: "conflict".into(), change: "unresolved".into(), conflict: Some(conflict_kind.into()), base, current, incoming, result: None, warnings: vec![] });
+            kind, outcome: "conflict".into(), change: "unresolved".into(), conflict: Some(conflict_kind.into()), base, current, incoming, result: None, directory_sides: vec![], warnings: vec![] });
     }
     if status != "up_to_date" {
         let paths: std::collections::BTreeSet<_> = ours.keys().chain(theirs.keys()).chain(result.keys()).collect();
@@ -167,13 +187,11 @@ fn preview(root: String, target: String, source: String, expected_incoming: Opti
             let incoming = theirs.get(path).cloned();
             let final_version = result.get(path).cloned();
             if current == incoming && current == final_version { continue; }
-            let base = base_tree.as_ref().and_then(|t| t.get_path(Path::new(path)).ok()).filter(|e| e.kind() != Some(git2::ObjectType::Tree))
-                .map(|e| version(path, e.id(), e.filemode() as u32));
-            let outcome = if final_version == current && final_version == incoming { "both" }
-                else if final_version == incoming { "incoming" } else if final_version == current { "current" } else { "combined" };
+            let base = base_version(base_tree.as_ref(), path)?;
+            let outcome = outcome(current.as_ref(), incoming.as_ref(), final_version.as_ref());
             items.push(Item { path: path.clone(), kind: kind(&[base.as_ref(),current.as_ref(),incoming.as_ref(),final_version.as_ref()]),
                 outcome: outcome.into(), change: change(current.as_ref(),final_version.as_ref()), conflict: None,
-                base, current, incoming, result: final_version, warnings: vec![] });
+                base, current, incoming, result: final_version, directory_sides: vec![], warnings: vec![] });
         }
     }
     // Reuse the real merge's registration check with the simulated index, not
@@ -183,16 +201,37 @@ fn preview(root: String, target: String, source: String, expected_incoming: Opti
     match super::merge::unregistered_gitlinks_in_index(&index, &root, &links) {
         Ok(missing) => for path in missing {
             if !items.iter().any(|item| item.path == path) {
-                items.push(Item { path: path.clone(), kind: "submodule".into(), outcome: "current".into(), change: "unchanged".into(), conflict: None,
-                    base: None, current: ours.get(&path).cloned(), incoming: theirs.get(&path).cloned(), result: result.get(&path).cloned(), warnings: vec![] });
+                let current = ours.get(&path).cloned();
+                let incoming = theirs.get(&path).cloned();
+                let final_version = result.get(&path).cloned();
+                items.push(Item { path: path.clone(), kind: "submodule".into(),
+                    outcome: outcome(current.as_ref(), incoming.as_ref(), final_version.as_ref()).into(),
+                    change: change(current.as_ref(), final_version.as_ref()), conflict: None,
+                    base: base_version(base_tree.as_ref(), &path)?, current, incoming, result: final_version, directory_sides: vec![], warnings: vec![] });
             }
             if let Some(item) = items.iter_mut().find(|item| item.path == path) {
-                item.warnings.push("Result keeps a submodule pointer without a matching .gitmodules registration. Update/init cannot repair this inconsistency.".into());
+                item.warnings.push("Result contains a submodule pointer without a matching .gitmodules registration. Update/init cannot repair this inconsistency.".into());
             }
         },
         Err(error) => warnings.push(format!("Submodule registration could not be verified for this result: {error}")),
     }
     if items.len() > MAX_ITEMS { return Err("Merge preview exceeds 25,000 report items. No partial report was applied.".into()); }
+    for item in &mut items {
+        for (side,entries,missing) in [("current",&ours,item.current.is_none()),("incoming",&theirs,item.incoming.is_none()),
+            ("result",&result,item.result.is_none() && item.outcome!="conflict")] {
+            if missing && contains_directory(entries, &item.path) { item.directory_sides.push(side.into()); }
+        }
+        if item.base.is_none() {
+            if let Some(tree) = base_tree.as_ref() {
+                match tree.get_path(Path::new(&item.path)) {
+                    Ok(entry) if entry.kind()==Some(git2::ObjectType::Tree) => item.directory_sides.push("base".into()),
+                    Ok(_) => (),
+                    Err(error) if error.code()==git2::ErrorCode::NotFound => (),
+                    Err(error) => return Err(format!("Cannot read the common base path type: {}",error.message())),
+                }
+            }
+        }
+    }
     items.sort_by(|a,b| (a.outcome != "conflict", a.warnings.is_empty(), &a.path).cmp(&(b.outcome != "conflict", b.warnings.is_empty(), &b.path)));
     // An external Git process does not share our lock. Pin the report or fail,
     // never silently label a moved ref with the old computation.
@@ -352,6 +391,105 @@ mod tests {
         let before=f.state();let report=f.preview();assert_eq!(before,f.state());
         let item=report.items.iter().find(|i|i.path=="dep").unwrap();assert_eq!(item.outcome,"current");assert_eq!(item.change,"unchanged");assert_eq!(item.warnings.len(),1);
         assert!(fs::read_to_string(f.root.join(".gitmodules")).unwrap().contains("path = dep"));
+    }
+
+    #[test]
+    fn current_only_addition_is_not_an_incoming_deletion_even_for_submodules() {
+        let f=Fixture::new();let link=Oid::from_str(&"c".repeat(40)).unwrap();let text=f.blob("own content\n");
+        let config=f.blob("[submodule \"dep\"]\npath=dep\nurl=../dep.git\n");
+        let base=f.commit(&[],&[]);
+        let ours=f.commit(&[("dep",link,GITLINK),(".gitmodules",config,FILE),("own-file",text,FILE)],&[base]);
+        let theirs=f.commit(&[("incoming-file",text,FILE)],&[base]);f.branches(ours,theirs);
+        let before=f.state();let report=f.preview();assert_eq!(before,f.state());
+        for path in ["dep","own-file"] {
+            let row=report.items.iter().find(|i|i.path==path).unwrap();
+            assert!(row.base.is_none());assert!(row.incoming.is_none());assert!(row.current.is_some());
+            assert_eq!(row.result,row.current);assert_eq!(row.outcome,"current");assert_eq!(row.change,"unchanged");
+            assert!(row.warnings.is_empty());
+        }
+    }
+
+    #[test]
+    fn unchanged_orphan_warning_keeps_real_base_and_symmetric_outcome() {
+        let f=Fixture::new();let link=Oid::from_str(&"c".repeat(40)).unwrap();let text=f.blob("text\n");
+        let base=f.commit(&[("dep",link,GITLINK)],&[]);
+        let ours=f.commit(&[("dep",link,GITLINK),("own",text,FILE)],&[base]);
+        let theirs=f.commit(&[("dep",link,GITLINK),("incoming",text,FILE)],&[base]);f.branches(ours,theirs);
+        for up_to_date in [false,true] {
+            if up_to_date {f.branches(ours,base);}
+            let before=f.state();let report=f.preview();assert_eq!(before,f.state());
+            let row=report.items.iter().find(|i|i.path=="dep").unwrap();
+            assert_eq!(row.base.as_ref().unwrap().oid,link.to_string());
+            assert_eq!(row.current,row.base);assert_eq!(row.incoming,row.base);assert_eq!(row.result,row.base);
+            assert_eq!(row.outcome,"both");assert_eq!(row.change,"unchanged");assert_eq!(row.warnings.len(),1);
+        }
+    }
+
+    #[test]
+    fn result_contents_preserve_generated_merge_and_all_other_comparison_pairs() {
+        let f=Fixture::new();let base_text="a\nb\nc\nd\ne\nf\ng\nh\ni\nj\n";
+        let our_text="OUR\nb\nc\nd\ne\nf\ng\nh\ni\nj\n";let their_text="a\nb\nc\nd\ne\nf\ng\nh\ni\nTHEIR\n";
+        let base=f.commit(&[("file",f.blob(base_text),FILE)],&[]);
+        let ours=f.commit(&[("file",f.blob(our_text),FILE)],&[base]);
+        let theirs=f.commit(&[("file",f.blob(their_text),FILE)],&[base]);f.branches(ours,theirs);
+        let before=f.state();let report=f.preview();let row=report.items.iter().find(|i|i.path=="file").unwrap();
+        let versions=vec![row.base.clone(),row.current.clone(),row.incoming.clone(),row.result.clone()];
+        let contents=tauri::async_runtime::block_on(merge_preview_contents(f.root(),versions)).unwrap();
+        assert_eq!(contents[0].content.as_deref(),Some(base_text));assert_eq!(contents[1].content.as_deref(),Some(our_text));
+        assert_eq!(contents[2].content.as_deref(),Some(their_text));
+        assert_eq!(contents[3].content.as_deref(),Some("OUR\nb\nc\nd\ne\nf\ng\nh\ni\nTHEIR\n"));
+        for (a,b) in [(1,3),(1,2),(0,1),(0,2)] {assert_ne!(contents[a].content,contents[b].content);}
+        assert_eq!(before,f.state());
+    }
+
+    #[test]
+    fn mode_only_and_empty_file_changes_have_real_effects_without_text_differences() {
+        let f=Fixture::new();let text=f.blob("unchanged text\n");let empty=f.blob("");
+        let base=f.commit(&[("file",text,FILE),("removed-empty",empty,FILE)],&[]);
+        let ours=f.commit(&[("file",text,FILE),("removed-empty",empty,FILE),("own",text,FILE)],&[base]);
+        let theirs=f.commit(&[("file",text,0o100755),("added-empty",empty,FILE)],&[base]);f.branches(ours,theirs);
+        let report=f.preview();
+        for (path,change) in [("file","modified"),("added-empty","added"),("removed-empty","removed")] {
+            let row=report.items.iter().find(|i|i.path==path).unwrap();assert_eq!(row.change,change);assert_ne!(row.current,row.result);
+            let contents=tauri::async_runtime::block_on(merge_preview_contents(f.root(),vec![row.current.clone(),row.result.clone()])).unwrap();
+            assert_eq!(contents[0].content,contents[1].content);
+        }
+    }
+
+    #[test]
+    fn current_deletion_is_kept_but_incoming_edit_makes_it_a_conflict() {
+        let f=Fixture::new();let text=f.blob("base\n");let edited=f.blob("edited\n");
+        let base=f.commit(&[("kept-deletion",text,FILE),("conflicted-deletion",text,FILE)],&[]);
+        let ours=f.commit(&[("own",f.blob("unrelated new file\n"),FILE)],&[base]);
+        let theirs=f.commit(&[("kept-deletion",text,FILE),("conflicted-deletion",edited,FILE)],&[base]);f.branches(ours,theirs);
+        let report=f.preview();let kept=report.items.iter().find(|i|i.path=="kept-deletion").unwrap();
+        assert!(kept.current.is_none());assert!(kept.result.is_none());assert_eq!(kept.base,kept.incoming);
+        assert_eq!(kept.outcome,"current");assert_eq!(kept.change,"unchanged");
+        let conflict=report.items.iter().find(|i|i.path=="conflicted-deletion").unwrap();
+        assert_eq!(conflict.outcome,"conflict");assert!(conflict.result.is_none());
+    }
+
+    #[test]
+    fn folder_submodule_conversions_report_directories_not_absence_in_both_directions() {
+        for current_converts in [true,false] {
+            for base_is_folder in [true,false] {
+                let f=Fixture::new();let text=f.blob("folder file\n");let link=Oid::from_str(&"c".repeat(40)).unwrap();
+                let config=f.blob("[submodule \"dep\"]\npath=dep\nurl=../dep.git\n");
+                let folder=vec![("dep/file",text,FILE)];let sub=vec![("dep",link,GITLINK),(".gitmodules",config,FILE)];
+                let (initial,converted)=if base_is_folder {(&folder,&sub)} else {(&sub,&folder)};
+                let base=f.commit(initial,&[]);let mut unchanged=initial.clone();unchanged.push(("independent",f.blob("unrelated\n"),FILE));
+                let converts=f.commit(converted,&[base]);let other=f.commit(&unchanged,&[base]);
+                let (ours,theirs)=if current_converts {(converts,other)} else {(other,converts)};f.branches(ours,theirs);
+                let before=f.state();let report=f.preview();assert_eq!(before,f.state());assert_eq!(report.status,"clean");
+                let row=report.items.iter().find(|i|i.path=="dep").unwrap();
+                let has=|side:&str|row.directory_sides.iter().any(|s|s==side);
+                assert_eq!(has("base"),base_is_folder);
+                assert_eq!(has("current"),base_is_folder!=current_converts);
+                assert_eq!(has("incoming"),base_is_folder==current_converts);
+                assert_eq!(has("result"),!base_is_folder);
+                assert_eq!(row.outcome,if current_converts {"current"} else {"incoming"});
+            }
+        }
     }
 
     #[test]

@@ -47,6 +47,15 @@
   const enumValue = value => text(value && typeof value === 'object' ? value.id || value.name : value, 240);
   const validId = (id, count) => typeof id === 'string' && id.split('/').length === count && id.split('/').every(p => p && p !== '.' && p !== '..' && p.length <= 240 && !/[\x00-\x1f\\]/.test(p));
   const hasErrors = item => Boolean(item?.meta?.errors?.length);
+  // Validation can fail after a successful GET. Keep it attached to that
+  // response (not whichever request happened last), without retaining bodies
+  // in the diagnostic report or making any additional request.
+  const responseDiagnostics = new WeakMap();
+  const invalidResponse = (data, reason, catalog_pages = 0) => {
+    const entry = responseDiagnostics.get(data);
+    if (entry) { entry.code = 'invalid_response'; entry.reason = reason; }
+    throw { code: 'invalid_response', http: entry?.http || 0, catalog_pages };
+  };
   const route = url => {
     const p = url.pathname.split('/').slice(4);
     if (p.length === 2 && p[0] === 'all' && p[1] === 'documents') return 'all_documents';
@@ -182,7 +191,16 @@
           throw { http, parameter: entry.parameter, code: http === 401 ? 'auth_required' : http === 403 ? 'forbidden' : [404,405,501,503].includes(http) ? 'api_unavailable' : http === 400 ? 'query_rejected' : 'http_error' };
         }
         if (entry.media !== 'json') throw { http, code: 'not_json' };
-        const data = await response.json();
+        let data;
+        try { data = await response.json(); }
+        catch (error) {
+          if (error?.name !== 'SyntaxError') throw error;
+          entry.reason = 'invalid_json'; throw { http, code: 'invalid_response' };
+        }
+        if (!data || typeof data !== 'object' || Array.isArray(data)) {
+          entry.reason = 'invalid_payload'; throw { http, code: 'invalid_response' };
+        }
+        responseDiagnostics.set(data, entry);
         const resource = Array.isArray(data.data) ? data.data[0] : data.data;
         entry.resource_type = resourceTypes.includes(resource?.type) ? resource.type : '';
         entry.count = Array.isArray(data.data) ? data.data.length : data.data ? 1 : 0;
@@ -283,7 +301,7 @@
         const invalidDocumentResponse = reason => {
           const last = diagnostics[diagnostics.length - 1];
           if (last) { last.code = 'invalid_response'; last.reason = reason; }
-          throw { code: 'invalid_response' };
+          throw { code: 'invalid_response', http: last?.http || 0 };
         };
         let acceptedModuleLookup = false;
         for (let index = 0; index < sources.length; index++) {
@@ -365,7 +383,9 @@
           if (page > 200) throw { code: 'catalog_limit', catalog_pages };
           const url = new URL(args.url); url.searchParams.set('page[number]', String(page)); url.searchParams.set('sort', 'id');
           const data = await request(url.href, 'catalog_page'); catalog_pages++;
-          if (!Array.isArray(data.data) || data.data.some(item => hasErrors(item) || (isProject ? item.type !== 'projects' || !/^[\w-]+$/.test(item.id) : item.type !== 'documents' || !validId(item.id, 3) || !item.id.startsWith(args.project + '/')))) throw { code: 'invalid_response', catalog_pages };
+          if (!Array.isArray(data.data)) invalidResponse(data, 'expected_list', catalog_pages);
+          if (data.data.some(hasErrors)) invalidResponse(data, 'partial_errors', catalog_pages);
+          if (data.data.some(item => isProject ? item?.type !== 'projects' || !/^[\w-]+$/.test(item.id) : item?.type !== 'documents' || !validId(item.id, 3) || !item.id.startsWith(args.project + '/'))) invalidResponse(data, 'unexpected_resource', catalog_pages);
           let added = 0;
           for (const item of data.data) {
             if (seen.has(item.id)) continue;
@@ -374,7 +394,7 @@
             items.push({ id: item.id, title: text(isProject ? a.name || item.id : a.title || a.moduleName || item.id), prefix: text(a.trackerPrefix), item_type: enumValue(a.type) });
           }
           if (!data.links?.next) break;
-          if (!added) throw { code: 'invalid_response', catalog_pages };
+          if (!added) invalidResponse(data, 'duplicate_item', catalog_pages);
         }
         if (token) window[key] = { token, time: Date.now(), items };
       }
@@ -405,15 +425,23 @@
           if (error.http !== 400 || !urls.fallbackUrl || urls.fallbackUrl === urls.url) throw error;
           prefix_fallback = true; data = await request(atPage(urls.fallbackUrl), 'prefix_fallback');
         }
-        if (!Array.isArray(data.data) || data.data.length > 25 || offset > data.data.length
-          || (!data.data.length && data.links?.next)) throw { code: 'invalid_response' };
+        if (!Array.isArray(data.data)) invalidResponse(data, 'expected_list');
+        if (data.data.length > 25) invalidResponse(data, 'page_size_exceeded');
+        if (offset > data.data.length) invalidResponse(data, 'page_offset_changed');
+        if (!data.data.length && data.links?.next) invalidResponse(data, 'empty_page_with_next');
         received += data.data.length;
         for (; offset < data.data.length; offset++) {
           const item = data.data[offset];
-          if (item.type !== 'workitems' || !validId(item.id, 2) || !item.id.startsWith(args.project + '/')
-            || hasErrors(item) || enumValue(item.attributes?.type) !== 'task' || seen.has(item.id)) throw { code: 'invalid_response' };
+          if (item?.type !== 'workitems') invalidResponse(data, 'unexpected_resource');
+          if (!validId(item.id, 2)) invalidResponse(data, 'invalid_item_id');
+          if (!item.id.startsWith(args.project + '/')) invalidResponse(data, 'wrong_project');
+          if (hasErrors(item)) invalidResponse(data, 'partial_errors');
+          const itemType = enumValue(item.attributes?.type);
+          if (!itemType) invalidResponse(data, 'missing_task_type');
+          if (itemType !== 'task') invalidResponse(data, 'unexpected_task_type');
+          if (seen.has(item.id)) invalidResponse(data, 'duplicate_item');
           const matches = urls.statuses?.some(status => status.toLowerCase() === enumValue(item.attributes?.status).toLowerCase());
-          if (urls.exclude ? matches : !matches) throw { code: 'invalid_response' };
+          if (urls.exclude ? matches : !matches) invalidResponse(data, enumValue(item.attributes?.status) ? 'task_status_mismatch' : 'missing_task_status');
           // Look ahead for a real next result, not just a possibly empty group.
           if (items.length === 25) return reply({ code: 'ok', http: 200, items, received, more: true, task_next_cursor: [group, serverPage, offset].join(':') });
           seen.add(item.id);
@@ -433,26 +461,31 @@
       else { prefix_fallback = true; data = await request(args.fallbackUrl, 'prefix_fallback'); }
     }
     if (args.kind === 'user') {
-      if (data.data?.type !== 'users' || typeof data.data.id !== 'string' || !/^[\w.@-]{1,120}$/.test(data.data.id) || hasErrors(data.data)) throw { code: 'invalid_response' };
+      if (hasErrors(data.data)) invalidResponse(data, 'partial_errors');
+      if (data.data?.type !== 'users' || typeof data.data.id !== 'string' || !/^[\w.@-]{1,120}$/.test(data.data.id)) invalidResponse(data, 'unexpected_resource');
       return reply({ code: 'ok', http: 200, user_id: data.data.id, user_name: text(data.data.attributes?.name) });
     }
     if (args.kind === 'workitem' || args.kind === 'document') {
       const item = data.data;
-      if (!item || item.id !== args.resourceId || item.type !== (args.kind === 'document' ? 'documents' : 'workitems') || hasErrors(item)) throw { code: 'invalid_response' };
+      if (hasErrors(item)) invalidResponse(data, 'partial_errors');
+      if (!item || item.id !== args.resourceId || item.type !== (args.kind === 'document' ? 'documents' : 'workitems')) invalidResponse(data, 'unexpected_resource');
       return reply({ code: 'ok', http: 200, snapshot: snapshot(item) });
     }
-    if (!Array.isArray(data.data)) throw { code: 'invalid_response' };
+    if (!Array.isArray(data.data)) invalidResponse(data, 'expected_list');
     if (args.kind === 'elements' || args.kind === 'links') {
-      if (data.data.length > 25 || (data.included != null && !Array.isArray(data.included))) throw { code: 'invalid_response' };
-      const elements = [], included = new Map((data.included || []).filter(i => i.type === 'workitems').map(i => [i.id, i]));
+      if (data.data.length > 25) invalidResponse(data, 'page_size_exceeded');
+      if (data.included != null && !Array.isArray(data.included)) invalidResponse(data, 'expected_list');
+      if (data.included?.some(item => item == null)) invalidResponse(data, 'unexpected_resource');
+      const elements = [], included = new Map((data.included || []).filter(i => i?.type === 'workitems').map(i => [i.id, i]));
       let incomplete = 0;
       for (const part of data.data.slice(0, 25)) {
-        if (hasErrors(part) || part.type !== (args.kind === 'elements' ? 'document_parts' : 'linkedworkitems')) throw { code: 'invalid_response' };
-        if (args.kind === 'elements' && !part.id?.startsWith(args.resourceId + '/')) throw { code: 'invalid_response' };
+        if (hasErrors(part)) invalidResponse(data, 'partial_errors');
+        if (part?.type !== (args.kind === 'elements' ? 'document_parts' : 'linkedworkitems')) invalidResponse(data, 'unexpected_resource');
+        if (args.kind === 'elements' && !part.id?.startsWith(args.resourceId + '/')) invalidResponse(data, 'unexpected_resource');
         if (args.kind === 'elements' && part.attributes?.type !== 'workitem') continue;
-        if (args.kind === 'links' && part.relationships?.sourceWorkItem?.data?.id !== args.resourceId) throw { code: 'invalid_response' };
+        if (args.kind === 'links' && part.relationships?.sourceWorkItem?.data?.id !== args.resourceId) invalidResponse(data, 'unexpected_resource');
         const related = part.relationships?.workItem?.data;
-        if (!related || related.type !== 'workitems' || !validId(related.id, 2)) throw { code: 'invalid_response' };
+        if (!related || related.type !== 'workitems' || !validId(related.id, 2)) invalidResponse(data, 'relationship_missing');
         const item = included.get(related.id), available = item && !hasErrors(item);
         if (!available) incomplete++;
         const saved = snapshot(available ? item : { id: related.id, type: 'workitems' }, true);
@@ -463,11 +496,13 @@
       }
       return reply({ code: 'ok', http: 200, elements, page_key: data.data.slice(0, 25).map(p => p.id).join('|'), received: data.data.length, incomplete, more: Boolean(data.links?.next) });
     }
-    if (data.data.length > 25) throw { code: 'invalid_response' };
-    const items = data.data.filter(item => item.type === 'workitems' && validId(item.id, 2) && item.id.startsWith(args.project + '/') && !hasErrors(item)
+    if (data.data.length > 25) invalidResponse(data, 'page_size_exceeded');
+    if (data.data.some(item => item == null)) invalidResponse(data, 'unexpected_resource');
+    const items = data.data.filter(item => item?.type === 'workitems' && validId(item.id, 2) && item.id.startsWith(args.project + '/') && !hasErrors(item)
       && (args.kind === 'containers' || enumValue(item.attributes?.type) === 'task'))
       .map(item => ({ id: item.id.split('/').pop(), title: text(item.attributes?.title || item.id), item_type: enumValue(item.attributes?.type), status: enumValue(item.attributes?.status) }));
-    reply({ code: data.data.length && !items.length ? 'invalid_response' : 'ok', http: 200, received: data.data.length, items, more: Boolean(data.links?.next) });
+    if (data.data.length && !items.length) invalidResponse(data, 'unexpected_resource');
+    reply({ code: 'ok', http: 200, received: data.data.length, items, more: Boolean(data.links?.next) });
   } catch (error) {
     reply({ code: failureCode(error), http: error?.http || 0, catalog_pages: error?.catalog_pages || 0 });
   } finally { clearTimeout(timeout); }

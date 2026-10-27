@@ -40,7 +40,8 @@ fn refresh_navigation_status_inner(repository_path: String, head_oid: String, br
     }
     if force_fresh { invalidate_git_metadata(&repository_path); }
     let epoch = status_cache_epoch(&repository_path);
-    let changes = refresh_status_inner(repository_path.clone())?;
+    perf_log(&format!("refresh_navigation_status: force_fresh={force_fresh} phase=status_request"), Duration::ZERO);
+    let changes = refresh_status_inner_from(repository_path.clone(), "refresh_navigation_status")?;
     if !same_head(&navigation_status_inner(&repository_path)?) {
         return Err("Repository HEAD/branch changed during verification. Refresh repository before continuing.".into());
     }
@@ -56,7 +57,11 @@ fn refresh_navigation_status_inner(repository_path: String, head_oid: String, br
 
 #[tauri::command]
 pub async fn refresh_navigation_status(repository_path: String, head_oid: String, branch: String, force_fresh: Option<bool>) -> Result<Vec<Change>, String> {
-    off_main_thread(move || refresh_navigation_status_inner(repository_path, head_oid, branch, force_fresh.unwrap_or(false))).await
+    let queued = Instant::now();
+    off_main_thread(move || {
+        perf_log("refresh_navigation_status: phase=worker_queue", queued.elapsed());
+        refresh_navigation_status_inner(repository_path, head_oid, branch, force_fresh.unwrap_or(false))
+    }).await
 }
 use std::hash::{Hash, Hasher};
 

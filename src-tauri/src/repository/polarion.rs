@@ -712,7 +712,7 @@ fn valid_diagnostic(d: &HttpDiagnostic) -> bool {
     ["primary", "prefix_fallback", "metadata_fallback", "catalog_page", "document_global", "document_modules", "metadata", "current_user", "project_access", "tasks_baseline", "documents_catalog", "documents_global", "workitem_modules", "document_name_query", "document_query", "known_document_query", "known_item_query", "document_parts_expanded", "workitem_sample", "spaces", "document_exact", "page_exact", "space_documents", "space_pages", "document_parts", "query_current", "query_prefix", "query_without_id_star"].contains(&d.step.as_str())
         && diagnostic_endpoint(&d.route).is_some() && d.duration_ms <= 600_000 && d.http <= 599 && d.page <= 1000 && d.count <= 100_000
         && ["ok", "auth_required", "forbidden", "api_unavailable", "query_rejected", "http_error", "not_json", "network_error", "timeout", "invalid_response", "not_run"].contains(&d.code.as_str())
-        && ["", "leading_wildcard", "unknown_field", "query_syntax", "unsupported_parameter", "permission_denied", "authentication_required", "not_found", "method_not_allowed", "unclassified", "error_body_limit", "partial_errors", "unexpected_resource", "relationship_missing", "prerequisite_missing", "sample_missing", "budget"].contains(&d.reason.as_str())
+        && ["", "leading_wildcard", "unknown_field", "query_syntax", "unsupported_parameter", "permission_denied", "authentication_required", "not_found", "method_not_allowed", "unclassified", "error_body_limit", "partial_errors", "unexpected_resource", "relationship_missing", "prerequisite_missing", "sample_missing", "budget", "invalid_json", "invalid_payload", "expected_list", "page_size_exceeded", "page_offset_changed", "empty_page_with_next", "invalid_item_id", "wrong_project", "missing_task_type", "unexpected_task_type", "duplicate_item", "task_status_mismatch", "missing_task_status"].contains(&d.reason.as_str())
         && ["", "query", "fields", "page", "sort", "include", "revision", "other"].contains(&d.parameter.as_str())
         && ["", "json", "html", "text", "other"].contains(&d.media.as_str())
         && ["", "metadata", "users", "projects", "workitems", "documents", "pages", "spaces", "document_parts", "linkedworkitems"].contains(&d.resource_type.as_str())
@@ -761,6 +761,20 @@ mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
     fn pairs(url: &str) -> HashMap<String, String> { reqwest::Url::parse(url).unwrap().query_pairs().into_owned().collect() }
+    #[test]
+    fn rejected_task_responses_preserve_http_and_only_accept_fixed_validation_reasons() {
+        for reason in ["invalid_json", "invalid_payload", "expected_list", "page_size_exceeded", "page_offset_changed", "empty_page_with_next", "invalid_item_id", "wrong_project", "missing_task_type", "unexpected_task_type", "duplicate_item", "task_status_mismatch", "missing_task_status"] {
+            let value = serde_json::json!({"code":"invalid_response", "http":200,
+                "diagnostics":[{"step":"primary", "route":"workitems", "code":"invalid_response", "http":200, "reason":reason}]});
+            let parsed = validate_result(&value.to_string()).unwrap();
+            assert_eq!(parsed.http, 200);
+            assert_eq!(parsed.diagnostics[0].reason, reason);
+            assert_ne!(parsed.diagnostics[0].code, "ok", "response_usable must be false");
+            let mut bad = value;
+            bad["diagnostics"][0]["reason"] = "PRIVATE_RESPONSE_DETAILS".into();
+            assert!(validate_result(&bad.to_string()).is_err());
+        }
+    }
     #[test]
     fn permission_checks_use_only_an_exact_current_document_and_an_isolated_script() {
         let args = read_args("permissions", "VWAQ4/Structure Information/ERRM", 1, None).unwrap();

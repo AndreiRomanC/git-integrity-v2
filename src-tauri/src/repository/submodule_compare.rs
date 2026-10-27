@@ -44,7 +44,7 @@ fn display_url(value: &str) -> String {
 
 fn registration(repo: &Repository, root: &str, tree: Option<&git2::Tree>, path: &str, side: &mut Side) -> Result<(), String> {
     let source = if let Some(tree) = tree {
-        let Ok(entry) = tree.get_path(Path::new(".gitmodules")) else { return Ok(()); };
+        let Some(entry) = super::comparison::snapshot_path_entry(repo, tree, Path::new(".gitmodules")).map_err(|e| e.message().to_owned())? else { return Ok(()); };
         if !matches!(entry.filemode(), 0o100644 | 0o100755) { return Err("Snapshot .gitmodules is not a regular file.".into()); }
         vec!["--blob".to_owned(), entry.id().to_string()]
     } else {
@@ -95,7 +95,9 @@ fn read_side(repo: &Repository, root: &str, path: &Path, revision: Option<&str>,
         None
     };
     let entry = if let Some(tree) = tree.as_ref() {
-        tree.get_path(path).ok().map(|e| (e.filemode() as u32, e.id()))
+        super::comparison::snapshot_path_entry(repo, tree, path)
+            .map_err(|e| super::comparison::snapshot_error(root, &normalized(path), "selected", &side.source, "submodule-path", e))?
+            .map(|e| (e.filemode() as u32, e.id()))
     } else if let Some(oid) = workspace_revision {
         Some((0o160000, Oid::from_str(oid).map_err(|e| e.message().to_owned())?))
     } else {

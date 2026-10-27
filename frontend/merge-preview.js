@@ -5,15 +5,53 @@
   const labels = {current:'Keep current', incoming:'From incoming', both:'Both match', combined:'Combined automatically', conflict:'Decision needed'};
   const statuses = {up_to_date:'Already up to date', fast_forward:'Fast-forward available', clean:'Automatic merge calculated', conflicts:'Conflicts need resolution'};
   const same = (a,b) => !a && !b || !!a && !!b && a.oid === b.oid && a.mode === b.mode;
+  // One definition for both the buttons and the actual viewer. A result diff
+  // measures the merge's effect on CURRENT, not the difference between branches.
+  function comparison(item, report, pair) {
+    const sides={result:['current','result'],sides:['current','incoming'],ours:['base','current'],theirs:['base','incoming']}[pair];
+    if(!sides || sides.some(side=>item.directory_sides?.includes(side))) return null;
+    const current = `Current · ${report.current_branch} @ ${report.current_revision.slice(0,10)}`;
+    const incoming = `Incoming · ${report.source_ref} @ ${report.incoming_revision.slice(0,10)}`;
+    const base = `Common base @ ${report.merge_bases?.[0]?.slice(0,10) || '?'}`;
+    const choices = {
+      result: {left:item.current,right:item.result,leftLabel:current,rightLabel:'Proposed merge result',label:'Current → result',description:'Changes this merge would make to your current committed version.'},
+      sides: {left:item.current,right:item.incoming,leftLabel:current,rightLabel:incoming,label:'Current ↔ incoming',description:'Branch snapshots only — this is not the proposed merge result.'},
+      ours: {left:item.base,right:item.current,leftLabel:base,rightLabel:current,label:'Base → current',description:'Changes on the current branch since the common base.'},
+      theirs: {left:item.base,right:item.incoming,leftLabel:base,rightLabel:incoming,label:'Base → incoming',description:'Changes on the incoming branch since the common base.'},
+    };
+    if (pair==='result' && item.outcome==='conflict' || ['ours','theirs'].includes(pair) && report.merge_bases?.length!==1) return null;
+    const selected = choices[pair];
+    return selected ? {...selected, identical:same(selected.left,selected.right)} : null;
+  }
+  function changeLabel(item,report) {
+    if(item.change!=='unchanged' && item.outcome!=='conflict' && item.directory_sides?.includes('result')) return 'Replaced by folder';
+    if(item.change!=='unchanged' && item.outcome!=='conflict' && item.directory_sides?.includes('current')) return item.kind==='submodule' ? 'Folder → submodule' : 'Folder → file';
+    if(item.change!=='unchanged') return {added:'Added by merge',removed:'Removed by merge',modified:'Changed by merge',unresolved:'Unresolved'}[item.change] || item.change;
+    if(report.merge_bases?.length===1) {
+      if(!item.base && item.current && !item.incoming && !item.directory_sides?.length) return 'Current-only addition';
+      if(item.base && !item.current && same(item.base,item.incoming) && !item.directory_sides?.length) return 'Removed on current';
+    }
+    return 'No change to current';
+  }
   function reason(item, report) {
     if (item.outcome === 'conflict') return `No final version chosen · ${item.conflict || 'unresolved conflict'}.`;
-    if (item.outcome === 'combined') return 'The engine combined both versions automatically. Review the result; no textual conflict does not guarantee functional correctness.';
+    if(item.directory_sides?.length) {
+      const result = item.directory_sides.includes('result') ? 'The result is a folder.' : item.result ? `The result ${item.outcome==='current' ? 'keeps the current' : 'uses a'} ${item.kind==='submodule' ? 'submodule pointer' : 'file'}.` : 'The result removes this path.';
+      return `Folder/${item.kind==='submodule' ? 'submodule' : 'file'} conversion. ${result} Folder contents are listed as separate paths.`;
+    }
+    if (item.outcome === 'combined') return 'The engine calculated a new result for this path (combined changes or rename handling). Review it; no textual conflict does not guarantee functional correctness.';
     if (item.outcome === 'both') return 'Both sides have the same result.';
     const hasBase = report.merge_bases?.length === 1;
+    if(hasBase && !item.base && item.outcome==='current' && item.current && !item.incoming)
+      return 'Added only on the current branch; absent from the common base and incoming branch. The merge keeps it — absence on incoming is not a deletion from the base.';
+    if(hasBase && !item.base && item.outcome==='incoming' && !item.current && item.incoming)
+      return 'Added only on the incoming branch. The merge adds it to the current branch.';
+    if(!item.result && hasBase && !same(item.base,item.current) && !same(item.base,item.incoming))
+      return 'Absent at this path in the proposed result. A rename may be recorded under another path; compare the branch snapshots before interpreting this as a deletion.';
     if (item.outcome === 'incoming') return (hasBase && same(item.base,item.current) ? 'Current branch did not change this path since the common base. ' : '') +
       (item.result ? 'The incoming version is used.' : 'The incoming side removes this path.');
     return (hasBase && same(item.base,item.incoming) ? 'Incoming branch did not change this path since the common base. ' : '') +
-      (item.result ? 'The current version is kept; no change to this path.' : 'The current branch’s removal is kept.');
+      (item.result ? 'The current version is kept; the merge makes no further change to it.' : 'The current branch’s removal is kept.');
   }
   function counts(items) {
     return {changes:items.filter(i=>i.change!=='unchanged' && i.outcome!=='conflict').length,
@@ -27,18 +65,23 @@
       (filter==='all' || filter==='changes' && item.change!=='unchanged' && item.outcome!=='conflict' || filter==='conflicts' && item.outcome==='conflict' ||
         filter==='submodules' && item.kind==='submodule' || filter==='review' && (item.outcome==='conflict' || item.warnings?.length)));
   }
-  function versionHtml(value, title, path, unresolved=false, unknownBase=false) {
-    return `<div class="merge-preview-version"><span>${escape(title)}</span><code title="${escape(value?.oid || '')}">${unresolved ? 'Unresolved' : unknownBase ? 'Multiple bases' : value ? escape(value.oid.slice(0,10)) : 'Absent'}</code>${value ? `<small>${value.mode===0o160000 ? 'Submodule commit' : 'File object'}${value.path!==path ? ' · '+escape(value.path) : ''}</small>` : ''}</div>`;
+  function versionHtml(value, title, path, unresolved=false, unknownBase=false, directory=false) {
+    return `<div class="merge-preview-version"><span>${escape(title)}</span><code title="${escape(value?.oid || '')}">${unresolved ? 'Unresolved' : unknownBase ? 'Multiple bases' : directory ? 'Folder' : value ? escape(value.oid.slice(0,10)) : 'Absent'}</code>${directory ? '<small>See child paths</small>' : value ? `<small>${value.mode===0o160000 ? 'Submodule commit' : value.mode===0o120000 ? 'Symbolic link' : value.mode===0o100755 ? 'Executable file object' : 'File object'}${value.path!==path ? ' · '+escape(value.path) : ''}</small>` : ''}</div>`;
   }
   function rowHtml(item,index,report) {
     const sub = item.kind==='submodule', conflict = item.outcome==='conflict';
-    const compare = (pair,label) => `<button type="button" data-preview-file="${index}" data-pair="${pair}">${label}</button>`;
-    return `<details class="merge-preview-item${conflict ? ' is-conflict' : ''}${item.warnings?.length ? ' has-warning' : ''}"><summary><span class="merge-preview-kind" title="${sub ? 'Submodule pointer' : 'File'}">${sub ? '◇' : '≡'}</span><span class="merge-preview-path" title="${escape(item.path)}">${escape(item.path)}</span><span class="merge-preview-change">${escape(item.change)}</span><span class="merge-preview-outcome outcome-${escape(item.outcome)}">${labels[item.outcome] || 'Review'}${item.warnings?.length ? ' · review' : ''}</span></summary>
+    const folder = side => item.directory_sides?.includes(side);
+    const compare = pair => {
+      const selected=comparison(item,report,pair);
+      if(!selected || selected.identical && pair!=='result') return '';
+      return `<button type="button" data-preview-file="${index}" data-pair="${pair}" title="${escape(selected.identical ? 'The proposed result is identical to the current version. Compare branches or the common base instead.' : selected.description)}"${selected.identical ? ' disabled' : ''}>${selected.identical ? 'Current = result' : selected.label}</button>`;
+    };
+    return `<details class="merge-preview-item${conflict ? ' is-conflict' : ''}${item.warnings?.length ? ' has-warning' : ''}"><summary><span class="merge-preview-kind" title="${sub ? 'Submodule pointer' : 'File'}">${sub ? '◇' : '≡'}</span><span class="merge-preview-path" title="${escape(item.path)}">${escape(item.path)}</span><span class="merge-preview-change" title="Effect of the proposed merge on the current committed version">${escape(changeLabel(item,report))}</span><span class="merge-preview-outcome outcome-${escape(item.outcome)}">${labels[item.outcome] || 'Review'}${item.warnings?.length ? ' · review' : ''}</span></summary>
       <div class="merge-preview-item-body"><p>${escape(reason(item,report))}</p>
-      <div class="merge-preview-versions">${versionHtml(item.base,'Common base',item.path,false,report.merge_bases?.length>1)}${versionHtml(item.current,'Current · '+report.current_branch,item.path)}${versionHtml(item.incoming,'Incoming · '+report.source_ref,item.path)}${versionHtml(item.result,'Proposed result',item.path,conflict)}</div>
+      <div class="merge-preview-versions">${versionHtml(item.base,'Common base',item.path,false,report.merge_bases?.length>1,folder('base'))}${versionHtml(item.current,'Current · '+report.current_branch,item.path,false,false,folder('current'))}${versionHtml(item.incoming,'Incoming · '+report.source_ref,item.path,false,false,folder('incoming'))}${versionHtml(item.result,'Proposed result',item.path,conflict,false,folder('result'))}</div>
       ${(item.warnings||[]).map(w=>`<p class="merge-preview-warning">${escape(w)}</p>`).join('')}
       ${sub ? '<p class="merge-preview-note">This is the parent’s recorded pointer, not a merge of files inside the submodule. Updating its local folder is a separate update/init operation.</p>' : ''}
-      <div class="merge-preview-item-actions">${!sub ? (!conflict ? compare('result','View result diff') : compare('sides','Compare conflicting sides')) + (item.base ? compare('ours','Base → current') + compare('theirs','Base → incoming') : '') : `<button type="button" data-preview-submodule="${index}">Inspect current / incoming versions</button>`}</div><div data-preview-extra="${index}"></div></div></details>`;
+      <div class="merge-preview-item-actions">${!sub ? compare('result') + compare('sides') + compare('ours') + compare('theirs') : `<button type="button" data-preview-submodule="${index}">Inspect current / incoming versions</button>`}</div><div data-preview-extra="${index}"></div></div></details>`;
   }
   function create({dialog, invoke, onFile, current}) {
     const el = name => dialog.querySelector(`[data-preview-${name}]`);
@@ -67,7 +110,7 @@
         el('direction').textContent=`${data.source_ref} → ${data.current_branch}`;
         el('direction').title=`${data.repository_path}\nIncoming: ${data.incoming_revision}\nCurrent: ${data.current_revision}`;
         el('snapshots').textContent=`${data.incoming_revision.slice(0,10)} → ${data.current_revision.slice(0,10)} · ${(data.elapsed_ms/1000).toFixed(1)}s`;
-        el('summary').textContent=`${statuses[data.status] || data.status} · ${c.changes} changed${c.combined ? ` (${c.combined} combined)` : ''} · ${c.kept} kept · ${c.conflicts} unresolved`;
+        el('summary').textContent=`${statuses[data.status] || data.status} · ${c.changes} changes to current${c.combined ? ` (${c.combined} combined)` : ''} · ${c.kept} kept · ${c.conflicts} unresolved`;
         el('warnings').innerHTML=(data.warnings||[]).map(w=>`<p class="merge-preview-warning">${escape(w)}</p>`).join('');
         el('search').disabled=false; el('filter').disabled=false;
         if (!data.items.length) message(data.status==='up_to_date' ? 'The incoming branch is already contained in the current branch. Nothing to merge.' : 'No path changes in the calculated result.');
@@ -101,7 +144,7 @@
     });
     return {open(nextArgs,nextContext){args=nextArgs;context=nextContext;el('search').value='';el('filter').value='all';el('direction').textContent=`${args.sourceRef} → current branch`;el('snapshots').textContent='';if(!dialog.open)dialog.showModal();return calculate();}};
   }
-  const api={create,counts,filtered,rowHtml,reason};
+  const api={create,counts,filtered,rowHtml,reason,comparison,changeLabel};
   if(typeof module!=='undefined'&&module.exports)module.exports=api;
   global.MergePreview=api;
 })(typeof window!=='undefined'?window:globalThis);

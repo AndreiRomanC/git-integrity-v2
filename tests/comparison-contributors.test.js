@@ -175,7 +175,7 @@ test('existing selector includes introduction history; strict is inside Details 
   const ui=renderer(cache), model=ui.render(); await cache.load(model);
   ui.render();
   assert.equal((ui.element.innerHTML.match(/<select /g)||[]).length,1);
-  assert.match(ui.element.innerHTML,/>All differences<.*Shared files · 2\+ authors.*optgroup label="Files touched by author"/);
+  assert.match(ui.element.innerHTML,/>All differences<.*Files touched by multiple authors.*optgroup label="Files touched by author"/);
   assert.match(ui.element.innerHTML,/optgroup label="Introduced by author"/);
   assert.doesNotMatch(ui.element.innerHTML,/Only files modified/);
   assert.match(ui.element.innerHTML,/<details[^>]*>[\s\S]*data-author-direct[\s\S]*<\/details>/);
@@ -196,6 +196,34 @@ test('existing selector includes introduction history; strict is inside Details 
   assert.equal(model.mode,'shared'); assert.equal(model.directOnly,false);
   assert.match(ui.element.innerHTML,/1 items shown · touched by 2\+ recorded authors/);
   assert.doesNotMatch(ui.element.innerHTML,/Details · surviving required|data-author-direct checked/);
+});
+
+test('one author in both categories has explicit selected labels but still counts as one contributor', async () => {
+  const author={...authors[0],name:'<Alice>'};
+  const calls=[];
+  const cache=createComparisonAuthorCache(async command=>{calls.push(command);return [author];});
+  const ui=renderer(cache),model=ui.render();await cache.load(model);await cache.loadIntroductions(model);
+  for(const [mode,value,prefix] of [['touched',author.key,'Touched by:'],['introduced',`introduced:${author.key}`,'Introduced by:']]) {
+    cache.select(model,author.key,mode);ui.render();
+    assert.equal(ui.element.querySelector('[data-author-select]').value,value);
+    assert.ok(ui.element.innerHTML.includes(`<option value="${value}">${prefix} &lt;Alice&gt; &lt;a@test&gt;</option>`));
+    assert.equal((ui.element.innerHTML.match(/<select /g)||[]).length,1);
+    assert.equal(comparisonAuthorContributors(rows[0],model).length,1);
+  }
+  cache.setMode(model,'shared');ui.render();
+  assert.deepEqual(matching(model),[],'two menu categories must not create two contributors');
+  assert.match(ui.element.innerHTML,/>Files touched by multiple authors</);
+  assert.doesNotMatch(ui.element.innerHTML,/>Shared files · 2\+ authors</);
+  assert.deepEqual(calls,['comparison_authors','comparison_introductions']);
+});
+
+test('retained selections with no matching author keep the category prefix', async () => {
+  const cache=createComparisonAuthorCache(async()=>[]);
+  const ui=renderer(cache),model=ui.render();await cache.load(model);await cache.loadIntroductions(model);
+  for(const [mode,prefix] of [['touched','Touched by:'],['introduced','Introduced by:']]) {
+    cache.select(model,'email:missing@test',mode);ui.render();
+    assert.ok(ui.element.innerHTML.includes(`>${prefix} missing@test — no matching items here</option>`));
+  }
 });
 
 test('Shared summaries count current text/state candidates but keep the full folder metadata context', async () => {

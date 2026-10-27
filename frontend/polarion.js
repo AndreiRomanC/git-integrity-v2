@@ -23,7 +23,20 @@ function polarionSearchExplanation(result) {
     response_limit: 'The Polarion reply is too large for this local overview. Existing snapshots were preserved.',
     http_error: 'Polarion returned an unexpected HTTP response.',
   };
-  return (hints[result.code] || 'Search failed.') + (result.http ? ' HTTP ' + result.http + '.' : '') +
+  const validationReasons = {
+    invalid_json: 'The API returned malformed JSON.', invalid_payload: 'The API response is not a resource object.',
+    expected_list: 'The API did not return the requested list.', page_size_exceeded: 'The server exceeded the requested page size.',
+    page_offset_changed: 'The result page changed during pagination. Retry the search.', empty_page_with_next: 'The server returned an empty page with a next-page link.',
+    invalid_item_id: 'An item has an invalid ID.', wrong_project: 'An item belongs to a different project.',
+    missing_task_type: 'The task type field is missing; task results cannot be verified.', unexpected_task_type: 'The server returned a non-task item for the task query.',
+    duplicate_item: 'The server returned a duplicate item.', task_status_mismatch: 'A task does not match the requested status group.',
+    missing_task_status: 'The task status field is missing; the requested status cannot be verified.',
+    partial_errors: 'The response contains item-level errors.', unexpected_resource: 'The returned resource does not match the requested type or identity.',
+    relationship_missing: 'A required Work Item or document relationship is missing or invalid.',
+  };
+  const rejected = result.code === 'invalid_response' && [...(result.diagnostics || [])].reverse().find(d => d.code === 'invalid_response');
+  const reason = rejected && validationReasons[rejected.reason];
+  return (reason ? reason + ' No partial results were applied; existing snapshots were preserved.' : hints[result.code] || 'Search failed.') + (result.http ? ' HTTP ' + result.http + '.' : '') +
     (result.session_token ? ' Portal session token detected.' : ' No portal REST session token detected.') + ' Diagnostics are in the application log (no credentials).';
 }
 function polarionFilterElements(elements, query = '', type = '') {

@@ -67,6 +67,70 @@ test('diagnostic logging itself is not traced recursively', async () => {
   assert.equal(h.calls.length, 1);
 });
 
+test('detached Push preview is a blocked precondition, while other push failures remain errors', async () => {
+  const detached = 'Push unavailable — detached HEAD at 99d2b0b5. Use Change version or New branch. PRIVATE';
+  for (const [command, message, blocked] of [
+    ['push_submodule_preview', detached, true],
+    ['push_submodule_preview', 'Push failed: PRIVATE network error mentioning detached HEAD', false],
+    ['push_submodule', detached, false],
+  ]) {
+    const h = harness();
+    const pending = h.context.call(command, { relativePath: 'PRIVATE_MODULE' });
+    const rejected = assert.rejects(pending, error => error.message === message);
+    h.calls[0].reject(new Error(message)); await rejected;
+    assert.ok(h.logs.some(l => l.message === `invoke(${command}) ${blocked ? 'BLOCKED' : 'ERROR'}`));
+    if (blocked) assert.ok(h.logs.some(l => /event=blocked category=detached-head$/.test(l.message)));
+    assert.doesNotMatch(JSON.stringify(h.logs), /PRIVATE/);
+    assert.equal(h.calls.length, 1); assert.deepEqual(h.refreshes, []);
+  }
+});
+
+test('detached Push dialog explains the next step and cannot publish', async () => {
+  const h = harness(), nodes = {};
+  h.context.$ = id => nodes[id] ||= { textContent: '', innerHTML: '', disabled: false, showModal() { this.open = true; } };
+  h.context.esc = value => String(value).replaceAll('<', '&lt;').replaceAll('>', '&gt;');
+  vm.runInContext(app.slice(app.indexOf('async function pushSubmodule('), app.indexOf('async function fetchSubmodule(')), h.context);
+  const pending = h.context.pushSubmodule({ name: 'module', kind: 'submodule', relative_path: 'modules/module' });
+  assert.equal(h.calls.length, 1); assert.equal(h.calls[0].command, 'push_submodule_preview');
+  h.calls[0].reject('Push unavailable — detached HEAD at 99d2b0b5. Use Change version or New branch.');
+  await pending;
+  assert.equal(nodes['#confirmSubmodulePublish'].disabled, true);
+  assert.equal(nodes['#submodulePublishDialog'].open, true);
+  assert.match(nodes['#submodulePublishSummary'].textContent, /Detached HEAD.*local branch required/);
+  assert.match(nodes['#submodulePublishStatus'].textContent, /No fetch or push was attempted/);
+  assert.equal(h.calls.length, 1); assert.deepEqual(h.refreshes, []);
+});
+
+test('PR link IPC diagnostics distinguish validation, launch, wait and exit without logging the URL', async () => {
+  for (const stage of ['validation', 'launch', 'wait', 'exit']) {
+    const h = harness();
+    const pending = h.context.call('open_status_check_url', { url: 'https://github.com/?token=PRIVATE' });
+    const rejected = assert.rejects(pending);
+    h.calls[0].reject(`[check-link:${stage}] PRIVATE_DETAILS`); await rejected;
+    assert.ok(h.logs.some(l => l.message.endsWith(`event=error category=check-link-${stage}`)));
+    assert.doesNotMatch(JSON.stringify(h.logs), /PRIVATE/);
+    assert.equal(h.calls.length, 1); assert.deepEqual(h.refreshes, []);
+  }
+});
+
+test('snapshot directory/list failures are correlated without arguments, raw errors or recovery writes', async () => {
+  for (const command of ['compare_git_revisions_directory', 'compare_git_revisions_file_list',
+    'compare_submodule_revisions_directory', 'compare_submodule_revisions_file_list',
+    'compare_github_module_revisions_directory', 'compare_github_module_revisions_file_list',
+    'compare_workspace_revision', 'submodule_comparison_details']) {
+    const h = harness();
+    const pending = h.context.call(command, { repositoryPath: 'PRIVATE_PATH', leftRef: 'PRIVATE_REF', rightRef: 'PRIVATE_REF' });
+    const rejected = assert.rejects(pending, /Comparison is incomplete/);
+    h.calls[0].reject(new Error('Cannot read left snapshot: PRIVATE_OBJECT. Comparison is incomplete; this is not an absent path.'));
+    await rejected;
+    assert.ok(h.logs.some(item => item.message === `ipc_trace: request=1 command=${command} event=error category=snapshot-read-failed`));
+    assert.equal(h.logs.filter(item => item.message.startsWith('ipc_trace:')).length, 2);
+    assert.doesNotMatch(JSON.stringify(h.logs), /PRIVATE_/);
+    assert.equal(h.calls.length, 1);
+    assert.deepEqual(h.refreshes, []);
+  }
+});
+
 test('Merge/Stash failure refreshes repository and conflicts but preserves original error', async () => {
   for (const command of ['merge_branch', 'resolve_conflict', 'open_merge_tool', 'pop_stash', 'restore_stash_paths', 'stash_changes', 'complete_merge']) {
     const h = harness();

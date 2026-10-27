@@ -24,7 +24,7 @@ test('slow backend round trips are measured without logging command arguments', 
   assert.match(app, /const SLOW_INVOKE_LOG_THRESHOLD_MS = 250/);
   assert.match(app, /if \(command === 'frontend_perf_log'\) return pending/);
   assert.match(app, /if \(elapsedMs >= SLOW_INVOKE_LOG_THRESHOLD_MS\) jsPerfLog\(`invoke\(\$\{command\}\) SUCCESS`, elapsedMs\)/);
-  assert.match(app, /jsPerfLog\(`invoke\(\$\{command\}\) ERROR`, performance\.now\(\) - startedAt\)/);
+  assert.match(app, /jsPerfLog\(`invoke\(\$\{command\}\) \$\{blocked \? 'BLOCKED' : 'ERROR'\}`, performance\.now\(\) - startedAt\)/);
   const invokeTiming = app.match(/const startedAt = performance\.now\(\);[\s\S]*?return Promise\.resolve\(pending\)\.then\([\s\S]*?\n  \}\);/)?.[0] || '';
   assert.doesNotMatch(invokeTiming, /JSON\.stringify\(args\)|\$\{args\}/);
 });

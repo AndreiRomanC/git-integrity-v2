@@ -5,19 +5,27 @@ pub(super) const MAX_LOG_BYTES: u64 = 10 * 1024 * 1024;
 const MAX_ENTRY_BYTES: usize = 64 * 1024;
 const SIZE_RECHECK_INTERVAL: Duration = Duration::from_secs(5);
 
+// Process-local correlation only; no repository state or filesystem access.
+pub(super) fn request_context(caller: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT_REQUEST: AtomicU64 = AtomicU64::new(1);
+    format!("request={} caller={caller}", NEXT_REQUEST.fetch_add(1, Ordering::Relaxed))
+}
+
+pub(super) fn opaque_id(value: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut hash);
+    format!("repo-{:08x}", (hash.finish() & 0xffff_ffff) as u32)
+}
+
 // Diagnostic only: callers supply an already-computed cache key and age.
 // No canonicalize/stat, Git lookup, cache mutation or background work here.
 pub(super) fn cache_lookup_label(cache: &str, key: &str, scope: Option<&str>, age: Option<Duration>, ttl: Duration, decision: &str) -> String {
-    use std::hash::{Hash, Hasher};
-    let id = |value: &str| {
-        let mut hash = std::collections::hash_map::DefaultHasher::new();
-        value.hash(&mut hash);
-        format!("repo-{:08x}", (hash.finish() & 0xffff_ffff) as u32)
-    };
     let state = match age { None => "absent", Some(age) if age < ttl => "fresh", Some(_) => "expired" };
     let age_ms = age.map(|age| age.as_millis().to_string()).unwrap_or_else(|| "none".into());
     format!("cache_lookup: cache={cache} repo={} scope={} state={state} age_ms={age_ms} ttl_ms={} decision={decision}",
-        id(key), scope.map(id).unwrap_or_else(|| "all".into()), ttl.as_millis())
+        opaque_id(key), scope.map(opaque_id).unwrap_or_else(|| "all".into()), ttl.as_millis())
 }
 
 pub(super) struct RotatingLog {
@@ -100,10 +108,53 @@ fn regular_file_size(path: &Path) -> io::Result<Option<u64>> {
     }
 }
 
+// Observe actual diagnostic decisions in fixture tests, isolated from other
+// test threads. Compiled out entirely in the application.
+#[cfg(test)]
+std::thread_local! {
+    static TEST_RECORDS: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(super) fn record_for_test(label: &str) {
+    TEST_RECORDS.with(|records| {
+        if let Some(records) = records.borrow_mut().as_mut() { records.push(label.to_owned()); }
+    });
+}
+
+#[cfg(test)]
+pub(super) fn capture_for_test<T>(body: impl FnOnce() -> T) -> (T, Vec<String>) {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) { TEST_RECORDS.with(|records| *records.borrow_mut() = None); }
+    }
+    TEST_RECORDS.with(|records| {
+        assert!(records.borrow().is_none(), "nested diagnostic capture");
+        *records.borrow_mut() = Some(Vec::new());
+    });
+    let _reset = Reset;
+    let result = body();
+    let records = TEST_RECORDS.with(|records| records.borrow_mut().take().unwrap());
+    (result, records)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn request_diagnostics_use_unique_process_ids_and_hash_only_supplied_keys() {
+        let contexts: Vec<_> = (0..16).map(|_| std::thread::spawn(|| request_context("refresh_status")))
+            .map(|thread| thread.join().unwrap()).collect();
+        assert_eq!(contexts.iter().collect::<std::collections::HashSet<_>>().len(), 16);
+        for context in contexts { assert!(context.starts_with("request=")); assert!(context.ends_with("caller=refresh_status")); }
+        let id = opaque_id("D:/private/repository");
+        assert_eq!(id.len(), 13);
+        assert!(!id.contains("private"));
+        assert_eq!(id, opaque_id("D:/private/repository"));
+        assert_ne!(id, opaque_id("D:/private/other"));
+    }
 
     #[test]
     fn cache_diagnostics_distinguish_absent_fresh_and_expired_at_the_exact_ttl() {
@@ -138,8 +189,10 @@ mod tests {
     }
 
     fn fixture() -> (PathBuf, RotatingLog) {
+        static NEXT_FIXTURE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let sequence = NEXT_FIXTURE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-        let dir = std::env::temp_dir().join(format!("git-drilldown-log-rotation-{}-{suffix}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("git-drilldown-log-rotation-{}-{suffix}-{sequence}", std::process::id()));
         fs::create_dir(&dir).unwrap();
         let writer = RotatingLog::with_limit(dir.join("git-integrity-perf.log"), 1024);
         (dir, writer)
