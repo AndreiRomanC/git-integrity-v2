@@ -40,6 +40,7 @@ pub struct RemoteTrackingCheckoutResult {
 
 const RESTORE_SUBMODULE_UPDATE_TIMEOUT: Duration = SUBMODULE_UPDATE_TIMEOUT;
 const RESTORE_SUBMODULE_UPDATE_TIMEOUT_LABEL: &str = SUBMODULE_UPDATE_TIMEOUT_LABEL;
+const RESTORE_INDEX_LOCK_WAIT: Duration = Duration::from_secs(2);
 
 // Computes OID-based divergence independently of the graph renderer.
 #[tauri::command]
@@ -262,6 +263,8 @@ fn restore_exact_checkpoint_locked(repository_path: &str, commit_id: &str, branc
             });
         if occupied_elsewhere { return Err(format!("Branch {name} is checked out in another worktree. No files were cleaned.")); }
     }
+    restore_checkpoint_wait_for_index(&repo.path().join("index.lock"), "before-cleanup", RESTORE_INDEX_LOCK_WAIT)
+        .map_err(|detail| format!("No cleanup or submodule deinitialization was started. {detail}"))?;
     drop(commit);
     drop(object);
     drop(repo);
@@ -296,6 +299,13 @@ fn restore_exact_checkpoint_locked(repository_path: &str, commit_id: &str, branc
     }
 
     let restore_result = (|| -> Result<(), String> {
+        // Quarantining can take time. Recheck all known indexes immediately
+        // before deinit; a later external writer is still enforced by Git's
+        // own atomic index lock. Never remove someone else's lock to proceed.
+        for safety in std::iter::once(&quarantine).chain(submodule_quarantines.iter()) {
+            restore_checkpoint_wait_for_index(&safety.index_lock, "before-deinit", RESTORE_INDEX_LOCK_WAIT)
+                .map_err(|detail| format!("Stopped before submodule deinitialization or checkout. {detail}"))?;
+        }
         // Important subtlety: jumping between checkpoints with different
         // submodule sets can leave old submodule worktrees behind unless the
         // currently-registered submodules are deinitialized first. A plain
@@ -304,13 +314,7 @@ fn restore_exact_checkpoint_locked(repository_path: &str, commit_id: &str, branc
         // only in the previous checkpoint.
         restore_checkpoint_step(&repository_path, "deinit current submodules", &["submodule", "deinit", "--all", "--force"])
             .map_err(|detail| format!("Could not deinitialize the current submodules before restoring checkpoint {oid}. HEAD was not changed, but the workspace may need Submodule update --init --recursive. Git said: {detail}"))?;
-        if let Some(name) = branch.as_deref() {
-            restore_checkpoint_step(&repository_path, "checkout branch checkpoint", &["checkout", "--force", name])
-                .map_err(|detail| format!("Could not restore branch {name} at checkpoint {oid}: {detail}"))?;
-        } else {
-            restore_checkpoint_step(&repository_path, "checkout detached checkpoint", &["checkout", "--detach", "--force", &oid])
-                .map_err(|detail| format!("Could not restore checkpoint {oid}: {detail}"))?;
-        }
+        restore_checkpoint_checkout(repository_path, &oid, branch.as_deref())?;
         let _ = restore_checkpoint_optional_step(&repository_path, "sync submodule urls", &["submodule", "sync", "--recursive"]);
         // A submodule present only in the old checkpoint becomes an ordinary
         // untracked path only after checkout. Quarantine that second wave too,
@@ -329,9 +333,15 @@ fn restore_exact_checkpoint_locked(repository_path: &str, commit_id: &str, branc
             // run `git clean` here: deleting user files while reporting a
             // failed restore recreates the exact partial-loss bug this flow is
             // designed to prevent.
-            let _ = restore_checkpoint_optional_step(&repository_path, "cleanup after failed submodule update: reset initialized submodules", &["submodule", "foreach", "--recursive", "git reset --hard"]);
-            let verification = restore_checkpoint_verify(&repository_path).err().map(|error| format!(" Remaining state: {error}")).unwrap_or_default();
-            return Err(format!("Checkpoint {oid} was checked out, but submodule update did not finish after {RESTORE_SUBMODULE_UPDATE_TIMEOUT_LABEL}. The restore is incomplete; retry the exact checkpoint restore or run Submodule update --init --recursive after checking the network/VPN. Git said: {detail}{verification}"));
+            let verification = if restore_checkpoint_failure_category(&detail) == "index-locked" {
+                // Do not follow a concurrent writer's lock failure with more
+                // destructive Git commands in other initialized submodules.
+                String::new()
+            } else {
+                let _ = restore_checkpoint_optional_step(&repository_path, "cleanup after failed submodule update: reset initialized submodules", &["submodule", "foreach", "--recursive", "git reset --hard"]);
+                restore_checkpoint_verify(&repository_path).err().map(|error| format!(" Remaining state: {error}")).unwrap_or_default()
+            };
+            return Err(format!("Checkpoint {oid} was checked out, but submodule update failed. The restore is incomplete (maximum update time: {RESTORE_SUBMODULE_UPDATE_TIMEOUT_LABEL}). Resolve the reported cause before retrying exact checkpoint restore or Submodule update --init --recursive. Git said: {detail}{verification}"));
         }
         let _ = restore_checkpoint_optional_step(&repository_path, "reset submodules hard", &["submodule", "foreach", "--recursive", "git reset --hard"]);
         restore_checkpoint_quarantine_submodule_leftovers(&repository_path, "after-checkout", &mut submodule_quarantines)
@@ -402,6 +412,8 @@ fn clean_branch_from_upstream_inner(repository_path: String, branch: String, ups
     let result = (|| {
         let repo = internal_repository(&repository_path)?;
         let target = clean_upstream_target(&repo, &branch, &upstream, &expected_head)?;
+        restore_checkpoint_wait_for_index(&repo.path().join("index.lock"), "before-upstream-fetch", RESTORE_INDEX_LOCK_WAIT)
+            .map_err(|detail| format!("Replace was not started. No fetch, cleanup or submodule deinitialization was performed. {detail}"))?;
         let own = repo.workdir().and_then(|path| fs::canonicalize(path).ok());
         let occupied = git(&repository_path, &["worktree", "list", "--porcelain"])?
             .split("\n\n").any(|record| record.lines().any(|line| line == format!("branch refs/heads/{branch}"))
@@ -423,7 +435,7 @@ fn clean_branch_from_upstream_inner(repository_path: String, branch: String, ups
         // checkout succeeds. A failed submodule update must not silently report
         // success or move that branch past an incomplete restore.
         restore_exact_checkpoint_locked(&repository_path, &oid, None)
-            .map_err(|e| format!("Replacing {branch} from {upstream} did not complete. The local branch pointer was not reset; the workspace may already be detached at {oid}. {e}"))?;
+            .map_err(|e| format!("Replacing {branch} from {upstream} did not complete. The local branch pointer was not reset. {e}"))?;
         let repo = internal_repository(&repository_path)?;
         if !repo.head_detached().unwrap_or(false) || repo.head().ok().and_then(|h| h.target()).map(|id| id.to_string()).as_deref() != Some(&oid) {
             return Err("Checkout changed during cleanup. The local branch was not reset; inspect the workspace.".into());
@@ -446,6 +458,7 @@ fn clean_branch_from_upstream_inner(repository_path: String, branch: String, ups
 struct RestoreCheckpointQuarantine {
     root: PathBuf,
     workdir: PathBuf,
+    index_lock: PathBuf,
     moved: Vec<(PathBuf, PathBuf)>,
 }
 
@@ -456,7 +469,8 @@ impl RestoreCheckpointQuarantine {
         let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
             .map_err(|error| error.to_string())?.as_nanos();
         let root = repo.path().join("gdd-restore").join(format!("{}-{stamp}", std::process::id()));
-        Ok(Self { root, workdir, moved: Vec::new() })
+        let index_lock = repo.path().join("index.lock");
+        Ok(Self { root, workdir, index_lock, moved: Vec::new() })
     }
 
     fn move_untracked(&mut self, repository_path: &str, phase: &str) -> Result<usize, String> {
@@ -572,9 +586,15 @@ fn restore_checkpoint_quarantine_submodule_leftovers(repository_path: &str, phas
     let mut paths = Vec::new();
     let mut visited = HashSet::new();
     collect_initialized_submodule_workdirs(Path::new(repository_path), &mut visited, &mut paths)?;
-    for path in paths {
+    // Check the complete initialized set BEFORE moving the first file. Reuse
+    // the existing traversal; no status scans, extra Git processes or fetches.
+    let prepared = paths.iter().map(|path| RestoreCheckpointQuarantine::new(&path.to_string_lossy()))
+        .collect::<Result<Vec<_>, _>>()?;
+    for safety in &prepared {
+        restore_checkpoint_wait_for_index(&safety.index_lock, phase, RESTORE_INDEX_LOCK_WAIT)?;
+    }
+    for (path, mut quarantine) in paths.iter().zip(prepared) {
         let submodule_path = path.to_string_lossy().into_owned();
-        let mut quarantine = RestoreCheckpointQuarantine::new(&submodule_path)?;
         if let Err(error) = quarantine.move_untracked(&submodule_path, phase) {
             let current_recovery = quarantine.rollback();
             let earlier_recovery = rollback_restore_quarantines(quarantines);
@@ -616,6 +636,53 @@ fn discard_restore_quarantines(quarantines: &mut Vec<RestoreCheckpointQuarantine
     errors
 }
 
+// The real Git directory handles .git files, linked worktrees and submodules.
+// Merely checking .git/index.lock under the visible folder would miss them.
+// This is a bounded, read-only preflight, NOT proof of ownership or staleness.
+// Git must still acquire its own atomic lock; do not retry a failed checkout
+// automatically because hooks or worktree writes may already have occurred.
+fn restore_checkpoint_wait_for_index(lock_path: &Path, phase: &str, max_wait: Duration) -> Result<(), String> {
+    let started = Instant::now();
+    let scope = perf_logging::opaque_id(&lock_path.to_string_lossy());
+    let mut waited = false;
+    loop {
+        match fs::symlink_metadata(lock_path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if waited { perf_log(&format!("restore_index_guard: phase={phase} scope={scope} result=released lock_removed=false"), started.elapsed()); }
+                return Ok(());
+            }
+            Err(error) => {
+                perf_log(&format!("restore_index_guard: phase={phase} scope={scope} result=inspection-error kind={:?} lock_removed=false", error.kind()), started.elapsed());
+                return Err(format!("Cannot inspect Git index lock at {}: {error}. Stopped rather than assuming the index is available.", lock_path.display()));
+            }
+            Ok(_) => {
+                if !waited {
+                    perf_log(&format!("restore_index_guard: phase={phase} scope={scope} result=waiting owner=unknown lock_removed=false"), started.elapsed());
+                    waited = true;
+                }
+                if started.elapsed() >= max_wait {
+                    perf_log(&format!("restore_index_guard: phase={phase} scope={scope} result=index-locked owner=unknown lock_removed=false"), started.elapsed());
+                    return Err(format!("Git index is locked (index.lock): {}. Another Git operation may be active, or an interrupted operation may have left this lock. It was not removed. Wait for other Git operations to finish and retry. If it persists, confirm that no process uses this repository before recovering the lock manually.", lock_path.display()));
+                }
+                std::thread::sleep(Duration::from_millis(50).min(max_wait.saturating_sub(started.elapsed())));
+            }
+        }
+    }
+}
+
+fn restore_checkpoint_checkout(repository_path: &str, oid: &str, branch: Option<&str>) -> Result<(), String> {
+    let repo = internal_repository(repository_path)?;
+    let ready = restore_checkpoint_wait_for_index(&repo.path().join("index.lock"), "before-checkout", RESTORE_INDEX_LOCK_WAIT);
+    drop(repo);
+    ready.and_then(|()| {
+        if let Some(name) = branch {
+            restore_checkpoint_step(repository_path, "checkout branch checkpoint", &["checkout", "--force", name])
+        } else {
+            restore_checkpoint_step(repository_path, "checkout detached checkpoint", &["checkout", "--detach", "--force", oid])
+        }.map(|_| ())
+    }).map_err(|detail| format!("Checkout of checkpoint {oid} did not complete. Submodules may already be deinitialized; the workspace is incomplete. Resolve the error before retrying Clean checkout/Replace. Git said: {detail}"))
+}
+
 fn restore_checkpoint_step(repository_path: &str, label: &str, args: &[&str]) -> Result<String, String> {
     let started = Instant::now();
     let result = git(repository_path, args).map_err(|detail| restore_checkpoint_failure_detail(&detail));
@@ -654,7 +721,8 @@ fn restore_checkpoint_perf_log(label: &str, result: &Result<String, String>, ela
 
 fn restore_checkpoint_failure_category(detail: &str) -> &'static str {
     let lower = detail.to_ascii_lowercase();
-    if lower.contains("timed out") { "timeout" }
+    if lower.contains("index is locked") || (lower.contains("index.lock") && (lower.contains("file exists") || lower.contains("already exists"))) { "index-locked" }
+    else if lower.contains("timed out") { "timeout" }
     else if lower.contains("filename was too long") || lower.contains("filename too long") { "filename-too-long" }
     else if lower.contains("access is denied") || lower.contains("permission denied") || lower.contains("unable to unlink") || lower.contains("failed to remove") { "locked-or-access-denied" }
     else if lower.contains("nested git repository") { "nested-repository" }
@@ -692,6 +760,15 @@ fn restore_checkpoint_nonempty_lines(output: &str) -> Vec<String> {
 
 fn restore_checkpoint_failure_detail(detail: &str) -> String {
     let lines = restore_checkpoint_nonempty_lines(detail);
+    if restore_checkpoint_failure_category(detail) == "index-locked" {
+        // Preserve the actual cause even after many preceding warnings. Raw
+        // paths are returned to the local UI, never to the shared perf log.
+        let cause = lines.iter().find(|line| {
+            let lower = line.to_ascii_lowercase();
+            lower.contains("index is locked") || (lower.contains("index.lock") && (lower.contains("file exists") || lower.contains("already exists")))
+        }).map(String::as_str).unwrap_or("Git could not acquire its index lock.");
+        return format!("Git index is locked (index.lock). {cause} The lock was not removed. Wait for other Git operations to finish before retrying; a persistent lock requires checking that no process still uses this repository.");
+    }
     let long_path_lines = lines.iter().filter(|line| line.to_ascii_lowercase().contains("filename too long")).collect::<Vec<_>>();
     if !long_path_lines.is_empty() {
         let mut examples = long_path_lines.iter().filter_map(|line| {
@@ -745,6 +822,154 @@ mod tests {
         }
     }
     impl Drop for UpstreamFixture { fn drop(&mut self) { let _ = fs::remove_dir_all(&self.base); } }
+
+    #[test]
+    fn clean_upstream_index_lock_stops_before_fetch_or_cleanup_and_retry_succeeds() {
+        let f = UpstreamFixture::new();
+        let before = upstream_git(&f.local, &["rev-parse", "HEAD"]);
+        fs::write(f.remote.join("file.txt"), "new server version\n").unwrap();
+        upstream_git(&f.remote, &["commit", "-am", "remote advance"]);
+        let target = upstream_git(&f.remote, &["rev-parse", "HEAD"]);
+        fs::write(f.local.join("file.txt"), "staged edit\n").unwrap();
+        upstream_git(&f.local, &["add", "file.txt"]);
+        fs::write(f.local.join("file.txt"), "unstaged edit\n").unwrap();
+        fs::write(f.local.join("loose.txt"), "keep loose\n").unwrap();
+        let index = fs::read(f.local.join(".git/index")).unwrap();
+        let config = fs::read(f.local.join(".git/config")).unwrap();
+        let lock = f.local.join(".git/index.lock");
+        fs::write(&lock, "owned by another operation").unwrap();
+
+        let error = f.clean(&before).unwrap_err();
+        assert!(error.contains("No fetch, cleanup or submodule deinitialization"), "{error}");
+        assert_eq!(restore_checkpoint_failure_category(&error), "index-locked");
+        assert_eq!(fs::read_to_string(&lock).unwrap(), "owned by another operation");
+        assert_eq!(fs::read(f.local.join(".git/index")).unwrap(), index);
+        assert_eq!(fs::read(f.local.join(".git/config")).unwrap(), config);
+        assert_eq!(fs::read_to_string(f.local.join("file.txt")).unwrap(), "unstaged edit\n");
+        assert!(f.local.join("loose.txt").exists());
+        assert!(!f.local.join(".git/gdd-restore").exists());
+        assert_eq!(upstream_git(&f.local, &["rev-parse", "company/main"]), before, "must not fetch with an existing lock");
+        assert_eq!(upstream_git(&f.local, &["branch", "--show-current"]), "my-main");
+        assert_eq!(upstream_git(&f.local, &["rev-parse", "HEAD"]), before);
+
+        // Only the test fixture owner releases its lock. Production never does.
+        fs::remove_file(&lock).unwrap();
+        assert_eq!(f.clean(&before).unwrap().revision, target);
+        assert_eq!(upstream_git(&f.local, &["branch", "--show-current"]), "my-main");
+        assert_eq!(upstream_git(&f.local, &["status", "--porcelain"]), "");
+    }
+
+    #[test]
+    fn exact_checkpoint_checks_all_submodule_locks_before_moving_any_files() {
+        let f = UpstreamFixture::new();
+        // A gitfile and a recursive child exercise real Git dirs, not a
+        // hard-coded <visible-worktree>/.git/index.lock location.
+        upstream_git(&f.local, &["-c", "protocol.file.allow=always", "submodule", "add", f.remote.to_str().unwrap(), "module"]);
+        let module = f.local.join("module");
+        upstream_git(&module, &["-c", "protocol.file.allow=always", "submodule", "add", f.remote.to_str().unwrap(), "nested"]);
+        upstream_git(&module, &["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-am", "nested"]);
+        upstream_git(&f.local, &["commit", "-am", "module"]);
+        let head = upstream_git(&f.local, &["rev-parse", "HEAD"]);
+        let nested = module.join("nested");
+        let nested_repo = Repository::open(&nested).unwrap();
+        let lock = nested_repo.path().join("index.lock");
+        fs::write(&lock, "recursive child lock").unwrap();
+        let paths = [&f.local, &module, &nested];
+        let mut snapshots = Vec::new();
+        for path in paths {
+            fs::write(path.join("file.txt"), "local edit\n").unwrap();
+            fs::write(path.join("loose.txt"), "untracked\n").unwrap();
+            let repo = Repository::open(path).unwrap();
+            snapshots.push((repo.path().to_path_buf(), fs::read(repo.path().join("index")).unwrap(), fs::read(repo.path().join("config")).unwrap()));
+        }
+        let error = restore_exact_checkpoint_inner(f.local.to_string_lossy().into(), head.clone()).unwrap_err();
+        assert_eq!(restore_checkpoint_failure_category(&error), "index-locked", "{error}");
+        assert!(error.contains("No checkout was attempted"), "{error}");
+        assert_eq!(fs::read_to_string(&lock).unwrap(), "recursive child lock");
+        for (path, (git_dir, index, config)) in paths.into_iter().zip(snapshots) {
+            assert_eq!(fs::read_to_string(path.join("file.txt")).unwrap(), "local edit\n");
+            assert!(path.join("loose.txt").exists());
+            assert_eq!(fs::read(git_dir.join("index")).unwrap(), index);
+            assert_eq!(fs::read(git_dir.join("config")).unwrap(), config, "must not deinit any module");
+            assert!(!git_dir.join("gdd-restore").exists(), "must check every child before moving the first file");
+        }
+        assert_eq!(upstream_git(&f.local, &["rev-parse", "HEAD"]), head);
+    }
+
+    #[test]
+    fn exact_checkpoint_index_guard_uses_linked_worktree_git_dir() {
+        let f = UpstreamFixture::new();
+        let worktree = f.base.join("linked");
+        upstream_git(&f.local, &["worktree", "add", "-b", "linked-branch", worktree.to_str().unwrap()]);
+        assert!(worktree.join(".git").is_file());
+        let repo = Repository::open(&worktree).unwrap();
+        let lock = repo.path().join("index.lock");
+        fs::write(&lock, "linked worktree lock").unwrap();
+        fs::write(worktree.join("file.txt"), "keep\n").unwrap();
+        let error = restore_exact_checkpoint_inner(worktree.to_string_lossy().into(), "HEAD".into()).unwrap_err();
+        assert!(error.contains("No cleanup or submodule deinitialization was started"), "{error}");
+        assert_eq!(restore_checkpoint_failure_category(&error), "index-locked");
+        assert_eq!(fs::read_to_string(&lock).unwrap(), "linked worktree lock");
+        assert_eq!(fs::read_to_string(worktree.join("file.txt")).unwrap(), "keep\n");
+        assert_eq!(upstream_git(&worktree, &["branch", "--show-current"]), "linked-branch");
+    }
+
+    #[test]
+    fn exact_checkpoint_index_guard_waits_for_external_release_without_removing_lock() {
+        let f = UpstreamFixture::new();
+        let lock = f.local.join(".git/index.lock");
+        fs::write(&lock, "external lock").unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker_lock = lock.clone();
+        let worker = std::thread::spawn(move || {
+            tx.send(restore_checkpoint_wait_for_index(&worker_lock, "test", Duration::from_secs(2))).unwrap();
+        });
+        assert!(matches!(rx.recv_timeout(Duration::from_millis(100)), Err(std::sync::mpsc::RecvTimeoutError::Timeout)));
+        assert_eq!(fs::read_to_string(&lock).unwrap(), "external lock");
+        fs::remove_file(&lock).unwrap();
+        rx.recv_timeout(Duration::from_secs(3)).unwrap().unwrap();
+        worker.join().unwrap();
+        // A directory in the lock's place is also occupied, never deleted.
+        fs::create_dir(&lock).unwrap();
+        assert!(restore_checkpoint_wait_for_index(&lock, "test", Duration::ZERO).is_err());
+        assert!(lock.is_dir());
+    }
+
+    #[test]
+    fn exact_checkpoint_preserves_index_lock_cause_beyond_warning_summary_limit() {
+        let raw = format!("{}fatal: Unable to create 'D:/project/.git/index.lock': File exists.\nAnother git process seems to be running in this repository.\n", "warning: earlier message\n".repeat(20));
+        let detail = restore_checkpoint_failure_detail(&raw);
+        assert_eq!(restore_checkpoint_failure_category(&detail), "index-locked");
+        assert!(detail.contains("D:/project/.git/index.lock"));
+        assert!(detail.contains("lock was not removed"));
+        assert!(!detail.contains("earlier message"));
+        assert_eq!(restore_checkpoint_failure_category("the index is locked; this might be due to a concurrent or crashed process"), "index-locked");
+        assert_eq!(restore_checkpoint_failure_category("fatal: Unable to create '/project/.git/index.lock': Permission denied"), "locked-or-access-denied");
+        assert_eq!(restore_checkpoint_failure_category("fatal: Unable to create '/project/.git/config.lock': File exists"), "git-error");
+    }
+
+    #[test]
+    fn exact_checkpoint_late_index_lock_reports_partial_state_without_checkout_or_retry() {
+        let f = UpstreamFixture::new();
+        let head = upstream_git(&f.local, &["rev-parse", "HEAD"]);
+        upstream_git(&f.local, &["-c", "protocol.file.allow=always", "submodule", "add", f.remote.to_str().unwrap(), "module"]);
+        upstream_git(&f.local, &["commit", "-am", "module"]);
+        let before = upstream_git(&f.local, &["rev-parse", "HEAD"]);
+        let path = f.local.to_string_lossy();
+        restore_checkpoint_wait_for_index(&f.local.join(".git/index.lock"), "test-preflight", Duration::ZERO).unwrap();
+        restore_checkpoint_step(&path, "test-deinit", &["submodule", "deinit", "--all", "--force"]).unwrap();
+        // Model another process taking the lock after preflight/deinit.
+        let lock = f.local.join(".git/index.lock");
+        fs::write(&lock, "late external writer").unwrap();
+        let index = fs::read(f.local.join(".git/index")).unwrap();
+        let error = restore_checkpoint_checkout(&path, &head, None).unwrap_err();
+        assert!(error.contains("Submodules may already be deinitialized"), "{error}");
+        assert_eq!(restore_checkpoint_failure_category(&error), "index-locked");
+        assert_eq!(fs::read_to_string(&lock).unwrap(), "late external writer");
+        assert_eq!(fs::read(f.local.join(".git/index")).unwrap(), index);
+        assert_eq!(upstream_git(&f.local, &["rev-parse", "HEAD"]), before);
+        assert_eq!(upstream_git(&f.local, &["branch", "--show-current"]), "my-main");
+    }
 
     #[test]
     fn clean_upstream_fetches_then_replaces_differently_named_branch_without_remote_writes() {
@@ -1019,7 +1244,7 @@ mod tests {
         std::os::unix::fs::symlink(&outside, safety.join("link")).unwrap();
         remove_empty_restore_directories(&safety).unwrap();
         assert!(outside.join("empty-child").exists(), "cleanup must not walk into a symlink");
-        let mut quarantine = RestoreCheckpointQuarantine { root: safety, workdir: base.clone(), moved: Vec::new() };
+        let mut quarantine = RestoreCheckpointQuarantine { root: safety, workdir: base.clone(), index_lock: base.join(".git/index.lock"), moved: Vec::new() };
         quarantine.discard().unwrap();
         assert!(outside.join("empty-child").exists());
         assert_eq!(fs::read_to_string(outside.join("keep.txt")).unwrap(), "outside checkout\n");

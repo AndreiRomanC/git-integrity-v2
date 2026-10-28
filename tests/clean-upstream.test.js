@@ -61,6 +61,22 @@ test('partial failure refreshes current state and reports the original error', a
   await c.cleanUpstreamMenuItems(active,[{kind:'local_branch',name:'my-main'}])[0].run();
   assert.equal(refresh.length,1); assert.match(calls[0][1],/Submodule update failed/);
 });
+test('index-lock failures preserve early/partial state guidance and never auto-retry', async () => {
+  for (const message of [
+    'Replace was not started. No fetch, cleanup or submodule deinitialization was performed. Git index is locked (index.lock).',
+    'Checkout did not complete. Submodules may already be deinitialized; the workspace is incomplete. Git index is locked (index.lock).',
+  ]) {
+    const {c,active,calls,refresh} = harness();
+    let attempts = 0, successToasts = 0;
+    c.invoke=async()=>{attempts++; throw new Error(message);};
+    c.showOperationToast=()=>successToasts++;
+    await c.cleanUpstreamMenuItems(active,[{kind:'local_branch',name:'my-main'}])[0].run();
+    assert.equal(attempts,1);
+    assert.equal(refresh.length,1);
+    assert.equal(successToasts,0);
+    assert.equal(calls[0][1],`Error: ${message}`);
+  }
+});
 test('new command is registered and uses the centralized mutation guard', () => {
   assert.match(app.split(']);')[0],/'clean_branch_from_upstream'/);
   const rust=fs.readFileSync(require('node:path').join(__dirname,'../src-tauri/src/lib.rs'),'utf8');
