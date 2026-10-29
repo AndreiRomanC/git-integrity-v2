@@ -374,7 +374,7 @@ const refs = {
   graphView: $('#graphView'), emptyState: $('#emptyState'), laneLegend: $('#laneLegend'),
   details: $('#detailsPanel'), currentBranch: $('#currentBranch'), statusText: $('#statusText'),
   statusDot: $('#statusDot'), search: $('#search'), graphSubtitle: $('#graphSubtitle'),
-  statusFooter: $('#statusFooter'), statusCommandHint: $('#statusCommandHint'), statusStopCommand: $('#statusStopCommand'), consoleStopCommand: $('#consoleStopCommand'), commandHistoryDialog: $('#commandHistoryDialog'), commandHistoryList: $('#commandHistoryList'),
+  statusFooter: $('#statusFooter'), statusCommandHint: $('#statusCommandHint'), statusStopCommand: $('#statusStopCommand'), consoleStopCommand: $('#consoleStopCommand'), commandHistoryDialog: $('#commandHistoryDialog'), commandHistoryList: $('#commandHistoryList'), commandHistoryMaximize: $('#commandHistoryMaximize'),
   changeBadge: $('#changeBadge'), workspaceSubtitle: $('#workspaceSubtitle'), changes: $('#changes'),
   changesDrawer: $('#changesDrawer'), changesSummary: $('#changesSummary'), commitMessage: $('#commitMessage'),
   defaultCommitMessage: $('#defaultCommitMessage'), defaultCommitPolarionLink: $('#defaultCommitPolarionLink'),
@@ -642,14 +642,62 @@ function commandHistoryRowHtml(entry) {
   </article>`;
 }
 
+let commandHistoryBounds = null;
+let commandHistoryMaximized = false;
+let commandHistoryGeneration = 0;
+
+function placeCommandHistoryDialog(bounds) {
+  const fitted = fitFloatingPanel(bounds, { width: innerWidth, height: innerHeight });
+  Object.assign(refs.commandHistoryDialog.style, {
+    width: `${fitted.width}px`, height: `${fitted.height}px`, left: `${fitted.left}px`, top: `${fitted.top}px`,
+  });
+  return fitted;
+}
+function layoutCommandHistoryDialog() {
+  const normal = commandHistoryBounds || { width: 1060, height: 720, left: (innerWidth - 1060) / 2, top: (innerHeight - 720) / 2 };
+  const fitted = placeCommandHistoryDialog(commandHistoryMaximized
+    ? { width: innerWidth - 32, height: innerHeight - 32, left: 16, top: 16 } : normal);
+  if (!commandHistoryMaximized) commandHistoryBounds = fitted;
+  refs.commandHistoryMaximize.textContent = commandHistoryMaximized ? 'Restore size' : 'Maximize';
+  refs.commandHistoryMaximize.setAttribute('aria-pressed', String(commandHistoryMaximized));
+}
+function toggleCommandHistorySize() {
+  if (!refs.commandHistoryDialog.open) return;
+  commandHistoryMaximized = !commandHistoryMaximized;
+  layoutCommandHistoryDialog();
+}
+function resizeCommandHistoryDialog(rect, dx, dy) {
+  commandHistoryMaximized = false;
+  commandHistoryBounds = { left: rect.left, top: rect.top, width: rect.width + dx, height: rect.height + dy };
+  layoutCommandHistoryDialog();
+}
+function commandHistoryStatusHtml() {
+  // Preflight/libgit2 errors can happen without any Git subprocess. Preserve
+  // the full footer message, including line breaks, above the CLI history.
+  const message = refs.statusText.title || refs.statusText.textContent;
+  if (!message || message === 'Ready') return '';
+  const failed = refs.statusDot.classList.contains('error');
+  return `<article class="command-history-row ${failed ? 'failed' : ''}"><div class="command-history-summary"><span class="command-history-state">APP MESSAGE</span><span>Current footer message · not a Git command</span></div><div class="command-history-output"><section${failed ? ' class="stderr"' : ''}><pre>${esc(message)}</pre></section></div></article>`;
+}
 async function openCommandHistoryDialog() {
-  if (!invoke) { refs.commandHistoryList.innerHTML = '<div class="empty-change">No commands recorded yet this session.</div>'; refs.commandHistoryDialog.showModal(); return; }
-  refs.commandHistoryList.innerHTML = '<div class="loading-row"><i class="spinner"></i>Loading…</div>';
+  if (refs.commandHistoryDialog.open) return;
+  const generation = ++commandHistoryGeneration;
+  const appMessage = commandHistoryStatusHtml();
+  const empty = '<div class="empty-change">No Git commands recorded yet this session.</div>';
+  refs.commandHistoryList.innerHTML = appMessage + (invoke ? '<div class="loading-row"><i class="spinner"></i>Loading commands…</div>' : empty);
   refs.commandHistoryDialog.showModal();
+  layoutCommandHistoryDialog();
+  refs.commandHistoryList.scrollTop = 0;
+  if (!invoke) return;
   try {
     const commands = await invoke('recent_git_commands');
-    refs.commandHistoryList.innerHTML = commands.length ? commands.map(commandHistoryRowHtml).join('') : '<div class="empty-change">No commands recorded yet this session.</div>';
-  } catch (error) { const message = handleError(error); showOperationToast(`Could not load command history: ${message}`, 'error'); }
+    if (!refs.commandHistoryDialog.open || generation !== commandHistoryGeneration) return;
+    refs.commandHistoryList.innerHTML = appMessage + (commands.length ? commands.map(commandHistoryRowHtml).join('') : empty);
+  } catch (error) {
+    if (!refs.commandHistoryDialog.open || generation !== commandHistoryGeneration) return;
+    // Keep the original failure visible even when loading the CLI history fails.
+    refs.commandHistoryList.innerHTML = appMessage + `<div class="empty-change">Could not load Git commands: ${esc(String(error))}</div>`;
+  }
 }
 refs.statusFooter.addEventListener('dblclick', openCommandHistoryDialog);
 // Also observe Terminal/background requests even when an unrelated status()
@@ -9845,9 +9893,19 @@ bindPanelResize($('#workingTreeResize'), {
   resize: (rect, _dx, dy) => resizeWorkingTree(rect.height - dy),
   reset: () => resizeWorkingTree(280),
 });
+refs.commandHistoryMaximize.addEventListener('click', toggleCommandHistorySize);
+refs.commandHistoryDialog.addEventListener('close', () => { commandHistoryGeneration++; });
+$('#copyCommandHistory').addEventListener('click', () => copyText(refs.commandHistoryList.innerText, 'Console output copied'));
+bindPanelResize($('#commandHistoryResize'), {
+  read: () => refs.commandHistoryDialog.getBoundingClientRect(),
+  resize: resizeCommandHistoryDialog,
+  reset: () => { commandHistoryBounds = null; commandHistoryMaximized = false; layoutCommandHistoryDialog(); },
+  canStart: () => refs.commandHistoryDialog.open,
+});
 window.addEventListener('resize', () => {
   if (!refs.submoduleMenu.hidden) placeSubmoduleMenu(refs.submoduleMenu.getBoundingClientRect());
   if (refs.changesDrawer.classList.contains('open')) resizeWorkingTree(refs.changesDrawer.getBoundingClientRect().height);
+  if (refs.commandHistoryDialog.open) layoutCommandHistoryDialog();
 });
 $('#refreshSubmoduleMenu').addEventListener('click', event => refreshSubmoduleMenu(event.currentTarget));
 $('#fetchSubmoduleVersions').addEventListener('click', event => { if (submoduleMenuEntry) fetchSubmodule(submoduleMenuEntry, event.currentTarget); });

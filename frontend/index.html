@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Git DrillDown</title>
   <link rel="icon" type="image/png" href="assets/git-drilldown-mark.png">
-  <link rel="stylesheet" href="styles.css?v=20261027-navigation-feedback">
-  <link rel="stylesheet" href="polarion.css?v=20261027-navigation-feedback">
+  <link rel="stylesheet" href="styles.css?v=20261028-command-console">
+  <link rel="stylesheet" href="polarion.css?v=20261028-command-console">
 </head>
 <body>
   <div id="startupIntro" class="startup-intro" hidden>
@@ -17,7 +17,7 @@
       <div id="startupIntroFailure" class="startup-intro-failure" hidden><p>Reload the window to retry.</p><button type="button" id="startupIntroRetry">Reload interface</button></div>
     </div>
   </div>
-  <script src="startup-intro.js?v=20261027-navigation-feedback"></script>
+  <script src="startup-intro.js?v=20261028-command-console"></script>
   <div class="app-shell">
     <header class="topbar">
       <div class="brand" aria-label="Git DrillDown">
@@ -850,12 +850,13 @@
       <footer><span style="flex:1"></span><button value="cancel">Close</button></footer>
     </form>
   </dialog>
-  <dialog id="commandHistoryDialog" class="publish-dialog command-history-dialog">
+  <dialog id="commandHistoryDialog" class="publish-dialog command-history-dialog" aria-labelledby="commandHistoryTitle">
     <form method="dialog">
-      <header><div><h2>Git command console</h2><p>Full commands, timing and captured output for this app session. The footer stays compact; double-click it whenever you need these details.</p></div><button value="cancel">×</button></header>
-      <div id="commandHistoryList" class="conflicts-list"></div>
-      <footer><span style="flex:1"></span><button value="cancel">Close</button></footer>
+      <header><div><h2 id="commandHistoryTitle">Git command console</h2><p>Current app message and captured Git output · this session</p></div><button type="button" id="commandHistoryMaximize" aria-pressed="false">Maximize</button><button value="cancel" aria-label="Close command console">×</button></header>
+      <div id="commandHistoryList" class="conflicts-list" tabindex="0" aria-label="Captured messages and command output"></div>
+      <footer><span>Drag the lower-right corner to resize. Very large captured output may be truncated.</span><button type="button" id="copyCommandHistory">Copy all</button><button value="cancel">Close</button></footer>
     </form>
+    <div id="commandHistoryResize" class="panel-resize-corner" role="button" aria-label="Resize command console" tabindex="0" title="Drag or use arrow keys to resize · double-click to reset">◢</div>
   </dialog>
   <dialog id="newBranchDialog" class="publish-dialog">
     <form method="dialog">
@@ -962,22 +963,22 @@
       <footer><span>Read-only on Polarion · local snapshots outside Git</span><button value="cancel">Close</button><button type="button" id="polarionAdd" class="confirm" disabled>Add to Commit List</button></footer>
     </form>
   </dialog>
-  <script src="polarion.js?v=20261027-navigation-feedback"></script>
-  <script src="console-context.js?v=20261027-navigation-feedback"></script>
-  <script src="graph-model.js?v=20261027-navigation-feedback"></script>
-  <script src="submodule-state.js?v=20261027-navigation-feedback"></script>
-  <script src="submodule-versions.js?v=20261027-navigation-feedback"></script>
-  <script src="local-diff.js?v=20261027-navigation-feedback"></script>
-  <script src="local-drive.js?v=20261027-navigation-feedback"></script>
-  <script src="pr-status.js?v=20261027-navigation-feedback"></script>
-  <script src="refresh-coordinator.js?v=20261027-navigation-feedback"></script>
-  <script src="comparison-authors.js?v=20261027-navigation-feedback"></script>
-  <script src="git-activity.js?v=20261027-navigation-feedback"></script>
-  <script src="comparison-navigation.js?v=20261027-navigation-feedback"></script>
-  <script src="panel-resize.js?v=20261027-navigation-feedback"></script>
-  <script src="submodule-compare-details.js?v=20261027-navigation-feedback"></script>
-  <script src="merge-preview.js?v=20261027-navigation-feedback"></script>
-  <script src="navigation-refresh.js?v=20261027-navigation-feedback"></script>
-  <script src="app.js?v=20261027-navigation-feedback"></script>
+  <script src="polarion.js?v=20261028-command-console"></script>
+  <script src="console-context.js?v=20261028-command-console"></script>
+  <script src="graph-model.js?v=20261028-command-console"></script>
+  <script src="submodule-state.js?v=20261028-command-console"></script>
+  <script src="submodule-versions.js?v=20261028-command-console"></script>
+  <script src="local-diff.js?v=20261028-command-console"></script>
+  <script src="local-drive.js?v=20261028-command-console"></script>
+  <script src="pr-status.js?v=20261028-command-console"></script>
+  <script src="refresh-coordinator.js?v=20261028-command-console"></script>
+  <script src="comparison-authors.js?v=20261028-command-console"></script>
+  <script src="git-activity.js?v=20261028-command-console"></script>
+  <script src="comparison-navigation.js?v=20261028-command-console"></script>
+  <script src="panel-resize.js?v=20261028-command-console"></script>
+  <script src="submodule-compare-details.js?v=20261028-command-console"></script>
+  <script src="merge-preview.js?v=20261028-command-console"></script>
+  <script src="navigation-refresh.js?v=20261028-command-console"></script>
+  <script src="app.js?v=20261028-command-console"></script>
 </body>
 </html>

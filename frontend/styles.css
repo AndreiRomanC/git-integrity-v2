@@ -1238,11 +1238,19 @@ footer { display: flex; align-items: center; gap: 8px; padding: 0 12px; backgrou
 .status-stop-command:disabled { opacity: .5; cursor: not-allowed; }
 /* The footer is intentionally terse; this double-click-only view is the one
    place where commands and their output must never be ellipsized. */
-.publish-dialog.command-history-dialog { width: min(980px, 94vw); max-width: 980px; }
-.command-history-dialog .conflicts-list { max-height: min(68vh, 720px); background: #0c1218; }
+.publish-dialog.command-history-dialog { position: fixed; margin: 0; width: min(1060px, calc(100vw - 32px)); height: min(720px, calc(100vh - 32px)); max-width: calc(100vw - 32px); max-height: calc(100vh - 32px); overflow: hidden; }
+.command-history-dialog > form { display: flex; flex-direction: column; height: 100%; min-height: 0; }
+.command-history-dialog .conflicts-list { flex: 1; min-height: 0; max-height: none; margin: 0; border: 0; border-radius: 0; background: #0c1218; overflow: auto; overscroll-behavior: contain; }
+.command-history-dialog .empty-change { height: auto; min-height: 60px; padding: 20px; overflow-wrap: anywhere; }
+.command-history-dialog header, .command-history-dialog footer { flex: none; gap: 10px; }
+.command-history-dialog header > div { flex: 1; min-width: 0; }
+.command-history-dialog header #commandHistoryMaximize { width: auto; height: 30px; padding: 0 10px; margin: 0; border: 1px solid var(--border); border-radius: 5px; background: var(--surface-soft); color: var(--text); font-size: 11px; white-space: nowrap; }
+.command-history-dialog footer { padding-right: 28px; }
+.command-history-dialog footer span { flex: 1; min-width: 0; }
+.command-history-dialog button:focus-visible, .command-history-dialog .conflicts-list:focus-visible { outline: 1px solid var(--blue); outline-offset: -2px; }
 .command-history-row { padding: 12px 14px; border-bottom: 1px solid var(--border-soft); }
 .command-history-row:last-child { border-bottom: 0; }
-.command-history-summary { display: flex; align-items: center; gap: 8px; margin-bottom: 7px; color: #718596; font-size: 9px; }
+.command-history-summary { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-bottom: 7px; color: #91a0af; font-size: 10px; overflow-wrap: anywhere; }
 .command-history-state { min-width: 58px; padding: 2px 6px; border: 1px solid #38536a; border-radius: 10px; color: #91a9bb; font-size: 8px; font-weight: 800; letter-spacing: .6px; text-align: center; }
 .command-history-row.running .command-history-state { border-color: #80652f; color: #efbf68; }
 .command-history-row.success .command-history-state { border-color: #2d684f; color: #79d5ac; }
@@ -1253,7 +1261,7 @@ footer { display: flex; align-items: center; gap: 8px; padding: 0 12px; backgrou
 .command-history-output section { min-width: 0; border-left: 2px solid #335570; padding-left: 9px; }
 .command-history-output section.stderr { border-left-color: #82454d; }
 .command-history-output b { display: block; margin-bottom: 4px; color: #6d8598; font-size: 8px; letter-spacing: .8px; }
-.command-history-output pre { max-height: 260px; margin: 0; overflow: auto; color: #aebfcb; font: 10px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; user-select: text; }
+.command-history-output pre { max-height: none; margin: 0; overflow: visible; color: #becbd5; font: 12px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; user-select: text; }
 .command-history-output .stderr pre { color: #dfa1a7; }
 .command-history-empty-output { color: #596b79; font-size: 9px; font-style: italic; }
 
