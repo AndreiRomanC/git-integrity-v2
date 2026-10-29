@@ -161,3 +161,5 @@ polarion_search
 polarion_project_context
 polarion_read
 polarion_workspace
+inspect_index_lock
+recover_index_lock

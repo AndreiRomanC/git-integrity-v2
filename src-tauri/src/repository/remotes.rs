@@ -26,7 +26,11 @@ pub fn list_remotes(repository_path: String) -> Result<Vec<RemoteInfo>, String> 
 }
 
 #[tauri::command]
-pub fn fetch_remote(repository_path: String, remote: String) -> Result<(), String> {
+pub async fn fetch_remote(repository_path: String, remote: String) -> Result<(), String> {
+    off_main_thread(move || fetch_remote_inner(repository_path, remote)).await
+}
+
+fn fetch_remote_inner(repository_path: String, remote: String) -> Result<(), String> {
     validate_path(&repository_path)?;
     let remote_name = remote.trim();
     let repo = internal_repository(&repository_path)?;
@@ -88,7 +92,9 @@ pub(in crate::repository) fn sync_repository_inner(repository_path: String, acti
                     if dirty.len() == 1 { "" } else { "s" }
                 ));
             }
-            fetch_remote(repository_path.clone(), remote_name.into())?;
+            // sync_repository already runs in a worker; keep the same fetch
+            // implementation without nesting another worker/runtime wait.
+            fetch_remote_inner(repository_path.clone(), remote_name.into())?;
             let remote_ref = repo.find_reference(&format!("refs/remotes/{remote_name}/{remote_branch}"))
                 .map_err(|error| error.message().to_string())?;
             let target = remote_ref.target().ok_or("Remote branch has no target")?;

@@ -62,6 +62,7 @@ test('instrumented directory loading still rejects late responses', async () => 
 test('fast-open status diagnostics still perform exactly one request and do not log repository paths', async () => {
   const calls = [], logs = [], changes = [{ path: 'private-file', status: 'M' }];
   const c = { state: { repository: { path: '/private/repo' }, view: 'history', commits: [] }, repoOpenGeneration: 4,
+    ipcDiagnostics: { applied: result => assert.equal(result, changes) },
     jsPerfLog: line => logs.push(line), invoke: async (command, args) => { calls.push({ command, args }); return changes; },
     updateChangeBadge() {}, render() {}, status() {}, handleError: error => { throw error; } };
   vm.createContext(c); vm.runInContext(source('completeRepositoryOpenStatus'), c);

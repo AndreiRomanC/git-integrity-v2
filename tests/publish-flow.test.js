@@ -19,7 +19,7 @@ function harness() {
   const refs = { publishFastMode: { checked: true }, publishSafeMode: {}, publishBranch: { value: 'feature' }, publishRemote: { value: 'origin' },
     publishDialog: { open: true, close() { this.open = false; } }, publishCommits: { querySelectorAll: () => [] }, details: {} };
   const metadata = { head_oid: 'head', current_branch: 'feature', upstream: 'origin/feature', remote_tip: 'head', unpushed_paths: [] };
-  const context = { state, refs, $: node, mode: 'all', repoOpenGeneration: 1, publishInFlight: false, publishRiskGeneration: 0, publishSubmoduleRisksHtml: '',
+  const context = { state, refs, $: node, mode: 'all', repoOpenGeneration: 1, publishInFlight: false, publishRiskGeneration: 0, publishSubmoduleRisksHtml: '', ipcDiagnostics: null,
     UNPUSHED_SUBMODULE_OVERRIDABLE_PREFIX: 'UNPUSHED_SUBMODULE_OVERRIDABLE::', directoryCache: new Map([['folder', []]]),
     document: { querySelector: () => ({ value: context.mode }), querySelectorAll: () => [] },
     invoke: async (command, args) => { calls.push({ command, args }); if (command === 'refresh_publish_metadata') return metadata; return []; },

@@ -12,7 +12,7 @@ function harness() {
   let id = 0;
   const state = { repository: { path: 'repo' }, currentPath: '', changes: [{ path: 'a', staged: false }] };
   const buttons = {};
-  const context = { state, drawerPolarionReferences: null, commitWriteRunning: false, performance, jsPerfLog() {}, renderChanges() {}, status() {}, showOperationToast() {},
+  const context = { state, repoOpenGeneration: 1, drawerPolarionReferences: null, commitWriteRunning: false, performance, jsPerfLog() {}, renderChanges() {}, status() {}, showOperationToast() {},
     handleError: error => String(error), diagnosticErrorCategory: () => 'test-error',
     setTimeout(fn, ms) { timers.set(++id, { fn, ms }); return id; }, clearTimeout(key) { timers.delete(key); },
     $: selector => buttons[selector] ||= { textContent: selector, disabled: false },
@@ -22,9 +22,10 @@ function harness() {
     requestRepositoryStatusRefresh: async () => {},
     activeRepositoryContext: () => ({ path: state.repository.path, isSubmodule: false }),
     beginButtonOperation: () => () => {},
-    loadRepository: async () => { events.push('load'); },
+    loadRepository: async () => { events.push('load'); return true; },
   };
   vm.createContext(context);
+  vm.runInContext(app.match(/async function refreshAfterCompletedAction\([^]*?\n}/)[0], context);
   vm.runInContext(app.slice(app.indexOf('let pendingToggles ='), app.indexOf("$('#openRepo').addEventListener")) +
     app.slice(app.indexOf('async function stageAllInScope('), app.indexOf('// Pre-fills the commit message box')) +
     '\nglobalThis.flush = flushPendingTogglesNow; globalThis.hasFlight = () => pendingToggleFlight !== null;', context);

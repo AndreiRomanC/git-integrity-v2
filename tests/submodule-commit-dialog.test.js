@@ -34,10 +34,10 @@ test('detached submodule dialog opens with StructDoc controls, but neither refer
 });
 test('Commit submodule opens inspection while detached without a Git write; an attached branch keeps the existing commit operation', async () => {
   const calls = [], prompts = [], defaults = [], state = { repository: { path: '/parent' }, currentPath: 'modules' };
-  const sandbox = { state, refs: { defaultCommitMessage: { value: ' P:OEM-123 - Selected task ' } },
+  const sandbox = { state, repoOpenGeneration: 1, refs: { defaultCommitMessage: { value: ' P:OEM-123 - Selected task ' } },
     customPrompt: async (message, value, options) => { prompts.push(options); defaults.push(value); return 'Draft'; },
     submoduleCommitReferenceContext: entry => ({ moduleName: entry.name }), invoke: async (name, args) => { calls.push({ name, args }); return { push_detail: '' }; },
-    status() {}, directoryCache: { clear() {} }, loadRepository: async () => {}, showOperationToast() {}, handleError(error) { throw error; } };
+    status() {}, directoryCache: { clear() {} }, refreshAfterCompletedAction: async () => true, showOperationToast() {}, handleError(error) { throw error; } };
   vm.createContext(sandbox); vm.runInContext(app.match(/async function commitSubmoduleChanges\([^]*?\n}/)[0], sandbox);
   const entry = { kind: 'submodule', name: 'errm_adpdg', relative_path: 'modules/errm_adpdg', submodule_current_branch: '' };
   await sandbox.commitSubmoduleChanges(entry);
@@ -54,7 +54,7 @@ test('submodule commit starts with the top message and appends optional StructDo
   for (const withReferences of [false, true]) {
     const calls = [], refs = { defaultCommitMessage: { value: 'P:OEM-123 - My base description\nMore detail' } };
     const ids = ['OEM-85585', 'OEM-85586', 'OEM-85587'];
-    const sandbox = { refs, state: { repository: { path: '/parent' }, currentPath: 'modules' },
+    const sandbox = { refs, repoOpenGeneration: 1, state: { repository: { path: '/parent' }, currentPath: 'modules' },
       customPrompt: async (message, value, options) => {
         assert.equal(value, refs.defaultCommitMessage.value); assert.equal(options.multiline, true);
         assert.equal(options.polarionContext.moduleName, 'errm_adpdg');
@@ -63,7 +63,7 @@ test('submodule commit starts with the top message and appends optional StructDo
         return withReferences ? polarionCommitMessageWithReferences(edited, ids) : edited;
       }, submoduleCommitReferenceContext: entry => ({ moduleName: entry.name }),
       invoke: async (command, args) => { calls.push({ command, args }); return { push_detail: '' }; },
-      status() {}, directoryCache: { clear() {} }, loadRepository: async () => {}, showOperationToast() {}, handleError(error) { throw error; } };
+      status() {}, directoryCache: { clear() {} }, refreshAfterCompletedAction: async () => true, showOperationToast() {}, handleError(error) { throw error; } };
     vm.createContext(sandbox); vm.runInContext(app.match(/async function commitSubmoduleChanges\([^]*?\n}/)[0], sandbox);
     await sandbox.commitSubmoduleChanges({ kind: 'submodule', name: 'errm_adpdg', relative_path: 'modules/errm_adpdg', submodule_current_branch: 'feature' });
     assert.equal(calls.length, 1); assert.equal(calls[0].command, 'commit_submodule');

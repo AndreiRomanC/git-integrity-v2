@@ -11,7 +11,7 @@ window.GitDrillDownStartup?.preparing();
 // One list here, checked once, covers every call site — present and future —
 // without relying on each new mutating action to add its own copy.
 const MUTATING_COMMANDS = new Set([
-  'stage_files', 'unstage_files', 'stage_all', 'commit_files', 'commit_staged', 'commit_path',
+  'stage_files', 'unstage_files', 'stage_all', 'commit_files', 'commit_staged', 'commit_path', 'recover_index_lock',
   'remove_git_path', 'delete_local_path', 'switch_branch', 'checkout_remote_tracking_branch', 'create_branch', 'create_branch_at_commit', 'checkout_commit', 'rename_branch', 'delete_branch',
   'stash_changes', 'stash_file', 'pop_stash', 'drop_stash', 'restore_stash_paths', 'abort_stash_conflict',
   'restore_file', 'restore_remote_file', 'restore_folder', 'restore_exact_checkpoint', 'restore_exact_checkpoint_branch', 'clean_branch_from_upstream', 'add_submodule', 'init_submodule', 'switch_submodule_version', 'reset_submodule', 'reset_submodule_branch_to_upstream', 'change_submodule_url',
@@ -72,6 +72,7 @@ function diagnosticErrorCategory(error) {
   return 'unclassified';
 }
 const rawInvoke = window.__TAURI__?.core?.invoke;
+const ipcDiagnostics = window.GitDrillDownIpcDiagnostics?.create({ log: (label, elapsed) => jsPerfLog(label, elapsed) });
 const invoke = rawInvoke && ((command, args) => {
   if (!STAGING_COMMANDS.has(command) && (MUTATING_COMMANDS.has(command) || REPO_SWITCH_COMMANDS.has(command)) &&
       (activeStagingOperation || pendingToggleFlight || pendingToggles.size)) {
@@ -107,7 +108,9 @@ const invoke = rawInvoke && ((command, args) => {
     return Promise.reject(message);
   }
   const startedAt = performance.now();
-  const diagnosticId = DIAGNOSTIC_COMMANDS.has(command) ? ++diagnosticRequestSequence : null;
+  const deliveryTrace = ipcDiagnostics?.wants(command);
+  const diagnosticId = deliveryTrace || DIAGNOSTIC_COMMANDS.has(command) ? ++diagnosticRequestSequence : null;
+  const delivery = deliveryTrace ? ipcDiagnostics.start(command, diagnosticId) : null;
   if (diagnosticId) jsPerfLog(`ipc_trace: request=${diagnosticId} command=${command} event=start at=${new Date().toISOString()}`, 0);
   const recoveryContext = RECOVER_ON_MUTATION_ERROR.has(command)
     ? { path: state.repository?.path, generation: repoOpenGeneration } : null;
@@ -117,8 +120,9 @@ const invoke = rawInvoke && ((command, args) => {
   if (observeActivity) ++inFlightBackendRequests;
   if (write) ++inFlightRepositoryWrites;
   try {
-    pending = rawInvoke(command, args);
+    pending = rawInvoke(command, delivery ? { ...args, diagnosticRequestId: diagnosticId } : args);
   } catch (error) {
+    ipcDiagnostics?.finish(delivery, false);
     if (observeActivity) --inFlightBackendRequests;
     if (write) --inFlightRepositoryWrites;
     if (diagnosticId) jsPerfLog(`ipc_trace: request=${diagnosticId} command=${command} event=throw category=${diagnosticErrorCategory(error)}`, performance.now() - startedAt);
@@ -127,6 +131,7 @@ const invoke = rawInvoke && ((command, args) => {
   }
   if (command === 'frontend_perf_log') return pending;
   return Promise.resolve(pending).then(result => {
+    ipcDiagnostics?.finish(delivery, true, result);
     if (observeActivity) --inFlightBackendRequests;
     if (write) --inFlightRepositoryWrites;
     const elapsedMs = performance.now() - startedAt;
@@ -134,6 +139,7 @@ const invoke = rawInvoke && ((command, args) => {
     if (elapsedMs >= SLOW_INVOKE_LOG_THRESHOLD_MS) jsPerfLog(`invoke(${command}) SUCCESS`, elapsedMs);
     return result;
   }, async error => {
+    ipcDiagnostics?.finish(delivery, false);
     if (observeActivity) --inFlightBackendRequests;
     if (write) --inFlightRepositoryWrites;
     const blocked = detachedPushPreviewBlocked(command, error);
@@ -645,6 +651,7 @@ function commandHistoryRowHtml(entry) {
 let commandHistoryBounds = null;
 let commandHistoryMaximized = false;
 let commandHistoryGeneration = 0;
+let commandHistoryRepositoryPath = null;
 
 function placeCommandHistoryDialog(bounds) {
   const fitted = fitFloatingPanel(bounds, { width: innerWidth, height: innerHeight });
@@ -677,12 +684,18 @@ function commandHistoryStatusHtml() {
   const message = refs.statusText.title || refs.statusText.textContent;
   if (!message || message === 'Ready') return '';
   const failed = refs.statusDot.classList.contains('error');
-  return `<article class="command-history-row ${failed ? 'failed' : ''}"><div class="command-history-summary"><span class="command-history-state">APP MESSAGE</span><span>Current footer message · not a Git command</span></div><div class="command-history-output"><section${failed ? ' class="stderr"' : ''}><pre>${esc(message)}</pre></section></div></article>`;
+  return `<article data-command-app-message class="command-history-row ${failed ? 'failed' : ''}"><div class="command-history-summary"><span class="command-history-state">APP MESSAGE</span><span>Current footer message · not a Git command</span></div><div class="command-history-output"><section${failed ? ' class="stderr"' : ''}><pre>${esc(message)}</pre></section></div></article>`;
 }
 async function openCommandHistoryDialog() {
   if (refs.commandHistoryDialog.open) return;
   const generation = ++commandHistoryGeneration;
   const appMessage = commandHistoryStatusHtml();
+  commandHistoryRepositoryPath = activeRepositoryContext().path || null;
+  const recoveryButton = $('#recoverIndexLock');
+  recoveryButton.hidden = !invoke || !commandHistoryRepositoryPath;
+  recoveryButton.disabled = Boolean(invoke);
+  recoveryButton.textContent = 'Check / recover index lock…';
+  recoveryButton.title = commandHistoryRepositoryPath ? `Inspect index.lock in ${commandHistoryRepositoryPath}. No automatic cleanup or retry.` : '';
   const empty = '<div class="empty-change">No Git commands recorded yet this session.</div>';
   refs.commandHistoryList.innerHTML = appMessage + (invoke ? '<div class="loading-row"><i class="spinner"></i>Loading commands…</div>' : empty);
   refs.commandHistoryDialog.showModal();
@@ -697,7 +710,40 @@ async function openCommandHistoryDialog() {
     if (!refs.commandHistoryDialog.open || generation !== commandHistoryGeneration) return;
     // Keep the original failure visible even when loading the CLI history fails.
     refs.commandHistoryList.innerHTML = appMessage + `<div class="empty-change">Could not load Git commands: ${esc(String(error))}</div>`;
+  } finally {
+    if (refs.commandHistoryDialog.open && generation === commandHistoryGeneration) recoveryButton.disabled = false;
   }
+}
+async function recoverIndexLockFromConsole() {
+  const repositoryPath = commandHistoryRepositoryPath;
+  const generation = commandHistoryGeneration;
+  const current = () => refs.commandHistoryDialog.open && generation === commandHistoryGeneration
+    && activeRepositoryContext().path === repositoryPath;
+  if (!invoke || !repositoryPath || !current()) return;
+  const button = $('#recoverIndexLock');
+  if (button.disabled) return;
+  const done = beginButtonOperation(button, 'Checking lock…');
+  const display = (message, kind) => {
+    status(message, kind);
+    if (!current()) return;
+    refs.commandHistoryList.querySelector('[data-command-app-message]')?.remove();
+    refs.commandHistoryList.insertAdjacentHTML('afterbegin', commandHistoryStatusHtml());
+    refs.commandHistoryList.scrollTop = 0;
+  };
+  try {
+    const report = await invoke('inspect_index_lock', { repositoryPath });
+    if (!current()) return;
+    const consent = { label: 'I have stopped Git operations and closed other Git applications using this repository.', checked: false, required: true };
+    const ok = await customConfirm(
+      `Move this index lock to a backup?\n\n${report.lock_path}\n${report.bytes} bytes · last written ${Math.floor(report.age_seconds / 60)} minute(s) ago\n\nNo running Git process was detected and the lock did not change during inspection. This does not prove that it is abandoned: other applications may use Git internally. Close them before continuing.\n\nOnly index.lock will be moved to a backup inside the Git directory. The index (staging), files, branches and server will not be changed. No process will be killed. Replace/checkout will NOT restart automatically.`,
+      { title: 'Recover index lock · local only', danger: true, okLabel: 'Back up & release lock', checkbox: consent });
+    if (!ok || !current()) return;
+    if (!consent.checked) { display('Recovery cancelled: first confirm that other Git operations and applications are closed. Nothing was changed.', 'notice'); return; }
+    const result = await invoke('recover_index_lock', { repositoryPath, ticket: report.ticket, confirmed: true });
+    if (!current()) return;
+    display(`Index lock moved to backup:\n${result.backup_path}\n\nIndex, local files and branches were not changed. Review the repository, then retry your original action manually. Do not restore the backup over index.`, 'notice');
+  } catch (error) { if (current()) display(String(error), 'error'); }
+  finally { if (current()) done(); }
 }
 refs.statusFooter.addEventListener('dblclick', openCommandHistoryDialog);
 // Also observe Terminal/background requests even when an unrelated status()
@@ -884,11 +930,14 @@ function customConfirm(message, options = {}) {
     const okButton = $('#appConfirmOk');
     okButton.textContent = options.okLabel || 'Confirm';
     okButton.className = options.danger ? 'danger' : 'confirm';
-    const cleanup = (result) => { dialog.close(); okButton.removeEventListener('click', onOk); cancelButton.removeEventListener('click', onCancel); dialog.removeEventListener('cancel', onCancel); resolve(result); };
-    const onOk = () => { if (options.checkbox) options.checkbox.checked = $('#appConfirmOption').checked; cleanup(true); };
+    const optionInput = $('#appConfirmOption');
+    const updateConsent = () => { okButton.disabled = Boolean(options.checkbox?.required && !optionInput.checked); };
+    updateConsent();
+    const cleanup = (result) => { dialog.close(); okButton.removeEventListener('click', onOk); cancelButton.removeEventListener('click', onCancel); dialog.removeEventListener('cancel', onCancel); optionInput.removeEventListener('change', updateConsent); okButton.disabled = false; resolve(result); };
+    const onOk = () => { if (okButton.disabled) return; if (options.checkbox) options.checkbox.checked = optionInput.checked; cleanup(true); };
     const onCancel = () => cleanup(false);
     const cancelButton = $('#appConfirmCancel');
-    okButton.addEventListener('click', onOk); cancelButton.addEventListener('click', onCancel); dialog.addEventListener('cancel', onCancel);
+    okButton.addEventListener('click', onOk); cancelButton.addEventListener('click', onCancel); dialog.addEventListener('cancel', onCancel); optionInput.addEventListener('change', updateConsent);
     dialog.showModal();
   });
 }
@@ -1383,6 +1432,7 @@ async function confirmAddSubmodule() {
 let repoOpenGeneration = 0;
 
 async function loadRepository(path, options = {}) {
+  let generation;
   // Everything here, including the flush below, is inside this try —
   // flushPendingTogglesNow used to be called *before* this try started, so
   // its safety-net timeout (or any other rejection) would propagate as an
@@ -1397,7 +1447,7 @@ async function loadRepository(path, options = {}) {
     // before this call potentially switches to a different one or refreshes
     // this one out from under a still-in-flight checkbox click.
     await flushPendingTogglesNow({}, 'the Stage operation');
-    const generation = ++repoOpenGeneration;
+    generation = ++repoOpenGeneration;
     status('Reading repository…', 'busy');
     const keepPath = options.keepPath ? state.currentPath : '';
     // Most callers already know exactly which folder they want open again after
@@ -1437,7 +1487,109 @@ async function loadRepository(path, options = {}) {
     updatePublishIndicator();
     await checkForMergeConflicts();
     return true;
-  } catch (error) { handleError(error); return false; }
+  } catch (error) {
+    // Post-action callers must distinguish a failed display refresh from a
+    // failed Git operation. Keep the existing behaviour for ordinary opens.
+    if (options.throwOnError) {
+      if (generation !== undefined && generation !== repoOpenGeneration) return false;
+      throw error;
+    }
+    handleError(error); return false;
+  }
+}
+
+function showCompletedActionRefreshFailure(completionMessage, error) {
+  const message = `${completionMessage}\nDisplay refresh failed. Use Refresh to reload the current state.\nDetails: ${String(error)}`;
+  status(message, 'notice'); showOperationToast(message, 'error');
+  jsPerfLog(`post_action_refresh: outcome=failed operation_completed=true category=${diagnosticErrorCategory(error)}`, 0);
+}
+
+async function refreshAfterCompletedAction(repositoryPath, completionMessage, options = {}, refreshRemotes = false) {
+  if (state.repository?.path !== repositoryPath) return false;
+  try {
+    if (!await loadRepository(repositoryPath, { ...options, throwOnError: true })) return false;
+    if (refreshRemotes && !await loadRemotes({ throwOnError: true })) return false;
+    return true;
+  } catch (error) {
+    if (state.repository?.path === repositoryPath) showCompletedActionRefreshFailure(completionMessage, error);
+    return false;
+  }
+}
+
+async function refreshAfterFetch(repositoryPath, completionMessage) {
+  const originalGeneration = repoOpenGeneration;
+  let generation = originalGeneration;
+  const sameContext = () => state.repository?.path === repositoryPath && repoOpenGeneration === generation;
+  const startedAt = performance.now();
+  try {
+    if (!sameContext()) return false;
+    // Scoped/embedded histories keep their specialized full refresh. Do not
+    // replace a folder/child history with the parent's unscoped commit list.
+    if (state.historyScope || state.submoduleGraph) {
+      jsPerfLog('fetch_refresh: phase=full_fallback reason=scoped_history', 0);
+      return await refreshAfterCompletedAction(repositoryPath, completionMessage, { keepPath: true }, true);
+    }
+    await flushPendingTogglesNow({}, 'the Stage operation');
+    if (!sameContext()) return false;
+    generation = ++repoOpenGeneration; // retire pre-Fetch reads, including status
+    const folderRequest = explorerRequestSeq;
+    const head = { head_oid: state.repository.head_oid, branch: state.repository.current_branch || '' };
+    const target = { owner: repositoryPath, repositoryPath, generation, submodulePath: '',
+      rootHead: head.head_oid, rootBranch: state.repository.current_branch, expectedHead: head };
+    const metadata = (async () => {
+      const [data, remotes] = await Promise.all([
+        invoke('open_repository_fast', { path: repositoryPath }),
+        invoke('list_remotes', { repositoryPath }),
+      ]);
+      if (!sameContext()) return 'obsolete';
+      if (data.repository.head_oid !== head.head_oid || data.repository.current_branch !== head.branch ||
+          state.repository.head_oid !== head.head_oid || (state.repository.current_branch || '') !== head.branch) return 'head-changed';
+      // FastRepositoryData contains no changes. Keep the draft, staged rows,
+      // folder, selection, compare setup and view while the scan catches up.
+      state.repository = { ...data.repository, path: repositoryPath };
+      state.branches = data.branches; state.allCommits = data.commits;
+      // The user may have opened a scoped history while this read was pending.
+      if (!state.historyScope && !state.submoduleGraph) {
+        state.commits = data.commits; state.commits_truncated = data.commits_truncated;
+      }
+      state.stashes = data.stashes; state.hasStash = data.stashes.length > 0;
+      state.submodule_paths = data.submodule_paths; state.remotes = remotes;
+      if (!state.remoteRef) state.remoteRef = data.branches.find(branch => branch.remote)?.name || '';
+      render();
+      status(`${completionMessage} References updated; verifying local status…`, 'busy');
+      jsPerfLog('fetch_refresh: phase=references_visible full_reload=false', performance.now() - startedAt);
+      return 'applied';
+    })();
+    // The existing navigation job gates writes and keeps previous rows usable.
+    // Folder clicks join it; keep the barrier until BOTH local reads settle.
+    const verification = navigationRefresh.ensure(target, { readStatus: true, completeWith: metadata });
+    // Observe both failures immediately. A fast refs result is painted without
+    // waiting for status; a failed scan must never become "everything updated".
+    const [refsResult, statusResult] = await Promise.allSettled([metadata, verification]);
+    if (!sameContext()) return false;
+    if (refsResult.status === 'fulfilled' && refsResult.value === 'head-changed') {
+      jsPerfLog('fetch_refresh: phase=full_fallback reason=head_changed', performance.now() - startedAt);
+      return await refreshAfterCompletedAction(repositoryPath, completionMessage, { keepPath: true, force: true }, true);
+    }
+    const failures = [refsResult, statusResult].filter(result => result.status === 'rejected');
+    if (failures.length) throw new Error(failures.map(result => String(result.reason?.message || result.reason)).join('\n'));
+    if (refsResult.value !== 'applied' || statusResult.value?.obsolete) return false;
+    // Navigation during verification already repaints its own destination.
+    // Only repaint here if no folder navigation has taken ownership meanwhile.
+    if (state.view === 'explorer' && explorerRequestSeq === folderRequest) {
+      await openDirectory(state.currentPath, { force: true, keepVisible: true, preserveSelection: true, explorerOnly: true });
+    }
+    if (!sameContext()) return false;
+    updatePublishIndicator();
+    await checkForMergeConflicts();
+    if (!sameContext()) return false;
+    jsPerfLog('fetch_refresh: phase=verified full_reload=false', performance.now() - startedAt);
+    return true;
+  } catch (error) {
+    if (sameContext()) showCompletedActionRefreshFailure(completionMessage, error);
+    jsPerfLog(`fetch_refresh: phase=failed category=${diagnosticErrorCategory(error)}`, performance.now() - startedAt);
+    return false;
+  }
 }
 
 async function refreshRepository(button = null) {
@@ -1468,8 +1620,9 @@ async function refreshRepository(button = null) {
 // combined-stress case). Shows structure — folders, files, branches,
 // commits — immediately; Stage/Delete/Commit/switch branch stay refused
 // (state.statusReady = false) until the background completion below applies
-// real status. Refresh and every action's own reload keep using the
-// unchanged, fully synchronous loadRepository above, not this.
+// real status. Explicit Refresh and mutation reloads keep using
+// loadRepository above; post-Fetch refresh reuses only the fast backend
+// read, not this initial-open function or its UI resets.
 async function openRepositoryFast(path, options = {}) {
   // Real "Open Repository" — always a genuine backend call, never served
   // from directoryCache (that cache only ever holds *folder listings* inside
@@ -1541,6 +1694,7 @@ async function completeRepositoryOpenStatus(path, generation) {
     if (state.view === 'explorer') await openDirectory(state.currentPath, { force: true, keepVisible: true, preserveSelection: true, explorerOnly: true });
     render();
     status(`${state.commits.length} commits loaded`);
+    ipcDiagnostics?.applied(changes);
   } catch (error) { handleError(error); }
 }
 
@@ -4224,10 +4378,19 @@ async function commitSelectedScope(event) {
   if (!invoke) { refs.commitScopeDialog.close(); status(`Preview: committed ${scope.name}`); return; }
   if (!scopeHasChanges(scope)) { const msg = `Nothing to commit — "${scope.name}" has no uncommitted local changes.`; refs.commitScopeDialog.close(); status(msg); showOperationToast(msg, 'error'); return; }
   refs.confirmScopeCommit.disabled = true; refs.confirmScopeCommit.textContent = 'Committing…';
+  const repositoryPath = state.repository.path, generation = repoOpenGeneration;
   try {
-    await invoke('commit_path', { repositoryPath: state.repository.path, relativePath: scope.path, message });
-    const folder = state.currentPath; refs.commitScopeDialog.close(); const data = await invoke('load_repository', { path: state.repository.path, force: false });
-    Object.assign(state, data); state.allCommits = data.commits; state.selectedEntry = null; directoryCache.clear(); await openDirectory(folder, { force: true });
+    await invoke('commit_path', { repositoryPath, relativePath: scope.path, message });
+    if (state.repository?.path !== repositoryPath || generation !== repoOpenGeneration) return;
+    const folder = state.currentPath; refs.commitScopeDialog.close();
+    try {
+      const data = await invoke('load_repository', { path: repositoryPath, force: false });
+      if (state.repository?.path !== repositoryPath || generation !== repoOpenGeneration) return;
+      Object.assign(state, data); state.allCommits = data.commits; state.selectedEntry = null; directoryCache.clear(); await openDirectory(folder, { force: true });
+    } catch (error) {
+      if (state.repository?.path === repositoryPath && generation === repoOpenGeneration) showCompletedActionRefreshFailure(`Commit for "${scope.name}" succeeded. Do not repeat the commit.`, error);
+      return;
+    }
     const successMsg = `Committed "${scope.name}". Push when you're ready to send it to the server.`;
     status(successMsg); showOperationToast(successMsg, 'success');
   } catch (error) { const message = handleError(error); showOperationToast(message, 'error'); }
@@ -4937,6 +5100,7 @@ async function commitSubmoduleChanges(entry) {
   if (!entry.submodule_current_branch) return; // Inspection-only on detached HEAD; backend also verifies the live checkout.
   if (state.repository?.path !== repositoryPath) return;
   if (!invoke) return status(`Preview: committed changes in ${entry.name}`);
+  const generation = repoOpenGeneration;
   try {
     status(`Committing changes in ${entry.name}…`, 'busy');
     // Push-submodule-workflow report, point 1: "Commit submodule" creates
@@ -4947,7 +5111,9 @@ async function commitSubmoduleChanges(entry) {
     // pointed at a commit that only ever existed on this machine. Push
     // remains its own separate, explicit action ("Push submodule").
     const result = await invoke('commit_submodule', { repositoryPath, relativePath: entry.relative_path, message: message.trim(), alsoPush: false });
-    directoryCache.clear(); await loadRepository(state.repository.path, { reopenPath: state.currentPath });
+    if (state.repository?.path !== repositoryPath || generation !== repoOpenGeneration) return;
+    directoryCache.clear();
+    if (!await refreshAfterCompletedAction(repositoryPath, `${entry.name}: commit succeeded inside the submodule. Do not repeat the commit.`, { reopenPath: state.currentPath })) return;
     const successMsg = `${entry.name}: committed inside the submodule. ${result.push_detail}`;
     status(successMsg); showOperationToast(successMsg);
   }
@@ -6502,30 +6668,47 @@ function renderRemotes() {
 }
 
 const loadRemotesGuard = createRequestGuard();
-async function loadRemotes() {
+async function loadRemotes(options = {}) {
   if (state.view !== 'remotes') resetFooterForContextChange();
   state.view = 'remotes'; refs.search.value = ''; clearDetails('Remote configuration');
   const stillCurrent = loadRemotesGuard();
   if (invoke) {
-    try { const remotes = await invoke('list_remotes', { repositoryPath: state.repository.path }); if (!stillCurrent()) return; state.remotes = remotes; }
-    catch (error) { if (stillCurrent()) handleError(error); }
+    try { const remotes = await invoke('list_remotes', { repositoryPath: state.repository.path }); if (!stillCurrent()) return false; state.remotes = remotes; }
+    catch (error) { if (!stillCurrent()) return false; if (options.throwOnError) throw error; handleError(error); return false; }
   } else state.remotes = [{ name: 'origin', fetch_url: 'git@example.com:vehicle-control.git', push_url: 'git@example.com:vehicle-control.git' }];
-  if (stillCurrent()) render();
+  if (!stillCurrent()) return false;
+  render(); return true;
 }
 async function fetchRemote(name, button = null) {
+  const repositoryPath = state.repository.path, generation = repoOpenGeneration;
   const finishButton = beginButtonOperation(button, 'Fetching…');
-  try { status(`Fetching ${name}…`, 'busy'); await invoke('fetch_remote', { repositoryPath: state.repository.path, remote: name }); await loadRepository(state.repository.path, { keepPath: true }); await loadRemotes(); status(`${name} updated`); }
-  catch (error) { handleError(error); }
+  try {
+    status(`Fetching ${name}…`, 'busy'); await invoke('fetch_remote', { repositoryPath, remote: name });
+    if (state.repository?.path !== repositoryPath || generation !== repoOpenGeneration) return;
+    if (!await refreshAfterFetch(repositoryPath, `Fetch from ${name} completed.`)) return;
+    status(`${name} updated`);
+  }
+  catch (error) { if (state.repository?.path === repositoryPath && generation === repoOpenGeneration) handleError(error); }
   finally { finishButton(); }
 }
 async function fetchAllRemotes(button = null) {
   if (!state.repository) return;
   if (!invoke) return status('Preview: fetched all remotes');
+  const repositoryPath = state.repository.path, generation = repoOpenGeneration;
   const finishButton = beginButtonOperation(button, 'Fetching…');
   const startedAt = performance.now();
   jsPerfLog('fetchAllRemotes START', 0);
-  try { status('Fetching every remote…', 'busy'); await invoke('fetch_all_remotes', { repositoryPath: state.repository.path }); await loadRepository(state.repository.path, { keepPath: true }); await loadRemotes(); const msg = `${state.remotes.length} remote${state.remotes.length === 1 ? '' : 's'} updated`; status(msg); showOperationToast(msg, 'success'); jsPerfLog('fetchAllRemotes SUCCESS', performance.now() - startedAt); }
-  catch (error) { jsPerfLog(`fetchAllRemotes ERROR: ${String(error)}`, performance.now() - startedAt); handleError(error); }
+  try {
+    status('Fetching every remote…', 'busy'); await invoke('fetch_all_remotes', { repositoryPath });
+    if (state.repository?.path !== repositoryPath || generation !== repoOpenGeneration) return;
+    if (!await refreshAfterFetch(repositoryPath, 'Fetch from all remotes completed.')) return;
+    const msg = `${state.remotes.length} remote${state.remotes.length === 1 ? '' : 's'} updated`;
+    status(msg); showOperationToast(msg, 'success'); jsPerfLog('fetchAllRemotes SUCCESS', performance.now() - startedAt);
+  }
+  catch (error) {
+    jsPerfLog(`fetchAllRemotes ERROR category=${diagnosticErrorCategory(error)}`, performance.now() - startedAt);
+    if (state.repository?.path === repositoryPath && generation === repoOpenGeneration) handleError(error);
+  }
   finally { finishButton(); }
 }
 function limitedFetchProjectDetails(label, list = []) {
@@ -6537,24 +6720,28 @@ function limitedFetchProjectDetails(label, list = []) {
 async function fetchProjectAndSubmodules(button = null) {
   if (!state.repository) return;
   if (!invoke) return status('Preview: fetched parent repository and submodules');
+  const repositoryPath = state.repository.path, generation = repoOpenGeneration;
   const finishButton = beginButtonOperation(button, 'Fetching…');
   const startedAt = performance.now();
   jsPerfLog('fetchProjectAndSubmodules START', 0);
   try {
     status('Fetching parent repository and initialized submodules…', 'busy');
-    const result = await invoke('fetch_project', { repositoryPath: state.repository.path });
-    await loadRepository(state.repository.path, { keepPath: true });
-    await loadRemotes();
+    const result = await invoke('fetch_project', { repositoryPath });
+    if (state.repository?.path !== repositoryPath || generation !== repoOpenGeneration) return;
     const parentText = result.parent_fetched ? 'Parent updated' : 'Parent not updated';
     const submoduleText = `${result.submodules_fetched}/${result.submodules_total} submodule${result.submodules_total === 1 ? '' : 's'} fetched`;
     const skippedText = result.submodules_skipped ? ` · ${result.submodules_skipped} skipped` : '';
     const msg = `${parentText} · ${submoduleText}${skippedText}`;
     const details = `${limitedFetchProjectDetails('Skipped', result.warnings)}${limitedFetchProjectDetails('Errors', result.errors)}`;
+    if (!await refreshAfterFetch(repositoryPath, `Fetch finished: ${msg}${details}`)) return;
     status(msg, result.errors?.length ? 'error' : '');
     showOperationToast(`${msg}${details}`, result.errors?.length ? 'error' : 'success');
     jsPerfLog(`fetchProjectAndSubmodules SUCCESS (parent=${result.parent_fetched}, submodules=${result.submodules_fetched}/${result.submodules_total}, skipped=${result.submodules_skipped}, errors=${result.errors?.length || 0})`, performance.now() - startedAt);
   }
-  catch (error) { jsPerfLog(`fetchProjectAndSubmodules ERROR: ${String(error)}`, performance.now() - startedAt); handleError(error); }
+  catch (error) {
+    jsPerfLog(`fetchProjectAndSubmodules ERROR category=${diagnosticErrorCategory(error)}`, performance.now() - startedAt);
+    if (state.repository?.path === repositoryPath && generation === repoOpenGeneration) handleError(error);
+  }
   finally { finishButton(); }
 }
 
@@ -7563,7 +7750,7 @@ async function restoreExactCheckpointFromGraphCommit(commitId, branch = '') {
   if (!context.path) return;
   const shortId = commitId.slice(0, 8);
   const ok = await customConfirm(
-    `Clean checkout ${branch ? `branch ${branch}` : `commit ${shortId}`} in ${context.name}?\n\nThis is stronger than Checkout:\n• ${branch ? `attaches HEAD to local branch ${branch} at ${shortId}` : 'detaches HEAD at this exact commit'}\n• discards staged and unstaged local edits\n• removes untracked, non-ignored leftovers, including nested Git repositories and their local-only commits\n• forces submodules to the versions recorded by this checkpoint\n\nNested repositories being removed are deleted entirely, including ignored files inside them. Other ignored build artifacts are not removed. The selected branch's commits are kept; nothing is changed on the server. This cannot be undone from the app.`,
+    `Clean checkout ${branch ? `branch ${branch}` : `commit ${shortId}`} in ${context.name}?\n\nThis is stronger than Checkout:\n• ${branch ? `attaches HEAD to local branch ${branch} at ${shortId}` : 'detaches HEAD at this exact commit'}\n• discards staged and unstaged local edits\n• removes untracked, non-ignored leftovers, including nested Git repositories and their local-only commits\n• forces submodules to the versions recorded by this checkpoint\n\nNested repositories being removed are deleted entirely, including ignored files inside them. Other ignored build artifacts are not removed. The selected branch's commits are kept; nothing is changed on the server. No backup or temporary copy is created. If Clean stops partway through, already deleted files are not restored. This cannot be undone from the app.`,
     { title: branch ? 'Clean checkout branch' : 'Restore exact checkpoint', danger: true, okLabel: branch ? 'Clean checkout branch' : 'Restore exact checkpoint' }
   );
   if (!ok) return;
@@ -7597,7 +7784,7 @@ async function cleanBranchFromUpstream(selection) {
   };
   if (!stillSelected()) return;
   const ok = await customConfirm(
-    `Replace local branch ${selection.branch} with the latest ${selection.upstream}?\n\nFetch runs first. If it fails, no cleanup is performed. After a successful fetch:\n• ${selection.branch} moves to the fetched commit and stays checked out\n• local-only commits are removed from this branch\n• staged and unstaged edits are discarded\n• untracked, non-ignored leftovers are deleted, including whole nested Git repositories and their local history\n• submodules are forced to the versions recorded by the fetched commit\n\nOther ignored build artifacts are kept. The local branch name and upstream are preserved. No Push; nothing on the server is changed. This cannot be undone from the app.`,
+    `Replace local branch ${selection.branch} with the latest ${selection.upstream}?\n\nFetch runs first. If it fails, no cleanup is performed. After a successful fetch:\n• ${selection.branch} moves to the fetched commit and stays checked out\n• local-only commits are removed from this branch\n• staged and unstaged edits are discarded\n• untracked, non-ignored leftovers are deleted, including whole nested Git repositories and their local history\n• submodules are forced to the versions recorded by the fetched commit\n\nOther ignored build artifacts are kept. The local branch name and upstream are preserved. No Push; nothing on the server is changed. No backup or temporary copy is created. If Clean stops partway through, already deleted files are not restored. This cannot be undone from the app.`,
     { title: 'Replace branch from upstream · destructive', danger: true, okLabel: 'Fetch, replace & clean' }
   );
   if (!ok || !stillSelected() || !invoke) return;
@@ -8247,10 +8434,9 @@ function updateChangeBadge() {
   refs.workspaceSubtitle.textContent = !state.repository ? 'No repository loaded' : !state.statusReady ? 'Loading status…' : state.changes.length ? `${state.changes.length} changed files` : 'Everything committed';
 }
 
-function changeDisplayState(change) {
+function changeDisplayState(change, submoduleRoots = new Set(knownSubmodulePaths())) {
   if (!change) return 'Modified';
-  const submodulePath = submoduleBoundaryFor(change.path);
-  const isSubmoduleRoot = Boolean(submodulePath) && normalizeRepositoryRelativePath(change.path) === submodulePath;
+  const isSubmoduleRoot = submoduleRoots.has(normalizeRepositoryRelativePath(change.path));
   if (isSubmoduleRoot) return change.staged ? 'Submodule version staged' : 'Submodule changed';
   if (change.status === '??') return 'New file';
   if (change.status === 'A') return change.staged ? 'Staged new file' : 'New file';
@@ -8264,17 +8450,21 @@ function renderChanges() {
   syncDrawerPolarionReferences();
   updateChangeBadge();
   const scope = state.changesScope === 'folder' ? state.currentPath : ''; const scopedChanges = state.changes.filter(change => !scope || change.path === scope || change.path.startsWith(`${scope}/`));
+  // One snapshot per list render, never one sorted submodule scan per row.
+  // These are local lookups, not a cache: staging/status refreshes rebuild them.
+  const submoduleRoots = new Set(knownSubmodulePaths());
+  const changesByPath = new Map(scopedChanges.map(change => [change.path, change]));
   refs.drawerScopeTitle.textContent = state.changesScope === 'folder' ? `Changes in folder · /${scope}` : 'Working tree · entire repository';
   refs.changesSummary.textContent = scopedChanges.length ? `${scopedChanges.length} changed item${scopedChanges.length === 1 ? '' : 's'}` : `No changes in ${scope ? `/${scope}` : 'the repository'}`;
   $('#stageAllButton').disabled = scopedChanges.length === 0;
   $('#unstageAllButton').disabled = !scopedChanges.some(change => change.staged);
   refs.changes.innerHTML = scopedChanges.map(change => `<div class="change-row-wrap diffable" data-change-compare-path="${esc(change.path)}" title="Double-click to compare working tree with the Git index"><div class="change-row"><input type="checkbox" data-change-path="${esc(change.path)}" aria-label="Stage ${esc(change.path)}" ${change.staged ? 'checked' : ''}>
-    <span class="status-code">${esc(change.status)}</span><span class="change-path">${esc(change.path)}</span><span class="change-state">${esc(changeDisplayState(change))}</span></div>
+    <span class="status-code">${esc(change.status)}</span><span class="change-path">${esc(change.path)}</span><span class="change-state">${esc(changeDisplayState(change, submoduleRoots))}</span></div>
     <button class="stash-file-btn" data-stash-path="${esc(change.path)}" title="Set aside just this file in its own repository's stash. Parent projects and submodules have separate stash lists.">⇕ Stash</button></div>`).join('') || `<div class="empty-change">No changes inside /${esc(scope)}</div>`;
   refs.changes.querySelectorAll('[data-stash-path]').forEach(button => button.addEventListener('click', () => stashOneFile(button.dataset.stashPath)));
   refs.changes.querySelectorAll('[data-change-compare-path]').forEach(row => row.addEventListener('dblclick', event => {
     if (event.target.closest('input,button')) return;
-    const change = scopedChanges.find(item => item.path === row.dataset.changeComparePath);
+    const change = changesByPath.get(row.dataset.changeComparePath);
     openWorkingTreeChangeCompare(change).catch(error => handleError(error));
   }));
   refs.changes.querySelectorAll('[data-change-path]').forEach(input => {
@@ -8284,7 +8474,7 @@ function renderChanges() {
     // the surrounding HTML is replaced right after — the row would then show
     // the state from before the click. Setting the property explicitly right
     // after building the HTML always wins over that.
-    const change = scopedChanges.find(item => item.path === input.dataset.changePath);
+    const change = changesByPath.get(input.dataset.changePath);
     input.checked = Boolean(change?.staged);
     input.addEventListener('click', event => event.stopPropagation());
     input.addEventListener('change', () => toggleStage(input.dataset.changePath, input.checked));
@@ -8294,6 +8484,15 @@ function renderChanges() {
   refs.selectionText.textContent = detached
     ? `${staged} file${staged === 1 ? '' : 's'} in staging area · checkout/create a branch before commit`
     : `${staged} file${staged === 1 ? '' : 's'} in staging area`;
+  updateCommitMessageControls();
+}
+
+function updateCommitMessageControls() {
+  // Typing (including paste/IME and StructDoc message updates) only validates
+  // the action. Do not rebuild file rows, resolve submodules or start IPC here.
+  const scope = state.changesScope === 'folder' ? state.currentPath : '';
+  const staged = state.changes.some(change => change.staged && (!scope || change.path === scope || change.path.startsWith(`${scope}/`)));
+  const detached = Boolean(state.repository?.head_detached);
   refs.commitButton.disabled = !staged || !refs.commitMessage.value.trim() || detached || commitWriteRunning || (drawerPolarionReferences && !drawerPolarionReferences.canSubmit());
   refs.commitButton.title = detached ? detachedHeadWorkMessage('commit') : '';
 }
@@ -8473,7 +8672,7 @@ async function refreshPublish() {
   document.querySelector('[name="publishCommitMode"][value="all"]').checked = true;
   $('#publishCombinedMessage').value = '';
   if (!branch || !remote) { refs.publishCommits.innerHTML = '<div class="publish-empty">Configure a remote before publishing.</div>'; refs.publishSummary.textContent = 'Nothing to publish'; $('#confirmPublish').disabled = true; return; }
-  refs.publishDestination.textContent = `${branch} → ${remote}/${branch}`; refs.publishCommits.innerHTML = '<div class="loading-row"><i class="spinner"></i>Checking server state…</div>';
+  refs.publishDestination.textContent = `${branch} → ${remote}/${branch}`; refs.publishCommits.innerHTML = '<div class="loading-row"><i class="spinner"></i>Reading local commits and cached remote refs…</div>';
   refs.publishSummary.textContent = 'Checking…';
   let publish;
   try {
@@ -8660,6 +8859,7 @@ async function finishPublishUi(request, combined, message) {
   $('#publishToken').value = '';
   if (request.isCurrent()) { refs.publishDialog.close(); status(message); }
   showOperationToast(message, 'success');
+  ipcDiagnostics?.publishApplied();
   // A UI refresh failure must never report a completed server push as failed
   // (nor invite retrying it). Keep this separate from the Git operation.
   try { await refreshAfterPublish(request, combined); }
@@ -9128,7 +9328,7 @@ function syncOpenDrawerDefaultCommitMessage() {
   if (!current || current === lastAppliedDefaultCommitMessage) {
     lastAppliedDefaultCommitMessage = next;
     refs.commitMessage.value = next;
-    renderChanges();
+    updateCommitMessageControls();
   }
 }
 
@@ -9163,7 +9363,7 @@ function scopeCommitReferenceContext(scope) {
 function syncDrawerPolarionReferences() {
   const host = $('#commitPolarionRefs');
   if (!host) return;
-  if (!drawerPolarionReferences) drawerPolarionReferences = createPolarionCommitReferences({ host, editor: refs.commitMessage, invoke, log: text => jsPerfLog(text, 0), onChange: () => renderChanges() });
+  if (!drawerPolarionReferences) drawerPolarionReferences = createPolarionCommitReferences({ host, editor: refs.commitMessage, invoke, log: text => jsPerfLog(text, 0), onChange: () => updateCommitMessageControls() });
   drawerPolarionReferences.setContext(submoduleCommitReferenceContext());
 }
 const polarionTaskPicker = createPolarionTaskPicker({ invoke, log: text => jsPerfLog(text, 0), onDocumentChange() {
@@ -9171,7 +9371,7 @@ const polarionTaskPicker = createPolarionTaskPicker({ invoke, log: text => jsPer
   // previously checked in an already-open Working Tree drawer. No Git scan.
   drawerPolarionReferences?.reset();
   scopePolarionReferences?.reset();
-  if (refs.changesDrawer.classList.contains('open')) renderChanges();
+  if (refs.changesDrawer.classList.contains('open')) updateCommitMessageControls();
 }, addMessage(message) {
   refs.defaultCommitMessage.value = message;
   refs.defaultCommitMessage.dispatchEvent(new Event('input', { bubbles: true }));
@@ -9271,6 +9471,7 @@ const repositoryStatusRefreshCoordinator = window.GitDrillDownRefresh.createRefr
     if (scope.repaintFolder && state.view === 'explorer' && state.currentPath === scope.folder) {
       await openDirectory(state.currentPath, { force: true, explorerOnly: true });
     }
+    ipcDiagnostics?.applied(changes);
     return true;
   },
 });
@@ -9376,7 +9577,7 @@ let searchTimeout; refs.search.addEventListener('input', () => {
 refs.search.addEventListener('keydown', event => {
   if (event.key === 'Enter' && state.view === 'graph') { event.preventDefault(); goToGraphSearchMatch(event.shiftKey ? -1 : 1); }
 });
-refs.commitMessage.addEventListener('input', renderChanges);
+refs.commitMessage.addEventListener('input', updateCommitMessageControls);
 async function returnToProjectNavigator() {
   closeSubmoduleGraph();
   if (state.view !== 'explorer') resetFooterForContextChange();
@@ -9894,6 +10095,7 @@ bindPanelResize($('#workingTreeResize'), {
   reset: () => resizeWorkingTree(280),
 });
 refs.commandHistoryMaximize.addEventListener('click', toggleCommandHistorySize);
+$('#recoverIndexLock').addEventListener('click', recoverIndexLockFromConsole);
 refs.commandHistoryDialog.addEventListener('close', () => { commandHistoryGeneration++; });
 $('#copyCommandHistory').addEventListener('click', () => copyText(refs.commandHistoryList.innerText, 'Console output copied'));
 bindPanelResize($('#commandHistoryResize'), {
@@ -10120,11 +10322,14 @@ refs.commitButton.addEventListener('click', async () => {
     commitPhase = 'write';
     jsPerfLog(`commit_ui: request=${trace} phase=write event=start`, performance.now() - commitStartedAt);
     const message = drawerPolarionReferences ? drawerPolarionReferences.message(refs.commitMessage.value) : refs.commitMessage.value;
-    if (folder) await invoke('commit_files', { repositoryPath: state.repository.path, files, message });
-    else await invoke('commit_staged', { repositoryPath: state.repository.path, message });
+    const repositoryPath = state.repository.path, generation = repoOpenGeneration;
+    if (folder) await invoke('commit_files', { repositoryPath, files, message });
+    else await invoke('commit_staged', { repositoryPath, message });
     commitPhase = 'refresh-after-successful-write';
     jsPerfLog(`commit_ui: request=${trace} phase=${commitPhase} event=start`, performance.now() - commitStartedAt);
-    refs.commitMessage.value = ''; drawerPolarionReferences?.reset(); refs.commitButton.textContent = 'Updating status…'; status(refs.commitButton.textContent, 'busy'); await loadRepository(state.repository.path, { reopenPath: folder });
+    if (state.repository?.path !== repositoryPath || generation !== repoOpenGeneration) { commitPhase = 'completed-context-changed'; return; }
+    refs.commitMessage.value = ''; drawerPolarionReferences?.reset(); refs.commitButton.textContent = 'Updating status…'; status(refs.commitButton.textContent, 'busy');
+    if (!await refreshAfterCompletedAction(repositoryPath, 'Commit succeeded. Do not repeat the commit.', { reopenPath: folder })) { commitPhase = 'refresh-not-applied'; return; }
     const successMsg = `Committed ${files.length} file${files.length === 1 ? '' : 's'}${folder ? ` in "${folder}"` : ''}. Push when you're ready to send it to the server.`;
     status(successMsg); showOperationToast(successMsg, 'success');
     commitPhase = 'completed';

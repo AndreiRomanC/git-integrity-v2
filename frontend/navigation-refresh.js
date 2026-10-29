@@ -13,7 +13,7 @@
     const verifiedHeads = new Map();
     const key = t => JSON.stringify([t.owner, t.generation, t.repositoryPath, t.rootHead, t.rootBranch]);
     const sameHead = (a, b) => a.head_oid === b.head_oid && a.branch === b.branch;
-    function ensure(target) {
+    function ensure(target, { readStatus = false, completeWith = null } = {}) {
       const id = key(target);
       const existing = jobs.get(id);
       if (existing) return existing.promise;
@@ -31,7 +31,9 @@
           throw new Error('The repository branch or HEAD changed outside the app. Use Refresh repository before continuing.');
         }
         const forceFresh = !target.expectedHead && !sameHead(before, verifiedHeads.get(id)?.head || {});
-        if (before.fresh && !forceFresh) return { refreshed: false };
+        // After Fetch the UI needs the current status snapshot even if another
+        // reader already warmed it. Reuse that snapshot; do not force a scan.
+        if (before.fresh && !forceFresh && !readStatus) return { refreshed: false };
         job.phase = 'refreshing'; job.refreshStartedAt = Date.now(); changed(); log('started', target, Date.now() - started);
         // Uses the same backend single-flight status scan and mutation epochs
         // as Working tree/Refresh; navigation clicks join, never queue reruns.
@@ -49,7 +51,11 @@
           log('failed', target, Date.now() - started);
         }
         throw error;
-      }).finally(() => {
+      }).finally(async () => {
+        // A post-Fetch refs read belongs to the same read-only verification.
+        // Do not release its write barrier if status finishes first. Errors
+        // from that companion read are reported by the caller, not hidden.
+        if (completeWith) await Promise.allSettled([completeWith]);
         if (job.phase !== 'error' || !current(target)) {
           if (jobs.get(id) === job) jobs.delete(id);
         }

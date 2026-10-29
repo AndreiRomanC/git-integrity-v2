@@ -269,101 +269,56 @@ fn restore_exact_checkpoint_locked(repository_path: &str, commit_id: &str, branc
     drop(object);
     drop(repo);
 
-    // This is intentionally separate from ordinary "Checkout this commit":
-    // it is the destructive "make my workspace exactly this checkpoint"
-    // operation. It discards tracked edits, removes untracked non-ignored
-    // leftovers (including whole embedded repositories), and forces submodule
-    // worktrees to the gitlinks recorded by the selected parent commit.
-    // Ignored artifacts outside removed embedded repositories stay in place.
-    //
-    // Never start this with `git clean -fd`. `git clean` is not transactional:
-    // it can remove nine files, fail on the tenth (locked/read-only/invalid on
-    // Windows), and return an error after the workspace has already been
-    // damaged. Move every untracked file or embedded repository into the Git
-    // directory first. Renames on the same volume are fast and reversible; if
-    // any later step fails we put them back, or retain the clearly-reported
-    // quarantine rather than silently deleting user data.
-    let mut submodule_quarantines = Vec::new();
-    restore_checkpoint_quarantine_submodule_leftovers(&repository_path, "before-checkout", &mut submodule_quarantines)
-        .map_err(|detail| format!("Could not safely prepare submodules for checkpoint {oid}. No checkout was attempted. {detail}"))?;
-    let mut quarantine = match RestoreCheckpointQuarantine::new(&repository_path) {
-        Ok(quarantine) => quarantine,
-        Err(detail) => {
-            let submodule_recovery = rollback_restore_quarantines(&mut submodule_quarantines);
-            return Err(format!("Could not create the parent safety area. {detail} {submodule_recovery}"));
-        }
-    };
-    if let Err(detail) = quarantine.move_untracked(&repository_path, "before-checkout") {
-        let submodule_recovery = rollback_restore_quarantines(&mut submodule_quarantines);
-        return Err(format!("Could not safely prepare workspace for checkpoint {oid}. No checkout was attempted. {detail} {submodule_recovery}"));
-    }
+    // Explicit Clean discards local work without making source backups,
+    // stashes or temporary worktrees. Build tools may scan even .git, so a
+    // recovery directory there can accidentally become a build input.
+    // Keep the existing scope: non-ignored untracked paths, including whole
+    // embedded repositories, plus tracked edits overwritten by checkout.
+    let targets = restore_checkpoint_clean_targets(repository_path, "before-cleanup")
+        .map_err(|detail| format!("No cleanup or submodule deinitialization was started. No checkout was attempted. {detail}"))?;
+    perf_log("restore_exact_checkpoint: clean policy=permanent-delete backup=false", Duration::ZERO);
 
     let restore_result = (|| -> Result<(), String> {
-        // Quarantining can take time. Recheck all known indexes immediately
-        // before deinit; a later external writer is still enforced by Git's
-        // own atomic index lock. Never remove someone else's lock to proceed.
-        for safety in std::iter::once(&quarantine).chain(submodule_quarantines.iter()) {
-            restore_checkpoint_wait_for_index(&safety.index_lock, "before-deinit", RESTORE_INDEX_LOCK_WAIT)
-                .map_err(|detail| format!("Stopped before submodule deinitialization or checkout. {detail}"))?;
+        // Check every known index before deleting anything. Recheck each
+        // target as it is cleaned and the whole set again before deinit.
+        // These checks do not remove locks or make deletion transactional.
+        for path in targets.iter().rev() {
+            restore_checkpoint_clean_untracked(&path.to_string_lossy(), "before-checkout")?;
         }
-        // Important subtlety: jumping between checkpoints with different
-        // submodule sets can leave old submodule worktrees behind unless the
-        // currently-registered submodules are deinitialized first. A plain
-        // checkout + submodule update only moves modules that still exist in
-        // the target commit; it does not reliably remove modules that existed
-        // only in the previous checkpoint.
-        restore_checkpoint_step(&repository_path, "deinit current submodules", &["submodule", "deinit", "--all", "--force"])
-            .map_err(|detail| format!("Could not deinitialize the current submodules before restoring checkpoint {oid}. HEAD was not changed, but the workspace may need Submodule update --init --recursive. Git said: {detail}"))?;
+        restore_checkpoint_check_indexes(&targets, "before-deinit")?;
+        // Checkout alone leaves worktrees for submodules absent from the new
+        // checkpoint. Deinitialize the current set before switching.
+        restore_checkpoint_step(repository_path, "deinit current submodules", &["submodule", "deinit", "--all", "--force"])
+            .map_err(|detail| format!("Could not deinitialize current submodules. HEAD was not changed, but the workspace may need Submodule update --init --recursive. Git said: {detail}"))?;
         restore_checkpoint_checkout(repository_path, &oid, branch.as_deref())?;
-        let _ = restore_checkpoint_optional_step(&repository_path, "sync submodule urls", &["submodule", "sync", "--recursive"]);
-        // A submodule present only in the old checkpoint becomes an ordinary
-        // untracked path only after checkout. Quarantine that second wave too,
-        // instead of reintroducing the same partial-delete bug after HEAD moved.
-        quarantine.move_untracked(&repository_path, "after-checkout")
-            .map_err(|detail| format!("Checkpoint was selected, but obsolete parent files could not all be moved safely. {detail}"))?;
-        if let Err(detail) = restore_checkpoint_step_with_timeout(
-            &repository_path,
+        restore_checkpoint_step(repository_path, "sync submodule urls", &["submodule", "sync", "--recursive"])?;
+        // Old gitlinks can become untracked paths only after checkout.
+        restore_checkpoint_clean_untracked(&targets[0].to_string_lossy(), "after-checkout")?;
+        restore_checkpoint_step_with_timeout(
+            repository_path,
             "init/update submodules",
             &["submodule", "update", "--init", "--recursive", "--force"],
             RESTORE_SUBMODULE_UPDATE_TIMEOUT,
             RESTORE_SUBMODULE_UPDATE_TIMEOUT_LABEL,
-        ) {
-            // The parent checkpoint is already checked out at this point. A
-            // hard reset of initialized submodules is best-effort, but do not
-            // run `git clean` here: deleting user files while reporting a
-            // failed restore recreates the exact partial-loss bug this flow is
-            // designed to prevent.
-            let verification = if restore_checkpoint_failure_category(&detail) == "index-locked" {
-                // Do not follow a concurrent writer's lock failure with more
-                // destructive Git commands in other initialized submodules.
-                String::new()
-            } else {
-                let _ = restore_checkpoint_optional_step(&repository_path, "cleanup after failed submodule update: reset initialized submodules", &["submodule", "foreach", "--recursive", "git reset --hard"]);
-                restore_checkpoint_verify(&repository_path).err().map(|error| format!(" Remaining state: {error}")).unwrap_or_default()
-            };
-            return Err(format!("Checkpoint {oid} was checked out, but submodule update failed. The restore is incomplete (maximum update time: {RESTORE_SUBMODULE_UPDATE_TIMEOUT_LABEL}). Resolve the reported cause before retrying exact checkpoint restore or Submodule update --init --recursive. Git said: {detail}{verification}"));
+        ).map_err(|detail| format!("Checkpoint {oid} was checked out, but submodule update failed (maximum update time: {RESTORE_SUBMODULE_UPDATE_TIMEOUT_LABEL}). Resolve the reported cause before retrying Clean checkout/Replace or Submodule update --init --recursive. Git said: {detail}"))?;
+        // Re-enumerate the new initialized set, which may differ from the
+        // previous checkpoint. Fail visibly; never continue after a reset error.
+        let current_targets = restore_checkpoint_clean_targets(repository_path, "after-update")?;
+        restore_checkpoint_step(repository_path, "reset submodules hard", &["submodule", "foreach", "--recursive", "git reset --hard"])?;
+        for path in current_targets.iter().rev() {
+            restore_checkpoint_clean_untracked(&path.to_string_lossy(), "after-update")?;
         }
-        let _ = restore_checkpoint_optional_step(&repository_path, "reset submodules hard", &["submodule", "foreach", "--recursive", "git reset --hard"]);
-        restore_checkpoint_quarantine_submodule_leftovers(&repository_path, "after-checkout", &mut submodule_quarantines)
-            .map_err(|detail| format!("Checkpoint restored, but submodule leftovers could not be removed safely: {detail}"))?;
-        restore_checkpoint_verify(&repository_path)
-            .map_err(|detail| format!("Checkpoint {oid} restore finished, but verification found the workspace is not exact yet: {detail}. Retry exact checkpoint restore or run Submodule update --init --recursive before trusting this checkout."))?;
+        restore_checkpoint_verify(repository_path)
+            .map_err(|detail| format!("Checkpoint {oid} verification found the workspace is not exact yet: {detail}"))?;
         Ok(())
     })();
 
-    if let Err(detail) = restore_result {
-        let submodule_recovery = rollback_restore_quarantines(&mut submodule_quarantines);
-        let recovery = quarantine.rollback();
-        return Err(format!("{detail} {submodule_recovery} {recovery}"));
-    }
-    let mut cleanup_errors = discard_restore_quarantines(&mut submodule_quarantines);
-    if let Err(detail) = quarantine.discard() { cleanup_errors.push(detail); }
-    if !cleanup_errors.is_empty() {
-        return Err(format!("Checkpoint {oid} was restored successfully, but {} temporary safety backup(s) could not be removed: {}", cleanup_errors.len(), cleanup_errors.join(" ")));
-    }
-    invalidate_git_metadata(&repository_path);
-    invalidate_submodule_sync(&repository_path);
-    Ok(())
+    // A failed command can have partially deleted or checked out files. Do
+    // not restore old files, issue further destructive commands or reuse the
+    // pre-clean status snapshot. The user must inspect/retry explicitly.
+    invalidate_git_metadata(repository_path);
+    invalidate_submodule_sync(repository_path);
+    restore_result.map_err(|detail| format!("{detail}\nClean is incomplete. Local files may already have been permanently deleted or overwritten. No backup was created and no files were restored. Inspect the workspace before retrying."))
 }
 
 #[derive(Serialize, Debug)]
@@ -452,157 +407,36 @@ fn clean_branch_from_upstream_inner(repository_path: String, branch: String, ups
     result
 }
 
-// Temporary, same-repository safety area for non-ignored untracked paths.
-// It lives under the real Git directory so Git never sees it as another
-// untracked item and so ordinary repositories keep renames on one volume.
-struct RestoreCheckpointQuarantine {
-    root: PathBuf,
-    workdir: PathBuf,
-    index_lock: PathBuf,
-    moved: Vec<(PathBuf, PathBuf)>,
-}
-
-impl RestoreCheckpointQuarantine {
-    fn new(repository_path: &str) -> Result<Self, String> {
-        let repo = internal_repository(repository_path)?;
-        let workdir = repo.workdir().ok_or("A clean checkpoint requires a working-tree repository")?.to_path_buf();
-        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-            .map_err(|error| error.to_string())?.as_nanos();
-        let root = repo.path().join("gdd-restore").join(format!("{}-{stamp}", std::process::id()));
-        let index_lock = repo.path().join("index.lock");
-        Ok(Self { root, workdir, index_lock, moved: Vec::new() })
-    }
-
-    fn move_untracked(&mut self, repository_path: &str, phase: &str) -> Result<usize, String> {
-        let started = Instant::now();
-        // `-z` makes spaces/newlines unambiguous. Deliberately omit
-        // `--directory`: collapsing a folder can accidentally include ignored
-        // build artifacts, while this operation promises to preserve them.
-        let output = git(repository_path, &["ls-files", "--others", "--exclude-standard", "-z"])
-            .map_err(|detail| format!("Could not inspect untracked files: {detail}"))?;
-        let raw_paths = output.split('\0').filter(|path| !path.is_empty()).collect::<Vec<_>>();
-
-        // Git reports embedded untracked repositories as trailing-slash
-        // directories even without --directory. Clean checkout explicitly
-        // confirms their removal, including local history. Move each WHOLE
-        // directory using the existing quarantine, then discard it on success.
-        // Never follow its .git file to delete external/shared Git metadata.
-        let embedded_count = raw_paths.iter().filter(|path| path.ends_with('/')).count();
-        let mut candidates = Vec::with_capacity(raw_paths.len());
-        for raw in raw_paths {
-            let relative = safe_relative_path(raw)
-                .map_err(|_| "Git reported an unsafe untracked path. Nothing was moved; inspect the repository from a terminal before retrying.".to_string())?;
-            if !matches!(relative.components().next(), Some(Component::Normal(_))) || relative.starts_with(".git") {
-                return Err("Git reported an unsafe untracked path. Nothing was moved.".into());
-            }
-            candidates.push((self.workdir.join(&relative), self.root.join(phase).join(relative)));
-        }
-        if embedded_count > 0 {
-            perf_log(&format!("restore_exact_checkpoint: quarantine {phase} embedded_repositories={embedded_count} repo={}", anonymized_repository_id(repository_path)), Duration::ZERO);
-        }
-
-        let phase_start = self.moved.len();
-        for (source, destination) in candidates {
-            // A concurrent external process may remove a path after ls-files.
-            // Missing is harmless; every path that still exists must move.
-            if fs::symlink_metadata(&source).is_err() { continue; }
-            if let Some(parent) = destination.parent() {
-                if let Err(error) = fs::create_dir_all(parent) {
-                    let rollback = self.rollback_from(phase_start);
-                    return Err(format!("Could not create the temporary safety area: {error}. {rollback}"));
-                }
-            }
-            if let Err(error) = fs::rename(&source, &destination) {
-                let rollback = self.rollback_from(phase_start);
-                let path = source.strip_prefix(&self.workdir).unwrap_or(&source).display();
-                return Err(format!("Local path \"{path}\" could not be moved into the temporary safety area (it may be open, locked or read-only): {error}. {rollback}"));
-            }
-            self.moved.push((source, destination));
-        }
-        let count = self.moved.len() - phase_start;
-        // At this point every listed untracked path is in the quarantine,
-        // including embedded repositories. Let Git remove empty directory shells.
-        // This preserves the previous exact-checkout behavior (notably old,
-        // deinitialized submodule folders) without exposing file contents to
-        // git-clean's non-transactional deletion.
-        if let Err(detail) = restore_checkpoint_step(repository_path, &format!("remove empty parent directories ({phase})"), &["clean", "-fd"]) {
-            let rollback = self.rollback_from(phase_start);
-            return Err(format!("Empty leftover directories could not be removed safely: {detail}. {rollback}"));
-        }
-        perf_log(&format!("restore_exact_checkpoint: quarantine {phase} ok ({count} paths)"), started.elapsed());
-        Ok(count)
-    }
-
-    fn rollback_from(&mut self, start: usize) -> String {
-        let mut restored = 0usize;
-        let mut retained = 0usize;
-        for index in (start..self.moved.len()).rev() {
-            let (source, backup) = &self.moved[index];
-            if fs::symlink_metadata(backup).is_err() { continue; }
-            if fs::symlink_metadata(source).is_ok() {
-                retained += 1;
-                continue;
-            }
-            if let Some(parent) = source.parent() { let _ = fs::create_dir_all(parent); }
-            if fs::rename(backup, source).is_ok() { restored += 1; } else { retained += 1; }
-        }
-        self.moved.truncate(start);
-        let _ = remove_empty_restore_directories(&self.root);
-        if retained == 0 {
-            format!("Restored {restored} temporarily moved local file{}.", if restored == 1 { "" } else { "s" })
-        } else {
-            format!("Restored {restored} temporarily moved local file(s); {retained} could not be returned and remain safely under {}.", self.root.display())
-        }
-    }
-
-    fn rollback(&mut self) -> String {
-        let message = self.rollback_from(0);
-        perf_log("restore_exact_checkpoint: quarantine rollback", Duration::ZERO);
-        message
-    }
-
-    fn discard(&mut self) -> Result<(), String> {
-        if !self.root.exists() { return Ok(()); }
-        fs::remove_dir_all(&self.root)
-            .map_err(|error| format!("The backup remains at {} ({error}). The restored working tree itself is already at the requested checkpoint.", self.root.display()))?;
-        self.moved.clear();
-        Ok(())
-    }
-}
-
-fn remove_empty_restore_directories(path: &Path) -> std::io::Result<()> {
-    if !path.exists() { return Ok(()); }
-    for entry in fs::read_dir(path)? {
-        let child = entry?.path();
-        // Embedded repositories may contain symlinks/junctions. Cleanup must
-        // never traverse them into another checkout or outside this repository.
-        if child.symlink_metadata()?.file_type().is_dir() { let _ = remove_empty_restore_directories(&child); }
-    }
-    if fs::read_dir(path)?.next().is_none() { fs::remove_dir(path)?; }
-    Ok(())
-}
-
-fn restore_checkpoint_quarantine_submodule_leftovers(repository_path: &str, phase: &str, quarantines: &mut Vec<RestoreCheckpointQuarantine>) -> Result<(), String> {
-    let mut paths = Vec::new();
+// Read-only preflight of the parent and every initialized recursive child.
+// Retain real Git directories for index-lock checks (gitfiles/worktrees too).
+fn restore_checkpoint_clean_targets(repository_path: &str, phase: &str) -> Result<Vec<PathBuf>, String> {
+    let repo = internal_repository(repository_path)?;
+    let workdir = repo.workdir().ok_or("A clean checkpoint requires a working-tree repository")?.to_path_buf();
     let mut visited = HashSet::new();
-    collect_initialized_submodule_workdirs(Path::new(repository_path), &mut visited, &mut paths)?;
-    // Check the complete initialized set BEFORE moving the first file. Reuse
-    // the existing traversal; no status scans, extra Git processes or fetches.
-    let prepared = paths.iter().map(|path| RestoreCheckpointQuarantine::new(&path.to_string_lossy()))
-        .collect::<Result<Vec<_>, _>>()?;
-    for safety in &prepared {
-        restore_checkpoint_wait_for_index(&safety.index_lock, phase, RESTORE_INDEX_LOCK_WAIT)?;
-    }
-    for (path, mut quarantine) in paths.iter().zip(prepared) {
-        let submodule_path = path.to_string_lossy().into_owned();
-        if let Err(error) = quarantine.move_untracked(&submodule_path, phase) {
-            let current_recovery = quarantine.rollback();
-            let earlier_recovery = rollback_restore_quarantines(quarantines);
-            return Err(format!("{error} {current_recovery} {earlier_recovery}"));
-        }
-        quarantines.push(quarantine);
+    visited.insert(fs::canonicalize(&workdir).map_err(|error| format!("Cannot resolve clean working tree: {error}"))?);
+    let mut paths = vec![workdir.clone()];
+    collect_initialized_submodule_workdirs(&workdir, &mut visited, &mut paths)?;
+    restore_checkpoint_check_indexes(&paths, phase)?;
+    Ok(paths)
+}
+
+fn restore_checkpoint_check_indexes(paths: &[PathBuf], phase: &str) -> Result<(), String> {
+    for path in paths {
+        let repo = internal_repository(&path.to_string_lossy())?;
+        restore_checkpoint_wait_for_index(&repo.path().join("index.lock"), phase, RESTORE_INDEX_LOCK_WAIT)?;
     }
     Ok(())
+}
+
+fn restore_checkpoint_clean_untracked(repository_path: &str, phase: &str) -> Result<(), String> {
+    let repo = internal_repository(repository_path)?;
+    restore_checkpoint_wait_for_index(&repo.path().join("index.lock"), phase, RESTORE_INDEX_LOCK_WAIT)?;
+    drop(repo);
+    // Two -f flags authorize removal of untracked embedded repositories,
+    // already covered by the destructive confirmation. Deliberately no -x:
+    // ignored artifacts outside removed embedded repositories stay untouched.
+    // Git does not follow symlinks or gitfiles to delete external metadata.
+    restore_checkpoint_step(repository_path, &format!("delete untracked files ({phase})"), &["clean", "-ffd"]).map(|_| ())
 }
 
 fn collect_initialized_submodule_workdirs(repository_path: &Path, visited: &mut HashSet<PathBuf>, paths: &mut Vec<PathBuf>) -> Result<(), String> {
@@ -619,22 +453,6 @@ fn collect_initialized_submodule_workdirs(repository_path: &Path, visited: &mut 
     Ok(())
 }
 
-fn rollback_restore_quarantines(quarantines: &mut Vec<RestoreCheckpointQuarantine>) -> String {
-    if quarantines.is_empty() { return "No submodule local files needed recovery.".into(); }
-    let count = quarantines.len();
-    let messages = quarantines.iter_mut().rev().map(RestoreCheckpointQuarantine::rollback).collect::<Vec<_>>();
-    quarantines.clear();
-    format!("Recovered local files for {count} submodule(s): {}", messages.join(" "))
-}
-
-fn discard_restore_quarantines(quarantines: &mut Vec<RestoreCheckpointQuarantine>) -> Vec<String> {
-    let mut errors = Vec::new();
-    for quarantine in quarantines.iter_mut() {
-        if let Err(error) = quarantine.discard() { errors.push(error); }
-    }
-    quarantines.clear();
-    errors
-}
 
 // The real Git directory handles .git files, linked worktrees and submodules.
 // Merely checking .git/index.lock under the visible folder would miss them.
@@ -662,7 +480,7 @@ fn restore_checkpoint_wait_for_index(lock_path: &Path, phase: &str, max_wait: Du
                 }
                 if started.elapsed() >= max_wait {
                     perf_log(&format!("restore_index_guard: phase={phase} scope={scope} result=index-locked owner=unknown lock_removed=false"), started.elapsed());
-                    return Err(format!("Git index is locked (index.lock): {}. Another Git operation may be active, or an interrupted operation may have left this lock. It was not removed. Wait for other Git operations to finish and retry. If it persists, confirm that no process uses this repository before recovering the lock manually.", lock_path.display()));
+                    return Err(format!("Git index is locked (index.lock): {}. Another Git operation may be active, or an interrupted operation may have left this lock. It was not removed. Wait for other Git operations to finish and retry. If it persists, close other Git applications, double-click the bottom status bar and choose Check / recover index lock. Recovery requires confirmation and does not restart this operation.", lock_path.display()));
                 }
                 std::thread::sleep(Duration::from_millis(50).min(max_wait.saturating_sub(started.elapsed())));
             }
@@ -694,17 +512,6 @@ fn restore_checkpoint_step_with_timeout(repository_path: &str, label: &str, args
     let started = Instant::now();
     let result = git_with_timeout(repository_path, args, timeout, timeout_label).map_err(|detail| restore_checkpoint_failure_detail(&detail));
     restore_checkpoint_perf_log(label, &result, started.elapsed());
-    result
-}
-
-fn restore_checkpoint_optional_step(repository_path: &str, label: &str, args: &[&str]) -> Result<String, String> {
-    let started = Instant::now();
-    let result = git(repository_path, args).map_err(|detail| restore_checkpoint_failure_detail(&detail));
-    if let Err(detail) = &result {
-        perf_log(&format!("restore_exact_checkpoint: {label} ignored ERROR ({})", restore_checkpoint_failure_category(detail)), started.elapsed());
-    } else {
-        perf_log(&format!("restore_exact_checkpoint: {label} ok"), started.elapsed());
-    }
     result
 }
 
@@ -860,7 +667,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_checkpoint_checks_all_submodule_locks_before_moving_any_files() {
+    fn exact_checkpoint_checks_all_submodule_locks_before_deleting_any_files() {
         let f = UpstreamFixture::new();
         // A gitfile and a recursive child exercise real Git dirs, not a
         // hard-coded <visible-worktree>/.git/index.lock location.
@@ -891,7 +698,7 @@ mod tests {
             assert!(path.join("loose.txt").exists());
             assert_eq!(fs::read(git_dir.join("index")).unwrap(), index);
             assert_eq!(fs::read(git_dir.join("config")).unwrap(), config, "must not deinit any module");
-            assert!(!git_dir.join("gdd-restore").exists(), "must check every child before moving the first file");
+            assert!(!git_dir.join("gdd-restore").exists(), "Clean must not create source backups");
         }
         assert_eq!(upstream_git(&f.local, &["rev-parse", "HEAD"]), head);
     }
@@ -1061,6 +868,7 @@ mod tests {
     fn clean_upstream_failed_submodule_update_does_not_move_local_branch_or_claim_success() {
         let f = UpstreamFixture::new();
         let before = upstream_git(&f.local, &["rev-parse", "HEAD"]);
+        fs::write(f.local.join("loose.tdcl"), "discard, never restore after Clean\n").unwrap();
         fs::write(f.remote.join(".gitmodules"), format!("[submodule \"missing\"]\npath = missing\nurl = {}\n", f.base.join("no-such-remote").display())).unwrap();
         upstream_git(&f.remote, &["add", ".gitmodules"]);
         upstream_git(&f.remote, &["update-index", "--add", "--cacheinfo", &format!("160000,{before},missing")]);
@@ -1068,6 +876,9 @@ mod tests {
         let error = f.clean(&before).unwrap_err();
         assert!(error.contains("did not complete"), "{error}");
         assert!(error.contains("local branch pointer was not reset"), "{error}");
+        assert!(error.contains("No backup was created and no files were restored"), "{error}");
+        assert!(!f.local.join("loose.tdcl").exists());
+        assert!(!f.local.join(".git/gdd-restore").exists());
         assert_eq!(upstream_git(&f.local, &["rev-parse", "my-main"]), before);
         assert_eq!(upstream_git(&f.local, &["branch", "--show-current"]), "");
     }
@@ -1122,133 +933,131 @@ mod tests {
     }
 
     #[test]
-    fn exact_checkpoint_quarantine_is_reversible_and_preserves_ignored_files() {
-        let suffix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-        let repository = std::env::temp_dir().join(format!("git-integrity-restore-quarantine-{suffix}"));
-        fs::create_dir_all(repository.join("mixed")).unwrap();
-        fs::write(repository.join("tracked.txt"), "tracked\n").unwrap();
-        fs::write(repository.join(".gitignore"), "*.ignored\n").unwrap();
-        let run = |args: &[&str]| {
-            let status = Command::new("git").arg("-C").arg(&repository).args(args).status().unwrap();
-            assert!(status.success(), "git command failed: {args:?}");
-        };
-        run(&["init", "-b", "main"]);
-        run(&["config", "user.email", "test@example.com"]);
-        run(&["config", "user.name", "Test User"]);
-        run(&["add", ".gitignore", "tracked.txt"]);
-        run(&["commit", "-m", "Initial"]);
-        fs::write(repository.join("loose.txt"), "loose\n").unwrap();
-        fs::write(repository.join("mixed/free.txt"), "free\n").unwrap();
-        fs::write(repository.join("mixed/build.ignored"), "keep\n").unwrap();
+    fn exact_checkpoint_clean_deletes_untracked_without_backups_and_keeps_ignored() {
+        let f = UpstreamFixture::new();
+        fs::create_dir(f.local.join("mixed")).unwrap();
+        fs::write(f.local.join("loose.txt"), "discard\n").unwrap();
+        fs::write(f.local.join("mixed/free.txt"), "discard\n").unwrap();
+        fs::write(f.local.join("mixed/build.ignored"), "keep\n").unwrap();
+        let index = fs::read(f.local.join(".git/index")).unwrap();
+        let config = fs::read(f.local.join(".git/config")).unwrap();
 
-        let path = repository.to_string_lossy().into_owned();
-        let mut quarantine = RestoreCheckpointQuarantine::new(&path).unwrap();
-        assert_eq!(quarantine.move_untracked(&path, "test").unwrap(), 2);
-        assert!(!repository.join("loose.txt").exists());
-        assert!(!repository.join("mixed/free.txt").exists());
-        assert!(repository.join("mixed/build.ignored").exists(), "ignored artifacts must never be quarantined or cleaned");
-
-        let recovery = quarantine.rollback();
-        assert!(recovery.contains("Restored 2"));
-        assert!(repository.join("loose.txt").exists());
-        assert!(repository.join("mixed/free.txt").exists());
-        assert!(repository.join("mixed/build.ignored").exists());
-        fs::remove_dir_all(repository).unwrap();
+        restore_checkpoint_clean_untracked(&f.local.to_string_lossy(), "test").unwrap();
+        assert!(!f.local.join("loose.txt").exists());
+        assert!(!f.local.join("mixed/free.txt").exists());
+        assert_eq!(fs::read_to_string(f.local.join("mixed/build.ignored")).unwrap(), "keep\n");
+        assert_eq!(fs::read_to_string(f.local.join("file.txt")).unwrap(), "base\n");
+        assert_eq!(fs::read(f.local.join(".git/index")).unwrap(), index);
+        assert_eq!(fs::read(f.local.join(".git/config")).unwrap(), config);
+        assert!(!f.local.join(".git/gdd-restore").exists());
     }
 
     #[test]
-    fn exact_checkpoint_quarantine_removes_embedded_repositories_and_can_roll_back_failure() {
-        let suffix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-        let repository = std::env::temp_dir().join(format!("git-integrity-restore-nested-{suffix}"));
-        fs::create_dir_all(&repository).unwrap();
-        fs::write(repository.join("tracked.txt"), "tracked\n").unwrap();
-        let run = |path: &Path, args: &[&str]| {
-            let status = Command::new("git").arg("-C").arg(path).args(args).status().unwrap();
-            assert!(status.success(), "git command failed: {args:?}");
-        };
-        run(&repository, &["init", "-b", "main"]);
-        run(&repository, &["config", "user.email", "test@example.com"]);
-        run(&repository, &["config", "user.name", "Test User"]);
-        run(&repository, &["add", "tracked.txt"]);
-        run(&repository, &["commit", "-m", "Initial"]);
-        fs::write(repository.join("loose.txt"), "must survive\n").unwrap();
-        fs::create_dir_all(repository.join("nested")).unwrap();
-        run(&repository.join("nested"), &["init"]);
-        run(&repository.join("nested"), &["config", "user.email", "test@example.com"]);
-        run(&repository.join("nested"), &["config", "user.name", "Test User"]);
-        fs::write(repository.join("nested/local.txt"), "local-only history\n").unwrap();
-        fs::write(repository.join("nested/.gitignore"), "*.ignored\n").unwrap();
-        run(&repository.join("nested"), &["add", "."]);
-        run(&repository.join("nested"), &["commit", "-m", "Unpublished embedded commit"]);
-        fs::write(repository.join("nested/cache.ignored"), "discard with nested repository\n").unwrap();
-        fs::write(repository.join("nested/local.txt"), "uncommitted nested edit\n").unwrap();
+    fn exact_checkpoint_clean_deletes_embedded_repositories_without_recovery_copies() {
+        let f = UpstreamFixture::new();
+        let nested = f.local.join("nested");
+        fs::create_dir(&nested).unwrap();
+        upstream_git(&nested, &["init"]);
+        fs::write(nested.join(".gitignore"), "*.ignored\n").unwrap();
+        fs::write(nested.join("local.txt"), "local-only history\n").unwrap();
+        upstream_git(&nested, &["add", "."]);
+        upstream_git(&nested, &["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "embedded commit"]);
+        fs::write(nested.join("cache.ignored"), "discard with nested repository\n").unwrap();
 
-        let path = repository.to_string_lossy().into_owned();
-        let mut quarantine = RestoreCheckpointQuarantine::new(&path).unwrap();
-        assert_eq!(quarantine.move_untracked(&path, "test").unwrap(), 2);
-        assert!(!repository.join("loose.txt").exists());
-        assert!(!repository.join("nested").exists());
-        quarantine.rollback();
-        assert!(repository.join("loose.txt").exists());
-        assert!(repository.join("nested/.git").exists());
-        assert_eq!(fs::read_to_string(repository.join("nested/local.txt")).unwrap(), "uncommitted nested edit\n");
-        run(&repository.join("nested"), &["cat-file", "-e", "HEAD:local.txt"]);
-
-        assert_eq!(quarantine.move_untracked(&path, "retry").unwrap(), 2);
-        quarantine.discard().unwrap();
-        assert!(!repository.join("nested").exists(), "confirmed Clean removes the whole embedded repository");
-        assert!(!quarantine.root.exists(), "successful Clean leaves no extra safety copy");
-        run(&repository, &["cat-file", "-e", "HEAD:tracked.txt"]);
-        fs::remove_dir_all(repository).unwrap();
+        restore_checkpoint_clean_untracked(&f.local.to_string_lossy(), "test").unwrap();
+        assert!(!nested.exists(), "confirmed Clean removes the entire untracked embedded repository");
+        assert!(!f.local.join(".git/gdd-restore").exists());
+        upstream_git(&f.local, &["cat-file", "-e", "HEAD:file.txt"]);
     }
 
     #[test]
-    fn exact_checkpoint_quarantine_does_not_delete_gitfile_targets() {
-        let suffix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-        let base = std::env::temp_dir().join(format!("git-integrity-restore-gitfile-{suffix}"));
-        let repository = base.join("parent");
-        let external = base.join("external-git");
-        let nested = repository.join("nested");
-        fs::create_dir_all(&nested).unwrap();
-        let run = |args: &[&str]| {
-            let output = Command::new("git").arg("-C").arg(&repository).args(args).output().unwrap();
-            assert!(output.status.success(), "git failed: {}", String::from_utf8_lossy(&output.stderr));
-        };
-        run(&["init"]);
-        run(&["init", "--separate-git-dir", external.to_str().unwrap(), nested.to_str().unwrap()]);
+    fn exact_checkpoint_clean_does_not_delete_gitfile_targets() {
+        let f = UpstreamFixture::new();
+        let external = f.base.join("external-git");
+        let nested = f.local.join("nested");
+        upstream_git(&f.local, &["init", "--separate-git-dir", external.to_str().unwrap(), nested.to_str().unwrap()]);
         fs::write(nested.join("local.txt"), "discard\n").unwrap();
-        let gitfile = fs::read(nested.join(".git")).unwrap();
         let external_config = fs::read(external.join("config")).unwrap();
-        let path = repository.to_string_lossy().into_owned();
-        let mut quarantine = RestoreCheckpointQuarantine::new(&path).unwrap();
-        assert_eq!(quarantine.move_untracked(&path, "test").unwrap(), 1);
-        quarantine.rollback();
-        assert_eq!(fs::read(nested.join(".git")).unwrap(), gitfile);
-        assert_eq!(quarantine.move_untracked(&path, "retry").unwrap(), 1);
-        quarantine.discard().unwrap();
+
+        restore_checkpoint_clean_untracked(&f.local.to_string_lossy(), "test").unwrap();
         assert!(!nested.exists());
         assert_eq!(fs::read(external.join("config")).unwrap(), external_config, "never follow .git to remove external metadata");
-        fs::remove_dir_all(base).unwrap();
+        assert!(!f.local.join(".git/gdd-restore").exists());
     }
 
     #[cfg(unix)]
     #[test]
-    fn exact_checkpoint_quarantine_cleanup_does_not_follow_symlinks() {
-        let suffix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-        let base = std::env::temp_dir().join(format!("git-integrity-restore-symlink-{suffix}"));
-        let safety = base.join("safety");
-        let outside = base.join("outside");
-        fs::create_dir_all(&safety).unwrap();
+    fn exact_checkpoint_clean_does_not_follow_symlinks() {
+        let f = UpstreamFixture::new();
+        let outside = f.base.join("outside");
         fs::create_dir_all(outside.join("empty-child")).unwrap();
         fs::write(outside.join("keep.txt"), "outside checkout\n").unwrap();
-        std::os::unix::fs::symlink(&outside, safety.join("link")).unwrap();
-        remove_empty_restore_directories(&safety).unwrap();
-        assert!(outside.join("empty-child").exists(), "cleanup must not walk into a symlink");
-        let mut quarantine = RestoreCheckpointQuarantine { root: safety, workdir: base.clone(), index_lock: base.join(".git/index.lock"), moved: Vec::new() };
-        quarantine.discard().unwrap();
+        std::os::unix::fs::symlink(&outside, f.local.join("link")).unwrap();
+
+        restore_checkpoint_clean_untracked(&f.local.to_string_lossy(), "test").unwrap();
+        assert!(fs::symlink_metadata(f.local.join("link")).is_err());
         assert!(outside.join("empty-child").exists());
         assert_eq!(fs::read_to_string(outside.join("keep.txt")).unwrap(), "outside checkout\n");
-        fs::remove_dir_all(base).unwrap();
+        assert!(!f.local.join(".git/gdd-restore").exists());
+    }
+
+    #[test]
+    fn exact_checkpoint_clean_branch_removes_obsolete_submodule_without_source_backups() {
+        let f = UpstreamFixture::new();
+        let target = upstream_git(&f.local, &["rev-parse", "HEAD"]);
+        upstream_git(&f.local, &["branch", "without-module"]);
+        upstream_git(&f.local, &["-c", "protocol.file.allow=always", "submodule", "add", f.remote.to_str().unwrap(), "module"]);
+        upstream_git(&f.local, &["commit", "-am", "add module"]);
+        let previous = upstream_git(&f.local, &["rev-parse", "HEAD"]);
+        fs::create_dir(f.local.join("module/i")).unwrap();
+        fs::write(f.local.join("module/i/input.tdcl"), "untracked generated input\n").unwrap();
+        fs::write(f.local.join("loose.txt"), "discard\n").unwrap();
+        let module_git = Repository::open(f.local.join("module")).unwrap().path().to_path_buf();
+
+        restore_exact_checkpoint_inner_with_branch(f.local.to_string_lossy().into(), target.clone(), Some("without-module".into())).unwrap();
+        assert_eq!(upstream_git(&f.local, &["branch", "--show-current"]), "without-module");
+        assert_eq!(upstream_git(&f.local, &["rev-parse", "HEAD"]), target);
+        assert_eq!(upstream_git(&f.local, &["rev-parse", "my-main"]), previous);
+        assert_eq!(upstream_git(&f.local, &["status", "--porcelain"]), "");
+        assert!(!f.local.join("module").exists());
+        assert!(!f.local.join("loose.txt").exists());
+        assert!(!f.local.join(".git/gdd-restore").exists());
+        assert!(!module_git.join("gdd-restore").exists());
+        assert!(module_git.join("objects").exists(), "preserve real Git metadata for registered submodules");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_checkpoint_late_checkout_failure_does_not_restore_deleted_files_or_make_backups() {
+        use std::os::unix::fs::PermissionsExt;
+        let f = UpstreamFixture::new();
+        let head = upstream_git(&f.local, &["rev-parse", "HEAD"]);
+        fs::write(f.local.join("loose.txt"), "discard\n").unwrap();
+        // Git can fail after cleanup and after checkout side effects. No
+        // automatic recovery copies, retries or further destructive commands.
+        let hook = f.local.join(".git/hooks/post-checkout");
+        fs::write(&hook, "#!/bin/sh\necho test-checkout-refused >&2\nexit 1\n").unwrap();
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+        let error = restore_exact_checkpoint_inner(f.local.to_string_lossy().into(), head).unwrap_err();
+        assert!(error.contains("Clean is incomplete"), "{error}");
+        assert!(error.contains("No backup was created and no files were restored"), "{error}");
+        assert!(error.contains("test-checkout-refused"), "{error}");
+        assert!(!f.local.join("loose.txt").exists(), "deleted files must not reappear after a failed Clean");
+        assert!(!f.local.join(".git/gdd-restore").exists());
+    }
+
+    #[test]
+    fn exact_checkpoint_clean_does_not_touch_legacy_backups_or_other_git_metadata() {
+        let f = UpstreamFixture::new();
+        let legacy = f.local.join(".git/gdd-restore/legacy/before-checkout/i");
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(legacy.join("old.tdcl"), "legacy recovery data\n").unwrap();
+        fs::write(f.local.join("loose.tdcl"), "discard\n").unwrap();
+        let head = upstream_git(&f.local, &["rev-parse", "HEAD"]);
+        restore_exact_checkpoint_inner(f.local.to_string_lossy().into(), head).unwrap();
+        assert!(!f.local.join("loose.tdcl").exists());
+        assert_eq!(fs::read_to_string(legacy.join("old.tdcl")).unwrap(), "legacy recovery data\n");
+        assert_eq!(fs::read_dir(f.local.join(".git/gdd-restore")).unwrap().count(), 1, "do not create another backup");
     }
 
     #[test]

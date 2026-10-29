@@ -20,7 +20,7 @@ function harness() {
   let badges = 0;
   const state = { repository: { path: 'repo-a' }, changes: ['initial'], statusReady: false, view: 'explorer', currentPath: '' };
   const context = {
-    state, repoOpenGeneration: 1,
+    state, repoOpenGeneration: 1, ipcDiagnostics: { applied: result => assert.equal(result, state.changes) },
     window: { GitDrillDownRefresh: { createRefreshCoordinator(options) {
       return refresh.createRefreshCoordinator({ ...options, log: (event, details) => events.push({ event, ...details }) });
     } } },

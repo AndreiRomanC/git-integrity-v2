@@ -31,6 +31,8 @@ test('red action uses configured upstream, including differently named branch an
   assert.equal(confirmations[0][1].danger,true);
   assert.match(confirmations[0][0],/No Push; nothing on the server is changed/);
   assert.match(confirmations[0][0],/local-only commits are removed/);
+  assert.match(confirmations[0][0],/No backup or temporary copy is created/);
+  assert.match(confirmations[0][0],/already deleted files are not restored/);
   assert.equal(refresh.length,2);
 });
 test('unrelated refs, detached HEAD and missing upstream never offer destructive reset', () => {

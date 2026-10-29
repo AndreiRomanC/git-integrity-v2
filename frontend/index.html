@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Git DrillDown</title>
   <link rel="icon" type="image/png" href="assets/git-drilldown-mark.png">
-  <link rel="stylesheet" href="styles.css?v=20261028-command-console">
-  <link rel="stylesheet" href="polarion.css?v=20261028-command-console">
+  <link rel="stylesheet" href="styles.css?v=20261029-clean-no-backups">
+  <link rel="stylesheet" href="polarion.css?v=20261029-clean-no-backups">
 </head>
 <body>
   <div id="startupIntro" class="startup-intro" hidden>
@@ -17,7 +17,7 @@
       <div id="startupIntroFailure" class="startup-intro-failure" hidden><p>Reload the window to retry.</p><button type="button" id="startupIntroRetry">Reload interface</button></div>
     </div>
   </div>
-  <script src="startup-intro.js?v=20261028-command-console"></script>
+  <script src="startup-intro.js?v=20261029-clean-no-backups"></script>
   <div class="app-shell">
     <header class="topbar">
       <div class="brand" aria-label="Git DrillDown">
@@ -854,7 +854,7 @@
     <form method="dialog">
       <header><div><h2 id="commandHistoryTitle">Git command console</h2><p>Current app message and captured Git output · this session</p></div><button type="button" id="commandHistoryMaximize" aria-pressed="false">Maximize</button><button value="cancel" aria-label="Close command console">×</button></header>
       <div id="commandHistoryList" class="conflicts-list" tabindex="0" aria-label="Captured messages and command output"></div>
-      <footer><span>Drag the lower-right corner to resize. Very large captured output may be truncated.</span><button type="button" id="copyCommandHistory">Copy all</button><button value="cancel">Close</button></footer>
+      <footer><span>Drag the lower-right corner to resize. Very large captured output may be truncated.</span><button type="button" id="recoverIndexLock" hidden>Check / recover index lock…</button><button type="button" id="copyCommandHistory">Copy all</button><button value="cancel">Close</button></footer>
     </form>
     <div id="commandHistoryResize" class="panel-resize-corner" role="button" aria-label="Resize command console" tabindex="0" title="Drag or use arrow keys to resize · double-click to reset">◢</div>
   </dialog>
@@ -963,22 +963,23 @@
       <footer><span>Read-only on Polarion · local snapshots outside Git</span><button value="cancel">Close</button><button type="button" id="polarionAdd" class="confirm" disabled>Add to Commit List</button></footer>
     </form>
   </dialog>
-  <script src="polarion.js?v=20261028-command-console"></script>
-  <script src="console-context.js?v=20261028-command-console"></script>
-  <script src="graph-model.js?v=20261028-command-console"></script>
-  <script src="submodule-state.js?v=20261028-command-console"></script>
-  <script src="submodule-versions.js?v=20261028-command-console"></script>
-  <script src="local-diff.js?v=20261028-command-console"></script>
-  <script src="local-drive.js?v=20261028-command-console"></script>
-  <script src="pr-status.js?v=20261028-command-console"></script>
-  <script src="refresh-coordinator.js?v=20261028-command-console"></script>
-  <script src="comparison-authors.js?v=20261028-command-console"></script>
-  <script src="git-activity.js?v=20261028-command-console"></script>
-  <script src="comparison-navigation.js?v=20261028-command-console"></script>
-  <script src="panel-resize.js?v=20261028-command-console"></script>
-  <script src="submodule-compare-details.js?v=20261028-command-console"></script>
-  <script src="merge-preview.js?v=20261028-command-console"></script>
-  <script src="navigation-refresh.js?v=20261028-command-console"></script>
-  <script src="app.js?v=20261028-command-console"></script>
+  <script src="polarion.js?v=20261029-clean-no-backups"></script>
+  <script src="console-context.js?v=20261029-clean-no-backups"></script>
+  <script src="graph-model.js?v=20261029-clean-no-backups"></script>
+  <script src="submodule-state.js?v=20261029-clean-no-backups"></script>
+  <script src="submodule-versions.js?v=20261029-clean-no-backups"></script>
+  <script src="local-diff.js?v=20261029-clean-no-backups"></script>
+  <script src="local-drive.js?v=20261029-clean-no-backups"></script>
+  <script src="pr-status.js?v=20261029-clean-no-backups"></script>
+  <script src="refresh-coordinator.js?v=20261029-clean-no-backups"></script>
+  <script src="comparison-authors.js?v=20261029-clean-no-backups"></script>
+  <script src="git-activity.js?v=20261029-clean-no-backups"></script>
+  <script src="comparison-navigation.js?v=20261029-clean-no-backups"></script>
+  <script src="panel-resize.js?v=20261029-clean-no-backups"></script>
+  <script src="submodule-compare-details.js?v=20261029-clean-no-backups"></script>
+  <script src="merge-preview.js?v=20261029-clean-no-backups"></script>
+  <script src="navigation-refresh.js?v=20261029-clean-no-backups"></script>
+  <script src="ipc-diagnostics.js?v=20261029-clean-no-backups"></script>
+  <script src="app.js?v=20261029-clean-no-backups"></script>
 </body>
 </html>

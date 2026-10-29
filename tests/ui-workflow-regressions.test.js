@@ -134,7 +134,7 @@ test('top bar has a safe project fetch that updates parent and submodule refs wi
   assert.match(html, /Fetch parent repository and initialized submodules — safe update only, no pull, checkout or branch change/);
   assert.match(app, /'fetch_project'/);
   assert.match(app, /async function fetchProjectAndSubmodules\(button = null\)/);
-  assert.match(app, /invoke\('fetch_project', \{ repositoryPath: state\.repository\.path \}\)/);
+  assert.match(app, /invoke\('fetch_project', \{ repositoryPath \}\)/);
   assert.match(app, /Parent updated/);
   assert.match(app, /submodule\$\{result\.submodules_total === 1 \? '' : 's'\} fetched/);
   assert.match(app, /id: 'fetch-project'/);
@@ -244,7 +244,7 @@ test('brand-new untracked files and folders are labelled as new items in Explore
   assert.match(app, /if \(entry\.kind === 'folder'\) return 'New folder';/);
   assert.match(app, /return 'New file';/);
   assert.match(app, /entryKindHint\(entry\)/);
-  assert.match(app, /function changeDisplayState\(change\)/);
+  assert.match(app, /function changeDisplayState\(change, submoduleRoots = new Set\(knownSubmodulePaths\(\)\)\)/);
   assert.match(app, /if \(change\.status === '\?\?'\) return 'New file';/);
   assert.match(app, /if \(change\.status === 'A'\) return change\.staged \? 'Staged new file' : 'New file';/);
   assert.match(app, /This item is new on disk\. Stage it to include it in the next commit\./);

@@ -20,6 +20,27 @@ test('warm navigation performs one cheap probe, no status scan or refresh timer'
   assert.equal(h.calls[0].command, 'navigation_status'); h.calls[0].resolve(snapshot(true));
   assert.deepEqual(await p, { refreshed: false }); assert.equal(h.calls.length, 1); assert.equal(h.c.states().length, 0);
 });
+test('explicit post-Fetch status read applies a warm snapshot without forcing cache invalidation', async () => {
+  const h = controller(), p = h.c.ensure(target, { readStatus: true }); await tick();
+  h.calls[0].resolve(snapshot(true)); await tick();
+  assert.equal(h.calls[1].command, 'refresh_navigation_status'); assert.equal(h.calls[1].args.forceFresh, false);
+  assert.equal(h.c.ensure(target), p, 'ordinary navigation joins the post-Fetch read');
+  h.calls[1].resolve([{ path: 'cached-current.c' }]); assert.deepEqual(await p, { refreshed: true });
+  assert.equal(h.applied[0].changes[0].path, 'cached-current.c'); assert.equal(h.calls.length, 2);
+});
+test('post-Fetch companion read holds the write barrier even when status finishes first', async () => {
+  for (const fails of [false, true]) {
+    const h = controller(), metadata = gate();
+    const p = h.c.ensure(target, { readStatus: true, completeWith: metadata.promise });
+    await tick(); h.calls[0].resolve(snapshot(true)); await tick(); h.calls[1].resolve([]); await tick();
+    assert.equal(h.c.states().length, 1, 'status completion must not release the metadata write barrier');
+    assert.equal(h.c.ensure(target), p, 'navigation still joins the same job');
+    if (fails) metadata.reject(new Error('refs failed')); else metadata.resolve();
+    assert.deepEqual(await p, { refreshed: true });
+    assert.equal(h.c.states().length, 0, 'a failed refs read is reported by its caller, not a stuck status gate');
+    assert.equal(h.calls.length, 2);
+  }
+});
 test('rapid folder/selection requests join one background scan for the repository', async () => {
   const h = controller(), a = h.c.ensure(target), b = h.c.ensure({ ...target });
   assert.equal(a, b); assert.equal(h.c.states()[0].phase, 'checking'); await tick();

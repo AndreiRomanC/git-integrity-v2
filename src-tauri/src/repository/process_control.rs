@@ -120,7 +120,7 @@ mod tests {
             result
         });
         let started = Instant::now();
-        while !active_git_commands().iter().any(|entry| entry.id == id && entry.stoppable) {
+        while !active_git_commands(None).iter().any(|entry| entry.id == id && entry.stoppable) {
             assert!(started.elapsed() < Duration::from_secs(5));
             std::thread::sleep(Duration::from_millis(10));
         }

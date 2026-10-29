@@ -15,8 +15,11 @@ pub mod navigation;
 pub mod comparison;
 pub mod submodule_compare;
 mod perf_logging;
+mod ipc_diagnostics;
+mod publish_diagnostics;
 mod process_control;
 mod check_links;
+pub mod index_lock;
 #[cfg(test)]
 use stash::{abort_stash_conflict, drop_stash, list_stashes, list_submodule_stashes, pop_stash, restore_stash_paths, stash_changes, stash_entry_files, stash_file};
 #[cfg(test)]
@@ -1318,7 +1321,11 @@ fn git_command_timeout(args: &[&str]) -> (Duration, &'static str) {
     else { (GIT_COMMAND_TIMEOUT, "10 minutes") }
 }
 
-fn run_with_timeout_labeled(mut command: Command, timeout: Duration, program_label: &str, timeout_label: &str) -> Result<std::process::Output, String> {
+fn run_with_timeout_labeled(command: Command, timeout: Duration, program_label: &str, timeout_label: &str) -> Result<std::process::Output, String> {
+    run_with_timeout_labeled_traced(command, timeout, program_label, timeout_label, None)
+}
+
+fn run_with_timeout_labeled_traced(mut command: Command, timeout: Duration, program_label: &str, timeout_label: &str, trace: Option<publish_diagnostics::PushTrace>) -> Result<std::process::Output, String> {
     // Put the child in its own process group (Unix) so a timeout kill can
     // target the whole group, not just this one PID — see the comment on
     // the kill call below for why that matters. Must be set before spawn().
@@ -1326,7 +1333,13 @@ fn run_with_timeout_labeled(mut command: Command, timeout: Duration, program_lab
     let child = command.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().map_err(|e| format!("Cannot start {program_label}: {e}"))?;
     let id = child.id();
     let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || { let _ = tx.send(child.wait_with_output()); });
+    std::thread::spawn(move || {
+        let result = match trace {
+            Some(trace) => publish_diagnostics::wait_with_output(child, trace),
+            None => child.wait_with_output(),
+        };
+        let _ = tx.send(result);
+    });
     match rx.recv_timeout(timeout) {
         Ok(Ok(output)) => Ok(output),
         Ok(Err(error)) => Err(format!("{program_label} process error: {error}")),
@@ -1525,7 +1538,14 @@ pub struct ActiveGitCommand {
 }
 
 #[tauri::command]
-pub fn active_git_commands() -> Vec<ActiveGitCommand> {
+pub fn active_git_commands(diagnostic_request_id: Option<u64>) -> Vec<ActiveGitCommand> {
+    let timing = ipc_diagnostics::IpcTiming::new("active_git_commands", diagnostic_request_id);
+    let result = active_git_commands_inner();
+    timing.mark("response_ready");
+    result
+}
+
+fn active_git_commands_inner() -> Vec<ActiveGitCommand> {
     recent_git_commands_store().lock().unwrap().iter().rev().filter(|entry| entry.finished.is_none()).map(|entry| ActiveGitCommand {
         id: entry.id, repo_hint: entry.repo_hint.clone(), command: entry.command.clone(),
         started_at_ms: entry.started_at_ms, seconds_ago: entry.started.elapsed().as_secs_f64(), running: true,
@@ -1555,6 +1575,10 @@ fn git_with_timeout(path: &str, args: &[&str], timeout: Duration, timeout_label:
 }
 
 fn git_with_timeout_control(path: &str, args: &[&str], timeout: Duration, timeout_label: &str, stoppable: bool) -> Result<String, String> {
+    git_with_timeout_control_traced(path, args, timeout, timeout_label, stoppable, None)
+}
+
+fn git_with_timeout_control_traced(path: &str, args: &[&str], timeout: Duration, timeout_label: &str, stoppable: bool, trace: Option<publish_diagnostics::PushTrace>) -> Result<String, String> {
     let history_id = begin_git_command(path, args);
     if is_submodule_update(args) {
         perf_log(&format!("submodule_update: start repo={} timeout_seconds={} force_requested={}", anonymized_repository_id(path), timeout.as_secs(), args.contains(&"--force")), Duration::ZERO);
@@ -1565,6 +1589,7 @@ fn git_with_timeout_control(path: &str, args: &[&str], timeout: Duration, timeou
     // own `-c` flags need to land here, before `args` (which starts with the
     // subcommand), not after.
     configure_git_command(&mut command);
+    if let Some(trace) = &trace { trace.configure(&mut command); }
     // Git for Windows still applies MAX_PATH handling to several worktree
     // operations unless core.longPaths is enabled. Keep this process-local:
     // clean/checkout/submodule update can then remove real repository paths
@@ -1583,7 +1608,7 @@ fn git_with_timeout_control(path: &str, args: &[&str], timeout: Duration, timeou
     let result = if stoppable {
         process_control::run(command, timeout, "Git", timeout_label, history_id)
     } else {
-        run_with_timeout_labeled(command, timeout, "Git", timeout_label)
+        run_with_timeout_labeled_traced(command, timeout, "Git", timeout_label, trace)
     };
     let output = match result {
         Ok(output) => output,
@@ -1737,15 +1762,28 @@ fn remote_callbacks() -> git2::RemoteCallbacks<'static> {
 fn network_fetch_options() -> git2::FetchOptions<'static> { let mut options = git2::FetchOptions::new(); options.remote_callbacks(remote_callbacks()); options.prune(git2::FetchPrune::On); options }
 fn network_push_options() -> git2::PushOptions<'static> { let mut options = git2::PushOptions::new(); options.remote_callbacks(remote_callbacks()); options }
 
-fn authenticated_push_options(username: String, access_token: String) -> git2::PushOptions<'static> {
+fn authenticated_push_options_traced(username: String, access_token: String, trace: Option<Arc<publish_diagnostics::PushTrace>>) -> git2::PushOptions<'static> {
     if access_token.is_empty() { return network_push_options(); }
     let mut callbacks = git2::RemoteCallbacks::new();
+    let auth_trace = trace.clone();
+    let mut auth_calls = 0;
     callbacks.credentials(move |_url, remote_username, allowed| {
+        if auth_calls < 4 { if let Some(trace) = &auth_trace { trace.milestone("credential_requested_not_authentication_complete"); } }
+        auth_calls += 1;
         if allowed.contains(git2::CredentialType::USER_PASS_PLAINTEXT) {
             git2::Cred::userpass_plaintext(if username.is_empty() { remote_username.unwrap_or("git") } else { &username }, &access_token)
         } else if allowed.contains(git2::CredentialType::SSH_KEY) { git2::Cred::ssh_key_from_agent(remote_username.unwrap_or("git")) }
         else { git2::Cred::default() }
     });
+    if let Some(trace) = trace {
+        let negotiation = trace.clone();
+        callbacks.push_negotiation(move |_| { negotiation.milestone("negotiation_callback"); Ok(()) });
+        let pack = trace.clone();
+        let mut pack_seen = false;
+        callbacks.pack_progress(move |_, _, _| { if !pack_seen { pack_seen = true; pack.milestone("first_pack_progress"); } });
+        let mut transfer_seen = false;
+        callbacks.push_transfer_progress(move |_, _, _| { if !transfer_seen { transfer_seen = true; trace.milestone("first_transfer_progress"); } });
+    }
     let mut options = git2::PushOptions::new(); options.remote_callbacks(callbacks); options
 }
 
@@ -3039,12 +3077,19 @@ pub fn tag_details(repository_path: String, tag_name: String) -> Result<TagDetai
 // Always a fresh scan, deliberately bypassing the status cache — the whole
 // point is "what's actually on disk right now".
 #[tauri::command]
-pub async fn refresh_status(repository_path: String) -> Result<Vec<Change>, String> {
+pub async fn refresh_status(repository_path: String, diagnostic_request_id: Option<u64>) -> Result<Vec<Change>, String> {
+    let timing = Arc::new(ipc_diagnostics::IpcTiming::new("refresh_status", diagnostic_request_id));
+    let worker_timing = timing.clone();
     let queued = Instant::now();
-    off_main_thread(move || {
+    let result = off_main_thread(move || {
+        worker_timing.mark("worker_started");
         perf_log("refresh_status: phase=worker_queue", queued.elapsed());
-        refresh_status_inner(repository_path)
-    }).await
+        let result = refresh_status_inner(repository_path);
+        worker_timing.mark("worker_finished");
+        result
+    }).await;
+    timing.mark("response_ready");
+    result
 }
 
 fn refresh_status_inner(repository_path: String) -> Result<Vec<Change>, String> {
@@ -5843,8 +5888,17 @@ fn submodule_publish_risks_inner(repository_path: String, branch: String, remote
 }
 
 #[tauri::command]
-pub async fn publish_branch(repository_path: String, branch: String, remote: String, username: String, access_token: String, upto_commit: String, override_unpushed_submodules: bool, skip_submodule_safety: Option<bool>) -> Result<(), String> {
-    off_main_thread(move || publish_branch_inner_with_options(repository_path, branch, remote, username, access_token, upto_commit, override_unpushed_submodules, skip_submodule_safety.unwrap_or(false))).await
+pub async fn publish_branch(repository_path: String, branch: String, remote: String, username: String, access_token: String, upto_commit: String, override_unpushed_submodules: bool, skip_submodule_safety: Option<bool>, diagnostic_request_id: Option<u64>) -> Result<(), String> {
+    let timing = Arc::new(ipc_diagnostics::IpcTiming::new("publish_branch", diagnostic_request_id));
+    let worker_timing = timing.clone();
+    let result = off_main_thread(move || {
+        worker_timing.mark("worker_started");
+        let result = publish_branch_inner_with_options(repository_path, branch, remote, username, access_token, upto_commit, override_unpushed_submodules, skip_submodule_safety.unwrap_or(false));
+        worker_timing.mark("worker_finished");
+        result
+    }).await;
+    timing.mark("response_ready");
+    result
 }
 
 #[cfg(test)]
@@ -5855,7 +5909,7 @@ fn publish_branch_inner(repository_path: String, branch: String, remote: String,
 fn publish_branch_inner_with_options(repository_path: String, branch: String, remote: String, username: String, access_token: String, upto_commit: String, override_unpushed_submodules: bool, skip_submodule_safety: bool) -> Result<(), String> {
     let total_started = Instant::now();
     perf_log("publish_branch: START", Duration::ZERO);
-    let result = (|| {
+    let result: Result<(), String> = (|| {
     validate_path(&repository_path)?;
     if branch.trim().is_empty() || remote.trim().is_empty() { return Err("Choose a local branch and a remote".into()); }
     // See repo_write_lock's doc comment. No credentials in this log line —
@@ -5890,13 +5944,14 @@ fn publish_branch_inner_with_options(repository_path: String, branch: String, re
         perf_log("publish_branch: safety preflight", safety_started.elapsed());
     }
     let push_started = Instant::now();
+    let push_trace = publish_diagnostics::PushTrace::new(&repo, remote_name, !access_token.trim().is_empty());
     if access_token.trim().is_empty() {
         // No explicit token was entered — prefer the system `git` binary, which
         // transparently reuses the user's already-working SSH agent, credential
         // helper, or OS keychain. libgit2's own credential search is much narrower
         // and can fail here ("failed to acquire username/password") even when a
         // plain `git push` in a terminal works fine for the same repository.
-        git(&repository_path, &["push", remote_name, &format!("{push_oid}:refs/heads/{branch}")])
+        git_with_timeout_control_traced(&repository_path, &["push", remote_name, &format!("{push_oid}:refs/heads/{branch}")], GIT_COMMAND_TIMEOUT, "10 minutes", false, Some(push_trace))
             .map_err(|detail| if detail.to_lowercase().contains("authentication") || detail.contains("403") || detail.contains("could not read") { "Push authentication failed. Either make sure `git push` works for this repository from a terminal, or enter a Git username and Personal Access Token in Publish credentials.".to_string() } else if detail.to_lowercase().contains("non-fast-forward") || detail.to_lowercase().contains("fetch first") { "Push rejected because the server branch has newer commits. Pull/fetch those commits first, then publish again.".to_string() } else { format!("Push failed: {detail}") })?;
     } else {
         // libgit2 needs a source ref for this commit. A fixed refs/heads name
@@ -5906,12 +5961,14 @@ fn publish_branch_inner_with_options(repository_path: String, branch: String, re
         let scratch_ref = format!("refs/git-drilldown/tmp/publish-{}-{stamp}-{}", std::process::id(), &push_oid.to_string()[..8]);
         repo.reference(&scratch_ref, push_oid, false, "temporary ref for an authenticated publish")
             .map_err(|error| format!("Could not create a private publish ref without replacing existing data: {}", error.message()))?;
+        let push_trace = Arc::new(push_trace);
         let push_result = (|| {
             let mut remote = repo.find_remote(remote_name).map_err(|error| error.message().to_string())?;
-            let mut options = authenticated_push_options(username, access_token);
+            let mut options = authenticated_push_options_traced(username, access_token, Some(push_trace.clone()));
             remote.push(&[&format!("{scratch_ref}:refs/heads/{branch}")], Some(&mut options))
                 .map_err(|error| { let detail = error.message(); if detail.contains("username/password") || detail.contains("authentication") || detail.contains("401") || detail.contains("403") { "Push authentication failed. Check the username and Personal Access Token in Publish credentials (not your account password).".to_string() } else if detail.contains("non-fast-forward") { "Push rejected because the server branch has newer commits. Pull/fetch those commits first, then publish again.".to_string() } else { format!("Push failed: {detail}") } })
         })();
+        push_trace.libgit_end(push_result.is_ok());
         if let Err(error) = repo.find_reference(&scratch_ref).and_then(|mut reference| reference.delete()) {
             // Never turn a successful server push into a false failure merely
             // because cleanup of this private, recoverable ref failed.
@@ -5929,7 +5986,7 @@ fn publish_branch_inner_with_options(repository_path: String, branch: String, re
     })();
     match &result {
         Ok(()) => perf_log("publish_branch: TOTAL", total_started.elapsed()),
-        Err(error) => perf_log(&format!("publish_branch: ERROR: {error}"), total_started.elapsed()),
+        Err(error) => perf_log(&format!("publish_branch: ERROR category={}", publish_diagnostics::failure_category(error)), total_started.elapsed()),
     }
     result
 }
@@ -10829,12 +10886,12 @@ mod tests {
         let running = recent_git_commands().into_iter().find(|entry| entry.id == running_id).expect("a command must be visible as soon as it starts");
         assert!(running.running);
         assert!(running.duration_ms.is_none());
-        let active = active_git_commands().into_iter().find(|entry| entry.id == running_id).unwrap();
+        let active = active_git_commands(None).into_iter().find(|entry| entry.id == running_id).unwrap();
         assert_eq!(active.started_at_ms, running.started_at_ms);
         let metadata = serde_json::to_value(&active).unwrap();
         assert!(metadata.get("stdout").is_none() && metadata.get("stderr").is_none(), "polling must not clone output buffers");
         finish_git_command(running_id, false, None, "", "", "synthetic timeout");
-        assert!(!active_git_commands().iter().any(|entry| entry.id == running_id));
+        assert!(!active_git_commands(None).iter().any(|entry| entry.id == running_id));
         let finished = recent_git_commands().into_iter().find(|entry| entry.id == running_id).unwrap();
         assert!(!finished.running && !finished.success);
         assert_eq!(finished.error, "synthetic timeout");
@@ -10873,7 +10930,7 @@ mod tests {
         for _ in 0..(RECENT_GIT_COMMANDS_LIMIT + 20) {
             record_git_command("/tmp/history-active-fixture", &["finished-test"], true);
         }
-        assert!(active_git_commands().iter().any(|entry| entry.id == id));
+        assert!(active_git_commands(None).iter().any(|entry| entry.id == id));
         finish_git_command(id, true, Some(0), "", "", "");
     }
 
@@ -13026,6 +13083,56 @@ mod tests {
         assert!(load_repository_inner(path, Some(true)).unwrap().changes.is_empty(), "nothing should be left pending after committing the whole repository");
 
         fs::remove_dir_all(repository).unwrap();
+    }
+
+    #[test]
+    fn fetch_remote_worker_preserves_staged_and_working_files() {
+        let base = PathBuf::from(unique_status_epoch_test_path("fetch-remote-worker"));
+        let source = base.join("source");
+        let local = base.join("local");
+        create_libgit2_repository(&source, "file.txt");
+        run_git(&source, &["branch", "-M", "main"]);
+        run_git(&base, &["clone", source.to_str().unwrap(), "local"]);
+        run_git(&local, &["remote", "add", "other", base.join("missing.git").to_str().unwrap()]);
+        fs::write(local.join("file.txt"), "staged local content").unwrap();
+        run_git(&local, &["add", "file.txt"]);
+        fs::write(local.join("file.txt"), "unstaged local content").unwrap();
+        fs::write(local.join("new.txt"), "untracked content").unwrap();
+        let before_head = run_git_capture(&local, &["rev-parse", "HEAD"]);
+        let before_index = run_git_capture(&local, &["ls-files", "--stage"]);
+        let before_branch = run_git_capture(&local, &["symbolic-ref", "HEAD"]);
+        run_git(&source, &["config", "user.name", "Fetch Test"]);
+        run_git(&source, &["config", "user.email", "fetch@example.invalid"]);
+        fs::write(source.join("file.txt"), "incoming content").unwrap();
+        run_git(&source, &["commit", "-am", "Incoming change"]);
+        run_git(&source, &["tag", "new-version"]);
+        let incoming = run_git_capture(&source, &["rev-parse", "HEAD"]);
+
+        tauri::async_runtime::block_on(remotes::fetch_remote(local.to_string_lossy().into_owned(), " origin ".into())).unwrap();
+        assert_eq!(run_git_capture(&local, &["rev-parse", "origin/main"]), incoming);
+        assert_eq!(run_git_capture(&local, &["rev-parse", "new-version"]), incoming);
+        assert_eq!(run_git_capture(&local, &["rev-parse", "HEAD"]), before_head);
+        assert_eq!(run_git_capture(&local, &["symbolic-ref", "HEAD"]), before_branch);
+        assert_eq!(run_git_capture(&local, &["ls-files", "--stage"]), before_index);
+        assert_eq!(fs::read_to_string(local.join("file.txt")).unwrap(), "unstaged local content");
+        assert_eq!(fs::read_to_string(local.join("new.txt")).unwrap(), "untracked content");
+        // Success also proves that Fetch origin did not attempt the invalid
+        // unrelated remote. Remote configuration/upstream are left untouched.
+        assert_eq!(run_git_capture(&local, &["config", "branch.main.remote"]), "origin");
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn fetch_remote_worker_propagates_missing_remote_errors() {
+        let path = unique_status_epoch_test_path("fetch-remote-missing");
+        let root = Path::new(&path);
+        create_libgit2_repository(root, "file.txt");
+        let head = run_git_capture(root, &["rev-parse", "HEAD"]);
+        let error = tauri::async_runtime::block_on(remotes::fetch_remote(path.clone(), "not-configured".into())).unwrap_err();
+        assert!(!error.is_empty());
+        assert_eq!(run_git_capture(root, &["rev-parse", "HEAD"]), head);
+        assert_eq!(fs::read_to_string(root.join("file.txt")).unwrap(), "content");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -18722,7 +18829,7 @@ mod tests {
         let started = Instant::now();
         let id = loop {
             if base.join("ready.txt").exists() {
-                if let Some(entry) = active_git_commands().into_iter().find(|entry| entry.repo_hint == base.file_name().unwrap().to_str().unwrap() && entry.stoppable) { break entry.id; }
+                if let Some(entry) = active_git_commands(None).into_iter().find(|entry| entry.repo_hint == base.file_name().unwrap().to_str().unwrap() && entry.stoppable) { break entry.id; }
             }
             assert!(started.elapsed() < Duration::from_secs(10), "fixture must begin its long command");
             std::thread::sleep(Duration::from_millis(10));

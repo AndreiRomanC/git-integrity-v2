@@ -17,6 +17,7 @@ function harness(invoke = null) {
     commandHistoryMaximize: { textContent: '', attrs: {}, setAttribute(k, v) { this.attrs[k] = v; } },
   };
   const c = { refs, invoke, fitFloatingPanel, GitActivity, innerWidth: 1440, innerHeight: 1000,
+    activeRepositoryContext: () => ({ path: '/repository' }), $: () => ({}),
     esc: value => String(value).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;'),
   };
   vm.createContext(c);
