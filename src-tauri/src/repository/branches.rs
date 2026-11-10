@@ -2,6 +2,7 @@ use super::*;
 
 pub mod merge;
 pub mod merge_preview;
+pub mod reset;
 
 #[derive(Serialize)]
 pub struct BranchCreationContext {
@@ -1024,6 +1025,84 @@ mod tests {
         assert!(!f.local.join(".git/gdd-restore").exists());
         assert!(!module_git.join("gdd-restore").exists());
         assert!(module_git.join("objects").exists(), "preserve real Git metadata for registered submodules");
+    }
+
+    #[test]
+    fn all_clean_entrypoints_leave_no_build_input_copies_in_recursive_git_metadata() {
+        // Regression: an external build importer found source backups inside
+        // .git/modules/... and reproduced their paths in its generated output.
+        // A clean Git status cannot detect this: inspect physical files too.
+        const MARKER: &[u8] = b"GDD_UNTRACKED_BUILD_INPUT_MUST_NOT_BE_BACKED_UP";
+        fn assert_no_copies(path: &Path) {
+            for entry in fs::read_dir(path).unwrap() {
+                let entry = entry.unwrap();
+                let kind = entry.file_type().unwrap();
+                assert_ne!(entry.file_name(), "gdd-restore", "source recovery area at {}", entry.path().display());
+                if kind.is_dir() {
+                    assert_no_copies(&entry.path());
+                } else if kind.is_file() {
+                    let bytes = fs::read(entry.path()).unwrap();
+                    assert!(!bytes.windows(MARKER.len()).any(|part| part == MARKER),
+                        "Clean retained/copied an untracked build input at {}", entry.path().display());
+                }
+            }
+        }
+        fn seed(path: &Path) {
+            fs::create_dir(path).unwrap();
+            upstream_git(path, &["init", "-b", "main"]);
+            upstream_git(path, &["config", "user.name", "Test"]);
+            upstream_git(path, &["config", "user.email", "test@example.invalid"]);
+            fs::write(path.join("tracked.txt"), "keep committed sources\n").unwrap();
+            upstream_git(path, &["add", "."]);
+            upstream_git(path, &["commit", "-m", "tracked input"]);
+        }
+
+        for mode in ["commit", "branch", "upstream"] {
+            let f = UpstreamFixture::new();
+            let leaf_seed = f.base.join("leaf-seed");
+            let module_seed = f.base.join("module-seed");
+            seed(&leaf_seed);
+            seed(&module_seed);
+            upstream_git(&module_seed, &["-c", "protocol.file.allow=always", "submodule", "add", leaf_seed.to_str().unwrap(), "nested"]);
+            upstream_git(&module_seed, &["commit", "-am", "add nested module"]);
+            upstream_git(&f.remote, &["-c", "protocol.file.allow=always", "submodule", "add", module_seed.to_str().unwrap(), "module"]);
+            upstream_git(&f.remote, &["commit", "-am", "add module"]);
+            upstream_git(&f.local, &["fetch", "company"]);
+            upstream_git(&f.local, &["merge", "--ff-only", "company/main"]);
+            upstream_git(&f.local, &["-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive"]);
+            let head = upstream_git(&f.local, &["rev-parse", "HEAD"]);
+            let module = f.local.join("module");
+            let leaf = module.join("nested");
+            let module_head = upstream_git(&module, &["rev-parse", "HEAD"]);
+            let leaf_head = upstream_git(&leaf, &["rev-parse", "HEAD"]);
+            let module_git = Repository::open(&module).unwrap().path().to_path_buf();
+            let leaf_git = Repository::open(&leaf).unwrap().path().to_path_buf();
+            for checkout in [&f.local, &module, &leaf] {
+                fs::create_dir_all(checkout.join("i")).unwrap();
+                fs::create_dir_all(checkout.join("m/work/CM_misc")).unwrap();
+                fs::write(checkout.join("i/input.tdcl"), MARKER).unwrap();
+                fs::write(checkout.join("m/work/CM_misc/dummy.m"), MARKER).unwrap();
+            }
+
+            let path = f.local.to_string_lossy().into_owned();
+            match mode {
+                "commit" => restore_exact_checkpoint_inner(path, head.clone()).unwrap(),
+                "branch" => restore_exact_checkpoint_inner_with_branch(path, head.clone(), Some("my-main".into())).unwrap(),
+                "upstream" => { f.clean(&head).unwrap(); }
+                _ => unreachable!(),
+            }
+
+            assert_eq!(upstream_git(&f.local, &["rev-parse", "HEAD"]), head, "{mode}");
+            assert_eq!(upstream_git(&f.local, &["branch", "--show-current"]), if mode == "commit" { "" } else { "my-main" });
+            assert_eq!(upstream_git(&f.local, &["status", "--porcelain"]), "", "{mode}");
+            assert_eq!(upstream_git(&module, &["rev-parse", "HEAD"]), module_head, "{mode}");
+            assert_eq!(upstream_git(&leaf, &["rev-parse", "HEAD"]), leaf_head, "{mode}");
+            assert_eq!(fs::read_to_string(leaf.join("tracked.txt")).unwrap(), "keep committed sources\n");
+            assert!(module_git.join("objects").is_dir() && leaf_git.join("objects").is_dir());
+            assert_no_copies(&f.local); // Includes the parent's .git/modules tree.
+            assert_no_copies(&module_git);
+            assert_no_copies(&leaf_git);
+        }
     }
 
     #[cfg(unix)]

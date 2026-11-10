@@ -14,7 +14,7 @@ const MUTATING_COMMANDS = new Set([
   'stage_files', 'unstage_files', 'stage_all', 'commit_files', 'commit_staged', 'commit_path', 'recover_index_lock',
   'remove_git_path', 'delete_local_path', 'switch_branch', 'checkout_remote_tracking_branch', 'create_branch', 'create_branch_at_commit', 'checkout_commit', 'rename_branch', 'delete_branch',
   'stash_changes', 'stash_file', 'pop_stash', 'drop_stash', 'restore_stash_paths', 'abort_stash_conflict',
-  'restore_file', 'restore_remote_file', 'restore_folder', 'restore_exact_checkpoint', 'restore_exact_checkpoint_branch', 'clean_branch_from_upstream', 'add_submodule', 'init_submodule', 'switch_submodule_version', 'reset_submodule', 'reset_submodule_branch_to_upstream', 'change_submodule_url',
+  'restore_file', 'restore_remote_file', 'restore_folder', 'restore_exact_checkpoint', 'restore_exact_checkpoint_branch', 'clean_branch_from_upstream', 'reset_current_branch', 'add_submodule', 'init_submodule', 'switch_submodule_version', 'reset_submodule', 'reset_submodule_branch_to_upstream', 'change_submodule_url',
   'commit_submodule', 'push_submodule', 'pull_submodule', 'force_push_submodule', 'fetch_submodule',
   'create_submodule_branch', 'merge_branch', 'open_merge_tool', 'resolve_conflict', 'complete_merge', 'abort_merge',
   'sync_repository', 'publish_branch', 'combine_local_commits', 'fetch_remote', 'fetch_all_remotes', 'fetch_project', 'write_text_file', 'run_git_command', 'run_terminal_command',
@@ -6516,21 +6516,9 @@ function showBranchMenu(branchName, event) {
   const isHead = !branch.remote && !!branch.current && !context.headDetached;
   const mutableLocal = !branch.remote && !isHead;
   const items = [
-    { header: branch.remote ? 'Remote branch' : 'Local branch' },
+    { header: branch.remote ? 'Checkout · remote branch' : 'Checkout · local branch' },
     graphCheckoutBranchMenuItem(branchName, branch.remote ? 'remote_branch' : 'local_branch'),
-    { separator: true },
-    { header: 'Merge' },
-    graphMergeMenuItem(branchName),
-    graphMergePreviewMenuItem(branchName),
   ];
-  if (mutableLocal) {
-    items.push(
-      { separator: true },
-      { header: 'Manage local branch' },
-      { id: 'rename', label: `Rename ${branchName}…`, detail: 'Rename this local branch', run: async () => { const newName = await customPrompt(`Rename branch "${branchName}" to:`, branchName, { title: 'Rename branch' }); if (newName && newName !== branchName) await renameBranch(branchName, newName); } },
-      { id: 'delete', label: `Delete ${branchName}…`, detail: 'Delete the local branch reference', danger: true, run: async () => { if (await customConfirm(`Delete branch "${branchName}"?`, { title: 'Delete branch', danger: true, okLabel: 'Delete' })) await deleteBranch(branchName); } },
-    );
-  }
   items.push(
     { separator: true },
     { header: 'Compare · read only' },
@@ -6539,6 +6527,24 @@ function showBranchMenu(branchName, event) {
   );
   if (anchor && anchor.branch !== branchName) {
     items.push({ id: 'compare-with-start', label: 'Compare with selected start', detail: `${anchor.branch} → ${branchName}`, kind: 'compare', run: () => { const start = anchor.branch; state.graphBranchCompareAnchor = null; openGraphBranchCompare(start, branchName); } });
+  }
+  items.push(
+    { separator: true },
+    { header: 'Merge into current branch' },
+    graphMergePreviewMenuItem(branchName),
+    graphMergeMenuItem(branchName),
+    { separator: true },
+    { header: 'Reset / replace · moves current branch' },
+    branchResetMenuItem(context, `refs/${branch.remote ? 'remotes' : 'heads'}/${branchName}`, branchName),
+    ...cleanUpstreamMenuItems(context, [{ kind: branch.remote ? 'remote_branch' : 'local_branch', name: branchName }]),
+  );
+  if (mutableLocal) {
+    items.push(
+      { separator: true },
+      { header: 'Manage selected local branch' },
+      { id: 'rename', label: `Rename ${branchName}…`, detail: 'Rename this local branch', run: async () => { const newName = await customPrompt(`Rename branch "${branchName}" to:`, branchName, { title: 'Rename branch' }); if (newName && newName !== branchName) await renameBranch(branchName, newName); } },
+      { id: 'delete', label: `Delete ${branchName}…`, detail: 'Delete the local branch reference', danger: true, run: async () => { if (await customConfirm(`Delete branch "${branchName}"?`, { title: 'Delete branch', danger: true, okLabel: 'Delete' })) await deleteBranch(branchName); } },
+    );
   }
   showFloatingMenu(event, items);
 }
@@ -6997,20 +7003,22 @@ function refsBadges(refList, isHead, currentBranchName) {
   const { badges, overflowTags, overflowBranches } = selectRefBadges(refList, { isHead, currentBranchName });
   if (!badges.length && !overflowTags.length && !overflowBranches.length) return '';
   const branchCompareAnchor = graphBranchCompareAnchorMatches(activeRepositoryContext()) ? state.graphBranchCompareAnchor : null;
+  // Native hover text is not clipped by the graph's ellipsis/overflow containers.
+  // Keep the full ref first, followed by the existing click/compare guidance.
   const badgeHtml = badges.map(badge => {
-    if (badge.kind === 'tag') return `<b class="ref-pill kind-tag" data-tag-name="${esc(badge.name)}" data-tooltip="Click for tag details">${REF_BADGE_ICON.tag}${esc(badge.name)}</b>`;
+    if (badge.kind === 'tag') return `<b class="ref-pill kind-tag" data-tag-name="${esc(badge.name)}" title="${esc(badge.name)}\nClick for tag details">${REF_BADGE_ICON.tag}${esc(badge.name)}</b>`;
     const compareSelected = branchCompareAnchor?.branch === badge.name ? ' compare-start' : '';
     const compareTip = compareSelected
       ? 'Compare start selected — click another branch to compare'
       : branchCompareAnchor
         ? `Click to compare ${branchCompareAnchor.branch} with this branch`
         : 'Click to select as compare start; right-click for actions';
-    if (badge.kind === 'local_branch') return `<b class="ref-pill kind-local_branch branch-ref-pill${compareSelected}" data-graph-ref-kind="local_branch" data-graph-ref-name="${esc(badge.name)}" data-tooltip="${esc(compareTip)}"><i>LOCAL</i>${esc(badge.name)}</b>`;
-    if (badge.kind === 'remote_branch') return `<b class="ref-pill kind-remote_branch branch-ref-pill ${badge.name === 'origin/main' ? 'primary-remote' : ''}${compareSelected}" data-graph-ref-kind="remote_branch" data-graph-ref-name="${esc(badge.name)}" data-tooltip="${esc(compareTip)}"><i>${badge.name === 'origin/main' ? 'ORIGIN MAIN' : 'REMOTE'}</i>${esc(badge.name)}</b>`;
+    if (badge.kind === 'local_branch') return `<b class="ref-pill kind-local_branch branch-ref-pill${compareSelected}" data-graph-ref-kind="local_branch" data-graph-ref-name="${esc(badge.name)}" title="${esc(badge.name)}\n${esc(compareTip)}"><i>LOCAL</i>${esc(badge.name)}</b>`;
+    if (badge.kind === 'remote_branch') return `<b class="ref-pill kind-remote_branch branch-ref-pill ${badge.name === 'origin/main' ? 'primary-remote' : ''}${compareSelected}" data-graph-ref-kind="remote_branch" data-graph-ref-name="${esc(badge.name)}" title="${esc(badge.name)}\n${esc(compareTip)}"><i>${badge.name === 'origin/main' ? 'ORIGIN MAIN' : 'REMOTE'}</i>${esc(badge.name)}</b>`;
     return `<b class="ref-pill kind-${badge.kind}">${esc(badge.name)}</b>`;
   }).join('');
-  const tagOverflow = overflowTags.length ? `<b class="ref-pill kind-tag ref-pill-more" data-tooltip="${esc(overflowTags.map(t => t.name).join(', '))}">+${overflowTags.length} tags</b>` : '';
-  const branchOverflow = overflowBranches.length ? `<b class="ref-pill ref-pill-more" data-tooltip="${esc(overflowBranches.map(b => b.name).join(', '))}">+${overflowBranches.length}</b>` : '';
+  const tagOverflow = overflowTags.length ? `<b class="ref-pill kind-tag ref-pill-more" title="${esc(overflowTags.map(t => t.name).join('\n'))}">+${overflowTags.length} tags</b>` : '';
+  const branchOverflow = overflowBranches.length ? `<b class="ref-pill ref-pill-more" title="${esc(overflowBranches.map(b => b.name).join('\n'))}">+${overflowBranches.length}</b>` : '';
   return `<span class="ref-pills">${badgeHtml}${tagOverflow}${branchOverflow}</span>`;
 }
 
@@ -7803,6 +7811,57 @@ async function cleanBranchFromUpstream(selection) {
   }
 }
 
+function branchResetSelectionMatches(selection) {
+  const context = activeRepositoryContext();
+  return selection.generation === repoOpenGeneration && context.path === selection.path
+    && !context.headDetached && context.currentBranch === selection.branch && context.headOid === selection.head;
+}
+
+function branchResetMenuItem(context, targetRef, targetLabel = 'this commit') {
+  const selection = { path: context.path, name: context.name, isSubmodule: context.isSubmodule,
+    branch: context.currentBranch, head: context.headOid, generation: repoOpenGeneration, targetRef };
+  const disabled = !context.path || context.headDetached || !context.currentBranch || !context.headOid;
+  return { id: 'reset-current-branch', label: `Reset ${context.currentBranch || 'current branch'} to ${targetLabel}…`, danger: true, disabled,
+    detail: disabled ? 'Switch to a local branch first; detached HEAD is not reset here.' : `Moves ${context.currentBranch}, not the clicked branch · choose Soft, Mixed or Hard`,
+    run: () => openBranchReset(selection) };
+}
+
+let branchResetActive = false;
+async function openBranchReset(selection) {
+  if (branchResetActive) return;
+  if (!branchResetSelectionMatches(selection)) return;
+  if (!invoke) { status('Reset is available in the desktop app with a local repository.'); return; }
+  branchResetActive = true;
+  try {
+    let report;
+    let resetAttempted = false;
+    try {
+      status('Checking reset target against local history…', 'busy');
+      report = await invoke('preview_branch_reset', { repositoryPath: selection.path, branch: selection.branch, expectedHead: selection.head, targetRef: selection.targetRef });
+      if (!branchResetSelectionMatches(selection)) return;
+      status('Review the reset type and its effects. Nothing has been changed.');
+      const mode = await window.GDDBranchReset.choose($('#branchResetDialog'), report, selection.name, selection.isSubmodule);
+      if (!mode) return;
+      if (!branchResetSelectionMatches(selection)) { status('Repository or branch changed. Reopen Reset; nothing was reset.', 'error'); return; }
+      status(`Resetting ${selection.branch} to ${report.target.slice(0, 8)} (${mode})…`, 'busy');
+      resetAttempted = true;
+      await invoke('reset_current_branch', { repositoryPath: selection.path, branch: selection.branch,
+        expectedHead: selection.head, targetCommit: report.target, mode });
+    } catch (error) {
+      if (resetAttempted && branchResetSelectionMatches(selection)) {
+        try { await refreshAfterGraphCommitAction(selection.path); } catch (_) { /* preserve original error; never retry reset */ }
+      }
+      handleError(error); return;
+    }
+    const message = `${selection.branch} reset to ${report.target.slice(0, 8)}. Submodule folders were not updated; nothing was pushed.`;
+    if (branchResetSelectionMatches(selection)) {
+      try { await refreshAfterGraphCommitAction(selection.path); }
+      catch (error) { status(`${message} Display refresh failed; refresh manually. ${String(error)}`, 'error'); return; }
+      status(message); showOperationToast(message, 'success');
+    }
+  } finally { branchResetActive = false; }
+}
+
 function showGraphCommitContextMenu(event, commitId) {
   if (!selectedGraphCommitIds().includes(commitId)) selectCommit(commitId);
   const selectedIds = selectedGraphCommitIds();
@@ -7860,22 +7919,23 @@ function showGraphCommitContextMenu(event, commitId) {
     { id: 'checkout', label: 'Checkout exact commit', detail: `${commitId.slice(0, 8)} · detached HEAD; branches stay unchanged`, kind: 'primary', run: () => checkoutGraphCommit(commitId) },
     { id: 'branch', label: 'Create new branch here…', detail: `${commitId.slice(0, 8)} · new attached local branch`, kind: 'primary', run: () => createBranchFromGraphCommit(commitId) },
   ];
+  menuItems.push({ separator: true }, { header: 'Compare · read only' }, ...commitCompareItems);
   if (mergeRefs.length) {
     menuItems.push(
       { separator: true },
       { header: 'Merge into current branch' },
-      ...mergeRefs.flatMap((ref, index) => [graphMergeMenuItem(ref.name, `merge-${index}`), graphMergePreviewMenuItem(ref.name, `preview-merge-${index}`, commitId)]),
+      ...mergeRefs.flatMap((ref, index) => [graphMergePreviewMenuItem(ref.name, `preview-merge-${index}`, commitId), graphMergeMenuItem(ref.name, `merge-${index}`)]),
     );
   }
   menuItems.push(
     { separator: true },
-    { header: 'Clean checkout · discards local files' },
-    { id: 'restore-exact', label: 'Clean checkout exact commit…', detail: `${commitId.slice(0, 8)} · detached HEAD`, danger: true, run: () => restoreExactCheckpointFromGraphCommit(commitId) },
-    ...localBranchesAtCommit.map((ref, index) => ({ id: `clean-branch-${index}`, label: `Clean checkout branch ${ref.name}…`, detail: 'Attach HEAD to this local branch after cleaning', danger: true, run: () => restoreExactCheckpointFromGraphCommit(commitId, ref.name) })),
-    ...cleanUpstreamMenuItems(context, branchRefs),
+    { header: 'Clean checkout · keeps branch tips' },
+    ...localBranchesAtCommit.map((ref, index) => ({ id: `clean-branch-${index}`, label: `Clean checkout branch ${ref.name}…`, detail: 'Discard local edits · switch branch · align submodule folders', danger: true, run: () => restoreExactCheckpointFromGraphCommit(commitId, ref.name) })),
+    { id: 'restore-exact', label: 'Clean checkout exact commit…', detail: `${commitId.slice(0, 8)} · discard local edits · detached HEAD`, danger: true, run: () => restoreExactCheckpointFromGraphCommit(commitId) },
     { separator: true },
-    { header: 'Compare · read only' },
-    ...commitCompareItems,
+    { header: 'Reset / replace · moves current branch' },
+    branchResetMenuItem(context, commitId),
+    ...cleanUpstreamMenuItems(context, branchRefs),
   );
   showFloatingMenu(event, menuItems);
 }

@@ -14,10 +14,10 @@ impl Drop for StopHandle {
     }
 }
 
-fn kill_tree(child: &mut std::process::Child) -> Result<(), String> {
+pub(super) fn kill_tree(child: &mut std::process::Child) -> Result<bool, String> {
     // We still own the unreaped Child. The UI sends a session-unique command
     // ID, never a PID. A stale confirmation cannot target a replacement job.
-    if child.try_wait().map_err(|error| error.to_string())?.is_some() { return Ok(()); }
+    if child.try_wait().map_err(|error| error.to_string())?.is_some() { return Ok(false); }
     #[cfg(unix)]
     let result = Command::new("kill").arg("-9").arg(format!("-{}", child.id())).output();
     #[cfg(windows)]
@@ -27,7 +27,8 @@ fn kill_tree(child: &mut std::process::Child) -> Result<(), String> {
             .args(["/F", "/T", "/PID"]).arg(child.id().to_string()).output()
     };
     let output = result.map_err(|error| error.to_string())?;
-    if output.status.success() || child.try_wait().map_err(|error| error.to_string())?.is_some() { Ok(()) }
+    if output.status.success() { Ok(true) }
+    else if child.try_wait().map_err(|error| error.to_string())?.is_some() { Ok(false) }
     else { Err(String::from_utf8_lossy(&output.stderr).trim().to_string()) }
 }
 
@@ -59,7 +60,8 @@ pub(super) fn run(mut command: Command, timeout: Duration, label: &str, timeout_
         let user_stop = requested.load(Ordering::Relaxed);
         if interruption.is_none() && (user_stop || started.elapsed() >= next_timeout_attempt) {
             match kill_tree(&mut child) {
-                Ok(()) => {
+                Ok(false) => continue, // Finished before the stop; preserve its real exit status.
+                Ok(true) => {
                     interruption = Some(if user_stop {
                         format!("{label} command stopped by user. Completed local or server changes were not rolled back. Inspect repository status before continuing; an interrupted command may leave lock files or an unfinished operation. No automatic reset, clean, commit or push was run.")
                     } else {

@@ -5,8 +5,14 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Git DrillDown</title>
   <link rel="icon" type="image/png" href="assets/git-drilldown-mark.png">
-  <link rel="stylesheet" href="styles.css?v=20261029-clean-no-backups">
-  <link rel="stylesheet" href="polarion.css?v=20261029-clean-no-backups">
+  <!-- Critical, inline: guarantees the first-ever paint already has the
+       app's background/font, even if the external stylesheet below loads
+       slowly (e.g. a cold WebView after the app sat idle). Without this,
+       that gap can show a flash of default browser background/font before
+       styles.css applies. Keep in sync with the body rule in styles.css. -->
+  <style>html,body{width:100%;height:100%;margin:0;overflow:hidden;background:#0d1117;color:#e8eef5;font:14px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}</style>
+  <link rel="stylesheet" href="styles.css?v=20261030-branch-reset">
+  <link rel="stylesheet" href="polarion.css?v=20261030-branch-reset">
 </head>
 <body>
   <div id="startupIntro" class="startup-intro" hidden>
@@ -17,7 +23,7 @@
       <div id="startupIntroFailure" class="startup-intro-failure" hidden><p>Reload the window to retry.</p><button type="button" id="startupIntroRetry">Reload interface</button></div>
     </div>
   </div>
-  <script src="startup-intro.js?v=20261029-clean-no-backups"></script>
+  <script src="startup-intro.js?v=20261030-branch-reset"></script>
   <div class="app-shell">
     <header class="topbar">
       <div class="brand" aria-label="Git DrillDown">
@@ -744,6 +750,7 @@
       <div class="commit-dialog-actions"><button value="cancel">Cancel</button><button type="button" id="previewMergeBranch">Preview merge…</button><button type="button" id="confirmMergeBranch" class="confirm">Merge</button></div>
     </form>
   </dialog>
+  <dialog id="branchResetDialog" class="branch-reset-dialog" aria-labelledby="branchResetTitle"></dialog>
   <dialog id="mergePreviewDialog" class="merge-preview-dialog" aria-labelledby="mergePreviewTitle">
     <header><div><h2 id="mergePreviewTitle">Merge preview</h2><p data-preview-direction></p></div><span data-preview-snapshots></span><button type="button" data-preview-close aria-label="Close merge preview">×</button></header>
     <div class="merge-preview-toolbar"><span data-preview-summary role="status" aria-live="polite"></span><div><input data-preview-search type="search" aria-label="Find paths in merge preview" placeholder="Find a path…"><select data-preview-filter aria-label="Filter merge report"><option value="all">All items</option><option value="changes">Changes to current</option><option value="conflicts">Conflicts</option><option value="submodules">Submodules</option><option value="review">Needs review</option></select><button type="button" data-preview-refresh title="Recalculate using the latest local branch references. No fetch.">Recalculate</button></div></div>
@@ -963,23 +970,24 @@
       <footer><span>Read-only on Polarion · local snapshots outside Git</span><button value="cancel">Close</button><button type="button" id="polarionAdd" class="confirm" disabled>Add to Commit List</button></footer>
     </form>
   </dialog>
-  <script src="polarion.js?v=20261029-clean-no-backups"></script>
-  <script src="console-context.js?v=20261029-clean-no-backups"></script>
-  <script src="graph-model.js?v=20261029-clean-no-backups"></script>
-  <script src="submodule-state.js?v=20261029-clean-no-backups"></script>
-  <script src="submodule-versions.js?v=20261029-clean-no-backups"></script>
-  <script src="local-diff.js?v=20261029-clean-no-backups"></script>
-  <script src="local-drive.js?v=20261029-clean-no-backups"></script>
-  <script src="pr-status.js?v=20261029-clean-no-backups"></script>
-  <script src="refresh-coordinator.js?v=20261029-clean-no-backups"></script>
-  <script src="comparison-authors.js?v=20261029-clean-no-backups"></script>
-  <script src="git-activity.js?v=20261029-clean-no-backups"></script>
-  <script src="comparison-navigation.js?v=20261029-clean-no-backups"></script>
-  <script src="panel-resize.js?v=20261029-clean-no-backups"></script>
-  <script src="submodule-compare-details.js?v=20261029-clean-no-backups"></script>
-  <script src="merge-preview.js?v=20261029-clean-no-backups"></script>
-  <script src="navigation-refresh.js?v=20261029-clean-no-backups"></script>
-  <script src="ipc-diagnostics.js?v=20261029-clean-no-backups"></script>
-  <script src="app.js?v=20261029-clean-no-backups"></script>
+  <script src="polarion.js?v=20261030-branch-reset"></script>
+  <script src="console-context.js?v=20261030-branch-reset"></script>
+  <script src="graph-model.js?v=20261030-branch-reset"></script>
+  <script src="submodule-state.js?v=20261030-branch-reset"></script>
+  <script src="submodule-versions.js?v=20261030-branch-reset"></script>
+  <script src="local-diff.js?v=20261030-branch-reset"></script>
+  <script src="local-drive.js?v=20261030-branch-reset"></script>
+  <script src="pr-status.js?v=20261030-branch-reset"></script>
+  <script src="refresh-coordinator.js?v=20261030-branch-reset"></script>
+  <script src="comparison-authors.js?v=20261030-branch-reset"></script>
+  <script src="git-activity.js?v=20261030-branch-reset"></script>
+  <script src="comparison-navigation.js?v=20261030-branch-reset"></script>
+  <script src="panel-resize.js?v=20261030-branch-reset"></script>
+  <script src="submodule-compare-details.js?v=20261030-branch-reset"></script>
+  <script src="branch-reset.js?v=20261030-branch-reset"></script>
+  <script src="merge-preview.js?v=20261030-branch-reset"></script>
+  <script src="navigation-refresh.js?v=20261030-branch-reset"></script>
+  <script src="ipc-diagnostics.js?v=20261030-branch-reset"></script>
+  <script src="app.js?v=20261030-branch-reset"></script>
 </body>
 </html>

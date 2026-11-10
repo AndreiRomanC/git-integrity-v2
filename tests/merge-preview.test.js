@@ -115,7 +115,7 @@ test('graph preview keeps submodule scope and rejects stale menu actions',()=>{
   vm.createContext(c);vm.runInContext(source('graphMergePreviewMenuItem'),c);
   const menu=c.graphMergePreviewMenuItem('origin/main','preview-1','sha');menu.run();assert.equal(c.args[0].targetPath,'dep');assert.equal(c.args[2],'sha');
   c.args=null;c.repoOpenGeneration++;menu.run();assert.equal(c.args,null);
-  assert.match(app,/graphMergeMenuItem\(ref.name, `merge-\$\{index\}`\), graphMergePreviewMenuItem/);
+  assert.match(app,/graphMergePreviewMenuItem\(ref.name, `preview-merge-\$\{index\}`, commitId\), graphMergeMenuItem/);
 });
 test('preview file comparison has no write actions, reads immutable objects and rejects stale loads',async()=>{
   let resolve;const c={MergePreview:api,jsPerfLog(){},state:{},refs:{compareDialog:node(),compareTitle:node(),compareSubtitle:node(),localCompare:node(),remoteCompare:node()},

@@ -2,7 +2,7 @@
 //! trace file, argv, URL, header, credential or message is written to our log.
 //! Inclusive/nested timings are deliberately NOT added into a fake breakdown.
 use super::*;
-use std::io::Read;
+pub(super) mod runner;
 
 const MAX_LINE: usize = 32 * 1024;
 const MAX_CHILDREN: usize = 4096;
@@ -11,23 +11,11 @@ static NEXT_PUSH: AtomicU64 = AtomicU64::new(1);
 
 pub(super) fn failure_category(error: &str) -> &'static str {
     let value = error.to_ascii_lowercase();
-    if value.contains("authentication") { "authentication" }
+    if value.contains("timed out") { "timeout" }
+    else if value.contains("authentication") { "authentication" }
     else if value.contains("non-fast-forward") || value.contains("server branch has newer") { "remote_ahead" }
-    else if value.contains("timed out") { "timeout" }
     else if value.contains("index.lock") { "index_lock" }
     else { "other" }
-}
-
-pub(super) fn wait_with_output(mut child: std::process::Child, trace: PushTrace) -> std::io::Result<std::process::Output> {
-    // Drain both streams concurrently using the same existing process wait /
-    // timeout / process-group cleanup. Only the trace stream is filtered.
-    let pipe = child.stderr.take().expect("publish stderr is piped");
-    let reader = std::thread::spawn(move || trace.read_stderr(pipe));
-    let output = child.wait_with_output();
-    let stderr = reader.join().map_err(|_| std::io::Error::other("Publish diagnostic reader failed"))?;
-    let mut output = output?;
-    output.stderr = stderr?;
-    Ok(output)
 }
 
 pub(super) struct PushTrace {
@@ -49,39 +37,19 @@ impl PushTrace {
 
     fn log(&self, fields: &str) { perf_log(&format!("publish_diag: push={} {fields}", self.id), self.started.elapsed()); }
 
-    pub(super) fn configure(&self, command: &mut Command) {
-        command.env("GIT_TRACE2_EVENT", "2")
-            .env("GIT_TRACE2_CONFIG_PARAMS", "push.recurseSubmodules,submodule.recurse,push.negotiate")
-            .env("GIT_TRACE2_EVENT_NESTING", "3");
+    pub(super) fn log_command(&self, fast: bool, is_tip: bool) {
+        self.log(&format!("event=command shape=git_push_remote_oid_to_branch mode={} source={} force=false hooks=normal recursion=git_config terminal_prompt=false stdin=null helper_interactivity=inherited timeout_s={} automatic_retry=false",
+            if fast { "fast" } else { "safe" }, if is_tip { "branch_tip" } else { "selected_commit" }, GIT_COMMAND_TIMEOUT.as_secs()));
+        let presence = |key| if std::env::var_os(key).is_some() { "set" } else { "unset" };
+        let interactive = std::env::var("GCM_INTERACTIVE").ok();
+        self.log(&format!("event=prompt_environment git_askpass={} ssh_askpass={} gcm_interactive={} values_redacted=true",
+            presence("GIT_ASKPASS"), presence("SSH_ASKPASS"), prompt_setting(interactive.as_deref())));
     }
 
-    pub(super) fn read_stderr(self, mut pipe: impl Read) -> std::io::Result<Vec<u8>> {
-        let mut summary = Summary::default();
-        let mut output = Vec::new();
-        let mut line = Vec::new();
-        let mut overflow = false;
-        let mut bytes = [0u8; 8192];
-        loop {
-            let count = match pipe.read(&mut bytes) {
-                Ok(count) => count,
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(error) => { self.log("event=trace_end coverage=incomplete reason=pipe_read_error"); return Err(error); }
-            };
-            if count == 0 { break; }
-            for &byte in &bytes[..count] {
-                if byte == b'\n' {
-                    summary.line(&self, &line, overflow, &mut output);
-                    line.clear(); overflow = false;
-                } else if line.len() < MAX_LINE { line.push(byte); }
-                else { overflow = true; }
-            }
-        }
-        if !line.is_empty() || overflow { summary.line(&self, &line, overflow, &mut output); }
-        if summary.output_truncated {
-            output.extend_from_slice(b"\n[Git stderr capture truncated; process exit status is unchanged.]\n");
-        }
-        summary.finish(&self);
-        Ok(output)
+    pub(super) fn configure(&self, command: &mut Command) {
+        command.env("GIT_TRACE2_EVENT", "2")
+            .env("GIT_TRACE2_CONFIG_PARAMS", "push.recurseSubmodules,submodule.recurse,push.negotiate,credential.interactive,credential.guiPrompt")
+            .env("GIT_TRACE2_EVENT_NESTING", "3");
     }
 
     // libgit2 does not emit Git Trace2. Log callback milestones, not invented
@@ -89,6 +57,41 @@ impl PushTrace {
     pub(super) fn milestone(&self, phase: &'static str) { self.log(&format!("event=milestone phase={phase} timing=since_push_start")); }
     pub(super) fn libgit_end(&self, success: bool) {
         self.log(&format!("event=end success={success} coverage=libgit2_callback_milestones network_auth_server_wait=not_separated"));
+    }
+}
+
+#[derive(Default)]
+struct Capture {
+    summary: Summary,
+    output: Vec<u8>,
+    line: Vec<u8>,
+    overflow: bool,
+}
+
+impl Capture {
+    fn feed(&mut self, trace: &PushTrace, bytes: &[u8]) {
+        for &byte in bytes {
+            if byte == b'\n' {
+                self.flush_line(trace);
+            } else if self.line.len() < MAX_LINE { self.line.push(byte); }
+            else { self.overflow = true; }
+        }
+    }
+
+    fn flush_line(&mut self, trace: &PushTrace) {
+        self.summary.line(trace, &self.line, self.overflow, &mut self.output);
+        self.line.clear();
+        self.overflow = false;
+    }
+
+    fn finish(mut self, trace: &PushTrace, eof: bool) -> Vec<u8> {
+        // A cut-off JSON/Trace2 prefix may contain raw argv later in the line.
+        if eof && (!self.line.is_empty() || self.overflow) { self.flush_line(trace); }
+        if !eof || self.summary.output_truncated {
+            self.output.extend_from_slice(b"\n[Git stderr capture incomplete; process exit status is unchanged.]\n");
+        }
+        self.summary.finish(trace);
+        self.output
     }
 }
 
@@ -102,12 +105,42 @@ impl Aggregate {
 struct Summary {
     events: usize,
     dropped: usize,
-    children: HashMap<(String, u64), &'static str>,
+    children: HashMap<(String, u64), (&'static str, &'static str, Instant)>,
     totals: std::collections::BTreeMap<&'static str, Aggregate>,
     first: HashSet<&'static str>,
+    helper_events: HashSet<(&'static str, bool)>,
     configs: HashMap<&'static str, (&'static str, &'static str)>,
     version: bool,
     output_truncated: bool,
+    stderr_reason: Option<&'static str>,
+}
+
+fn helper_action(event: &serde_json::Value) -> &'static str {
+    // Both ["git", "credential-manager", "get"] and ["git credential-manager get"] occur.
+    match event["argv"].as_array().and_then(|a| a.last()).and_then(|s| s.as_str())
+        .and_then(|s| s.split_ascii_whitespace().last()) {
+        Some("get") => "get", Some("store") => "store", Some("erase") => "erase", _ => "unknown",
+    }
+}
+
+fn prompt_setting(value: Option<&str>) -> &'static str {
+    match value.map(str::to_ascii_lowercase).as_deref() {
+        Some("never" | "false" | "0" | "no") => "disabled",
+        Some("true" | "1" | "yes") => "enabled", Some("auto") => "auto",
+        None => "unset", Some(_) => "other",
+    }
+}
+
+fn stderr_reason(text: &str) -> Option<&'static str> {
+    let s = text.to_ascii_lowercase();
+    if s.contains("authentication failed") || s.contains("terminal prompts disabled") || s.contains("could not read username") { Some("authentication") }
+    else if (s.contains("403") && s.contains("http")) || s.contains("returned error: 403") { Some("http_forbidden") }
+    else if s.contains("could not resolve host") { Some("dns") }
+    else if s.contains("could not resolve proxy") { Some("proxy") }
+    else if s.contains("ssl certificate") || s.contains("certificate verify failed") { Some("tls_certificate") }
+    else if s.contains("failed to connect") || s.contains("connection reset") { Some("connection") }
+    else if s.contains("non-fast-forward") || s.contains("[rejected]") { Some("remote_rejection") }
+    else { None }
 }
 
 fn child_category(event: &serde_json::Value) -> &'static str {
@@ -131,21 +164,41 @@ fn child_category(event: &serde_json::Value) -> &'static str {
 
 fn config_value(key: &str, value: &str) -> Option<(&'static str, &'static str)> {
     let value = value.to_ascii_lowercase();
-    match key {
+    match key.to_ascii_lowercase().as_str() {
         "push.recursesubmodules" => Some(("push.recurseSubmodules", match value.as_str() { "check" => "check", "on-demand" => "on-demand", "only" => "only", "no" | "false" => "no", _ => "other" })),
         "submodule.recurse" => Some(("submodule.recurse", match value.as_str() { "true" | "yes" | "1" => "true", "false" | "no" | "0" => "false", _ => "other" })),
         "push.negotiate" => Some(("push.negotiate", match value.as_str() { "true" | "yes" | "1" => "true", "false" | "no" | "0" => "false", _ => "other" })),
+        "credential.interactive" => Some(("credential.interactive", prompt_setting(Some(&value)))),
+        "credential.guiprompt" => Some(("credential.guiPrompt", prompt_setting(Some(&value)))),
         _ => None,
     }
 }
 
 impl Summary {
+    fn helper_observed_open(&self) -> bool {
+        self.children.values().any(|(category, _, _)| *category == "credential_helper")
+    }
+    fn snapshot(&self) -> String {
+        let mut active = std::collections::BTreeMap::new();
+        for &(category, action, since) in self.children.values() {
+            let entry = active.entry((category, action)).or_insert((0usize, 0u128));
+            entry.0 += 1;
+            entry.1 = entry.1.max(since.elapsed().as_millis());
+        }
+        let groups = active.iter().map(|((c,a),(count,age))| format!("{c}/{a}:{count}@{age}ms")).collect::<Vec<_>>().join(",");
+        format!("observed_open_children={} stderr_reason={} trace_events={} dropped={}",
+            if groups.is_empty() { "none" } else { &groups }, self.stderr_reason.unwrap_or("not_observed"), self.events, self.dropped)
+    }
+
     fn line(&mut self, trace: &PushTrace, line: &[u8], overflow: bool, output: &mut Vec<u8>) {
         let text = String::from_utf8_lossy(line);
         // Concurrent child stderr can interleave. Treat malformed/interleaved
         // Trace2 as incomplete, NEVER as ordinary console output with argv.
         let trace_line = text.contains("\"event\"");
         if !trace_line {
+            if !overflow {
+                if let Some(reason) = stderr_reason(&text) { self.stderr_reason = Some(reason); }
+            }
             let available = RECENT_GIT_COMMAND_OUTPUT_LIMIT.saturating_sub(output.len());
             self.output_truncated |= overflow || line.len() > available;
             output.extend_from_slice(&line[..line.len().min(available)]);
@@ -165,7 +218,7 @@ impl Summary {
                 trace.log(&format!("event=git_version numeric={version}"));
             }
             "def_param" => {
-                if let Some((key, value)) = config_value(&event["param"].as_str().unwrap_or("").to_ascii_lowercase(), event["value"].as_str().unwrap_or("")) {
+                if let Some((key, value)) = config_value(event["param"].as_str().unwrap_or(""), event["value"].as_str().unwrap_or("")) {
                     // Keep the last ROOT observation (global/local/command
                     // values can repeat); never substitute a child's config.
                     // This is reported as an observation, not a Git override.
@@ -179,13 +232,20 @@ impl Summary {
                 if let Some(id) = event["child_id"].as_u64() {
                     if self.children.len() >= MAX_CHILDREN { self.dropped += 1; return; }
                     let category = child_category(&event);
-                    self.children.insert((sid.to_owned(), id), category);
-                    if self.first.insert(category) { trace.log(&format!("event=first_child category={category}")); }
+                    let action = if category == "credential_helper" { helper_action(&event) } else { "-" };
+                    self.children.insert((sid.to_owned(), id), (category, action, Instant::now()));
+                    let first = if category == "credential_helper" { self.helper_events.insert((action, false)) } else { self.first.insert(category) };
+                    if first {
+                        trace.log(&format!("event=first_child category={category} action={action}"));
+                    }
                 }
             }
             "child_exit" => {
                 if let Some(id) = event["child_id"].as_u64() {
-                    if let Some(category) = self.children.remove(&(sid.to_owned(), id)) {
+                    if let Some((category, action, _)) = self.children.remove(&(sid.to_owned(), id)) {
+                        if category == "credential_helper" && self.helper_events.insert((action, true)) {
+                            trace.log(&format!("event=first_helper_exit action={action} exit_code={}", event["code"].as_i64().map(|v| v.to_string()).unwrap_or_else(|| "unknown".into())));
+                        }
                         if let Some(seconds) = seconds { self.totals.entry(category).or_default().add(seconds); }
                         else { self.dropped += 1; }
                     }
@@ -206,7 +266,7 @@ impl Summary {
     }
 
     fn finish(self, trace: &PushTrace) {
-        for key in ["push.recurseSubmodules", "submodule.recurse", "push.negotiate"] {
+        for key in ["push.recurseSubmodules", "submodule.recurse", "push.negotiate", "credential.interactive", "credential.guiPrompt"] {
             match self.configs.get(key) {
                 Some((value, scope)) => trace.log(&format!("event=config key={key} value={value} scope={scope} interpretation=last_root_observation")),
                 None => trace.log(&format!("event=config key={key} value=not_observed")),

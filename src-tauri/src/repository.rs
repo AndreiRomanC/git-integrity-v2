@@ -18,6 +18,8 @@ mod perf_logging;
 mod ipc_diagnostics;
 mod publish_diagnostics;
 mod process_control;
+mod background_process;
+use background_process::command as background_command;
 mod check_links;
 pub mod index_lock;
 #[cfg(test)]
@@ -1331,14 +1333,13 @@ fn run_with_timeout_labeled_traced(mut command: Command, timeout: Duration, prog
     // the kill call below for why that matters. Must be set before spawn().
     #[cfg(unix)] { use std::os::unix::process::CommandExt; command.process_group(0); }
     let child = command.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().map_err(|e| format!("Cannot start {program_label}: {e}"))?;
+    if let Some(trace) = trace {
+        return publish_diagnostics::runner::wait(child, trace, timeout, timeout_label);
+    }
     let id = child.id();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let result = match trace {
-            Some(trace) => publish_diagnostics::wait_with_output(child, trace),
-            None => child.wait_with_output(),
-        };
-        let _ = tx.send(result);
+        let _ = tx.send(child.wait_with_output());
     });
     match rx.recv_timeout(timeout) {
         Ok(Ok(output)) => Ok(output),
@@ -1359,7 +1360,7 @@ fn run_with_timeout_labeled_traced(mut command: Command, timeout: Duration, prog
             #[cfg(unix)] { let _ = Command::new("kill").arg("-9").arg(format!("-{id}")).status(); }
             // /T is the Windows equivalent: kill the whole process tree
             // rooted at this PID, not just cmd.exe itself.
-            #[cfg(windows)] { let _ = Command::new("taskkill").args(["/F", "/T", "/PID"]).arg(id.to_string()).status(); }
+            #[cfg(windows)] { let _ = background_command("taskkill").args(["/F", "/T", "/PID"]).arg(id.to_string()).status(); }
             Err(format!("{program_label} command timed out after {timeout_label} — check your network connection and try again"))
         }
     }
@@ -1583,7 +1584,7 @@ fn git_with_timeout_control_traced(path: &str, args: &[&str], timeout: Duration,
     if is_submodule_update(args) {
         perf_log(&format!("submodule_update: start repo={} timeout_seconds={} force_requested={}", anonymized_repository_id(path), timeout.as_secs(), args.contains(&"--force")), Duration::ZERO);
     }
-    let mut command = Command::new("git");
+    let mut command = background_command("git");
     // `-c` overrides must come before the subcommand to be recognized as
     // global git config, not passed through to it — configure_git_command's
     // own `-c` flags need to land here, before `args` (which starts with the
@@ -2384,7 +2385,7 @@ pub fn open_external_url(url: String) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     let status = Command::new("open").arg(&url).status();
     #[cfg(target_os = "windows")]
-    let status = Command::new("cmd").args(["/C", "start", "", &url]).status();
+    let status = background_command("cmd").args(["/C", "start", "", &url]).status();
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     let status = Command::new("xdg-open").arg(&url).status();
     status.map_err(|error| error.to_string()).and_then(|result| result.success().then_some(()).ok_or_else(|| "Could not open the default browser".into()))
@@ -2660,7 +2661,7 @@ fn launch_browser(url: &str) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     let status = Command::new("open").arg(url).status();
     #[cfg(target_os = "windows")]
-    let status = Command::new("cmd").args(["/C", "start", "", url]).status();
+    let status = background_command("cmd").args(["/C", "start", "", url]).status();
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     let status = Command::new("xdg-open").arg(url).status();
     status.map_err(|error| error.to_string()).and_then(|result| result.success().then_some(()).ok_or_else(|| "Could not open the default browser".into()))
@@ -4328,7 +4329,7 @@ static GH_CLI_AVAILABLE: OnceLock<bool> = OnceLock::new();
 #[cfg(not(test))]
 fn gh_cli_available() -> bool {
     *GH_CLI_AVAILABLE.get_or_init(|| {
-        let mut command = Command::new("gh");
+        let mut command = background_command("gh");
         command.arg("--version").stdin(std::process::Stdio::null());
         run_with_timeout_labeled(command, Duration::from_secs(3), "gh", "3 seconds")
             .map(|output| output.status.success())
@@ -4346,7 +4347,7 @@ fn gh_cli_available() -> bool { true }
 // without printing (or logging) the token. Tests keep the injected gh runner.
 #[cfg(not(test))]
 fn gh_cli_authenticated(host: &str) -> bool {
-    let mut command = Command::new("gh");
+    let mut command = background_command("gh");
     command.args(["auth", "token", "--hostname", host])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -4431,7 +4432,7 @@ fn classify_credential_helpers(raw: &[u8]) -> String {
 }
 
 fn credential_helper_kind(repository_path: &str) -> String {
-    let mut command = Command::new("git");
+    let mut command = background_command("git");
     command.arg("-C").arg(repository_path).args(["config", "--get-all", "credential.helper"])
         .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(std::process::Stdio::null());
@@ -4443,7 +4444,7 @@ fn credential_helper_kind(repository_path: &str) -> String {
 fn approve_git_credential(repository_path: &str, repo: &GitHubRepo, credential: &GitHttpsCredential) -> Result<(), String> {
     use std::io::Write;
     let Some(username) = credential.username.as_deref() else { return Err("username_missing".into()) };
-    let mut command = Command::new("git");
+    let mut command = background_command("git");
     command.arg("-C").arg(repository_path).args(["credential", "approve"])
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GCM_INTERACTIVE", "never")
@@ -4473,7 +4474,7 @@ fn approve_git_credential(repository_path: &str, repo: &GitHubRepo, credential: 
         Ok(Err(error)) => Err(format!("wait_failed(kind={:?})", error.kind())),
         Err(_) => {
             #[cfg(unix)] { let _ = Command::new("kill").arg("-9").arg(format!("-{id}")).status(); }
-            #[cfg(windows)] { let _ = Command::new("taskkill").args(["/F", "/T", "/PID"]).arg(id.to_string()).status(); }
+            #[cfg(windows)] { let _ = background_command("taskkill").args(["/F", "/T", "/PID"]).arg(id.to_string()).status(); }
             Err("timeout".into())
         }
     }
@@ -4529,7 +4530,7 @@ fn forget_github_session_token(host: &str) {
 fn github_token_from_git_credential_helper(repository_path: &str, repo: &GitHubRepo, interactive: bool) -> Result<GitHttpsCredential, String> {
     use std::io::Write;
 
-    let mut command = Command::new("git");
+    let mut command = background_command("git");
     command.arg("-C").arg(repository_path).args(["credential", "fill"])
         .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(std::process::Stdio::piped())
@@ -4569,7 +4570,7 @@ fn github_token_from_git_credential_helper(repository_path: &str, repo: &GitHubR
         Ok(Err(_)) => Err("Could not read the Git credential helper's response".into()),
         Err(_) => {
             #[cfg(unix)] { let _ = Command::new("kill").arg("-9").arg(format!("-{id}")).status(); }
-            #[cfg(windows)] { let _ = Command::new("taskkill").args(["/F", "/T", "/PID"]).arg(id.to_string()).status(); }
+            #[cfg(windows)] { let _ = background_command("taskkill").args(["/F", "/T", "/PID"]).arg(id.to_string()).status(); }
             Err(if interactive { "Git Credential Manager sign-in did not finish within 5 minutes. Retry after checking the browser sign-in window." } else { "Git credential lookup did not finish within 5 seconds." }.into())
         }
     }
@@ -4931,7 +4932,7 @@ fn gh_stderr_looks_like_auth(stderr: &str) -> bool {
 
 fn run_gh_pr_list(query: &PrGhQuery) -> GhOutcome {
     let side_flag = match query.direction { PrQueryDirection::Head => "--head", PrQueryDirection::Base => "--base" };
-    let mut command = Command::new("gh");
+    let mut command = background_command("gh");
     command.args(["pr", "list", "--repo", &query.repo, side_flag, &query.branch, "--state", "open", "--json", PR_GH_JSON_FIELDS]);
     command.stdin(std::process::Stdio::null());
     match run_with_timeout_labeled(command, Duration::from_secs(20), "gh", "20 seconds") {
@@ -5298,7 +5299,7 @@ fn github_rest_endpoint(repo: &GitHubRepo, suffix: &str) -> String {
 
 fn post_pull_request_comment_with_gh(repo: &GitHubRepo, number: u64, body: &str) -> Result<(), String> {
     let endpoint = format!("repos/{}/{}/issues/{number}/comments", repo.owner, repo.repo);
-    let mut command = Command::new("gh");
+    let mut command = background_command("gh");
     command.args(["api", "--hostname", &repo.host, "--method", "POST", &endpoint, "--raw-field"])
         .arg(format!("body={body}")).stdin(std::process::Stdio::null());
     let output = run_with_timeout_labeled(command, Duration::from_secs(20), "gh comment", "20 seconds")?;
@@ -5946,13 +5947,14 @@ fn publish_branch_inner_with_options(repository_path: String, branch: String, re
     let push_started = Instant::now();
     let push_trace = publish_diagnostics::PushTrace::new(&repo, remote_name, !access_token.trim().is_empty());
     if access_token.trim().is_empty() {
+        push_trace.log_command(skip_submodule_safety, push_oid == local_oid);
         // No explicit token was entered — prefer the system `git` binary, which
         // transparently reuses the user's already-working SSH agent, credential
         // helper, or OS keychain. libgit2's own credential search is much narrower
         // and can fail here ("failed to acquire username/password") even when a
         // plain `git push` in a terminal works fine for the same repository.
         git_with_timeout_control_traced(&repository_path, &["push", remote_name, &format!("{push_oid}:refs/heads/{branch}")], GIT_COMMAND_TIMEOUT, "10 minutes", false, Some(push_trace))
-            .map_err(|detail| if detail.to_lowercase().contains("authentication") || detail.contains("403") || detail.contains("could not read") { "Push authentication failed. Either make sure `git push` works for this repository from a terminal, or enter a Git username and Personal Access Token in Publish credentials.".to_string() } else if detail.to_lowercase().contains("non-fast-forward") || detail.to_lowercase().contains("fetch first") { "Push rejected because the server branch has newer commits. Pull/fetch those commits first, then publish again.".to_string() } else { format!("Push failed: {detail}") })?;
+            .map_err(|detail| if detail.starts_with("Git push timed out") { detail } else if detail.to_lowercase().contains("authentication") || detail.contains("403") || detail.contains("could not read") { "Push authentication failed. Either make sure `git push` works for this repository from a terminal, or enter a Git username and Personal Access Token in Publish credentials.".to_string() } else if detail.to_lowercase().contains("non-fast-forward") || detail.to_lowercase().contains("fetch first") { "Push rejected because the server branch has newer commits. Pull/fetch those commits first, then publish again.".to_string() } else { format!("Push failed: {detail}") })?;
     } else {
         // libgit2 needs a source ref for this commit. A fixed refs/heads name
         // with force=true could overwrite and then DELETE a real user branch.

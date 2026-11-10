@@ -601,11 +601,11 @@ test('graph exposes branch and commit context actions without relying on lane id
   assert.match(app, /openMergeBranchDialog\(activeGraphMergeTarget\(\), branchName\)/);
   assert.match(app, /showGraphCommitContextMenu\(event, row\.dataset\.id\)/);
   assert.doesNotMatch(app, /function showGraphBranchContextMenu\(/);
-  assert.match(app, /\.\.\.mergeRefs\.flatMap\(\(ref, index\) => \[graphMergeMenuItem\(ref\.name, `merge-\$\{index\}`\), graphMergePreviewMenuItem\(ref\.name, `preview-merge-\$\{index\}`, commitId\)\]/);
+  assert.match(app, /\.\.\.mergeRefs\.flatMap\(\(ref, index\) => \[graphMergePreviewMenuItem\(ref\.name, `preview-merge-\$\{index\}`, commitId\), graphMergeMenuItem\(ref\.name, `merge-\$\{index\}`\)\]/);
   assert.match(app, /Create new branch here…/);
   assert.match(app, /Checkout exact commit/);
   assert.match(app, /Clean checkout exact commit…/);
-  assert.match(app, /Clean checkout · discards local files/);
+  assert.match(app, /Clean checkout · keeps branch tips/);
   assert.match(app, /invoke\('create_branch_at_commit', \{ repositoryPath: context\.path, branch: name\.trim\(\), commitId \}\)/);
   assert.match(app, /invoke\('checkout_commit', \{ repositoryPath: context\.path, commitId \}\)/);
   assert.match(app, /invoke\(branch \? 'restore_exact_checkpoint_branch' : 'restore_exact_checkpoint', \{ repositoryPath: context\.path, commitId/);
@@ -882,11 +882,11 @@ test('graph branch context menus can attach detached HEAD to a local branch', ()
   assert.match(app, /checkout_remote_tracking_branch/);
   assert.match(app, /Attach detached HEAD to this local branch/);
   assert.match(app, /openGraphBranchCompare\(branchName\)/);
-  assert.match(app, /function showBranchMenu\(branchName, event\)[\s\S]*?\{ header: branch\.remote \? 'Remote branch' : 'Local branch' \}[\s\S]*?graphCheckoutBranchMenuItem\(branchName, branch\.remote \? 'remote_branch' : 'local_branch'\)[\s\S]*?\{ header: 'Merge' \}[\s\S]*?graphMergeMenuItem\(branchName\)[\s\S]*?\{ header: 'Compare · read only' \}/);
+  assert.match(app, /function showBranchMenu\(branchName, event\)[\s\S]*?\{ header: branch\.remote \? 'Checkout · remote branch' : 'Checkout · local branch' \}[\s\S]*?graphCheckoutBranchMenuItem\(branchName, branch\.remote \? 'remote_branch' : 'local_branch'\)[\s\S]*?\{ header: 'Compare · read only' \}[\s\S]*?\{ header: 'Merge into current branch' \}[\s\S]*?graphMergeMenuItem\(branchName\)/);
   assert.match(app, /localBranchesAtCommit = branchRefs\.filter\(ref => ref\.kind === 'local_branch'\)/);
   assert.match(app, /Checkout \/ attach HEAD[\s\S]*?graphCheckoutBranchMenuItem\(ref\.name, ref\.kind,[\s\S]*?Checkout exact commit[\s\S]*?Create new branch here/);
   assert.match(app, /\{ header: 'Compare · read only' \},[\s\S]*?\.\.\.commitCompareItems/);
-  assert.match(app, /Clean checkout exact commit[\s\S]*?Clean checkout branch \$\{ref\.name\}/);
+  assert.match(app, /Clean checkout branch \$\{ref\.name\}[\s\S]*?Clean checkout exact commit/);
   assert.match(app, /item\.separator[\s\S]*?floating-menu-separator/);
   assert.match(app, /if \(item\.header\) return `<div class="floating-menu-section">/);
   assert.match(css, /\.floating-menu-separator/);

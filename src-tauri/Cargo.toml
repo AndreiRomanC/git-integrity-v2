@@ -22,6 +22,14 @@ time = { version = "0.3", features = ["formatting"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "native-tls"] }
 trash = "5.2.8"
 
+# Already in Cargo.lock. Inspect only the private push pipes we own so an
+# inherited writer cannot make an exited Git process look like a hung push.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Pipes"] }
+
 [profile.dev]
 debug = 0
 incremental = false

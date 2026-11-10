@@ -40,7 +40,7 @@ function graphHarness() {
   vm.createContext(context);
   vm.runInContext([
     'graphCommitCompareAnchorMatches', 'selectedGraphCommitIds', 'refreshGraphCommitSelection',
-    'handleGraphCommitRowClick', 'selectCommit', 'cleanUpstreamMenuItems', 'showGraphCommitContextMenu', 'wireGraphRowInteractions',
+    'handleGraphCommitRowClick', 'selectCommit', 'cleanUpstreamMenuItems', 'branchResetMenuItem', 'showGraphCommitContextMenu', 'wireGraphRowInteractions',
   ].map(source).join('\n'), context);
   context.wireGraphRowInteractions(rows);
   return { state, context, rows, calls, messages, selected: () => plain(context.selectedGraphCommitIds()) };

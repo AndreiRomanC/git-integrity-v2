@@ -101,6 +101,7 @@ pop_stash
 post_pull_request_comment
 pr_status
 preview_folder_restore
+preview_branch_reset
 preview_merge
 publish_branch
 publish_status
@@ -119,6 +120,7 @@ remove_git_path
 rename_branch
 replace_local_merge_file
 reset_submodule
+reset_current_branch
 reset_submodule_branch_to_upstream
 resolve_conflict
 resolve_submodule_repository

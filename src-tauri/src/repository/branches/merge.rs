@@ -663,7 +663,7 @@ fn open_merge_tool_inner(repository_path: String, target_path: String, relative_
     validate_path(&repository_path)?;
     let relative = safe_relative_path(&relative_path)?;
     let relative = normalized(&relative);
-    let configured_tool = Command::new("git")
+    let configured_tool = background_command("git")
         .args(["config", "--get", "merge.tool"])
         .current_dir(&repository_path)
         .output()

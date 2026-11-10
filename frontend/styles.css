@@ -1776,6 +1776,38 @@ dialog form { padding: 28px; text-align: center; }dialog h2 { margin: 0 0 10px; 
 .folder-history-selection button:disabled { opacity: .45; }
 .folder-history-row small b, .history-compare-side { color: #88d2e5; font-size: 9px; letter-spacing: .5px; }
 .folder-history-footer { justify-content: space-between; padding-top: 8px; }
+.branch-reset-dialog { width: min(620px, 94vw); max-height: 90vh; text-align: left; overflow: hidden; }
+.branch-reset-dialog[open] { display: flex; flex-direction: column; }
+.branch-reset-dialog header, .branch-reset-dialog footer { display: flex; flex: none; align-items: center; gap: 12px; padding: 14px 18px; }
+.branch-reset-dialog header { border-bottom: 1px solid var(--border); }
+.branch-reset-dialog header > div { flex: 1; min-width: 0; }
+.branch-reset-dialog h2 { font-size: 18px; margin: 0 0 5px; }
+.branch-reset-dialog p { font-size: 12px; overflow-wrap: anywhere; }
+.branch-reset-dialog button { width: auto; height: 34px; margin: 0; padding: 0 12px; }
+.branch-reset-dialog header button { border: 0; background: transparent; font-size: 22px; color: var(--muted); }
+.branch-reset-body { padding: 16px 18px; min-height: 0; overflow-y: auto; }
+.branch-reset-target { display: grid; gap: 6px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 7px; background: var(--bg); overflow-wrap: anywhere; }
+.branch-reset-target span, .branch-reset-target small { color: var(--muted); font-size: 11px; }
+.branch-reset-target strong { font-size: 13px; }
+.branch-reset-target code { color: var(--text); }
+.branch-reset-dialog fieldset { display: flex; gap: 8px; border: 0; padding: 0; margin: 16px 0 10px; }
+.branch-reset-dialog legend { font-size: 11px; color: var(--muted); padding: 0 0 8px; }
+.branch-reset-choice { flex: 1; display: flex; align-items: flex-start; gap: 7px; border: 1px solid var(--border); border-radius: 7px; padding: 10px 8px; cursor: pointer; }
+.branch-reset-choice:has(input:checked) { border-color: var(--blue); background: #1b3347; }
+.branch-reset-choice input, .branch-reset-consent input { flex: none; width: 14px; height: 14px; margin: 1px 0 0; accent-color: var(--blue); }
+.branch-reset-choice span { display: grid; gap: 4px; }
+.branch-reset-choice strong { font-size: 12px; }
+.branch-reset-choice small { color: var(--muted); font-size: 11px; }
+.branch-reset-dialog [data-reset-effect] { min-height: 38px; color: var(--text); }
+.branch-reset-dialog [data-reset-effect].is-destructive { color: #f1a1a6; }
+.branch-reset-warnings { display: grid; gap: 8px; border-left: 2px solid #bb8d45; margin: 14px 0; padding-left: 10px; }
+.branch-reset-dialog .branch-reset-note { font-size: 11px; }
+.branch-reset-consent { display: flex; gap: 8px; margin-top: 16px; font-size: 12px; line-height: 1.5; }
+.branch-reset-dialog footer { justify-content: flex-end; border-top: 1px solid var(--border); }
+.branch-reset-dialog footer [data-reset-cancel] { background: var(--surface); border-color: var(--border); color: var(--text); }
+.branch-reset-dialog footer .danger { background: #602b33; border-color: #b95c66; color: #ffe4e7; }
+.branch-reset-dialog button:disabled { opacity: .45; cursor: not-allowed; }
+@media (max-width: 500px) { .branch-reset-dialog fieldset { flex-direction: column; } }
 .folder-history-dialog { width: min(850px, 92vw); max-width: 850px; padding: 0; text-align: left; }
 .folder-history-dialog button { width: auto; margin: 0; height: auto; }
 .folder-history-dialog header { display: flex; align-items: center; gap: 12px; padding: 14px 18px; border-bottom: 1px solid var(--border); }

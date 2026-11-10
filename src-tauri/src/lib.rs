@@ -59,6 +59,8 @@ pub fn run() {
             repository::branches::restore_exact_checkpoint,
             repository::branches::restore_exact_checkpoint_branch,
             repository::branches::clean_branch_from_upstream,
+            repository::branches::reset::preview_branch_reset,
+            repository::branches::reset::reset_current_branch,
             repository::index_lock::inspect_index_lock,
             repository::index_lock::recover_index_lock,
             repository::branches::switch_branch,

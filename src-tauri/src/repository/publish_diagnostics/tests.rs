@@ -3,6 +3,117 @@ use std::io::Cursor;
 
 fn trace() -> PushTrace { PushTrace { id: 42, started: Instant::now() } }
 
+impl PushTrace {
+    fn read_stderr(&self, mut input: impl std::io::Read) -> std::io::Result<Vec<u8>> {
+        let mut capture = Capture::default();
+        let mut block = [0u8; 37]; // Exercise real stream segmentation, including inside JSON strings.
+        loop {
+            let n = input.read(&mut block)?;
+            if n == 0 { return Ok(capture.finish(self, true)); }
+            capture.feed(self, &block[..n]);
+        }
+    }
+}
+
+#[test]
+fn pending_helpers_report_only_action_count_age_and_recognized_error() {
+    let mut c = Capture::default();
+    let t = trace();
+    c.feed(&t, b"{\"event\":\"child_start\",\"child_id\":1,\"sid\":\"PRIVATE\",\"argv\":[\"git credential-manager get\"]}\n");
+    c.feed(&t, b"{\"event\":\"child_start\",\"child_id\":2,\"sid\":\"PRIVATE\",\"argv\":[\"git\",\"credential-manager\",\"store\"]}\n");
+    c.feed(&t, b"fatal: Authentication failed for https://PRIVATE\n");
+    let s = c.summary.snapshot();
+    assert!(s.contains("credential_helper/get:1@") && s.contains("credential_helper/store:1@") && s.contains("stderr_reason=authentication"));
+    assert!(!s.contains("PRIVATE"));
+    c.feed(&t, b"{\"event\":\"child_exit\",\"child_id\":1,\"sid\":\"PRIVATE\",\"code\":0,\"t_rel\":1}\n");
+    assert!(!c.summary.snapshot().contains("helper/get:"));
+    assert_eq!(failure_category("Git push timed out. Last recognized Git error: authentication"), "timeout");
+}
+
+#[test]
+fn prompt_diagnostics_are_observations_not_new_authentication_policy() {
+    let t = trace();
+    let mut cmd = Command::new("git");
+    t.configure(&mut cmd);
+    assert!(cmd.get_envs().all(|(k, _)| k.to_string_lossy().starts_with("GIT_TRACE2_")));
+    assert_eq!(prompt_setting(Some("PRIVATE")), "other");
+    assert_eq!(config_value("credential.guiPrompt", "false"), Some(("credential.guiPrompt", "disabled")));
+    let (_, logs) = perf_logging::capture_for_test(|| {
+        t.log_command(true, false);
+        let mut c = Capture::default();
+        for id in 0..15 {
+            let e = serde_json::json!({"event":"child_start","child_id": id, "sid":"PRIVATE","argv":["git credential-manager get"]});
+            c.feed(&t, format!("{e}\n").as_bytes());
+        }
+    });
+    assert!(logs.iter().any(|s| s.contains("mode=fast source=selected_commit force=false")));
+    assert_eq!(logs.iter().filter(|s| s.contains("first_child category=credential_helper action=get")).count(), 1);
+    assert!(!logs.join("\n").contains("PRIVATE"));
+}
+
+const FIXTURE: &str = "repository::publish_diagnostics::tests::push_child_process_fixture";
+fn fixture(role: &str) -> Command {
+    let mut cmd = Command::new(std::env::current_exe().unwrap());
+    cmd.args(["--ignored", "--exact", FIXTURE, "--nocapture"]).env("GDD_TEST_PUSH_CHILD_ROLE", role);
+    cmd
+}
+
+#[test]
+#[ignore = "only invoked as a disposable subprocess by the runner tests"]
+fn push_child_process_fixture() {
+    use std::io::Write;
+    match std::env::var("GDD_TEST_PUSH_CHILD_ROLE").as_deref() {
+        Ok("hold_pipes") => std::thread::sleep(Duration::from_secs(5)),
+        Ok("exit_ok") | Ok("exit_failed") => {
+            let _writer = fixture("hold_pipes").spawn().unwrap(); // deliberately inherits both pipes
+            eprintln!("diagnostic before exit");
+            std::process::exit(if std::env::var("GDD_TEST_PUSH_CHILD_ROLE").unwrap()=="exit_ok" { 0 } else { 7 });
+        }
+        Ok("await_helper") => {
+            eprintln!(r#"{{"event":"child_start","sid":"PRIVATE","child_id":1,"argv":["git credential-manager get"]}}"#);
+            eprintln!("fatal: Authentication failed for https://PRIVATE");
+            std::thread::sleep(Duration::from_secs(20));
+        }
+        Ok("noisy") => {
+            for _ in 0..60 { std::io::stdout().write_all(&[b'x'; 8192]).unwrap(); eprintln!("{}", "y".repeat(8192)); }
+            eprintln!("fatal: Authentication failed for https://PRIVATE");
+            std::process::exit(7);
+        }
+        _ => panic!("fixture requires an explicit role"),
+    }
+}
+
+#[test]
+fn inherited_pipes_never_turn_an_exited_push_into_a_timeout_or_successful_retry() {
+    for (role, code) in [("exit_ok",0),("exit_failed",7)] {
+        let started = Instant::now();
+        let (output, logs) = perf_logging::capture_for_test(|| run_with_timeout_labeled_traced(fixture(role), Duration::from_secs(3), "Git", "3 seconds", Some(trace())).unwrap());
+        assert_eq!(output.status.code(), Some(code));
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("diagnostic before exit"));
+        assert!(logs.iter().any(|s| s.contains("git_exit")));
+        assert!(logs.iter().any(|s| s.contains("capture_finished") && s.contains("stderr=open") && s.contains("timeout_requested=false")));
+        assert!(!logs.iter().any(|s| s.contains("event=timeout")));
+    }
+}
+
+#[test]
+fn actual_timeout_preserves_allowlisted_evidence_and_warns_about_unknown_remote_state() {
+    let (err, logs) = perf_logging::capture_for_test(|| run_with_timeout_labeled_traced(fixture("await_helper"), Duration::from_secs(2), "Git", "test budget", Some(trace())).unwrap_err());
+    assert!(err.contains("timed out") && err.contains("no exit was observed") && err.contains("authentication") && err.contains("remote result is unknown"));
+    assert!(logs.iter().any(|s| s.contains("event=timeout git=running") && s.contains("credential_helper/get:1@")));
+    assert!(!err.contains("PRIVATE") && !logs.join("\n").contains("PRIVATE"));
+}
+
+#[test]
+fn large_concurrent_output_is_drained_and_bounded_without_changing_exit_status() {
+    let (output, logs) = perf_logging::capture_for_test(|| run_with_timeout_labeled_traced(fixture("noisy"), Duration::from_secs(15), "Git", "15 seconds", Some(trace())).unwrap());
+    assert_eq!(output.status.code(), Some(7));
+    assert!(output.stdout.len() <= RECENT_GIT_COMMAND_OUTPUT_LIMIT + 128 && output.stderr.len() <= RECENT_GIT_COMMAND_OUTPUT_LIMIT + 128);
+    assert!(logs.iter().any(|s| s.contains("stderr_reason=authentication")));
+    assert!(!logs.join("\n").contains("PRIVATE"));
+}
+
 #[test]
 fn trace_stream_is_allowlisted_and_never_reaches_console_output() {
     let input = concat!(
