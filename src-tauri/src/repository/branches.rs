@@ -1097,7 +1097,9 @@ mod tests {
             assert_eq!(upstream_git(&f.local, &["status", "--porcelain"]), "", "{mode}");
             assert_eq!(upstream_git(&module, &["rev-parse", "HEAD"]), module_head, "{mode}");
             assert_eq!(upstream_git(&leaf, &["rev-parse", "HEAD"]), leaf_head, "{mode}");
-            assert_eq!(fs::read_to_string(leaf.join("tracked.txt")).unwrap(), "keep committed sources\n");
+            // Git's own autocrlf may normalize this checked-out text file's line
+            // endings on Windows; that conversion is not a Clean/Reset defect.
+            assert_eq!(fs::read_to_string(leaf.join("tracked.txt")).unwrap().replace("\r\n", "\n"), "keep committed sources\n");
             assert!(module_git.join("objects").is_dir() && leaf_git.join("objects").is_dir());
             assert_no_copies(&f.local); // Includes the parent's .git/modules tree.
             assert_no_copies(&module_git);
