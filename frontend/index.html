@@ -11,8 +11,8 @@
        that gap can show a flash of default browser background/font before
        styles.css applies. Keep in sync with the body rule in styles.css. -->
   <style>html,body{width:100%;height:100%;margin:0;overflow:hidden;background:#0d1117;color:#e8eef5;font:14px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}</style>
-  <link rel="stylesheet" href="styles.css?v=20261030-branch-reset">
-  <link rel="stylesheet" href="polarion.css?v=20261030-branch-reset">
+  <link rel="stylesheet" href="styles.css?v=20261111-module-inspect">
+  <link rel="stylesheet" href="polarion.css?v=20261111-module-inspect">
 </head>
 <body>
   <div id="startupIntro" class="startup-intro" hidden>
@@ -23,7 +23,7 @@
       <div id="startupIntroFailure" class="startup-intro-failure" hidden><p>Reload the window to retry.</p><button type="button" id="startupIntroRetry">Reload interface</button></div>
     </div>
   </div>
-  <script src="startup-intro.js?v=20261030-branch-reset"></script>
+  <script src="startup-intro.js?v=20261111-module-inspect"></script>
   <div class="app-shell">
     <header class="topbar">
       <div class="brand" aria-label="Git DrillDown">
@@ -736,9 +736,29 @@
     </div>
     <footer>
       <span id="submoduleBrowserStatus">Nothing selected yet.</span>
+      <button id="inspectSubmoduleBrowser" type="button" disabled>Inspect…</button>
       <button id="compareSubmoduleBrowser" type="button" disabled>Compare revisions</button>
       <button id="cancelSubmoduleBrowser" type="button">Cancel</button>
       <button id="applySubmoduleBrowser" type="button" class="confirm" disabled>Use repository</button>
+    </footer>
+  </dialog>
+  <dialog id="moduleInspect" class="submodule-browser-dialog inspect-dialog" aria-labelledby="inspectTitle">
+    <header><div><span>REPOSITORY INSPECTOR</span><strong id="inspectTitle"></strong><small>Remote repository preview</small></div>
+      <button type="button" data-inspect-back aria-label="Back to results">×</button></header>
+    <nav class="version-tabs" aria-label="Repository versions">
+      <button type="button" data-inspect-tab="branch">Branches</button>
+      <button type="button" data-inspect-tab="tag">Tags</button>
+      <button type="button" data-inspect-tab="history">History</button>
+      <button type="button" id="inspectGraph" class="version-graph-link" hidden>Open full graph</button>
+    </nav>
+    <div class="inspect-tools"><input id="inspectSearch" type="search" class="version-search" aria-label="Filter loaded versions">
+      <small id="inspectScope"></small></div>
+    <div class="inspect-scroll"><div id="inspectRows" class="version-list"></div>
+      <button type="button" id="inspectMore" hidden>Load older commits</button></div>
+    <footer><span id="inspectStatus" role="status"></span>
+      <button type="button" data-inspect-back>Back to results</button>
+      <button type="button" id="inspectCompare" disabled>Compare selected</button>
+      <button type="button" id="inspectUse" class="confirm" disabled>Use this revision…</button>
     </footer>
   </dialog>
   <dialog id="mergeBranchDialog" class="clone-dialog">
@@ -970,24 +990,25 @@
       <footer><span>Read-only on Polarion · local snapshots outside Git</span><button value="cancel">Close</button><button type="button" id="polarionAdd" class="confirm" disabled>Add to Commit List</button></footer>
     </form>
   </dialog>
-  <script src="polarion.js?v=20261030-branch-reset"></script>
-  <script src="console-context.js?v=20261030-branch-reset"></script>
-  <script src="graph-model.js?v=20261030-branch-reset"></script>
-  <script src="submodule-state.js?v=20261030-branch-reset"></script>
-  <script src="submodule-versions.js?v=20261030-branch-reset"></script>
-  <script src="local-diff.js?v=20261030-branch-reset"></script>
-  <script src="local-drive.js?v=20261030-branch-reset"></script>
-  <script src="pr-status.js?v=20261030-branch-reset"></script>
-  <script src="refresh-coordinator.js?v=20261030-branch-reset"></script>
-  <script src="comparison-authors.js?v=20261030-branch-reset"></script>
-  <script src="git-activity.js?v=20261030-branch-reset"></script>
-  <script src="comparison-navigation.js?v=20261030-branch-reset"></script>
-  <script src="panel-resize.js?v=20261030-branch-reset"></script>
-  <script src="submodule-compare-details.js?v=20261030-branch-reset"></script>
-  <script src="branch-reset.js?v=20261030-branch-reset"></script>
-  <script src="merge-preview.js?v=20261030-branch-reset"></script>
-  <script src="navigation-refresh.js?v=20261030-branch-reset"></script>
-  <script src="ipc-diagnostics.js?v=20261030-branch-reset"></script>
-  <script src="app.js?v=20261030-branch-reset"></script>
+  <script src="polarion.js?v=20261111-module-inspect"></script>
+  <script src="console-context.js?v=20261111-module-inspect"></script>
+  <script src="graph-model.js?v=20261111-module-inspect"></script>
+  <script src="submodule-state.js?v=20261111-module-inspect"></script>
+  <script src="submodule-versions.js?v=20261111-module-inspect"></script>
+  <script src="module-inspect.js?v=20261111-module-inspect"></script>
+  <script src="local-diff.js?v=20261111-module-inspect"></script>
+  <script src="local-drive.js?v=20261111-module-inspect"></script>
+  <script src="pr-status.js?v=20261111-module-inspect"></script>
+  <script src="refresh-coordinator.js?v=20261111-module-inspect"></script>
+  <script src="comparison-authors.js?v=20261111-module-inspect"></script>
+  <script src="git-activity.js?v=20261111-module-inspect"></script>
+  <script src="comparison-navigation.js?v=20261111-module-inspect"></script>
+  <script src="panel-resize.js?v=20261111-module-inspect"></script>
+  <script src="submodule-compare-details.js?v=20261111-module-inspect"></script>
+  <script src="branch-reset.js?v=20261111-module-inspect"></script>
+  <script src="merge-preview.js?v=20261111-module-inspect"></script>
+  <script src="navigation-refresh.js?v=20261111-module-inspect"></script>
+  <script src="ipc-diagnostics.js?v=20261111-module-inspect"></script>
+  <script src="app.js?v=20261111-module-inspect"></script>
 </body>
 </html>

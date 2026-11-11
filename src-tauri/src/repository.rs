@@ -14,6 +14,7 @@ mod file_preview;
 pub mod navigation;
 pub mod comparison;
 pub mod submodule_compare;
+pub mod module_inspect;
 mod perf_logging;
 mod ipc_diagnostics;
 mod publish_diagnostics;
@@ -7382,6 +7383,15 @@ fn add_submodule_inner_with_revision(repository_path: String, parent_path: Strin
             perf_log("add_submodule: selected revision checkout failed", started.elapsed());
             return rollback(format!("Cannot check out the selected submodule revision: {error}"));
         }
+        // A ref can move between Browse/Inspect and the explicit Add. Check the
+        // clone before recording the gitlink against the reviewed full SHA.
+        if let Some(expected) = exact_commit_oid(&revision) {
+            let checked_out = Repository::open(&destination).ok()
+                .and_then(|repo| repo.head().ok().and_then(|head| head.target()));
+            if checked_out != Some(expected) {
+                return rollback(format!("The checkout no longer matches the selected revision {expected}. Refresh the refs in Browse and choose the version again."));
+            }
+        }
     }
     perf_log("add_submodule: checkout completed; staging gitlink", started.elapsed());
     if let Err(error) = submodule.add_finalize() { return rollback(format!("Cannot stage submodule: {}", error.message())); }
@@ -11368,7 +11378,17 @@ mod tests {
         assert_eq!(run_git_capture(&root, &["show-ref"]), refs_before);
         assert_eq!(run_git_capture(&root, &["rev-parse", "HEAD"]), current_head);
         assert!(path_history_page_inner(path, "folder".into(), Some("invalid".into()), 500).is_err());
-        fs::remove_dir_all(root).unwrap();
+        // This fixture reopens the repository many times in a tight loop; on
+        // macOS that intermittently leaves the directory transiently
+        // non-empty (DirectoryNotEmpty) right after the last close, observed
+        // as flaky in this specific test. Retry briefly instead of failing.
+        for attempt in 0.. {
+            match fs::remove_dir_all(&root) {
+                Ok(()) => break,
+                Err(error) if attempt < 20 && error.kind() == std::io::ErrorKind::DirectoryNotEmpty => std::thread::sleep(std::time::Duration::from_millis(25)),
+                Err(error) => panic!("{error}"),
+            }
+        }
     }
 
     #[test]
@@ -20122,6 +20142,26 @@ mod tests {
         assert_eq!(portable_submodule_configured_url("git@github.vitesco.io:eng/sw-pkg-0G-errm_common.git"), "../../eng/sw-pkg-0G-errm_common.git");
         assert_eq!(portable_submodule_configured_url("../../eng/sw-pkg-0G-errm_common.git"), "../../eng/sw-pkg-0G-errm_common.git");
         assert_eq!(portable_submodule_configured_url("https://github.com/example/public.git"), "https://github.com/example/public.git", "other Git hosts must keep their chosen URL");
+    }
+
+    #[test]
+    fn module_inspect_moved_tag_cannot_stage_an_unreviewed_revision() {
+        let base = std::env::temp_dir().join(format!("gdd-inspect-moved-tag-{}", std::process::id()));
+        let parent = base.join("parent");
+        let dep = base.join("dependency");
+        create_libgit2_repository(&parent, "README");
+        create_libgit2_repository(&dep, "file");
+        let reviewed = run_git_capture(&dep, &["rev-parse", "HEAD"]);
+        run_git(&dep, &["tag", "v1"]);
+        run_git(&dep, &["-c", "user.name=Test", "-c", "user.email=test@example.org", "commit", "--allow-empty", "-m", "Next"]);
+        run_git(&dep, &["tag", "-f", "v1"]);
+        let result = add_submodule_inner_with_revision(parent.to_string_lossy().into(), "".into(),
+            dep.to_string_lossy().into(), "module".into(), "".into(), "".into(),
+            Some(reviewed), Some("tag".into()), Some("v1".into()));
+        assert!(result.unwrap_err().contains("no longer matches"));
+        assert!(run_git_capture(&parent, &["status", "--porcelain"]).is_empty());
+        assert!(!parent.join("module").exists());
+        fs::remove_dir_all(base).unwrap();
     }
 
     #[test]

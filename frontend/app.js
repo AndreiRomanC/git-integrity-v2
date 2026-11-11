@@ -375,6 +375,7 @@ const previewData = {
   ]
 };
 const refs = {
+  inspectSubmoduleBrowser: $('#inspectSubmoduleBrowser'),
   folderRestoreUnstage: $('#folderRestoreUnstage'), folderRestoreStagedNotice: $('#folderRestoreStagedNotice'),
   repoName: $('#repoName'), repoPath: $('#repoPath'), branches: $('#branches'), graph: $('#graph'),
   graphView: $('#graphView'), emptyState: $('#emptyState'), laneLegend: $('#laneLegend'),
@@ -1074,6 +1075,7 @@ function submoduleBrowserSelectedCompareRefs() {
 }
 function updateSubmoduleBrowserActions() {
   const selected = submoduleBrowserSelectedCompareRefs();
+  refs.inspectSubmoduleBrowser.disabled = !submoduleBrowserState.selectedRepository;
   if (refs.compareSubmoduleBrowser) {
     refs.compareSubmoduleBrowser.disabled = !submoduleBrowserState.selectedRepository || !selected.length;
     refs.compareSubmoduleBrowser.textContent = selected.length >= 2 ? 'Compare selected revisions' : 'Compare with default';
@@ -1085,6 +1087,7 @@ function updateSubmoduleBrowserActions() {
 }
 function resetSubmoduleBrowser() {
   invalidateSubmoduleRefRequest();
+  refs.inspectSubmoduleBrowser.disabled = true;
   submoduleBrowserState = { repositories: [], selectedRepository: null, allRefs: [], refs: [], selectedRef: null, selectedRefs: [] };
   refs.submoduleBrowserAuth.hidden = true;
   refs.submoduleRepoResults.innerHTML = '<div class="version-loading">Search in github.vitesco.io/eng.</div>';
@@ -1307,6 +1310,7 @@ async function searchSubmoduleRefs(query = refs.submoduleRefSearch.value.trim(),
     if (request === submoduleRefRequest) {
       finishSubmoduleRefRequest?.();
       finishSubmoduleRefRequest = null;
+      refs.submoduleBrowserDialog.dispatchEvent?.(new Event('module-refs-settled'));
     }
   }
 }
@@ -1343,17 +1347,17 @@ function defaultBrowserCompareRef() {
     || refsList[0]
     || null;
 }
-async function openGithubModuleCompareFromBrowser(anchorRef = null) {
+async function openGithubModuleCompareFromBrowser(anchorRef = null, inspectedPair = null) {
   const repo = submoduleBrowserState.selectedRepository;
   if (!repo) return status('Select a module repository first.', 'error');
   const selected = submoduleBrowserSelectedCompareRefs();
-  const pair = selected.length >= 2
+  const pair = inspectedPair || (selected.length >= 2
     ? selected.slice(0, 2)
-    : [defaultBrowserCompareRef(), anchorRef || selected[0]].filter(Boolean);
+    : [defaultBrowserCompareRef(), anchorRef || selected[0]].filter(Boolean));
   if (pair.length < 2) return status('Select one revision and make sure the repository has a default branch, or Cmd/Ctrl-click two revisions.', 'error');
   const [left, right] = pair;
-  const leftRef = browserRefCompareValue(left);
-  const rightRef = browserRefCompareValue(right);
+  const leftRef = inspectedPair ? left.revision : browserRefCompareValue(left);
+  const rightRef = inspectedPair ? right.revision : browserRefCompareValue(right);
   if (!leftRef || !rightRef) return status('Could not resolve the selected revisions.', 'error');
   state.compareMode = 'submodule';
   state.subCompareFlatMode = false;
@@ -8346,10 +8350,10 @@ function appendOlderGraphRows(previousCommitCount) {
 }
 
 function drawGraphOverlay(model, lanesWidth, options = {}) {
-  const container = refs.graph;
+  const container = options.container || refs.graph;
   const positions = new Map(); // commitId -> {x, y}
   const branchPointIds = new Set();
-  container.querySelectorAll('.commit-row[data-id]').forEach((row, index) => {
+  container.querySelectorAll(options.rowSelector || '.commit-row[data-id]').forEach((row, index) => {
     const node = model[index];
     positions.set(node.commitId, { x: laneX(node.lane), y: row.offsetTop + row.offsetHeight / 2 });
     if (row.classList.contains('is-branch-point')) branchPointIds.add(node.commitId);
@@ -8412,7 +8416,7 @@ function drawGraphOverlay(model, lanesWidth, options = {}) {
   // beyond this page (commitsTruncated) — a lane that simply reached its
   // own true root commit (the real end of that branch's history) gets no
   // such mark, since there genuinely is nothing more to continue into.
-  if (!options.disconnected && activeGraphData().commitsTruncated && model.length) {
+  if (!options.disconnected && (options.truncated ?? activeGraphData().commitsTruncated) && model.length) {
     const lastNode = model[model.length - 1];
     const lastPos = positions.get(lastNode.commitId);
     if (lastPos) {
@@ -9265,6 +9269,25 @@ $('#cloneRepo').addEventListener('click', openCloneDialog); $('#chooseCloneParen
 refs.cloneUrl.addEventListener('input', () => { if (!refs.cloneName.dataset.edited) { const inferred = refs.cloneUrl.value.trim().split(/[\\/]/).pop()?.replace(/\.git$/, '') || ''; refs.cloneName.value = inferred; } validateCloneForm(); }); refs.cloneParent.addEventListener('input', validateCloneForm); refs.cloneName.addEventListener('input', () => { refs.cloneName.dataset.edited = refs.cloneName.value ? '1' : ''; validateCloneForm(); });
 $('#addSubmodule').addEventListener('click', openAddSubmoduleDialog); refs.confirmAddSubmodule.addEventListener('click', confirmAddSubmodule);
 refs.browseSubmoduleRepository.addEventListener('click', openSubmoduleBrowser);
+const moduleInspector = createModuleInspector($('#moduleInspect'), {
+  readHistory: args => invoke ? invoke('github_module_history', args) : Promise.reject('Open the desktop app to load Git history.'),
+  useRevision: ref => { submoduleBrowserState.selectedRef = ref; applySubmoduleBrowserSelection(); },
+  compare: pair => openGithubModuleCompareFromBrowser(null, pair).catch(handleError),
+});
+refs.inspectSubmoduleBrowser.addEventListener('click', () => {
+  const model = submoduleBrowserState, repo = model.selectedRepository, repositoryPath = state.repository?.path;
+  if (!repo || !repositoryPath) return;
+  moduleInspector.open({
+    repo, repositoryPath, initialRef: model.selectedRef,
+    valid: () => refs.submoduleBrowserDialog.open && state.repository?.path === repositoryPath
+      && submoduleBrowserState === model && model.selectedRepository === repo,
+    versions: () => model.allRefs,
+    ready: () => model.refsComplete,
+    loading: () => !!finishSubmoduleRefRequest,
+  });
+});
+refs.submoduleBrowserDialog.addEventListener('module-refs-settled', moduleInspector.refreshRefs);
+refs.submoduleBrowserDialog.addEventListener('close', () => { if (!refs.submoduleBrowserDialog.open) moduleInspector.close(); });
 $('#closeSubmoduleBrowser').addEventListener('click', () => refs.submoduleBrowserDialog.close());
 $('#cancelSubmoduleBrowser').addEventListener('click', () => refs.submoduleBrowserDialog.close());
 refs.runSubmoduleRepoSearch.addEventListener('click', () => searchSubmoduleRepositories());

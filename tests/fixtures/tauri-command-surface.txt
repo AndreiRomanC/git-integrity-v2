@@ -72,6 +72,7 @@ frontend_perf_log
 graph_branch_divergence
 graph_head_main_merge_base
 github_module_refs
+github_module_history
 init_repository
 init_submodule
 inspect_submodule_checkout

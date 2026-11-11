@@ -181,9 +181,7 @@ function relatedSubmoduleVersionRefs(item, versions = []) {
 function submoduleVersionRowHtml(item) {
   const esc = escapeSubmoduleVersionHtml;
   const kindLabel = { branch: 'BRANCH', remote: 'REMOTE BRANCH', tag: 'TAG', commit: 'COMMIT (detached)' };
-  const symbol = { commit: '●', tag: '◆' };
   const revision = String(item.revision || '');
-  const tooltip = [revision, `${item.author || 'Unknown'} · ${item.date || ''}`, item.message || item.subject || ''].join('\n');
   // Spell the relationship out instead of showing only arrows. In a
   // detached checkout these rows describe their own branch tips, not HEAD;
   // wording such as "LOCAL + ORIGIN" / "ORIGIN NEWER" makes that boundary
@@ -253,11 +251,21 @@ function submoduleVersionRowHtml(item) {
     ${item.kind === 'branch' && item.checkout_detached ? '<span class="version-inactive-label">INACTIVE</span>' : ''}
     ${item.current ? '<span class="current-label">CURRENT</span>' : `<button type="button" class="version-checkout" data-switch-version>Checkout</button>`}
   </span>`;
+  return submoduleVersionRow(item, kindLabel[item.kind] || item.kind, rowContext + relatedHtml + dirtyNote, actions);
+}
+
+// Shared presentation. Only the installed-submodule caller supplies checkout actions.
+function submoduleVersionRow(item, kindLabel, context = '', actions = '') {
+  const esc = escapeSubmoduleVersionHtml;
+  const revision = String(item.revision || '');
+  const symbol = { commit: '●', tag: '◆' };
+  const meta = [item.author, item.date].filter(Boolean).join(' · ');
+  const tooltip = [revision, meta, item.message || item.subject].filter(Boolean).join('\n');
   return `<div class="version-row version-kind-${esc(item.kind)} ${item.name === 'origin/main' ? 'primary-remote' : ''} ${item.current ? 'current' : ''} ${item.cross_selected ? 'version-cross-selected' : ''}" tabindex="0" data-revision="${esc(revision)}" data-version-kind="${esc(item.kind)}" data-name="${esc(item.name)}">
     <span class="version-symbol">${symbol[item.kind] || '⑂'}</span>
     <span class="version-sha"><code>${esc(revision.slice(0, 8))}</code><span class="version-copy-sha" role="button" tabindex="0" title="Copy full SHA" data-copy-sha="${esc(revision)}">⧉</span></span>
-    <span class="version-name"><span class="version-ref-name" title="${esc(item.name)}">${esc(item.name)}</span><b class="version-kind-badge">${esc(kindLabel[item.kind] || item.kind)}</b>${rowContext}${relatedHtml}${dirtyNote}</span>
-    <span class="version-copy" title="${esc(tooltip)}"><span class="version-subject">${esc(item.subject)}</span><span class="version-meta">${esc(item.author)} · ${esc(item.date)}</span></span>
+    <span class="version-name"><span class="version-ref-name" title="${esc(item.name)}">${esc(item.name)}</span><b class="version-kind-badge">${esc(kindLabel)}</b>${context}</span>
+    <span class="version-copy" title="${esc(tooltip)}"><span class="version-subject">${esc(item.subject)}</span><span class="version-meta">${esc(meta)}</span></span>
     ${actions}
   </div>`;
 }
