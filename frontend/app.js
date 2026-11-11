@@ -374,6 +374,10 @@ const previewData = {
     { name: 'vehicle-control.code-workspace', relative_path: 'vehicle-control.code-workspace', kind: 'file', status: '??', tracked: false, size: 386, modified: 1786638000 }
   ]
 };
+// Both windows mount the same navigation, history picker and version list.
+for (const mount of document.querySelectorAll('[data-version-view]')) {
+  mount.replaceWith($('#submoduleVersionView').content.cloneNode(true));
+}
 const refs = {
   inspectSubmoduleBrowser: $('#inspectSubmoduleBrowser'),
   folderRestoreUnstage: $('#folderRestoreUnstage'), folderRestoreStagedNotice: $('#folderRestoreStagedNotice'),
@@ -388,7 +392,7 @@ const refs = {
   commitButton: $('#commitButton'), selectionText: $('#selectionText'), browserDialog: $('#browserDialog'),
   browserNotice: $('#browserNotice'), explorerView: $('#explorerView'), fileList: $('#fileList'),
   breadcrumbs: $('#breadcrumbs'), viewTitle: $('#viewTitle'), goUp: $('#goUp'), reloadFolder: $('#reloadFolder'), runCurrentUtrud: $('#runCurrentUtrud'),
-  submoduleMenu: $('#submoduleMenu'), submoduleVersions: $('#submoduleVersions'), submoduleMenuName: $('#submoduleMenuName'), currentSubmoduleVersion: $('#currentSubmoduleVersion'), submoduleVersionSearch: $('#submoduleVersionSearch'), submoduleOpenGraph: $('#submoduleOpenGraph'),
+  submoduleMenu: $('#submoduleMenu'), submoduleVersions: $('#submoduleMenu .version-list'), submoduleMenuName: $('#submoduleMenuName'), currentSubmoduleVersion: $('#currentSubmoduleVersion'), submoduleVersionSearch: $('#submoduleMenu .version-search'), submoduleOpenGraph: $('#submoduleMenu [data-version-map]'),
   commitScope: $('#commitScope'), showPathHistory: $('#showPathHistory'), commitScopeDialog: $('#commitScopeDialog'), commitScopeName: $('#commitScopeName'), scopeCommitMessage: $('#scopeCommitMessage'), confirmScopeCommit: $('#confirmScopeCommit'),
   folderRestoreDialog: $('#folderRestoreDialog'), folderRestorePath: $('#folderRestorePath'), folderRestoreSubtitle: $('#folderRestoreSubtitle'), folderRestoreModeHead: $('#folderRestoreModeHead'), folderRestoreModeCommit: $('#folderRestoreModeCommit'), folderRestoreCommitPicker: $('#folderRestoreCommitPicker'), folderRestoreCommitList: $('#folderRestoreCommitList'), refreshFolderRestoreCommits: $('#refreshFolderRestoreCommits'), loadOlderFolderRestoreCommits: $('#loadOlderFolderRestoreCommits'), folderRestoreHistoryStatus: $('#folderRestoreHistoryStatus'), folderRestoreClean: $('#folderRestoreClean'), folderRestorePreview: $('#folderRestorePreview'), folderRestoreStatus: $('#folderRestoreStatus'), previewFolderRestore: $('#previewFolderRestore'), confirmFolderRestore: $('#confirmFolderRestore'),
   commanderView: $('#commanderView'), commanderRows: $('#commanderRows'), commanderBreadcrumbs: $('#commanderBreadcrumbs'), remoteRef: $('#remoteRef'), gitWorkspaceCompareControls: $('#gitWorkspaceCompareControls'), gitBranchCompareControls: $('#gitBranchCompareControls'), branchCompareLeftRef: $('#branchCompareLeftRef'), branchCompareRightRef: $('#branchCompareRightRef'), branchCompareSwap: $('#branchCompareSwap'), branchCompareRefresh: $('#branchCompareRefresh'), gitCompareFlatControls: $('#gitCompareFlatControls'), gitCompareFlatToggle: $('#gitCompareFlatToggle'), gitCompareFlatFilter: $('#gitCompareFlatFilter'), gitCompareLeftLabel: $('#gitCompareLeftLabel'), gitCompareRightLabel: $('#gitCompareRightLabel'), gitComparePanel: $('#gitComparePanel'), localDrivePanel: $('#localDrivePanel'), compareModeGit: $('#compareModeGit'), compareModeDrive: $('#compareModeDrive'), compareModeSubmodule: $('#compareModeSubmodule'), submoduleComparePanel: $('#submoduleComparePanel'), subCompareSubmodule: $('#subCompareSubmodule'), subCompareSubmoduleOptions: $('#subCompareSubmoduleOptions'), subCompareLeftRef: $('#subCompareLeftRef'), subCompareRightRef: $('#subCompareRightRef'), subComparePickLeft: $('#subComparePickLeft'), subComparePickRight: $('#subComparePickRight'), subCompareSwap: $('#subCompareSwap'), subCompareRefresh: $('#subCompareRefresh'), subCompareDownload: $('#subCompareDownload'), subCompareFlatControls: $('#subCompareFlatControls'), subCompareFlatToggle: $('#subCompareFlatToggle'), subCompareFlatFilter: $('#subCompareFlatFilter'), subCompareExact: $('#subCompareExact'), subCompareCommits: $('#subCompareCommits'), subCompareBreadcrumbs: $('#subCompareBreadcrumbs'), subCompareRows: $('#subCompareRows'), subRevisionDialog: $('#subCompareRevisionDialog'), subRevisionDialogSide: $('#subRevisionDialogSide'), subRevisionDialogTitle: $('#subRevisionDialogTitle'), subRevisionSearch: $('#subRevisionSearch'), subRevisionSearchAll: $('#subRevisionSearchAll'), subRevisionResults: $('#subRevisionResults'), subRevisionHelp: $('#subRevisionHelp'), compareDialog: $('#compareDialog'), compareTitle: $('#compareTitle'), compareSubtitle: $('#compareSubtitle'), localCompare: $('#localCompare'), remoteCompare: $('#remoteCompare'), compareDiffStatus: $('#compareDiffStatus'), compareSearch: $('#compareSearch'), compareSearchStatus: $('#compareSearchStatus'), previousCompareSearch: $('#previousCompareSearch'), nextCompareSearch: $('#nextCompareSearch'), previousCompareDifference: $('#previousCompareDifference'), nextCompareDifference: $('#nextCompareDifference'),
@@ -1384,7 +1388,7 @@ async function openGithubModuleCompareFromBrowser(anchorRef = null, inspectedPai
   render();
   await openSubmoduleCompareDirectory('');
 }
-async function exportGithubModuleRevisionFromBrowser(ref, button = null) {
+async function exportGithubModuleRevisionFromBrowser(ref, button = null, revision = null) {
   const repo = submoduleBrowserState.selectedRepository;
   if (!repo || !ref?.revision) return status('Select a module revision first.', 'error');
   if (!invoke) return status(`Preview: export ${repo.name} ${revisionDisplay(ref.revision)}`);
@@ -1398,7 +1402,7 @@ async function exportGithubModuleRevisionFromBrowser(ref, button = null) {
       repositoryPath: state.repository.path,
       owner: repo.owner || 'eng',
       repositoryName: repo.name,
-      revision: browserRefCompareValue(ref),
+      revision: revision || browserRefCompareValue(ref),
       destinationPath,
     });
     const path = result.path || destinationPath;
@@ -3975,6 +3979,7 @@ async function openSubmoduleMenu(entry, x, y) {
   syncSubmoduleCompareSelection();
   openSubmoduleMenuGuard();
   refs.submoduleMenu.hidden = false;
+  refs.submoduleMenu.querySelector('.version-history-picker').hidden = true;
   placeSubmoduleMenu({ ...submoduleMenuSize, left: x, top: y });
   refs.submoduleMenuName.textContent = entry.name; refs.currentSubmoduleVersion.textContent = 'Loading…';
   refs.submoduleVersionSearch.value = '';
@@ -3993,6 +3998,14 @@ async function openSubmoduleMenu(entry, x, y) {
   await refreshSubmoduleMenu();
 }
 
+const installedVersionHistory = createInstalledVersionHistory($('#submoduleMenu .version-history-picker'), {
+  current: data => data === submoduleMenuData && !refs.submoduleMenu.hidden && state.repository?.path === submoduleMenuRepositoryPath,
+  read: revision => invoke ? invoke('submodule_history_from_revision', {
+    repositoryPath: submoduleMenuRepositoryPath, relativePath: submoduleMenuEntry.relative_path, revision,
+  }) : Promise.resolve(submoduleMenuData.versions.filter(ref => ref.kind === 'commit' && ref.revision === revision)),
+  render: renderSubmoduleVersions,
+});
+
 function renderSubmoduleVersions() {
   if (!submoduleMenuData) return;
   const current = submoduleCurrentPresentation(submoduleMenuData);
@@ -4001,15 +4014,15 @@ function renderSubmoduleVersions() {
   const newVersionButton = $('#submoduleMenuNewBranch');
   newVersionButton.textContent = versionFilter === 'tag' ? '＋ Tag current commit…' : '＋ New branch…';
   newVersionButton.title = versionFilter === 'tag' ? `Create a tag pointing exactly at the active commit ${String(submoduleMenuData.current_revision || '').slice(0, 8)}` : 'Create a new branch in this submodule, from its current commit';
-  const historyTab = document.querySelector('[data-version-filter="commit"]');
-  historyTab.textContent = submoduleMenuData.current_branch ? 'Current branch history' : 'Current checkout history';
   const query = refs.submoduleVersionSearch.value.trim().toLowerCase();
   refs.submoduleVersionSearch.placeholder = versionFilter === 'complete'
     ? 'Open the complete history map to search every branch and tag…'
     : versionFilter === 'commit' ? 'Search loaded history by SHA, message or author…' : versionFilter === 'tag' ? 'Search tags, SHAs or messages…' : 'Search branches, SHAs or messages…';
+  const history = installedVersionHistory.show(submoduleMenuData, versionFilter === 'commit');
+  const tips = indexSubmoduleRefTips(submoduleMenuData.versions);
   const matches = item => matchesSubmoduleVersion(item, query);
   const rowWithRelations = item => ({ ...item,
-    related_refs: relatedSubmoduleVersionRefs(item, submoduleMenuData.versions),
+    related_refs: relatedSubmoduleVersionRefs(item, tips.get(item.revision)),
     cross_selected: submoduleCrossSelected?.kind === item.kind && submoduleCrossSelected?.name === item.name,
   });
   const currentContext = submoduleCurrentContextHtml(submoduleMenuData);
@@ -4032,23 +4045,21 @@ function renderSubmoduleVersions() {
       + (remoteRows.length ? `<div class="version-section-heading">REMOTE TIPS NOT SHOWN ABOVE</div>${remoteRows.map(renderBranch).join('')}` : '');
     html = currentContext + (rows || `<div class="version-loading">${query ? 'No matches' : 'No branches found'}</div>`);
   } else if (versionFilter === 'complete') {
-    html = `${currentContext}<div class="complete-history-card"><h3>Complete submodule history</h3><p>The current-history tab follows only the active branch context. Open the complete map to see commits, branch tips and tags across this submodule. Use Fetch versions to include new server refs without changing the checkout.</p><button type="button" data-open-complete-history>Open complete history map ↗</button></div>`;
+    html = `${currentContext}<div class="complete-history-card"><h3>Complete submodule history</h3><p>Branch history follows the branch you select. Open the map to see commits, branch tips and tags across this submodule. Use Fetch versions to include new server refs without changing the checkout.</p><button type="button" data-open-complete-history>Open complete history map ↗</button></div>`;
   } else {
     // containing_branches now comes straight from the backend for every
     // commit row (not just the active checkout) — see submodule_versions_inner.
-    const versions = submoduleMenuData.versions
-      .filter(item => versionFilter === 'tag' ? item.kind === 'tag' : item.kind === 'commit')
-      .filter(matches);
-    const rows = versions.map(item => submoduleVersionRowHtml(rowWithRelations(item))).join('') || `<div class="version-loading">${query ? 'No matches' : versionFilter === 'tag' ? 'No tags in this submodule' : 'No versions found'}</div>`;
-    const historyContext = submoduleMenuData.history_context_branch
-      ? `History of ${submoduleMenuData.history_context_branch}. The active checkout is marked CURRENT even when it is inside the branch rather than at its tip.`
-      : 'No known branch contains this detached checkout. History starts at the active commit.';
-    html = versionFilter === 'commit'
-      ? `${currentContext}<div class="version-history-limit">${esc(historyContext)} Showing up to ${Number(submoduleMenuData.history_limit) || 100} commits; search covers this loaded history.</div>${rows}`
-      : rows;
+    const isHistory = versionFilter === 'commit';
+    const versions = isHistory ? history.page?.rows || [] : submoduleMenuData.versions.filter(ref => ref.kind === 'tag');
+    const items = versions.filter(matches).map(item => submoduleVersionRowHtml(rowWithRelations(item))).join('');
+    const empty = history.page?.loading && isHistory ? 'Loading branch history…' : isHistory && history.page?.error
+      ? history.page.error : query ? 'No matches' : isHistory ? 'No commits found' : 'No tags in this submodule';
+    const historyScope = isHistory && history.target
+      ? `<div class="version-history-limit">From ${esc(history.target.name)} @ ${esc(history.target.revision.slice(0, 8))} · up to ${Number(submoduleMenuData.history_limit) || 100} commits</div>` : '';
+    html = (isHistory ? currentContext + historyScope : '') + (items || `<div class="version-loading">${esc(empty)}</div>`);
   }
   refs.submoduleVersions.innerHTML = html;
-  submoduleCompareSelection = submoduleCompareSelection.filter(id => submoduleMenuData.versions.some(item => item.revision === id));
+  submoduleCompareSelection = submoduleCompareSelection.filter(id => (submoduleMenuData.versions.some(item => item.revision === id) || installedVersionHistory.includes(id)));
   bindSubmoduleVersionSelection();
   syncSubmoduleCompareSelection();
   refs.submoduleVersions.querySelectorAll('[data-download-version]').forEach(button => button.addEventListener('click', event => {
@@ -4059,13 +4070,12 @@ function renderSubmoduleVersions() {
   }));
   refs.submoduleVersions.querySelectorAll('[data-related-version]').forEach(button => button.addEventListener('click', event => {
     event.stopPropagation();
-    submoduleCrossSelected = { kind: button.dataset.relatedKind, name: button.dataset.relatedName };
-    versionFilter = submoduleCrossSelected.kind === 'tag' ? 'tag' : 'branch';
-    refs.submoduleVersionSearch.value = '';
-    document.querySelectorAll('[data-version-filter]').forEach(tab => tab.classList.toggle('active', tab.dataset.versionFilter === versionFilter));
-    renderSubmoduleVersions();
-    const selected = [...refs.submoduleVersions.querySelectorAll('.version-cross-selected')][0];
-    selected?.scrollIntoView({ block: 'nearest' });
+    revealSubmoduleVersion(refs.submoduleVersions, button, (tab, target) => {
+      versionFilter = tab; submoduleCrossSelected = target;
+      refs.submoduleVersionSearch.value = '';
+      refs.submoduleMenu.querySelectorAll('[data-version-filter]').forEach(button => button.classList.toggle('active', button.dataset.versionFilter === tab));
+      renderSubmoduleVersions();
+    });
   }));
   refs.submoduleVersions.querySelector('[data-open-complete-history]')?.addEventListener('click', () => {
     if (submoduleMenuEntry) { closeSubmoduleMenu(); openSubmoduleGraph(submoduleMenuEntry); }
@@ -4152,9 +4162,9 @@ function showSubmoduleVersionCompareMenu(event, revision) {
   document.querySelector('.floating-action-menu')?.setAttribute('data-version-context', '');
 }
 
-function placeSubmoduleMenu(rect) {
+function placeSubmoduleMenu(rect, panel = refs.submoduleMenu) {
   const fitted = fitFloatingPanel(rect, { width: innerWidth, height: innerHeight });
-  for (const key of ['width', 'height', 'left', 'top']) refs.submoduleMenu.style[key] = `${fitted[key]}px`;
+  for (const key of ['width', 'height', 'left', 'top']) panel.style[key] = `${fitted[key]}px`;
   return fitted;
 }
 
@@ -9270,6 +9280,8 @@ refs.cloneUrl.addEventListener('input', () => { if (!refs.cloneName.dataset.edit
 $('#addSubmodule').addEventListener('click', openAddSubmoduleDialog); refs.confirmAddSubmodule.addEventListener('click', confirmAddSubmodule);
 refs.browseSubmoduleRepository.addEventListener('click', openSubmoduleBrowser);
 const moduleInspector = createModuleInspector($('#moduleInspect'), {
+  readDetails: args => invoke ? invoke('github_module_tip_details', args) : Promise.reject('Open the desktop app to load commit details.'),
+  download: (ref, button) => exportGithubModuleRevisionFromBrowser(ref, button, ref.revision),
   readHistory: args => invoke ? invoke('github_module_history', args) : Promise.reject('Open the desktop app to load Git history.'),
   useRevision: ref => { submoduleBrowserState.selectedRef = ref; applySubmoduleBrowserSelection(); },
   compare: pair => openGithubModuleCompareFromBrowser(null, pair).catch(handleError),
@@ -10150,20 +10162,26 @@ refs.subCompareSwap.addEventListener('click', () => {
 });
 $('#closeSubmoduleMenu').addEventListener('click', closeSubmoduleMenu);
 $('#compareSelectedVersions').addEventListener('click', compareSelectedSubmoduleVersions);
-bindPanelResize($('#submoduleMenuDrag'), {
-  canStart: event => !event.target.closest('button, input, select, a'),
-  read: () => refs.submoduleMenu.getBoundingClientRect(),
-  resize: (rect, dx, dy) => placeSubmoduleMenu({ width: rect.width, height: rect.height, left: rect.left + dx, top: rect.top + dy }),
-});
-for (const [id, widthOnly] of [['submoduleWidthResize', true], ['submoduleCornerResize', false]]) {
-  bindPanelResize($(`#${id}`), {
-    read: () => refs.submoduleMenu.getBoundingClientRect(),
-    resize: (rect, dx, dy) => {
-      const fitted = placeSubmoduleMenu({ left: rect.left, top: rect.top, width: rect.width + dx, height: rect.height + (widthOnly ? 0 : dy) });
-      submoduleMenuSize = { width: fitted.width, height: fitted.height };
-    },
-    reset: () => { submoduleMenuSize = { width: 1060, height: 760 }; placeSubmoduleMenu({ ...submoduleMenuSize, left: 16, top: 16 }); },
+for (const panel of [refs.submoduleMenu, $('#moduleInspect')]) {
+  const read = () => panel.getBoundingClientRect();
+  const place = rect => {
+    if (panel.tagName === 'DIALOG') { panel.style.margin = '0'; panel.style.right = 'auto'; panel.style.bottom = 'auto'; }
+    return placeSubmoduleMenu(rect, panel);
+  };
+  bindPanelResize(panel.querySelector('.version-window-handle'), {
+    canStart: event => !event.target.closest('button, input, select, a'), read,
+    resize: (rect, dx, dy) => place({ width: rect.width, height: rect.height, left: rect.left + dx, top: rect.top + dy }),
   });
+  for (const handle of panel.querySelectorAll('.panel-resize-edge, .panel-resize-corner')) {
+    bindPanelResize(handle, { read, resize(rect, dx, dy) {
+      const widthOnly = handle.classList.contains('panel-resize-edge');
+      const fitted = place({ left: rect.left, top: rect.top, width: rect.width + dx, height: rect.height + (widthOnly ? 0 : dy) });
+      if (panel === refs.submoduleMenu) submoduleMenuSize = { width: fitted.width, height: fitted.height };
+    }, reset() {
+      if (panel === refs.submoduleMenu) submoduleMenuSize = { width: 1060, height: 760 };
+      place({ width: 1060, height: 760, left: 16, top: 16 });
+    } });
+  }
 }
 function resizeWorkingTree(height) {
   const fitted = fitWorkingTreeHeight(height, innerHeight);
@@ -10189,6 +10207,8 @@ bindPanelResize($('#commandHistoryResize'), {
 });
 window.addEventListener('resize', () => {
   if (!refs.submoduleMenu.hidden) placeSubmoduleMenu(refs.submoduleMenu.getBoundingClientRect());
+  const inspector = $('#moduleInspect');
+  if (inspector.open && inspector.style.left) placeSubmoduleMenu(inspector.getBoundingClientRect(), inspector);
   if (refs.changesDrawer.classList.contains('open')) resizeWorkingTree(refs.changesDrawer.getBoundingClientRect().height);
   if (refs.commandHistoryDialog.open) layoutCommandHistoryDialog();
 });
@@ -10208,8 +10228,8 @@ $('#submoduleMenuNewBranch').addEventListener('click', () => {
   // closing both the child action and its parent selector.
   if (versionFilter === 'tag') openCreateSubmoduleTagDialog(entry); else createSubmoduleBranch(entry);
 });
-document.querySelectorAll('[data-version-filter]').forEach(button => button.addEventListener('click', () => {
-  versionFilter = button.dataset.versionFilter; submoduleCrossSelected = null; document.querySelectorAll('[data-version-filter]').forEach(item => item.classList.toggle('active', item === button)); renderSubmoduleVersions();
+refs.submoduleMenu.querySelectorAll('[data-version-filter]').forEach(button => button.addEventListener('click', () => {
+  versionFilter = button.dataset.versionFilter; submoduleCrossSelected = null; refs.submoduleMenu.querySelectorAll('[data-version-filter]').forEach(item => item.classList.toggle('active', item === button)); renderSubmoduleVersions();
 }));
 refs.submoduleVersionSearch.addEventListener('input', renderSubmoduleVersions);
 refs.submoduleOpenGraph.addEventListener('click', () => { if (submoduleMenuEntry) { closeSubmoduleMenu(); openSubmoduleGraph(submoduleMenuEntry); } });

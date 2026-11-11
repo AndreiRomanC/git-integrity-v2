@@ -73,6 +73,7 @@ graph_branch_divergence
 graph_head_main_merge_base
 github_module_refs
 github_module_history
+github_module_tip_details
 init_repository
 init_submodule
 inspect_submodule_checkout
@@ -150,6 +151,7 @@ submodule_navigation_status
 submodule_publish_risks
 submodule_repository
 submodule_versions
+submodule_history_from_revision
 switch_branch
 switch_submodule_version
 sync_repository

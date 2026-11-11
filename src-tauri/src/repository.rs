@@ -6729,8 +6729,46 @@ pub async fn submodule_versions(repository_path: String, relative_path: String) 
     off_main_thread(move || submodule_versions_inner(repository_path, relative_path)).await
 }
 
+const SUBMODULE_HISTORY_LIMIT: usize = 100;
+
+fn submodule_version_history(repo: &Repository, start: Option<Oid>, current: &str, tips: &[(String, Oid, bool)]) -> Result<Vec<SubmoduleVersion>, String> {
+    let Some(start) = start else { return Ok(Vec::new()); };
+    let mut walk = repo.revwalk().map_err(|e| e.to_string())?;
+    walk.set_sorting(Sort::TIME).map_err(|e| e.to_string())?;
+    walk.push(start).map_err(|e| e.to_string())?;
+    Ok(walk.flatten().take(SUBMODULE_HISTORY_LIMIT).filter_map(|oid| {
+        let commit = repo.find_commit(oid).ok()?;
+        let revision = oid.to_string();
+        let author = commit.author().name().unwrap_or("Unknown").to_string();
+        Some(SubmoduleVersion {
+            name: revision[..8].into(), current: revision == current, revision, kind: "commit".into(),
+            subject: commit.summary().unwrap_or("").into(), message: String::from_utf8_lossy(commit.message_bytes()).into_owned(),
+            author, date: short_date(commit.time().seconds()),
+            attached_branch: None, upstream: None, ahead: None, behind: None, contains_current: false, commits_after_current: None,
+            containing_branches: branches_containing_commit(repo, tips, oid),
+        })
+    }).collect())
+}
+
+#[tauri::command]
+pub async fn submodule_history_from_revision(repository_path: String, relative_path: String, revision: String) -> Result<Vec<SubmoduleVersion>, String> {
+    off_main_thread(move || {
+        let start = exact_commit_oid(&revision).ok_or("Select a full submodule commit ID.")?;
+        let path = validate_submodule(&repository_path, &relative_path)?;
+        let repo = internal_submodule_repository(&path)?;
+        let current = repo.head().ok().and_then(|head| head.target()).map(|oid| oid.to_string()).unwrap_or_default();
+        let mut tips = Vec::new();
+        for branch in repo.branches(None).map_err(|e| e.to_string())? {
+            let (branch, kind) = branch.map_err(|e| e.to_string())?;
+            if let (Ok(Some(name)), Some(tip)) = (branch.name(), branch.get().target()) {
+                if !name.ends_with("/HEAD") { tips.push((name.to_owned(), tip, kind == BranchType::Local)); }
+            }
+        }
+        submodule_version_history(&repo, Some(start), &current, &tips)
+    }).await
+}
+
 fn submodule_versions_inner(repository_path: String, relative_path: String) -> Result<SubmoduleVersions, String> {
-    const HISTORY_LIMIT: usize = 100;
     let started = Instant::now();
     validate_path(&repository_path)?;
     let absolute = validate_submodule(&repository_path, &relative_path)?;
@@ -6813,19 +6851,13 @@ fn submodule_versions_inner(repository_path: String, relative_path: String) -> R
     let current_containing_branches = current_oid.map(|oid| branches_containing_commit(&repo, &branch_tips_simple, oid)).unwrap_or_default();
     let history_context_branch = if current_branch.is_empty() { current_containing_branches.first().cloned().unwrap_or_default() } else { current_branch.clone() };
     let history_start = known_branch_tips.iter().find(|(name, _, _, _)| name == &history_context_branch).map(|(_, oid, _, _)| *oid).or(current_oid);
-    let mut walk = repo.revwalk().map_err(|error| error.message().to_string())?; let _ = walk.set_sorting(Sort::TIME); if let Some(oid) = history_start { let _ = walk.push(oid); }
-    for oid in walk.flatten().take(HISTORY_LIMIT) {
-        if let Ok(commit) = repo.find_commit(oid) {
-            let containing_branches = branches_containing_commit(&repo, &branch_tips_simple, oid);
-            versions.push(SubmoduleVersion { name: oid.to_string()[..8].into(), revision: oid.to_string(), kind: "commit".into(), current: oid.to_string() == current_revision, subject: commit.summary().unwrap_or("").into(), message: String::from_utf8_lossy(commit.message_bytes()).into_owned(), author: commit.author().name().unwrap_or("Unknown").into(), date: short_date(commit.time().seconds()), attached_branch: None, upstream: None, ahead: None, behind: None, contains_current: false, commits_after_current: None, containing_branches });
-        }
-    }
+    versions.extend(submodule_version_history(&repo, history_start, &current_revision, &branch_tips_simple)?);
     perf_log(&format!("submodule_versions: TOTAL path={relative_path} local_branches={} remote_branches={} tags={} history_commits={} history_context={} history_start={} checkout={} ({} refs/commits, {} containing branches; local refs only)",
         versions.iter().filter(|v| v.kind == "branch").count(), versions.iter().filter(|v| v.kind == "remote").count(),
         versions.iter().filter(|v| v.kind == "tag").count(), versions.iter().filter(|v| v.kind == "commit").count(),
         history_context_branch, history_start.map(|oid| oid.to_string()).unwrap_or_default(), current_revision,
         versions.len(), current_containing_branches.len()), started.elapsed());
-    Ok(SubmoduleVersions { path: relative_path, current_revision, current_branch, parent_revision, parent_committed_revision, current_containing_branches, history_context_branch, history_limit: HISTORY_LIMIT, versions })
+    Ok(SubmoduleVersions { path: relative_path, current_revision, current_branch, parent_revision, parent_committed_revision, current_containing_branches, history_context_branch, history_limit: SUBMODULE_HISTORY_LIMIT, versions })
 }
 
 fn submodule_revision_matches(query: &str, name: &str, kind: &str, revision: &str, subject: &str, author: &str, date: &str) -> bool {
@@ -16589,6 +16621,30 @@ mod tests {
         assert!(a_ids.is_disjoint(&b_ids), "A and B must share zero commit OIDs — any overlap here is real cross-contamination, not a fixture-similarity artifact");
 
         fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn submodule_versions_browse_another_branch_without_switching_checkout() {
+        let path = std::env::temp_dir().join(format!("gdd-history-picker-{}", std::process::id()));
+        create_libgit2_repository(&path, "tracked.txt");
+        let base = run_git_capture(&path, &["rev-parse", "HEAD"]);
+        run_git(&path, &["switch", "-c", "side"]);
+        run_git(&path, &["-c", "user.name=Test", "-c", "user.email=test@example.org", "commit", "--allow-empty", "-m", "Side only"]);
+        let side = run_git_capture(&path, &["rev-parse", "HEAD"]);
+        run_git(&path, &["checkout", "--detach", &base]);
+        let repo = Repository::open(&path).unwrap();
+        let tip = Oid::from_str(&side).unwrap();
+        let rows = submodule_version_history(&repo, Some(tip), &base, &[("side".into(), tip, true)]).unwrap();
+        assert_eq!(rows[0].revision, side);
+        assert_eq!(rows[0].subject, "Side only");
+        assert!(!rows[0].current);
+        assert!(rows[1].current);
+        assert_eq!(rows[1].containing_branches, ["side"]);
+        assert_eq!(run_git_capture(&path, &["rev-parse", "HEAD"]), base);
+        assert!(repo.head_detached().unwrap());
+        assert!(run_git_capture(&path, &["status", "--porcelain"]).is_empty());
+        drop(repo);
+        fs::remove_dir_all(path).unwrap();
     }
 
     #[test]

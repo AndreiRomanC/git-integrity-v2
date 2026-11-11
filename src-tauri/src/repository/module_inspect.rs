@@ -14,6 +14,17 @@ pub struct HistoryCommit {
     date: String,
 }
 
+fn history_commit(commit: &git2::Commit<'_>) -> HistoryCommit {
+    HistoryCommit {
+        id: commit.id().to_string(),
+        parents: commit.parent_ids().map(|id| id.to_string()).collect(),
+        subject: commit.summary().unwrap_or("").into(),
+        message: String::from_utf8_lossy(commit.message_bytes()).into_owned(),
+        author: commit.author().name().unwrap_or("Unknown").into(),
+        date: short_date(commit.time().seconds()),
+    }
+}
+
 #[derive(Serialize)]
 pub struct HistoryPage {
     commits: Vec<HistoryCommit>,
@@ -40,16 +51,16 @@ fn history_page(repo: &Repository, tips: &[Oid], offset: usize) -> Result<Histor
         if index < offset { continue; }
         if commits.len() == PAGE_SIZE { return Ok(HistoryPage { commits, has_more: true }); }
         let commit = repo.find_commit(oid).map_err(|e| e.to_string())?;
-        commits.push(HistoryCommit {
-            id: oid.to_string(),
-            parents: commit.parent_ids().map(|id| id.to_string()).collect(),
-            subject: commit.summary().unwrap_or("").into(),
-            message: String::from_utf8_lossy(commit.message_bytes()).into_owned(),
-            author: commit.author().name().unwrap_or("Unknown").into(),
-            date: short_date(commit.time().seconds()),
-        });
+        commits.push(history_commit(&commit));
     }
     Ok(HistoryPage { commits, has_more: false })
+}
+
+fn inspect_tip_objects(repository_path: &str, owner: &str, repository_name: &str, revisions: &[String]) -> Result<(Repository, Vec<Oid>), String> {
+    let tips = revisions.iter().map(|s| exact_commit_oid(s).ok_or("Expected a full commit ID.")).collect::<Result<Vec<_>, _>>()?;
+    let ids: Vec<_> = revisions.iter().map(String::as_str).collect();
+    let path = ensure_github_module_cache(repository_path, owner, repository_name, &ids)?;
+    Ok((Repository::open_bare(path).map_err(|e| e.to_string())?, tips))
 }
 
 #[tauri::command]
@@ -59,13 +70,24 @@ pub async fn github_module_history(
 ) -> Result<HistoryPage, String> {
     off_main_thread(move || {
         if revisions.is_empty() { return Err("Choose a branch, tag or commit first.".into()); }
-        let tips = revisions.iter().map(|s| exact_commit_oid(s)
-            .ok_or_else(|| "Inspect requires full commit IDs from the selected repository.".to_string()))
-            .collect::<Result<Vec<_>, _>>()?;
-        let ids: Vec<_> = revisions.iter().map(String::as_str).collect();
-        let path = ensure_github_module_cache(&repository_path, &owner, &repository_name, &ids)?;
-        let repo = Repository::open_bare(path).map_err(|e| e.to_string())?;
+        let (repo, tips) = inspect_tip_objects(&repository_path, &owner, &repository_name, &revisions)?;
         history_page(&repo, &tips, offset)
+    }).await
+}
+
+// Explicit request from Inspect. Read each advertised tip once, without
+// walking its ancestry or querying the server separately for every row.
+#[tauri::command]
+pub async fn github_module_tip_details(repository_path: String, owner: String, repository_name: String, revisions: Vec<String>) -> Result<Vec<HistoryCommit>, String> {
+    off_main_thread(move || {
+        if revisions.is_empty() { return Ok(Vec::new()); }
+        let (repo, tips) = inspect_tip_objects(&repository_path, &owner, &repository_name, &revisions)?;
+        let mut details = Vec::new();
+        for id in tips {
+            let object = repo.find_object(id, None).map_err(|_| format!("Revision {id} is unavailable. Refresh refs in Browse."))?;
+            if let Ok(commit) = object.peel_to_commit() { details.push(history_commit(&commit)); }
+        }
+        Ok(details)
     }).await
 }
 

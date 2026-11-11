@@ -77,6 +77,8 @@ pub fn run() {
             repository::search_github_modules,
             repository::github_module_refs,
             repository::module_inspect::github_module_history,
+            repository::module_inspect::github_module_tip_details,
+            repository::submodule_history_from_revision,
             repository::add_submodule,
             repository::init_submodule,
             repository::switch_submodule_version,

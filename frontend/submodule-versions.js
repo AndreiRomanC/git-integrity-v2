@@ -162,6 +162,79 @@ function matchesSubmoduleVersion(item = {}, query = '') {
     .filter(Boolean).join(' ').toLowerCase().includes(needle);
 }
 
+function indexSubmoduleRefTips(versions) {
+  const byId = new Map();
+  for (const ref of versions) {
+    if (ref.kind === 'commit') continue;
+    if (!byId.has(ref.revision)) byId.set(ref.revision, []);
+    byId.get(ref.revision).push(ref);
+  }
+  return byId;
+}
+
+// Keep navigation independent of the pair selected for comparison.
+function revealSubmoduleVersion(list, button, switchTab) {
+  const target = { kind: button.dataset.relatedKind, name: button.dataset.relatedName };
+  switchTab(target.kind === 'tag' ? 'tag' : 'branch', target);
+  const row = list.querySelector('.version-cross-selected');
+  row?.focus({ preventScroll: true });
+  row?.scrollIntoView({ block: 'nearest' });
+}
+
+function historyBranchOptions(refs, extra = null) {
+  const branches = refs.filter(ref => ref.kind === 'branch' || ref.kind === 'remote');
+  if (extra && !branches.some(ref => ref.kind === extra.kind && ref.name === extra.name)) branches.unshift(extra);
+  return branches;
+}
+
+function showHistoryBranchPicker(picker, choices, selected) {
+  const select = picker.querySelector('select');
+  const options = choices.map((ref, index) => {
+    const label = ref.kind === 'remote' ? `${ref.name} (remote)` : ref.kind === 'tag' ? `Tag · ${ref.name}` : ref.name;
+    return `<option value="${index}">${escapeSubmoduleVersionHtml(label)}</option>`;
+  }).join('');
+  // Replacing the options on every keystroke collapses the native dropdown.
+  if (select._versionOptions !== options) { select.innerHTML = options; select._versionOptions = options; }
+  select.value = String(choices.findIndex(ref => ref.kind === selected?.kind && ref.name === selected?.name));
+  select.disabled = choices.length === 0;
+  select.title = selected ? `${selected.name} @ ${selected.revision}` : '';
+}
+
+// The initial history comes with submodule_versions. Only an explicit choice
+// of a different tip reads Git; branch aliases reuse the same immutable page.
+function createInstalledVersionHistory(picker, { read, current, render }) {
+  const select = picker.querySelector('select');
+  let source, choices = [], target, pages;
+  function show(data, visible) {
+    if (source !== data) {
+      source = data;
+      const checkout = data.current_revision && !data.current_branch
+        ? { kind: 'commit', name: 'Current checkout', revision: data.current_revision } : null;
+      choices = historyBranchOptions(data.versions, checkout);
+      target = choices.find(ref => ref.name === data.history_context_branch) || checkout || choices[0];
+      pages = new Map();
+      if (target) pages.set(target.revision, { rows: data.versions.filter(ref => ref.kind === 'commit') });
+    }
+    picker.hidden = !visible;
+    if (visible) showHistoryBranchPicker(picker, choices, target);
+    return { target, page: pages.get(target?.revision) };
+  }
+  select.addEventListener('change', async () => {
+    if (!source || !current(source)) return;
+    const ref = choices[select.selectedIndex];
+    if (!ref) return;
+    target = ref;
+    const data = source, cache = pages;
+    if (!cache.has(ref.revision) || cache.get(ref.revision).error) {
+      cache.set(ref.revision, { loading: true }); render();
+      try { cache.set(ref.revision, { rows: await read(ref.revision) }); }
+      catch (error) { cache.set(ref.revision, { error: String(error) }); }
+    }
+    if (current(data) && source === data && target?.revision === ref.revision) render();
+  });
+  return { show, includes: id => [...(pages?.values() || [])].some(page => page.rows?.some(row => row.revision === id)) };
+}
+
 function relatedSubmoduleVersionRefs(item, versions = []) {
   const revision = String(item?.revision || '');
   if (!revision) return [];
@@ -178,10 +251,28 @@ function relatedSubmoduleVersionRefs(item, versions = []) {
   return [];
 }
 
-function submoduleVersionRowHtml(item) {
+function submoduleRelatedLinksHtml(related = []) {
+  const esc = escapeSubmoduleVersionHtml;
+  const relatedButton = ref => `<button type="button" class="version-related-link" data-related-version data-related-kind="${esc(ref.kind)}" data-related-name="${esc(ref.name)}" title="Show ${esc(ref.name)} in the ${ref.kind === 'tag' ? 'Tags' : 'Branches'} tab">${ref.kind === 'tag' ? '◆' : '⑂'} <span>${esc(ref.name)}</span></button>`;
+  return related.length === 1 ? relatedButton(related[0]) : related.length > 1
+    ? `<details class="version-related-list"><summary>${related.every(ref => ref.kind === 'tag') ? 'Tags' : related.every(ref => ref.kind !== 'tag') ? 'Branches' : 'Refs'} · ${related.length}</summary><div>${related.map(relatedButton).join('')}</div></details>` : '';
+}
+
+function submoduleVersionDownloadHtml(revision) {
+  const esc = escapeSubmoduleVersionHtml;
+  return `<button type="button" class="snapshot-download" data-download-version ${revision ? '' : 'disabled'} title="Download this exact revision locally; no checkout" aria-label="Download revision ${esc(revision.slice(0, 8))}"><svg class="ui-icon" viewBox="0 0 20 20" aria-hidden="true" focusable="false"><path d="M10 2v10m-4-4 4 4 4-4M3 13v4h14v-4"/></svg></button>`;
+}
+
+function submoduleVersionRowHtml(item, remotePreview = false) {
   const esc = escapeSubmoduleVersionHtml;
   const kindLabel = { branch: 'BRANCH', remote: 'REMOTE BRANCH', tag: 'TAG', commit: 'COMMIT (detached)' };
   const revision = String(item.revision || '');
+  const relatedHtml = submoduleRelatedLinksHtml(item.related_refs);
+  if (remotePreview === true) {
+    const badge = item.default_branch ? '<small class="version-attached-branch">Default branch</small>' : '';
+    return submoduleVersionRow(item, item.kind === 'branch' ? 'REMOTE BRANCH' : item.kind.toUpperCase(), badge + relatedHtml,
+      `<span class="version-row-actions">${submoduleVersionDownloadHtml(revision)}</span>`);
+  }
   // Spell the relationship out instead of showing only arrows. In a
   // detached checkout these rows describe their own branch tips, not HEAD;
   // wording such as "LOCAL + ORIGIN" / "ORIGIN NEWER" makes that boundary
@@ -213,10 +304,6 @@ function submoduleVersionRowHtml(item) {
   const rowContext = item.kind === 'tag'
     ? ''
     : item.kind === 'commit' ? commitBranchContext : upstreamState;
-  const related = Array.isArray(item.related_refs) ? item.related_refs : [];
-  const relatedButton = ref => `<button type="button" class="version-related-link" data-related-version data-related-kind="${esc(ref.kind)}" data-related-name="${esc(ref.name)}" title="Show ${esc(ref.name)} in the ${ref.kind === 'tag' ? 'Tags' : 'Branches'} tab">${ref.kind === 'tag' ? '◆' : '⑂'} <span>${esc(ref.name)}</span></button>`;
-  const relatedHtml = related.length === 1 ? relatedButton(related[0]) : related.length > 1
-    ? `<details class="version-related-list"><summary>${item.kind === 'tag' ? 'Branches' : 'Tags'} · ${related.length}</summary><div>${related.map(relatedButton).join('')}</div></details>` : '';
   // Report: "matches upstream" next to a destructive "Discard local work…"
   // button reads as a contradiction — nothing here said *why* the button was
   // still offered. It's this: canResetToUpstream below also fires on a
@@ -244,7 +331,7 @@ function submoduleVersionRowHtml(item) {
   const aheadCount = Number(item.ahead) || 0;
   const canPushAhead = item.kind === 'branch' && item.current && item.upstream && aheadCount > 0;
   const actions = `<span class="version-row-actions">
-    <button type="button" class="snapshot-download" data-download-version ${revision ? '' : 'disabled'} title="Download this exact revision locally; no checkout" aria-label="Download revision ${esc(revision.slice(0, 8))}"><svg class="ui-icon" viewBox="0 0 20 20" aria-hidden="true" focusable="false"><path d="M10 2v10m-4-4 4 4 4-4M3 13v4h14v-4"/></svg></button>
+    ${submoduleVersionDownloadHtml(revision)}
     ${item.kind === 'commit' ? `<button type="button" class="version-tag-commit" data-tag-version title="Create a tag pointing exactly at commit ${esc(revision.slice(0, 8))}">Tag this commit…</button>` : ''}
     ${canPushAhead ? `<button type="button" class="version-push-ahead" data-push-version title="Send ${aheadCount} local commit${aheadCount === 1 ? '' : 's'} on ${esc(item.name)} to ${esc(item.upstream)}">Push</button>` : ''}
     ${canResetToUpstream ? `<button type="button" class="version-reset-upstream" data-reset-upstream data-name="${esc(item.name)}" data-upstream="${esc(item.upstream)}" data-ahead="${Number(item.ahead) || 0}" data-behind="${Number(item.behind) || 0}" title="Destructive recovery for the active branch: discard its local-only commits and current uncommitted work (including a purely dirty working tree with no divergent commits), then replace it with ${esc(item.upstream)}">Discard local work…</button>` : ''}
