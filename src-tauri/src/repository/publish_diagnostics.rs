@@ -12,20 +12,29 @@ static NEXT_PUSH: AtomicU64 = AtomicU64::new(1);
 pub(super) fn failure_category(error: &str) -> &'static str {
     let value = error.to_ascii_lowercase();
     if value.contains("timed out") { "timeout" }
+    else if value.starts_with("git push stopped") { "stopped" }
     else if value.contains("authentication") { "authentication" }
     else if value.contains("non-fast-forward") || value.contains("server branch has newer") { "remote_ahead" }
     else if value.contains("index.lock") { "index_lock" }
     else { "other" }
 }
 
+#[derive(Default)]
+pub(super) struct PublishUi {
+    pub(super) parent_hwnd: Option<isize>,
+    pub(super) credential_wait: Option<tauri::ipc::Channel<Option<u64>>>,
+}
+
 pub(super) struct PushTrace {
+    pub(super) ui: PublishUi,
+    pub(super) command_id: Option<u64>,
     pub(super) id: u64,
     started: Instant,
 }
 
 impl PushTrace {
     pub(super) fn new(repo: &Repository, remote_name: &str, token: bool) -> Self {
-        let trace = Self { id: NEXT_PUSH.fetch_add(1, Ordering::Relaxed), started: Instant::now() };
+        let trace = Self { id: NEXT_PUSH.fetch_add(1, Ordering::Relaxed), started: Instant::now(), ui: PublishUi::default(), command_id: None };
         let remote = repo.find_remote(remote_name).ok();
         let url = remote.as_ref().and_then(|r| r.pushurl().or_else(|| r.url())).unwrap_or("");
         let transport = if url.starts_with("https://") { "https" } else if url.starts_with("http://") { "http" }
@@ -47,6 +56,10 @@ impl PushTrace {
     }
 
     pub(super) fn configure(&self, command: &mut Command) {
+        if let Some(hwnd) = self.ui.parent_hwnd {
+            command.env("GCM_MODAL_PARENTHWND", hwnd.to_string());
+            self.log("event=credential_dialog parent=publish_window");
+        }
         command.env("GIT_TRACE2_EVENT", "2")
             .env("GIT_TRACE2_CONFIG_PARAMS", "push.recurseSubmodules,submodule.recurse,push.negotiate,credential.interactive,credential.guiPrompt")
             .env("GIT_TRACE2_EVENT_NESTING", "3");
@@ -88,7 +101,7 @@ impl Capture {
         // A cut-off JSON/Trace2 prefix may contain raw argv later in the line.
         if eof && (!self.line.is_empty() || self.overflow) { self.flush_line(trace); }
         if !eof || self.summary.output_truncated {
-            self.output.extend_from_slice(b"\n[Git stderr capture incomplete; process exit status is unchanged.]\n");
+            self.output.extend_from_slice(b"\n[Git stderr capture incomplete.]\n");
         }
         self.summary.finish(trace);
         self.output
@@ -178,6 +191,11 @@ impl Summary {
     fn helper_observed_open(&self) -> bool {
         self.children.values().any(|(category, _, _)| *category == "credential_helper")
     }
+    fn waiting_for_credentials(&self) -> bool {
+        self.children.values().any(|&(category, action, since)|
+            category == "credential_helper" && action == "get" && since.elapsed() >= Duration::from_secs(3))
+    }
+
     fn snapshot(&self) -> String {
         let mut active = std::collections::BTreeMap::new();
         for &(category, action, since) in self.children.values() {

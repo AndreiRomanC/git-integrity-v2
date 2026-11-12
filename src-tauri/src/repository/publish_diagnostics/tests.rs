@@ -1,7 +1,7 @@
 use super::*;
 use std::io::Cursor;
 
-fn trace() -> PushTrace { PushTrace { id: 42, started: Instant::now() } }
+fn trace() -> PushTrace { PushTrace { id: 42, started: Instant::now(), ui: Default::default(), command_id: None } }
 
 impl PushTrace {
     fn read_stderr(&self, mut input: impl std::io::Read) -> std::io::Result<Vec<u8>> {
@@ -103,6 +103,39 @@ fn actual_timeout_preserves_allowlisted_evidence_and_warns_about_unknown_remote_
     assert!(err.contains("timed out") && err.contains("no exit was observed") && err.contains("authentication") && err.contains("remote result is unknown"));
     assert!(logs.iter().any(|s| s.contains("event=timeout git=running") && s.contains("credential_helper/get:1@")));
     assert!(!err.contains("PRIVATE") && !logs.join("\n").contains("PRIVATE"));
+}
+
+#[test]
+fn credential_wait_can_stop_only_its_own_observed_push() {
+    let id = begin_git_command("fixture", &["push", "origin", "HEAD:refs/heads/test"]);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut t = trace();
+    t.command_id = Some(id);
+    t.ui.credential_wait = Some(tauri::ipc::Channel::new(move |body| {
+        tx.send(body.deserialize::<Option<u64>>().unwrap()).unwrap();
+        Ok(())
+    }));
+    assert!(stop_git_command(id).is_err());
+    let runner = std::thread::spawn(move || run_with_timeout_labeled_traced(fixture("await_helper"),
+        Duration::from_secs(15), "Git", "fixture timeout", Some(t)));
+    let reported = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert_eq!(reported, Some(id));
+    stop_git_command(id).unwrap();
+    let error = runner.join().unwrap().unwrap_err();
+    finish_git_command(id, false, None, "", "", &error);
+    assert!(error.starts_with("Git push stopped"));
+    assert!(stop_git_command(id).is_err());
+}
+
+#[test]
+fn modal_parent_is_passed_only_to_the_git_child_without_changing_helper_policy() {
+    let mut t = trace();
+    t.ui.parent_hwnd = Some(9182);
+    let mut cmd = Command::new("git");
+    t.configure(&mut cmd);
+    let vars: std::collections::HashMap<_, _> = cmd.get_envs().collect();
+    assert_eq!(vars[std::ffi::OsStr::new("GCM_MODAL_PARENTHWND")], Some(std::ffi::OsStr::new("9182")));
+    assert!(!vars.contains_key(std::ffi::OsStr::new("GCM_INTERACTIVE")));
 }
 
 #[test]

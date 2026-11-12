@@ -81,7 +81,7 @@ pub fn run_git_command(repository_path: String, args: String) -> Result<RawGitRe
     let submodule_update = is_submodule_update(&arg_refs);
     let (timeout, timeout_label) = git_command_timeout(&arg_refs);
     let history_id = begin_git_command(&repository_path, &arg_refs);
-    let mut command = background_command("git");
+    let mut command = Command::new("git");
     configure_git_command(&mut command);
     command.arg("-C").arg(&repository_path).arg("-c").arg("color.ui=false").args(&parts);
     if submodule_update {
@@ -194,14 +194,14 @@ pub(in crate::repository) fn run_terminal_command_with_timeout(repository_path: 
     #[cfg(windows)]
     let mut command = {
         let shell = std::env::var_os("COMSPEC").unwrap_or_else(|| "cmd.exe".into());
-        let mut command = background_command(shell);
+        let mut command = Command::new(shell);
         command.args(["/D", "/S", "/C"]).arg(command_text);
         command
     };
     #[cfg(not(windows))]
     let mut command = {
         let shell = std::env::var_os("SHELL").filter(|value| Path::new(value).is_file()).unwrap_or_else(|| "/bin/sh".into());
-        let mut command = background_command(shell);
+        let mut command = Command::new(shell);
         command.args(["-l", "-c"]).arg(command_text);
         command
     };

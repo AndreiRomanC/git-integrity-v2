@@ -23,15 +23,6 @@ jobs:
           cargo test --release --manifest-path src-tauri/Cargo.toml --lib repository::branches::tests::all_clean_entrypoints_leave_no_build_input_copies_in_recursive_git_metadata -- --exact --test-threads=1
           if ($LASTEXITCODE -ne 0) { throw "Clean source-backup regression check failed; executable will not be published." }
 
-      - name: Verify background commands do not create a console
-        shell: pwsh
-        env:
-          CARGO_TARGET_DIR: .build-windows
-          CARGO_INCREMENTAL: "0"
-        run: |
-          cargo test --release --manifest-path src-tauri/Cargo.toml --lib repository::background_process::tests:: -- --test-threads=1
-          if ($LASTEXITCODE -ne 0) { throw "Background console regression check failed." }
-
       - name: Verify native Publish on Windows (local fixtures only)
         shell: pwsh
         env:
@@ -45,7 +36,7 @@ jobs:
         shell: pwsh
         run: ./build-windows.ps1
 
-      - name: Verify executable size and GUI subsystem
+      - name: Verify executable size and console subsystem
         shell: pwsh
         run: |
           $exe = Get-Item "dist/windows/GitDrillDown.exe"
@@ -55,7 +46,7 @@ jobs:
           if ([BitConverter]::ToUInt32($bytes, $peOffset) -ne 0x4550) { throw "Invalid Windows executable" }
           # Subsystem is 68 bytes into the optional header, for both PE32 and PE32+.
           $subsystem = [BitConverter]::ToUInt16($bytes, $peOffset + 24 + 68)
-          if ($subsystem -ne 2) { throw "Release executable must use the Windows GUI subsystem, not Console" }
+          if ($subsystem -ne 3) { throw "Release executable must use the Windows console subsystem" }
           Write-Host "Windows executable: $([math]::Round($exe.Length / 1MB, 2)) MB"
 
       - name: Upload Windows application

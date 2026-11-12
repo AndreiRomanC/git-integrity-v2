@@ -5,7 +5,16 @@ use super::*;
 use std::io::Read;
 use std::sync::atomic::AtomicBool;
 
-struct StopHandle(u64);
+pub(super) struct StopHandle(u64);
+
+impl StopHandle {
+    pub(super) fn register(id: u64, requested: &Arc<AtomicBool>) -> Self {
+        if let Some(entry) = recent_git_commands_store().lock().unwrap().iter_mut().find(|entry| entry.id == id) {
+            entry.stop_request = Some(Arc::clone(requested));
+        }
+        Self(id)
+    }
+}
 impl Drop for StopHandle {
     fn drop(&mut self) {
         if let Some(entry) = recent_git_commands_store().lock().unwrap().iter_mut().find(|entry| entry.id == self.0) {
@@ -43,13 +52,7 @@ pub(super) fn run(mut command: Command, timeout: Duration, label: &str, timeout_
     let stdout = read(Box::new(child.stdout.take().expect("piped stdout")));
     let stderr = read(Box::new(child.stderr.take().expect("piped stderr")));
     let requested = Arc::new(AtomicBool::new(false));
-    {
-        let mut store = recent_git_commands_store().lock().unwrap();
-        if let Some(entry) = store.iter_mut().find(|entry| entry.id == history_id) {
-            entry.stop_request = Some(Arc::clone(&requested));
-        }
-    }
-    let handle = StopHandle(history_id);
+    let handle = StopHandle::register(history_id, &requested);
     let started = Instant::now();
     perf_log(&format!("git_process: id={history_id} started stoppable=true"), Duration::ZERO);
     let mut interruption = None;

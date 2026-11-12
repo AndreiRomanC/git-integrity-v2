@@ -471,7 +471,7 @@ test('Publish dialog defaults to Fast publish and still asks for confirmation be
   assert.match(html, /The safety check does not push submodules, update their checked-out files, merge, stage or commit/);
   assert.match(app, /Same normal push, without the submodule safety check or its fetches\./);
   assert.match(app, /Fast publish is not a force push\./);
-  assert.match(app, /invoke\('publish_branch', \{ repositoryPath, branch: publish\.branch, remote: publish\.remote, username: request\.username, accessToken: request\.accessToken, uptoCommit: combined \? '' : request\.uptoCommit, overrideUnpushedSubmodules, skipSubmoduleSafety \}\)/);
+  assert.match(app, /invoke\('publish_branch', \{ repositoryPath, branch: publish\.branch, remote: publish\.remote, username: request\.username, accessToken: request\.accessToken, uptoCommit: combined \? '' : request\.uptoCommit, overrideUnpushedSubmodules, skipSubmoduleSafety, credentialWait: credentials\.channel \}\)/);
 });
 
 test('opening Publish resets Fast as the UI default without starting a push', async () => {

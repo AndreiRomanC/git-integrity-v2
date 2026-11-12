@@ -78,6 +78,11 @@ pub(in crate::repository) fn wait(mut child: Child, trace: PushTrace, timeout: D
     let mut exited = None;
     let mut timeout_requested = false;
     let mut helper_open_at_timeout = false;
+    let mut deadline_seen = false;
+    let mut stopped_by_user = false;
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut stop_handle = None;
+    let mut next_credential_check = Duration::ZERO;
     let mut next_termination = timeout;
     let mut next_report = Duration::from_secs(30);
     trace.log("event=process_spawned");
@@ -108,19 +113,43 @@ pub(in crate::repository) fn wait(mut child: Child, trace: PushTrace, timeout: D
                 trace.log(&format!("event=waiting git=running stdout={} stderr={} {}", os.label(), es.label(), capture.summary.snapshot()));
                 next_report = elapsed + Duration::from_secs(30);
             }
-            if elapsed >= next_termination {
-                trace.log(&format!("event=timeout git=running {}", capture.summary.snapshot()));
-                // Never terminate a PID after observing its exit. Reuse the
-                // original child's process-tree guard, not a PID from the UI.
-                match process_control::kill_tree(&mut child) {
-                    Ok(true) => {
-                        timeout_requested = true;
-                        helper_open_at_timeout = capture.summary.helper_observed_open();
+            // Offer Stop only while Git reports an outstanding credential lookup.
+            // Most pushes never need a UI update. Use Git's process events rather
+            // than probing the server or touching the credential store ourselves.
+            if let Some(id) = trace.command_id {
+                if elapsed >= next_credential_check || stop.load(Ordering::Relaxed) {
+                    next_credential_check = elapsed + Duration::from_millis(250);
+                    let waiting = capture.summary.waiting_for_credentials();
+                    if waiting != stop_handle.is_some() {
+                        stop.store(false, Ordering::Relaxed);
+                        stop_handle = waiting.then(|| process_control::StopHandle::register(id, &stop));
+                        if let Some(channel) = &trace.ui.credential_wait {
+                            let _ = channel.send(waiting.then_some(id));
+                        }
                     }
-                    Ok(false) => continue, // Exit won the race; inspect its status.
-                    Err(_) => trace.log("event=termination_failed awaiting_git_exit=true"),
                 }
-                // Keep the existing repository lock until we observe exit.
+            }
+            let user_stop = stop_handle.is_some() && stop.swap(false, Ordering::Relaxed);
+            if !stopped_by_user && !timeout_requested && (user_stop || elapsed >= next_termination) {
+                if user_stop {
+                    trace.log("event=stop_requested phase=credential_lookup");
+                } else {
+                    deadline_seen = true;
+                    helper_open_at_timeout |= capture.summary.helper_observed_open();
+                    trace.log(&format!("event=timeout git=running {}", capture.summary.snapshot()));
+                }
+                // Git may exit as taskkill walks the process tree on Windows.
+                // Preserve a successful exit if it finishes before termination.
+                match process_control::kill_tree(&mut child) {
+                    Ok(true) => { stopped_by_user = user_stop; timeout_requested = !user_stop; }
+                    Ok(false) => continue,
+                    Err(_) => {
+                        trace.log("event=termination_failed awaiting_git_exit=true");
+                        if user_stop {
+                            if let Some(channel) = &trace.ui.credential_wait { let _ = channel.send(trace.command_id); }
+                        }
+                    }
+                }
                 next_termination = elapsed + Duration::from_secs(30);
             }
         }
@@ -129,10 +158,15 @@ pub(in crate::repository) fn wait(mut child: Child, trace: PushTrace, timeout: D
     if matches!(es, Stream::Eof) && !capture.line.is_empty() { capture.flush_line(&trace); }
     trace.log(&format!("event=capture_finished stdout={} stderr={} timeout_requested={} {}", os.label(), es.label(), timeout_requested, capture.summary.snapshot()));
     if truncated || !matches!(os, Stream::Eof) { stdout.extend_from_slice(b"\n[Git stdout capture incomplete.]\n"); }
-    if timeout_requested {
+    drop(stop_handle);
+    if stopped_by_user {
+        capture.finish(&trace, matches!(es, Stream::Eof));
+        return Err("Git push stopped while waiting for credentials. Check the destination branch before another push.".into());
+    }
+    if timeout_requested || (deadline_seen && !status.success()) {
         let reason = capture.summary.stderr_reason.unwrap_or("not observed");
         capture.finish(&trace, matches!(es, Stream::Eof));
-        let helper = if helper_open_at_timeout { " Git had reported a credential helper starting, but no exit was observed for it." } else { "" };
+        let helper = if helper_open_at_timeout { " Git had reported a credential helper starting, but no exit was observed for it at the deadline. If no sign-in window appeared, use Private server credentials in Publish or sign in from Git for Windows." } else { "" };
         return Err(format!("Git push timed out after {timeout_label}.{helper} Last recognized Git error: {reason}. The remote result is unknown. Check the destination branch and commit before retrying. No automatic retry was performed."));
     }
     let stderr = capture.finish(&trace, matches!(es, Stream::Eof));

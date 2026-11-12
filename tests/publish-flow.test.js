@@ -29,7 +29,9 @@ function harness() {
     refreshPublish: async () => { calls.push({command:'preview'}); },
     loadRepository: async (repo, options) => { calls.push({command:'load_repository', repo, options}); context.repoOpenGeneration++; return true; },
     status: (message, kind) => messages.push({message,kind}), showOperationToast: (message,kind) => messages.push({message,kind}), jsPerfLog() {} };
+  context.window = {};
   vm.createContext(context);
+  vm.runInContext(app.match(/function watchPublishCredentials\([^]*?\n\}/)[0], context);
   for (const name of ['refreshPublishRisks', 'refreshAfterPublish', 'confirmPublish', 'executePublish', 'finishPublishUi']) {
     const source = app.match(new RegExp(`async function ${name}\\([^]*?\\n\\}`))?.[0];
     assert.ok(source, name); vm.runInContext(source, context);
@@ -188,4 +190,30 @@ test('publish workers and metadata refresh keep Git status/submodule scans out o
   const metadata = rust.match(/fn refresh_publish_metadata_inner\([^]*?\n\}/)[0];
   assert.doesNotMatch(metadata, /internal_statuses|cached_full_statuses|load_repository|load_directory|fetch|\.index\(/);
   assert.match(metadata, /unpushed_paths\(&repository_path\)/);
+});
+
+
+test('publish offers Stop for the reported credential wait and ignores a confirmation after Git continues', async () => {
+  const h = harness(), op = h.node('#publishOperationStatus'), button = h.node('#stopPublishCredentialWait');
+  h.context.window.__TAURI__ = { core: { Channel: class {} } };
+  op.textContent = 'Publishing feature…';
+  const watch = h.context.watchPublishCredentials(h.request(), op);
+  watch.channel.onmessage(42);
+  assert.equal(button.hidden, false);
+  assert.match(op.textContent, /waiting for credentials/);
+  const confirmation = deferred();
+  h.context.customConfirm = () => confirmation.promise;
+  const first = button.onclick();
+  watch.channel.onmessage(null);
+  confirmation.resolve(true); await first;
+  assert.equal(button.hidden, true);
+  assert.equal(op.textContent, 'Publishing feature…');
+  assert.equal(h.calls.length, 0);
+  watch.channel.onmessage(43);
+  await button.onclick();
+  assert.deepEqual(h.calls.map(c => [c.command, c.args.commandId]), [['stop_git_command', 43]]);
+  watch.close();
+  watch.channel.onmessage(44);
+  assert.equal(button.hidden, true);
+  assert.equal(button.onclick, null);
 });

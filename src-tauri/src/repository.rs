@@ -19,8 +19,6 @@ mod perf_logging;
 mod ipc_diagnostics;
 mod publish_diagnostics;
 mod process_control;
-mod background_process;
-use background_process::command as background_command;
 mod check_links;
 pub mod index_lock;
 #[cfg(test)]
@@ -1361,7 +1359,7 @@ fn run_with_timeout_labeled_traced(mut command: Command, timeout: Duration, prog
             #[cfg(unix)] { let _ = Command::new("kill").arg("-9").arg(format!("-{id}")).status(); }
             // /T is the Windows equivalent: kill the whole process tree
             // rooted at this PID, not just cmd.exe itself.
-            #[cfg(windows)] { let _ = background_command("taskkill").args(["/F", "/T", "/PID"]).arg(id.to_string()).status(); }
+            #[cfg(windows)] { let _ = Command::new("taskkill").args(["/F", "/T", "/PID"]).arg(id.to_string()).status(); }
             Err(format!("{program_label} command timed out after {timeout_label} — check your network connection and try again"))
         }
     }
@@ -1585,13 +1583,14 @@ fn git_with_timeout_control_traced(path: &str, args: &[&str], timeout: Duration,
     if is_submodule_update(args) {
         perf_log(&format!("submodule_update: start repo={} timeout_seconds={} force_requested={}", anonymized_repository_id(path), timeout.as_secs(), args.contains(&"--force")), Duration::ZERO);
     }
-    let mut command = background_command("git");
+    let mut command = Command::new("git");
     // `-c` overrides must come before the subcommand to be recognized as
     // global git config, not passed through to it — configure_git_command's
     // own `-c` flags need to land here, before `args` (which starts with the
     // subcommand), not after.
     configure_git_command(&mut command);
-    if let Some(trace) = &trace { trace.configure(&mut command); }
+    let mut trace = trace;
+    if let Some(trace) = &mut trace { trace.command_id = Some(history_id); trace.configure(&mut command); }
     // Git for Windows still applies MAX_PATH handling to several worktree
     // operations unless core.longPaths is enabled. Keep this process-local:
     // clean/checkout/submodule update can then remove real repository paths
@@ -2386,7 +2385,7 @@ pub fn open_external_url(url: String) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     let status = Command::new("open").arg(&url).status();
     #[cfg(target_os = "windows")]
-    let status = background_command("cmd").args(["/C", "start", "", &url]).status();
+    let status = Command::new("cmd").args(["/C", "start", "", &url]).status();
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     let status = Command::new("xdg-open").arg(&url).status();
     status.map_err(|error| error.to_string()).and_then(|result| result.success().then_some(()).ok_or_else(|| "Could not open the default browser".into()))
@@ -2662,7 +2661,7 @@ fn launch_browser(url: &str) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     let status = Command::new("open").arg(url).status();
     #[cfg(target_os = "windows")]
-    let status = background_command("cmd").args(["/C", "start", "", url]).status();
+    let status = Command::new("cmd").args(["/C", "start", "", url]).status();
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     let status = Command::new("xdg-open").arg(url).status();
     status.map_err(|error| error.to_string()).and_then(|result| result.success().then_some(()).ok_or_else(|| "Could not open the default browser".into()))
@@ -4330,7 +4329,7 @@ static GH_CLI_AVAILABLE: OnceLock<bool> = OnceLock::new();
 #[cfg(not(test))]
 fn gh_cli_available() -> bool {
     *GH_CLI_AVAILABLE.get_or_init(|| {
-        let mut command = background_command("gh");
+        let mut command = Command::new("gh");
         command.arg("--version").stdin(std::process::Stdio::null());
         run_with_timeout_labeled(command, Duration::from_secs(3), "gh", "3 seconds")
             .map(|output| output.status.success())
@@ -4348,7 +4347,7 @@ fn gh_cli_available() -> bool { true }
 // without printing (or logging) the token. Tests keep the injected gh runner.
 #[cfg(not(test))]
 fn gh_cli_authenticated(host: &str) -> bool {
-    let mut command = background_command("gh");
+    let mut command = Command::new("gh");
     command.args(["auth", "token", "--hostname", host])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -4433,7 +4432,7 @@ fn classify_credential_helpers(raw: &[u8]) -> String {
 }
 
 fn credential_helper_kind(repository_path: &str) -> String {
-    let mut command = background_command("git");
+    let mut command = Command::new("git");
     command.arg("-C").arg(repository_path).args(["config", "--get-all", "credential.helper"])
         .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(std::process::Stdio::null());
@@ -4445,7 +4444,7 @@ fn credential_helper_kind(repository_path: &str) -> String {
 fn approve_git_credential(repository_path: &str, repo: &GitHubRepo, credential: &GitHttpsCredential) -> Result<(), String> {
     use std::io::Write;
     let Some(username) = credential.username.as_deref() else { return Err("username_missing".into()) };
-    let mut command = background_command("git");
+    let mut command = Command::new("git");
     command.arg("-C").arg(repository_path).args(["credential", "approve"])
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GCM_INTERACTIVE", "never")
@@ -4475,7 +4474,7 @@ fn approve_git_credential(repository_path: &str, repo: &GitHubRepo, credential: 
         Ok(Err(error)) => Err(format!("wait_failed(kind={:?})", error.kind())),
         Err(_) => {
             #[cfg(unix)] { let _ = Command::new("kill").arg("-9").arg(format!("-{id}")).status(); }
-            #[cfg(windows)] { let _ = background_command("taskkill").args(["/F", "/T", "/PID"]).arg(id.to_string()).status(); }
+            #[cfg(windows)] { let _ = Command::new("taskkill").args(["/F", "/T", "/PID"]).arg(id.to_string()).status(); }
             Err("timeout".into())
         }
     }
@@ -4531,7 +4530,7 @@ fn forget_github_session_token(host: &str) {
 fn github_token_from_git_credential_helper(repository_path: &str, repo: &GitHubRepo, interactive: bool) -> Result<GitHttpsCredential, String> {
     use std::io::Write;
 
-    let mut command = background_command("git");
+    let mut command = Command::new("git");
     command.arg("-C").arg(repository_path).args(["credential", "fill"])
         .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(std::process::Stdio::piped())
@@ -4571,7 +4570,7 @@ fn github_token_from_git_credential_helper(repository_path: &str, repo: &GitHubR
         Ok(Err(_)) => Err("Could not read the Git credential helper's response".into()),
         Err(_) => {
             #[cfg(unix)] { let _ = Command::new("kill").arg("-9").arg(format!("-{id}")).status(); }
-            #[cfg(windows)] { let _ = background_command("taskkill").args(["/F", "/T", "/PID"]).arg(id.to_string()).status(); }
+            #[cfg(windows)] { let _ = Command::new("taskkill").args(["/F", "/T", "/PID"]).arg(id.to_string()).status(); }
             Err(if interactive { "Git Credential Manager sign-in did not finish within 5 minutes. Retry after checking the browser sign-in window." } else { "Git credential lookup did not finish within 5 seconds." }.into())
         }
     }
@@ -4933,7 +4932,7 @@ fn gh_stderr_looks_like_auth(stderr: &str) -> bool {
 
 fn run_gh_pr_list(query: &PrGhQuery) -> GhOutcome {
     let side_flag = match query.direction { PrQueryDirection::Head => "--head", PrQueryDirection::Base => "--base" };
-    let mut command = background_command("gh");
+    let mut command = Command::new("gh");
     command.args(["pr", "list", "--repo", &query.repo, side_flag, &query.branch, "--state", "open", "--json", PR_GH_JSON_FIELDS]);
     command.stdin(std::process::Stdio::null());
     match run_with_timeout_labeled(command, Duration::from_secs(20), "gh", "20 seconds") {
@@ -5300,7 +5299,7 @@ fn github_rest_endpoint(repo: &GitHubRepo, suffix: &str) -> String {
 
 fn post_pull_request_comment_with_gh(repo: &GitHubRepo, number: u64, body: &str) -> Result<(), String> {
     let endpoint = format!("repos/{}/{}/issues/{number}/comments", repo.owner, repo.repo);
-    let mut command = background_command("gh");
+    let mut command = Command::new("gh");
     command.args(["api", "--hostname", &repo.host, "--method", "POST", &endpoint, "--raw-field"])
         .arg(format!("body={body}")).stdin(std::process::Stdio::null());
     let output = run_with_timeout_labeled(command, Duration::from_secs(20), "gh comment", "20 seconds")?;
@@ -5890,12 +5889,17 @@ fn submodule_publish_risks_inner(repository_path: String, branch: String, remote
 }
 
 #[tauri::command]
-pub async fn publish_branch(repository_path: String, branch: String, remote: String, username: String, access_token: String, upto_commit: String, override_unpushed_submodules: bool, skip_submodule_safety: Option<bool>, diagnostic_request_id: Option<u64>) -> Result<(), String> {
+pub async fn publish_branch(webview: tauri::Webview, credential_wait: Option<tauri::ipc::JavaScriptChannelId>, repository_path: String, branch: String, remote: String, username: String, access_token: String, upto_commit: String, override_unpushed_submodules: bool, skip_submodule_safety: Option<bool>, diagnostic_request_id: Option<u64>) -> Result<(), String> {
     let timing = Arc::new(ipc_diagnostics::IpcTiming::new("publish_branch", diagnostic_request_id));
+    #[cfg(windows)]
+    let parent_hwnd = webview.window().hwnd().ok().map(|h| h.0 as isize).filter(|&h| h != 0);
+    #[cfg(not(windows))]
+    let parent_hwnd = None;
+    let ui = publish_diagnostics::PublishUi { parent_hwnd, credential_wait: credential_wait.map(|id| id.channel_on(webview)) };
     let worker_timing = timing.clone();
     let result = off_main_thread(move || {
         worker_timing.mark("worker_started");
-        let result = publish_branch_inner_with_options(repository_path, branch, remote, username, access_token, upto_commit, override_unpushed_submodules, skip_submodule_safety.unwrap_or(false));
+        let result = publish_branch_inner_with_options(repository_path, branch, remote, username, access_token, upto_commit, override_unpushed_submodules, skip_submodule_safety.unwrap_or(false), ui);
         worker_timing.mark("worker_finished");
         result
     }).await;
@@ -5905,10 +5909,10 @@ pub async fn publish_branch(repository_path: String, branch: String, remote: Str
 
 #[cfg(test)]
 fn publish_branch_inner(repository_path: String, branch: String, remote: String, username: String, access_token: String, upto_commit: String, override_unpushed_submodules: bool) -> Result<(), String> {
-    publish_branch_inner_with_options(repository_path, branch, remote, username, access_token, upto_commit, override_unpushed_submodules, false)
+    publish_branch_inner_with_options(repository_path, branch, remote, username, access_token, upto_commit, override_unpushed_submodules, false, Default::default())
 }
 
-fn publish_branch_inner_with_options(repository_path: String, branch: String, remote: String, username: String, access_token: String, upto_commit: String, override_unpushed_submodules: bool, skip_submodule_safety: bool) -> Result<(), String> {
+fn publish_branch_inner_with_options(repository_path: String, branch: String, remote: String, username: String, access_token: String, upto_commit: String, override_unpushed_submodules: bool, skip_submodule_safety: bool, ui: publish_diagnostics::PublishUi) -> Result<(), String> {
     let total_started = Instant::now();
     perf_log("publish_branch: START", Duration::ZERO);
     let result: Result<(), String> = (|| {
@@ -5946,7 +5950,8 @@ fn publish_branch_inner_with_options(repository_path: String, branch: String, re
         perf_log("publish_branch: safety preflight", safety_started.elapsed());
     }
     let push_started = Instant::now();
-    let push_trace = publish_diagnostics::PushTrace::new(&repo, remote_name, !access_token.trim().is_empty());
+    let mut push_trace = publish_diagnostics::PushTrace::new(&repo, remote_name, !access_token.trim().is_empty());
+    push_trace.ui = ui;
     if access_token.trim().is_empty() {
         push_trace.log_command(skip_submodule_safety, push_oid == local_oid);
         // No explicit token was entered — prefer the system `git` binary, which
@@ -5955,7 +5960,7 @@ fn publish_branch_inner_with_options(repository_path: String, branch: String, re
         // and can fail here ("failed to acquire username/password") even when a
         // plain `git push` in a terminal works fine for the same repository.
         git_with_timeout_control_traced(&repository_path, &["push", remote_name, &format!("{push_oid}:refs/heads/{branch}")], GIT_COMMAND_TIMEOUT, "10 minutes", false, Some(push_trace))
-            .map_err(|detail| if detail.starts_with("Git push timed out") { detail } else if detail.to_lowercase().contains("authentication") || detail.contains("403") || detail.contains("could not read") { "Push authentication failed. Either make sure `git push` works for this repository from a terminal, or enter a Git username and Personal Access Token in Publish credentials.".to_string() } else if detail.to_lowercase().contains("non-fast-forward") || detail.to_lowercase().contains("fetch first") { "Push rejected because the server branch has newer commits. Pull/fetch those commits first, then publish again.".to_string() } else { format!("Push failed: {detail}") })?;
+            .map_err(|detail| if detail.starts_with("Git push timed out") || detail.starts_with("Git push stopped") { detail } else if detail.to_lowercase().contains("authentication") || detail.contains("403") || detail.contains("could not read") { "Push authentication failed. Either make sure `git push` works for this repository from a terminal, or enter a Git username and Personal Access Token in Publish credentials.".to_string() } else if detail.to_lowercase().contains("non-fast-forward") || detail.to_lowercase().contains("fetch first") { "Push rejected because the server branch has newer commits. Pull/fetch those commits first, then publish again.".to_string() } else { format!("Push failed: {detail}") })?;
     } else {
         // libgit2 needs a source ref for this commit. A fixed refs/heads name
         // with force=true could overwrite and then DELETE a real user branch.
@@ -18668,7 +18673,7 @@ mod tests {
         // The old fixed scratch name is a perfectly valid user branch. An
         // authenticated partial push must preserve it exactly.
         run_git(&repository, &["branch", "__git-integrity-partial-publish__", &commit1]);
-        publish_branch_inner_with_options(path.clone(), "main".into(), "origin".into(), "test".into(), "test-token".into(), commit1.clone(), false, true).unwrap();
+        publish_branch_inner_with_options(path.clone(), "main".into(), "origin".into(), "test".into(), "test-token".into(), commit1.clone(), false, true, Default::default()).unwrap();
         assert_eq!(run_git_capture(&repository, &["rev-parse", "refs/heads/__git-integrity-partial-publish__"]), commit1);
         assert!(git(&path, &["for-each-ref", "--format=%(refname)", "refs/git-drilldown/tmp"]).unwrap().trim().is_empty());
 
@@ -18677,7 +18682,7 @@ mod tests {
         let local_tip = run_git_capture(&repository, &["rev-parse", "HEAD"]);
         run_git(&remote, &["fetch", repository.to_str().unwrap(), "HEAD"]);
         run_git(&remote, &["update-ref", "refs/heads/main", &local_tip]);
-        assert!(publish_branch_inner_with_options(path.clone(), "main".into(), "origin".into(), "test".into(), "test-token".into(), commit1.clone(), false, true).is_err());
+        assert!(publish_branch_inner_with_options(path.clone(), "main".into(), "origin".into(), "test".into(), "test-token".into(), commit1.clone(), false, true, Default::default()).is_err());
         assert_eq!(run_git_capture(&repository, &["rev-parse", "refs/heads/__git-integrity-partial-publish__"]), commit1);
         assert!(git(&path, &["for-each-ref", "--format=%(refname)", "refs/git-drilldown/tmp"]).unwrap().trim().is_empty());
         run_git(&remote, &["update-ref", "refs/heads/main", &commit1]);
@@ -18725,7 +18730,7 @@ mod tests {
         fs::write(repository.join("first.txt"), "unstaged").unwrap();
         fs::write(repository.join("untracked.txt"), "keep me").unwrap();
         let index = fs::read(repository.join(".git/index")).unwrap();
-        publish_branch_inner_with_options(path.clone(), "feature".into(), "origin".into(), String::new(), String::new(), first.clone(), false, true).unwrap();
+        publish_branch_inner_with_options(path.clone(), "feature".into(), "origin".into(), String::new(), String::new(), first.clone(), false, true, Default::default()).unwrap();
         let key = repo_lock_key(&path);
         assert!(!full_status_cache().lock().unwrap().contains_key(&key));
         let refreshed = tauri::async_runtime::block_on(refresh_publish_metadata(path.clone(), "feature".into(), "origin".into())).unwrap();
@@ -18738,7 +18743,7 @@ mod tests {
         assert_eq!(fs::read(repository.join(".git/index")).unwrap(), index);
         assert_eq!(fs::read_to_string(repository.join("first.txt")).unwrap(), "unstaged");
         assert_eq!(fs::read_to_string(repository.join("untracked.txt")).unwrap(), "keep me");
-        publish_branch_inner_with_options(path.clone(), "feature".into(), "origin".into(), String::new(), String::new(), String::new(), false, true).unwrap();
+        publish_branch_inner_with_options(path.clone(), "feature".into(), "origin".into(), String::new(), String::new(), String::new(), false, true, Default::default()).unwrap();
         let refreshed = refresh_publish_metadata_inner(path.clone(), "feature".into(), "origin".into()).unwrap();
         assert_eq!(refreshed.remote_tip, head); assert!(refreshed.unpushed_paths.is_empty());
         assert!(publish_status_inner(path, "feature".into(), "origin".into()).unwrap().commits.is_empty());
@@ -19736,14 +19741,14 @@ mod tests {
         assert_eq!(violations.len(), 1, "{violations:?}");
         assert_eq!(violations[0].risk, "unpushed", "the current tip's own gitlink must be the hard-blocked risk, not a superseded one");
 
-        let blocked = publish_branch_inner_with_options(parent_path.clone(), "main".into(), "origin".into(), String::new(), String::new(), String::new(), false, false);
+        let blocked = publish_branch_inner_with_options(parent_path.clone(), "main".into(), "origin".into(), String::new(), String::new(), String::new(), false, false, Default::default());
         assert!(blocked.is_err(), "safe publish must block on an unpushed current gitlink");
         assert!(blocked.unwrap_err().starts_with("Cannot publish"), "this risk is a hard block, never override-eligible");
 
-        let still_blocked = publish_branch_inner_with_options(parent_path.clone(), "main".into(), "origin".into(), String::new(), String::new(), String::new(), true, false);
+        let still_blocked = publish_branch_inner_with_options(parent_path.clone(), "main".into(), "origin".into(), String::new(), String::new(), String::new(), true, false, Default::default());
         assert!(still_blocked.is_err(), "override_unpushed_submodules must not be able to bypass a hard-blocked \"unpushed\" risk");
 
-        let fast_published = publish_branch_inner_with_options(parent_path, "main".into(), "origin".into(), String::new(), String::new(), String::new(), false, true);
+        let fast_published = publish_branch_inner_with_options(parent_path, "main".into(), "origin".into(), String::new(), String::new(), String::new(), false, true, Default::default());
         assert!(fast_published.is_ok(), "skip_submodule_safety=true (Fast publish) must bypass the preflight entirely, including the hard block: {fast_published:?}");
 
         fs::remove_dir_all(base).unwrap();

@@ -11,8 +11,8 @@
        that gap can show a flash of default browser background/font before
        styles.css applies. Keep in sync with the body rule in styles.css. -->
   <style>html,body{width:100%;height:100%;margin:0;overflow:hidden;background:#0d1117;color:#e8eef5;font:14px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}</style>
-  <link rel="stylesheet" href="styles.css?v=20261111-version-view">
-  <link rel="stylesheet" href="polarion.css?v=20261111-version-view">
+  <link rel="stylesheet" href="styles.css?v=20261112-publish-auth">
+  <link rel="stylesheet" href="polarion.css?v=20261112-publish-auth">
 </head>
 <body>
   <div id="startupIntro" class="startup-intro" hidden>
@@ -23,7 +23,7 @@
       <div id="startupIntroFailure" class="startup-intro-failure" hidden><p>Reload the window to retry.</p><button type="button" id="startupIntroRetry">Reload interface</button></div>
     </div>
   </div>
-  <script src="startup-intro.js?v=20261111-version-view"></script>
+  <script src="startup-intro.js?v=20261112-publish-auth"></script>
   <div class="app-shell">
     <header class="topbar">
       <div class="brand" aria-label="Git DrillDown">
@@ -679,7 +679,7 @@
       </fieldset>
       <details class="submodule-auth"><summary>Private server credentials</summary><div><label><span>USERNAME</span><input id="publishUsername" autocomplete="username" placeholder="Git username"></label><label><span>PERSONAL ACCESS TOKEN</span><input id="publishToken" type="password" autocomplete="off" placeholder="Token (not account password)"></label></div><small>Used only for this push and never saved by Git DrillDown.</small></details>
       <p id="publishOperationStatus" class="submodule-operation-status" role="status"></p>
-      <footer><span id="publishSummary">Checking…</span><button value="cancel">Cancel</button><button value="default" id="confirmPublish">Publish branch</button></footer>
+      <footer><span id="publishSummary">Checking…</span><button type="button" id="stopPublishCredentialWait" hidden>Stop waiting…</button><button value="cancel">Cancel</button><button value="default" id="confirmPublish">Publish branch</button></footer>
     </form>
   </dialog>
   <dialog id="submodulePublishDialog" class="publish-dialog">
@@ -995,25 +995,25 @@
       <footer><span>Read-only on Polarion · local snapshots outside Git</span><button value="cancel">Close</button><button type="button" id="polarionAdd" class="confirm" disabled>Add to Commit List</button></footer>
     </form>
   </dialog>
-  <script src="polarion.js?v=20261111-version-view"></script>
-  <script src="console-context.js?v=20261111-version-view"></script>
-  <script src="graph-model.js?v=20261111-version-view"></script>
-  <script src="submodule-state.js?v=20261111-version-view"></script>
-  <script src="submodule-versions.js?v=20261111-version-view"></script>
-  <script src="module-inspect.js?v=20261111-version-view"></script>
-  <script src="local-diff.js?v=20261111-version-view"></script>
-  <script src="local-drive.js?v=20261111-version-view"></script>
-  <script src="pr-status.js?v=20261111-version-view"></script>
-  <script src="refresh-coordinator.js?v=20261111-version-view"></script>
-  <script src="comparison-authors.js?v=20261111-version-view"></script>
-  <script src="git-activity.js?v=20261111-version-view"></script>
-  <script src="comparison-navigation.js?v=20261111-version-view"></script>
-  <script src="panel-resize.js?v=20261111-version-view"></script>
-  <script src="submodule-compare-details.js?v=20261111-version-view"></script>
-  <script src="branch-reset.js?v=20261111-version-view"></script>
-  <script src="merge-preview.js?v=20261111-version-view"></script>
-  <script src="navigation-refresh.js?v=20261111-version-view"></script>
-  <script src="ipc-diagnostics.js?v=20261111-version-view"></script>
-  <script src="app.js?v=20261111-version-view"></script>
+  <script src="polarion.js?v=20261112-publish-auth"></script>
+  <script src="console-context.js?v=20261112-publish-auth"></script>
+  <script src="graph-model.js?v=20261112-publish-auth"></script>
+  <script src="submodule-state.js?v=20261112-publish-auth"></script>
+  <script src="submodule-versions.js?v=20261112-publish-auth"></script>
+  <script src="module-inspect.js?v=20261112-publish-auth"></script>
+  <script src="local-diff.js?v=20261112-publish-auth"></script>
+  <script src="local-drive.js?v=20261112-publish-auth"></script>
+  <script src="pr-status.js?v=20261112-publish-auth"></script>
+  <script src="refresh-coordinator.js?v=20261112-publish-auth"></script>
+  <script src="comparison-authors.js?v=20261112-publish-auth"></script>
+  <script src="git-activity.js?v=20261112-publish-auth"></script>
+  <script src="comparison-navigation.js?v=20261112-publish-auth"></script>
+  <script src="panel-resize.js?v=20261112-publish-auth"></script>
+  <script src="submodule-compare-details.js?v=20261112-publish-auth"></script>
+  <script src="branch-reset.js?v=20261112-publish-auth"></script>
+  <script src="merge-preview.js?v=20261112-publish-auth"></script>
+  <script src="navigation-refresh.js?v=20261112-publish-auth"></script>
+  <script src="ipc-diagnostics.js?v=20261112-publish-auth"></script>
+  <script src="app.js?v=20261112-publish-auth"></script>
 </body>
 </html>

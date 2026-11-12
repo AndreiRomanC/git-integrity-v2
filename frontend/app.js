@@ -64,6 +64,8 @@ function diagnosticErrorCategory(error) {
   if (text.includes('no remote-tracking branch')) return 'missing-submodule-remote';
   if (text.includes('file does not exist in the selected remote')) return 'file-absent-in-remote';
   if (text.includes('cannot read local file')) return 'local-file-read-failed';
+  if (text.startsWith('git push timed out')) return 'timeout';
+  if (text.startsWith('git push stopped')) return 'stopped';
   if (/status.*changed|stale.*status|repository changed/.test(text)) return 'stale-status';
   if (/index\.lock|locked file|lock.*exists/.test(text)) return 'git-lock';
   if (/not found|notfound|does not exist|invalid.*ref/.test(text)) return 'missing-ref-or-object';
@@ -8881,6 +8883,37 @@ async function confirmPublish(event) {
   }
 }
 
+function watchPublishCredentials(request, operation) {
+  const Channel = window.__TAURI__?.core?.Channel;
+  if (!Channel) return { channel: null, close() {} };
+  const channel = new Channel();
+  const button = $('#stopPublishCredentialWait');
+  const normalStatus = operation.textContent;
+  let active = true, waitingId = null;
+  const current = () => active && request.isCurrent() && state.publish === request.publish && refs.publishDialog.open;
+  channel.onmessage = id => {
+    if (!current()) return;
+    waitingId = id;
+    button.hidden = id == null;
+    button.disabled = false;
+    operation.textContent = id == null ? normalStatus : 'Git is waiting for credentials. Check the sign-in window or your browser.';
+  };
+  button.onclick = async () => {
+    const id = waitingId;
+    if (id == null || !current()) return;
+    const confirmed = await customConfirm('Interrupt this push while Git is waiting for credentials? Check the destination branch before another push.', { title: 'Stop waiting for credentials?', danger: true, okLabel: 'Stop push' });
+    if (!confirmed || waitingId !== id || !current()) return;
+    button.disabled = true;
+    try { await invoke('stop_git_command', { commandId: id }); }
+    catch (error) { if (current() && waitingId === id) { operation.textContent = String(error); button.disabled = false; } }
+  };
+  return { channel, close() {
+    active = false;
+    button.hidden = true;
+    button.onclick = null;
+  } };
+}
+
 async function executePublish(request, overrideUnpushedSubmodules = false, alreadyCombined = null) {
   const { publish, repositoryPath, commitMode, skipSubmoduleSafety } = request;
   const combining = commitMode !== 'all';
@@ -8909,7 +8942,10 @@ async function executePublish(request, overrideUnpushedSubmodules = false, alrea
         await finishPublishUi(request, combined, message); return;
       }
     }
-    await invoke('publish_branch', { repositoryPath, branch: publish.branch, remote: publish.remote, username: request.username, accessToken: request.accessToken, uptoCommit: combined ? '' : request.uptoCommit, overrideUnpushedSubmodules, skipSubmoduleSafety });
+    const credentials = watchPublishCredentials(request, operation);
+    try {
+      await invoke('publish_branch', { repositoryPath, branch: publish.branch, remote: publish.remote, username: request.username, accessToken: request.accessToken, uptoCommit: combined ? '' : request.uptoCommit, overrideUnpushedSubmodules, skipSubmoduleSafety, credentialWait: credentials.channel });
+    } finally { credentials.close(); }
     const msg = combined ? `Combined ${combined.count} commits and published ${combined.revision.slice(0, 8)}. Original commits: ${combined.backup_ref}` : request.uptoCommit ? `Published part of ${publish.branch} to ${publish.remote} (up to your chosen commit)${skipSubmoduleSafety ? ' — fast publish' : ''}.` : `Published ${publish.branch} to ${publish.remote}${skipSubmoduleSafety ? ' (fast publish)' : ''}`;
     await finishPublishUi(request, combined, msg);
   } catch (error) {
