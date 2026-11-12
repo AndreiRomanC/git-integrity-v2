@@ -225,6 +225,23 @@ mod tests {
         assert_eq!(fs::read(path.join("outside.txt")).unwrap(), b"unstaged work");
     }
     #[test]
+    fn snapshot_export_preserves_preview_blob_without_a_commit() {
+        let fixture = Fixture::new();
+        let path = fixture.0.join("repo");
+        let repo = Repository::init(&path).unwrap();
+        let bytes = b"\0preview\xff\r\n";
+        let oid = repo.blob(bytes).unwrap();
+        let out = fixture.export(vec![
+            SnapshotSource::Missing,
+            SnapshotSource::Blob { repository_path: path.to_string_lossy().into_owned(),
+                oid: oid.to_string(), name: "proposed.bin".into() },
+        ]).unwrap();
+        assert!(out.join("left/.gitdrilldown-absent").is_file());
+        assert_eq!(fs::read(out.join("right/proposed.bin")).unwrap(), bytes);
+        assert!(repo.is_empty().unwrap());
+    }
+
+    #[test]
     fn snapshot_export_single_file_absence_empty_and_gitlink_are_distinct() {
         let fixture = Fixture::new(); let path = fixture.0.join("repo");
         let repo = Repository::init(&path).unwrap();

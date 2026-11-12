@@ -45,7 +45,7 @@ test('general file comparison groups consecutive changed rows into navigable blo
   ]))), [{ start: 1, end: 2 }, { start: 4, end: 4 }]);
   assert.match(html, /id="compareSearch"/);
   assert.match(html, /id="previousCompareDifference"[^>]*disabled><svg[^]*?<\/svg>Previous block<\/button>/);
-  assert.match(app, /activeBlock && rowIndex >= activeBlock\.start && rowIndex <= activeBlock\.end/);
+  assert.match(app, /for \(let i = active\.start; i <= active\.end; i\+\+\) comparePaneRow\(pane, i\)\.classList\.add\('active-compare-difference'\)/);
 });
 
 test('detached dirty submodule guidance keeps one warning with a readable separate action', () => {

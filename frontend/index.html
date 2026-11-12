@@ -11,8 +11,8 @@
        that gap can show a flash of default browser background/font before
        styles.css applies. Keep in sync with the body rule in styles.css. -->
   <style>html,body{width:100%;height:100%;margin:0;overflow:hidden;background:#0d1117;color:#e8eef5;font:14px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}</style>
-  <link rel="stylesheet" href="styles.css?v=20261112-publish-auth">
-  <link rel="stylesheet" href="polarion.css?v=20261112-publish-auth">
+  <link rel="stylesheet" href="styles.css?v=20261112-file-compare">
+  <link rel="stylesheet" href="polarion.css?v=20261112-file-compare">
 </head>
 <body>
   <div id="startupIntro" class="startup-intro" hidden>
@@ -23,7 +23,7 @@
       <div id="startupIntroFailure" class="startup-intro-failure" hidden><p>Reload the window to retry.</p><button type="button" id="startupIntroRetry">Reload interface</button></div>
     </div>
   </div>
-  <script src="startup-intro.js?v=20261112-publish-auth"></script>
+  <script src="startup-intro.js?v=20261112-file-compare"></script>
   <div class="app-shell">
     <header class="topbar">
       <div class="brand" aria-label="Git DrillDown">
@@ -438,7 +438,7 @@
   </dialog>
   <dialog id="compareDialog" class="compare-dialog">
     <form method="dialog">
-      <header><div><h2 id="compareTitle">Compare file</h2><p id="compareSubtitle"></p></div><button value="close">×</button></header>
+      <header class="compare-window-handle" tabindex="0" aria-label="Move comparison window"><div><h2 id="compareTitle">Compare file</h2><p id="compareSubtitle"></p></div><button type="button" class="compare-window-expand" aria-label="Expand comparison" title="Expand comparison" aria-pressed="false"><svg class="ui-icon" viewBox="0 0 20 20" aria-hidden="true"><path d="M7 3H3v4m10-4h4v4M3 13v4h4m10-4v4h-4"/></svg></button><button value="close" aria-label="Close comparison">×</button></header>
       <div class="compare-actionbar">
         <div class="compare-action-group">
           <span class="compare-group-label">STAGING</span>
@@ -475,6 +475,7 @@
       <div class="compare-head"><span>LOCAL</span><span>REMOTE</span></div>
       <div class="compare-content"><pre id="localCompare"></pre><pre id="remoteCompare"></pre></div>
     </form>
+    <div class="panel-resize-corner" role="button" tabindex="0" aria-label="Resize comparison" title="Drag to resize · arrow keys to resize">◢</div>
   </dialog>
   <dialog id="editorDialog" class="editor-dialog">
     <div class="editor-shell"><header><div><h2 id="editorTitle">Edit file</h2><p id="editorPath"></p></div><button type="button" id="closeEditor" aria-label="Close editor">×</button></header>
@@ -502,8 +503,9 @@
   </dialog>
   <dialog id="localDriveCompareDialog" class="local-drive-compare-dialog">
     <div class="local-drive-compare-shell">
-      <header>
+      <header class="compare-window-handle" tabindex="0" aria-label="Move comparison window">
         <div><h2>Merge local files</h2><p id="localDriveCompareSummary">Select one file in each pane</p></div>
+        <button type="button" class="compare-window-expand" aria-label="Expand comparison" title="Expand comparison" aria-pressed="false"><svg class="ui-icon" viewBox="0 0 20 20" aria-hidden="true"><path d="M7 3H3v4m10-4h4v4M3 13v4h4m10-4v4h-4"/></svg></button>
         <button type="button" id="closeLocalDriveCompare" aria-label="Close">×</button>
       </header>
       <div class="local-drive-compare-paths">
@@ -568,6 +570,7 @@
         <button type="button" id="cancelLocalDriveCompare">Close</button>
       </footer>
     </div>
+    <div class="panel-resize-corner" role="button" tabindex="0" aria-label="Resize comparison" title="Drag to resize · arrow keys to resize">◢</div>
   </dialog>
   <dialog id="localFolderMergeDialog" class="local-folder-merge-dialog">
     <div class="local-folder-merge-shell">
@@ -728,7 +731,10 @@
     </div>
     <div class="submodule-browser-body">
       <section>
-        <h3>Repositories</h3>
+        <div class="submodule-repo-heading">
+          <h3>Repositories</h3>
+          <button id="inspectSubmoduleBrowser" type="button" title="Browse versions and history of the selected repository" disabled>Inspect repository…</button>
+        </div>
         <div id="submoduleRepoResults" class="submodule-browser-list"><div class="version-loading">Search in github.vitesco.io/eng.</div></div>
       </section>
       <section>
@@ -742,7 +748,6 @@
     </div>
     <footer>
       <span id="submoduleBrowserStatus">Nothing selected yet.</span>
-      <button id="inspectSubmoduleBrowser" type="button" disabled>Inspect…</button>
       <button id="compareSubmoduleBrowser" type="button" disabled>Compare revisions</button>
       <button id="cancelSubmoduleBrowser" type="button">Cancel</button>
       <button id="applySubmoduleBrowser" type="button" class="confirm" disabled>Use repository</button>
@@ -995,25 +1000,25 @@
       <footer><span>Read-only on Polarion · local snapshots outside Git</span><button value="cancel">Close</button><button type="button" id="polarionAdd" class="confirm" disabled>Add to Commit List</button></footer>
     </form>
   </dialog>
-  <script src="polarion.js?v=20261112-publish-auth"></script>
-  <script src="console-context.js?v=20261112-publish-auth"></script>
-  <script src="graph-model.js?v=20261112-publish-auth"></script>
-  <script src="submodule-state.js?v=20261112-publish-auth"></script>
-  <script src="submodule-versions.js?v=20261112-publish-auth"></script>
-  <script src="module-inspect.js?v=20261112-publish-auth"></script>
-  <script src="local-diff.js?v=20261112-publish-auth"></script>
-  <script src="local-drive.js?v=20261112-publish-auth"></script>
-  <script src="pr-status.js?v=20261112-publish-auth"></script>
-  <script src="refresh-coordinator.js?v=20261112-publish-auth"></script>
-  <script src="comparison-authors.js?v=20261112-publish-auth"></script>
-  <script src="git-activity.js?v=20261112-publish-auth"></script>
-  <script src="comparison-navigation.js?v=20261112-publish-auth"></script>
-  <script src="panel-resize.js?v=20261112-publish-auth"></script>
-  <script src="submodule-compare-details.js?v=20261112-publish-auth"></script>
-  <script src="branch-reset.js?v=20261112-publish-auth"></script>
-  <script src="merge-preview.js?v=20261112-publish-auth"></script>
-  <script src="navigation-refresh.js?v=20261112-publish-auth"></script>
-  <script src="ipc-diagnostics.js?v=20261112-publish-auth"></script>
-  <script src="app.js?v=20261112-publish-auth"></script>
+  <script src="polarion.js?v=20261112-file-compare"></script>
+  <script src="console-context.js?v=20261112-file-compare"></script>
+  <script src="graph-model.js?v=20261112-file-compare"></script>
+  <script src="submodule-state.js?v=20261112-file-compare"></script>
+  <script src="submodule-versions.js?v=20261112-file-compare"></script>
+  <script src="module-inspect.js?v=20261112-file-compare"></script>
+  <script src="local-diff.js?v=20261112-file-compare"></script>
+  <script src="local-drive.js?v=20261112-file-compare"></script>
+  <script src="pr-status.js?v=20261112-file-compare"></script>
+  <script src="refresh-coordinator.js?v=20261112-file-compare"></script>
+  <script src="comparison-authors.js?v=20261112-file-compare"></script>
+  <script src="git-activity.js?v=20261112-file-compare"></script>
+  <script src="comparison-navigation.js?v=20261112-file-compare"></script>
+  <script src="panel-resize.js?v=20261112-file-compare"></script>
+  <script src="submodule-compare-details.js?v=20261112-file-compare"></script>
+  <script src="branch-reset.js?v=20261112-file-compare"></script>
+  <script src="merge-preview.js?v=20261112-file-compare"></script>
+  <script src="navigation-refresh.js?v=20261112-file-compare"></script>
+  <script src="ipc-diagnostics.js?v=20261112-file-compare"></script>
+  <script src="app.js?v=20261112-file-compare"></script>
 </body>
 </html>

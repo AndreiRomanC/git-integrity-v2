@@ -237,13 +237,23 @@ test('file comparison searches both sides and navigates complete changed blocks'
   dom.listeners.click({ target: { closest: selector => selector === '[data-drive-shortcut]' ? { dataset: { driveShortcut: 'compare' } } : null } });
   await new Promise(resolve => setImmediate(resolve));
 
+  const makeLine = () => {
+    const classes = new Set();
+    return {
+      classes, lastElementChild: { innerHTML: '', childElementCount: 0 },
+      classList: { toggle: (cls, on) => on ? classes.add(cls) : classes.delete(cls), remove: cls => classes.delete(cls), add: cls => classes.add(cls) },
+      querySelector: () => null, scrollIntoView() {},
+    };
+  };
+  const lines = Array.from({ length: 3 }, () => Array.from({ length: 6 }, makeLine));
+  document.nodes.localDriveDiffRows.children = lines.map(children => ({ firstElementChild: { children } }));
   document.nodes.nextLocalDriveDifference.listeners.click();
   assert.equal(document.nodes.localDriveCompareState.textContent, 'Changed block 1 of 2');
-  assert.equal((document.nodes.localDriveDiffRows.innerHTML.match(/active-difference/g) || []).length, 2, 'the complete first block is highlighted');
+  for (const column of lines) assert.deepEqual(column.map(line => line.classes.has('active-difference')), [false, true, true, false, false, false]);
 
   document.nodes.localDriveCompareSearch.value = 'needle';
   document.nodes.localDriveCompareSearch.listeners.input();
-  assert.match(document.nodes.localDriveDiffRows.innerHTML, /<mark>needle<\/mark>/i);
+  for (const pane of [0, 2]) assert.match(lines[pane][1].lastElementChild.innerHTML, /<mark>needle<\/mark>/i);
   assert.equal(document.nodes.localDriveCompareSearchStatus.textContent, '1');
   document.nodes.nextLocalDriveSearch.listeners.click();
   assert.equal(document.nodes.localDriveCompareSearchStatus.textContent, '1/1');

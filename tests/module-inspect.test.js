@@ -101,10 +101,12 @@ test('tag/branch links reveal the exact named ref and keep a comparison pair acr
 });
 
 test('switching history branches discards late display updates, reuses aliases and keeps tags selectable', async () => {
-  const { controller, source, find, calls } = harness();
+  const { controller, source, find, calls, choose } = harness();
   const side = { ...main, name: 'feature/side', revision: 'c'.repeat(40) };
   const alias = { ...side, name: 'side-alias' };
-  controller.open({ ...source, versions: () => [main, side, alias, release], initialRef: release });
+  controller.open({ ...source, versions: () => [main, side, alias, release] });
+  assert.equal(find('#inspectUse').disabled, true);
+  find('tag').click(); choose(release);
   find('commit').click();
   const select = find('select');
   assert.match(select.innerHTML, /Tag · release/);

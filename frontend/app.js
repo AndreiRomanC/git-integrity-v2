@@ -1121,7 +1121,7 @@ function renderSubmoduleRepositoryResults() {
     return `<button type="button" class="submodule-browser-row submodule-repo-row ${selected?.full_name === repo.full_name ? 'selected' : ''}" data-submodule-repo="${esc(repo.full_name)}">
       <span class="submodule-repo-main"><strong>${esc(repo.name)}</strong>${details ? `<small>${esc(details)}</small>` : ''}</span>
       <code>${esc(repo.portable_url)}</code>
-      <span class="submodule-browser-row-action">Open refs</span>
+      <span class="submodule-browser-row-action">${selected?.full_name === repo.full_name ? 'Selected' : 'Select'}</span>
     </button>`;
   }).join('') || '<div class="version-loading">No repositories found.</div>';
   refs.submoduleRepoResults.querySelectorAll('[data-submodule-repo]').forEach(button => button.addEventListener('click', () => {
@@ -1676,16 +1676,19 @@ async function openRepositoryFast(path, options = {}) {
     // open_repository_fast was built to skip — a real perf log caught this
     // directly (2.67-4.58s). The root is now visible with zero Git work at all.
     await openDirectoryFast(normalizeRepositoryRelativePath(options.reopenPath || ''));
+    if (generation !== repoOpenGeneration || state.repository?.path !== data.repository.path) return;
+    jsPerfLog(`repository_open: initial_folder_loaded entries=${state.entries.length} branches=${data.branches.length} submodules=${data.submodule_paths.length}`, performance.now() - openStarted);
     status(`${data.commits.length} commits loaded — checking status…`, 'busy');
     addRecentRepo(path, data.repository.name);
     updatePublishIndicator();
     await checkForMergeConflicts();
-    completeRepositoryOpenStatus(state.repository.path, generation);
+    if (generation !== repoOpenGeneration || state.repository?.path !== data.repository.path) return;
+    completeRepositoryOpenStatus(data.repository.path, generation, openStarted);
     jsPerfLog(`openRepositoryFast END (${(performance.now() - openStarted).toFixed(0)}ms)`, 0);
   } catch (error) { jsPerfLog(`openRepositoryFast ERROR (${(performance.now() - openStarted).toFixed(0)}ms): ${String(error)}`, 0); handleError(error); }
 }
 
-async function completeRepositoryOpenStatus(path, generation) {
+async function completeRepositoryOpenStatus(path, generation, openStarted) {
   try {
     // The one and only full status scan in this whole flow.
     jsPerfLog('statusRefresh requested reason=fast_repository_open', 0);
@@ -1695,6 +1698,7 @@ async function completeRepositoryOpenStatus(path, generation) {
     // screen, not this catching up a moment later and overwriting it.
     if (generation !== repoOpenGeneration || state.repository?.path !== path) return;
     state.changes = changes; state.statusReady = true;
+    jsPerfLog(`repository_open: status_ready changes=${changes.length}`, performance.now() - openStarted);
     updateChangeBadge();
     // Reloads whatever folder is actually on screen with real status —
     // *not* a second full scan: refresh_status just populated the backend's
@@ -3106,7 +3110,6 @@ function resetCompareDiffNavigation(message = 'Loading differences…') {
   refs.previousCompareDifference.disabled = refs.nextCompareDifference.disabled = true;
   if (refs.previousCompareSearch) refs.previousCompareSearch.disabled = true;
   if (refs.nextCompareSearch) refs.nextCompareSearch.disabled = true;
-  refs.compareDialog.querySelectorAll('[data-diff-row]').forEach(node => node.classList.remove('active-compare-difference'));
 }
 function syncCompareVerticalScroll(source, target) {
   if (Math.abs(target.scrollTop - source.scrollTop) > 1) target.scrollTop = source.scrollTop;
@@ -3182,31 +3185,53 @@ function compareHighlightedText(value, query = '') {
 function renderComparisonRows() {
   const diff = state.compareRendered?.diff;
   if (!diff) return;
-  const query = refs.compareSearch?.value.trim() || '';
-  const lowerQuery = query.toLocaleLowerCase();
-  const searchRows = [];
-  const renderSide = side => diff.rows.map((row, index) => {
-    const text = side === 'left' ? row.left : row.right;
-    const lineNumber = side === 'left' ? row.leftNumber : row.rightNumber;
-    const diffAttr = row.same ? '' : ` data-diff-row="${index}"`;
-    const diffClass = row.same ? '' : ' compare-diff-target';
-    const leftMatches = lowerQuery && row.left !== null && String(row.left).toLocaleLowerCase().includes(lowerQuery);
-    const rightMatches = lowerQuery && row.right !== null && String(row.right).toLocaleLowerCase().includes(lowerQuery);
-    const rowMatches = !!(leftMatches || rightMatches);
-    if (side === 'left' && rowMatches) searchRows.push(index);
-    const searchAttr = rowMatches ? ` data-compare-search-row="${index}"` : '';
-    const searchClass = rowMatches ? ' compare-search-target' : '';
-    if (text === null) return `<span class="filler-line${diffClass}${searchClass}"${diffAttr}${searchAttr}><i class="line-number"></i></span>`;
-    const remoteSide = side === 'right';
-    const cls = row.same ? 'same-line' : `diff-line${remoteSide ? ' remote-line' : ''}`;
-    const displayText = String(text).replace(/\r$/, '');
-    return `<span class="${cls}${diffClass}${searchClass}"${diffAttr}${searchAttr}><i class="line-number">${lineNumber ?? ''}</i>${compareHighlightedText(displayText, query)}</span>`;
-  }).join('');
-  refs.localCompare.innerHTML = renderSide('left');
-  refs.remoteCompare.innerHTML = renderSide('right');
-  state.compareSearchRows = searchRows;
-  if (state.compareSearchActive >= searchRows.length) state.compareSearchActive = -1;
+  const renderSide = (pane, side) => {
+    const numberField = side === 'left' ? 'leftNumber' : 'rightNumber';
+    const lines = diff.rows.map(row => {
+      const value = row[side];
+      const kind = value === null ? 'filler-line' : row.same ? 'same-line' : side === 'right' ? 'diff-line remote-line' : 'diff-line';
+      return `<span class="${kind}"><i class="line-number">${row[numberField] ?? ''}</i><span>${value === null ? '' : esc(value.replace(/\r$/, ''))}</span></span>`;
+    }).join('');
+    pane.innerHTML = `<span class="compare-lines">${lines}</span>`;
+  };
+  renderSide(refs.localCompare, 'left');
+  renderSide(refs.remoteCompare, 'right');
   updateCompareDiffNavigation();
+  updateCompareSearchResults();
+}
+
+function comparePaneRow(pane, index) {
+  return pane.firstElementChild?.children[index];
+}
+
+function updateCompareSearchResults() {
+  const diff = state.compareRendered?.diff;
+  if (!diff) return;
+  const query = refs.compareSearch.value.trim();
+  const needle = query.toLocaleLowerCase();
+  if (!needle && !state.compareSearchRows.length) { updateCompareSearchNavigation(); return; }
+  const previous = new Set(state.compareSearchRows);
+  const matches = [];
+  const panes = [['left', refs.localCompare], ['right', refs.remoteCompare]];
+  diff.rows.forEach((row, index) => {
+    let matched = false;
+    for (const [side, pane] of panes) {
+      const value = row[side];
+      const hit = value != null && needle && value.toLocaleLowerCase().includes(needle);
+      if (!hit && !previous.has(index)) continue;
+      const line = comparePaneRow(pane, index);
+      line.classList.remove('active-compare-search');
+      if (value === null) continue;
+      const content = line.lastElementChild;
+      if (hit) {
+        content.innerHTML = compareHighlightedText(value.replace(/\r$/, ''), query);
+        matched = true;
+      } else if (content.childElementCount) content.textContent = value.replace(/\r$/, '');
+    }
+    if (matched) matches.push(index);
+  });
+  state.compareSearchRows = matches;
+  state.compareSearchActive = -1;
   updateCompareSearchNavigation();
 }
 
@@ -3224,6 +3249,17 @@ function showComparisonPreviewUnavailable(note, snapshot) {
 
 function renderComparisonContents(localText, remoteText, snapshot = null) {
   if (snapshot?.preview_note) { showComparisonPreviewUnavailable(snapshot.preview_note, snapshot); return; }
+  if (snapshot && [localText, remoteText].some(text => {
+    let pos = -1;
+    for (let count = 0; count < 12000; count++) {
+      pos = (text ?? '').indexOf('\n', pos + 1);
+      if (pos === -1) return false;
+    }
+    return true;
+  })) {
+    showComparisonPreviewUnavailable('More than 12,000 lines. Download the complete versions to compare externally.', snapshot);
+    return;
+  }
   if (snapshot) captureFileComparisonDownload(snapshot);
   const diffEngine = window.LocalDriveDiff || globalThis.LocalDriveDiff;
   const diff = diffEngine?.buildLineDiff
@@ -3251,23 +3287,22 @@ function updateCompareDiffNavigation() {
       ? `Changed block ${state.compareDiffActive + 1} of ${total}`
       : `${total} changed block${total === 1 ? '' : 's'} · ${state.compareDiffRows.length} aligned line${state.compareDiffRows.length === 1 ? '' : 's'}`
     : 'No differences in this file.';
-  refs.compareDialog.querySelectorAll('[data-diff-row]').forEach(node => {
-    const rowIndex = Number(node.dataset.diffRow);
-    const activeBlock = state.compareDiffBlocks[state.compareDiffActive];
-    node.classList.toggle('active-compare-difference', !!activeBlock && rowIndex >= activeBlock.start && rowIndex <= activeBlock.end);
-  });
 }
 
 function goToCompareDifference(direction = 1) {
   const total = state.compareDiffBlocks.length;
   if (!total) return;
+  const previous = state.compareDiffBlocks[state.compareDiffActive];
   state.compareDiffActive = state.compareDiffActive < 0
     ? (direction < 0 ? total - 1 : 0)
     : (state.compareDiffActive + direction + total) % total;
   updateCompareDiffNavigation();
-  const rowIndex = state.compareDiffBlocks[state.compareDiffActive].start;
-  const target = refs.localCompare.querySelector(`[data-diff-row="${rowIndex}"]`) || refs.remoteCompare.querySelector(`[data-diff-row="${rowIndex}"]`);
-  target?.scrollIntoView({ block: 'center', inline: 'nearest' });
+  const active = state.compareDiffBlocks[state.compareDiffActive];
+  for (const pane of [refs.localCompare, refs.remoteCompare]) {
+    if (previous) for (let i = previous.start; i <= previous.end; i++) comparePaneRow(pane, i).classList.remove('active-compare-difference');
+    for (let i = active.start; i <= active.end; i++) comparePaneRow(pane, i).classList.add('active-compare-difference');
+  }
+  comparePaneRow(refs.localCompare, active.start).scrollIntoView({ block: 'center', inline: 'nearest' });
 }
 
 function updateCompareSearchNavigation() {
@@ -3277,21 +3312,24 @@ function updateCompareSearchNavigation() {
   if (refs.compareSearchStatus) refs.compareSearchStatus.textContent = refs.compareSearch?.value.trim()
     ? total ? state.compareSearchActive >= 0 ? `${state.compareSearchActive + 1}/${total}` : `${total}` : '0'
     : '';
-  refs.compareDialog.querySelectorAll('[data-compare-search-row]').forEach(node => {
-    const rowIndex = Number(node.dataset.compareSearchRow);
-    node.classList.toggle('active-compare-search', rowIndex === state.compareSearchRows[state.compareSearchActive]);
-  });
 }
 
 function goToCompareSearch(direction = 1) {
   const total = state.compareSearchRows.length;
   if (!total) return;
+  const previous = state.compareSearchRows[state.compareSearchActive];
   state.compareSearchActive = state.compareSearchActive < 0
     ? (direction < 0 ? total - 1 : 0)
     : (state.compareSearchActive + direction + total) % total;
   updateCompareSearchNavigation();
   const rowIndex = state.compareSearchRows[state.compareSearchActive];
-  const target = refs.localCompare.querySelector(`[data-compare-search-row="${rowIndex}"]`) || refs.remoteCompare.querySelector(`[data-compare-search-row="${rowIndex}"]`);
+  let target;
+  for (const pane of [refs.localCompare, refs.remoteCompare]) {
+    comparePaneRow(pane, previous)?.classList.remove('active-compare-search');
+    const line = comparePaneRow(pane, rowIndex);
+    line.classList.add('active-compare-search');
+    target ??= line.querySelector('mark');
+  }
   target?.scrollIntoView({ block: 'center', inline: 'nearest' });
 }
 
@@ -3322,8 +3360,9 @@ function formatSize(bytes) {
   if (!bytes) return '—'; if (bytes < 1024) return `${bytes} B`; if (bytes < 1048576) return `${(bytes / 1024).toFixed(1)} KB`; return `${(bytes / 1048576).toFixed(1)} MB`;
 }
 
+const modifiedDateFormat = new Intl.DateTimeFormat(undefined, { month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit' });
 function formatModified(seconds) {
-  if (!seconds) return '—'; return new Intl.DateTimeFormat(undefined, { month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit' }).format(new Date(seconds * 1000));
+  return seconds ? modifiedDateFormat.format(seconds * 1000) : '—';
 }
 
 function iconFor(entry) {
@@ -3925,9 +3964,10 @@ async function paintDirectoryFast(path, requestId) {
   try {
     const entries = await invoke('list_directory_fast', { repositoryPath: state.repository.path, relativePath: path });
     if (requestId !== explorerRequestSeq || state.repository?.path !== repositoryPath || generation !== repoOpenGeneration || state.view !== 'explorer') return;
-    state.entries = entries.map(entry => (state.submodule_paths || []).includes(entry.relative_path)
+    const submodules = new Set(state.submodule_paths);
+    state.entries = entries.map(entry => submodules.has(entry.relative_path)
       ? { ...entry, kind: 'submodule', submodule_checked: false, submodule_initialized: undefined } : entry);
-    if (!state.statusReady) render(); else renderExplorerAfterStatusRefresh();
+    renderExplorerAfterStatusRefresh();
   } catch (error) {
     if (requestId !== explorerRequestSeq || state.repository?.path !== repositoryPath || generation !== repoOpenGeneration || state.view !== 'explorer') return;
     status(String(error), 'error'); refs.fileList.innerHTML = `<div class="empty-change">${esc(String(error))}</div>`;
@@ -5220,13 +5260,20 @@ async function openMergePreviewFile(report, item, pair, isCurrent) {
     const contents=await invoke('merge_preview_contents',{repositoryPath:report.repository_path,versions:[selected.left,selected.right]});
     if(!valid())return;
     jsPerfLog(`merge_preview_diff: pair=${pair} current=${report.current_revision} incoming=${report.incoming_revision} left=${selected.left?.oid || 'absent'} right=${selected.right?.oid || 'absent'} left_mode=${selected.left?.mode || 0} right_mode=${selected.right?.mode || 0} identical=${selected.identical} text_equal=${contents[0].content!==null && contents[0].content===contents[1].content} readable=${contents.map(c=>c.content!==null).join(',')}`,0);
-    if(contents.some(c=>c.content===null)) {
-      resetCompareDiffNavigation('Text comparison unavailable for this item.');
-      refs.localCompare.textContent=contents[0].note || 'Text comparison unavailable because the other side cannot be displayed.';
-      refs.remoteCompare.textContent=contents[1].note || 'Text comparison unavailable because the other side cannot be displayed.';
+    const versions = [selected.left, selected.right];
+    const snapshot = {
+      relative_path: item.path, local_exists: !!selected.left, remote_exists: !!selected.right,
+      download_sources: versions.map(version => version ? {
+        kind: 'blob', repository_path: report.repository_path, oid: version.oid,
+        name: version.path.split('/').pop(),
+      } : { kind: 'missing' }),
+    };
+    if (contents.some(side => side.content === null)) {
+      const notes = contents.flatMap((side, index) => side.content === null ? [`${index ? selected.rightLabel : selected.leftLabel}: ${side.note}`] : []);
+      showComparisonPreviewUnavailable(notes.join('\n'), snapshot);
       return;
     }
-    renderComparisonContents(contents[0].content,contents[1].content);
+    renderComparisonContents(contents[0].content, contents[1].content, snapshot);
     // Text alone cannot express adding/deleting an empty file or a chmod/type
     // change. Keep that distinction visible even when there are zero hunks.
     if(contents[0].content===contents[1].content) {
@@ -9326,7 +9373,7 @@ refs.inspectSubmoduleBrowser.addEventListener('click', () => {
   const model = submoduleBrowserState, repo = model.selectedRepository, repositoryPath = state.repository?.path;
   if (!repo || !repositoryPath) return;
   moduleInspector.open({
-    repo, repositoryPath, initialRef: model.selectedRef,
+    repo, repositoryPath,
     valid: () => refs.submoduleBrowserDialog.open && state.repository?.path === repositoryPath
       && submoduleBrowserState === model && model.selectedRepository === repo,
     versions: () => model.allRefs,
@@ -9947,14 +9994,11 @@ refs.previousCompareDifference?.addEventListener('click', () => goToCompareDiffe
 refs.nextCompareDifference?.addEventListener('click', () => goToCompareDifference(1));
 refs.previousCompareSearch?.addEventListener('click', () => goToCompareSearch(-1));
 refs.nextCompareSearch?.addEventListener('click', () => goToCompareSearch(1));
-refs.compareSearch?.addEventListener('input', () => {
-  state.compareSearchActive = -1;
-  renderComparisonRows();
-});
+refs.compareSearch?.addEventListener('input', updateCompareSearchResults);
 refs.compareSearch?.addEventListener('keydown', event => {
   if (event.key === 'Enter') { event.preventDefault(); goToCompareSearch(event.shiftKey ? -1 : 1); }
   else if (event.key === 'Escape' && refs.compareSearch.value) {
-    event.preventDefault(); refs.compareSearch.value = ''; state.compareSearchActive = -1; renderComparisonRows();
+    event.preventDefault(); refs.compareSearch.value = ''; updateCompareSearchResults();
   }
 });
 document.addEventListener('click', event => { const link = event.target.closest('.polarion-link'); if (!link) return; event.preventDefault(); if (invoke) invoke('open_external_url', { url: link.href }).catch(error => status(String(error), 'error')); else window.open(link.href, '_blank', 'noopener'); });
@@ -10198,6 +10242,7 @@ refs.subCompareSwap.addEventListener('click', () => {
 });
 $('#closeSubmoduleMenu').addEventListener('click', closeSubmoduleMenu);
 $('#compareSelectedVersions').addEventListener('click', compareSelectedSubmoduleVersions);
+for (const dialog of [refs.compareDialog, $('#localDriveCompareDialog')]) bindComparisonWindow(dialog);
 for (const panel of [refs.submoduleMenu, $('#moduleInspect')]) {
   const read = () => panel.getBoundingClientRect();
   const place = rect => {

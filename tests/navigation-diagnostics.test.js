@@ -62,17 +62,17 @@ test('instrumented directory loading still rejects late responses', async () => 
 test('fast-open status diagnostics still perform exactly one request and do not log repository paths', async () => {
   const calls = [], logs = [], changes = [{ path: 'private-file', status: 'M' }];
   const c = { state: { repository: { path: '/private/repo' }, view: 'history', commits: [] }, repoOpenGeneration: 4,
-    ipcDiagnostics: { applied: result => assert.equal(result, changes) },
+    ipcDiagnostics: { applied: result => assert.equal(result, changes) }, performance,
     jsPerfLog: line => logs.push(line), invoke: async (command, args) => { calls.push({ command, args }); return changes; },
     updateChangeBadge() {}, render() {}, status() {}, handleError: error => { throw error; } };
   vm.createContext(c); vm.runInContext(source('completeRepositoryOpenStatus'), c);
-  await c.completeRepositoryOpenStatus('/private/repo', 4);
+  await c.completeRepositoryOpenStatus('/private/repo', 4, performance.now());
   assert.equal(calls.length, 1);
   assert.equal(calls[0].command, 'refresh_status');
   assert.equal(calls[0].args.repositoryPath, '/private/repo');
   assert.equal(c.state.changes, changes);
   assert.equal(c.state.statusReady, true);
-  assert.deepEqual(logs, ['statusRefresh requested reason=fast_repository_open']);
+  assert.deepEqual(logs, ['statusRefresh requested reason=fast_repository_open', 'repository_open: status_ready changes=1']);
 });
 
 test('elapsed feedback changes only text and stops its one timer after verification or failure', () => {

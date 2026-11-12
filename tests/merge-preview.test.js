@@ -121,15 +121,18 @@ test('preview file comparison has no write actions, reads immutable objects and 
   let resolve;const c={MergePreview:api,jsPerfLog(){},state:{},refs:{compareDialog:node(),compareTitle:node(),compareSubtitle:node(),localCompare:node(),remoteCompare:node()},
     openFileCompareGuard:()=>()=>true,resetCompareDiffNavigation:message=>{c.diffStatus=message;},setCompareHeadLabels(){},
     setCompareReadOnly:value=>{c.readOnly=value;},invoke:(command,args)=>{c.command=command;c.args=args;return new Promise(r=>{resolve=r;});},
+    showComparisonPreviewUnavailable:(note,snapshot)=>{c.unavailable={note,snapshot};},
     renderComparisonContents:(...contents)=>{c.rendered=contents;}};
   vm.createContext(c);vm.runInContext(source('openMergePreviewFile'),c);let active=true;
   const first=c.openMergePreviewFile(report(),item('f'),'result',()=>active);
   assert.equal(c.readOnly,true);assert.equal(c.command,'merge_preview_contents');assert.equal(c.args.versions[1].oid,'b'.repeat(40));
   active=false;resolve([{content:'old'},{content:'new'}]);await first;assert.equal(c.rendered,undefined);
   active=true;const second=c.openMergePreviewFile(report(),item('f'),'result',()=>active);resolve([{content:'old'},{content:'new'}]);await second;
-  assert.deepEqual(Array.from(c.rendered),['old','new']);
+  assert.deepEqual(Array.from(c.rendered).slice(0,2),['old','new']);
+  const pair=JSON.parse(JSON.stringify(c.rendered[2].download_sources));
+  assert.deepEqual(pair,['a','b'].map(id=>({kind:'blob',oid:id.repeat(40),repository_path:'/repo',name:'f'})));
   c.rendered=null;const binary=c.openMergePreviewFile(report(),item('f'),'result',()=>active);resolve([{content:null,note:'Binary file'},{content:'text',note:''}]);await binary;
-  assert.match(c.diffStatus,/unavailable/);assert.equal(c.rendered,null);assert.equal(c.refs.localCompare.textContent,'Binary file');
+  assert.match(c.unavailable.note,/Binary file/);assert.equal(c.rendered,null);assert.deepEqual(JSON.parse(JSON.stringify(c.unavailable.snapshot.download_sources)),pair);
 });
 
 test('current-only additions are kept, not mislabelled as unchanged since the base',()=>{
@@ -192,7 +195,7 @@ test('preview viewer uses the real line-diff renderer for all four pairs, not ju
     refs:{compareDialog:node(),compareTitle:node(),compareSubtitle:node(),localCompare:node(),remoteCompare:node(),compareDiffStatus:node()},
     openFileCompareGuard:()=>()=>true,resetCompareDiffNavigation(){},setCompareHeadLabels:(...v)=>{c.labels=v;},
     setCompareReadOnly(){},setCompareActionStatus:text=>{c.note=text;},jsPerfLog:label=>{c.log=label;},
-    renderComparisonRows(){},invoke:async(command,args)=>{
+    captureFileComparisonDownload:snapshot=>{c.download=snapshot.download_sources;},renderComparisonRows(){},invoke:async(command,args)=>{
       assert.equal(command,'merge_preview_contents');c.args=args;
       return args.versions.map(v=>({content:v?blobs[v.oid[0]]:'',note:''}));
     }};
@@ -203,6 +206,7 @@ test('preview viewer uses the real line-diff renderer for all four pairs, not ju
     assert.equal(c.state.compareRendered.localText,blobs[left]);assert.equal(c.state.compareRendered.remoteText,blobs[right]);
     assert.ok(c.state.compareDiffBlocks.length>0,`${pair} must highlight actual differences`);
     assert.match(c.log,new RegExp(`pair=${pair}.*text_equal=false`));
+    assert.deepEqual(Array.from(c.download,v=>v.oid),[left.repeat(40),right.repeat(40)]);
   }
   row.result={...row.current,mode:0o100755};
   await c.openMergePreviewFile(report(),row,'result',()=>true);
@@ -210,7 +214,7 @@ test('preview viewer uses the real line-diff renderer for all four pairs, not ju
   assert.match(c.labels[1],/Executable/);
   row.current=null;row.result=version('e');blobs.e='';
   await c.openMergePreviewFile(report(),row,'result',()=>true);
-  assert.match(c.note,/empty file is added/);assert.match(c.labels[0],/Absent/);
+  assert.equal(c.download[0].kind,'missing');assert.equal(c.download[1].kind,'blob');assert.match(c.note,/empty file is added/);assert.match(c.labels[0],/Absent/);
   row.current=row.result;row.result=null;
   await c.openMergePreviewFile(report(),row,'result',()=>true);
   assert.match(c.note,/empty file is removed/);

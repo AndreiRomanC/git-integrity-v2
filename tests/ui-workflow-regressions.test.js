@@ -159,7 +159,7 @@ test('fast repository open keeps folder navigation filesystem-only until the fir
   assert.match(app, /async function openDirectory\(path, options = \{\}\)/);
   assert.match(app, /if \(!state\.statusReady && !options\.force && !options\.invalidateGit\) \{/);
   assert.match(app, /return paintDirectoryFast\(path, requestId\)/);
-  assert.match(app, /completeRepositoryOpenStatus\(state\.repository\.path, generation\)/);
+  assert.match(app, /completeRepositoryOpenStatus\(data\.repository\.path, generation, openStarted\)/);
   assert.match(app, /await openDirectory\(state\.currentPath, \{ force: true \}\)/);
   assert.match(app, /completeRepositoryOpenStatus finishes, it reloads the \*current\* folder/);
 });

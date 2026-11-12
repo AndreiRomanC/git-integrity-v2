@@ -204,9 +204,8 @@ function createModuleInspector(dialog, { readHistory, readDetails, download, use
     const pair = session.selected; close(); compare(pair);
   });
   return { close, refreshRefs, open(source) {
-    const initial = /^[0-9a-f]{40}$/i.test(source.initialRef?.revision || '') ? source.initialRef : null;
-    session = { source, anchor: initial, tab: initial?.kind === 'tag' ? 'tag' : 'branch',
-      pages: new Map(), metadata: new Map(), selected: initial ? [initial] : [], visible: [] };
+    session = { source, anchor: null, tab: 'branch',
+      pages: new Map(), metadata: new Map(), selected: [], visible: [] };
     find('#inspectTitle').textContent = source.repo.full_name;
     search.value = ''; dialog.showModal(); rows.parentElement.scrollTop = 0; refreshRefs(); search.focus();
   } };

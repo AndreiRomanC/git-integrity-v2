@@ -56,6 +56,51 @@ function bindPanelResize(handle, { read, resize, reset, canStart = () => true },
   });
 }
 
+function bindComparisonWindow(dialog) {
+  const header = dialog.querySelector('.compare-window-handle');
+  const expand = header.querySelector('.compare-window-expand');
+  const read = () => dialog.getBoundingClientRect();
+  let restoreRect = null;
+  function place(rect) {
+    const fitted = fitFloatingPanel(rect, { width: innerWidth, height: innerHeight });
+    for (const key of ['left', 'top', 'width', 'height']) dialog.style[key] = `${fitted[key]}px`;
+    dialog.classList.add('positioned-compare');
+  }
+  function toggle() {
+    const previous = restoreRect;
+    restoreRect = previous ? null : read();
+    place(previous || { left: 16, top: 16, width: innerWidth, height: innerHeight });
+    expand.setAttribute('aria-pressed', String(!!restoreRect));
+    expand.title = restoreRect ? 'Restore window size' : 'Expand comparison';
+    expand.setAttribute('aria-label', expand.title);
+  }
+  expand.addEventListener('click', toggle);
+  bindPanelResize(header, {
+    read, canStart: event => !event.target.closest('button'),
+    resize: (rect, dx, dy) => { if (!restoreRect) place({ left: rect.left + dx, top: rect.top + dy, width: rect.width, height: rect.height }); },
+    reset: toggle,
+  });
+  bindPanelResize(dialog.querySelector('.panel-resize-corner'), {
+    read, canStart: () => !restoreRect,
+    resize: (rect, dx, dy) => place({ left: rect.left, top: rect.top, width: rect.width + dx, height: rect.height + dy }),
+  });
+  function fit() {
+    if (dialog.open && dialog.classList.contains('positioned-compare')) {
+      place(restoreRect ? { left: 16, top: 16, width: innerWidth, height: innerHeight } : read());
+    }
+  }
+  window.addEventListener('resize', fit);
+  dialog.addEventListener('toggle', fit);
+  dialog.addEventListener('keydown', event => {
+    if ((event.ctrlKey || event.metaKey) && !event.shiftKey && event.key.toLowerCase() === 'f') {
+      const input = dialog.querySelector('input[type="search"]');
+      if (input && !input.disabled && input.getClientRects().length) {
+        event.preventDefault(); event.stopPropagation(); input.focus(); input.select();
+      }
+    }
+  });
+}
+
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = { fitFloatingPanel, fitWorkingTreeHeight, bindPanelResize };
 }
