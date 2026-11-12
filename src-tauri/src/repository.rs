@@ -5959,8 +5959,18 @@ fn publish_branch_inner_with_options(repository_path: String, branch: String, re
         // helper, or OS keychain. libgit2's own credential search is much narrower
         // and can fail here ("failed to acquire username/password") even when a
         // plain `git push` in a terminal works fine for the same repository.
-        git_with_timeout_control_traced(&repository_path, &["push", remote_name, &format!("{push_oid}:refs/heads/{branch}")], GIT_COMMAND_TIMEOUT, "10 minutes", false, Some(push_trace))
-            .map_err(|detail| if detail.starts_with("Git push timed out") || detail.starts_with("Git push stopped") { detail } else if detail.to_lowercase().contains("authentication") || detail.contains("403") || detail.contains("could not read") { "Push authentication failed. Either make sure `git push` works for this repository from a terminal, or enter a Git username and Personal Access Token in Publish credentials.".to_string() } else if detail.to_lowercase().contains("non-fast-forward") || detail.to_lowercase().contains("fetch first") { "Push rejected because the server branch has newer commits. Pull/fetch those commits first, then publish again.".to_string() } else { format!("Push failed: {detail}") })?;
+        let refspec = format!("{push_oid}:refs/heads/{branch}");
+        let args = ["push", remote_name, refspec.as_str()];
+        let result = if skip_submodule_safety {
+            perf_log("publish_branch: native Fast Publish uses standard Git runner", push_started.elapsed());
+            git(&repository_path, &args)
+        } else {
+            git_with_timeout_control_traced(&repository_path, &args, GIT_COMMAND_TIMEOUT, "10 minutes", false, Some(push_trace))
+        };
+        if result.as_ref().is_err_and(|detail| detail.starts_with("Git command timed out after ")) {
+            return Err("Git push timed out. Check the destination branch before retrying. The remote result is unknown.".into());
+        }
+        result.map_err(|detail| if detail.starts_with("Git push timed out") || detail.starts_with("Git push stopped") { detail } else if detail.to_lowercase().contains("authentication") || detail.contains("403") || detail.contains("could not read") { "Push authentication failed. Either make sure `git push` works for this repository from a terminal, or enter a Git username and Personal Access Token in Publish credentials.".to_string() } else if detail.to_lowercase().contains("non-fast-forward") || detail.to_lowercase().contains("fetch first") { "Push rejected because the server branch has newer commits. Pull/fetch those commits first, then publish again.".to_string() } else { format!("Push failed: {detail}") })?;
     } else {
         // libgit2 needs a source ref for this commit. A fixed refs/heads name
         // with force=true could overwrite and then DELETE a real user branch.

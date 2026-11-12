@@ -8,7 +8,8 @@ const html = fs.readFileSync(path.join(__dirname,'../frontend/index.html'),'utf8
 
 test('publish diagnostics keep the same Git refspec, authentication and safety decisions', () => {
   const publish = rust.slice(rust.indexOf('fn publish_branch_inner_with_options'), rust.indexOf('pub async fn submodule_repository'));
-  assert.match(publish, /\["push", remote_name, &format!\("\{push_oid\}:refs\/heads\/\{branch\}"\)\]/);
+  assert.match(publish, /format!\("\{push_oid\}:refs\/heads\/\{branch\}"\)/);
+  assert.match(publish, /\["push", remote_name, refspec.as_str\(\)\]/);
   assert.match(publish, /submodule_publish_safety_check/);
   assert.doesNotMatch(publish, /--no-verify|--force|--no-recurse-submodules/);
   assert.match(publish, /authenticated_push_options_traced/);

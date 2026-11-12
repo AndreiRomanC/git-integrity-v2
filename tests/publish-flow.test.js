@@ -197,6 +197,8 @@ test('publish offers Stop for the reported credential wait and ignores a confirm
   const h = harness(), op = h.node('#publishOperationStatus'), button = h.node('#stopPublishCredentialWait');
   h.context.window.__TAURI__ = { core: { Channel: class {} } };
   op.textContent = 'Publishing feature…';
+  const fast = h.context.watchPublishCredentials({ ...h.request(), skipSubmoduleSafety: true }, op);
+  assert.equal(fast.channel, null);
   const watch = h.context.watchPublishCredentials(h.request(), op);
   watch.channel.onmessage(42);
   assert.equal(button.hidden, false);

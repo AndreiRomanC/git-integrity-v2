@@ -8885,7 +8885,7 @@ async function confirmPublish(event) {
 
 function watchPublishCredentials(request, operation) {
   const Channel = window.__TAURI__?.core?.Channel;
-  if (!Channel) return { channel: null, close() {} };
+  if (request.skipSubmoduleSafety || !Channel) return { channel: null, close() {} };
   const channel = new Channel();
   const button = $('#stopPublishCredentialWait');
   const normalStatus = operation.textContent;

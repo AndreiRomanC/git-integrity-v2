@@ -300,3 +300,44 @@ fn real_local_git_push_keeps_hooks_refspec_index_and_rejection_behaviour() {
     drop(tree); drop(index); drop(repo); drop(remote);
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn fast_publish_runs_once_with_the_standard_git_environment() {
+    let stamp = std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let root = std::env::temp_dir().join(format!("gdd-fast-publish-{}-{stamp}", std::process::id()));
+    let source = root.join("source");
+    let server = root.join("server.git");
+    let repo = Repository::init(&source).unwrap();
+    let remote = Repository::init_bare(&server).unwrap();
+    repo.remote("origin", server.to_str().unwrap()).unwrap();
+    let tree = repo.find_tree(repo.treebuilder(None).unwrap().write().unwrap()).unwrap();
+    let sig = git2::Signature::now("Fixture", "fixture@example.test").unwrap();
+    let oid = repo.commit(Some("refs/heads/feature"), &sig, &sig, "fixture", &tree, &[]).unwrap();
+    repo.set_head("refs/heads/feature").unwrap();
+
+    // The same hook observes the child environment of an ordinary push and Fast Publish.
+    // Record only its digest, including whether each variable was set.
+    let hooks = repo.path().join("hooks");
+    fs::create_dir_all(&hooks).unwrap();
+    repo.config().unwrap().set_str("core.hooksPath", hooks.to_str().unwrap()).unwrap();
+    let hook = hooks.join("pre-push");
+    fs::write(&hook, r#"#!/bin/sh
+printf '%s\n' "${GIT_TRACE2_EVENT-unset}" "${GIT_TRACE2_CONFIG_PARAMS-unset}" "${GIT_TRACE2_EVENT_NESTING-unset}" "${GCM_MODAL_PARENTHWND-unset}" | git hash-object --stdin >> .git/push-observations
+"#).unwrap();
+    #[cfg(unix)] {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let path = source.to_str().unwrap();
+    git(path, &["push", "origin", &format!("{oid}:refs/heads/control")]).unwrap();
+    let ui = PublishUi { parent_hwnd: Some(9182), ..Default::default() };
+    publish_branch_inner_with_options(path.into(), "feature".into(), "origin".into(),
+        String::new(), String::new(), String::new(), false, true, ui).unwrap();
+    assert_eq!(remote.refname_to_id("refs/heads/feature").unwrap(), oid);
+    let observations = fs::read_to_string(repo.path().join("push-observations")).unwrap();
+    let calls: Vec<_> = observations.lines().collect();
+    assert_eq!(calls.len(), 2, "exactly one push per operation");
+    assert_eq!(calls[0], calls[1], "Fast Publish changed the Git diagnostic or credential environment");
+    drop(tree); drop(repo); drop(remote);
+    fs::remove_dir_all(root).unwrap();
+}
