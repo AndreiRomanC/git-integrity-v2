@@ -445,3 +445,40 @@ test('closing a folder scan never leaves the dialog stuck in loading state', asy
   pendingScans.shift()(scanResult);
   await new Promise(resolve => setImmediate(resolve));
 });
+
+test('immediate save includes the last edit, and typing during the write stays unsaved', async () => {
+  const dom = fakeLocalDriveDom(), document = fakeComparisonDocument(), nodes = document.nodes;
+  let finishWrite;
+  const writes = [];
+  const invoke = async (command, args) => {
+    if (command === 'list_local_directory') return { path: args.path, parent: '/', entries: [{ name: 'f', path: args.path + '/f', kind: 'file' }] };
+    if (command === 'read_local_text_file') return { content: args.path, fingerprint: 'loaded', encoding: 'utf-8' };
+    if (command === 'write_local_text_file') {
+      writes.push(args);
+      return new Promise(resolve => { finishWrite = () => resolve({ fingerprint: 'saved' }); });
+    }
+    throw Error(command);
+  };
+  const workspace = create({ root: dom.root, document, invoke, diff: require('../frontend/local-diff.js') });
+  await workspace.activate('/repo');
+  for (const side of ['left', 'right']) {
+    const entry = { dataset: { driveEntry: '0' }, classList: classList() };
+    dom.panes[side].entryButtons = [entry];
+    dom.listeners.click({ target: { closest: key => key === '[data-drive-side]' ? dom.panes[side] : key === '[data-drive-entry]' ? entry : null } });
+  }
+  dom.listeners.click({ target: { closest: key => key === '[data-drive-shortcut]' ? { dataset: { driveShortcut: 'compare' } } : null } });
+  await new Promise(resolve => setImmediate(resolve));
+  nodes.editLocalDriveDiff.listeners.click();
+  const field = { dataset: { localLineSide: 'right', row: '0' }, value: 'first edit' };
+  const type = () => nodes.localDriveAlignedEditors.listeners.input({ target: { closest: () => field } });
+  type();
+  const saving = nodes.saveLocalDriveCompareRight.listeners.click();
+  assert.equal(writes[0].content, 'first edit');
+  field.value = 'second edit'; type(); finishWrite(); await saving;
+  assert.equal(nodes.saveLocalDriveCompareRight.disabled, false);
+  const again = nodes.saveLocalDriveCompareRight.listeners.click();
+  assert.equal(writes[1].content, 'second edit');
+  assert.equal(writes[1].expectedFingerprint, 'saved');
+  finishWrite(); await again;
+  assert.equal(nodes.saveLocalDriveCompareRight.disabled, true);
+});

@@ -211,7 +211,7 @@ test('real renderers use projected rows, keep parent navigation on empty results
       renderComparisonScopedFilter:()=>({model,scopeRows:leaves}),commanderSide:e=>e?.relative_path||'',compareStatusText:String,
       flatCompareRowHtml:(r,d)=>`<button ${d}="${r.relative_path}">${r.relative_path}</button>`,comparisonEvidenceRowHtml:()=>'',
       bindComparisonConversion:()=>false,SubmoduleCompareDetails:{bindRow(){}},openGitRevisionFileCompare:r=>opened.push(r.relative_path),openSubmoduleRevisionFileCompare:r=>opened.push(r.relative_path)};
-    vm.createContext(h);vm.runInContext(source('comparisonExcludedRowsHtml')+'\n'+source(submodule?'renderSubmoduleCompare':'renderCommander'),h);
+    vm.createContext(h);vm.runInContext(source('indexComparisonRows')+'\n'+source('comparisonExcludedRowsHtml')+'\n'+source(submodule?'renderSubmoduleCompare':'renderCommander'),h);
     h[submodule?'renderSubmoduleCompare':'renderCommander']();
     const rendered=submodule?refs.subCompareRows:refs.commanderRows;
     assert.match(rendered.innerHTML,/Parent folder/);
@@ -298,4 +298,17 @@ test('failed submodule comparison cannot retain old snapshots for export or beco
   fail=false;await h.openSubmoduleCompareDirectory('src');
   assert.equal(compare.error,'');assert.equal(compare.scopeNote,'folder to submodule');
   assert.equal(compare.leftRevision,'a');assert.equal(compare.rightRevision,'b');assert.equal(calls,2);
+});
+
+test('comparison row index preserves exact paths, first source match and scope fallback', () => {
+  const index = vm.runInNewContext('(' + source('indexComparisonRows') + ')');
+  const folder = row('src/deep', 'folder'), duplicate = row('src/deep', 'submodule');
+  const other = row('lib/deep'), scoped = row('src/deep/file & 1');
+  const primary = [folder, duplicate, other], scope = [duplicate, scoped, row(scoped.relative_path)];
+  for (const extra of [null, primary, scope]) {
+    const indexed = index(primary, extra);
+    for (const path of ['src/deep', 'lib/deep', scoped.relative_path, 'missing']) {
+      assert.equal(indexed.get(path), primary.find(r => r.relative_path === path) || extra?.find(r => r.relative_path === path));
+    }
+  }
 });

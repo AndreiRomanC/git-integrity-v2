@@ -110,3 +110,60 @@ test('recent repositories disambiguate duplicate names with their parent folder'
   assert.match(app, /\$\{parentName\} \/ \$\{repo\.name\}/);
   assert.match(css, /\.recent-repo-btn \{[^}]*max-width: 156px/);
 });
+
+test('Explorer initial cycles filtered entries and crosses the display cap without expanding it', () => {
+  const names = ['ape', 'beta', 'apple', 'apricot'];
+  const entries = names.map(name => ({ name, relative_path: name }));
+  const state = { view: 'explorer', repository: {}, entries, selectedEntry: null };
+  const row = { focus() {}, scrollIntoView() {} };
+  const inside = area => ({ closest: selector => selector.includes(area) ? {} : null });
+  const target = inside('#explorerView'), pages = [], renderState = { offset: 0, showAll: false };
+  const refs = { search: { value: 'ap' }, fileList: { querySelector: () => row } };
+  let overlay = null;
+  const ctx = vm.createContext({ state, refs, document: { body: {}, documentElement: {}, querySelector: () => overlay },
+    CSS: { escape: s => s }, EXPLORER_DOM_ROW_CAP: 2, explorerRenderState: renderState,
+    renderExplorer(offset) { pages.push(offset); renderState.offset = offset; },
+    selectEntry(path) { state.selectedEntry = entries.find(e => e.relative_path === path); }, lastExplorerClick: {} });
+  vm.runInContext(extractFunction('jumpToExplorerInitial'), ctx);
+  const press = (options = {}) => ctx.jumpToExplorerInitial({ key: 'A', target, preventDefault() {}, ...options });
+  press({ target: inside('#contentHead') }); assert.equal(state.selectedEntry.name, 'ape');
+  press({ ctrlKey: true }); press({ metaKey: true }); press({ target: inside('.sidebar') }); press({ isComposing: true });
+  press({ target: inside('input') }); press({ target: { isContentEditable: true } });
+  overlay = {}; press(); overlay = null;
+  assert.equal(state.selectedEntry.name, 'ape');
+  press({ target: inside('#recentReposBar') }); assert.equal(state.selectedEntry.name, 'apple');
+  press(); assert.equal(state.selectedEntry.name, 'apricot');
+  press({ target: ctx.document.body }); assert.equal(state.selectedEntry.name, 'ape');
+  assert.deepEqual(pages, [2, 0]);
+});
+
+test('History Enter reuses painted matches and refreshes pending searches or replaced history', () => {
+  const graph = {path:'/parent', commits:['a','b','c']};
+  let rows = [], paints = 0, selected, marked;
+  const state = {view:'graph', graphSearchCurrentId:null};
+  const refs = {search:{value:'a'}, graph:{
+    querySelectorAll: () => rows,
+    querySelector: () => rows.find(row => row.dataset.id === marked),
+  }};
+  const ctx = vm.createContext({state, refs, lastGraphRenderContext:null, searchTimeout:null,
+    activeGraphData: () => graph, clearTimeout(){}, status(){}, selectCommit: id => { selected = id; },
+    renderGraph(){
+      paints++;
+      const query = refs.search.value.toLowerCase();
+      ctx.lastGraphRenderContext = {query, sourceCommits:graph.commits, repositoryPath:graph.path};
+      rows = graph.commits.filter(id => id.includes(query)).map(id => ({
+        dataset:{id}, classList:{add(){marked=id;},remove(){marked=null;}},scrollIntoView(){},
+      }));
+    },
+  });
+  vm.runInContext(extractFunction('cyclicSearchMatchId') + '\n' + extractFunction('goToGraphSearchMatch'), ctx);
+  graph.commits = ['abc', 'abd', 'cd'];
+  ctx.goToGraphSearchMatch(1); assert.equal(selected,'abc');
+  ctx.goToGraphSearchMatch(1); assert.equal(selected,'abd');
+  ctx.goToGraphSearchMatch(1); assert.equal(selected,'abc');
+  ctx.goToGraphSearchMatch(-1); assert.equal(selected,'abd'); assert.equal(paints,1);
+  refs.search.value='C'; ctx.goToGraphSearchMatch(-1); assert.equal(selected,'cd'); assert.equal(paints,2);
+  graph.commits=['cc']; ctx.goToGraphSearchMatch(1); assert.equal(selected,'cc'); assert.equal(paints,3);
+  graph.path='/child'; ctx.goToGraphSearchMatch(1); assert.equal(paints,4);
+  refs.search.value='absent'; selected=null; ctx.goToGraphSearchMatch(1); assert.equal(selected,null);
+});

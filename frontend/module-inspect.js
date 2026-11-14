@@ -6,6 +6,9 @@ function createModuleInspector(dialog, { readHistory, readDetails, download, use
   const use = find('#inspectUse'), compareButton = find('#inspectCompare');
   const picker = find('.version-history-picker'), branchSelect = picker.querySelector('select');
   const details = find('#inspectDetails');
+  const layout = find('#inspectLayout'), listButton = find('#inspectList'), networkButton = find('#inspectNetwork');
+  const scroller = find('.version-scroll');
+  find('.version-filters').append(layout);
   const tabs = Array.from(dialog.querySelectorAll('[data-version-filter]'));
   const view = { branch: 'branch', tag: 'tag', commit: 'history', complete: 'graph' };
   let session = null;
@@ -36,6 +39,7 @@ function createModuleInspector(dialog, { readHistory, readDetails, download, use
       const selected = s.selected.some(item => item.revision === row.dataset.revision
         && (isHistory(s) || (item.kind === row.dataset.versionKind && item.name === row.dataset.name)));
       row.classList.toggle('version-compare-selected', selected);
+      if (row.ownerSVGElement) { row.setAttribute('aria-pressed', String(selected)); continue; }
       row.setAttribute('aria-label', `${row.dataset.name} · ${row.dataset.revision}${selected ? ' · selected' : ''}`);
     }
     use.disabled = s.selected.length !== 1;
@@ -66,23 +70,52 @@ function createModuleInspector(dialog, { readHistory, readDetails, download, use
     details.disabled = !ready || !s.tips.size || s.loadingDetails || s.detailsLoaded;
     details.textContent = s.loadingDetails ? 'Loading details…' : s.detailsLoaded ? 'Commit details loaded' : 'Load commit details';
     search.placeholder = history ? 'Filter loaded commits by message, author or SHA…' : `Filter ${s.tab === 'branch' ? 'branches' : 'tags'} by name or SHA…`;
+    const network = s.tab === 'graph' && s.layout === 'network';
+    layout.hidden = s.tab !== 'graph';
+    listButton.setAttribute('aria-pressed', String(!network));
+    networkButton.setAttribute('aria-pressed', String(network));
+    if (network) search.placeholder = 'Find a commit or branch in the network…';
     const all = history ? page?.commits || [] : s.source.versions().filter(ref => ref.kind === s.tab);
-    s.visible = all.filter(ref => matchesSubmoduleVersion({ ...ref, ...s.metadata.get(ref.revision) }, query));
+    s.visible = query ? all.filter(ref => matchesSubmoduleVersion({ ...ref, ...s.metadata.get(ref.revision) }, query)
+      || (network && s.tips.get(ref.revision)?.some(tip => tip.name.toLowerCase().includes(query.toLowerCase())))) : all;
     scope.textContent = history
       ? `${s.tab === 'graph' ? 'All branches and tags' : 'From ' + (s.anchor ? label(s.anchor) : 'default branch')} · ${all.length} commits loaded`
       : `${s.visible.length} ${s.tab === 'tag' ? 'tags' : 'branches'}`;
-    const graphVisible = s.tab === 'graph' && !query && s.visible.length > 0;
+    const graphVisible = s.tab === 'graph' && !network && !query && s.visible.length > 0;
     rows.classList.toggle('inspect-graph', graphVisible);
     const model = graphVisible ? buildGraphModel(s.visible, s.defaultRef?.revision) : null;
     const width = model ? model.reduce((n, row) => Math.max(n, row.before.length, row.after.length, row.lane + 1), 1) * LANE_WIDTH : 0;
     rows.style.setProperty('--inspect-lanes', width + 'px');
-    rows.innerHTML = (model ? '<svg class="graph-overlay" aria-hidden="true"></svg>' : '') + s.visible.map(item => {
-      const tips = s.tips.get(item.revision) || [];
-      const related = item.kind === 'commit' ? tips : relatedSubmoduleVersionRefs(item, tips);
-      return submoduleVersionRowHtml({ ...item, ...s.metadata.get(item.revision),
-        cross_selected: s.cross?.kind === item.kind && s.cross.name === item.name,
-        default_branch: item === s.defaultRef, related_refs: related }, true);
-    }).join('');
+    scroller.classList.toggle('network-scroll', network);
+    if (network && all.length) {
+      if (s.networkCount !== all.length || s.networkTips !== s.tips) {
+        const distanceFromNewest = s.networkCount ? scroller.scrollWidth - scroller.clientWidth - scroller.scrollLeft : 0;
+        const networkModel = buildGraphModel(all, s.defaultRef?.revision);
+        rows.innerHTML = inspectNetworkHtml(networkModel, all, s.tips, s.defaultRef);
+        scroller.scrollLeft = scroller.scrollWidth - scroller.clientWidth - distanceFromNewest;
+        s.networkCount = all.length; s.networkTips = s.tips;
+      }
+      const matches = new Set(s.visible.map(item => item.revision));
+      let first;
+      for (const node of rows.querySelectorAll('[data-revision]')) {
+        const match = matches.has(node.dataset.revision);
+        node.classList.toggle('network-muted', !match);
+        node.setAttribute('tabindex', match ? '0' : '-1');
+        if (match && !first) first = node;
+      }
+      if (query && first && s.networkQuery !== query) first.scrollIntoView({ block: 'nearest', inline: 'center' });
+      s.networkQuery = query;
+      if (query) scope.textContent = `${matches.size} of ${all.length} loaded commits match`;
+    } else {
+      s.networkCount = 0; s.networkQuery = '';
+      rows.innerHTML = (model ? '<svg class="graph-overlay" aria-hidden="true"></svg>' : '') + s.visible.map(item => {
+        const tips = s.tips.get(item.revision) || [];
+        const related = item.kind === 'commit' ? tips : relatedSubmoduleVersionRefs(item, tips);
+        return submoduleVersionRowHtml({ ...item, ...s.metadata.get(item.revision),
+          cross_selected: s.cross?.kind === item.kind && s.cross.name === item.name,
+          default_branch: item === s.defaultRef, related_refs: related }, true);
+      }).join('');
+    }
     s.drawGraph = model && (() => drawGraphOverlay(model, width, { container: rows, rowSelector: '[data-revision]', truncated: page.more }));
     s.drawGraph?.();
     let message = '';
@@ -90,7 +123,8 @@ function createModuleInspector(dialog, { readHistory, readDetails, download, use
     else if (s.detailsError) message = s.detailsError;
     else if (page?.error) message = page.error;
     else if (page?.loading) message = 'Loading repository history…';
-    else if (!s.visible.length) message = query ? 'No matches in the loaded results.' : 'No versions found.';
+    else if (!s.visible.length && !(network && all.length)) message = query ? 'No matches in the loaded results.' : 'No versions found.';
+    if (network) rows.querySelector('.version-loading')?.remove();
     if (message) {
       const note = document.createElement('div');
       note.className = 'version-loading'; note.setAttribute('role', 'status'); note.textContent = message;
@@ -170,6 +204,15 @@ function createModuleInspector(dialog, { readHistory, readDetails, download, use
     if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); select(event); }
   });
   tabs.forEach(button => button.addEventListener('click', () => setTab(view[button.dataset.versionFilter])));
+  function setLayout(next) {
+    if (!live(session) || session.tab !== 'graph' || session.layout === next) return;
+    session.layout = next;
+    scroller.scrollTop = scroller.scrollLeft = 0;
+    render(session);
+  }
+  listButton.addEventListener('click', () => setLayout('list'));
+  networkButton.addEventListener('click', () => setLayout('network'));
+  bindInspectNetworkPan(scroller, () => live(session) && session.tab === 'graph' && session.layout === 'network');
   graph.addEventListener('click', () => setTab('graph'));
   branchSelect.addEventListener('change', () => {
     const s = session;
@@ -204,7 +247,7 @@ function createModuleInspector(dialog, { readHistory, readDetails, download, use
     const pair = session.selected; close(); compare(pair);
   });
   return { close, refreshRefs, open(source) {
-    session = { source, anchor: null, tab: 'branch',
+    session = { source, anchor: null, tab: 'branch', layout: 'list',
       pages: new Map(), metadata: new Map(), selected: [], visible: [] };
     find('#inspectTitle').textContent = source.repo.full_name;
     search.value = ''; dialog.showModal(); rows.parentElement.scrollTop = 0; refreshRefs(); search.focus();

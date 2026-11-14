@@ -11,8 +11,8 @@
        that gap can show a flash of default browser background/font before
        styles.css applies. Keep in sync with the body rule in styles.css. -->
   <style>html,body{width:100%;height:100%;margin:0;overflow:hidden;background:#0d1117;color:#e8eef5;font:14px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}</style>
-  <link rel="stylesheet" href="styles.css?v=20261112-file-compare">
-  <link rel="stylesheet" href="polarion.css?v=20261112-file-compare">
+  <link rel="stylesheet" href="styles.css?v=20261113-explorer-keys">
+  <link rel="stylesheet" href="polarion.css?v=20261113-explorer-keys">
 </head>
 <body>
   <div id="startupIntro" class="startup-intro" hidden>
@@ -23,7 +23,7 @@
       <div id="startupIntroFailure" class="startup-intro-failure" hidden><p>Reload the window to retry.</p><button type="button" id="startupIntroRetry">Reload interface</button></div>
     </div>
   </div>
-  <script src="startup-intro.js?v=20261112-file-compare"></script>
+  <script src="startup-intro.js?v=20261113-explorer-keys"></script>
   <div class="app-shell">
     <header class="topbar">
       <div class="brand" aria-label="Git DrillDown">
@@ -131,7 +131,7 @@
           <nav id="breadcrumbs" class="breadcrumbs" aria-label="Repository path"></nav>
           <div id="navigationRefreshNotice" class="navigation-refresh-notice" role="status" aria-live="polite" hidden><span></span><button type="button" hidden>Retry</button></div>
           <div class="file-header file-grid"><span>NAME</span><span>GIT</span><span>SIZE</span><span>MODIFIED</span></div>
-          <div id="fileList" class="file-list"></div>
+          <div id="fileList" class="file-list" tabindex="0" aria-label="Project files and folders"></div>
         </div>
 
         <div id="commanderView" class="commander-view" hidden>
@@ -760,6 +760,7 @@
       <button type="button" data-inspect-back aria-label="Back to results">×</button>
     </header>
     <div class="version-current"><span>Remote preview</span><code id="inspectDefaultBranch"></code></div>
+    <div id="inspectLayout" role="group" aria-label="Complete history layout" hidden><button type="button" id="inspectList">List</button><button type="button" id="inspectNetwork" title="Drag horizontally to explore the commit network">Network</button></div>
     <div data-version-view="remote"></div>
     <button type="button" id="inspectMore" hidden>Load older commits</button>
     <footer class="version-help"><div class="version-compare-bar"><span id="inspectStatus" role="status"></span>
@@ -1000,25 +1001,26 @@
       <footer><span>Read-only on Polarion · local snapshots outside Git</span><button value="cancel">Close</button><button type="button" id="polarionAdd" class="confirm" disabled>Add to Commit List</button></footer>
     </form>
   </dialog>
-  <script src="polarion.js?v=20261112-file-compare"></script>
-  <script src="console-context.js?v=20261112-file-compare"></script>
-  <script src="graph-model.js?v=20261112-file-compare"></script>
-  <script src="submodule-state.js?v=20261112-file-compare"></script>
-  <script src="submodule-versions.js?v=20261112-file-compare"></script>
-  <script src="module-inspect.js?v=20261112-file-compare"></script>
-  <script src="local-diff.js?v=20261112-file-compare"></script>
-  <script src="local-drive.js?v=20261112-file-compare"></script>
-  <script src="pr-status.js?v=20261112-file-compare"></script>
-  <script src="refresh-coordinator.js?v=20261112-file-compare"></script>
-  <script src="comparison-authors.js?v=20261112-file-compare"></script>
-  <script src="git-activity.js?v=20261112-file-compare"></script>
-  <script src="comparison-navigation.js?v=20261112-file-compare"></script>
-  <script src="panel-resize.js?v=20261112-file-compare"></script>
-  <script src="submodule-compare-details.js?v=20261112-file-compare"></script>
-  <script src="branch-reset.js?v=20261112-file-compare"></script>
-  <script src="merge-preview.js?v=20261112-file-compare"></script>
-  <script src="navigation-refresh.js?v=20261112-file-compare"></script>
-  <script src="ipc-diagnostics.js?v=20261112-file-compare"></script>
-  <script src="app.js?v=20261112-file-compare"></script>
+  <script src="polarion.js?v=20261113-explorer-keys"></script>
+  <script src="console-context.js?v=20261113-explorer-keys"></script>
+  <script src="graph-model.js?v=20261113-explorer-keys"></script>
+  <script src="submodule-state.js?v=20261113-explorer-keys"></script>
+  <script src="submodule-versions.js?v=20261113-explorer-keys"></script>
+  <script src="inspect-network.js?v=20261113-explorer-keys"></script>
+  <script src="module-inspect.js?v=20261113-explorer-keys"></script>
+  <script src="local-diff.js?v=20261113-explorer-keys"></script>
+  <script src="local-drive.js?v=20261113-explorer-keys"></script>
+  <script src="pr-status.js?v=20261113-explorer-keys"></script>
+  <script src="refresh-coordinator.js?v=20261113-explorer-keys"></script>
+  <script src="comparison-authors.js?v=20261113-explorer-keys"></script>
+  <script src="git-activity.js?v=20261113-explorer-keys"></script>
+  <script src="comparison-navigation.js?v=20261113-explorer-keys"></script>
+  <script src="panel-resize.js?v=20261113-explorer-keys"></script>
+  <script src="submodule-compare-details.js?v=20261113-explorer-keys"></script>
+  <script src="branch-reset.js?v=20261113-explorer-keys"></script>
+  <script src="merge-preview.js?v=20261113-explorer-keys"></script>
+  <script src="navigation-refresh.js?v=20261113-explorer-keys"></script>
+  <script src="ipc-diagnostics.js?v=20261113-explorer-keys"></script>
+  <script src="app.js?v=20261113-explorer-keys"></script>
 </body>
 </html>

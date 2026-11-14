@@ -8,7 +8,7 @@ const main = { kind: 'branch', name: 'main', revision: 'a'.repeat(40) };
 const release = { kind: 'tag', name: 'release', revision: 'b'.repeat(40) };
 function node() {
   return { dataset: {}, value: '', parentElement: {}, classList: { toggle() {} }, style: { setProperty() {} },
-    addEventListener(name, callback) { this[name] = callback; }, querySelectorAll() { return []; },
+    addEventListener(name, callback) { this[name] = callback; }, querySelector() { return null; }, querySelectorAll() { return []; },
     append() {}, setAttribute() {}, focus() {} };
 }
 function harness() {
@@ -19,7 +19,7 @@ function harness() {
   const dialog = { ...node(), querySelector: find, querySelectorAll: key => key === '[data-version-filter]' ? tabs : [],
     addEventListener() {}, showModal() { this.open = true; }, close() { this.open = false; } };
   const ctx = vm.createContext({ document: { createElement: node }, LANE_WIDTH: 30, drawGraphOverlay() {} });
-  for (const file of ['graph-model.js', 'submodule-versions.js', 'module-inspect.js']) {
+  for (const file of ['graph-model.js', 'submodule-versions.js', 'inspect-network.js', 'module-inspect.js']) {
     vm.runInContext(fs.readFileSync(path.join(__dirname, '../frontend', file), 'utf8'), ctx);
   }
   const calls = [], used = [], pairs = [], detailCalls = [];
@@ -133,4 +133,31 @@ test('tip details are one explicit batch and preserve exact-SHA links and search
   assert.match(find('.version-list').innerHTML, /Branch message/);
   assert.match(find('.version-list').innerHTML, /data-related-name="same-commit"/);
   assert.equal(calls.length, 0);
+});
+
+test('Network reuses complete history, draws each parent once and labels branches at their tips', async () => {
+  const { controller, source, find, calls, choose } = harness();
+  const feature = { ...main, name: 'feature/<test>', revision: 'c'.repeat(40) };
+  controller.open({ ...source, versions: () => [main, feature, release] });
+  assert.equal(find('#inspectLayout').hidden, true);
+  find('complete').click();
+  const commit = (id, parents) => ({ id, parents, subject: 'A <change>', author: 'Dev', date: '2026-11-13' });
+  calls[0].resolve({ commits: [commit(main.revision, [release.revision, feature.revision]),
+    commit(feature.revision, [release.revision]), commit(release.revision, ['d'.repeat(40)])], has_more: true });
+  await settle();
+  assert.equal(find('#inspectLayout').hidden, false);
+  const rows = find('.version-list');
+  assert.doesNotMatch(rows.innerHTML, /class="inspect-network"/);
+  find('#inspectNetwork').click();
+  assert.equal((rows.innerHTML.match(/data-revision=/g) || []).length, 3);
+  assert.equal((rows.innerHTML.match(/<path /g) || []).length, 4);
+  assert.equal((rows.innerHTML.match(/outside loaded history/g) || []).length, 1);
+  assert.match(rows.innerHTML, /feature\/&lt;test&gt;/);
+  assert.doesNotMatch(rows.innerHTML, /<change>|<test>/);
+  const ref = id => ({ kind: 'commit', revision: id, name: id.slice(0, 12) });
+  choose(ref(main.revision)); choose(ref(feature.revision), true);
+  find('#inspectList').click();
+  assert.equal(find('#inspectCompare').disabled, false);
+  assert.equal(calls.length, 1);
+  find('commit').click(); assert.equal(find('#inspectLayout').hidden, true);
 });

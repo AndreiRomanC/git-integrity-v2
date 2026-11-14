@@ -451,7 +451,9 @@
       if (comparison.resultHistory.length > 50) comparison.resultHistory.shift();
     }
 
+    let previewTimer;
     function renderResultPreview() {
+      clearTimeout(previewTimer);
       syncComparisonEditors();
       if (comparison.resultPreview) comparison.resultPreview.textContent = comparison.rightText;
       if (comparison.resultStats) {
@@ -468,6 +470,12 @@
       return `<label class="local-drive-edit-cell ${side} ${sideState}" role="gridcell"><span class="local-drive-edit-number">${number}</span><textarea rows="1" class="local-drive-line-input" data-local-line-side="${side}" data-row="${rowIndex}" spellcheck="false" aria-label="${side} line ${number}">${escapeHtml(value)}</textarea></label>`;
     }
 
+    function rowCopyAction(row, index, state) {
+      return state === 'same'
+          ? '<i title="Lines match"></i>'
+          : `<button type="button" data-local-row-copy="left-to-right" data-row="${index}" title="${row.left === null ? 'Remove this right-side line from the prepared result' : 'Copy this exact left line into the aligned right result'}">${row.left === null ? '× →' : '→'}</button>`;
+    }
+
     function renderMergeEditors(focus = null) {
       if (!comparison.alignedEditors) return;
       let leftNumber = 0, rightNumber = 0;
@@ -475,9 +483,7 @@
         if (row.left !== null) leftNumber++;
         if (row.right !== null) rightNumber++;
         const state = diffEngine.rowState(row);
-        const action = state === 'same'
-          ? '<i title="Lines match"></i>'
-          : `<button type="button" data-local-row-copy="left-to-right" data-row="${index}" title="${row.left === null ? 'Remove this right-side line from the prepared result' : 'Copy this exact left line into the aligned right result'}">${row.left === null ? '× →' : '→'}</button>`;
+        const action = rowCopyAction(row, index, state);
         return `<div class="local-drive-edit-row ${state}" role="row">${renderMergeCell(row, index, 'left', leftNumber, state)}<div class="local-drive-row-action">${action}</div>${renderMergeCell(row, index, 'right', rightNumber, state)}</div>`;
       }).join('');
       renderResultPreview();
@@ -625,6 +631,7 @@
         }
         comparison.mergeRows = rows;
       }
+      clearTimeout(previewTimer);
       comparison.mode = mode;
       const editing = mode === 'edit';
       comparison.diffView.hidden = editing;
@@ -829,15 +836,16 @@
       syncComparisonEditors();
       if (comparison.readOnly || !comparisonDirty(side) || comparison.loading || operationBusy) return;
       const path = comparison[`${side}Path`];
+      const savedText = comparison[`${side}Text`];
       operationBusy = true;
       comparison.loading = true;
       updateComparisonState(`Saving ${side} file…`);
       try {
         const result = await invoke('write_local_text_file', {
-          path, content: comparison[`${side}Text`], encoding: comparison[`${side}Encoding`],
+          path, content: savedText, encoding: comparison[`${side}Encoding`],
           expectedFingerprint: comparison[`${side}Fingerprint`] || null,
         });
-        comparison[`${side}Original`] = comparison[`${side}Text`];
+        comparison[`${side}Original`] = savedText;
         comparison[`${side}Fingerprint`] = result?.fingerprint || comparison[`${side}Fingerprint`];
         if (side === 'right') {
           comparison.resultHistory = [];
@@ -863,6 +871,7 @@
       syncComparisonEditors();
       if ((comparisonDirty('left') || comparisonDirty('right')) && !await ask('Discard the unsaved edits in this comparison?', { title: 'Unsaved comparison edits', danger: true, okLabel: 'Discard' })) return;
       comparison.generation++;
+      clearTimeout(previewTimer);
       comparison.dialog.close();
       if (comparison.returnToFolderMerge && folderMerge.dialog && !folderMerge.dialog.open) folderMerge.dialog.showModal();
       comparison.returnToFolderMerge = false;
@@ -1346,9 +1355,31 @@
         field.dataset.resultHistoryCaptured = 'true';
       }
       const multiline = /[\r\n]/.test(field.value);
-      comparison.mergeRows = diffEngine.setMergeLine(comparison.mergeRows, row, side, field.value);
-      if (multiline) renderMergeEditors({ side, row, column: 0 });
-      else { renderResultPreview(); updateComparisonState(); }
+      if (multiline) {
+        comparison.mergeRows = diffEngine.setMergeLine(comparison.mergeRows, row, side, field.value);
+        renderMergeEditors({ side, row, column: 0 });
+        return;
+      }
+      const edited = comparison.mergeRows[row];
+      const before = diffEngine.rowState(edited);
+      edited[side] = field.value;
+      const after = diffEngine.rowState(edited);
+      if (before !== after) {
+        const node = field.closest('.local-drive-edit-row');
+        node.classList.replace(before, after);
+        for (const cell of node.querySelectorAll('.local-drive-edit-cell')) cell.classList.replace(before, after);
+        node.querySelector('.local-drive-row-action').innerHTML = rowCopyAction(edited, row, after);
+      }
+      const save = side === 'left' ? comparison.saveLeft : comparison.saveRight;
+      save.disabled = comparison.loading;
+      if (side === 'right') {
+        comparison.undoResult.disabled = !comparison.resultHistory.length || comparison.loading;
+        comparison.resetResult.disabled = comparison.loading;
+      }
+      clearTimeout(previewTimer);
+      previewTimer = setTimeout(() => {
+        if (comparison.dialog.open && comparison.mode === 'edit') { renderResultPreview(); updateComparisonState(); }
+      }, 100);
     });
     comparison.alignedEditors?.addEventListener('keydown', event => {
       if (comparison.readOnly) return;

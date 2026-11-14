@@ -2346,6 +2346,19 @@ function logComparisonAuthorDisplay(model, totalRows, shownRows, otherFilterActi
   }
 }
 
+// The same path can occur in the directory result and in the contributor
+// scope. Preserve the first directory record, including its file/gitlink type.
+function indexComparisonRows(sourceRows, scopeRows) {
+  const byPath = new Map();
+  const lists = scopeRows && scopeRows !== sourceRows ? [sourceRows, scopeRows] : [sourceRows];
+  for (const list of lists) {
+    for (const row of list) {
+      if (!byPath.has(row.relative_path)) byPath.set(row.relative_path, row);
+    }
+  }
+  return byPath;
+}
+
 function renderCommander() {
   if (!state.repository) return;
   renderComparisonLocation();
@@ -2437,8 +2450,9 @@ function renderCommander() {
     + (!flatMode ? comparisonExcludedRowsHtml(candidates,authorModel,'data-commander-entry') : '');
   bindComparisonEvidence(refs.commanderRows, rows, authorModel);
   refs.commanderRows.querySelector('[data-commander-up]')?.addEventListener('click', () => { const parent = state.commanderPath.split('/').slice(0, -1).join('/'); openCommanderDirectory(parent); });
+  const rowsByPath = indexComparisonRows(state.commanderRows, scopeRows);
   refs.commanderRows.querySelectorAll('[data-commander-entry]').forEach(rowNode => {
-    const row = state.commanderRows.find(item => item.relative_path === rowNode.dataset.commanderEntry) || scopeRows?.find(item => item.relative_path === rowNode.dataset.commanderEntry);
+    const row = rowsByPath.get(rowNode.dataset.commanderEntry);
     if (bindComparisonConversion(rowNode,row)) return;
     if (row?.local?.kind === 'submodule' || row?.remote?.kind === 'submodule') {
       SubmoduleCompareDetails.bindRow(rowNode, () => openSubmoduleComparisonDetails(row));
@@ -2619,8 +2633,9 @@ function renderSubmoduleCompare() {
     + (!state.subCompareFlatMode ? comparisonExcludedRowsHtml(candidates,authorModel,'data-sub-compare-entry') : '');
   bindComparisonEvidence(refs.subCompareRows, rows, authorModel);
   refs.subCompareRows.querySelector('[data-commander-up]')?.addEventListener('click', () => { const parent = state.commanderPath.split('/').slice(0, -1).join('/'); openSubmoduleCompareDirectory(parent); });
+  const rowsByPath = indexComparisonRows(rowsSource, scopeRows);
   refs.subCompareRows.querySelectorAll('[data-sub-compare-entry]').forEach(rowNode => {
-    const row = rowsSource.find(item => item.relative_path === rowNode.dataset.subCompareEntry) || scopeRows?.find(item => item.relative_path === rowNode.dataset.subCompareEntry);
+    const row = rowsByPath.get(rowNode.dataset.subCompareEntry);
     if (bindComparisonConversion(rowNode,row,true)) return;
     if (row?.local?.kind === 'submodule' || row?.remote?.kind === 'submodule') {
       SubmoduleCompareDetails.bindRow(rowNode, () => openSubmoduleComparisonDetails(row, true));
@@ -3187,12 +3202,19 @@ function renderComparisonRows() {
   if (!diff) return;
   const renderSide = (pane, side) => {
     const numberField = side === 'left' ? 'leftNumber' : 'rightNumber';
+    const gutter = [];
+    let lastTone, numbers;
     const lines = diff.rows.map(row => {
       const value = row[side];
       const kind = value === null ? 'filler-line' : row.same ? 'same-line' : side === 'right' ? 'diff-line remote-line' : 'diff-line';
-      return `<span class="${kind}"><i class="line-number">${row[numberField] ?? ''}</i><span>${value === null ? '' : esc(value.replace(/\r$/, ''))}</span></span>`;
+      const tone = row.same || value === null ? '' : side;
+      if (tone !== lastTone) { numbers = []; gutter.push({ tone, numbers }); lastTone = tone; }
+      numbers.push(row[numberField] ?? ' ');
+      return `<span class="${kind}">${value === null ? '' : esc(value.replace(/\r$/, ''))}</span>`;
     }).join('');
-    pane.innerHTML = `<span class="compare-lines">${lines}</span>`;
+    // One sticky gutter per pane avoids creating a sticky layer for every line.
+    const lineNumbers = gutter.map(run => `<span class="${run.tone}">${run.numbers.join('\n')}</span>`).join('');
+    pane.innerHTML = `<span class="compare-lines"><span class="compare-gutter" aria-hidden="true">${lineNumbers}</span><span class="compare-line-body">${lines}</span></span>`;
   };
   renderSide(refs.localCompare, 'left');
   renderSide(refs.remoteCompare, 'right');
@@ -3201,7 +3223,7 @@ function renderComparisonRows() {
 }
 
 function comparePaneRow(pane, index) {
-  return pane.firstElementChild?.children[index];
+  return pane.firstElementChild?.lastElementChild?.children[index];
 }
 
 function updateCompareSearchResults() {
@@ -3222,11 +3244,10 @@ function updateCompareSearchResults() {
       const line = comparePaneRow(pane, index);
       line.classList.remove('active-compare-search');
       if (value === null) continue;
-      const content = line.lastElementChild;
       if (hit) {
-        content.innerHTML = compareHighlightedText(value.replace(/\r$/, ''), query);
+        line.innerHTML = compareHighlightedText(value.replace(/\r$/, ''), query);
         matched = true;
-      } else if (content.childElementCount) content.textContent = value.replace(/\r$/, '');
+      } else if (line.childElementCount) line.textContent = value.replace(/\r$/, '');
     }
     if (matched) matches.push(index);
   });
@@ -3526,7 +3547,7 @@ const EXPLORER_DOM_ROW_CAP = 500;
 let explorerRenderState = { path: null, query: null, entries: null, showAll: false, pendingShowAll: false };
 let lastExplorerClick = { path: null, time: 0 };
 const EXPLORER_DOUBLE_CLICK_MS = 800;
-function renderExplorer() {
+function renderExplorer(pageStart) {
   if (!state.repository) return;
   syncNavigationRefreshNotice();
   renderBreadcrumbs();
@@ -3540,7 +3561,7 @@ function renderExplorer() {
   // sequence (it requires both clicks to land on the same element), so a
   // folder needed two double-clicks to open. macOS's WebKit is more
   // lenient about this, which is why it only showed up there.
-  if (samePlace && explorerRenderState.entries === state.entries && !explorerRenderState.pendingShowAll) {
+  if (pageStart === undefined && samePlace && explorerRenderState.entries === state.entries && !explorerRenderState.pendingShowAll) {
     refs.fileList.querySelectorAll('[data-entry]').forEach(row => row.classList.toggle('selected', state.selectedEntry?.relative_path === row.dataset.entry));
     return;
   }
@@ -3549,11 +3570,13 @@ function renderExplorer() {
   // already-expanded huge folder back under the cap; leaving this folder
   // (or starting a new search in it) is the only thing that should.
   const showAll = samePlace && (explorerRenderState.showAll || explorerRenderState.pendingShowAll);
-  explorerRenderState = { path: state.currentPath, query, entries: state.entries, showAll, pendingShowAll: false };
+  const requestedStart = samePlace ? (pageStart ?? explorerRenderState.offset ?? 0) : 0;
   const buildStarted = performance.now();
   const allEntries = state.entries.filter(entry => !query || entry.name.toLowerCase().includes(query));
   const capped = !showAll && allEntries.length > EXPLORER_DOM_ROW_CAP;
-  const entries = capped ? allEntries.slice(0, EXPLORER_DOM_ROW_CAP) : allEntries;
+  const offset = capped ? Math.min(requestedStart, Math.floor((allEntries.length - 1) / EXPLORER_DOM_ROW_CAP) * EXPLORER_DOM_ROW_CAP) : 0;
+  explorerRenderState = { path: state.currentPath, query, entries: state.entries, showAll, offset, pendingShowAll: false };
+  const entries = capped ? allEntries.slice(offset, offset + EXPLORER_DOM_ROW_CAP) : allEntries;
   const upRow = state.currentPath ? `<button class="file-row file-grid up-row" data-go-up="1">
     <span class="file-main"><span class="entry-icon folder">▲</span><span class="entry-copy"><span class="entry-name">..</span><span class="entry-hint">Parent folder</span></span></span>
     <span></span><span></span><span></span>
@@ -3562,7 +3585,7 @@ function renderExplorer() {
     <span class="file-main">${iconFor(entry)}<span class="entry-copy"><span class="entry-name">${esc(entry.name)}${entryHasPersonalNote(entry) ? '<b class="personal-note-dot" title="Personal note">✎</b>' : ''}${entry.kind === 'submodule' ? '<b class="inline-submodule-badge">SUBMODULE</b>' : ''}</span><span class="entry-hint">${esc(entryKindHint(entry))}</span></span>${['folder','submodule'].includes(entry.kind) ? '<span class="folder-arrow">›</span>' : ''}</span>
     ${gitState(entry)}<span class="file-size">${entry.kind === 'file' ? formatSize(entry.size) : '—'}</span><span class="file-modified">${formatModified(entry.modified)}</span>
   </button>`).join('') || (state.currentPath ? '' : '<div class="empty-change">This folder is empty</div>');
-  const showAllStub = capped ? `<div class="history-truncated-stub"><span>Showing ${EXPLORER_DOM_ROW_CAP} of ${allEntries.length} items</span><button id="explorerShowAll">Show all ${allEntries.length}</button></div>` : '';
+  const showAllStub = capped ? `<div class="history-truncated-stub"><span>Showing ${offset ? (offset + 1) + '–' : ''}${offset + entries.length} of ${allEntries.length} items</span><button id="explorerShowAll">Show all ${allEntries.length}</button></div>` : '';
   jsPerfLog(`renderExplorer build HTML (${state.currentPath || '/'}, ${entries.length}${capped ? `/${allEntries.length}` : ''} rows)`, performance.now() - buildStarted);
   // Isolated from the string-building above and attachFileListDelegation
   // below, so a slow render can be attributed to whichever of the three it
@@ -3597,6 +3620,36 @@ function renderExplorerAfterStatusRefresh() {
   renderCommitScope();
 }
 
+function jumpToExplorerInitial(event) {
+  if (state.view !== 'explorer' || !state.repository || event.defaultPrevented || event.isComposing ||
+      event.ctrlKey || event.metaKey || event.altKey || !/^\p{L}$/u.test(event.key)) return;
+  const target = event.target;
+  if (target.isContentEditable || target.closest?.('input, textarea, select, [role="textbox"]')) return;
+  // Navigating by toolbar, breadcrumb or recent repository can leave focus on that button.
+  if (target !== document.body && target !== document.documentElement &&
+      !target.closest?.('#explorerView, #contentHead, #recentReposBar, #locationStrip, #navExplorer, #openRepo')) return;
+  if (document.querySelector('dialog[open], #submoduleMenu:not([hidden]), #repoPickerMenu:not([hidden]), .floating-action-menu, .changes-drawer.open')) return;
+  const query = refs.search.value.trim().toLowerCase();
+  const entries = query ? state.entries.filter(entry => entry.name.toLowerCase().includes(query)) : state.entries;
+  const start = state.selectedEntry ? entries.findIndex(entry => entry.relative_path === state.selectedEntry.relative_path) : -1;
+  const initial = event.key.toLocaleLowerCase();
+  for (let step = 1; step <= entries.length; step++) {
+    const index = (start + step) % entries.length;
+    const entry = entries[index];
+    if (!entry.name.toLocaleLowerCase().startsWith(initial)) continue;
+    event.preventDefault();
+    const offset = Math.floor(index / EXPLORER_DOM_ROW_CAP) * EXPLORER_DOM_ROW_CAP;
+    if (!explorerRenderState.showAll && offset !== explorerRenderState.offset) renderExplorer(offset);
+    lastExplorerClick = { path: null, time: 0 };
+    selectEntry(entry.relative_path, { deferMs: 250 });
+    const row = refs.fileList.querySelector('[data-entry="' + CSS.escape(entry.relative_path) + '"]');
+    row?.focus({ preventScroll: true });
+    row?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+    return;
+  }
+}
+
+document.addEventListener('keydown', jumpToExplorerInitial);
 let fileListDelegationAttached = false;
 function attachFileListDelegation() {
   if (fileListDelegationAttached) return;
@@ -8262,7 +8315,7 @@ function renderGraph() {
   // recompute the exact same inputs for just the newly-arrived rows,
   // without a second, drifting copy of the actual row markup — both paths
   // call buildCommitRowHtml for the real template.
-  lastGraphRenderContext = { model, lanesWidth, stashesByBase, aheadAnnotations, branchPointRows, commonAncestorRows, headMainBase, commitById: new Map(commits.map(commit => [commit.id, commit])), query, matchesQuery, currentBranch, refFilter, repositoryName: g.name, onlySearchMatches, story, branchStart: navigation.start, navigationMerge: navigation.merge };
+  lastGraphRenderContext = { repositoryPath: g.path, sourceCommits: allGraphCommits, model, lanesWidth, stashesByBase, aheadAnnotations, branchPointRows, commonAncestorRows, headMainBase, commitById: new Map(commits.map(commit => [commit.id, commit])), query, matchesQuery, currentBranch, refFilter, repositoryName: g.name, onlySearchMatches, story, branchStart: navigation.start, navigationMerge: navigation.merge };
   const rowsStarted = performance.now();
   const rows = commits.map((commit, index) => buildCommitRowHtml(commit, index, lastGraphRenderContext)).join('') || '<div class="empty-change">No commits in this history</div>';
 
@@ -9733,14 +9786,21 @@ function goToGraphSearchMatch(direction = 1) {
   const query = refs.search.value.trim();
   if (state.view !== 'graph' || !query) return;
   clearTimeout(searchTimeout);
-  renderGraph();
+  // Enter can arrive before the debounced search paints, or after a page
+  // of history changed. Otherwise navigate the matches already on screen.
+  const graph = activeGraphData();
+  if (lastGraphRenderContext?.query !== query.toLowerCase() ||
+      lastGraphRenderContext.repositoryPath !== graph.path || lastGraphRenderContext.sourceCommits !== graph.commits) {
+    renderGraph();
+  }
   const rows = [...refs.graph.querySelectorAll('.commit-row.is-search-match[data-id]')];
   const ids = rows.map(row => row.dataset.id);
   const nextId = cyclicSearchMatchId(ids, state.graphSearchCurrentId, direction);
   if (!nextId) { status(`No loaded commit matches “${query}”`); return; }
   state.graphSearchCurrentId = nextId;
-  rows.forEach(row => row.classList.toggle('is-search-current', row.dataset.id === nextId));
+  refs.graph.querySelector('.is-search-current')?.classList.remove('is-search-current');
   const target = rows.find(row => row.dataset.id === nextId);
+  target?.classList.add('is-search-current');
   target?.scrollIntoView({ block: 'center', behavior: 'smooth' });
   selectCommit(nextId);
   status(`Search result ${ids.indexOf(nextId) + 1} of ${ids.length} · Enter for next, Shift+Enter for previous`);

@@ -135,18 +135,26 @@
       };
     }
 
-    const table = Array.from({ length: n + 1 }, () => new Uint32Array(m + 1));
-    for (let left = n - 1; left >= 0; left--) {
-      for (let right = m - 1; right >= 0; right--) {
-        table[left][right] = leftKeys[left] === rightKeys[right]
+    // The traceback always takes matching leading lines. Leave those out
+    // of the quadratic matrix while retaining its tie-breaks in the suffix.
+    const rows = [];
+    let prefix = 0;
+    while (prefix < n && prefix < m && leftKeys[prefix] === rightKeys[prefix]) {
+      rows.push({ left: leftLines[prefix], right: rightLines[prefix], same: true,
+        ignored: leftLines[prefix] !== rightLines[prefix] });
+      prefix++;
+    }
+    const table = Array.from({ length: n - prefix + 1 }, () => new Uint32Array(m - prefix + 1));
+    for (let left = n - prefix - 1; left >= 0; left--) {
+      for (let right = m - prefix - 1; right >= 0; right--) {
+        table[left][right] = leftKeys[left + prefix] === rightKeys[right + prefix]
           ? table[left + 1][right + 1] + 1
           : Math.max(table[left + 1][right], table[left][right + 1]);
       }
     }
 
-    const rows = [];
-    let left = 0;
-    let right = 0;
+    let left = prefix;
+    let right = prefix;
     while (left < n && right < m) {
       if (leftKeys[left] === rightKeys[right]) {
         rows.push({
@@ -155,7 +163,7 @@
         });
         left++;
         right++;
-      } else if (table[left + 1][right] >= table[left][right + 1]) {
+      } else if (table[left - prefix + 1][right - prefix] >= table[left - prefix][right - prefix + 1]) {
         rows.push({ left: leftLines[left++], right: null, same: false, ignored: false });
       } else {
         rows.push({ left: null, right: rightLines[right++], same: false, ignored: false });
