@@ -38,14 +38,21 @@ jobs:
           CARGO_TARGET_DIR: .build-windows
           CARGO_INCREMENTAL: "0"
         run: |
-          cargo test --release --locked --manifest-path src-tauri/Cargo.toml --lib merge -- --test-threads=1
+          # Cargo reports the executable path; its internal output layout can change.
+          $buildMessages = @(cargo test --release --locked --manifest-path src-tauri/Cargo.toml --lib --no-run --message-format=json-render-diagnostics)
+          if ($LASTEXITCODE -ne 0) { throw "Library regression test build failed." }
+          $tests = @($buildMessages | ForEach-Object {
+            $message = $_ | ConvertFrom-Json
+            if ($message.reason -eq "compiler-artifact" -and $message.profile.test -and $message.target.name -eq "git_drilldown_lib" -and $message.executable) {
+              $message.executable
+            }
+          })
+          if ($tests.Count -ne 1 -or -not (Test-Path -LiteralPath $tests[0])) { throw "Expected one compiled library test executable from Cargo." }
+          & $tests[0] merge --test-threads=1
           if ($LASTEXITCODE -ne 0) { throw "Native merge regression checks failed." }
-          # Reuse the exact test binary just built above for the two small suites.
-          $tests = @(Get-ChildItem ".build-windows/release/deps/git_drilldown_lib-*.exe")
-          if ($tests.Count -ne 1) { throw "Expected one compiled library test executable." }
-          & $tests[0].FullName repository::settings::tests --test-threads=1
+          & $tests[0] repository::settings::tests --test-threads=1
           if ($LASTEXITCODE -ne 0) { throw "Settings regression checks failed." }
-          & $tests[0].FullName repository::module_cache::tests --test-threads=1
+          & $tests[0] repository::module_cache::tests --test-threads=1
           if ($LASTEXITCODE -ne 0) { throw "Inspect cache regression checks failed." }
 
       - name: Build portable executable
