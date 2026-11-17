@@ -10190,10 +10190,21 @@ mod tests {
         String::from_utf8_lossy(&output.stdout).trim().to_string()
     }
 
+    // Fixture repositories must not inherit the developer/runner's identity
+    // or checkout conversion defaults. CRLF behavior is tested explicitly.
+    fn configure_test_repository(path: &Path) {
+        let repo = Repository::open(path).unwrap();
+        let mut config = repo.config().unwrap();
+        config.set_str("user.name", "Test User").unwrap();
+        config.set_str("user.email", "test@example.com").unwrap();
+        config.set_bool("core.autocrlf", false).unwrap();
+    }
+
     fn create_libgit2_repository(path: &Path, file: &str) {
         fs::create_dir_all(path).unwrap();
         fs::write(path.join(file), "content").unwrap();
         let repo = Repository::init(path).unwrap();
+        configure_test_repository(path);
         let mut index = repo.index().unwrap(); index.add_path(Path::new(file)).unwrap(); index.write().unwrap();
         let tree_id = index.write_tree().unwrap(); let tree = repo.find_tree(tree_id).unwrap();
         let signature = git2::Signature::now("Test User", "test@example.com").unwrap();
@@ -12494,6 +12505,7 @@ mod tests {
         fs::create_dir_all(&repository).unwrap();
         fs::write(repository.join("a.txt"), "base\n").unwrap();
         run_git(&repository, &["init", "-b", "main"]);
+        configure_test_repository(&repository);
         run_git(&repository, &["config", "user.email", "test@example.com"]);
         run_git(&repository, &["config", "user.name", "Test User"]);
         run_git(&repository, &["add", "."]);
@@ -12607,6 +12619,7 @@ mod tests {
         run_git(&repository, &["switch", &default_branch]);
 
         let sub_path = repository.join("vendor/dep");
+        configure_test_repository(&sub_path);
         fs::write(sub_path.join("module.txt"), "bumped").unwrap();
         run_git(&sub_path, &["commit", "-am", "Bump"]);
         let bumped_oid = Repository::open(&sub_path).unwrap().head().unwrap().target().unwrap();
@@ -12624,6 +12637,31 @@ mod tests {
         assert_eq!(head_oid, Some(bumped_oid), "HEAD's tree must show the bumped submodule after fast-forward");
         assert_eq!(index_oid, Some(bumped_oid), "the INDEX must also show the bumped submodule after fast-forward — this is what Restore project version actually reads");
         fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn native_merge_respects_crlf_checkout_and_abort_restores_exact_bytes() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let (repository, _) = setup_diverged_repo(suffix);
+        run_git(&repository, &["config", "core.autocrlf", "true"]);
+        fs::write(repository.join("a.txt"), "feature version\r\n").unwrap();
+        run_git(&repository, &["commit", "-am", "Feature"]);
+        run_git(&repository, &["switch", "main"]);
+        fs::write(repository.join("a.txt"), "main version\r\n").unwrap();
+        run_git(&repository, &["commit", "-am", "Main"]);
+        run_git(&repository, &["switch", "feature"]);
+        let before = fs::read(repository.join("a.txt")).unwrap();
+        assert_eq!(before, b"feature version\r\n");
+        let path = repository.to_string_lossy().into_owned();
+        assert_eq!(merge_branch(path.clone(), "".into(), "main".into()).unwrap().status, "conflicts");
+        abort_merge(path.clone(), "".into()).unwrap();
+        assert_eq!(fs::read(repository.join("a.txt")).unwrap(), before);
+        assert_eq!(merge_branch(path.clone(), "".into(), "main".into()).unwrap().status, "conflicts");
+        resolve_conflict(path.clone(), "".into(), "a.txt".into(), "theirs".into()).unwrap();
+        complete_merge(path, "".into(), "Merge with CRLF checkout".into()).unwrap();
+        assert_eq!(fs::read(repository.join("a.txt")).unwrap(), b"main version\r\n");
+        assert!(run_git_capture(&repository, &["status", "--porcelain"]).is_empty());
+        fs::remove_dir_all(repository).unwrap();
     }
 
     #[test]
@@ -12682,6 +12720,7 @@ mod tests {
 
         run_git(&parent, &["switch", &default_branch]);
         let sub_path = parent.join("vendor/dep");
+        configure_test_repository(&sub_path);
         fs::write(sub_path.join("module.txt"), "incoming submodule update\n").unwrap();
         run_git(&sub_path, &["commit", "-am", "Incoming submodule update"]);
         let incoming_oid = Repository::open(&sub_path).unwrap().head().unwrap().target().unwrap();
@@ -13042,6 +13081,7 @@ mod tests {
         fs::write(repository.join("a.txt"), "base a\n").unwrap();
         fs::write(repository.join("b.txt"), "base b\n").unwrap();
         run_git(&repository, &["init", "-b", "main"]);
+        configure_test_repository(&repository);
         run_git(&repository, &["config", "user.email", "test@example.com"]);
         run_git(&repository, &["config", "user.name", "Test User"]);
         run_git(&repository, &["add", "."]);
@@ -13117,6 +13157,7 @@ mod tests {
         run_git(&parent, &["commit", "-am", "Add dep"]);
         let parent_branch = run_git_capture(&parent, &["branch", "--show-current"]);
         let sub_path = parent.join("vendor/dep");
+        configure_test_repository(&sub_path);
 
         run_git(&sub_path, &["switch", "-c", "left"]);
         fs::write(sub_path.join("module.txt"), "left\n").unwrap();
@@ -13191,6 +13232,7 @@ mod tests {
         create_commit(parent_string.clone(), "Add dep submodule".into()).unwrap();
 
         let sub_path = parent.join(&added);
+        configure_test_repository(&sub_path);
         run_git(&sub_path, &["switch", "-c", "feature"]);
         fs::write(sub_path.join("module.txt"), "feature version\n").unwrap();
         run_git(&sub_path, &["commit", "-am", "Feature change"]);
@@ -13226,6 +13268,7 @@ mod tests {
         create_commit(parent_string.clone(), "Add dep submodule".into()).unwrap();
 
         let sub_path = parent.join(&added);
+        configure_test_repository(&sub_path);
         run_git(&sub_path, &["switch", "-c", "feature"]);
         fs::write(sub_path.join("module.txt"), "feature version\n").unwrap();
         run_git(&sub_path, &["commit", "-am", "Feature change"]);

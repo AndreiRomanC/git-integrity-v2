@@ -40,9 +40,12 @@ jobs:
         run: |
           cargo test --release --locked --manifest-path src-tauri/Cargo.toml --lib merge -- --test-threads=1
           if ($LASTEXITCODE -ne 0) { throw "Native merge regression checks failed." }
-          cargo test --release --locked --manifest-path src-tauri/Cargo.toml --lib repository::settings::tests -- --test-threads=1
+          # Reuse the exact test binary just built above for the two small suites.
+          $tests = @(Get-ChildItem ".build-windows/release/deps/git_drilldown_lib-*.exe")
+          if ($tests.Count -ne 1) { throw "Expected one compiled library test executable." }
+          & $tests[0].FullName repository::settings::tests --test-threads=1
           if ($LASTEXITCODE -ne 0) { throw "Settings regression checks failed." }
-          cargo test --release --locked --manifest-path src-tauri/Cargo.toml --lib repository::module_cache::tests -- --test-threads=1
+          & $tests[0].FullName repository::module_cache::tests --test-threads=1
           if ($LASTEXITCODE -ne 0) { throw "Inspect cache regression checks failed." }
 
       - name: Build portable executable
