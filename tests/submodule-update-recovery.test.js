@@ -16,7 +16,7 @@ function harness() {
     looksDestructiveTerminalCommand: () => false, consoleGitTarget: () => ({ label: 'Repository root', path: 'parent', displayPath: 'parent' }),
     invoke: (command, args) => new Promise((resolve, reject) => calls.push({ command, args, resolve, reject })),
     setInterval: () => 1, clearInterval: () => events.push('ticker-cleared'),
-    renderConsoleTranscript() {}, refreshCommandHint() {}, jsPerfLog() {},
+    renderConsoleTranscript() {}, renderChanges() { events.push(`staging-disabled:${state.consoleCommandRunning}`); }, refreshCommandHint() {}, jsPerfLog() {},
     status: text => messages.push(text),
     directoryCache: { clear: () => events.push('directories-cleared') },
     loadRepository: async (repositoryPath, options) => { refreshes.push({ repositoryPath, options }); },

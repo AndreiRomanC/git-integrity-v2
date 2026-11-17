@@ -1,0 +1,49 @@
+/* Keep Settings anchored below the independently scrolling sidebar content. */
+.sidebar { display: flex; flex-direction: column; padding: 0; overflow: hidden; }
+.sidebar-content { min-height: 0; flex: 1; overflow: auto; padding: 13px 10px 8px; }
+.sidebar-footer { flex: none; padding: 4px 10px 7px; }
+.settings-trigger { display: grid; place-items: center; width: 30px; height: 30px; padding: 6px; border: 0; border-radius: 6px; color: #8293a3; background: transparent; }
+.settings-trigger:hover { color: #d9e6f1; background: #1d2935; }
+.settings-trigger svg { width: 17px; height: 17px; fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+.settings-trigger:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
+.settings-dialog { width: min(640px, 92vw); max-width: 92vw; max-height: 88vh; padding: 0; border: 1px solid #354655; border-radius: 12px; background: #111820; color: var(--text); box-shadow: 0 22px 80px #0008; }
+.settings-dialog[open] { display: flex; flex-direction: column; }
+.settings-dialog::backdrop { background: #05090fb0; }
+.settings-dialog > header { display: flex; justify-content: space-between; align-items: center; padding: 19px 22px 12px; flex: none; }
+.settings-dialog h2 { margin: 0; font-size: 19px; letter-spacing: -.3px; }
+.settings-dialog button { width: auto; height: auto; margin: 0; cursor: pointer; }
+.settings-dialog button:disabled { cursor: default; opacity: .45; }
+.settings-dialog button:focus-visible, .settings-dialog select:focus-visible, .settings-dialog summary:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
+.settings-dialog > header button { padding: 1px 7px; border: 0; border-radius: 5px; background: transparent; color: #9eafbf; font-size: 22px; }
+.settings-tabs { display: flex; gap: 22px; flex: none; padding: 0 22px; border-bottom: 1px solid var(--border); }
+.settings-tabs button { min-height: 37px; padding: 0 0 10px; border: 0; border-bottom: 2px solid transparent; border-radius: 0; color: #92a5b7; background: transparent; font-size: 12px; font-weight: 600; }
+.settings-tabs button[aria-selected="true"] { color: #d6e8f8; border-bottom-color: #71b4ed; }
+.settings-body { overflow-y: auto; min-height: 0; padding: 16px 22px 18px; }
+.settings-context { margin: 0 0 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #8499ac; font-size: 11px; }
+.settings-card { padding: 14px 15px; margin-bottom: 12px; border: 1px solid #293a49; border-radius: 8px; background: #15202a; }
+.settings-card:last-child { margin-bottom: 0; }
+.settings-card > header { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.settings-card h3 { margin: 0; font-size: 13px; font-weight: 650; }
+.settings-state { color: #91a4b6; font-size: 10px; }
+.settings-state[data-state="connected"] { color: #82d0b5; }
+.settings-state[data-state="sign_in_required"], .settings-state[data-state="failed"] { color: #e5b879; }
+.settings-card p { margin: 7px 0 0; font-size: 11px; line-height: 1.5; color: #9eb0c0; overflow-wrap: anywhere; }
+.settings-card .settings-user { font-size: 13px; color: #d6e1eb; }
+.settings-card .settings-host { color: #8eb8d9; font-size: 11px; }
+.settings-card .settings-host:empty, .settings-card p:empty, .settings-notice:empty { display: none; }
+.settings-card .settings-checked { font-size: 10px; color: #8b9cac; }
+.settings-actions { display: flex; gap: 7px; flex-wrap: wrap; margin-top: 12px; }
+.settings-actions button, .settings-dialog > footer button { min-height: 30px; padding: 5px 10px; border: 1px solid #3b5062; border-radius: 5px; background: #1a2a37; color: #d0e1ef; font-size: 11px; }
+.settings-actions button:hover:not(:disabled), .settings-dialog > footer button:hover { background: #233a4b; border-color: #5f829e; }
+.settings-actions button.settings-link { border-color: transparent; background: transparent; color: #9dbbd4; }
+.settings-card details { margin-top: 10px; font-size: 10px; color: #90a5b6; }
+.settings-card summary { cursor: pointer; width: fit-content; }
+.settings-card dl { display: grid; grid-template-columns: 75px minmax(0, 1fr); gap: 8px 12px; margin: 12px 0 0; font-size: 11px; }
+.settings-card dt { color: #90a5b6; }
+.settings-card dd { margin: 0; overflow-wrap: anywhere; color: #d5e0e9; }
+.settings-card label { display: block; margin-top: 10px; color: #90a5b6; font-size: 11px; }
+.settings-card select { max-width: 100%; margin-left: 8px; padding: 4px; border: 1px solid #3b5062; border-radius: 4px; background: #101a24; color: #d5e0e9; font-size: 11px; }
+.settings-notice { font-size: 11px; color: #e5b879; line-height: 1.5; }
+.settings-dialog > footer { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex: none; padding: 12px 22px; border-top: 1px solid var(--border); }
+.settings-dialog > footer small { color: #8297a9; font-size: 10px; }
+.settings-dialog [hidden] { display: none !important; }

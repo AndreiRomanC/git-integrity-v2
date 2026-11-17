@@ -16,7 +16,7 @@ const MUTATING_COMMANDS = new Set([
   'stash_changes', 'stash_file', 'pop_stash', 'drop_stash', 'restore_stash_paths', 'abort_stash_conflict',
   'restore_file', 'restore_remote_file', 'restore_folder', 'restore_exact_checkpoint', 'restore_exact_checkpoint_branch', 'clean_branch_from_upstream', 'reset_current_branch', 'add_submodule', 'init_submodule', 'switch_submodule_version', 'reset_submodule', 'reset_submodule_branch_to_upstream', 'change_submodule_url',
   'commit_submodule', 'push_submodule', 'pull_submodule', 'force_push_submodule', 'fetch_submodule',
-  'create_submodule_branch', 'merge_branch', 'open_merge_tool', 'resolve_conflict', 'complete_merge', 'abort_merge',
+  'create_submodule_branch', 'merge_branch', 'apply_submodule_merge_revision', 'open_merge_tool', 'resolve_conflict', 'complete_merge', 'abort_merge',
   'sync_repository', 'publish_branch', 'combine_local_commits', 'fetch_remote', 'fetch_all_remotes', 'fetch_project', 'write_text_file', 'run_git_command', 'run_terminal_command',
 ]);
 // While an embedded Terminal command is running, every mutation *and* switching to
@@ -30,7 +30,7 @@ const MUTATING_COMMANDS = new Set([
 const REPO_SWITCH_COMMANDS = new Set(['load_repository', 'open_repository_fast']);
 const EMBEDDED_CONSOLE_COMMANDS = new Set(['run_git_command', 'run_terminal_command']);
 const STAGING_COMMANDS = new Set(['stage_files', 'unstage_files', 'stage_all']);
-const RECOVER_ON_MUTATION_ERROR = new Set(['merge_branch', 'resolve_conflict', 'open_merge_tool', 'complete_merge', 'abort_merge', 'stash_changes', 'stash_file', 'pop_stash', 'restore_stash_paths', 'abort_stash_conflict']);
+const RECOVER_ON_MUTATION_ERROR = new Set(['merge_branch', 'apply_submodule_merge_revision', 'resolve_conflict', 'open_merge_tool', 'complete_merge', 'abort_merge', 'stash_changes', 'stash_file', 'pop_stash', 'restore_stash_paths', 'abort_stash_conflict']);
 // Measure the whole frontend -> Tauri -> frontend round trip, not just the
 // backend phases that individual commands happen to log. Only slow calls and
 // failures are recorded so ordinary navigation does not flood the diagnostic
@@ -5539,7 +5539,7 @@ function submoduleReviewRowHtml(item) {
     </div>
     ${registrationNotice}
     <details class="submodule-review-details"><summary>Details${localDiffers ? ' · folder on disk differs' : ''}</summary>
-      <div class="submodule-review-pointers">${pointerRow('Merge base', item.base)}${pointerRow('Prepared result', item.result)}${pointerRow('Folder on disk', item.local_checkout, 'Not available')}</div>
+      <div class="submodule-review-pointers">${pointerRow('Merge base', item.base, item.base_is_ambiguous ? 'Multiple bases' : 'No submodule')}${pointerRow('Prepared result', item.result)}${pointerRow('Folder on disk', item.local_checkout, 'Not available')}</div>
       <p><b>Prepared result review.</b> ${esc(item.reason)}</p>
       ${submoduleReviewLocalNotice(item, selected)}
       <div class="submodule-review-actions"><button type="button" data-review-action="choose">Choose another commit…</button><button type="button" data-review-action="history">Open history</button></div>
@@ -8632,9 +8632,9 @@ function renderChanges() {
   const changesByPath = new Map(scopedChanges.map(change => [change.path, change]));
   refs.drawerScopeTitle.textContent = state.changesScope === 'folder' ? `Changes in folder · /${scope}` : 'Working tree · entire repository';
   refs.changesSummary.textContent = scopedChanges.length ? `${scopedChanges.length} changed item${scopedChanges.length === 1 ? '' : 's'}` : `No changes in ${scope ? `/${scope}` : 'the repository'}`;
-  $('#stageAllButton').disabled = scopedChanges.length === 0;
-  $('#unstageAllButton').disabled = !scopedChanges.some(change => change.staged);
-  refs.changes.innerHTML = scopedChanges.map(change => `<div class="change-row-wrap diffable" data-change-compare-path="${esc(change.path)}" title="Double-click to compare working tree with the Git index"><div class="change-row"><input type="checkbox" data-change-path="${esc(change.path)}" aria-label="Stage ${esc(change.path)}" ${change.staged ? 'checked' : ''}>
+  $('#stageAllButton').disabled = state.consoleCommandRunning || scopedChanges.length === 0;
+  $('#unstageAllButton').disabled = state.consoleCommandRunning || !scopedChanges.some(change => change.staged);
+  refs.changes.innerHTML = scopedChanges.map(change => `<div class="change-row-wrap diffable" data-change-compare-path="${esc(change.path)}" title="Double-click to compare working tree with the Git index"><div class="change-row"><input type="checkbox" data-change-path="${esc(change.path)}" aria-label="Stage ${esc(change.path)}" ${state.consoleCommandRunning ? 'disabled' : ''} ${change.staged ? 'checked' : ''}>
     <span class="status-code">${esc(change.status)}</span><span class="change-path">${esc(change.path)}</span><span class="change-state">${esc(changeDisplayState(change, submoduleRoots))}</span></div>
     <button class="stash-file-btn" data-stash-path="${esc(change.path)}" title="Set aside just this file in its own repository's stash. Parent projects and submodules have separate stash lists.">⇕ Stash</button></div>`).join('') || `<div class="empty-change">No changes inside /${esc(scope)}</div>`;
   refs.changes.querySelectorAll('[data-stash-path]').forEach(button => button.addEventListener('click', () => stashOneFile(button.dataset.stashPath)));
@@ -9145,6 +9145,12 @@ const STAGE_FLUSH_TIMEOUT_MS = 20000;
 
 function toggleStage(path, checked) {
   if (!invoke || !state.repository) return;
+  if (state.consoleCommandRunning) {
+    renderChanges();
+    status('Wait for the running Git command before changing staging. This click was not queued.', 'error');
+    return;
+  }
+
   // Defensive: the queue should never carry entries from a repository that's
   // no longer open (every path that switches repository/branch is expected
   // to flush first, via flushPendingTogglesNow — this only guards against
@@ -11109,6 +11115,7 @@ async function runTerminalFromConsole(input, options = {}) {
   state.consoleTranscript.push(entry);
   renderConsoleTranscript();
   state.consoleCommandRunning = true;
+  renderChanges();
   jsPerfLog(`frontend: runTerminal START (${target.label})`, 0);
   consoleRunningTicker = setInterval(renderConsoleTranscript, 200);
   try {
@@ -11126,6 +11133,7 @@ async function runTerminalFromConsole(input, options = {}) {
   }
   clearInterval(consoleRunningTicker); consoleRunningTicker = null;
   state.consoleCommandRunning = false;
+  renderChanges();
   renderConsoleTranscript();
   refreshCommandHint();
   // Failure/timeout is not rollback. Refresh possibly-mutated state on BOTH
@@ -11347,6 +11355,13 @@ $('#closeCommandPalette').addEventListener('click', () => $('#commandPalette').c
 $('#commandPalette').addEventListener('close', () => { commandPaletteOpen = false; });
 $('#openConsole').addEventListener('click', () => openCommandPalette());
 $('#openHelp').addEventListener('click', () => $('#helpDialog').showModal());
+window.GitDrillDownSettings?.create({
+  invoke,
+  getRepositoryPath: () => state.submoduleGraph?.repository?.path || state.repository?.path || null,
+  copy: copyText,
+  rememberedPolarion: () => polarionRememberedUser(localStorage),
+  rememberPolarion: user => polarionRememberedUser(localStorage, user),
+});
 document.addEventListener('keydown', (e) => {
   if ((e.ctrlKey || e.metaKey) && e.key === 'k') { e.preventDefault(); commandPaletteOpen ? $('#commandPalette').close() : openCommandPalette(); }
   else if ((e.ctrlKey || e.metaKey) && e.key === 'o') { e.preventDefault(); openRepository(); }

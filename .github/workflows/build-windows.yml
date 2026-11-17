@@ -32,6 +32,19 @@ jobs:
           cargo test --release --locked --manifest-path src-tauri/Cargo.toml --lib repository::publish_diagnostics::tests:: -- --test-threads=1
           if ($LASTEXITCODE -ne 0) { throw "Native push diagnostics or process-lifecycle regression." }
 
+      - name: Verify native merge, Settings and Inspect cache on Windows
+        shell: pwsh
+        env:
+          CARGO_TARGET_DIR: .build-windows
+          CARGO_INCREMENTAL: "0"
+        run: |
+          cargo test --release --locked --manifest-path src-tauri/Cargo.toml --lib merge -- --test-threads=1
+          if ($LASTEXITCODE -ne 0) { throw "Native merge regression checks failed." }
+          cargo test --release --locked --manifest-path src-tauri/Cargo.toml --lib repository::settings::tests -- --test-threads=1
+          if ($LASTEXITCODE -ne 0) { throw "Settings regression checks failed." }
+          cargo test --release --locked --manifest-path src-tauri/Cargo.toml --lib repository::module_cache::tests -- --test-threads=1
+          if ($LASTEXITCODE -ne 0) { throw "Inspect cache regression checks failed." }
+
       - name: Build portable executable
         shell: pwsh
         run: ./build-windows.ps1

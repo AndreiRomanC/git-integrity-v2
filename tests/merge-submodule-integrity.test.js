@@ -218,3 +218,30 @@ test('prepared-result diagnostics stay identified separately from a new selectio
   assert.match(row, /Prepared: Incoming applied/);
   assert.match(row, /Folder on disk<\/span><code title="Not available">Not available/);
 });
+
+
+test('multiple merge bases are labelled explicitly rather than shown as a missing submodule', () => {
+  const h = harness();
+  const html = h.context.submoduleReviewRowHtml({path:'dep', base:null, base_is_ambiguous:true, current:'old', incoming:'new', result:'new', selectedRevision:'new', selectedSource:'result', reason:'Git virtual base',status:'Review recommended'});
+  assert.match(html, /Merge base<\/span><code title="Multiple bases">Multiple bases/);
+});
+
+
+test('review pointer choices obey the same terminal and pending-staging barriers as merge', async () => {
+  const calls = [];
+  const context = { state: { repository: {path:'parent'}, statusReady:true, consoleCommandRunning:true },
+    window: {__TAURI__: {core:{invoke: async (command,args) => {calls.push({command,args});}}}},
+    activeStagingOperation:null, pendingToggleFlight:null, pendingToggles:new Map(),
+    performance, jsPerfLog() {}, status() {}, repoOpenGeneration:1,
+  };
+  vm.createContext(context);
+  vm.runInContext(section('const MUTATING_COMMANDS =', 'const $ =') + '\nglobalThis.request = invoke;', context);
+  await assert.rejects(context.request('apply_submodule_merge_revision', {}), error => /Terminal command is still running/.test(String(error)));
+  context.state.consoleCommandRunning = false;
+  context.pendingToggles.set('dep', false);
+  await assert.rejects(context.request('apply_submodule_merge_revision', {}), error => /Stage\/Unstage is still pending/.test(String(error)));
+  assert.equal(calls.length,0);
+  context.pendingToggles.clear();
+  await context.request('apply_submodule_merge_revision',{relativePath:'dep',revision:''});
+  assert.equal(calls.length,1);
+});

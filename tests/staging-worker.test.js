@@ -202,3 +202,17 @@ test('stage/unstage IPC wrappers reuse synchronous inner logic without nested wo
   assert.match(source, /let inner = stage_files_blocking\(sub_path, inner_files\)\?/);
   assert.match(source, /unstage_files_blocking\(sub_path, inner_files\)\?/);
 });
+
+
+test('log41: stage/unstage clicks during submodule update are not replayed after it finishes', async () => {
+  const h = harness();
+  h.state.changes[0] = { path: 'work/app/EPWRMO/ps1n_esfmcs', staged: true };
+  h.state.consoleCommandRunning = true;
+  h.context.toggleStage(h.state.changes[0].path, false);
+  h.context.toggleStage(h.state.changes[0].path, true);
+  assert.equal(h.state.changes[0].staged, true);
+  assert.equal(h.timers.size, 0);
+  h.state.consoleCommandRunning = false;
+  await h.context.flush();
+  assert.equal(h.calls.length, 0, 'no deferred reset HEAD may resurrect the removed gitlink');
+});
