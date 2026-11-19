@@ -1,6 +1,7 @@
 use super::*;
 
 pub mod merge;
+pub(in crate::repository) mod native_merge;
 pub mod merge_preview;
 pub mod reset;
 

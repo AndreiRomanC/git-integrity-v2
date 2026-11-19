@@ -167,3 +167,15 @@ test('History Enter reuses painted matches and refreshes pending searches or rep
   graph.path='/child'; ctx.goToGraphSearchMatch(1); assert.equal(paints,4);
   refs.search.value='absent'; selected=null; ctx.goToGraphSearchMatch(1); assert.equal(selected,null);
 });
+
+test('fast unknown entries remain neutral; only verified local changes get the amber row accent', () => {
+  const changed = loadFunction('entryHasKnownChanges');
+  for (const kind of ['folder','submodule','file']) {
+    assert.equal(changed({kind, status_known:false, tracked:false, status:''}), false);
+    assert.equal(changed({kind, status_known:false, tracked:true, status:'M'}), false);
+    assert.equal(changed({kind, status_known:true, tracked:true, status:''}), false);
+    assert.equal(changed({kind, status_known:true, tracked:true, status:'M'}), true);
+    assert.equal(changed({kind, status_known:true, tracked:false, status:'??'}), true);
+  }
+  assert.match(app, /entryHasKnownChanges\(entry\) \? 'has-change'/);
+});

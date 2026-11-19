@@ -259,7 +259,7 @@ test('task selection uses the same saved-message storage and preserves manual en
   const block = app.slice(app.indexOf('const COMMIT_MESSAGE_HISTORY_KEY'), app.indexOf('// Opening the drawer no longer auto-stages'));
   const storage = new Map([['git-integrity-default-commit-message-history', JSON.stringify(['My manual checkpoint'])]]);
   let picker, inputEvents = 0;
-  const sandbox = { state: {}, refs: { defaultCommitMessage: { value: '', dispatchEvent: () => inputEvents++ } },
+  const sandbox = { state: {}, polarionConnection: null, refs: { defaultCommitMessage: { value: '', dispatchEvent: () => inputEvents++ } },
     localStorage: { getItem: key => storage.get(key), setItem: (key, value) => storage.set(key, value) },
     document: { querySelectorAll: () => [] }, $: () => ({}), esc: String, Event: class {}, invoke: () => { throw Error('No backend call expected'); },
     createPolarionTaskPicker: options => { picker = options; return {}; }, showOperationToast: () => {},
@@ -770,4 +770,22 @@ test('technical response facts stay bounded on normal large reads without adding
   assert.equal(requests.length, 1); assert.equal(reply.diagnostics[0].sample_rows, 10);
   assert.ok(reply.diagnostics[0].returned_fields.length <= 32); assert.ok(reply.diagnostics[0].item_types.length <= 12);
   assert.doesNotMatch(JSON.stringify(reply.diagnostics), /PRIVATE_NAME|SECRET/);
+});
+
+const connectionProbeUrl = 'https://polarion.vitesco.io/polarion/rest/v1/projects?page[size]=1&page[number]=1&fields[projects]=id';
+test('connection probe validates one project page without following pagination or returning its contents', async () => {
+  for (const data of [{ data: [] }, { data: [{ type: 'projects', id: 'P' }], links: { next: 'https://polarion.vitesco.io/polarion/rest/v1/projects?page[number]=2' } }]) {
+    const { reply, requests } = await portal({ kind: 'connection', url: connectionProbeUrl, data });
+    assert.equal(reply.code, 'ok'); assert.equal(requests.length, 1);
+    assert.equal(reply.items, undefined); assert.equal(reply.user_id, undefined);
+  }
+});
+test('connection probe rejects unexpected payloads and does not turn authentication errors green', async () => {
+  for (const data of [{ data: {} }, { data: [{ type: 'users', id: 'u' }] }, { data: [{ type: 'projects', id: 'P' }, { type: 'projects', id: 'Q' }] }]) {
+    assert.equal((await portal({ kind: 'connection', url: connectionProbeUrl, data })).reply.code, 'invalid_response');
+  }
+  for (const [status, code] of [[401,'auth_required'], [403,'forbidden'], [404,'api_unavailable']]) {
+    const { reply, requests } = await portal({ kind: 'connection', url: connectionProbeUrl, status });
+    assert.equal(reply.code, code); assert.equal(requests.length, 1);
+  }
 });

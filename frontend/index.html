@@ -11,8 +11,9 @@
        that gap can show a flash of default browser background/font before
        styles.css applies. Keep in sync with the body rule in styles.css. -->
   <style>html,body{width:100%;height:100%;margin:0;overflow:hidden;background:#0d1117;color:#e8eef5;font:14px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}</style>
-  <link rel="stylesheet" href="styles.css?v=20261113-explorer-keys">
-  <link rel="stylesheet" href="polarion.css?v=20261113-explorer-keys">
+  <link rel="stylesheet" href="styles.css?v=20261117-session-navigation">
+  <link rel="stylesheet" href="settings.css?v=20261117-session-navigation">
+  <link rel="stylesheet" href="polarion.css?v=20261117-session-navigation">
 </head>
 <body>
   <div id="startupIntro" class="startup-intro" hidden>
@@ -23,7 +24,7 @@
       <div id="startupIntroFailure" class="startup-intro-failure" hidden><p>Reload the window to retry.</p><button type="button" id="startupIntroRetry">Reload interface</button></div>
     </div>
   </div>
-  <script src="startup-intro.js?v=20261113-explorer-keys"></script>
+  <script src="startup-intro.js?v=20261117-session-navigation"></script>
   <div class="app-shell">
     <header class="topbar">
       <div class="brand" aria-label="Git DrillDown">
@@ -61,6 +62,7 @@
 
     <main class="main-layout details-empty-state">
       <aside class="sidebar">
+        <div class="sidebar-content">
         <button class="nav-item active" id="navExplorer"><span class="nav-icon">▰</span><span>Project Explorer</span></button>
         <button class="nav-item" id="navCommander"><span class="nav-icon">⇄</span><span>Compare & Sync</span></button>
         <button class="nav-item" id="navGraph"><span class="nav-icon">⑂</span><span>Branch Map</span></button>
@@ -88,6 +90,8 @@
              what "PROJECT PULL REQUEST" above is reporting on. -->
         <div class="side-heading pr-status-heading" id="toggleSubmodulePrStatus" title="Pull request status for this submodule's own currently checked-out branch" hidden><span class="branch-heading-arrow" id="submodulePrStatusArrow">▸</span><span id="submodulePrStatusLabel">SUBMODULE PULL REQUEST</span></div>
         <div id="submodulePrStatusPanel" class="pr-status-panel collapsed" hidden></div>
+        </div>
+        <div class="sidebar-footer"><button type="button" id="openSettings" class="settings-trigger" title="Settings" aria-label="Settings"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9.5 3-.7 2.5-2 .9-2.3-.7L2 10l1.8 1.8v2.3L2 16l2.5 4.3 2.4-.7 2 .9.6 2.5h5l.7-2.5 2-.9 2.3.7L22 16l-1.8-1.9v-2.3L22 10l-2.5-4.3-2.4.7-2-.9-.6-2.5Z" transform="translate(1 0) scale(.92)"/><circle cx="12" cy="12" r="3.4"/></svg></button></div>
       </aside>
 
       <section class="content">
@@ -128,8 +132,10 @@
         </div>
 
         <div id="explorerView" class="explorer-view" hidden>
-          <nav id="breadcrumbs" class="breadcrumbs" aria-label="Repository path"></nav>
-          <div id="navigationRefreshNotice" class="navigation-refresh-notice" role="status" aria-live="polite" hidden><span></span><button type="button" hidden>Retry</button></div>
+          <div class="explorer-path-bar">
+            <nav id="breadcrumbs" class="breadcrumbs" aria-label="Repository path"></nav>
+            <div id="navigationRefreshNotice" class="navigation-refresh-notice" role="status" aria-live="polite" hidden><i aria-hidden="true"></i><span></span><button type="button" hidden>Retry</button></div>
+          </div>
           <div class="file-header file-grid"><span>NAME</span><span>GIT</span><span>SIZE</span><span>MODIFIED</span></div>
           <div id="fileList" class="file-list" tabindex="0" aria-label="Project files and folders"></div>
         </div>
@@ -1001,26 +1007,69 @@
       <footer><span>Read-only on Polarion · local snapshots outside Git</span><button value="cancel">Close</button><button type="button" id="polarionAdd" class="confirm" disabled>Add to Commit List</button></footer>
     </form>
   </dialog>
-  <script src="polarion.js?v=20261113-explorer-keys"></script>
-  <script src="console-context.js?v=20261113-explorer-keys"></script>
-  <script src="graph-model.js?v=20261113-explorer-keys"></script>
-  <script src="submodule-state.js?v=20261113-explorer-keys"></script>
-  <script src="submodule-versions.js?v=20261113-explorer-keys"></script>
-  <script src="inspect-network.js?v=20261113-explorer-keys"></script>
-  <script src="module-inspect.js?v=20261113-explorer-keys"></script>
-  <script src="local-diff.js?v=20261113-explorer-keys"></script>
-  <script src="local-drive.js?v=20261113-explorer-keys"></script>
-  <script src="pr-status.js?v=20261113-explorer-keys"></script>
-  <script src="refresh-coordinator.js?v=20261113-explorer-keys"></script>
-  <script src="comparison-authors.js?v=20261113-explorer-keys"></script>
-  <script src="git-activity.js?v=20261113-explorer-keys"></script>
-  <script src="comparison-navigation.js?v=20261113-explorer-keys"></script>
-  <script src="panel-resize.js?v=20261113-explorer-keys"></script>
-  <script src="submodule-compare-details.js?v=20261113-explorer-keys"></script>
-  <script src="branch-reset.js?v=20261113-explorer-keys"></script>
-  <script src="merge-preview.js?v=20261113-explorer-keys"></script>
-  <script src="navigation-refresh.js?v=20261113-explorer-keys"></script>
-  <script src="ipc-diagnostics.js?v=20261113-explorer-keys"></script>
-  <script src="app.js?v=20261113-explorer-keys"></script>
+  <dialog id="settingsDialog" class="settings-dialog" aria-labelledby="settingsTitle">
+    <header><h2 id="settingsTitle">Settings</h2><button type="button" data-settings-close aria-label="Close settings">×</button></header>
+    <nav class="settings-tabs" role="tablist" aria-label="Settings sections">
+      <button type="button" id="settingsConnectionsTab" data-settings-tab="connections" role="tab" aria-selected="true" aria-controls="settingsConnections">Connections</button>
+      <button type="button" id="settingsDiagnosticsTab" data-settings-tab="diagnostics" role="tab" aria-selected="false" aria-controls="settingsDiagnostics" tabindex="-1">About &amp; diagnostics</button>
+    </nav>
+    <div class="settings-body" data-settings="body">
+      <p class="settings-notice" data-settings="notice" role="status"></p>
+      <section id="settingsConnections" data-settings="connections" role="tabpanel" aria-labelledby="settingsConnectionsTab">
+        <p class="settings-context" data-settings="context"></p>
+        <section class="settings-card" aria-label="GitHub connection">
+          <header><h3>GitHub</h3><span class="settings-state" data-settings="github-state" role="status">Not checked</span></header>
+          <p class="settings-host" data-settings="github-host"></p>
+          <label data-settings="github-hosts-label" hidden>Server<select data-settings="github-hosts" aria-label="GitHub server"></select></label>
+          <p class="settings-user" data-settings="github-user">Account not verified</p>
+          <p data-settings="github-detail"></p><p class="settings-checked" data-settings="github-checked"></p>
+          <div class="settings-actions"><button type="button" data-settings="github-check">Check connection</button><button type="button" data-settings="github-connect">Sign in…</button><button type="button" class="settings-link" data-settings="github-open">Open GitHub ↗</button></div>
+          <details><summary>Authentication</summary><p data-settings="github-method"></p><p>Browser sign-in and Git Push may use different credentials.</p></details>
+        </section>
+        <section class="settings-card" aria-label="Polarion connection">
+          <header><h3>Polarion</h3><span class="settings-state" data-settings="polarion-state" role="status">Not checked</span></header>
+          <p class="settings-host">polarion.vitesco.io</p>
+          <p class="settings-user" data-settings="polarion-user">Account not verified</p>
+          <p data-settings="polarion-detail"></p><p class="settings-checked" data-settings="polarion-checked"></p>
+          <div class="settings-actions"><button type="button" data-settings="polarion-check">Check connection</button><button type="button" class="settings-link" data-settings="polarion-connect">Open Polarion / sign in ↗</button></div>
+          <details><summary>Authentication</summary><p data-settings="polarion-method"></p><p data-settings="polarion-remembered"></p></details>
+        </section>
+        <section class="settings-card" aria-label="Git commit identity">
+          <header><h3>Git commit identity</h3><span class="settings-state">Read-only</span></header>
+          <dl><dt>Name</dt><dd data-settings="identity-name">—</dd><dt>Email</dt><dd data-settings="identity-email">—</dd></dl>
+          <p data-settings="identity-detail"></p>
+        </section>
+      </section>
+      <section id="settingsDiagnostics" data-settings="diagnostics" role="tabpanel" aria-labelledby="settingsDiagnosticsTab" hidden>
+        <section class="settings-card"><h3>Git DrillDown</h3><dl><dt>Version</dt><dd data-settings="version">—</dd><dt>Build</dt><dd data-settings="build">—</dd><dt>Platform</dt><dd data-settings="platform">—</dd><dt>Git</dt><dd data-settings="git_version">—</dd><dt>Executable</dt><dd data-settings="git_path">—</dd><dt>Log file</dt><dd data-settings="log_path">—</dd></dl></section>
+        <p class="settings-notice" data-settings="diagnostics-state" role="status"></p>
+        <div class="settings-actions"><button type="button" data-settings="logs">Open log folder</button><button type="button" data-settings="copy" disabled>Copy diagnostic summary</button></div>
+      </section>
+    </div>
+    <footer><small>Connections are checked only when you ask.</small><button type="button" data-settings-close>Close</button></footer>
+  </dialog>
+  <script src="polarion-connection.js?v=20261117-session-navigation"></script>
+  <script src="settings.js?v=20261117-session-navigation"></script>
+  <script src="polarion.js?v=20261117-session-navigation"></script>
+  <script src="console-context.js?v=20261117-session-navigation"></script>
+  <script src="graph-model.js?v=20261117-session-navigation"></script>
+  <script src="submodule-state.js?v=20261117-session-navigation"></script>
+  <script src="submodule-versions.js?v=20261117-session-navigation"></script>
+  <script src="inspect-network.js?v=20261117-session-navigation"></script>
+  <script src="module-inspect.js?v=20261117-session-navigation"></script>
+  <script src="local-diff.js?v=20261117-session-navigation"></script>
+  <script src="local-drive.js?v=20261117-session-navigation"></script>
+  <script src="pr-status.js?v=20261117-session-navigation"></script>
+  <script src="refresh-coordinator.js?v=20261117-session-navigation"></script>
+  <script src="comparison-authors.js?v=20261117-session-navigation"></script>
+  <script src="git-activity.js?v=20261117-session-navigation"></script>
+  <script src="comparison-navigation.js?v=20261117-session-navigation"></script>
+  <script src="panel-resize.js?v=20261117-session-navigation"></script>
+  <script src="submodule-compare-details.js?v=20261117-session-navigation"></script>
+  <script src="branch-reset.js?v=20261117-session-navigation"></script>
+  <script src="merge-preview.js?v=20261117-session-navigation"></script>
+  <script src="navigation-refresh.js?v=20261117-session-navigation"></script>
+  <script src="ipc-diagnostics.js?v=20261117-session-navigation"></script>
+  <script src="app.js?v=20261117-session-navigation"></script>
 </body>
 </html>

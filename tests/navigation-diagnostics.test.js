@@ -87,9 +87,10 @@ test('elapsed feedback changes only text and stops its one timer after verificat
     invoke: () => assert.fail('the feedback clock must not query Git') };
   const time = clock(c);
   vm.runInContext('let navigationFeedbackTimer = null;\n' + source('entryDetailsProgressText') + '\n' + source('syncNavigationRefreshNotice'), c);
-  c.syncNavigationRefreshNotice(); assert.equal(timers.size, 1); assert.match(text.textContent, /0 s/);
+  c.syncNavigationRefreshNotice(); assert.equal(timers.size, 1); assert.equal(notice.hidden, true); assert.equal(c.state.navigationStatusPending, true);
+  time.advance(350); c.syncNavigationRefreshNotice(); assert.equal(notice.hidden, false); assert.equal(text.textContent, 'Checking Git status…');
   time.advance(44000); c.syncNavigationRefreshNotice();
-  assert.equal(timers.size, 1); assert.match(text.textContent, /44 s/); assert.match(label.textContent, /Waiting for repository status verification · 44 s/);
+  assert.equal(timers.size, 1); assert.match(notice.title, /44 s/); assert.match(label.textContent, /Waiting for repository status verification · 44 s/);
   assert.equal(c.state.navigationStatusPending, true);
   jobs[0].phase = 'error'; jobs[0].error = 'scan failed'; jobs[0].target = { repositoryPath: '/repo' }; entry.details_error = true;
   c.syncNavigationRefreshNotice(); assert.equal(timers.size, 0); assert.equal(button.hidden, false);

@@ -1,4 +1,5 @@
 use super::super::*;
+use super::native_merge as native;
 
 #[derive(Serialize, Clone)]
 pub struct ConflictedFile {
@@ -19,6 +20,7 @@ pub struct MergeOutcome {
 pub struct SubmoduleMergeReviewItem {
     pub(in crate::repository) path: String,
     pub(in crate::repository) base: Option<String>,
+    pub(in crate::repository) base_is_ambiguous: bool,
     pub(in crate::repository) current: Option<String>,
     pub(in crate::repository) incoming: Option<String>,
     pub(in crate::repository) result: Option<String>,
@@ -43,12 +45,6 @@ pub struct ConflictSides {
     pub(in crate::repository) theirs: Option<String>,
 }
 
-fn blob_text(repo: &Repository, id: Option<git2::Oid>) -> Option<String> {
-    let id = id?;
-    let blob = repo.find_blob(id).ok()?;
-    Some(String::from_utf8_lossy(blob.content()).into_owned())
-}
-
 fn contains_conflict_markers(bytes: &[u8]) -> bool {
     let text = String::from_utf8_lossy(bytes);
     let mut saw_start = false;
@@ -67,130 +63,58 @@ fn contains_conflict_markers(bytes: &[u8]) -> bool {
 }
 
 const GIT_FILEMODE_COMMIT: u32 = 0o160000;
-const GIT_INDEX_ENTRY_STAGEMASK: u16 = 0x3000;
 
 fn short_oid(oid: Option<git2::Oid>) -> String {
-    oid.map(|oid| oid.to_string()[..8].to_string()).unwrap_or_else(|| "none".into())
+    oid.map(|oid| oid.to_string()[..8].to_string())
+        .unwrap_or_else(|| "none".into())
 }
 
 fn pointer_label(oid: Option<git2::Oid>) -> String {
-    oid.map(|oid| oid.to_string()[..8].to_string()).unwrap_or_else(|| "no submodule".into())
+    oid.map(|oid| oid.to_string()[..8].to_string())
+        .unwrap_or_else(|| "no submodule".into())
 }
 
-fn oid_string(oid: Option<git2::Oid>) -> Option<String> { oid.map(|oid| oid.to_string()) }
-
-fn tree_gitlink_map(tree: &git2::Tree<'_>) -> HashMap<String, git2::Oid> {
-    let mut links = HashMap::new();
-    let _ = tree.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
-        if entry.filemode() == GIT_FILEMODE_COMMIT as i32 {
-            if let Some(name) = entry.name() {
-                links.insert(format!("{root}{name}"), entry.id());
-            }
-        }
-        git2::TreeWalkResult::Ok
-    });
-    links
+fn oid_string(oid: Option<git2::Oid>) -> Option<String> {
+    oid.map(|oid| oid.to_string())
 }
 
-fn index_gitlink_map(repo: &Repository) -> Result<HashMap<String, git2::Oid>, String> {
-    let index = repo.index().map_err(|error| error.message().to_string())?;
-    Ok(index.iter()
-        .filter(|entry| entry.mode == GIT_FILEMODE_COMMIT && (entry.flags & GIT_INDEX_ENTRY_STAGEMASK) == 0)
-        .map(|entry| (String::from_utf8_lossy(&entry.path).into_owned(), entry.id))
-        .collect())
-}
-
-// Check the exact staged .gitmodules blob, not the working copy or .git/config.
-// Git parses its own quoting/escaping; this reads one small object and never
-// scans the working tree or opens/fetches individual submodules.
-fn unregistered_merge_gitlinks(
-    repo: &Repository,
-    repository_path: &str,
-    links: &HashMap<String, git2::Oid>,
-) -> Result<Vec<String>, String> {
-    if links.is_empty() { return Ok(vec![]); }
-    let index = repo.index().map_err(|error| error.message().to_string())?;
-    unregistered_gitlinks_in_index(&index, repository_path, links)
-}
-
-// Also used by the preview's IN-MEMORY index. Never substitute the real index
-// when checking the simulated result's .gitmodules registration.
-pub(super) fn unregistered_gitlinks_in_index(
-    index: &git2::Index,
-    repository_path: &str,
-    links: &HashMap<String, git2::Oid>,
-) -> Result<Vec<String>, String> {
-    if links.is_empty() { return Ok(vec![]); }
-    if (1..=3).any(|stage| index.get_path(Path::new(".gitmodules"), stage).is_some()) {
-        return Err("Resolve the .gitmodules conflict before reviewing or updating submodules.".into());
-    }
-    let mut registered = HashSet::new();
-    if let Some(entry) = index.get_path(Path::new(".gitmodules"), 0) {
-        if entry.mode != 0o100644 && entry.mode != 0o100755 {
-            return Err("The staged .gitmodules must be a regular configuration file before completing this merge.".into());
-        }
-        let blob = entry.id.to_string();
-        let args = ["config", "--no-includes", "--null", "--blob", &blob, "--get-regexp", "^submodule\\..*\\.path$"];
-        let raw = match git_with_timeout(repository_path, &args, Duration::from_secs(30), "30 seconds") {
-            Ok(raw) => raw,
-            // `git config --get-regexp` returns 1 with no stderr for no matches.
-            // An empty set is conservative: every remaining gitlink is blocked.
-            Err(error) if error.is_empty() => String::new(),
-            Err(error) => return Err(format!("Cannot validate the staged .gitmodules: {error}")),
-        };
-        let mut paths_by_key = HashMap::new();
-        for record in raw.split('\0').filter(|record| !record.is_empty()) {
-            let (key, path) = record.split_once('\n').ok_or("Cannot parse the staged .gitmodules paths; merge was not committed.")?;
-            if paths_by_key.insert(key, path.to_owned()).is_some_and(|previous| previous != path) {
-                return Err("The staged .gitmodules has conflicting duplicate submodule paths. Resolve its configuration before completing the merge.".into());
-            }
-        }
-        registered.extend(paths_by_key.into_values());
-    }
-    let mut missing: Vec<_> = links.keys().filter(|path| !registered.contains(*path)).cloned().collect();
-    missing.sort();
-    Ok(missing)
-}
-
-fn validate_merge_gitlinks(repo: &Repository, repository_path: &str) -> Result<(), String> {
+fn validate_merge_gitlinks(repository_path: &str, index: &native::Index) -> Result<(), String> {
     let started = Instant::now();
-    let links = index_gitlink_map(repo)?;
-    let missing = unregistered_merge_gitlinks(repo, repository_path, &links)?;
-    perf_log(&format!("merge_integrity: repo={} gitlinks={} unregistered={} result={}",
-        anonymized_repository_id(repository_path), links.len(), missing.len(),
-        if missing.is_empty() { "accepted" } else { "blocked" }), started.elapsed());
-    if missing.is_empty() { return Ok(()); }
+    let missing = native::unregistered(repository_path, index)?;
+    perf_log(
+        &format!(
+            "merge_integrity: engine=git_cli repo={} gitlinks={} unregistered={} result={}",
+            anonymized_repository_id(repository_path),
+            index.links().len(),
+            missing.len(),
+            if missing.is_empty() {
+                "accepted"
+            } else {
+                "blocked"
+            }
+        ),
+        started.elapsed(),
+    );
+    if missing.is_empty() {
+        return Ok(());
+    }
     for path in missing.iter().take(12) {
-        perf_log(&format!("merge_integrity: repo={} unregistered_path={path:?}", anonymized_repository_id(repository_path)), Duration::ZERO);
+        perf_log(
+            &format!(
+                "merge_integrity: repo={} unregistered_path={path:?}",
+                anonymized_repository_id(repository_path)
+            ),
+            Duration::ZERO,
+        );
     }
-    let shown = missing.iter().take(12).map(|path| format!("- {path}")).collect::<Vec<_>>().join("\n");
-    let more = if missing.len() > 12 { format!("\n- …and {} more", missing.len() - 12) } else { String::new() };
-    Err(format!("Merge not committed: {} submodule pointer(s) remain in the index without a matching path in the staged .gitmodules:\n{shown}{more}\n\nReview these paths. Choose No submodule / Remove gitlink if they were removed, or restore their matching .gitmodules registration if they must stay. Update/init cannot repair this mismatch. No commit or automatic deletion was made.", missing.len()))
+    Err(format!("Merge not committed: submodule pointers remain without a matching path in the staged .gitmodules:\n{}\n\nChoose No submodule / Remove gitlink in merge review, or restore the matching registration. Update/init cannot repair this mismatch. No commit or automatic deletion was made.",missing.iter().take(12).map(|p|format!("- {p}")).collect::<Vec<_>>().join("\n")))
 }
-
-fn initialized_submodule_dirty_paths(repository_path: &str, repo: &Repository) -> Vec<(String, usize)> {
-    let mut dirty = Vec::new();
-    let Ok(submodules) = repo.submodules() else { return dirty; };
-    for submodule in submodules {
-        let Some(path) = submodule.path().to_str().map(|value| value.replace('\\', "/")) else { continue; };
-        let absolute = Path::new(repository_path).join(&path);
-        let Ok(sub_repo) = internal_submodule_repository(&absolute) else { continue; };
-        let count = internal_statuses(&sub_repo, None).map(|statuses| statuses.len()).unwrap_or(0);
-        if count > 0 { dirty.push((path, count)); }
+fn is_submodule_ancestor(root: &str, a: Oid, b: Oid) -> Option<bool> {
+    if a == b {
+        return Some(true);
     }
-    dirty
+    native::ancestor(root, a, b).ok()
 }
-
-fn graph_has_commit(repo: &Repository, oid: git2::Oid) -> bool {
-    repo.find_commit(oid).is_ok()
-}
-
-fn is_submodule_ancestor(repo: &Repository, ancestor: git2::Oid, descendant: git2::Oid) -> Option<bool> {
-    if ancestor == descendant { return Some(true); }
-    if !graph_has_commit(repo, ancestor) || !graph_has_commit(repo, descendant) { return None; }
-    repo.graph_descendant_of(descendant, ancestor).ok()
-}
-
 fn classify_submodule_merge_item(
     repository_path: &str,
     path: &str,
@@ -200,53 +124,43 @@ fn classify_submodule_merge_item(
     result: Option<git2::Oid>,
 ) -> (String, String, bool, Option<String>) {
     let absolute = Path::new(repository_path).join(path);
-    let sub_repo = internal_submodule_repository(&absolute).ok();
-    let local_checkout = sub_repo.as_ref()
-        .and_then(|repo| repo.head().ok())
-        .and_then(|head| head.target())
+    let sub_repo = absolute
+        .join(".git")
+        .exists()
+        .then(|| absolute.to_string_lossy().into_owned());
+    let local_checkout = sub_repo
+        .as_ref()
+        .and_then(|root| native::oid(root, "HEAD").ok())
         .map(|oid| oid.to_string());
 
     let local_mismatch = match (local_checkout.as_deref(), result) {
         (Some(local), Some(result)) => local != result.to_string(),
         _ => false,
     };
-    let incoming_ahead_current = sub_repo.as_ref().and_then(|repo| match (current, incoming) {
-        (Some(current), Some(incoming)) => is_submodule_ancestor(repo, current, incoming),
-        _ => None,
-    }).unwrap_or(false) && current != incoming;
-    let current_ahead_incoming = sub_repo.as_ref().and_then(|repo| match (current, incoming) {
-        (Some(current), Some(incoming)) => is_submodule_ancestor(repo, incoming, current),
-        _ => None,
-    }).unwrap_or(false) && current != incoming;
-    let result_behind_incoming = sub_repo.as_ref().and_then(|repo| match (result, incoming) {
-        (Some(result), Some(incoming)) => is_submodule_ancestor(repo, result, incoming),
-        _ => None,
-    }).unwrap_or(false) && result != incoming;
-    let result_behind_current = sub_repo.as_ref().and_then(|repo| match (result, current) {
-        (Some(result), Some(current)) => is_submodule_ancestor(repo, result, current),
-        _ => None,
-    }).unwrap_or(false) && result != current;
-    let current_and_incoming_diverged = sub_repo.as_ref().and_then(|repo| match (current, incoming) {
-        (Some(current), Some(incoming)) => {
-            let current_contains_incoming = is_submodule_ancestor(repo, incoming, current)?;
-            let incoming_contains_current = is_submodule_ancestor(repo, current, incoming)?;
-            Some(!current_contains_incoming && !incoming_contains_current)
-        }
-        _ => None,
-    }).unwrap_or(false);
-
     if result == current && base == incoming && current != incoming {
         let mut reason = format!(
             "Incoming/origin did not change this submodule since the merge base. Prepared result chose Current Branch: {}.",
             pointer_label(current),
         );
         if local_mismatch {
-            reason.push_str(&format!(" Folder on disk is {}, while the selected pointer is {}.", local_checkout.as_deref().unwrap_or("unknown"), pointer_label(result)));
+            reason.push_str(&format!(
+                " Folder on disk is {}, while the selected pointer is {}.",
+                local_checkout.as_deref().unwrap_or("unknown"),
+                pointer_label(result)
+            ));
         }
         if current.is_none() && incoming.is_some() {
-            reason.push_str(&format!(" Use Incoming/origin only if you want to restore {}.", pointer_label(incoming)));
+            reason.push_str(&format!(
+                " Use Incoming/origin only if you want to restore {}.",
+                pointer_label(incoming)
+            ));
         }
-        return ("Kept current".into(), reason, local_mismatch, local_checkout);
+        return (
+            "Kept current".into(),
+            reason,
+            local_mismatch,
+            local_checkout,
+        );
     }
     if result == incoming && base == current && current != incoming {
         let mut reason = format!(
@@ -254,24 +168,61 @@ fn classify_submodule_merge_item(
             pointer_label(incoming),
         );
         if local_mismatch {
-            reason.push_str(&format!(" Folder on disk is still at {}, so run submodule update when ready.", local_checkout.as_deref().unwrap_or("unknown")));
+            reason.push_str(&format!(
+                " Folder on disk is still at {}, so run submodule update when ready.",
+                local_checkout.as_deref().unwrap_or("unknown")
+            ));
         }
         if incoming.is_none() && current.is_some() {
             reason.push_str(" The incoming side removes the submodule pointer.");
         }
-        return ("Incoming applied".into(), reason, local_mismatch, local_checkout);
+        return (
+            "Incoming applied".into(),
+            reason,
+            local_mismatch,
+            local_checkout,
+        );
     }
     if result == incoming {
-        let mut reason = format!("Prepared result chose Incoming/origin: {}.", pointer_label(incoming));
+        let mut reason = format!(
+            "Prepared result chose Incoming/origin: {}.",
+            pointer_label(incoming)
+        );
         if base == incoming && current != incoming {
-            reason.push_str(&format!(" Current Branch was {}, so review this if you expected to keep your branch state.", pointer_label(current)));
+            reason.push_str(&format!(
+                " Current Branch was {}, so review this if you expected to keep your branch state.",
+                pointer_label(current)
+            ));
             return ("Review recommended".into(), reason, true, local_checkout);
         }
         if local_mismatch {
-            reason.push_str(&format!(" Folder on disk is still at {}, so run submodule update when ready.", local_checkout.as_deref().unwrap_or("unknown")));
+            reason.push_str(&format!(
+                " Folder on disk is still at {}, so run submodule update when ready.",
+                local_checkout.as_deref().unwrap_or("unknown")
+            ));
         }
-        return ("Incoming applied".into(), reason, local_mismatch, local_checkout);
+        return (
+            "Incoming applied".into(),
+            reason,
+            local_mismatch,
+            local_checkout,
+        );
     }
+    let forward = sub_repo
+        .as_ref()
+        .and_then(|repo| match (current, incoming) {
+            (Some(a), Some(b)) if a != b => is_submodule_ancestor(repo, a, b),
+            _ => None,
+        });
+    let backward = sub_repo
+        .as_ref()
+        .and_then(|repo| match (current, incoming) {
+            (Some(a), Some(b)) if a != b => is_submodule_ancestor(repo, b, a),
+            _ => None,
+        });
+    let incoming_ahead_current = forward == Some(true);
+    let current_ahead_incoming = backward == Some(true);
+    let current_and_incoming_diverged = forward == Some(false) && backward == Some(false);
     if result == current {
         if incoming_ahead_current {
             return (
@@ -289,15 +240,30 @@ fn classify_submodule_merge_item(
                 local_checkout,
             );
         }
-        let mut reason = format!("Prepared result chose Current Branch: {}.", pointer_label(current));
+        let mut reason = format!(
+            "Prepared result chose Current Branch: {}.",
+            pointer_label(current)
+        );
         if base == current && incoming != current {
-            reason.push_str(&format!(" Incoming/origin changed this pointer to {}, so review before committing.", pointer_label(incoming)));
+            reason.push_str(&format!(
+                " Incoming/origin changed this pointer to {}, so review before committing.",
+                pointer_label(incoming)
+            ));
             return ("Review recommended".into(), reason, true, local_checkout);
         }
         if local_mismatch {
-            reason.push_str(&format!(" Folder on disk is {}, while the selected pointer is {}.", local_checkout.as_deref().unwrap_or("unknown"), short_oid(result)));
+            reason.push_str(&format!(
+                " Folder on disk is {}, while the selected pointer is {}.",
+                local_checkout.as_deref().unwrap_or("unknown"),
+                short_oid(result)
+            ));
         }
-        return ("Kept current".into(), reason, local_mismatch, local_checkout);
+        return (
+            "Kept current".into(),
+            reason,
+            local_mismatch,
+            local_checkout,
+        );
     }
     if result.is_some() && result != current && result != incoming {
         return (
@@ -307,18 +273,14 @@ fn classify_submodule_merge_item(
             local_checkout,
         );
     }
-    if result_behind_incoming || result_behind_current {
-        return (
-            "Possible rollback".into(),
-            format!("Prepared result {} appears to be an ancestor of another selected side (Current Branch {}, Incoming/origin {}).", short_oid(result), short_oid(current), short_oid(incoming)),
-            true,
-            local_checkout,
-        );
-    }
     if current_and_incoming_diverged {
         return (
             "Diverged history".into(),
-            format!("Current branch ({}) and incoming/origin ({}) diverged in this submodule.", short_oid(current), short_oid(incoming)),
+            format!(
+                "Current branch ({}) and incoming/origin ({}) diverged in this submodule.",
+                short_oid(current),
+                short_oid(incoming)
+            ),
             true,
             local_checkout,
         );
@@ -326,7 +288,11 @@ fn classify_submodule_merge_item(
     if current_ahead_incoming {
         return (
             "Current branch ahead".into(),
-            format!("Current branch points to a descendant ({}) of incoming/origin ({}).", short_oid(current), short_oid(incoming)),
+            format!(
+                "Current branch points to a descendant ({}) of incoming/origin ({}).",
+                short_oid(current),
+                short_oid(incoming)
+            ),
             false,
             local_checkout,
         );
@@ -339,23 +305,33 @@ fn classify_submodule_merge_item(
     )
 }
 
-fn submodule_merge_review_inner(repo: &mut Repository, repository_path: &str) -> Result<SubmoduleMergeReview, String> {
-    if repo.state() != git2::RepositoryState::Merge {
-        return Ok(SubmoduleMergeReview { items: vec![], warnings: 0, summary: "No merge is in progress.".into() });
+fn submodule_merge_review_inner(repository_path: &str) -> Result<SubmoduleMergeReview, String> {
+    if !native::in_progress(repository_path)? {
+        return Ok(SubmoduleMergeReview {
+            items: vec![],
+            warnings: 0,
+            summary: "No merge is in progress.".into(),
+        });
     }
-    let mut merge_heads = Vec::new();
-    repo.mergehead_foreach(|oid| { merge_heads.push(*oid); true }).map_err(|error| error.message().to_string())?;
-    let current_commit = repo.head().map_err(|error| error.message().to_string())?.peel_to_commit().map_err(|error| error.message().to_string())?;
-    let incoming_oid = merge_heads.first().copied().ok_or_else(|| "Merge is in progress, but MERGE_HEAD is missing.".to_string())?;
-    let incoming_commit = repo.find_commit(incoming_oid).map_err(|error| error.message().to_string())?;
-    let base_oid = repo.merge_base(current_commit.id(), incoming_commit.id()).ok();
-    let current_links = tree_gitlink_map(&current_commit.tree().map_err(|error| error.message().to_string())?);
-    let incoming_links = tree_gitlink_map(&incoming_commit.tree().map_err(|error| error.message().to_string())?);
-    let base_links = base_oid.and_then(|oid| repo.find_commit(oid).ok()).and_then(|commit| commit.tree().ok()).map(|tree| tree_gitlink_map(&tree)).unwrap_or_default();
-    let result_links = index_gitlink_map(repo)?;
-    let unregistered: HashSet<_> = unregistered_merge_gitlinks(repo, repository_path, &result_links)?.into_iter().collect();
-
-    let mut paths: Vec<String> = base_links.keys()
+    let current_oid = native::oid(repository_path, "HEAD")?;
+    let incoming_oid = *native::heads(repository_path)?
+        .first()
+        .ok_or("MERGE_HEAD is missing")?;
+    let bases = native::bases(repository_path, current_oid, incoming_oid)?;
+    let current_links = native::tree(repository_path, &current_oid.to_string())?.links();
+    let incoming_links = native::tree(repository_path, &incoming_oid.to_string())?.links();
+    let base_links = if bases.len() == 1 {
+        native::tree(repository_path, &bases[0].to_string())?.links()
+    } else {
+        HashMap::new()
+    };
+    let index = native::index(repository_path)?;
+    let result_links = index.links();
+    let unregistered: HashSet<_> = native::unregistered(repository_path, &index)?
+        .into_iter()
+        .collect();
+    let mut paths: Vec<String> = base_links
+        .keys()
         .chain(current_links.keys())
         .chain(incoming_links.keys())
         .chain(result_links.keys())
@@ -371,10 +347,21 @@ fn submodule_merge_review_inner(repo: &mut Repository, repository_path: &str) ->
         let current = current_links.get(&path).copied();
         let incoming = incoming_links.get(&path).copied();
         let result = result_links.get(&path).copied();
-        let unique: HashSet<Option<git2::Oid>> = [base, current, incoming, result].into_iter().collect();
+        let unique: HashSet<Option<git2::Oid>> =
+            [base, current, incoming, result].into_iter().collect();
         let registration_issue = unregistered.contains(&path);
-        if unique.len() <= 1 && !registration_issue { continue; }
-        let (mut status, mut reason, mut suspicious, local_checkout) = classify_submodule_merge_item(repository_path, &path, base, current, incoming, result);
+        if (unique.len() <= 1 || (bases.len() != 1 && current == incoming && incoming == result))
+            && !registration_issue
+        {
+            continue;
+        }
+        let (mut status, mut reason, mut suspicious, local_checkout) =
+            classify_submodule_merge_item(repository_path, &path, base, current, incoming, result);
+        if bases.len() != 1 {
+            status = "Review recommended".into();
+            suspicious = true;
+            reason=format!("Multiple common bases; Git computed a virtual base. Prepared pointer: {}. Review the current and incoming versions before committing.",pointer_label(result));
+        }
         if registration_issue {
             status = "Missing .gitmodules entry".into();
             reason.push_str(" The prepared gitlink has no matching path in the staged .gitmodules. Choose No submodule / Remove gitlink if removed, or restore its registration if it must stay. Update/init cannot fix this mismatch; completing the merge is blocked until resolved.");
@@ -385,6 +372,7 @@ fn submodule_merge_review_inner(repo: &mut Repository, repository_path: &str) ->
         items.push(SubmoduleMergeReviewItem {
             path,
             base: oid_string(base),
+            base_is_ambiguous: bases.len() != 1,
             current: oid_string(current),
             incoming: oid_string(incoming),
             result: oid_string(result),
@@ -399,39 +387,62 @@ fn submodule_merge_review_inner(repo: &mut Repository, repository_path: &str) ->
     let summary = if items.is_empty() {
         "No submodule pointer changes were detected in this merge.".into()
     } else {
-        format!("{} submodule pointer change{} · {} need review", items.len(), if items.len() == 1 { "" } else { "s" }, warnings)
+        format!(
+            "{} submodule pointer change{} · {} need review",
+            items.len(),
+            if items.len() == 1 { "" } else { "s" },
+            warnings
+        )
     };
-    Ok(SubmoduleMergeReview { items, warnings, summary })
+    Ok(SubmoduleMergeReview {
+        items,
+        warnings,
+        summary,
+    })
 }
 
-fn gather_conflicts(repo: &Repository) -> Result<Vec<ConflictedFile>, String> {
-    let index = repo.index().map_err(|error| error.message().to_string())?;
-    let conflicts = index.conflicts().map_err(|error| error.message().to_string())?;
-    let mut files = Vec::new();
-    for conflict in conflicts.flatten() {
-        let path = conflict.our.as_ref().or(conflict.their.as_ref()).or(conflict.ancestor.as_ref())
-            .map(|entry| String::from_utf8_lossy(&entry.path).into_owned());
-        if let Some(path) = path {
-            let kind = if conflict.our.as_ref().or(conflict.their.as_ref()).or(conflict.ancestor.as_ref()).map(|entry| entry.mode) == Some(GIT_FILEMODE_COMMIT) {
+fn gather_conflicts(repository_path: &str) -> Result<Vec<ConflictedFile>, String> {
+    let index = native::index(repository_path)?;
+    Ok(index
+        .conflict_paths()
+        .into_iter()
+        .map(|path| {
+            let kind = if (1..=3).any(|stage| {
+                index
+                    .get(&path, stage)
+                    .is_some_and(|e| e.mode == GIT_FILEMODE_COMMIT)
+            }) {
                 "submodule"
             } else {
                 "file"
             };
-            files.push(ConflictedFile { path, has_ours: conflict.our.is_some(), has_theirs: conflict.their.is_some(), kind: kind.into() });
-        }
-    }
-    Ok(files)
+            ConflictedFile {
+                has_ours: index.get(&path, 2).is_some(),
+                has_theirs: index.get(&path, 3).is_some(),
+                path,
+                kind: kind.into(),
+            }
+        })
+        .collect())
 }
 
 // Works on either the parent repository or a submodule repository selected
 // through target_path. The repository resolution stays shared with all other
 // branch actions so commands cannot silently operate on the wrong scope.
 #[tauri::command]
-pub async fn merge_branch(repository_path: String, target_path: String, source_ref: String) -> Result<MergeOutcome, String> {
+pub async fn merge_branch(
+    repository_path: String,
+    target_path: String,
+    source_ref: String,
+) -> Result<MergeOutcome, String> {
     off_main_thread(move || merge_branch_inner(repository_path, target_path, source_ref)).await
 }
 
-pub(in crate::repository) fn merge_branch_inner(repository_path: String, target_path: String, source_ref: String) -> Result<MergeOutcome, String> {
+pub(in crate::repository) fn merge_branch_inner(
+    repository_path: String,
+    target_path: String,
+    source_ref: String,
+) -> Result<MergeOutcome, String> {
     let target_is_submodule = !target_path.trim().is_empty();
     let repository_path = resolve_target_repository(&repository_path, &target_path)?;
     validate_path(&repository_path)?;
@@ -439,140 +450,219 @@ pub(in crate::repository) fn merge_branch_inner(repository_path: String, target_
     let lock_handle = repo_write_lock(&repository_path);
     let _lock = lock_handle.lock().unwrap();
     log_repo_write_lock_acquired(&repository_path, "merge_branch", queue_started.elapsed());
-    let mut repo = internal_repository(&repository_path)?;
-    if repo.state() != git2::RepositoryState::Clean {
-        return Err("A merge (or other operation) is already in progress here. Resolve or abort it first.".into());
+    let plan = native::plan(&repository_path, source_ref.trim(), None)?;
+    let current_branch = plan
+        .branch
+        .as_ref()
+        .ok_or("This is a detached HEAD; create or switch to a local branch before merging.")?;
+    let dirty = native::bytes(
+        &repository_path,
+        &[
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=normal",
+            "--ignore-submodules=none",
+        ],
+    )?;
+    if !dirty.is_empty() {
+        return Err(format!("Cannot start the merge while local changes exist. Main Repository / Initialized submodules with local changes:\n{}\nCommit, stash or discard them first.",String::from_utf8_lossy(&dirty).replace('\0',"\n")));
     }
-    let dirty = internal_statuses(&repo, None)?;
-    let dirty_submodules = if target_is_submodule { Vec::new() } else { initialized_submodule_dirty_paths(&repository_path, &repo) };
-    if !dirty.is_empty() || !dirty_submodules.is_empty() {
-        let mut details = Vec::new();
-        if !dirty.is_empty() {
-            details.push(format!("Main Repository has {} uncommitted change{}.", dirty.len(), if dirty.len() == 1 { "" } else { "s" }));
-        }
-        if !dirty_submodules.is_empty() {
-            let shown = dirty_submodules.iter().take(8)
-                .map(|(path, count)| format!("- {path} ({count} local change{})", if *count == 1 { "" } else { "s" }))
-                .collect::<Vec<_>>()
-                .join("\n");
-            let more = if dirty_submodules.len() > 8 { format!("\n- …and {} more", dirty_submodules.len() - 8) } else { String::new() };
-            details.push(format!("Initialized submodules with local changes:\n{shown}{more}"));
-        }
-        return Err(format!("Cannot start the merge while local changes exist. Commit, stash or discard them first so the merge cannot overwrite local work.\n\n{}", details.join("\n\n")));
+    perf_log(
+        &format!(
+            "merge_start: engine=git_cli repo={} current={} incoming={} bases={:?}",
+            anonymized_repository_id(&repository_path),
+            plan.current,
+            plan.incoming,
+            plan.bases
+        ),
+        Duration::ZERO,
+    );
+    if plan.status == "up_to_date" {
+        return Ok(MergeOutcome {
+            status: "up_to_date".into(),
+            message: format!("{current_branch} is already up to date with {source_ref}."),
+            conflicts: vec![],
+        });
     }
-    if repo.head_detached().unwrap_or(true) {
-        return Err("This is a detached HEAD (not on a branch), so there is nothing to merge into.".into());
+    // Pin commits, not a ref that can move during the operation. Fast-forward
+    // stays a fast-forward; --no-commit alone cannot pause one for review.
+    if plan.status == "fast_forward" {
+        validate_merge_gitlinks(&repository_path, &plan.result)?;
     }
-    let current_branch = repo.head().ok().and_then(|head| head.shorthand().map(String::from)).ok_or("Could not determine the current branch")?;
-    let reference = repo.resolve_reference_from_short_name(source_ref.trim()).map_err(|_| format!("Could not find branch \"{source_ref}\" — fetch first if it's a remote branch."))?;
-    let annotated = repo.reference_to_annotated_commit(&reference).map_err(|error| error.message().to_string())?;
-    let (analysis, _) = repo.merge_analysis(&[&annotated]).map_err(|error| error.message().to_string())?;
-    let current_oid = repo.head().ok().and_then(|head| head.target());
-    perf_log(&format!("merge_start: repo={} current={} incoming={} base={}",
-        anonymized_repository_id(&repository_path), oid_string(current_oid).unwrap_or_default(), annotated.id(),
-        oid_string(current_oid.and_then(|current| repo.merge_base(current, annotated.id()).ok())).unwrap_or_default()), Duration::ZERO);
-
-    if analysis.is_up_to_date() {
-        return Ok(MergeOutcome { status: "up_to_date".into(), message: format!("{current_branch} is already up to date with {source_ref}."), conflicts: vec![] });
+    if native::oid(&repository_path, "HEAD")? != plan.current
+        || native::branch(&repository_path)? != plan.branch
+        || native::oid(&repository_path, source_ref.trim())? != plan.incoming
+    {
+        return Err("A branch changed before the merge. Refresh and preview again.".into());
     }
-    if analysis.is_fast_forward() {
-        let target = annotated.id();
-        let mut local = repo.find_reference(&format!("refs/heads/{current_branch}")).map_err(|error| error.message().to_string())?;
-        let target_commit = repo.find_commit(target).map_err(|error| error.message().to_string())?;
-        let mut checkout = git2::build::CheckoutBuilder::new();
-        checkout.safe();
-        // Do not advance the branch before files/index have been checked out.
-        // On an I/O failure the original ref remains recoverable; never hide
-        // partially changed files behind an unchanged cached status.
-        let checkout_result = repo.checkout_tree(target_commit.as_object(), Some(&mut checkout));
-        invalidate_git_metadata(&repository_path);
-        checkout_result.map_err(|error| format!("Fast-forward checkout failed; the branch was not advanced. Files may have changed; review the working tree before retrying. {}", error.message()))?;
-        local.set_target(target, "fast-forward merge").map_err(|error| format!("Files were checked out, but the branch could not be advanced. Review the working tree before retrying. {}", error.message()))?;
-        invalidate_git_metadata(&repository_path);
-        return Ok(MergeOutcome { status: "fast_forwarded".into(), message: format!("Fast-forwarded {current_branch} to {source_ref}."), conflicts: vec![] });
-    }
-
-    let mut checkout = git2::build::CheckoutBuilder::new();
-    checkout.allow_conflicts(true).conflict_style_merge(true).force();
-    let merge_result = repo.merge(&[&annotated], None, Some(&mut checkout));
+    let incoming = plan.incoming.to_string();
+    let args = if plan.status == "fast_forward" {
+        vec![
+            "merge",
+            "--ff-only",
+            "--no-edit",
+            "--no-autostash",
+            "--no-overwrite-ignore",
+            &incoming,
+        ]
+    } else {
+        vec![
+            "merge",
+            "--no-ff",
+            "--no-commit",
+            "--no-edit",
+            "--no-autostash",
+            "--no-rerere-autoupdate",
+            "--no-overwrite-ignore",
+            "-s",
+            "ort",
+            &incoming,
+        ]
+    };
+    let branch_options = format!("branch.{current_branch}.mergeOptions=");
+    let mut command = vec!["-c", branch_options.as_str()];
+    command.extend(args);
+    let executed = native::output(&repository_path, &command);
     invalidate_git_metadata(&repository_path);
-    merge_result.map_err(|error| format!("Merge did not complete. Files or merge state may have changed; review conflicts and the working tree before retrying. {}", error.message()))?;
-    // Record prepared pointers before any conflict resolution/review changes
-    // them. Tree-to-tree metadata only: no working-tree or child-repo scans.
-    if let (Some(current), Ok(incoming)) = (current_oid.and_then(|oid| repo.find_commit(oid).ok()), repo.find_commit(annotated.id())) {
-        if let (Ok(current), Ok(incoming), Ok(index)) = (current.tree(), incoming.tree(), repo.index()) {
-            if let Ok(diff) = repo.diff_tree_to_tree(Some(&current), Some(&incoming), None) {
-                for delta in diff.deltas().filter(|delta| delta.old_file().mode() == git2::FileMode::Commit || delta.new_file().mode() == git2::FileMode::Commit) {
-                    if let Some(path) = delta.new_file().path().or(delta.old_file().path()) {
-                        let prepared = index.get_path(path, 0).filter(|entry| entry.mode == GIT_FILEMODE_COMMIT).map(|entry| entry.id);
-                        perf_log(&format!("merge_prepared: repo={} path={:?} current={} incoming={} index={}",
-                            anonymized_repository_id(&repository_path), normalized(path),
-                            if delta.old_file().mode() == git2::FileMode::Commit { short_oid(Some(delta.old_file().id())) } else { "none".into() },
-                            if delta.new_file().mode() == git2::FileMode::Commit { short_oid(Some(delta.new_file().id())) } else { "none".into() }, short_oid(prepared)), Duration::ZERO);
-                    }
-                }
-            }
-        }
+    let output = executed.map_err(|e| {
+        format!(
+            "Merge did not complete. Review the working tree and merge state before retrying. {e}"
+        )
+    })?;
+    let index = native::index(&repository_path)?;
+    if !output.status.success()
+        && !(output.status.code() == Some(1)
+            && index.conflicted()
+            && native::in_progress(&repository_path)?)
+    {
+        return Err(format!(
+            "Merge did not complete. Review the working tree and merge state before retrying. {}",
+            native::failure(&output)
+        ));
     }
-    drop(annotated);
-    drop(reference);
-
-    let index = repo.index().map_err(|error| error.message().to_string())?;
-    if index.has_conflicts() {
-        let conflicts = gather_conflicts(&repo)?;
-        for conflict in &conflicts {
-            perf_log(&format!("merge_conflict: repo={} path={:?} kind={} has_current={} has_incoming={}",
-                anonymized_repository_id(&repository_path), conflict.path, conflict.kind, conflict.has_ours, conflict.has_theirs), Duration::ZERO);
-        }
-        let count = conflicts.len();
-        return Ok(MergeOutcome { status: "conflicts".into(), message: format!("Merging {source_ref} produced {count} conflict{}. Resolve them, then complete the merge.", if count == 1 { "" } else { "s" }), conflicts });
+    let actual_head = native::oid(&repository_path, "HEAD")?;
+    let expected_head = if plan.status == "fast_forward" {
+        plan.incoming
+    } else {
+        plan.current
+    };
+    if actual_head != expected_head || native::branch(&repository_path)? != plan.branch {
+        return Err("The checked-out branch changed while Git prepared the merge. Inspect the repository before continuing; no automatic commit was made.".into());
     }
-
-    drop(index);
+    if plan.status != "fast_forward" && native::heads(&repository_path)? != vec![plan.incoming] {
+        return Err("The pending merge's incoming commit changed. Inspect the merge state before continuing; no automatic commit was made.".into());
+    }
+    if index.entries != plan.result.entries {
+        if plan.status == "fast_forward" {
+            return Err("The fast-forward ran, but the index differs from its verified target. Inspect the repository before retrying.".into());
+        }
+        return Err("Git prepared a different index from the preview (for example an external process or hook changed it). No automatic commit was made. Review the pending merge before continuing.".into());
+    }
+    perf_log(
+        "merge_native: preview_matches_prepared=true",
+        Duration::ZERO,
+    );
+    if plan.status == "fast_forward" {
+        return Ok(MergeOutcome {
+            status: "fast_forwarded".into(),
+            message: format!("Fast-forwarded {current_branch} to {source_ref}."),
+            conflicts: vec![],
+        });
+    }
+    if index.conflicted() {
+        let conflicts = gather_conflicts(&repository_path)?;
+        return Ok(MergeOutcome{status:"conflicts".into(),message:format!("Merging {source_ref} produced {} conflicts. Resolve them, then complete the merge.",conflicts.len()),conflicts});
+    }
     if !target_is_submodule {
-        let review = submodule_merge_review_inner(&mut repo, &repository_path)?;
+        let review = submodule_merge_review_inner(&repository_path)?;
         if !review.items.is_empty() {
-            return Ok(MergeOutcome {
-                status: "submodule_review".into(),
-                message: format!("Merge prepared. Review {} submodule pointer{} before creating the merge commit.", review.items.len(), if review.items.len() == 1 { "" } else { "s" }),
-                conflicts: vec![],
-            });
+            return Ok(MergeOutcome{status:"submodule_review".into(),message:format!("Merge prepared. Review {} submodule pointers before creating the merge commit.",review.items.len()),conflicts:vec![]});
         }
     }
-    let oid = complete_merge_internal(&mut repo, &repository_path, &format!("Merge {source_ref} into {current_branch}"))?;
-    Ok(MergeOutcome { status: "merged".into(), message: format!("Merged {source_ref} into {current_branch} ({}).", &oid[..8.min(oid.len())]), conflicts: vec![] })
+    let oid = complete_merge_internal(
+        &repository_path,
+        &format!("Merge {source_ref} into {current_branch}"),
+    )?;
+    Ok(MergeOutcome {
+        status: "merged".into(),
+        message: format!("Merged {source_ref} into {current_branch} ({}).", &oid[..8]),
+        conflicts: vec![],
+    })
 }
 
 #[tauri::command]
-pub fn merge_in_progress(repository_path: String, target_path: String) -> Result<bool, String> {
+pub async fn merge_in_progress(
+    repository_path: String,
+    target_path: String,
+) -> Result<bool, String> {
+    off_main_thread(move || merge_in_progress_inner(repository_path, target_path)).await
+}
+pub(in crate::repository) fn merge_in_progress_inner(
+    repository_path: String,
+    target_path: String,
+) -> Result<bool, String> {
     let repository_path = resolve_target_repository(&repository_path, &target_path)?;
     validate_path(&repository_path)?;
-    let repo = internal_repository(&repository_path)?;
-    Ok(repo.state() == git2::RepositoryState::Merge)
+    native::in_progress(&repository_path)
 }
 
 #[tauri::command]
-pub fn list_conflicts(repository_path: String, target_path: String) -> Result<Vec<ConflictedFile>, String> {
+pub async fn list_conflicts(
+    repository_path: String,
+    target_path: String,
+) -> Result<Vec<ConflictedFile>, String> {
+    off_main_thread(move || list_conflicts_inner(repository_path, target_path)).await
+}
+pub(in crate::repository) fn list_conflicts_inner(
+    repository_path: String,
+    target_path: String,
+) -> Result<Vec<ConflictedFile>, String> {
     let repository_path = resolve_target_repository(&repository_path, &target_path)?;
     validate_path(&repository_path)?;
-    let repo = internal_repository(&repository_path)?;
-    gather_conflicts(&repo)
+    gather_conflicts(&repository_path)
 }
 
 #[tauri::command]
-pub async fn submodule_merge_review(repository_path: String, target_path: String) -> Result<SubmoduleMergeReview, String> {
-    off_main_thread(move || submodule_merge_review_request_inner(repository_path, target_path)).await
+pub async fn submodule_merge_review(
+    repository_path: String,
+    target_path: String,
+) -> Result<SubmoduleMergeReview, String> {
+    off_main_thread(move || submodule_merge_review_request_inner(repository_path, target_path))
+        .await
 }
 
-pub(in crate::repository) fn submodule_merge_review_request_inner(repository_path: String, target_path: String) -> Result<SubmoduleMergeReview, String> {
+pub(in crate::repository) fn submodule_merge_review_request_inner(
+    repository_path: String,
+    target_path: String,
+) -> Result<SubmoduleMergeReview, String> {
     let repository_path = resolve_target_repository(&repository_path, &target_path)?;
     validate_path(&repository_path)?;
-    let mut repo = internal_repository(&repository_path)?;
-    submodule_merge_review_inner(&mut repo, &repository_path)
+    let handle = repo_write_lock(&repository_path);
+    let _guard = handle
+        .lock()
+        .map_err(|_| "Repository operation lock is unavailable.")?;
+    submodule_merge_review_inner(&repository_path)
 }
 
 #[tauri::command]
-pub fn apply_submodule_merge_revision(repository_path: String, target_path: String, relative_path: String, revision: String) -> Result<(), String> {
+pub async fn apply_submodule_merge_revision(
+    repository_path: String,
+    target_path: String,
+    relative_path: String,
+    revision: String,
+) -> Result<(), String> {
+    off_main_thread(move || {
+        apply_submodule_merge_revision_inner(repository_path, target_path, relative_path, revision)
+    })
+    .await
+}
+pub(in crate::repository) fn apply_submodule_merge_revision_inner(
+    repository_path: String,
+    target_path: String,
+    relative_path: String,
+    revision: String,
+) -> Result<(), String> {
     let repository_path = resolve_target_repository(&repository_path, &target_path)?;
     validate_path(&repository_path)?;
     let relative = safe_relative_path(&relative_path)?;
@@ -581,84 +671,100 @@ pub fn apply_submodule_merge_revision(repository_path: String, target_path: Stri
     let queue_started = Instant::now();
     let lock_handle = repo_write_lock(&repository_path);
     let _lock = lock_handle.lock().unwrap();
-    log_repo_write_lock_acquired(&repository_path, "apply_submodule_merge_revision", queue_started.elapsed());
-    let repo = internal_repository(&repository_path)?;
-    if repo.state() != git2::RepositoryState::Merge {
+    log_repo_write_lock_acquired(
+        &repository_path,
+        "apply_submodule_merge_revision",
+        queue_started.elapsed(),
+    );
+    if !native::in_progress(&repository_path)? {
         return Err("There is no merge in progress here.".into());
     }
-    let previous = repo.index().ok().and_then(|index| index.get_path(&relative, 0)).map(|entry| entry.id);
-    let selected_log = if revision.is_empty() || revision == "__none__" { "none".into() }
-        else { git2::Oid::from_str(revision).map(|oid| oid.to_string()).unwrap_or_else(|_| "invalid".into()) };
-    perf_log(&format!("merge_submodule_choice: repo={} path={relative_string:?} previous={} selected={selected_log}",
-        anonymized_repository_id(&repository_path), short_oid(previous)), Duration::ZERO);
-    if revision.is_empty() || revision == "__none__" {
-        let mut index = repo.index().map_err(|error| error.message().to_string())?;
-        let _ = index.conflict_remove(&relative);
-        if index.get_path(&relative, 0).is_some() {
-            index.remove_path(&relative).map_err(|error| error.message().to_string())?;
-        }
-        index.write().map_err(|error| error.message().to_string())?;
-        invalidate_git_metadata(&repository_path);
-        return Ok(());
-    }
-    let oid = git2::Oid::from_str(revision).map_err(|_| format!("Invalid submodule revision \"{revision}\""))?;
-    let submodule_path = Path::new(&repository_path).join(&relative);
-    if let Ok(sub_repo) = internal_submodule_repository(&submodule_path) {
-        if sub_repo.find_commit(oid).is_err() {
-            return Err(format!("{} does not have commit {} locally. Fetch the submodule first or choose a reachable revision.", relative_string, &oid.to_string()[..8]));
+    let index = native::index(&repository_path)?;
+    let previous = index.get(&relative_string, 0).map(|e| e.id);
+    let id = if revision.is_empty() || revision == "__none__" {
+        None
+    } else {
+        Some(Oid::from_str(revision).map_err(|_| "Invalid submodule revision")?)
+    };
+    if let Some(id) = id {
+        let absolute = Path::new(&repository_path).join(&relative);
+        if absolute.join(".git").exists() {
+            native::oid(&absolute.to_string_lossy(),&id.to_string()).map_err(|_|format!("{relative_string} does not have commit {id} locally. Fetch it or choose another revision."))?;
         }
     }
-    let mut index = repo.index().map_err(|error| error.message().to_string())?;
-    let mut entry = index.get_path(&relative, 0).unwrap_or_else(|| git2::IndexEntry {
-        ctime: git2::IndexTime::new(0, 0),
-        mtime: git2::IndexTime::new(0, 0),
-        dev: 0,
-        ino: 0,
-        mode: GIT_FILEMODE_COMMIT,
-        uid: 0,
-        gid: 0,
-        file_size: 0,
-        id: oid,
-        flags: 0,
-        flags_extended: 0,
-        path: relative_string.as_bytes().to_vec(),
-    });
-    entry.id = oid;
-    entry.mode = GIT_FILEMODE_COMMIT;
-    entry.flags &= !GIT_INDEX_ENTRY_STAGEMASK;
-    index.add(&entry).map_err(|error| error.message().to_string())?;
-    index.write().map_err(|error| error.message().to_string())?;
+    // Review only accepts a submodule path from this merge, never an arbitrary
+    // regular-file path supplied by an outdated dialog.
+    let current = native::tree(&repository_path, "HEAD")?;
+    let incoming = native::heads(&repository_path)?
+        .first()
+        .copied()
+        .ok_or("Missing merge head")?;
+    let theirs = native::tree(&repository_path, &incoming.to_string())?;
+    if ![&index, &current, &theirs].iter().any(|idx| {
+        (0..=3).any(|stage| {
+            idx.get(&relative_string, stage)
+                .is_some_and(|e| e.mode == GIT_FILEMODE_COMMIT)
+        })
+    }) {
+        return Err("This path is not a submodule in the pending merge.".into());
+    }
+    let applied = native::set_link(&repository_path, &relative_string, id);
     invalidate_git_metadata(&repository_path);
+    applied?;
+    perf_log(&format!("merge_submodule_choice: engine=git_cli repo={} path={relative_string:?} previous={} selected={}",anonymized_repository_id(&repository_path),short_oid(previous),id.map(|x|x.to_string()).unwrap_or_else(||"none".into())),Duration::ZERO);
     Ok(())
 }
 
 #[tauri::command]
-pub fn conflict_sides(repository_path: String, target_path: String, relative_path: String) -> Result<ConflictSides, String> {
+pub async fn conflict_sides(
+    repository_path: String,
+    target_path: String,
+    relative_path: String,
+) -> Result<ConflictSides, String> {
+    off_main_thread(move || conflict_sides_inner(repository_path, target_path, relative_path)).await
+}
+pub(in crate::repository) fn conflict_sides_inner(
+    repository_path: String,
+    target_path: String,
+    relative_path: String,
+) -> Result<ConflictSides, String> {
     let repository_path = resolve_target_repository(&repository_path, &target_path)?;
     validate_path(&repository_path)?;
     let relative = safe_relative_path(&relative_path)?;
     let relative = normalized(&relative);
-    let repo = internal_repository(&repository_path)?;
-    let index = repo.index().map_err(|error| error.message().to_string())?;
-    let conflicts = index.conflicts().map_err(|error| error.message().to_string())?;
-    for conflict in conflicts.flatten() {
-        let path = conflict.our.as_ref().or(conflict.their.as_ref()).or(conflict.ancestor.as_ref()).map(|entry| String::from_utf8_lossy(&entry.path).into_owned());
-        if path.as_deref() != Some(relative.as_str()) { continue; }
-        return Ok(ConflictSides {
-            ancestor: blob_text(&repo, conflict.ancestor.as_ref().map(|entry| entry.id)),
-            ours: blob_text(&repo, conflict.our.as_ref().map(|entry| entry.id)),
-            theirs: blob_text(&repo, conflict.their.as_ref().map(|entry| entry.id)),
-        });
+    let index = native::index(&repository_path)?;
+    if !(1..=3).any(|stage| index.get(&relative, stage).is_some()) {
+        return Err(format!("{relative_path} is not a conflicted file"));
     }
-    Err(format!("{relative_path} is not a conflicted file"))
+    let read = |stage| -> Option<String> {
+        let e = index.get(&relative, stage)?;
+        if e.mode == GIT_FILEMODE_COMMIT {
+            return None;
+        }
+        String::from_utf8(native::blob(&repository_path, e.id).ok()?).ok()
+    };
+    Ok(ConflictSides {
+        ancestor: read(1),
+        ours: read(2),
+        theirs: read(3),
+    })
 }
 
 #[tauri::command]
-pub async fn open_merge_tool(repository_path: String, target_path: String, relative_path: String) -> Result<String, String> {
-    off_main_thread(move || open_merge_tool_inner(repository_path, target_path, relative_path)).await
+pub async fn open_merge_tool(
+    repository_path: String,
+    target_path: String,
+    relative_path: String,
+) -> Result<String, String> {
+    off_main_thread(move || open_merge_tool_inner(repository_path, target_path, relative_path))
+        .await
 }
 
-fn open_merge_tool_inner(repository_path: String, target_path: String, relative_path: String) -> Result<String, String> {
+fn open_merge_tool_inner(
+    repository_path: String,
+    target_path: String,
+    relative_path: String,
+) -> Result<String, String> {
     let repository_path = resolve_target_repository(&repository_path, &target_path)?;
     validate_path(&repository_path)?;
     let relative = safe_relative_path(&relative_path)?;
@@ -668,7 +774,12 @@ fn open_merge_tool_inner(repository_path: String, target_path: String, relative_
         .current_dir(&repository_path)
         .output()
         .ok()
-        .and_then(|output| output.status.success().then(|| String::from_utf8_lossy(&output.stdout).trim().to_string()))
+        .and_then(|output| {
+            output
+                .status
+                .success()
+                .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        })
         .filter(|tool| !tool.is_empty());
     let output = Command::new("git")
         .args(["mergetool", "--no-prompt", "--", &relative])
@@ -683,183 +794,345 @@ fn open_merge_tool_inner(repository_path: String, target_path: String, relative_
         let detail = if !stderr.is_empty() { stderr } else { stdout };
         return Err(if detail.is_empty() {
             "Git mergetool failed. Configure one with `git config merge.tool <tool>` or check `git mergetool --tool-help`.".into()
-        } else { detail });
+        } else {
+            detail
+        });
     }
-    Ok(configured_tool.map(|tool| format!("Merge tool \"{tool}\" finished for {relative}."))
+    Ok(configured_tool
+        .map(|tool| format!("Merge tool \"{tool}\" finished for {relative}."))
         .unwrap_or_else(|| format!("Git mergetool finished for {relative}.")))
 }
 
 #[tauri::command]
-pub fn resolve_conflict(repository_path: String, target_path: String, relative_path: String, resolution: String) -> Result<(), String> {
+pub async fn resolve_conflict(
+    repository_path: String,
+    target_path: String,
+    relative_path: String,
+    resolution: String,
+) -> Result<(), String> {
+    off_main_thread(move || {
+        resolve_conflict_inner(repository_path, target_path, relative_path, resolution)
+    })
+    .await
+}
+pub(in crate::repository) fn resolve_conflict_inner(
+    repository_path: String,
+    target_path: String,
+    relative_path: String,
+    resolution: String,
+) -> Result<(), String> {
     let repository_path = resolve_target_repository(&repository_path, &target_path)?;
     validate_path(&repository_path)?;
     let relative = safe_relative_path(&relative_path)?;
     let queue_started = Instant::now();
     let lock_handle = repo_write_lock(&repository_path);
     let _lock = lock_handle.lock().unwrap();
-    log_repo_write_lock_acquired(&repository_path, "resolve_conflict", queue_started.elapsed());
-    let repo = internal_repository(&repository_path)?;
+    log_repo_write_lock_acquired(
+        &repository_path,
+        "resolve_conflict",
+        queue_started.elapsed(),
+    );
+    let path = normalized(&relative);
+    let index = native::index(&repository_path)?;
     let absolute = Path::new(&repository_path).join(&relative);
-    perf_log(&format!("merge_resolve: repo={} path={:?} choice={resolution}",
-        anonymized_repository_id(&repository_path), normalized(&relative)), Duration::ZERO);
+    perf_log(
+        &format!("merge_resolve: engine=git_cli path={path:?} choice={resolution}"),
+        Duration::ZERO,
+    );
     let resolved = (|| -> Result<(), String> {
-    match resolution.as_str() {
-        "ours" | "theirs" => {
-            let target = normalized(&relative);
-            let mut gitlink_entry = None;
-            let mut gitlink_oid = None;
-            let mut remove_gitlink = false;
-            let content = {
-                let index = repo.index().map_err(|error| error.message().to_string())?;
-                let conflicts = index.conflicts().map_err(|error| error.message().to_string())?;
-                let mut content = None;
-                for conflict in conflicts.flatten() {
-                    let any_entry = conflict.our.as_ref().or(conflict.their.as_ref()).or(conflict.ancestor.as_ref());
-                    if any_entry.map(|entry| String::from_utf8_lossy(&entry.path) != target).unwrap_or(true) { continue; }
-                    let is_gitlink = [conflict.our.as_ref(), conflict.their.as_ref(), conflict.ancestor.as_ref()]
-                        .into_iter().flatten().any(|entry| entry.mode == GIT_FILEMODE_COMMIT);
-                    let entry = if resolution == "ours" { conflict.our } else { conflict.their };
-                    if entry.is_none() && is_gitlink { remove_gitlink = true; break; }
-                    let Some(mut entry) = entry else { continue };
-                    if String::from_utf8_lossy(&entry.path) != target { continue; }
-                    if entry.mode == GIT_FILEMODE_COMMIT {
-                        gitlink_oid = Some(entry.id);
-                        entry.flags &= !GIT_INDEX_ENTRY_STAGEMASK;
-                        gitlink_entry = Some(entry);
-                    } else {
-                        content = blob_text(&repo, Some(entry.id));
+        match resolution.as_str() {
+            "ours" | "theirs" => {
+                if !(1..=3).any(|stage| index.get(&path, stage).is_some()) {
+                    return Err(format!("{path} is not a conflicted file"));
+                }
+                let entry = index.get(&path, if resolution == "ours" { 2 } else { 3 });
+                let link = (1..=3).any(|stage| {
+                    index
+                        .get(&path, stage)
+                        .is_some_and(|e| e.mode == GIT_FILEMODE_COMMIT)
+                });
+                if link {
+                    if entry.is_some_and(|e| e.mode != GIT_FILEMODE_COMMIT) {
+                        return Err("Folder/submodule conversion requires resolving the paths explicitly; no automatic overwrite was made.".into());
                     }
-                    break;
-                }
-                content
-            };
-            if remove_gitlink {
-                let mut index = repo.index().map_err(|error| error.message().to_string())?;
-                index.conflict_remove(&relative).map_err(|error| error.message().to_string())?;
-                if index.get_path(&relative, 0).is_some() {
-                    index.remove_path(&relative).map_err(|error| error.message().to_string())?;
-                }
-                index.write().map_err(|error| error.message().to_string())?;
-                // Choosing the absent side removes only the parent's gitlink.
-                // Never delete a submodule's local files or internal repository.
-                return Ok(());
-            }
-            if let Some(entry) = gitlink_entry {
-                let mut index = repo.index().map_err(|error| error.message().to_string())?;
-                index.conflict_remove(&relative).map_err(|error| error.message().to_string())?;
-                index.add(&entry).map_err(|error| error.message().to_string())?;
-                index.write().map_err(|error| error.message().to_string())?;
-                if let Some(oid) = gitlink_oid {
-                    let submodule_path = Path::new(&repository_path).join(&relative);
-                    if internal_submodule_repository(&submodule_path).is_ok() {
-                        let submodule_path_string = submodule_path.to_string_lossy().into_owned();
-                        let checked_out = git(&submodule_path_string, &["checkout", "--detach", &oid.to_string()]);
-                        invalidate_git_metadata(&submodule_path_string);
-                        checked_out?;
+                    native::set_link(&repository_path, &path, entry.map(|e| e.id))?;
+                    if let Some(e) = entry {
+                        if absolute.join(".git").exists() {
+                            let child = absolute.to_string_lossy();
+                            let result =
+                                native::text(&child, &["checkout", "--detach", &e.id.to_string()]);
+                            invalidate_git_metadata(&child);
+                            result?;
+                        }
                     }
+                    return Ok(());
                 }
-                return Ok(());
+                if entry.is_none() {
+                    native::text(&repository_path, &["rm", "--", &path])?;
+                    return Ok(());
+                }
+                native::text(
+                    &repository_path,
+                    &[
+                        "checkout",
+                        if resolution == "ours" {
+                            "--ours"
+                        } else {
+                            "--theirs"
+                        },
+                        "--",
+                        &path,
+                    ],
+                )?;
             }
-            let content = content.ok_or_else(|| format!("No {resolution} version exists for {relative_path} (it may have been added only on one side — deleting or keeping the existing file may be more appropriate)."))?;
-            fs::write(&absolute, content).map_err(|error| format!("Cannot write {}: {error}", absolute.display()))?;
-        }
-        "manual" => {
-            if !absolute.exists() { return Err(format!("{relative_path} does not exist on disk — nothing to mark resolved.")); }
-            let content = fs::read(&absolute).map_err(|error| format!("Cannot read {}: {error}", absolute.display()))?;
-            if contains_conflict_markers(&content) {
-                return Err(format!("{relative_path} still contains conflict markers (<<<<<<< / ======= / >>>>>>>). Save the resolved content first, then Mark resolved or Recheck conflicts."));
+            "manual" => {
+                if !absolute.exists() {
+                    return Err(format!(
+                        "{path} does not exist on disk; resolve its deletion explicitly."
+                    ));
+                }
+                let bytes = fs::read(&absolute).map_err(|e| e.to_string())?;
+                if contains_conflict_markers(&bytes) {
+                    return Err(format!(
+                        "{path} still contains conflict markers. Save the resolved content first."
+                    ));
+                }
             }
+            _ => return Err("Unknown conflict resolution".into()),
         }
-        other => return Err(format!("Unknown resolution kind \"{other}\"")),
-    }
-    let mut index = repo.index().map_err(|error| error.message().to_string())?;
-    index.add_path(&relative).map_err(|error| error.message().to_string())?;
-    index.write().map_err(|error| error.message().to_string())?;
-    Ok(())
+        native::text(&repository_path, &["add", "--", &path])?;
+        Ok(())
     })();
-    perf_log(&format!("merge_resolve: repo={} path={:?} result={}",
-        anonymized_repository_id(&repository_path), normalized(&relative), if resolved.is_ok() { "accepted" } else { "error" }), Duration::ZERO);
     invalidate_git_metadata(&repository_path);
+    perf_log(
+        &format!(
+            "merge_resolve: path={path:?} result={}",
+            if resolved.is_ok() {
+                "accepted"
+            } else {
+                "error"
+            }
+        ),
+        Duration::ZERO,
+    );
     resolved
 }
 
-pub(in crate::repository) fn complete_merge_internal(repo: &mut Repository, repository_path: &str, message: &str) -> Result<String, String> {
-    let mut index = repo.index().map_err(|error| error.message().to_string())?;
-    if index.has_conflicts() { return Err("There are still unresolved conflicts.".into()); }
-    validate_merge_gitlinks(repo, repository_path)?;
-    let mut merge_heads = Vec::new();
-    repo.mergehead_foreach(|oid| { merge_heads.push(*oid); true }).map_err(|error| error.message().to_string())?;
-    let head_commit = repo.head().ok().and_then(|head| head.peel_to_commit().ok());
-    let mut parents = Vec::new();
-    if let Some(commit) = head_commit.as_ref() { parents.push(commit.clone()); }
-    for oid in &merge_heads { if let Ok(commit) = repo.find_commit(*oid) { parents.push(commit); } }
-    let tree_id = index.write_tree_to(repo).map_err(|error| error.message().to_string())?;
-    perf_log(&format!("merge_commit: repo={} tree={} current={} incoming={}",
-        anonymized_repository_id(repository_path), tree_id,
-        head_commit.as_ref().map(|head| head.id().to_string()).unwrap_or_default(),
-        merge_heads.iter().map(|oid| oid.to_string()).collect::<Vec<_>>().join(",")), Duration::ZERO);
-    // A previous attempt may have committed successfully but failed while
-    // removing MERGE_HEAD/MERGE_MSG. Retry cleanup, not another merge commit.
-    if let Some(head) = head_commit.as_ref() {
-        if !merge_heads.is_empty() && head.parent_count() > 1 && head.tree_id() == tree_id &&
-            merge_heads.iter().all(|oid| head.parent_ids().skip(1).any(|parent| parent == *oid)) {
-            let oid = head.id();
-            let cleaned = repo.cleanup_state();
-            invalidate_git_metadata(repository_path);
-            cleaned.map_err(|error| format!("Merge commit {oid} already exists, but Git could not clear the merge state. No new commit was created. {}", error.message()))?;
-            return Ok(oid.to_string());
-        }
+pub(in crate::repository) fn complete_merge_internal(
+    repository_path: &str,
+    message: &str,
+) -> Result<String, String> {
+    if !native::in_progress(repository_path)? {
+        return Err("There is no merge in progress here.".into());
     }
-    let tree = repo.find_tree(tree_id).map_err(|error| error.message().to_string())?;
-    let signature = repo.signature().map_err(|_| "Configure user.name and user.email for this repository".to_string())?;
-    let parent_refs: Vec<&git2::Commit<'_>> = parents.iter().collect();
-    let oid = repo.commit(Some("HEAD"), &signature, &signature, message, &tree, &parent_refs).map_err(|error| error.message().to_string())?;
-    let cleaned = repo.cleanup_state();
+    let index = native::index(repository_path)?;
+    if index.conflicted() {
+        return Err("There are still unresolved conflicts.".into());
+    }
+    validate_merge_gitlinks(repository_path, &index)?;
+    let current = native::oid(repository_path, "HEAD")?;
+    let parents = native::heads(repository_path)?;
+    let tree = native::text(repository_path, &["write-tree"])?;
+    let committed_tree = native::text(repository_path, &["rev-parse", "HEAD^{tree}"])?;
+    let recorded_parents = native::text(
+        repository_path,
+        &["rev-list", "--parents", "-n", "1", "HEAD"],
+    )?;
+    let recorded = recorded_parents
+        .split_whitespace()
+        .skip(2)
+        .collect::<Vec<_>>();
+    if committed_tree == tree
+        && !parents.is_empty()
+        && parents
+            .iter()
+            .all(|p| recorded.contains(&p.to_string().as_str()))
+    {
+        // The previous commit succeeded but cleanup was interrupted. Git's
+        // --quit clears only merge state and leaves HEAD/index/files intact.
+        let cleaned = native::text(repository_path, &["merge", "--quit"]);
+        invalidate_git_metadata(repository_path);
+        cleaned.map_err(|e|format!("Merge commit {current} already exists, but cleanup failed. No new commit was created. {e}"))?;
+        return Ok(current.to_string());
+    }
+    perf_log(
+        &format!(
+            "merge_commit: engine=git_cli repo={} tree={tree} current={current} incoming={:?}",
+            anonymized_repository_id(repository_path),
+            parents
+        ),
+        Duration::ZERO,
+    );
+    // Argument passing preserves the message; no shell/editor interpolation.
+    let committed = native::output(repository_path, &["commit", "--no-edit", "-m", message]);
     invalidate_git_metadata(repository_path);
-    cleaned.map_err(|error| format!("Merge commit {oid} was created, but Git could not clear the merge state. Do not create another merge commit; inspect the repository state. {}", error.message()))?;
+    let out = committed?;
+    let oid = native::oid(repository_path, "HEAD")?;
+    if !out.status.success() {
+        return Err(if oid != current {
+            format!("Merge commit {oid} was created, but Git reported an error afterward. Inspect the repository before retrying. {}",native::failure(&out))
+        } else {
+            format!("Git did not complete the merge commit. Review the pending state before retrying. {}",native::failure(&out))
+        });
+    }
+    if native::in_progress(repository_path)?
+        || native::git_path(repository_path, "MERGE_MSG")?.exists()
+    {
+        return Err(format!("Merge commit {oid} was created, but merge state remains. Inspect it before retrying; no automatic retry was made."));
+    }
+    let actual = native::text(
+        repository_path,
+        &["rev-list", "--parents", "-n", "1", "HEAD"],
+    )?;
+    let expected = std::iter::once(current.to_string())
+        .chain(parents.iter().map(ToString::to_string))
+        .collect::<Vec<_>>();
+    if actual.split_whitespace().skip(1).collect::<Vec<_>>() != expected {
+        return Err(format!("Commit {oid} was created with unexpected parents. Inspect it before any further action; no retry was made."));
+    }
     Ok(oid.to_string())
 }
 
 #[tauri::command]
-pub async fn complete_merge(repository_path: String, target_path: String, message: String) -> Result<String, String> {
-    off_main_thread(move || complete_merge_request_inner(repository_path, target_path, message)).await
+pub async fn complete_merge(
+    repository_path: String,
+    target_path: String,
+    message: String,
+) -> Result<String, String> {
+    off_main_thread(move || complete_merge_request_inner(repository_path, target_path, message))
+        .await
 }
 
-pub(in crate::repository) fn complete_merge_request_inner(repository_path: String, target_path: String, message: String) -> Result<String, String> {
+pub(in crate::repository) fn complete_merge_request_inner(
+    repository_path: String,
+    target_path: String,
+    message: String,
+) -> Result<String, String> {
     let repository_path = resolve_target_repository(&repository_path, &target_path)?;
     validate_path(&repository_path)?;
-    if message.trim().is_empty() { return Err("Merge commit message cannot be empty".into()); }
+    if message.trim().is_empty() {
+        return Err("Merge commit message cannot be empty".into());
+    }
     let queue_started = Instant::now();
     let lock_handle = repo_write_lock(&repository_path);
     let _lock = lock_handle.lock().unwrap();
     log_repo_write_lock_acquired(&repository_path, "complete_merge", queue_started.elapsed());
-    let mut repo = internal_repository(&repository_path)?;
-    if repo.state() != git2::RepositoryState::Merge {
+    if !native::in_progress(&repository_path)? {
         return Err("There is no merge in progress here.".into());
     }
-    complete_merge_internal(&mut repo, &repository_path, message.trim())
+    complete_merge_internal(&repository_path, message.trim())
 }
 
 #[tauri::command]
-pub fn abort_merge(repository_path: String, target_path: String) -> Result<(), String> {
+pub async fn abort_merge(repository_path: String, target_path: String) -> Result<(), String> {
+    off_main_thread(move || abort_merge_inner(repository_path, target_path)).await
+}
+pub(in crate::repository) fn abort_merge_inner(
+    repository_path: String,
+    target_path: String,
+) -> Result<(), String> {
     let repository_path = resolve_target_repository(&repository_path, &target_path)?;
     validate_path(&repository_path)?;
     let queue_started = Instant::now();
     let lock_handle = repo_write_lock(&repository_path);
     let _lock = lock_handle.lock().unwrap();
     log_repo_write_lock_acquired(&repository_path, "abort_merge", queue_started.elapsed());
-    let repo = internal_repository(&repository_path)?;
-    if repo.state() != git2::RepositoryState::Merge {
+    if !native::in_progress(&repository_path)? {
         return Err("There is no merge in progress here.".into());
     }
-    let head_commit = repo.head().map_err(|error| error.message().to_string())?.peel_to_commit().map_err(|error| error.message().to_string())?;
-    let mut checkout = git2::build::CheckoutBuilder::new();
-    checkout.force();
-    let reset = repo.reset(head_commit.as_object(), git2::ResetType::Hard, Some(&mut checkout));
+    let result = native::text(&repository_path, &["merge", "--abort"]);
     invalidate_git_metadata(&repository_path);
-    reset.map_err(|error| format!("Abort did not complete; files may have changed. Review the working tree and merge state. {}", error.message()))?;
-    let cleaned = repo.cleanup_state();
-    invalidate_git_metadata(&repository_path);
-    cleaned.map_err(|error| format!("Files were reset, but merge state cleanup failed: {}", error.message()))?;
-    Ok(())
+    result.map(|_| ()).map_err(|e| {
+        format!("Abort did not complete. Review the working tree and merge state. {e}")
+    })
+}
+
+// Working-tree buttons must not undo a reviewed submodule removal merely
+// because its retained local folder appears as untracked. Reversing the choice
+// remains available explicitly in the merge review.
+pub(in crate::repository) fn stage_merge_paths(
+    root: &str,
+    paths: &[PathBuf],
+    unstage: bool,
+) -> Result<StageResult, String> {
+    let before = native::index(root)?;
+    let head = native::tree(root, "HEAD")?;
+    let removed: Vec<_> = head
+        .links()
+        .into_keys()
+        .filter(|p| {
+            before.get(p, 0).is_none()
+                && !(1..=3).any(|s| before.get(p, s).is_some())
+                && !before
+                    .entries
+                    .values()
+                    .any(|e| e.path.starts_with(&format!("{p}/")))
+        })
+        .collect();
+    let names = paths
+        .iter()
+        .map(|p| {
+            normalized(
+                &p.components()
+                    .filter(|c| !matches!(c, Component::CurDir))
+                    .collect::<PathBuf>(),
+            )
+        })
+        .collect::<Vec<_>>();
+    for name in &names {
+        if let Some(removed) = removed.iter().find(|p| {
+            name.is_empty()
+                || *p == name
+                || p.starts_with(&format!("{name}/"))
+                || name.starts_with(&format!("{p}/"))
+        }) {
+            if unstage || Path::new(root).join(removed).exists() {
+                return Err(format!("{removed} was removed by this merge. Its local folder may still exist. Use the submodule merge review to change this choice; Stage/Unstage did not restore the old reference."));
+            }
+        }
+        if !unstage
+            && Path::new(root).join(name).is_dir()
+            && embedded_git_repo_path(&Path::new(root).join(name))
+            && !before
+                .get(name, 0)
+                .is_some_and(|e| e.mode == GIT_FILEMODE_COMMIT)
+        {
+            return Err(embedded_git_repo_error(name));
+        }
+    }
+    let mut result = StageResult::default();
+    let mut selected = Vec::new();
+    for name in &names {
+        if !unstage {
+            if let Some(e) = before
+                .get(name, 0)
+                .filter(|e| e.mode == GIT_FILEMODE_COMMIT)
+            {
+                let child = Path::new(root).join(name);
+                if child.join(".git").exists()
+                    && native::oid(&child.to_string_lossy(), "HEAD")? == e.id
+                {
+                    result.skipped_dirty_submodules.push(name.clone());
+                    continue;
+                }
+            }
+        }
+        selected.push(name.as_str());
+    }
+    if !selected.is_empty() {
+        let mut args = if unstage {
+            vec!["reset", "HEAD", "--"]
+        } else {
+            vec!["add", "--all", "--"]
+        };
+        args.extend(selected);
+        let outcome = native::text(root, &args);
+        invalidate_git_metadata(root);
+        outcome?;
+        result.staged_paths = names
+            .into_iter()
+            .filter(|p| !result.skipped_dirty_submodules.contains(p))
+            .collect();
+    }
+    Ok(result)
 }

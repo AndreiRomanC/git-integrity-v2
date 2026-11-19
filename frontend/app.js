@@ -16,7 +16,7 @@ const MUTATING_COMMANDS = new Set([
   'stash_changes', 'stash_file', 'pop_stash', 'drop_stash', 'restore_stash_paths', 'abort_stash_conflict',
   'restore_file', 'restore_remote_file', 'restore_folder', 'restore_exact_checkpoint', 'restore_exact_checkpoint_branch', 'clean_branch_from_upstream', 'reset_current_branch', 'add_submodule', 'init_submodule', 'switch_submodule_version', 'reset_submodule', 'reset_submodule_branch_to_upstream', 'change_submodule_url',
   'commit_submodule', 'push_submodule', 'pull_submodule', 'force_push_submodule', 'fetch_submodule',
-  'create_submodule_branch', 'merge_branch', 'open_merge_tool', 'resolve_conflict', 'complete_merge', 'abort_merge',
+  'create_submodule_branch', 'merge_branch', 'apply_submodule_merge_revision', 'open_merge_tool', 'resolve_conflict', 'complete_merge', 'abort_merge',
   'sync_repository', 'publish_branch', 'combine_local_commits', 'fetch_remote', 'fetch_all_remotes', 'fetch_project', 'write_text_file', 'run_git_command', 'run_terminal_command',
 ]);
 // While an embedded Terminal command is running, every mutation *and* switching to
@@ -30,7 +30,7 @@ const MUTATING_COMMANDS = new Set([
 const REPO_SWITCH_COMMANDS = new Set(['load_repository', 'open_repository_fast']);
 const EMBEDDED_CONSOLE_COMMANDS = new Set(['run_git_command', 'run_terminal_command']);
 const STAGING_COMMANDS = new Set(['stage_files', 'unstage_files', 'stage_all']);
-const RECOVER_ON_MUTATION_ERROR = new Set(['merge_branch', 'resolve_conflict', 'open_merge_tool', 'complete_merge', 'abort_merge', 'stash_changes', 'stash_file', 'pop_stash', 'restore_stash_paths', 'abort_stash_conflict']);
+const RECOVER_ON_MUTATION_ERROR = new Set(['merge_branch', 'apply_submodule_merge_revision', 'resolve_conflict', 'open_merge_tool', 'complete_merge', 'abort_merge', 'stash_changes', 'stash_file', 'pop_stash', 'restore_stash_paths', 'abort_stash_conflict']);
 // Measure the whole frontend -> Tauri -> frontend round trip, not just the
 // backend phases that individual commands happen to log. Only slow calls and
 // failures are recorded so ordinary navigation does not flood the diagnostic
@@ -74,6 +74,7 @@ function diagnosticErrorCategory(error) {
   return 'unclassified';
 }
 const rawInvoke = window.__TAURI__?.core?.invoke;
+const polarionConnection = window.GitDrillDownPolarionConnection?.create({ log: text => jsPerfLog(text, 0) });
 const ipcDiagnostics = window.GitDrillDownIpcDiagnostics?.create({ log: (label, elapsed) => jsPerfLog(label, elapsed) });
 const invoke = rawInvoke && ((command, args) => {
   if (!STAGING_COMMANDS.has(command) && (MUTATING_COMMANDS.has(command) || REPO_SWITCH_COMMANDS.has(command)) &&
@@ -133,6 +134,7 @@ const invoke = rawInvoke && ((command, args) => {
   }
   if (command === 'frontend_perf_log') return pending;
   return Promise.resolve(pending).then(result => {
+    polarionConnection?.observe(command, args, result);
     ipcDiagnostics?.finish(delivery, true, result);
     if (observeActivity) --inFlightBackendRequests;
     if (write) --inFlightRepositoryWrites;
@@ -141,6 +143,7 @@ const invoke = rawInvoke && ((command, args) => {
     if (elapsedMs >= SLOW_INVOKE_LOG_THRESHOLD_MS) jsPerfLog(`invoke(${command}) SUCCESS`, elapsedMs);
     return result;
   }, async error => {
+    polarionConnection?.observe(command, args, null, error);
     ipcDiagnostics?.finish(delivery, false);
     if (observeActivity) --inFlightBackendRequests;
     if (write) --inFlightRepositoryWrites;
@@ -3495,6 +3498,10 @@ function gitState(entry) {
   return `<span class="git-state ${esc(tone)} ${states.length > 1 ? 'combined' : ''}" title="${esc(title)}"><i class="git-dot"></i><span>${content}</span></span>`;
 }
 
+function entryHasKnownChanges(entry) {
+  return entry.status_known !== false && !!(entry.status || !entry.tracked);
+}
+
 function entryGitSummary(entry) {
   if (!entry) return 'Unknown';
   if (entry.details_loading) return entry.details_error ? 'Unavailable' : 'Checking…';
@@ -3581,7 +3588,7 @@ function renderExplorer(pageStart) {
     <span class="file-main"><span class="entry-icon folder">▲</span><span class="entry-copy"><span class="entry-name">..</span><span class="entry-hint">Parent folder</span></span></span>
     <span></span><span></span><span></span>
   </button>` : '';
-  const rowsHtml = entries.map(entry => `<button class="file-row file-grid ${entry.status || !entry.tracked ? 'has-change' : ''} ${entryHasPersonalNote(entry) ? 'has-personal-note' : ''} ${state.selectedEntry?.relative_path === entry.relative_path ? 'selected' : ''}" data-entry="${esc(entry.relative_path)}">
+  const rowsHtml = entries.map(entry => `<button class="file-row file-grid ${entryHasKnownChanges(entry) ? 'has-change' : ''} ${entryHasPersonalNote(entry) ? 'has-personal-note' : ''} ${state.selectedEntry?.relative_path === entry.relative_path ? 'selected' : ''}" data-entry="${esc(entry.relative_path)}">
     <span class="file-main">${iconFor(entry)}<span class="entry-copy"><span class="entry-name">${esc(entry.name)}${entryHasPersonalNote(entry) ? '<b class="personal-note-dot" title="Personal note">✎</b>' : ''}${entry.kind === 'submodule' ? '<b class="inline-submodule-badge">SUBMODULE</b>' : ''}</span><span class="entry-hint">${esc(entryKindHint(entry))}</span></span>${['folder','submodule'].includes(entry.kind) ? '<span class="folder-arrow">›</span>' : ''}</span>
     ${gitState(entry)}<span class="file-size">${entry.kind === 'file' ? formatSize(entry.size) : '—'}</span><span class="file-modified">${formatModified(entry.modified)}</span>
   </button>`).join('') || (state.currentPath ? '' : '<div class="empty-change">This folder is empty</div>');
@@ -3852,11 +3859,13 @@ function syncNavigationRefreshNotice() {
   const error = jobs.find(job => job.phase === 'error');
   const updating = jobs.filter(job => job.phase === 'refreshing');
   const elapsed = updating.length ? Math.max(0, Math.floor((Date.now() - Math.min(...updating.map(job => job.refreshStartedAt))) / 1000)) : 0;
-  notice.hidden = !error && !updating.length;
+  const feedbackDelay = updating.length ? Math.max(0, 350 - (Date.now() - Math.min(...updating.map(job => job.refreshStartedAt)))) : 0;
+  notice.hidden = !error && (!updating.length || feedbackDelay > 0);
   notice.classList.toggle('refresh-failed', !!error);
-  notice.querySelector('span').textContent = error
+  notice.title = error
     ? `Git status not verified (${anonymizeForLog(error.target.repositoryPath)}). Previous data remain visible. ${error.error}`
-    : `Checking local Git status · ${elapsed} s. You can keep browsing; displayed status is not yet verified.`;
+    : `Checking local Git status · ${elapsed} s. Previously displayed status is not yet verified; Git changes are unavailable until this finishes.`;
+  notice.querySelector('span').textContent = error ? 'Status not verified' : 'Checking Git status…';
   notice.querySelector('button').hidden = !error;
   const entry = refs.details?.displayedEntry;
   const pending = state.view === 'explorer' && refs.details?.displayedRepositoryPath === state.repository?.path &&
@@ -3865,7 +3874,7 @@ function syncNavigationRefreshNotice() {
   if (pending && label) label.textContent = entryDetailsProgressText(entry);
   // UI-only clock while a read is pending. No polling, Git commands, cache
   // renewal or extra renders; stop as soon as no current operation needs it.
-  if ((!error && updating.length) || pending) navigationFeedbackTimer = setTimeout(syncNavigationRefreshNotice, 1000);
+  if ((!error && updating.length) || pending) navigationFeedbackTimer = setTimeout(syncNavigationRefreshNotice, feedbackDelay || 1000);
 }
 
 function entryDetailsProgressText(entry, now = Date.now()) {
@@ -5539,7 +5548,7 @@ function submoduleReviewRowHtml(item) {
     </div>
     ${registrationNotice}
     <details class="submodule-review-details"><summary>Details${localDiffers ? ' · folder on disk differs' : ''}</summary>
-      <div class="submodule-review-pointers">${pointerRow('Merge base', item.base)}${pointerRow('Prepared result', item.result)}${pointerRow('Folder on disk', item.local_checkout, 'Not available')}</div>
+      <div class="submodule-review-pointers">${pointerRow('Merge base', item.base, item.base_is_ambiguous ? 'Multiple bases' : 'No submodule')}${pointerRow('Prepared result', item.result)}${pointerRow('Folder on disk', item.local_checkout, 'Not available')}</div>
       <p><b>Prepared result review.</b> ${esc(item.reason)}</p>
       ${submoduleReviewLocalNotice(item, selected)}
       <div class="submodule-review-actions"><button type="button" data-review-action="choose">Choose another commit…</button><button type="button" data-review-action="history">Open history</button></div>
@@ -8632,9 +8641,9 @@ function renderChanges() {
   const changesByPath = new Map(scopedChanges.map(change => [change.path, change]));
   refs.drawerScopeTitle.textContent = state.changesScope === 'folder' ? `Changes in folder · /${scope}` : 'Working tree · entire repository';
   refs.changesSummary.textContent = scopedChanges.length ? `${scopedChanges.length} changed item${scopedChanges.length === 1 ? '' : 's'}` : `No changes in ${scope ? `/${scope}` : 'the repository'}`;
-  $('#stageAllButton').disabled = scopedChanges.length === 0;
-  $('#unstageAllButton').disabled = !scopedChanges.some(change => change.staged);
-  refs.changes.innerHTML = scopedChanges.map(change => `<div class="change-row-wrap diffable" data-change-compare-path="${esc(change.path)}" title="Double-click to compare working tree with the Git index"><div class="change-row"><input type="checkbox" data-change-path="${esc(change.path)}" aria-label="Stage ${esc(change.path)}" ${change.staged ? 'checked' : ''}>
+  $('#stageAllButton').disabled = state.consoleCommandRunning || scopedChanges.length === 0;
+  $('#unstageAllButton').disabled = state.consoleCommandRunning || !scopedChanges.some(change => change.staged);
+  refs.changes.innerHTML = scopedChanges.map(change => `<div class="change-row-wrap diffable" data-change-compare-path="${esc(change.path)}" title="Double-click to compare working tree with the Git index"><div class="change-row"><input type="checkbox" data-change-path="${esc(change.path)}" aria-label="Stage ${esc(change.path)}" ${state.consoleCommandRunning ? 'disabled' : ''} ${change.staged ? 'checked' : ''}>
     <span class="status-code">${esc(change.status)}</span><span class="change-path">${esc(change.path)}</span><span class="change-state">${esc(changeDisplayState(change, submoduleRoots))}</span></div>
     <button class="stash-file-btn" data-stash-path="${esc(change.path)}" title="Set aside just this file in its own repository's stash. Parent projects and submodules have separate stash lists.">⇕ Stash</button></div>`).join('') || `<div class="empty-change">No changes inside /${esc(scope)}</div>`;
   refs.changes.querySelectorAll('[data-stash-path]').forEach(button => button.addEventListener('click', () => stashOneFile(button.dataset.stashPath)));
@@ -9145,6 +9154,12 @@ const STAGE_FLUSH_TIMEOUT_MS = 20000;
 
 function toggleStage(path, checked) {
   if (!invoke || !state.repository) return;
+  if (state.consoleCommandRunning) {
+    renderChanges();
+    status('Wait for the running Git command before changing staging. This click was not queued.', 'error');
+    return;
+  }
+
   // Defensive: the queue should never carry entries from a repository that's
   // no longer open (every path that switches repository/branch is expected
   // to flush first, via flushPendingTogglesNow — this only guards against
@@ -9597,7 +9612,7 @@ function syncDrawerPolarionReferences() {
   if (!drawerPolarionReferences) drawerPolarionReferences = createPolarionCommitReferences({ host, editor: refs.commitMessage, invoke, log: text => jsPerfLog(text, 0), onChange: () => updateCommitMessageControls() });
   drawerPolarionReferences.setContext(submoduleCommitReferenceContext());
 }
-const polarionTaskPicker = createPolarionTaskPicker({ invoke, log: text => jsPerfLog(text, 0), onDocumentChange() {
+const polarionTaskPicker = createPolarionTaskPicker({ invoke, session: polarionConnection, log: text => jsPerfLog(text, 0), onDocumentChange() {
   // Re-opt in against the updated local source instead of committing IDs
   // previously checked in an already-open Working Tree drawer. No Git scan.
   drawerPolarionReferences?.reset();
@@ -11109,6 +11124,7 @@ async function runTerminalFromConsole(input, options = {}) {
   state.consoleTranscript.push(entry);
   renderConsoleTranscript();
   state.consoleCommandRunning = true;
+  renderChanges();
   jsPerfLog(`frontend: runTerminal START (${target.label})`, 0);
   consoleRunningTicker = setInterval(renderConsoleTranscript, 200);
   try {
@@ -11126,6 +11142,7 @@ async function runTerminalFromConsole(input, options = {}) {
   }
   clearInterval(consoleRunningTicker); consoleRunningTicker = null;
   state.consoleCommandRunning = false;
+  renderChanges();
   renderConsoleTranscript();
   refreshCommandHint();
   // Failure/timeout is not rollback. Refresh possibly-mutated state on BOTH
@@ -11347,6 +11364,13 @@ $('#closeCommandPalette').addEventListener('click', () => $('#commandPalette').c
 $('#commandPalette').addEventListener('close', () => { commandPaletteOpen = false; });
 $('#openConsole').addEventListener('click', () => openCommandPalette());
 $('#openHelp').addEventListener('click', () => $('#helpDialog').showModal());
+window.GitDrillDownSettings?.create({
+  invoke, polarionConnection,
+  getRepositoryPath: () => state.submoduleGraph?.repository?.path || state.repository?.path || null,
+  copy: copyText,
+  rememberedPolarion: () => polarionRememberedUser(localStorage),
+  rememberPolarion: user => polarionRememberedUser(localStorage, user),
+});
 document.addEventListener('keydown', (e) => {
   if ((e.ctrlKey || e.metaKey) && e.key === 'k') { e.preventDefault(); commandPaletteOpen ? $('#commandPalette').close() : openCommandPalette(); }
   else if ((e.ctrlKey || e.metaKey) && e.key === 'o') { e.preventDefault(); openRepository(); }

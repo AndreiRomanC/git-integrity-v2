@@ -460,6 +460,14 @@
       if (args.readFallback) { metadata_fallback = true; data = await request(args.fallbackUrl, 'metadata_fallback'); }
       else { prefix_fallback = true; data = await request(args.fallbackUrl, 'prefix_fallback'); }
     }
+    if (args.kind === 'connection') {
+      if (!Array.isArray(data.data)) invalidResponse(data, 'expected_list');
+      if (data.data.length > 1) invalidResponse(data, 'page_size_exceeded');
+      if (data.data.some(item => item?.type !== 'projects' || !validId(item.id, 1) || hasErrors(item))) invalidResponse(data, 'unexpected_resource');
+      // Empty accessible catalog is still a valid read. Never follow next links
+      // or export project content for a connection check.
+      return reply({ code: 'ok', http: 200 });
+    }
     if (args.kind === 'user') {
       if (hasErrors(data.data)) invalidResponse(data, 'partial_errors');
       if (data.data?.type !== 'users' || typeof data.data.id !== 'string' || !/^[\w.@-]{1,120}$/.test(data.data.id)) invalidResponse(data, 'unexpected_resource');

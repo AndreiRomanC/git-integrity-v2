@@ -287,6 +287,12 @@ fn read_url(kind: &str, id: &str, page: usize) -> Result<String, String> {
     if page == 0 || page > 200 { return Err("Invalid Polarion page".into()); }
     let mut url = reqwest::Url::parse("https://polarion.vitesco.io/polarion/rest/v1/").unwrap();
     if kind == "user" { url.set_path("/polarion/rest/v1/user"); url.query_pairs_mut().append_pair("fields[users]", "id,name"); return Ok(url.to_string()); }
+    if kind == "connection" {
+        if !id.is_empty() || page != 1 { return Err("Invalid Polarion connection check".into()); }
+        url.set_path("/polarion/rest/v1/projects");
+        url.query_pairs_mut().append_pair("page[size]", "1").append_pair("page[number]", "1").append_pair("fields[projects]", "id");
+        return Ok(url.to_string());
+    }
     let is_doc = kind == "document" || kind == "elements";
     let parts = resource_segments(id, if is_doc { 3 } else { 2 })?;
     let mut segments = url.path_segments_mut().map_err(|_| "Invalid Polarion URL")?;
@@ -320,6 +326,7 @@ fn read_args(kind: &str, resource: &str, page: usize, revision: Option<&str>) ->
         if page != 1 || revision.is_some_and(|r| !r.is_empty()) { return Err("Permission checks require the current selected LiveDoc".into()); }
         return Ok(serde_json::json!({ "kind":"permissions", "resourceId":resource, "project":resource.split('/').next().unwrap_or(""), "page":1 }));
     }
+    if kind == "connection" && revision.is_some_and(|r| !r.is_empty()) { return Err("Connection checks use current server access".into()); }
     let from_link = kind == "document_link";
     let resource = if from_link { diagnostic_resource(resource)?.ok_or("Paste a StructDoc link first")? } else { resource.to_string() };
     let kind = if from_link { "document" } else { kind };
@@ -1062,6 +1069,21 @@ mod tests {
         }
         let mut bad = good; bad["document_query_variant"] = "raw query".into();
         assert!(validate_result(&bad.to_string()).is_err());
+    }
+    #[test]
+    fn connection_check_reads_only_one_project_page_without_a_query() {
+        let raw = read_url("connection", "", 1).unwrap();
+        let url = reqwest::Url::parse(&raw).unwrap();
+        assert_eq!(url.path(), "/polarion/rest/v1/projects");
+        let query = pairs(&raw);
+        assert_eq!(query["page[size]"], "1");
+        assert_eq!(query["page[number]"], "1");
+        assert_eq!(query["fields[projects]"], "id");
+        assert_eq!(query.len(), 3);
+        assert!(read_url("connection", "P", 1).is_err());
+        assert!(read_url("connection", "", 2).is_err());
+        assert!(read_args("connection", "", 1, Some("123")).is_err());
+        assert!(read_args("connection", "", 1, None).is_ok());
     }
     #[test]
     fn read_urls_are_read_only_precise_and_encode_document_names() {

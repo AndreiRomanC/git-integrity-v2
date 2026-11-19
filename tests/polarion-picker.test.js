@@ -28,7 +28,9 @@ function harness() {
   let search = async () => ({ code: 'ok', items: [], more: false });
   const sandbox = { localStorage: { getItem: k => memory.get(k), setItem: (k,v) => memory.set(k,v) }, document: { querySelector: () => dialog, createElement: () => new Element() } };
   vm.runInNewContext(fs.readFileSync(path.join(__dirname, '../frontend/polarion.js'), 'utf8'), sandbox);
-  const picker = sandbox.createPolarionTaskPicker({ invoke: async (name, args) => {
+  const session = require('../frontend/polarion-connection.js').create();
+  const observe = handler => async (name, args) => { try { const data = await handler(name,args); session.observe(name,args,data); return data; } catch (error) { session.observe(name,args,null,error); throw error; } };
+  const picker = sandbox.createPolarionTaskPicker({ session, invoke: observe(async (name, args) => {
     calls.push({ name, args });
     if (overrides[name]) return overrides[name](args);
     if (name === 'polarion_project_context') return { repository_path: '/repo', project: null };
@@ -45,8 +47,8 @@ function harness() {
       if (args.action === 'element') workspace.elements = workspace.elements.map(i => i.id === args.snapshot.id ? args.snapshot : i);
       return structuredClone(workspace);
     }
-  }, addMessage: message => messages.push(message), log: message => logs.push(message), onDocumentChange: path => changedSources.push(path) });
-  return { el, dialog, calls, picker, overrides, memory, messages, logs, changedSources, setWorkspace: value => { workspace = value; }, search: fn => { search = fn; } };
+  }), addMessage: message => messages.push(message), log: message => logs.push(message), onDocumentChange: path => changedSources.push(path) });
+  return { el, dialog, calls, picker, session, overrides, memory, messages, logs, changedSources, setWorkspace: value => { workspace = value; }, search: fn => { search = fn; } };
 }
 const tick = () => new Promise(resolve => setImmediate(resolve));
 
@@ -90,22 +92,22 @@ test('closed portal is clearly disconnected; unrelated network and permission er
   assert.match(h.el('Connect').textContent, /Open Polarion/);
   assert.equal(h.calls.filter(c => c.name === 'polarion_connect').length, 0, 'no unexpected sign-in or background probes');
   h.dialog.close(); await h.picker.open('/repo');
-  assert.equal(h.el('Connection').dataset.state, 'unknown');
-  assert.match(h.el('ConnectionHint').textContent, /Saved snapshots do not prove a connection/);
+  assert.equal(h.el('Connection').dataset.state, 'closed', 'reopening the local workspace does not reopen the portal');
+  assert.match(h.el('ConnectionHint').textContent, /Open the Polarion window/);
   for (const code of ['network_error', 'forbidden', 'api_unavailable']) {
     h.search(async () => ({ code })); await h.el('ProjectSearchButton').handlers.click();
     assert.equal(h.el('Connection').dataset.state, 'unknown', code + ' does not prove a disconnected session');
   }
 });
 
-test('closing and reopening Polarion rejects old search and authentication results', async () => {
+test('reopening a workspace discards old search rows but shares the portal authentication result', async () => {
   const h = harness(); await h.picker.open('/repo');
   let complete;
   h.search(() => new Promise(resolve => { complete = resolve; }));
   h.el('ProjectSearchButton').handlers.click();
   h.dialog.close(); await h.picker.open('/another');
   complete({ code: 'auth_required' }); await tick();
-  assert.equal(h.el('Connection').dataset.state, 'unknown');
+  assert.equal(h.el('Connection').dataset.state, 'required');
   assert.equal(h.el('Results').children.length, 0);
   assert.equal(h.el('ProjectSearchButton').disabled, false);
 });
@@ -749,7 +751,7 @@ test('name search rejects too-short fragments without HTTP and discards a result
   h.el('DocumentQuery').value = 'errm'; const pending = h.el('DocumentSearchButton').handlers.click();
   h.dialog.close(); await h.picker.open('/other');
   finish({ code: 'ok', catalog_source: 'work_item_modules', items: [{ id: 'P/S/ERRM', title: 'Stale document' }] }); await pending;
-  assert.equal(h.el('Results').children.length, 0); assert.equal(h.el('Connection').dataset.state, 'unknown');
+  assert.equal(h.el('Results').children.length, 0); assert.equal(h.el('Connection').dataset.state, 'connected', 'the portal read succeeded, but old results must not populate the new workspace');
 });
 test('StructDoc content and messages remain in that tab while shared inspection components follow the active tab', async () => {
   const h = harness(); await inProject(h); h.el('TabDocuments').handlers.click();
@@ -795,4 +797,15 @@ test('Polarion layout has one stable viewport and keeps all StructDoc-specific c
   assert.match(doc, /<details class="polarion-open-document">/);
   assert.match(doc, /<h4>Local elements<\/h4>/);
   assert.match(doc, /This does not search Polarion or require sign-in/);
+});
+
+test('Polarion workspace opens with the same verified state as Settings and cached search cannot revive an expired session', async () => {
+  const h = harness(); h.session.observe('polarion_read', { kind: 'connection' }, { code: 'ok' });
+  await h.picker.open('/repo');
+  assert.equal(h.el('Connection').dataset.state, 'connected');
+  assert.equal(h.calls.length, 2);
+  h.session.observe('polarion_read', { kind: 'workitem' }, { code: 'auth_required' });
+  h.search(async () => ({ code: 'ok', items: [], catalog_cached: true }));
+  h.el('ProjectSearchButton').handlers.click(); await tick();
+  assert.equal(h.el('Connection').dataset.state, 'required');
 });

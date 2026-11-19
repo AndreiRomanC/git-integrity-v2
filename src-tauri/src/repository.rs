@@ -15,18 +15,20 @@ pub mod navigation;
 pub mod comparison;
 pub mod submodule_compare;
 pub mod module_inspect;
+mod module_cache;
 mod perf_logging;
 mod ipc_diagnostics;
 mod publish_diagnostics;
 mod process_control;
 mod check_links;
 pub mod index_lock;
+pub mod settings;
 #[cfg(test)]
 use stash::{abort_stash_conflict, drop_stash, list_stashes, list_submodule_stashes, pop_stash, restore_stash_paths, stash_changes, stash_entry_files, stash_file};
 #[cfg(test)]
 use branches::{branch_creation_context, checkout_commit, checkout_remote_tracking_branch, create_branch, create_branch_at_commit, create_submodule_branch, delete_branch, graph_branch_divergence, rename_branch, restore_exact_checkpoint_inner, switch_branch};
 #[cfg(test)]
-use branches::merge::{abort_merge, apply_submodule_merge_revision, complete_merge_request_inner as complete_merge, conflict_sides, list_conflicts, merge_branch_inner as merge_branch, merge_in_progress, resolve_conflict, submodule_merge_review_request_inner as submodule_merge_review};
+use branches::merge::{abort_merge_inner as abort_merge, apply_submodule_merge_revision_inner as apply_submodule_merge_revision, complete_merge_request_inner as complete_merge, conflict_sides_inner as conflict_sides, list_conflicts_inner as list_conflicts, merge_branch_inner as merge_branch, merge_in_progress_inner as merge_in_progress, resolve_conflict_inner as resolve_conflict, submodule_merge_review_request_inner as submodule_merge_review};
 #[cfg(test)]
 use command_console::{is_definitely_read_only_terminal_command, is_read_only_git_subcommand, run_git_command, run_terminal_command_inner, tokenize_git_args};
 use remotes::fetch_all_remotes_inner;
@@ -1579,6 +1581,14 @@ fn git_with_timeout_control(path: &str, args: &[&str], timeout: Duration, timeou
 }
 
 fn git_with_timeout_control_traced(path: &str, args: &[&str], timeout: Duration, timeout_label: &str, stoppable: bool, trace: Option<publish_diagnostics::PushTrace>) -> Result<String, String> {
+    let output = git_output_with_timeout_control(path, args, timeout, timeout_label, stoppable, trace, &[0])?;
+    if output.status.success() { Ok(String::from_utf8_lossy(&output.stdout).into_owned()) }
+    else { Err(String::from_utf8_lossy(&output.stderr).trim().to_string()) }
+}
+
+// Preserve bytes and exit status for plumbing commands: exit 1 can mean a
+// valid conflict report, and NUL-delimited paths must not be reconstructed.
+fn git_output_with_timeout_control(path: &str, args: &[&str], timeout: Duration, timeout_label: &str, stoppable: bool, trace: Option<publish_diagnostics::PushTrace>, accepted_exit_codes: &[i32]) -> Result<std::process::Output, String> {
     let history_id = begin_git_command(path, args);
     if is_submodule_update(args) {
         perf_log(&format!("submodule_update: start repo={} timeout_seconds={} force_requested={}", anonymized_repository_id(path), timeout.as_secs(), args.contains(&"--force")), Duration::ZERO);
@@ -1618,11 +1628,10 @@ fn git_with_timeout_control_traced(path: &str, args: &[&str], timeout: Duration,
             return Err(error);
         }
     };
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    finish_git_command(history_id, output.status.success(), output.status.code(), &stdout, &stderr, "");
-    if output.status.success() { Ok(stdout) }
-    else { Err(stderr.trim().to_string()) }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    finish_git_command(history_id, output.status.code().is_some_and(|code| accepted_exit_codes.contains(&code)), output.status.code(), &stdout, &stderr, "");
+    Ok(output)
 }
 
 fn git_owned(path: &str, args: Vec<String>) -> Result<String, String> {
@@ -3278,6 +3287,9 @@ fn stage_files_inner(path: &str, files: Vec<String>) -> Result<StageResult, Stri
     log_repo_write_lock_acquired(path, "stage_files", queue_started.elapsed());
     let repo = internal_repository(path)?;
     let safe_files = files.into_iter().map(|file| safe_relative_path(file.trim_end_matches(|character| character == '/' || character == '\\'))).collect::<Result<Vec<_>, _>>()?;
+    if repo.path().join("MERGE_HEAD").is_file() {
+        return branches::merge::stage_merge_paths(path, &safe_files, false);
+    }
     let step = Instant::now();
     // `submodules.contains(...)` (an O(1) HashSet lookup against metadata
     // already fetched once for the whole batch) instead of calling
@@ -3385,6 +3397,10 @@ fn unstage_files_blocking(path: String, files: Vec<String>) -> Result<(), String
     log_repo_write_lock_acquired(&path, "unstage_files", queue_started.elapsed());
     let repo = internal_repository(&path)?; let head = repo.head().and_then(|head| head.peel(ObjectType::Commit)).map_err(|error| error.message().to_string())?;
     let safe = files.iter().map(|file| safe_relative_path(file)).collect::<Result<Vec<_>, _>>()?;
+    if repo.path().join("MERGE_HEAD").is_file() {
+        branches::merge::stage_merge_paths(&path, &safe, true)?;
+        return Ok(());
+    }
     repo.reset_default(Some(&head), safe.iter()).map_err(|error| error.message().to_string())?;
     let changed_scopes = safe.iter().map(|path| normalized(path)).collect::<Vec<_>>();
     patch_status_cache_after_index_change(&path, &changed_scopes);
@@ -3398,7 +3414,12 @@ pub fn create_commit(path: String, message: String) -> Result<(), String> {
     let lock_handle = repo_write_lock(&path);
     let _lock = lock_handle.lock().unwrap();
     log_repo_write_lock_acquired(&path, "create_commit", queue_started.elapsed());
-    let repo = internal_repository(&path)?; let mut index = repo.index().map_err(|error| error.message().to_string())?; let tree_id = index.write_tree().map_err(|error| error.message().to_string())?; let tree = repo.find_tree(tree_id).map_err(|error| error.message().to_string())?; let signature = repo.signature().map_err(|_| "Configure user.name and user.email for this repository".to_string())?;
+    let repo = internal_repository(&path)?;
+    if repo.path().join("MERGE_HEAD").is_file() {
+        branches::merge::complete_merge_internal(&path, message.trim())?;
+        return Ok(());
+    }
+    let mut index = repo.index().map_err(|error| error.message().to_string())?; let tree_id = index.write_tree().map_err(|error| error.message().to_string())?; let tree = repo.find_tree(tree_id).map_err(|error| error.message().to_string())?; let signature = repo.signature().map_err(|_| "Configure user.name and user.email for this repository".to_string())?;
     let parent = repo.head().ok().and_then(|head| head.peel_to_commit().ok()); let parents: Vec<&git2::Commit<'_>> = parent.iter().collect(); repo.commit(Some("HEAD"), &signature, &signature, message.trim(), &tree, &parents).map_err(|error| error.message().to_string())?; invalidate_git_metadata(&path); Ok(())
 }
 
@@ -7222,31 +7243,7 @@ fn ensure_github_module_cache(repository_path: &str, owner: &str, repository_nam
     let lock_handle = github_module_cache_lock(&owner, &repository_name);
     let _guard = lock_handle.lock().unwrap();
     let cache_path = github_module_cache_path(&owner, &repository_name);
-    let cache_parent = cache_path.parent().ok_or_else(|| "Could not resolve the module cache folder".to_string())?;
-    fs::create_dir_all(cache_parent).map_err(|error| format!("Could not create module cache folder: {error}"))?;
-    let url = github_module_clone_url(&owner, &repository_name);
-    let cache_text = cache_path.to_string_lossy().into_owned();
-    let started = Instant::now();
-    if cache_path.join("HEAD").is_file() {
-        // Browse returns immutable full SHAs. Once those exact objects exist
-        // in the bare cache, another network fetch cannot make the requested
-        // comparison/export more correct; it can only delay it. Branch/tag
-        // names still fetch every time because their targets may have moved.
-        if cache_has_exact_revisions(&cache_path, required_revisions) {
-            perf_log(&format!("github_module_cache: reuse exact objects {owner}/{repository_name} revisions={}", required_revisions.len()), started.elapsed());
-            return Ok(cache_path);
-        }
-        git_with_timeout(&cache_text, &["fetch", "--prune", "origin", "+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"], Duration::from_secs(300), "5 minutes")
-            .map_err(|error| format!("Could not update cached module {owner}/{repository_name}: {error}"))?;
-        perf_log(&format!("github_module_cache: fetch {owner}/{repository_name}"), started.elapsed());
-    } else if cache_path.exists() {
-        return Err(format!("Module cache path exists but is not a Git repository: {}", cache_path.display()));
-    } else {
-        git_with_timeout(repository_path, &["clone", "--bare", &url, &cache_text], Duration::from_secs(600), "10 minutes")
-            .map_err(|error| format!("Could not cache module {owner}/{repository_name}: {error}"))?;
-        perf_log(&format!("github_module_cache: clone {owner}/{repository_name}"), started.elapsed());
-    }
-    Ok(cache_path)
+    module_cache::ensure(repository_path, &cache_path, &github_module_clone_url(&owner, &repository_name), required_revisions)
 }
 
 #[tauri::command]
@@ -8078,12 +8075,12 @@ fn commit_staged_inner(repository_path: String, message: String) -> Result<Strin
     let _lock = lock_handle.lock().unwrap();
     log_repo_write_lock_acquired(&repository_path, "commit_staged", queue_started.elapsed());
     let step = Instant::now();
-    let mut repo = internal_repository(&repository_path)?;
+    let repo = internal_repository(&repository_path)?;
     perf_log("commit_staged: internal_repository (open)", step.elapsed());
-    if repo.state() == git2::RepositoryState::Merge {
+    if repo.path().join("MERGE_HEAD").is_file() {
         // A later, explicit Commit must preserve MERGE_HEAD's parent(s) and
         // validate the prepared merge tree, not create a one-parent checkpoint.
-        return branches::merge::complete_merge_internal(&mut repo, &repository_path, message.trim());
+        return branches::merge::complete_merge_internal(&repository_path, message.trim());
     }
     let step = Instant::now();
     let mut index = repo.index().map_err(|error| error.message().to_string())?;
@@ -9552,6 +9549,10 @@ fn commit_submodule_inner(repository_path: String, relative_path: String, messag
                 .unwrap_or_else(|| "unknown".into());
             return Err(format!("Commit unavailable — this submodule is detached at {short}. Create a new branch from this commit, or checkout an existing branch, then commit. This keeps the new commit pushable and avoids losing track of it."));
         }
+        if repo.path().join("MERGE_HEAD").is_file() {
+            let committed=branches::merge::complete_merge_internal(&sub_path,message.trim())?;
+            Oid::from_str(&committed).map_err(|e|e.to_string())?
+        } else {
         let mut index = repo.index().map_err(|error| error.message().to_string())?;
         index.add_all(["*"], git2::IndexAddOption::DEFAULT, None).map_err(|error| error.message().to_string())?;
         index.write().map_err(|error| error.message().to_string())?;
@@ -9563,6 +9564,7 @@ fn commit_submodule_inner(repository_path: String, relative_path: String, messag
         let signature = repo.signature().map_err(|_| "Configure user.name and user.email for this submodule".to_string())?;
         let parents: Vec<&git2::Commit<'_>> = parent.iter().collect();
         repo.commit(Some("HEAD"), &signature, &signature, message.trim(), &tree, &parents).map_err(|error| error.message().to_string())?
+        }
     };
     invalidate_git_metadata(&sub_path);
     invalidate_submodule_sync(&repository_path); // this app just changed the submodule's own commit
@@ -10188,10 +10190,21 @@ mod tests {
         String::from_utf8_lossy(&output.stdout).trim().to_string()
     }
 
+    // Fixture repositories must not inherit the developer/runner's identity
+    // or checkout conversion defaults. CRLF behavior is tested explicitly.
+    fn configure_test_repository(path: &Path) {
+        let repo = Repository::open(path).unwrap();
+        let mut config = repo.config().unwrap();
+        config.set_str("user.name", "Test User").unwrap();
+        config.set_str("user.email", "test@example.com").unwrap();
+        config.set_bool("core.autocrlf", false).unwrap();
+    }
+
     fn create_libgit2_repository(path: &Path, file: &str) {
         fs::create_dir_all(path).unwrap();
         fs::write(path.join(file), "content").unwrap();
         let repo = Repository::init(path).unwrap();
+        configure_test_repository(path);
         let mut index = repo.index().unwrap(); index.add_path(Path::new(file)).unwrap(); index.write().unwrap();
         let tree_id = index.write_tree().unwrap(); let tree = repo.find_tree(tree_id).unwrap();
         let signature = git2::Signature::now("Test User", "test@example.com").unwrap();
@@ -11236,7 +11249,7 @@ mod tests {
         let epoch = status_cache_epoch(&path);
         fs::write(root.join(".git/index.lock"), "external lock").unwrap();
         let error = merge_branch(path.clone(), "".into(), "incoming".into()).err().unwrap();
-        assert!(error.contains("branch was not advanced"), "{error}");
+        assert!(error.contains("index.lock"), "{error}");
         assert_eq!(run_git_capture(&root, &["rev-parse", "HEAD"]), old);
         assert!(status_cache_epoch(&path) > epoch);
         assert_eq!(fs::read_to_string(root.join(".git/index.lock")).unwrap(), "external lock");
@@ -11259,13 +11272,15 @@ mod tests {
         run_git(&root, &["switch", "-"]);
         assert_eq!(merge_branch(path.clone(), "".into(), "incoming".into()).unwrap().status, "conflicts");
         let epoch = status_cache_epoch(&path);
+        let conflicted = fs::read(root.join("folder/file.txt")).unwrap();
         fs::write(root.join(".git/index.lock"), "external lock").unwrap();
         assert!(resolve_conflict(path.clone(), "".into(), "folder/file.txt".into(), "ours".into()).is_err());
-        assert_eq!(fs::read_to_string(root.join("folder/file.txt")).unwrap(), "new\n");
+        // Native checkout checks the index lock before overwriting the file.
+        assert_eq!(fs::read(root.join("folder/file.txt")).unwrap(), conflicted);
         assert!(status_cache_epoch(&path) > epoch);
         assert_eq!(list_conflicts(path.clone(), "".into()).unwrap().len(), 1);
         fs::remove_file(root.join(".git/index.lock")).unwrap();
-        resolve_conflict(path.clone(), "".into(), "folder/file.txt".into(), "manual".into()).unwrap();
+        resolve_conflict(path.clone(), "".into(), "folder/file.txt".into(), "ours".into()).unwrap();
         complete_merge(path, "".into(), "Resolved after retry".into()).unwrap();
         fs::remove_dir_all(root).unwrap();
     }
@@ -12490,6 +12505,7 @@ mod tests {
         fs::create_dir_all(&repository).unwrap();
         fs::write(repository.join("a.txt"), "base\n").unwrap();
         run_git(&repository, &["init", "-b", "main"]);
+        configure_test_repository(&repository);
         run_git(&repository, &["config", "user.email", "test@example.com"]);
         run_git(&repository, &["config", "user.name", "Test User"]);
         run_git(&repository, &["add", "."]);
@@ -12504,6 +12520,89 @@ mod tests {
     // every path, gitlinks included. Confirms merge_branch's fast-forward
     // path (checkout_head with force()) actually holds that assumption for
     // a submodule pointer specifically, not just ordinary files.
+    #[test]
+    fn native_merge_log41_initialized_removals_survive_review_update_and_late_unstage() {
+        let suffix=SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base=std::env::temp_dir().join(format!("gdd-native-log41-{suffix}"));
+        let parent=base.join("parent");let dependency=base.join("dependency");
+        create_libgit2_repository(&parent,"README.md");create_libgit2_repository(&dependency,"module.txt");
+        let paths=["work/app/EPWRMO/ps1n_esfmcs","work/app/EPWRMO2/p21n_esfmcs2"];
+        for p in paths {run_git(&parent,&["-c","protocol.file.allow=always","submodule","add",dependency.to_str().unwrap(),p]);}
+        run_git(&parent,&["commit","-am","Base with both modules"]);
+        let incoming=run_git_capture(&parent,&["branch","--show-current"]);
+        run_git(&parent,&["switch","-c","feature"]);
+        fs::write(parent.join("feature.txt"),"feature only\n").unwrap();
+        run_git(&parent,&["add","feature.txt"]);run_git(&parent,&["commit","-m","Feature leaves pointers unchanged"]);
+        let current=run_git_capture(&parent,&["rev-parse","HEAD"]);
+        run_git(&parent,&["switch",&incoming]);
+        run_git(&parent,&["rm","-f",paths[0],paths[1]]);run_git(&parent,&["commit","-am","Remove modules and registration"]);
+        let incoming_oid=run_git_capture(&parent,&["rev-parse","HEAD"]);
+        run_git(&parent,&["switch","feature"]);
+        run_git(&parent,&["-c","protocol.file.allow=always","submodule","update","--init","--recursive"]);
+        let path=parent.to_string_lossy().into_owned();
+        let before=fs::read(parent.join(".git/index")).unwrap();
+        let preview=tauri::async_runtime::block_on(branches::merge_preview::preview_merge(path.clone(),"".into(),incoming.clone(),Some(incoming_oid.clone()))).unwrap();
+        let preview=serde_json::to_value(preview).unwrap();
+        assert_eq!(fs::read(parent.join(".git/index")).unwrap(),before,"preview must not rewrite real index");
+        for p in paths {
+            let item=preview["items"].as_array().unwrap().iter().find(|i|i["path"]==p).unwrap();
+            assert!(item["result"].is_null());assert_eq!(item["change"],"removed");
+            assert!(parent.join(p).join(".git").exists(),"must test initialized children");
+        }
+        assert_eq!(merge_branch(path.clone(),"".into(),incoming).unwrap().status,"submodule_review");
+        // Fresh calls reconstruct review from Git's persistent state, as after a restart.
+        let review=submodule_merge_review(path.clone(),"".into()).unwrap();
+        assert_eq!(review.items.len(),2);
+        for item in review.items {assert_eq!(item.base,item.current);assert!(item.result.is_none());assert!(!item.registration_issue);}
+        for p in paths {
+            apply_submodule_merge_revision(path.clone(),"".into(),p.into(),"__none__".into()).unwrap();
+            let before=run_git_capture(&parent,&["ls-files","--stage"]);
+            assert!(unstage_files_blocking(path.clone(),vec![p.into()]).unwrap_err().contains("removed by this merge"));
+            assert!(stage_files_inner(&path,vec![p.into()]).unwrap_err().contains("removed by this merge"));
+            assert_eq!(run_git_capture(&parent,&["ls-files","--stage"]),before);
+            assert!(parent.join(p).join("module.txt").exists(),"no local child data may be deleted");
+        }
+        run_git(&parent,&["submodule","update","--init","--recursive"]);
+        assert!(submodule_merge_review(path.clone(),"".into()).unwrap().items.iter().all(|i|i.result.is_none()));
+        let merged=commit_staged_inner(path,"Merge after review and update".into()).unwrap();
+        assert_eq!(run_git_capture(&parent,&["rev-list","--parents","-n","1","HEAD"]),format!("{merged} {current} {incoming_oid}"));
+        for p in paths {assert!(run_git_capture(&parent,&["ls-tree","HEAD","--",p]).is_empty());assert!(parent.join(p).join("module.txt").exists());}
+        assert!(!parent.join(".git/MERGE_HEAD").exists());fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn native_merge_commit_hook_failure_leaves_pending_merge_for_explicit_retry() {
+        let (base,parent,incoming,_)=setup_incoming_submodule_removal(false);
+        let path=parent.to_string_lossy().into_owned();
+        merge_branch(path.clone(),"".into(),incoming).unwrap();
+        let before=run_git_capture(&parent,&["rev-parse","HEAD"]);
+        let hooks=base.join("hooks");fs::create_dir(&hooks).unwrap();
+        let hook=hooks.join("pre-commit");fs::write(&hook,"#!/bin/sh\necho 'Test hook refused commit' >&2\nexit 1\n").unwrap();
+        #[cfg(unix)] {use std::os::unix::fs::PermissionsExt;fs::set_permissions(&hook,fs::Permissions::from_mode(0o755)).unwrap();}
+        run_git(&parent,&["config","core.hooksPath",hooks.to_str().unwrap()]);
+        let error=complete_merge(path.clone(),"".into(),"Blocked by hook".into()).unwrap_err();
+        assert!(error.contains("Test hook refused commit"),"{error}");
+        assert_eq!(run_git_capture(&parent,&["rev-parse","HEAD"]),before);assert!(parent.join(".git/MERGE_HEAD").exists());
+        fs::remove_file(hook).unwrap();complete_merge(path,"".into(),"Explicit retry after hook fixed".into()).unwrap();
+        assert_eq!(run_git_capture(&parent,&["rev-list","--parents","-n","1","HEAD"]).split_whitespace().count(),3);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn native_merge_fast_forward_rejects_orphan_pointer_before_moving_head() {
+        let (base,parent,incoming,pin)=setup_incoming_submodule_removal(false);
+        run_git(&parent,&["switch",&incoming]);
+        run_git(&parent,&["update-index","--add","--cacheinfo",&format!("160000,{pin},vendor/dep")]);
+        run_git(&parent,&["commit","-m","Invalid registration"]);
+        run_git(&parent,&["switch","feature"]);run_git(&parent,&["reset","--hard","HEAD~1"]);
+        let path=parent.to_string_lossy().into_owned();let head=run_git_capture(&parent,&["rev-parse","HEAD"]);
+        let index=fs::read(parent.join(".git/index")).unwrap();
+        let error=merge_branch(path,"".into(),incoming).err().unwrap();
+        assert!(error.contains("without a matching path"),"{error}");assert_eq!(run_git_capture(&parent,&["rev-parse","HEAD"]),head);
+        assert_eq!(fs::read(parent.join(".git/index")).unwrap(),index);assert!(!parent.join(".git/MERGE_HEAD").exists());
+        fs::remove_dir_all(base).unwrap();
+    }
+
     #[test]
     fn fast_forward_merge_updates_the_index_gitlink_not_just_head() {
         let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
@@ -12520,6 +12619,7 @@ mod tests {
         run_git(&repository, &["switch", &default_branch]);
 
         let sub_path = repository.join("vendor/dep");
+        configure_test_repository(&sub_path);
         fs::write(sub_path.join("module.txt"), "bumped").unwrap();
         run_git(&sub_path, &["commit", "-am", "Bump"]);
         let bumped_oid = Repository::open(&sub_path).unwrap().head().unwrap().target().unwrap();
@@ -12537,6 +12637,31 @@ mod tests {
         assert_eq!(head_oid, Some(bumped_oid), "HEAD's tree must show the bumped submodule after fast-forward");
         assert_eq!(index_oid, Some(bumped_oid), "the INDEX must also show the bumped submodule after fast-forward — this is what Restore project version actually reads");
         fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn native_merge_respects_crlf_checkout_and_abort_restores_exact_bytes() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let (repository, _) = setup_diverged_repo(suffix);
+        run_git(&repository, &["config", "core.autocrlf", "true"]);
+        fs::write(repository.join("a.txt"), "feature version\r\n").unwrap();
+        run_git(&repository, &["commit", "-am", "Feature"]);
+        run_git(&repository, &["switch", "main"]);
+        fs::write(repository.join("a.txt"), "main version\r\n").unwrap();
+        run_git(&repository, &["commit", "-am", "Main"]);
+        run_git(&repository, &["switch", "feature"]);
+        let before = fs::read(repository.join("a.txt")).unwrap();
+        assert_eq!(before, b"feature version\r\n");
+        let path = repository.to_string_lossy().into_owned();
+        assert_eq!(merge_branch(path.clone(), "".into(), "main".into()).unwrap().status, "conflicts");
+        abort_merge(path.clone(), "".into()).unwrap();
+        assert_eq!(fs::read(repository.join("a.txt")).unwrap(), before);
+        assert_eq!(merge_branch(path.clone(), "".into(), "main".into()).unwrap().status, "conflicts");
+        resolve_conflict(path.clone(), "".into(), "a.txt".into(), "theirs".into()).unwrap();
+        complete_merge(path, "".into(), "Merge with CRLF checkout".into()).unwrap();
+        assert_eq!(fs::read(repository.join("a.txt")).unwrap(), b"main version\r\n");
+        assert!(run_git_capture(&repository, &["status", "--porcelain"]).is_empty());
+        fs::remove_dir_all(repository).unwrap();
     }
 
     #[test]
@@ -12595,6 +12720,7 @@ mod tests {
 
         run_git(&parent, &["switch", &default_branch]);
         let sub_path = parent.join("vendor/dep");
+        configure_test_repository(&sub_path);
         fs::write(sub_path.join("module.txt"), "incoming submodule update\n").unwrap();
         run_git(&sub_path, &["commit", "-am", "Incoming submodule update"]);
         let incoming_oid = Repository::open(&sub_path).unwrap().head().unwrap().target().unwrap();
@@ -12655,6 +12781,7 @@ mod tests {
         if conflict { fs::write(parent.join("conflict.txt"), "incoming\n").unwrap(); }
         run_git(&parent, &["commit", "-am", "Incoming removes dep and registration"]);
         run_git(&parent, &["switch", "feature"]);
+        run_git(&parent, &["-c", "protocol.file.allow=always", "submodule", "update", "--init", "vendor/dep"]);
         (base, parent, branch, pin)
     }
 
@@ -12718,6 +12845,7 @@ mod tests {
         let review = submodule_merge_review(path.clone(), "".into()).unwrap();
         assert!(review.items[0].registration_issue && review.items[0].suspicious);
         assert!(commit_staged_inner(path.clone(), "Also blocked from normal Commit".into()).is_err());
+        assert!(create_commit(path.clone(), "Legacy commit entry point must also block".into()).is_err());
         apply_submodule_merge_revision(path.clone(), "".into(), "vendor/dep".into(), String::new()).unwrap();
         commit_staged_inner(path, "Explicitly remove obsolete pointer".into()).unwrap();
         assert!(parent_gitlink_oid(&Repository::open(&parent).unwrap(), "vendor/dep", false).is_none());
@@ -12953,6 +13081,7 @@ mod tests {
         fs::write(repository.join("a.txt"), "base a\n").unwrap();
         fs::write(repository.join("b.txt"), "base b\n").unwrap();
         run_git(&repository, &["init", "-b", "main"]);
+        configure_test_repository(&repository);
         run_git(&repository, &["config", "user.email", "test@example.com"]);
         run_git(&repository, &["config", "user.name", "Test User"]);
         run_git(&repository, &["add", "."]);
@@ -13028,6 +13157,7 @@ mod tests {
         run_git(&parent, &["commit", "-am", "Add dep"]);
         let parent_branch = run_git_capture(&parent, &["branch", "--show-current"]);
         let sub_path = parent.join("vendor/dep");
+        configure_test_repository(&sub_path);
 
         run_git(&sub_path, &["switch", "-c", "left"]);
         fs::write(sub_path.join("module.txt"), "left\n").unwrap();
@@ -13102,6 +13232,7 @@ mod tests {
         create_commit(parent_string.clone(), "Add dep submodule".into()).unwrap();
 
         let sub_path = parent.join(&added);
+        configure_test_repository(&sub_path);
         run_git(&sub_path, &["switch", "-c", "feature"]);
         fs::write(sub_path.join("module.txt"), "feature version\n").unwrap();
         run_git(&sub_path, &["commit", "-am", "Feature change"]);
@@ -13121,6 +13252,48 @@ mod tests {
         assert!(list_conflicts(parent_string.clone(), added.clone()).unwrap().is_empty());
         let oid = complete_merge(parent_string.clone(), added.clone(), "Merge master into feature".into()).unwrap();
         assert!(!oid.is_empty());
+        assert_eq!(fs::read_to_string(sub_path.join("module.txt")).unwrap(), "master version\n");
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn native_merge_submodule_commit_button_preserves_parents_and_unstaged_local_files() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("git-integrity-merge-submodule-{suffix}"));
+        let parent = base.join("parent"); let dependency = base.join("dependency");
+        create_libgit2_repository(&parent, "README.md"); create_libgit2_repository(&dependency, "module.txt");
+        let parent_string = parent.to_string_lossy().into_owned();
+        let added = add_submodule_inner(parent_string.clone(), "".into(), dependency.to_string_lossy().into_owned(), "dep".into(), String::new(), String::new()).unwrap();
+        create_commit(parent_string.clone(), "Add dep submodule".into()).unwrap();
+
+        let sub_path = parent.join(&added);
+        configure_test_repository(&sub_path);
+        run_git(&sub_path, &["switch", "-c", "feature"]);
+        fs::write(sub_path.join("module.txt"), "feature version\n").unwrap();
+        run_git(&sub_path, &["commit", "-am", "Feature change"]);
+        run_git(&sub_path, &["switch", "master"]);
+        fs::write(sub_path.join("module.txt"), "master version\n").unwrap();
+        run_git(&sub_path, &["commit", "-am", "Master change"]);
+        run_git(&sub_path, &["switch", "feature"]);
+
+        // Everything below is called with (parent_path, target_path=<submodule path>),
+        // never a raw absolute path — this is exactly how the frontend addresses a
+        // submodule for every other action in this app.
+        let outcome = merge_branch(parent_string.clone(), added.clone(), "master".into()).unwrap();
+        assert_eq!(outcome.status, "conflicts");
+        assert_eq!(list_conflicts(parent_string.clone(), added.clone()).unwrap().len(), 1);
+
+        resolve_conflict(parent_string.clone(), added.clone(), "module.txt".into(), "theirs".into()).unwrap();
+        assert!(list_conflicts(parent_string.clone(), added.clone()).unwrap().is_empty());
+        let parent_before=run_git_capture(&parent,&["rev-parse","HEAD"]);
+        fs::write(sub_path.join("unrelated-local.txt"),"do not stage this during merge\n").unwrap();
+        let result = commit_submodule_inner(parent_string.clone(),added.clone(),"Merge from submodule commit button".into(),false).unwrap();
+        assert!(!result.revision.is_empty());assert!(!result.pushed);
+        assert_eq!(run_git_capture(&sub_path,&["rev-list","--parents","-n","1","HEAD"]).split_whitespace().count(),3);
+        assert!(run_git_capture(&sub_path,&["ls-tree","HEAD","--","unrelated-local.txt"]).is_empty());
+        assert!(sub_path.join("unrelated-local.txt").exists());
+        assert_eq!(run_git_capture(&parent,&["rev-parse","HEAD"]),parent_before);
         assert_eq!(fs::read_to_string(sub_path.join("module.txt")).unwrap(), "master version\n");
 
         fs::remove_dir_all(base).unwrap();

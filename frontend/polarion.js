@@ -221,7 +221,7 @@ function polarionDiagnosticDocumentLink(link, document, projectId) {
     parts.some(part => !part || part === '.' || part === '..' || part.length > 240 || /[\x00-\x1f\\]/.test(part))) return '';
   return 'https://polarion.vitesco.io/polarion/#/project/' + encodeURIComponent(parts[0]) + '/wiki/' + parts.slice(1).map(encodeURIComponent).join('/');
 }
-function createPolarionTaskPicker({ invoke, addMessage, log = () => {}, onDocumentChange = () => {} }) {
+function createPolarionTaskPicker({ invoke, addMessage, log = () => {}, onDocumentChange = () => {}, session = null }) {
   const dialog = document.querySelector('#polarionTaskDialog');
   const el = id => dialog.querySelector('#polarion' + id);
   const storage = typeof localStorage === 'undefined' ? null : localStorage;
@@ -238,6 +238,14 @@ function createPolarionTaskPicker({ invoke, addMessage, log = () => {}, onDocume
   const button = (text, action) => { const node = make('button', text); node.type = 'button'; node.disabled = busy; node.addEventListener('click', action); return node; };
   const current = ticket => ticket === generation && dialog.open && context;
   const connection = (state, text) => {
+    const shared = session?.snapshot();
+    if (shared) {
+      state = shared.state === 'connected' ? 'connected' : shared.state === 'sign_in_required' ? shared.windowClosed ? 'closed' : 'required' : 'unknown';
+      text = shared.state === 'connected' ? 'Connected · Polarion read access verified'
+        : shared.state === 'sign_in_required' ? 'Not connected to Polarion · open the portal to reconnect'
+        : shared.state === 'failed' ? 'Connection check did not complete · retry when available'
+        : 'Connection not checked · Search verifies access';
+    }
     el('Connection').dataset.state = state; el('ConnectionPanel').dataset.state = state; el('Connection').textContent = text;
     el('Connect').textContent = state === 'required' ? 'Sign in to Polarion ↗' : 'Open Polarion ↗';
     el('ConnectionHint').textContent = state === 'required'
@@ -246,6 +254,7 @@ function createPolarionTaskPicker({ invoke, addMessage, log = () => {}, onDocume
       : state === 'connected' ? 'The last read request succeeded. This Polarion window has its own session; Edge sign-in is separate.'
       : 'Access has not been verified. Open Polarion to sign in, or Search to check an existing session. Saved snapshots do not prove a connection.';
   };
+  session?.subscribe(() => { if (dialog.open) connection('unknown', ''); });
   const update = () => {
     if (mountedMode !== mode) {
       // Reuse the existing result/detail components, but keep them physically

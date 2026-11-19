@@ -140,6 +140,10 @@ run_utrud
 search_github_modules
 search_submodule_revisions
 set_drill_down_note
+settings_check_github
+settings_diagnostics
+settings_local
+settings_open_logs
 stage_all
 stage_files
 stash_changes
